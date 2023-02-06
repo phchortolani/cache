@@ -1,0 +1,993 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLBankTran" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+	;-------------------------------------------------------------------------------
+	; FINGLBankTran - Routines related to bank statement transaction lines.
+	;-------------------------------------------------------------------------------
+	#include COMSYS
+	#include FINConst
+	#include WWWConst
+ 
+#define	TRAN		1
+#define TRANLINE	2
+#define ACCOUNT		3
+#define	BANKRECON	4
+#define	DATA		5
+#define	TYPE		6
+#define	MATCHED		7
+ 
+#define IsOnInterestCharges(%1,%2)		''$data(^FINGLBankReconLines(YM,1,%1,%2))
+#define IsOnPreCleared(%1,%2)			''$data(^FINGLBankReconPreCleareds(YM,3,%1,%2))
+#define IsManualMatch(%1,%2)			''$data(^FINGLBankTrans(YM,4,$$$YES,$$$Index(%2),%1))
+ 
+ 	/*
+ShowUnclearedTransactions(pidBankRecon) ; NOT IN USE???
+	;-------------------------------------------------------------------------------
+	; Sum the uncleared transactions
+	;
+	; Params:
+	; pidBankRecon : The id of the bank reconciliation record
+	; parrUncleared: The array of data to be returned for the uncleared.
+	;
+	; Returns:
+	;
+	; History:
+	; 22-Sep-2005	RobertW		SR13304: Created
+	;-------------------------------------------------------------------------------
+	quit
+	new idTran,idLine,objTran,idxAccount,idBankAccount,lstAccounts,intCount,intLoop,objBankRecon
+	new objCurrency,strSpecifier,lstHeader
+	
+	quit:$get(pidBankRecon)=""
+	
+	set lstHeader=""
+	set lstHeader=lstHeader_$lb($$$StrFINGLBankTranLine)
+	set lstHeader=lstHeader_$lb($$$StrFINGLBankTranDebitAmount)
+	set lstHeader=lstHeader_$lb($$$StrFINGLBankTranCreditAmount)
+	set lstHeader=lstHeader_$lb($$$StrFINGLBankTranTransactionDate)
+	set lstHeader=lstHeader_$lb($$$StrFINGLBankTranReference)
+	set lstHeader=lstHeader_$lb($$$Text("Fin00894"))  ;Pre Cleared
+	set lstHeader=lstHeader_$lb($$$Text("Fin00150"))  ;Charges/Interest
+	set lstHeader=lstHeader_$lb($$$Text("Fin00899")) ; Manual Match
+	
+	if $get(YFELD)="" {
+		set objBankRecon=$get(^FINGLBankRecon(YM,pidBankRecon,1))
+	} else {
+		set objBankRecon=YFELD
+	}
+	
+	set idBankAccount=$$$FINGLBankReconBankAccount(objBankRecon) ; SR13303
+	
+	set lstAccounts=$$GetReconAccounts^FINGLBank(idBankAccount) ; SR13303
+	set intCount=$listlength(lstAccounts) ; SR13303
+ 
+	for intLoop=1:1:intCount {
+		set idxAccount=$$$Index($listget(lstAccounts,intLoop))
+		set idTran=""
+		for {
+			set idTran=$order(^FINGLTranLines(YM,2,idxAccount," ",idTran))
+			quit:idTran=""
+			
+			set idLine=""
+			for {
+				set idLine=$order(^FINGLTranLines(YM,2,idxAccount," ",idTran,idLine))
+				quit:idLine=""
+				
+				set objTran=$get(^FINGLTranLine(YM,idTran,idLine,1))
+				
+			}
+		}
+	}
+	
+	quit
+ 	*/
+ 
+SumUnmatchedBankLines(pidBankRecon,parrLines) ; ,pcurDebitTotal,pcurCreditTotal
+	/*------------------------------------------------------------------------------
+	; Sum the unmatched bank tran lines.
+	;
+	; Params:
+	; pidBankRecon   : The id of the banking reconciliation
+	; 
+	; ByRef:
+	; pcurDebitTotal : The total of the debits in the loaded file
+	; pcurCreditTotal: The total of the credits in the loaded file
+	;
+	; Returns:
+	; Nothing
+	;
+	; History:
+	; 21-Feb-2006	RPW			SR14229: Changed CREDIT and DEBIT around
+	; 27-Oct-2005	PO			SR13686: Include number of matches
+	; 27-Sep-2005	JW			SR13304: Don't include I/C or PC
+	; 16-Sep-2005	RobertW		SR13302: Created
+	;-----------------------------------------------------------------------------*/
+	new objBankRecon,idBankAccount,idTran,objTran
+	
+	kill parrLines
+	
+	set parrLines("DR","Total") = 0
+	set parrLines("CR","Total") = 0
+		
+	if '$$$NoKey(pidBankRecon) {
+		set objBankRecon=$get(^FINGLBankRecon(YM,pidBankRecon,1))
+		set idBankAccount=$$$FINGLBankReconBankAccount(objBankRecon)
+		if idBankAccount'="" {
+			set idTran=""
+			for {
+				set idTran=$order(^FINGLBankTran(YM,idBankAccount,idTran))
+				quit:(idTran="")
+				set objTran=$get(^FINGLBankTran(YM,idBankAccount,idTran,1))
+				if '$$$FINGLBankTranMatched(objTran) && '$$$IsOnPreCleared(idTran,pidBankRecon) && '$$$IsOnInterestCharges(idTran,pidBankRecon) {	//JW
+					set parrLines("DR","Total") = $get(parrLines("DR","Total")) + $$$FINGLBankTranCreditAmount(objTran) // 14229
+					if +$$$FINGLBankTranCreditAmount(objTran) {
+						set parrLines("DR","Count") = $get(parrLines("DR","Count")) + 1 // 14229
+					}
+					
+					set parrLines("CR","Total") = $get(parrLines("CR","Total")) + $$$FINGLBankTranDebitAmount(objTran)  // 14229
+					if +$$$FINGLBankTranDebitAmount(objTran) {
+						set parrLines("CR","Count") = $get(parrLines("CR","Count")) + 1 // 14229
+					}
+				}
+			}
+		}
+	}
+	quit
+	
+UnmatchBankTrans(pidAccount,pblnAll=$$$NO) 
+	/*------------------------------------------------------------------------------
+	; Resets all manually matched and automatched entries so they can be rechecked.
+	;
+	; Params:
+	; pidAccount: 	The bank account of the reconciliation
+	; pblnAll:		Unmatch all (including manual)
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Oct-2006	JW			SR15134: Look at kill status. Return status.
+	; 10-Oct-2005	JW			SR13641: Add pblnAll param
+	; 27-Sep-2005	JW			SR13304: Don't unmatch manually matched lines.
+	; 22-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new idLine,objTran,strStatus
+	set strStatus = $$$OK
+	set idLine=""
+	for {
+		set idLine=$order(^FINGLBankTran(YM,pidAccount,idLine))
+		quit:idLine=""
+		
+		set objTran=$get(^FINGLBankTran(YM,pidAccount,idLine,1))
+		
+		if $$$FINGLBankTranMatched(objTran) && (pblnAll || '$$$FINGLBankTranManualMatch(objTran)) {
+			set $$$FINGLBankTranMatched(objTran)=$$$ANNO
+			set $$$FINGLBankTranManualMatch(objTran)=$$$ANNO
+			set strStatus = $$$Save("FINGLBankTran",pidAccount_","_idLine,objTran,1)	//SR15134
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	
+	quit strStatus
+ 
+ReconcileBankRecon(pidBankRecon="",pstrSearch="",pidAccount)
+	/*------------------------------------------------------------------------------
+	; Loop through all of the un-cleared bank transaction lines
+	; and see if any can be cleared for this bank recon against the exception list.
+	;
+	; History:
+	; 20-Feb-2006	RPW			SR14229: Rewrote to do everything in one loop. Also get the
+	; 							search criteria. 
+	; 							Criteria is $e(pstrSearch,1) = Use Date or not
+	; 							            $e(pstrSearch,2) = Use Reference or not
+	;  7-Oct-2005	JW			SR13641: Rewrote: Looked at for large counts!
+	;  5-Oct-2005	JW			SR13617: Don't look at previously matched. Cleared field is string not boolean. Add +s
+	; 26-Sep-2005	RPW			SR13304: Code cleanup and speed up. THIS NEEDS TO BE LOOKED AT FOR LARGE COUNTS!
+	; 15-Sep-2005	RPW			SR13303: Get All the accounts and attempt to match them correctly.
+	; 15-Sep-2005	RPW			SR13306: This needs to handle to all the accounts from the me and my "Parents", see FINGLBank screen
+	; 28-Jan-2005	JW			SR11457: Added + to curAmount as could be ""
+	; 27-Oct-2004	Paul K		Created
+	;-----------------------------------------------------------------------------*/
+	new objBankRecon,idBankAccount,idBankLine,objTran,blnMatch,strNo
+	
+	kill ^CacheTempMatched(YUSER)
+				
+	if pidBankRecon'="" {
+		set objBankRecon=$get(^FINGLBankRecon(YM,pidBankRecon,1))
+		set idBankAccount=$$$FINGLBankReconBankAccount(objBankRecon) ; SR13303
+		if idBankAccount'="" {
+			
+			set idBankLine=""
+			for {
+				set idBankLine=$order(^FINGLBankTrans(YM,2,$$$ANINO,idBankAccount,idBankLine))
+				quit:idBankLine=""
+				
+				set objTran=$get(^FINGLBankTran(YM,idBankAccount,idBankLine,1))
+ 
+				if '$$$IsOnPreCleared(idBankLine,pidBankRecon) && '$$$IsOnInterestCharges(idBankLine,pidBankRecon) {
+					do Match^FINGLBankTranMatch(idBankLine,objTran,pstrSearch,pidBankRecon,pidAccount)
+				}
+			}
+		}
+	}
+	
+	quit
+   
+MoveToCleared(pidBankRecon="",penumMatch="") 
+	/*------------------------------------------------------------------------------
+	; This routine attempts to reconcile all the bank lines and match them, this is
+	; actually automatic match.
+	;
+	; Params:
+	; pidBankRecon: The id of the bank reconciliation record
+	; penumMatch  : The type of match (not used)
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Apr-2006	RPW			SR14459: Make sure that the system is able to do the match
+	; 							before attempting it.
+	; 03-Mar-2006	Steve S		SR14126: Match Pre Cleared to GL trans
+	; 20-Feb-2006	RPW			SR14229: Pass in the field criteria for the matchs into
+	; 							Reconcile BankRecon
+	; 							Removed call to RemoveAllAutomaticallyCleared as it no longer exists.
+	; 							Removed call to UnmatchBankTrans as it's no longer needed
+	; 10-Oct-2005	JW			SR13641: Just save found matches
+	; 27-Sep-2005	JW			SR13304: Don't match I/C or PC
+	; 22-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+ 	new objBankRecon,idAccount
+ 	
+ 	if pidBankRecon'="" {
+	 	if $$Editable^FINSYSReview("FINGLBankRecon",$$$FINGLBankReconStatus($get(^FINGLBankRecon(YM,pidBankRecon,1)))) {
+			set objBankRecon=$get(^FINGLBankRecon(YM,pidBankRecon,1))
+			set idAccount=$$$FINGLBankReconBankAccount(objBankRecon)
+			// FMFELD is required here as it's the only thing available.
+			do MatchToGLTrans^FINGLBankReconPreClearedMatch(pidBankRecon,(+$piece(FMFELD,Y,33))_(+$piece(FMFELD,Y,34))) ;SR14126
+			do ReconcileBankRecon(pidBankRecon,+$piece(FMFELD,Y,33)_(+$piece(FMFELD,Y,34)),idAccount) // SR14229		
+	 	}
+	}
+ 	
+	do ReloadForm^COMUtilForm()
+ 
+	quit
+ 
+SumUncleared(pidBankRecon,parrUncleared) 
+	/*------------------------------------------------------------------------------
+	; Sum the uncleared transactions
+	;
+	; Params:
+	; pidBankRecon : The id of the bank reconciliation record
+	; parrUncleared: The array of data to be returned for the uncleared.
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Feb-2006	RPW			Sr13675: Removed old code
+	; 27-Oct-2005	PO			SR13686: Include number of matches
+	; 22-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+ 
+	do SumTransactions(pidBankRecon,.parrUncleared,$$$ANINO)
+	
+	quit
+ 
+SumCleared(pidBankRecon,parrCleared) 
+	/*------------------------------------------------------------------------------
+	; Sum up the amounts of the cleared transactions
+	;
+	; Params:
+	; pidBankRecon: The id of the bank reconciliation record
+	; parrCleared : The array of data to be returned for the cleared.
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Feb-2006	RPW			Sr13675: Removed old code
+	; 27-Oct-2005	PO			SR13686: Include number of matches
+	; 22-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	
+	do SumTransactions(pidBankRecon,.parrCleared,$$$YES)
+ 
+	quit
+ 
+SumTransactions(pidBankRecon,parrTransactions,pblnClear) 
+	/*------------------------------------------------------------------------------
+	; Sum up the amounts of the cleared transactions
+	;
+	; Params:
+	; pidBankRecon: The id of the bank reconciliation record
+	; parrCleared : The array of data to be returned for the cleared.
+	; pblnClear   : Whether to show cleared or not
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Feb-2006	RPW			SR13675: Updated to used FINGLBankReconMatched instead of
+	; 							FINGLBankReconCleared - Compelte Rewrite
+	; 05-Dec-2005	RobertW		SR13813: Created
+	;-----------------------------------------------------------------------------*/
+	new idTran,idLine,objCleared,objBankReconMatched
+	
+	// TODOROB: Maybe need to change this to use the GetGridContents.
+	
+	kill parrTransactions
+	
+	set parrTransactions("DR","Total") = 0
+	set parrTransactions("CR","Total") = 0
+	
+	quit:pidBankRecon=""
+	 
+	set idLine=""
+	for {
+		set idLine=$order(^FINGLBankReconMatcheds(YM,1,pblnClear,pidBankRecon,idLine)) // SR13675
+		quit:idLine=""
+		
+		set objBankReconMatched=$get(^FINGLBankReconMatched(YM,pidBankRecon,idLine,1)) // SR13675
+				
+		set parrTransactions("DR","Total")=$get(parrTransactions("DR","Total"))+$$$FINGLBankReconMatchedDeposit(objBankReconMatched) // SR13675
+		if +$$$FINGLBankReconMatchedDeposit(objBankReconMatched) set parrTransactions("DR","Count") = $get(parrTransactions("DR","Count")) + 1
+		set parrTransactions("CR","Total")=$get(parrTransactions("CR","Total"))+$$$FINGLBankReconMatchedWithdrawal(objBankReconMatched) // SR13675
+		if +$$$FINGLBankReconMatchedWithdrawal(objBankReconMatched) set parrTransactions("CR","Count") = $get(parrTransactions("CR","Count")) + 1
+	}
+	
+	quit
+ 
+ResetMatched(pidBankRecon,pidTran,pidTranLine,pcurWithdrawal,pcurDeposit) 
+	/*------------------------------------------------------------------------------
+	; Reset a tranasction on a bank reconciliation record.
+	;
+	; Params:
+	; pidBankRecon  : The id of the bank reconciliation record
+	; pidTran       : The id of the transaction
+	; pidTranLine   : The id of the transaction line
+	; pcurWithdrawal: The amount of the withdrawal
+	; pcurDepost    : The amount of the deposit
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Feb-2006	RPW			SR13675: Modified to use FINGLBankReconMatched instead of FINGLBankReconCleared
+	; 27-Sep-2005	JW			SR13304: Added +s
+	; 22-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new idAccount,idxAccount,objCleared,idMatched,objBankReconMatched,idBankLine,strSearch
+	
+	set idAccount=$$$FINGLBankReconBankAccount($get(^FINGLBankRecon(YM,pidBankRecon,1)))
+	set idxAccount=$$$Index(idAccount)
+ 
+ 	set idMatched=$order(^FINGLBankReconMatcheds(YM,3,pidTran,pidTranLine,pidBankRecon,"")) // SR13675
+ 	if idMatched'="" {
+		set objBankReconMatched=$get(^FINGLBankReconMatched(YM,pidBankRecon,idMatched,1)) // SR13675
+		if objBankReconMatched'="" { // SR13675
+			if '$$$FINGLBankReconMatchedManuallyCleared(objBankReconMatched) { // SR13675
+				set idBankLine=$$$FINGLBankReconMatchedBankTranLine(objBankReconMatched)
+				set strSearch=$$$FINGLBankReconMatchedMatchType(objBankReconMatched)
+				if +pcurWithdrawal'=0 {		// JW
+					do FixMatchByType("DR",pcurWithdrawal,pidTran,pidTranLine,idAccount,idxAccount,idBankLine,strSearch)
+				}
+				
+				if +pcurDeposit'=0 {		// JW
+					do FixMatchByType("CR",pcurDeposit,pidTran,pidTranLine,idAccount,idxAccount,idBankLine,strSearch)
+				}
+			}
+		}
+ 	}
+ 
+	quit
+ 
+FixMatchByType(pstrType,pcurAmount,pidTran,pidTranLine,pidAccount,pidxAccount,pidBankTranLine,pstrSearch) 
+	/*------------------------------------------------------------------------------
+	; Reset the matched status of the FINGLBankTran for the amount and account passed in.
+	; Also reset the status to show that this can be matched again.
+	;
+	; Params:
+	; pstrType   : The type of the entry, either CR or DR
+	; pcurAmount : The amount to fix up
+	; pidTran    : The id of the transaction to reset
+	; pidTranLine: The id of the transaction line to reset
+	; pidAccount : The account number to reset
+	; pidxAccount: The account number in an index format.
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Oct-2005	JW			SR13641: Use known data
+	;  5-Oct-2005	JW			SR13617: Index reference field
+	; 27-Sep-2005	JW			SR13304: pcurAmount not pstrType
+	; 22-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new strReference,objTran,dteTxnDate,idTran,intIndex,objBank,objMatch
+ 	
+	set strReference=" "
+	set pcurAmount = +pcurAmount
+	
+	set objTran=$get(^FINGLTranLine(YM,pidTran,pidTranLine,1))
+	if objTran'="" set strReference=$$$Index($$$FINGLTranLineReference(objTran)) //SR13617
+	
+	if (pidBankTranLine'="") {	
+		set objTran=$get(^FINGLBankTran(YM,pidAccount,pidBankTranLine,1))
+		if objTran'="" {
+			set $$$FINGLBankTranMatched(objTran)=$$$ANNO
+			do Save^FINSYS("FINGLBankTran",pidAccount_","_pidBankTranLine,objTran,1)				
+		}
+				
+		set ^CacheTempMatched(YUSER,pstrSearch,pstrType,"Amount")=$get(^CacheTempMatched(YUSER,pstrSearch,pstrType,"Amount"))-pcurAmount
+		set ^CacheTempMatched(YUSER,pstrSearch,pstrType,"MatchCount")=$get(^CacheTempMatched(YUSER,pstrSearch,pstrType,"MatchCount"))-1
+		
+		if $get(^CacheTempMatched(YUSER,pstrSearch,pstrType,"MatchCount"))=0 {
+			kill ^CacheTempMatched(YUSER,pstrSearch,pstrType,"MatchCount")
+			kill ^CacheTempMatched(YUSER,pstrSearch,pstrType,"Amount")
+		}
+	}
+	
+	quit
+ 
+ 
+AddToPreCleared(pstrKey,pstrCheckedAndId)
+	/*------------------------------------------------------------------------------
+	; Make this entry a precleared item
+	;
+	; Params:
+	; pstrKey         : The key passed from COMTable
+	; pstrCheckedAndId: The checked status and the id of the object from COMTable
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new idAccount,idBankTran,idBankRecon
+	
+	set idAccount=$piece(pstrKey,"|",1)
+	set idBankTran=$piece(pstrKey,"|",2)
+	set idBankRecon=$piece(pstrKey,"|",3)
+	
+	if '$$$IsOnPreCleared(idBankTran,idBankRecon) {
+		
+		if $$$IsOnInterestCharges(idBankTran,idBankRecon) {
+			do KillInterestCharge(idBankRecon,idBankTran)
+			
+		} elseif $$$IsManualMatch(idBankTran,idAccount) {
+			do SetManualMatch(idBankTran,idAccount,$$$NO)
+		}
+		
+		do CreatePreCleared(idBankRecon,idBankTran,idAccount)
+	}
+ 
+	quit ""
+ 
+AddToChargeInterest(pstrKey,pstrCheckedAndId) 
+	/*------------------------------------------------------------------------------
+	; Make this entry into a Charge/Interest item.
+	;
+	; Params:
+	; pstrKey         : The key passed from COMTable
+	; pstrCheckedAndId: The checked status and the id of the object from COMTable
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new idAccount,idBankTran,idBankRecon
+	
+	set idAccount=$piece(pstrKey,"|",1)
+	set idBankTran=$piece(pstrKey,"|",2)
+	set idBankRecon=$piece(pstrKey,"|",3)
+	
+	if '$$$IsOnInterestCharges(idBankTran,idBankRecon) {
+		
+		if $$$IsOnPreCleared(idBankTran,idBankRecon) {
+			do KillPreCleared(idBankRecon,idBankTran)
+			
+		} elseif $$$IsManualMatch(idBankTran,idAccount) {
+			do SetManualMatch(idBankTran,idAccount,$$$NO)
+		}
+		
+		do CreateInterestCharge(idBankRecon,idBankTran,idAccount)
+	}
+ 
+	quit ""
+ 
+ManualMatch(pstrKey,pstrCheckedAndId) 
+	/*------------------------------------------------------------------------------
+	; Make this entry a manually matched entry
+	;
+	; Params:
+	; pstrKey         : The key passed from COMTable
+	; pstrCheckedAndId: The checked status and the id of the object from COMTable
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new idAccount,idBankTran,idBankRecon
+	
+	set idAccount=$piece(pstrKey,"|",1)
+	set idBankTran=$piece(pstrKey,"|",2)
+	set idBankRecon=$piece(pstrKey,"|",3)
+	
+	if '$$$IsManualMatch(idBankTran,idAccount) {
+		
+		if $$$IsOnInterestCharges(idBankTran,idBankRecon) {
+			do KillInterestCharge(idBankRecon,idBankTran)
+		}
+		
+		if $$$IsOnPreCleared(idBankTran,idBankRecon) {
+			do KillPreCleared(idBankRecon,idBankTran)
+		}
+		
+		do SetManualMatch(idBankTran,idAccount,$$$YES) 
+	}
+ 
+	quit ""
+ 
+SetManualMatch(pidBankTran,pidAccount,pblnMatch) 
+	/*------------------------------------------------------------------------------
+	; Make an item a manual match or not based on pblnMatch.
+	;
+	; Params:
+	; pidBankTran: The id of the bank line
+	; pidAccount :
+	; pblnMatch  : The boolean of whether to add or remove a manual match
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Oct-2006	JW			SR15134: Look at save status. Return status.
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new objBankTran,strStatus
+	set strStatus = $$$OK
+	
+	set objBankTran=$get(^FINGLBankTran(YM,pidAccount,pidBankTran,1))
+	if objBankTran'="" {
+		set $$$FINGLBankTranManualMatch(objBankTran)=$select('pblnMatch:"",1:pblnMatch)
+		set $$$FINGLBankTranMatched(objBankTran)=$select('pblnMatch:"",1:pblnMatch)
+		set strStatus = $$$Save("FINGLBankTran",pidAccount_","_pidBankTran,objBankTran,1)		// SR15134
+	}
+	
+	quit strStatus
+ 
+CreateInterestCharge(pidBankRecon,pidBankTran,pidAccount)
+	/*------------------------------------------------------------------------------
+	; Make this tran line into an interest or charge item
+	;
+	; Params:
+	; pidBankRecon: The id of the bank reconciliation record
+	; pidBankTran : The id of the bank line
+	; pidAccount  : The bank account of the reconciliation record
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Mar-2006	RPW			SR13305: Modified by moving saving code to separate
+	; 							routine.
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new objBankTran,objIC
+	
+	set objBankTran=$get(^FINGLBankTran(YM,pidAccount,pidBankTran,1))
+	if objBankTran'="" {
+		
+		set objIC=$$SaveGLAdj(pidBankRecon,$$$FINGLBankTranCreditAmount(objBankTran),
+									   $$$FINGLBankTranDebitAmount(objBankTran),
+									   $$$FINGLBankTranReference(objBankTran),
+									   $$$FINGLBankTranTransactionDate(objBankTran),
+									   pidBankTran)
+		
+		set $$$FINGLBankTranMatched(objBankTran)=$$$YES
+		do Save^FINSYS("FINGLBankTran",pidAccount_","_pidBankTran,objBankTran,1)
+	}
+	
+	quit objIC
+	
+SaveGLAdj(pidBankRecon,pcurCredit,pcurDebit,pstrReference,pdteTranDate,pidBankTran,&pidGLAdj)
+	;-------------------------------------------------------------------------------
+	; Save the General Ledger Adjustment entry directly.
+	;
+	; Params:
+	; pidBankRecon : The id of the bank reconciliation record
+	; pcurCredit   : The amount of money in withdrawals
+	; pcurDebit    : The amount of money in deposits
+	; pstrReference: The reference of the adjustment
+	; pdteTranDate : The date the transaction occurred.
+	; pidBankTran  : The id of a bank tran if this was created from one
+	; pidGLAdj     : The id of this saved record
+	;
+	; ByRefs:
+	; pidGLAdj
+	;
+	; Returns:
+	; The data stream created
+	;
+	; History:
+	; 02-Mar-2006	RPW		SR13305: Created
+	;-------------------------------------------------------------------------------
+ 
+	new objIC,strStatus
+	set objIC=""
+	set $$$FINGLBankReconLineCredit(objIC)=pcurCredit
+	set $$$FINGLBankReconLineDebit(objIC)=pcurDebit
+	set $$$FINGLBankReconLineReference(objIC)=pstrReference
+	set $$$FINGLBankReconLineTransactionDate(objIC)=pdteTranDate
+	set $$$FINGLBankReconLineBankFileLine(objIC)=pidBankTran
+	set $$$FINGLBankReconLineAccount(objIC)=$$GetDefaultAccount^FINGLBankReconLine()
+	
+	set pidGLAdj=pidBankRecon_","_($order(^FINGLBankReconLine(YM,pidBankRecon,""),-1)+1)
+	
+	set strStatus=$$$Save("FINGLBankReconLine",pidGLAdj,objIC,1)
+	
+	quit objIC
+ 
+KillInterestCharge(pidBankRecon,pidBankTran) 
+	/*------------------------------------------------------------------------------
+	; Remove an entry from the interest/charge list
+	;
+	; Params:
+	; pidBankRecon: The id of the bank reconciliation record
+	; pidBankTran : The id of the bank line
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new idLine
+	
+	set idLine=$order(^FINGLBankReconLines(YM,1,pidBankTran,pidBankRecon,""))
+	if idLine'="" {
+		do KILL^FINSYS("FINGLBankReconLine",pidBankRecon_","_idLine)
+	}
+		
+	quit
+ 
+CreatePreCleared(pidBankRecon,pidBankTran,pidAccount) 
+	/*------------------------------------------------------------------------------
+	; Add this transaction line to the precleared txns
+	;
+	; Params:
+	; pidBankRecon: The id of the bank reconciliation record
+	; pidBankTran : The id of the bank line
+	; pidAccount  : The bank account of the reconciliation record
+	; 
+	; Returns:
+	;
+	; History:
+	; 09-Feb-2006	RPW			SR14135: Move the creation to FINGLBankReconPreCleared
+	; 10-Oct-2005	JW			SR13654: Reference account
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new objBankTran
+		
+	set objBankTran=$get(^FINGLBankTran(YM,pidAccount,pidBankTran,1))
+	if objBankTran'="" {
+		
+		// SR14135
+		do CreatePreCleared^FINGLBankReconPreCleared(pidBankRecon,
+		                                             $$$FINGLBankTranCreditAmount(objBankTran),
+		                                             $$$FINGLBankTranDebitAmount(objBankTran),
+		                                             $$$FINGLBankTranReference(objBankTran),
+		                                             $$$FINGLBankTranTransactionDate(objBankTran),
+		                                             pidBankTran,
+		                                             pidAccount)
+		
+		set $$$FINGLBankTranMatched(objBankTran)=$$$YES
+		do Save^FINSYS("FINGLBankTran",pidAccount_","_pidBankTran,objBankTran,1)
+	}
+	
+	quit
+	
+KillPreCleared(pidBankRecon,pidBankTran) 
+	/*------------------------------------------------------------------------------
+	; Remove this from the pre cleared list.
+	;
+	; Params:
+	; pidBankRecon: The id of the bank reconciliation record
+	; pidBankTran : The id of the bank line
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new idCleared
+	
+	set idCleared=$order(^FINGLBankReconPreCleareds(YM,3,pidBankTran,pidBankRecon,""))
+	if idCleared'="" {
+		do KILL^FINSYS("FINGLBankReconPreCleared",pidBankRecon_","_idCleared)
+	}
+ 
+	quit
+		
+SumManualMatch(pidBankRecon,parrLines) ; ,pcurDebitTotal,pcurCreditTotal
+	/*------------------------------------------------------------------------------
+	; Sum the amount of manually matched bank lines
+	;
+	; Params:
+	; pidBankRecon   : The id of the bank reconciliation record
+	; pcurDebitTotal : The sum of the debits/deposits
+	; pcurCreditTotal: The sum of the credits/withdrawals
+	;
+	; Returns:
+	;
+	; History:
+	; 02-May-2006	RPW			SR14600: If the filename is - on the manually matched entry, ignore it
+	; 22-Feb-2006	RPW			SR14229: Changed CREDIT and DEBIT around
+	; 27-Oct-2005	PO			SR13686: Include number of matches
+	; 27-Sep-2005	JW			SR13304: Sum not set.
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new objBankRecon,idBankAccount,idxBankAccount,idTran,objTran
+	
+	kill parrLines
+	
+	set parrLines("DR","Total") = 0
+	set parrLines("CR","Total") = 0
+ 
+	if $get(YFELD)="" {
+		set objBankRecon=$get(^FINGLBankRecon(YM,pidBankRecon,1))
+	} else {
+		set objBankRecon=YFELD
+	}
+	
+	set idBankAccount=$$$FINGLBankReconBankAccount(objBankRecon)
+	set idxBankAccount=$$$Index(idBankAccount)
+	
+	set idTran=""
+	for {
+		set idTran=$order(^FINGLBankTrans(YM,4,$$$YES,idxBankAccount,idTran))
+		quit:(idTran="")
+ 
+		set objTran=$get(^FINGLBankTran(YM,idBankAccount,idTran,1))
+		if $extract($$$FINGLBankTranLoadFile(objTran))'="-" { // SR14600
+			
+			set parrLines("CR","Total") = $get(parrLines("CR","Total")) + $$$FINGLBankTranDebitAmount(objTran)
+			if +$$$FINGLBankTranDebitAmount(objTran) set parrLines("CR","Count") = $get(parrLines("CR","Count")) + 1
+			
+			set parrLines("DR","Total") = $get(parrLines("DR","Total")) + $$$FINGLBankTranCreditAmount(objTran)
+			if +$$$FINGLBankTranCreditAmount(objTran) set parrLines("DR","Count") = $get(parrLines("DR","Count")) + 1
+		}
+	}
+		
+	quit
+	
+ToggleManualMatch(pstrKey,pstrCheckedAndId) 
+	/*------------------------------------------------------------------------------
+	; Toggle the Manual Match flag for this bank line
+	;
+	; Params:
+	; pstrKey         : The key passed from COMTable
+	; pstrCheckedAndId: The checked status and the id of the object from COMTable
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2005	RobertW		SR13304: Created
+	;-----------------------------------------------------------------------------*/
+	new idAccount,idBankTran
+	
+	set idAccount=$piece(pstrKey,"|",1)
+	set idBankTran=$piece(pstrKey,"|",2)
+	do SetManualMatch(idBankTran,idAccount,$$JSBooleanToBoolean^COMTable($piece(pstrCheckedAndId,",",1)))
+	
+	quit ""
+	
+MessageQueryLoop(Query,Storage,VORG)
+	; -----------------------------------------------------------------------------
+	; Callback from routine above....
+	; 
+	; History:
+	; 22-Feb-2006	RPW			SR13305: Clean up the data loading. Rewrote for FINGLBankReconMatched
+	; 12-Oct-2005	JW			SR13671: Removed Title. Now in COMQuery
+	; 10-Oct-2005	JW			SR13641: Use global not local array
+	; 19-Sep-2005	RPW			SR13303: Added piece 5 to type DATA.
+	; 							Added MACROS for data.
+	; 15-Sep-2005	JW			SR13307: Changed row ordering
+	; 16-Mar-2005	Steve S		SR11761: Check for linked accounts in the query
+	; 01-Nov-2004	Paul K		Commented.
+	; -----------------------------------------------------------------------------
+	
+	new intCount,idBankRecon,strQueryType,objFINGLBankRecon,blnPosted,idLine,objBankReconMatched
+	new idTran,idTranLine,objData,strTransactionType
+	
+	kill ^mtemp("Query",$job)
+	set intCount=0
+ 
+	set idBankRecon=$get(Query("BankRecon"))
+	set strQueryType=$get(Query("Type"))
+	set strQueryType=$case(strQueryType,"0":"00","1":"01",:strQueryType)
+	set objFINGLBankRecon=$get(^FINGLBankRecon(YM,idBankRecon,1))
+	set blnPosted='$$Editable^FINSYSReview("FINGLBankRecon",$$$FINGLBankReconStatus(objFINGLBankRecon))
+	
+	set Query("Locked")=blnPosted
+	
+	set intCount=0
+	
+	set idLine=""
+	for {
+		set idLine=$order(^FINGLBankReconMatcheds(YM,12,$$$YES,strQueryType,idBankRecon,idLine))
+		quit:idLine=""
+		set objBankReconMatched=$get(^FINGLBankReconMatched(YM,idBankRecon,idLine,1))
+		
+		set idTran     = $$$FINGLBankReconMatchedTransaction1(objBankReconMatched)
+		set idTranLine = $$$FINGLBankReconMatchedTransactionLine(objBankReconMatched)
+		
+		set objData($$$TRAN)     = idTran
+		set objData($$$TRANLINE) = idTranLine
+		set objData($$$ACCOUNT)  = $$$FINGLBankReconMatchedAccount(objBankReconMatched)
+		
+		if blnPosted {
+			set objData($$$BANKRECON)=" " ; SR13303
+			set objData($$$DATA)=" " ; SR13303
+			set objData($$$MATCHED)=""
+		} else {
+			set objData($$$BANKRECON)=idBankRecon ; SR13303
+			set objData($$$DATA)=idLine
+			set objData($$$MATCHED)=idBankRecon_"~"_idBankRecon_","_idTran_","_idTranLine_","
+		}
+		
+		set strTransactionType = $$$FINGLBankReconMatchedTransactionType(objBankReconMatched)
+		set objData($$$TYPE) = strTransactionType ; SR13303
+		merge @Storage@($i(intCount))=objData
+	}
+		
+	quit intCount
+ 
+ 
+OnBeforeDeleteAll() 
+	;-------------------------------------------------------------------------------
+	; Determine if the grid rows can be deleted or not.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Apr-2006	RPW		SR14457: Fixed so that if any bank rec exists for this account,
+	; 						do not allow deletion of the lines. Use AnyUnposted on FINGLBankRecon
+	; 24-Mar-2006	RPW		SR14457: Created
+	;-------------------------------------------------------------------------------
+	new strYKey,blnOnBankRec,idxYKey,idLast
+	
+	set strYKey=$$$GRIDYKEYContainer
+	set blnOnBankRec=$$$NO
+	set idxYKey=$$$Index(strYKey)
+	
+	if $data(^FINGLBankRecons(YM,50,idxYKey)) {
+		if $$$ISERR($$AnyUnposted^FINGLBankRecon(,strYKey)) {
+			set idLast=$order(^FINGLBankRecons(YM,50,idxYKey,""),-1)
+			$$$Alert($listbuild("Fin01009",idLast))  ; The lines from this file are used on Bank Reconciliation %1, please delete it and try again.
+			set blnOnBankRec=$$$YES
+		}
+	}
+ 
+	quit 'blnOnBankRec
+	
+CountByType(pstrType,pidBankRecon,&pintDR,&pintCR)
+	;-------------------------------------------------------------------------------
+	; Count the number of Deposits and Credits matcheds
+	;
+	; Params:
+	; pstrType    : The match type
+	; pidBankRecon: The id of the bank reconciliationrecord
+	;
+	; ByRefs:
+	; pintDR      : The count of DR records
+	; pintCR      : The count of CR records
+	; 
+	; Returns:
+	;
+	; History:
+	; 21-Feb-2006	RPW		SR14229: Created
+	;-------------------------------------------------------------------------------
+ 	new idLine,strType,objFINGLBankReconMatched
+ 
+	set idLine=""
+	set pintDR=0
+	set pintCR=0
+	
+	set strType=$case(pstrType,0:"00",1:"01",10:"10",11:"11",:"")
+	
+	for {
+		set idLine=$order(^FINGLBankReconMatcheds(YM,12,$$$YES,strType,pidBankRecon,idLine))
+		quit:idLine=""
+		set objFINGLBankReconMatched=$get(^FINGLBankReconMatched(YM,pidBankRecon,idLine,1))
+		if +$$$FINGLBankReconMatchedDeposit(objFINGLBankReconMatched)'=0 {
+			set pintDR=pintDR+1
+		} else {
+			set pintCR=pintCR+1
+		}
+	}
+	
+	quit
+	
+	
+AmountByType(pstrType,pidBankRecon,&pcurDR,&pcurCR) 
+	;-------------------------------------------------------------------------------
+	; Method Usage
+	;
+	; Params:
+	; pstrType    : The match type
+	; pidBankRecon: The id of the bank reconciliationrecord
+	;
+	; ByRefs:
+	; pintDR      : The sum of the amount on DR records
+	; pintCR      : The sum of the amount on CR records
+	;
+	; Returns:
+	;
+	; History:
+	; 21-Feb-2006	RPW		SR14229: Created
+	;-------------------------------------------------------------------------------
+ 	new idLine,strType,objFINGLBankReconMatched
+ 
+	set idLine=""
+	set pcurDR=0
+	set pcurCR=0
+	
+	set strType=$case(pstrType,0:"00",1:"01",10:"10",11:"11",:"")
+	
+	for {
+		set idLine=$order(^FINGLBankReconMatcheds(YM,12,$$$YES,strType,pidBankRecon,idLine))
+		quit:]]><![CDATA[idLine=""
+		set objFINGLBankReconMatched=$get(^FINGLBankReconMatched(YM,pidBankRecon,idLine,1))
+		if +$$$FINGLBankReconMatchedDeposit(objFINGLBankReconMatched)'=0 {
+			set pcurDR=pcurDR+$$$FINGLBankReconMatchedDeposit(objFINGLBankReconMatched)
+		} else {
+			set pcurCR=pcurCR+$$$FINGLBankReconMatchedWithdrawal(objFINGLBankReconMatched)
+		}
+	}
+	
+	quit
+	
+	
+PreClearCount(pidBankRecon,parrPreClear)
+	;-------------------------------------------------------------------------------
+	; Get the count of pre clear entires/amounts.
+	;
+	; Params: pidBankRecon		: The bank rec number
+	;
+	; ByRefs: parrPreClear		: The array of values
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Mar-2006	Steve S		SR14126: Created
+	;-------------------------------------------------------------------------------
+	new idPCLine,objPC,curCredit,curDebit
+ 
+	set parrPreClear("CR","Count")=0
+	set parrPreClear("DR","Count")=0
+	set parrPreClear("CR","Total")=0
+	set parrPreClear("DR","Total")=0
+	
+	if '$$$NoKey(pidBankRecon) {
+		set idPCLine=""
+		for {
+			set idPCLine=$order(^FINGLBankReconPreCleareds(YM,15,$$$YES,pidBankRecon,idPCLine))
+			quit:(idPCLine="")
+			
+			set objPC=$get(^FINGLBankReconPreCleared(YM,pidBankRecon,idPCLine,1))
+			continue:$$$FINGLBankReconPreClearedBankFileLine(objPC)=""
+			
+			set curCredit=$$$FINGLBankReconPreClearedCredit(objPC)
+			set curDebit=$$$FINGLBankReconPreClearedDebit(objPC)
+			
+			if (+curCredit'=0) {
+				set parrPreClear("CR","Count")=parrPreClear("CR","Count")+1
+				set parrPreClear("CR","Total")=parrPreClear("CR","Total")+curCredit
+			} elseif (+curDebit'=0) {
+				set parrPreClear("DR","Count")=parrPreClear("DR","Count")+1
+				set parrPreClear("DR","Total")=parrPreClear("DR","Total")+curDebit	
+			}
+		}		
+	}
+ 
+	quit
+]]></Routine>
+</Export>

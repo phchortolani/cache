@@ -1,0 +1,411 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARSESEstoqueHistorico" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+#include VARSESFichaEstoque
+ 
+#include COMSYS
+#include INConst
+#include WWWConst
+ 
+ 
+VARSESHistoricoEstoque
+	//w !,"Creates and manages values of stock at specific dates"
+	w !,$$$Text("MED00180")  ;Creates and manages values of stock at specific dates"
+	quit
+	
+ClearCache(printMessage=1)
+	;------------------------------
+	; Erases everything. Then it will be rebuilt on use.
+	;------------------------------
+	kill ^VARSESEstoqueHistoricoData
+	kill ^VARSESEstoqueHistorico
+ 
+	if (printMessage) {
+		w !, "Caches: VARSESEstoqueHistoricoData and VARSESEstoqueHistorico were successifull cleared!"
+	}
+	
+	quit
+	
+GetCostAsAtDateAndTime(&strStatus="",pidItem,pdteDate,pdteTime)
+	// Andre, 30/06/2009 - TODO: inverter linhas comentadas e ativas a seguir:
+	// Andre, 04/06/2009:
+	;quit $$GetCostAtDateTime^VARSESStockHistoryTools( pidItem, pdteDate, $get(pdteTime) ) ; Andre, 29/06/2009
+	// Andre, 29/06/2009:
+	quit $$GetCostPublic^VARSESStockHistoryTools( pidItem, pdteDate, $get(pdteTime) )
+		
+GetStockAtDate(&strStatus="",itemCode,locationCode,date)
+	; ------------------------------------------------------
+	; Retrieves the stock at date X (horolog format, without time).
+	; The latest possible value for date is today-1.
+	; -------------------------------------------------------
+	new today
+	
+	//Adjusts the day
+	set today=$piece($horolog,",",1)
+	if (date>=today) {
+		set date=(today-1)
+	}
+ 
+	quit $$GetStockAtDateHelper(.strStatus,itemCode,locationCode,date)
+	
+GetStockAtDateHelper(&strStatus,itemCode,locationCode,date)
+	; ------------------------------------------------------
+	; Actual routine. NOT TO BE CALLED directly.
+	; The latest possible value for date is today-1. (calling this routine
+	; with larger values will break it!)
+	; -------------------------------------------------------
+	new latestDate,result
+ 
+	set result=""
+	set srtStatus=$$$OK
+	
+	//Quick verification
+	if (date<$$$ZeroStockDate) {
+		set date=$$$ZeroStockDate	
+	}
+	
+	//Get the latest value we have
+	set latestDate=$get(^VARSESEstoqueHistoricoData(itemCode,locationCode))
+	
+	//Case when there is nothing in the cache yet
+	if (latestDate="") {
+		//This is the place where the stock is considered Zero
+		set latestDate=$$$ZeroStockDate
+		set ^VARSESEstoqueHistoricoData(itemCode,locationCode)=latestDate
+		set ^VARSESEstoqueHistorico(itemCode,locationCode,latestDate)=0
+		}
+ 
+	//If it is not in cache (beyond the last date-value found), fetch it
+	if (date>latestDate) {
+		set strStatus=$$BuildCacheEstoque(itemCode,locationCode,latestDate+1,date)
+		
+		if ($$$ISOK(strStatus)) {
+			set ^VARSESEstoqueHistoricoData(itemCode,locationCode)=date
+		} else {
+			//There is already an error message
+			quit result
+		}
+	}
+	
+	//Retrieves the correct value
+	set result=0
+	set strStatus=$$FindLastAmount(.result,itemCode,locationCode,date)
+	
+	if (result="") {
+		set strStatus=$$MakeStackTrace(strStatus,
+			"The routine should never return '' at least Zero was expected!",
+			"GetStockAtDateHelper(strStatus='"_$get(strStatus)_"',itemCode='"_$get(itemCode)_"',locationCode='"_
+			$get(locationCode)_"',date='"_$get(date)_"')")
+	}
+	
+	quit result
+	
+	
+MakeStackTrace(oldMessage="",newMessage="",place="")
+	;-----------------------
+	;Builds a poor man kind of stack trace
+	;
+	;Parameters:
+	;  oldMessage - Some previous error returned by called function. It is the cause of thue current error
+	;  newMessage - The current described error
+	;  place - name of the current routine
+	;-------------------------------------
+	if ((oldMessage="")||($$$ISOK(oldMessage))) {
+		quit "0 "_"Error(s) found in routine '"_place_"'. "_$get(newMessage)	
+	} else {
+		quit "0 "_"Error(s) found in routine '"_place_"'. "_$get(newMessage)_" Caused by: "_oldMessage
+	}
+	
+	//This is only for aesthetcs
+	quit ""
+ 
+GetStringFromStatus(status)
+	; -------------------
+	; Extract oll messages from the error array into a string
+	; -------------------
+	new str,err
+	set str=""
+	set err=""
+	
+	if ($get(status)'="") {
+		do DecomposeStatus^%apiOBJ(status,.err,"-d")
+		for i=1:1:err {
+			if (str="") {
+				set str=err(i)
+			} else {
+				set str=_str_"; "_err(i)
+			}
+		}
+	}
+	
+	quit str
+	
+MakeErrorStatus(oldMessage="", newMessage="")
+	;-----------------------
+	; Builds an error status with an attached message
+	; ----------------------
+	
+	if ((oldMessage="")||($$$ISOK(oldMessage))) {
+		quit "0 "_"Error(s) found. "_$get(newMessage)	
+	} else {
+		quit oldMessage_", "_$get(newMessage)	
+	}
+	
+	//This is only for aesthetcs
+	quit ""
+	
+	
+BuildCacheEstoque(itemCode,locationCode,initialDate,finalDate)	
+	;---------------------------------------------------------------
+	; Bulds the cache of all quantities from initial to finalDate.
+	; It also causes the build up of VARSESCacheFichaEstoque
+	; 
+	; Parameters:
+	;   itemCode
+	;   locationCode
+	;   initialDate - initialDate to be filled (this should be usually lastDate+1)
+	;   finalDate - MUST be less than today
+	;--------------------------------------------------------------
+	new strStatus,lastAmount,dateFicha,objFicha,timeFicha,seqFicha,tempDate
+ 
+ 	set strStatus=$$$OK
+ 	
+ 	//Debug
+ 	//w !,"BuildCacheEstoque(itemCode,locationCode,initialDate,finalDate)="_itemCode_","_locationCode_","_initialDate_","_finalDate
+ 	
+ 	//Fix dates
+ 	if (initialDate>finalDate) {
+	 	set tempDate=finalDate
+	 	set finalDate=initialDate
+	 	set initialDate=tempDate
+ 	}
+ 
+	//Sets minimum date (earlier than that means zero available) 	
+ 	set tempDate=$$$ZeroStockDate+1
+ 	if (initialDate<tempDate) {
+	 	set initialDate=tempDate
+ 	}
+ 
+	//Debug
+	//w !,"$$BuildFichaEstoque^(itemCode,locationCode,initialDate,finalDate)="_itemCode_","_locationCode_","_initialDate_","_finalDate
+	 	
+	//First prepare the cache
+	set strStatus=$$BuildFichaEstoque^VARSESFichaEstoque(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeStackTrace(strStatus,"There was an error when trying to build the cache (BuildFichaEstoque())",
+				"$$BuildCacheEstoque(itemCode="_$get(itemCode)_",locationCode="_$get(locationCode)_",finalDate="_$get(finalDate)_")")
+	}
+	
+  	//Starting amount from one day before
+  	set strStatus=$$FindLastAmount(.lastAmount,itemCode,locationCode,initialDate-1)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeStackTrace(strStatus,"There was an error when trying to build the cache (BuildFichaEstoque())",
+				"$$BuildCacheEstoque(itemCode="_$get(itemCode)_",locationCode="_$get(locationCode)_",finalDate="_$get(finalDate)_")")
+	}
+	
+	//Go through all records in ficha, including initialDate
+	set dateFicha=initialDate-1
+	
+	for {
+		quit:($$$ISERR(strStatus))
+		set dateFicha=$order(^VARSESCacheFichaEstoque(0,itemCode,locationCode,dateFicha))
+		quit:(dateFicha="")
+		quit:(dateFicha>finalDate)
+		
+		//Now, search for all events in this day
+		set timeFicha=""
+		for {
+			quit:($$$ISERR(strStatus))
+			set timeFicha=$order(^VARSESCacheFichaEstoque(0,itemCode,locationCode,dateFicha,timeFicha))
+			quit:(timeFicha="")
+					
+			//Now search for all events at this time
+			set seqFicha=""
+			for {
+				quit:($$$ISERR(strStatus))
+				set seqFicha=$order(^VARSESCacheFichaEstoque(0,itemCode,locationCode,dateFicha,timeFicha,seqFicha))
+				quit:(seqFicha="")
+				
+				//For each event, calculate the remaining quantity for the day
+				set objFicha=$get(^VARSESCacheFichaEstoque(0,itemCode,locationCode,dateFicha,timeFicha,seqFicha,1))
+				set strStatus=$$CalculateDeltaQuantity(objFicha,.lastAmount)
+				if ($$$ISERR(strStatus)) {
+					set strStatus=$$MakeStackTrace(strStatus,"There was an error when trying to build the cache (BuildFichaEstoque())",
+							"BuildCacheEstoque(itemCode="_$get(itemCode)_",locationCode="_$get(locationCode)_",finalDate="_$get(finalDate)_")")
+				}
+				
+			} //Fim for seqFcha
+		} //Fim for timeFicha
+		
+		//Saves the value for the current date, if there were no errors
+		if ($$$ISOK(strStatus)) {
+			set ^VARSESEstoqueHistorico(itemCode,locationCode,dateFicha)=lastAmount
+			}
+		
+	} //Fim for dateFicha
+	
+	quit strStatus
+	
+FindLastAmount(&lastAmount,itemCode,locationCode,searchDate)
+	;---------------------------------------------
+	;Locate the latest known amount
+	;------------------------------
+	new i
+	
+	//Debug
+	//w !,"FindLastAmount(&lastAmount,itemCode,locationCode,searchDate)="_$get(lastAmount)_","_$get(itemCode)_","_$get(locationCode)_","_$get(searchDate)
+ 
+	//Go backwards until we find the first saved quantity. We start at searchDate+1
+	//because if tehre is something at searchDate we want it.
+	set lastAmount=0
+	set i=$order(^VARSESEstoqueHistorico(itemCode,locationCode,searchDate+1),-1,lastAmount)
+	
+	//Debug
+	//w ", lastAmount="_$get(lastAmount)	
+	quit $$$OK
+ 
+		
+CalculateDeltaQuantity(objFicha,&lastAmount)
+	;---------------------------------------------------
+	; Adds or subtracts the quantity stored in objFicha against lastAmount
+	; 
+	; Parameters:
+	;   objFicha - record in VARSESCacheFichaEstoque
+	;   lastAmount (reference) - initial amount (may be zero) to use as base of calculation. It will be
+	;                modified with the results.
+	; 
+	; Returns: OK, ERROR
+	;----------------------------------------------------
+	new strStatus,type,delta,temp,entrada,saida
+	set strStatus=$$$OK
+	
+	set delta=0
+	set type=0
+	
+	//the type gets set as a reference
+	set strStatus=$$GetType(.type,objFicha)
+ 
+	//Verify
+	if ($$$ISERR(strStatus)) {
+		set strStatus=$$MakeStackTrace(strStatus,"An error was found while extracting the type of movement!",
+							"CalculateDeltaQuantity(objFicha='"_$get(objFicha)_"',&lastAmount='"_$get(lastAmount)_")")
+		quit strStatus
+	}
+ 
+	set entrada=$$$FEquantidadeEntrada(objFicha)
+	set saida=$$$FEquantidadeSaida(objFicha)
+ 
+	//Verify
+	if (((entrada="") || (entrada=0)) && ((saida="") || (saida=0))) {
+		set strStatus=$$MakeStackTrace(strStatus,"An error was found in ^VARSESCacheFichaEstoque: values for 'entrada' AND 'saida' are zero!",
+							"CalculateDeltaQuantity(objFicha='"_$get(objFicha)_"',&lastAmount='"_$get(lastAmount)_")")
+		quit strStatus
+	}
+ 
+ 
+	if (type=$$$TIPOEntrada) {
+		set delta=entrada
+	
+	} elseif (type=$$$TIPOMovimentacao) {
+		//It may be a value to be subtracted or added
+		if ((entrada'="")&&(entrada>0)) {
+			//Add
+			set delta=entrada
+		} else {
+			//Subtract
+			set delta=-saida
+		}
+		
+	} elseif (type=$$$TIPOTrfSaida) {
+		set delta=-saida
+		
+	} elseif (type=$$$TIPOConsumo) {
+		set delta=-saida
+		
+	} elseif (type=$$$TIPOPaciente) {
+		set delta=-saida
+		
+	} elseif (type=$$$TIPORecebimento ) {
+		set delta=entrada
+		
+	} elseif (type=$$$TIPOTrfAceite) {
+		set delta=entrada
+		
+	} elseif (type=$$$TIPODevolucao) {
+		set delta=entrada
+		
+	} elseif (type=$$$TIPOEstornoTrf) {
+		set delta=entrada
+		
+	} elseif (type=$$$TIPOEstornoRec) {
+		set delta=-saida
+	}
+	
+	set lastAmount=(lastAmount+delta)
+	quit strStatus
+	
+GetType(&type, objFicha)
+	;-----------------------------------------
+	; Find out the type of movement that is present in this record
+	; 
+	; Parameters:
+	;   type (reference) - the type harvarsted from objFicha
+	;   objFicha - a record from VARSESCacheFichaEstoque
+	; 
+	; Returns $$$ok OR error (STACKTRACE)
+	;------------------------------------------
+	new strStatus,s
+	
+	set strStatus=$$$OK
+ 
+	set s=$$$FEtipoMovimento(objFicha)
+	if (s="ENTRADA") {
+		set type=$$$TIPOEntrada
+	
+	} elseif ((s="MOVIMENTACAO")||(s="MOVIMENTAÇÃO")) {
+		set type=$$$TIPOMovimentacao
+	
+	} elseif ((s="TRF-SAIDA")||(s="TRF-SAÍDA")) {
+		set type=$$$TIPOTrfSaida
+ 
+	} elseif (s="CONSUMO") {
+		set type=$$$TIPOConsumo
+ 
+	} elseif (s="PACIENTE") {
+		set type=$$$TIPOPaciente
+ 
+	} elseif (s="RECEBIMENTO") {
+		set type=$$$TIPORecebimento
+ 
+	} elseif (s="TRF-ACEITE") {
+		set type=$$$TIPOTrfAceite
+ 
+	} elseif ((s="DEVOLUCAO")||(s="DEVOLUÇÃO")) {
+		set type=$$$TIPODevolucao
+ 
+	} elseif (s="ESTORNO-TRF") {
+		set type=$$$TIPOEstornoTrf
+ 
+	} elseif (s="ESTORNO-REC") {
+		set type=$$$TIPOEstornoRec
+			
+	} else {
+		set strStatus=$$MakeStackTrace(strStatus,"An uknown type was found in ^VARSESCacheFichaEstoque: '"_type_"'",
+							"GetType(&type='"_$get(type)_"',objFicha='"_$get(objFicha)_")")
+	}
+ 
+	//w !,"type="_type_",s="_s 
+	quit strStatus
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,334 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Routine name="INStocktakeCreateUtil" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[INStocktakeCreateUtil
+	
+#include COMSYS
+#include INConst
+#include %occInclude
+		
+#define LogItem(%L,%S,%T,%E)	if %L'="" if %T'=$h do AddMessage^COMLog(%L,$$$Text(%S),.%E) set %T=$h
+#define LogMessage(%L,%S)		if %L'="" do AddMessage^COMLog(%L,$$$Text(%S))
+	
+GetAllItems(pidStocktake,pstrFilterGroup,pstrFilterLocn,pstrFilterFrom,pstrFilterTo,pidLog,penumSort,pblnDisplaySOH,pidCountingList,pintDaysCount)
+	;-------------------------------------------------------------------------------
+	; Add Bundles to temporary list for creation of stocktake
+	; One line for each item/storage/bundle
+	; 
+	; Called By: TakeSnapshot^INStocktakeCreate
+	; 
+	; History
+	; 08-Jul-2013	SCR		CORE-83: Check Locking and return status
+	; 03-Dec-2012	SCR		SR18217: Index Error
+	; 20-Sep-2011	SCR		SR17895: Pass Storage  to $$MakeKey^INStocktakeCreate when 0 SOH
+	; 16-Aug-2011	SCR		SR17895: Default storage and  use Item Status when no SOH
+	; 08-Aug-2011	shobby	SR17850: Changes to allow an item to be added when 'All
+	;							Items' or 'History Within the Year Items' has been
+	;						    selected for the stocktake even if the count is not
+	;                           0.  As the reported qty may be at locations other
+	;                           than that selected.
+	; 23-May-2011	shobby	SR17559: Exclude an item if Item selection has been done
+	;							for this stocktake but not for this item.
+	; 30-Sep-2010	shobby	SR17541: Allow ordering by TSU
+	; 10-Aug-2010	GRF		SR17296 only translate location string once
+	; 06-Aug-2010	PPP		SR17296:2 Added pidStocktake as a parameter
+	; 06-Aug-2010	PPP		SR17296:2 - Get the SOH for only the Locations in question
+	; 28-May-2010	PPP		SR17296: Updated routine - Moved from INStocktakeCreate
+	;							1. Include new parameter pidCountingList
+	;							2. For loop to go through all Items
+	;							3. Isolate Items based on pidCountingList
+	;							   pidCountingList = 0 Items on Stock (Default)
+	;							   pidCountingList = 1 All Items
+	;							   pidCountingList = 2 Items with Tx in last 365 days
+	;
+	; 04-Nov-2009	GRF		SR16871: INAvgCost replaces INARTAVG
+	; 02-Jul-2009 	PPP 	SR16510: Updated routine to use INItemPolicy class
+	; 23-Oct-2008	GRF		SR15810: Change to dItem ItemGroupGet means default
+	; 							group processing no longer required.
+	; 01-Oct-2008	GRF		SR15810: Default Group if not defined
+	; 22-Sep-2008	GRF		SR15810: created
+	;-------------------------------------------------------------------------------
+	new arrBundleAtt,blnAdded,blnCheckForTransactions,curAvgCost,fltQty
+	new idBundle,idGroup,idItem,idLocn,idLogEntry,idPhysical,idStore
+	new idxItemDesc,idxItemGroup,loopAttr,loopBundles,lstOnHand
+	new objAttr,objBundle,objBundleStock,objGroup,objItem,objResultSet,objSTLine
+	new sc,strCommaLocns,strSortKey,strStatus,tmeLastLog
+	
+	set strStatus = $$$OK
+	
+	set pstrFilterGroup = ";"_pstrFilterGroup_";"
+	set pstrFilterLocn  = ";"_pstrFilterLocn_";"
+	set strCommaLocns   = $translate(pstrFilterLocn,";",",")
+	set tmeLastLog      = ""
+	
+	set idItem = ""
+	for {                                        //SR17296
+		set idItem = $order(^INART(0,idItem))
+		quit:idItem=""	
+		quit:$$$ISERR(strStatus) ; CORE-83
+		;Lean-239
+		If ($$$INARTHoldReason($Get(^INART(0,idItem,1))) = 2) Continue
+		If ($$$INARTItemPolicy($Get(^INART(0,idItem,1))) = 1) Continue
+		If (+$$$INARTItemType($Get(^INART(0,idItem,1))) > 3) Continue
+		;
+		continue:( $data(^INWEINVPLine(0,pidStocktake)) && '$data(^INWEINVPLines(0,1,$$$Index(idItem),$$$Index(pidStocktake))) )	;SR18217
+		;continue:( $data(^INWEINVPLine(0,pidStocktake)) && '$data(^INWEINVPLines(0,1,$$$Index(idItem),pidStocktake)) )	;SR17559
+		
+		set objItem = ##class(alINV.dItem).%OpenId(idItem)
+
+		if objItem'=$$$NULLOREF {
+			if (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+				continue:(('##class(alSOH.iSOH).IsQtyAvailable(idItem,strCommaLocns)) && ('$$CheckForTransactions(idItem,pstrFilterLocn,(11 * 30))))
+			}
+			else {
+				//Check if Item has SOH (Type 0 = Only Items with SOH)
+				if pidCountingList = 0 {
+				//	continue:'##class(alSOH.iBundleStock).GetTotalSOH(idItem)
+					//SR17296:2 - Get if SOH available for only the Locations in question
+					continue:'##class(alSOH.iSOH).IsQtyAvailable(idItem,strCommaLocns)
+				} elseif pidCountingList = 3 {
+					continue:'$$CheckForTransactions(idItem,pstrFilterLocn,pintDaysCount)
+				}
+			}
+						
+			$$$LogItem(pidLog,$listbuild("IN00448",idItem),tmeLastLog,idLogEntry)    ; "Processing, Item %1"
+			
+			set lstOnHand = $$CreateBundleList^INStocktakeCreate(idItem,.sc)
+			if $$$ISERR(sc) set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+			quit:$$$ISERR(strStatus)
+			
+		;  Filter
+		; ------------------------------
+			set objGroup = objItem.ItemGroup
+			if objGroup = $$$NULLOREF {
+				set idGroup = ""
+			} else {
+				set idGroup = objItem.ItemGroup.Name
+			}
+			continue:((pstrFilterGroup'=";;") && '$find(pstrFilterGroup,";"_idGroup_";"))
+			
+			
+			set idxItemGroup = $$$Index(idGroup)
+			set idxItemDesc  = $$$Index(objItem.SearchName)
+			set blnAdded     = $$$NO                       ;SR17850
+			
+			//SR17296: Check for Items with SOH
+			if lstOnHand.Count()>0 {
+				for loopBundles = 1:1:lstOnHand.Count() {
+					set objBundleStock = lstOnHand.GetAt(loopBundles)
+					
+					set idLocn = objBundleStock.Storage.Location.Code
+					if pstrFilterLocn'=";;" continue:'$find(pstrFilterLocn,";"_idLocn_";")
+					
+					set idStore    = objBundleStock.Storage.Code        ; V1 Storage ID
+					set idPhysical = objBundleStock.Storage.Physical       ;SR17541
+					if pstrFilterFrom'="" continue:pstrFilterFrom]]idStore
+					if pstrFilterTo'=""   continue:idStore]]pstrFilterTo
+					if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+						continue:(idStore="EmTransito")
+					}
+					
+					
+				;	continue:$$$IsConsignment(objBundleStock)  ; TODO : Bundle equivalent of $$$INWEConsignment
+					
+					;  Use
+					; ------------------------------
+					set curAvgCost = $$GetCostForLocn^INAvgCost(idItem,idLocn)
+					
+					set objBundle = objBundleStock.Bundle
+					set idBundle  = objBundle.%Id()
+					set fltQty    = objBundleStock.QtyOnHand
+					
+					set objSTLine = ""
+					set $$$INWEINVItemNumber(objSTLine)     = idItem
+					set $$$INWEINVLocation(objSTLine)       = idLocn
+					set $$$INWEINVStockLocation(objSTLine)  = idStore
+	                set $$$INWEINVTargetQuantity(objSTLine) = fltQty 
+					set $$$INWEINVBundleID(objSTLine)       = idBundle
+
+					if pblnDisplaySOH {
+						set $$$INWEINVActualQuantity(objSTLine) = fltQty
+					} else {
+						set $$$INWEINVActualQuantity(objSTLine) = ""
+					}
+					set $$$INWEINVUnitPrice(objSTLine)    = curAvgCost   ; D8
+					set $$$INWEINVAveragePrice(objSTLine) = curAvgCost   ; D80
+					
+					//Imp:This field will be used for Editing of the Line Record
+					// Based on WWW122 #86/#87 (Field Is Inactive, If Data Field)  
+					//if not blank - No Editing
+					set $$$INWEINVStockType(objSTLine)    = "A"          ; D92   Available   
+					
+					//SR16510
+					set sc = ##class(alSOH.iBundle).GetAttributesForBundle(idBundle,.arrBundleAtt)
+					
+					set $$$INWEINVLotNo(objSTLine) 		= $get(arrBundleAtt("Lot Number"))
+					set $$$INWEINVExpiryDate(objSTLine) = $get(arrBundleAtt("Use By Date"))
+					set $$$INWEINVBrand(objSTLine)      = $get(arrBundleAtt("Brand"))
+					set $$$INWEINVOwner(objSTLine)      = $get(arrBundleAtt("Owner"))
+					set $$$INWEINVProgram1(objSTLine)   = $get(arrBundleAtt("Program"))
+					
+		;SR17541	set strSortKey = $$MakeKey^INStocktakeCreate(penumSort,idItem,idStore,idxItemGroup,idxItemDesc)
+					set strSortKey = $$MakeKey^INStocktakeCreate(penumSort,idItem,idStore,idxItemGroup,idxItemDesc,idPhysical)	;SR17541 
+					
+					if strSortKey'="" {
+						set @("^CacheTempStocktake($znspace,pidStocktake,idLocn,"_$$^WWWKEYBUILD(strSortKey)_",idBundle)") = objSTLine
+						; CORE-83  vvvv
+						if strStatus=$$$OK {
+							set strStatus=$$SOHPostCheck^INLocking(idItem,idLocn,idStore,41,9,"","",pidStocktake)
+						}
+						; CORE-83 ^^^^
+					}
+					if ($$$ISOK(strStatus)) {
+						set blnAdded = $$$YES
+					}
+					
+					//do objBundle.%Close()
+					//do objBundleStock.%Close()
+				}
+				//do lstOnHand.%Close()
+				
+	;SR17850 } else {
+			}
+			if 'blnAdded { ;SR17850
+				if (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+					set blnCheckForTransactions=$$CheckForTransactions(idItem,pstrFilterLocn,(11 * 30))
+					if (blnCheckForTransactions) {
+						set idLocn     = $piece(pstrFilterLocn,";",2)
+						; SR17895 vvvvv
+						continue:'$$IsUsable^INARTDataAccess(idItem,"INWEINVP") ; SR17895
+						set idStore = ##class(alLOC.dULocation).%OpenId("0||"_idLocn).GetDefaultStorage(idItem).StockLocation ; SR17895 use default location
+						if pstrFilterFrom'="" continue:pstrFilterFrom]]idStore
+						if pstrFilterTo'=""   continue:idStore]]pstrFilterTo
+						if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+							continue:(idStore="EmTransito")
+						}
+						; SR17895 ^^^^^
+
+						set curAvgCost = $$GetCostForLocn^INAvgCost(idItem,idLocn)
+					
+						set objSTLine = ""
+						set $$$INWEINVItemNumber(objSTLine)     = idItem
+						set $$$INWEINVLocation(objSTLine)       = idLocn
+						set $$$INWEINVUnitPrice(objSTLine)   	= curAvgCost   ; D8
+						set $$$INWEINVAveragePrice(objSTLine) 	= curAvgCost   ; D80
+						if pblnDisplaySOH {										;SR17850
+							set $$$INWEINVActualQuantity(objSTLine) = 0			;SR17850
+						}														;SR17850
+						//Imp:This field will be used for Editing of the Line Record
+						// Based on WWW122 #86/#87 (Field Is Inactive, If Data Field)  
+						//if B - Cannot Edit Item, "" - Can Edit Everything,
+						set $$$INWEINVStockType(objSTLine)    	= "B"          ; D92
+						set $$$INWEINVCheckForTransactions(objSTLine) = blnCheckForTransactions  ;SR17850
+						if blnCheckForTransactions set $$$INWEINVTargetQuantity(objSTLine) = 0   ;SR17850 
+
+						set $$$INWEINVStockLocation(objSTLine)  = idStore  ; SR17895
+
+						;set strSortKey = $$MakeKey^INStocktakeCreate(penumSort,idItem," ",idxItemGroup,idxItemDesc)
+						set strSortKey = $$MakeKey^INStocktakeCreate(penumSort,idItem,idStore,idxItemGroup,idxItemDesc,idStore) ; SR17895
+					
+						if strSortKey'="" {
+							set @("^CacheTempStocktake($znspace,pidStocktake,idLocn,"_$$^WWWKEYBUILD(strSortKey)_",0)") = objSTLine
+							; CORE-83  vvvv
+							if strStatus=$$$OK {
+								set strStatus=$$SOHPostCheck^INLocking(idItem,idLocn,idStore,41,9,"","",pidStocktake)
+							}
+							; CORE-83 ^^^^
+						}
+					}
+				}
+				else {
+					//SR17296 : Type 2 = Only include Items with History in the past year
+					//SR17296 : Type 1 = All Items 
+					set blnCheckForTransactions=$$CheckForTransactions(idItem,pstrFilterLocn,365) ;SR17850
+					if pidCountingList = 1 ||
+					 ((pidCountingList = 2) && $$CheckForTransactions(idItem,pstrFilterLocn,365)){
+					
+						set idLocn     = $piece(pstrFilterLocn,";",2)
+						; SR17895 vvvvv
+						continue:'$$IsUsable^INARTDataAccess(idItem,"INWEINVP") ; SR17895
+						set idStore = ##class(alLOC.dULocation).%OpenId("0||"_idLocn).GetDefaultStorage(idItem).StockLocation ; SR17895 use default location
+						if pstrFilterFrom'="" continue:pstrFilterFrom]]idStore
+						if pstrFilterTo'=""   continue:idStore]]pstrFilterTo
+						if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+							continue:(idStore="EmTransito")
+						}
+						; SR17895 ^^^^^
+
+						set curAvgCost = $$GetCostForLocn^INAvgCost(idItem,idLocn)
+					
+						set objSTLine = ""
+						set $$$INWEINVItemNumber(objSTLine)     = idItem
+						set $$$INWEINVLocation(objSTLine)       = idLocn
+						set $$$INWEINVUnitPrice(objSTLine)   	= curAvgCost   ; D8
+						set $$$INWEINVAveragePrice(objSTLine) 	= curAvgCost   ; D80
+						if pblnDisplaySOH {										;SR17850
+							set $$$INWEINVActualQuantity(objSTLine) = 0			;SR17850
+						}														;SR17850
+						//Imp:This field will be used for Editing of the Line Record
+						// Based on WWW122 #86/#87 (Field Is Inactive, If Data Field)  
+						//if B - Cannot Edit Item, "" - Can Edit Everything,
+						set $$$INWEINVStockType(objSTLine)    	= "B"          ; D92
+						set $$$INWEINVCheckForTransactions(objSTLine) = blnCheckForTransactions  ;SR17850
+						if blnCheckForTransactions set $$$INWEINVTargetQuantity(objSTLine) = 0   ;SR17850 
+
+						set $$$INWEINVStockLocation(objSTLine)  = idStore  ; SR17895
+
+						;set strSortKey = $$MakeKey^INStocktakeCreate(penumSort,idItem," ",idxItemGroup,idxItemDesc)
+						set strSortKey = $$MakeKey^INStocktakeCreate(penumSort,idItem,idStore,idxItemGroup,idxItemDesc,idStore) ; SR17895
+					
+						if strSortKey'="" {
+							set @("^CacheTempStocktake($znspace,pidStocktake,idLocn,"_$$^WWWKEYBUILD(strSortKey)_",0)") = objSTLine
+							; CORE-83  vvvv
+							if strStatus=$$$OK {
+								set strStatus=$$SOHPostCheck^INLocking(idItem,idLocn,idStore,41,9,"","",pidStocktake)
+							}
+							; CORE-83 ^^^^
+						}
+					}
+				}
+			}
+		}
+		//do objItem.%Close()
+	}
+	quit strStatus ; CORE-83
+	;quit
+	
+CheckForTransactions(pidItem,pstrFilterLocn,pidDays=365)
+	;-------------------------------------------------------------------------------
+	; Check if locn/locn list for an Item has Transactions
+	;
+	; Inputs:
+	;  pidItem - Item ID
+	;  pstrFilterLocn - Stocktake filter Locations 
+	;		ie can be 	';;' 	All Locations
+	;					';5;' 	List of Locations 
+	;  pidDays - No of Day to go back for (default 365)
+	;
+	; Returns:Boolean ($$$YES if Transactions found)
+	;
+	; History:
+	; 28-May-2010	PPP		SR17296: Created
+	;-------------------------------------------------------------------------------
+	new arrTrnDate,dteLast,intCnt,idLocn
+	
+	set dteLast = ""
+	
+	if pstrFilterLocn=";;" {    //All Locations
+		set dteLast = ##class(alSOH.iStockHistory).GetTranDate(pidItem,,,2)
+		
+	} else {
+		set idLocn = ""
+		for intCnt=1:1:$length(pstrFilterLocn,";") {
+			set idLocn = $piece(pstrFilterLocn,";",intCnt)
+			continue:idLocn=""
+			
+			set dteLast = ##class(alSOH.iStockHistory).GetTranDate(pidItem,idLocn,,2)
+			
+			if dteLast'="" {
+				set arrTrnDate(dteLast) = ""
+			}
+		}
+		set dteLast = $order(arrTrnDate(""),-1)
+	}
+	quit ((dteLast+pidDays)>$horolog)]]></Routine>
+</Export>

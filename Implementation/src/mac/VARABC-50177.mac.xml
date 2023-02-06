@@ -1,0 +1,393 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARABC" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARABC
+#include COMSYS
+#include INConst
+#include VARConst
+
+JobABC(Company,A,B,C,Months="",verbose=0)
+	//Set status to started
+	if $GET(YM)=""{
+		do ^WWWVAR
+		set YBED="SYSTEM"
+	}
+	new objABC
+	set objABC=$get(^VARABC(YM,Company,1))	
+	try {
+		do GeraClassificacaoABC(Company,A,B,C,Months,verbose)
+		set $$$VARABCMsgStatus(objABC)="Execução foi completada na data e hora -> "_$ZDATETIME($H,4)_" . Com os Parâmetros A="_A_", B="_B_" e C="_C_", contabilizando os útimos "_Months_" meses."
+		set $$$VARABCStatus(objABC)=0
+		set strStatus=$$Save^COMUtils("VARABC",Company,objABC,1)
+		if strStatus'=$$$OK { //HARD FAIL, restart execution control on the global
+			set $$$VARABCMsgStatus(objABC)="Execução foi completada na data e hora -> "_$ZDATETIME($H,4)_" . Com os Parâmetros A="_A_", B="_B_" e C="_C_", contabilizando os útimos "_Months_" meses."
+			SET $$$VARABCStatus(^VARABC(YM,Company,1))=0
+		}
+	}catch {
+		set $$$VARABCMsgStatus(objABC)="<font color ='red'>Falha na execução do Cálculo ABC, por favor contate o suporte. Execução falhou na data e hora -> "_$ZDATETIME($H,4)_" . Com os Parâmetros A="_A_", B="_B_" e C="_C_", contabilizando os útimos "_Months_" meses</font>."
+		set $$$VARABCStatus(objABC)=0
+		set strStatus=$$Save^COMUtils("VARABC",Company,objABC,1)
+		if strStatus'=$$$OK { //HARD FAIL, restart execution control on the global
+			set $$$VARABCMsgStatus(objABC)="<font color ='red'>Falha na execução do Cálculo ABC, por favor contate o suporte. Execução falhou na data e hora -> "_$ZDATETIME($H,4)_" . Com os Parâmetros A="_A_", B="_B_" e C="_C_", contabilizando os útimos "_Months_" meses</font>."
+			SET $$$VARABCStatus(^VARABC(YM,Company,1))=0
+		}
+	}
+		
+	q
+GeraClassificacaoABC(Company,A=20,B=30,C=50,Months="",verbose=0)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Função de cálculo dos dados de classificação ABC.
+    ;	São considerados no cálculo apenas consumos realizados na rede.
+    ;	A rotina utiliza os dados gerados pela VARCMM, usando dados guardados em VARCMMLinha
+    ; 
+    ; Histórico:
+    ; 14-Jul-2014	SCR		SESDF-1446: Correct Value & Periods
+    ; 20-Oct-2011		Criado
+    ;-------------------------------------------------------------------------------
+    new LocYearMonthTotal,sProduto,year,numMonth,sLocal,sDocumento,monthCount,Retrieve,productCount,YearList,MonthList
+
+    if verbose =1 w "Starting routine...",!
+    
+    //Validating parameters are in the correct format
+    set A=A/100
+    set B=B/100
+    set C=C/100
+	IF A+B+C'=1 {
+		set status="Erro, somatório dos parâmetros não é igual a 100."
+		if verbose =1 w "Error, the ABC classification does not add up to 100 percent."
+		QUIT
+	}
+	
+	//Initiating variable
+	if $GET(YM)=""{
+		do ^WWWVAR
+		set YBED="SYSTEM"
+	}
+	kill ^VARABCLine,^VARABCLines
+	kill ^VARCMMABCTemp
+	
+	if verbose =1 w "Clearing ABC classification...",!
+	//Clearing all ABC classification in Item Master Data
+	do ClearABC(verbose)
+	
+	//First Pass, gets total ever moved on the network and by product
+	//if there's a date parameter set, filter by it
+	
+	set monthCount=0
+	set productCount=0
+	set YearList=""
+	set MonthList=""
+	
+	if Months'="" {
+		set YearList=""
+		set MonthList=""
+		set currentYear=$e($ZD($H,8),0,4)
+		set currentMonth=$e($ZD($H,8),5,6)+0
+		set YearList=currentYear
+		set MonthList=currentMonth
+		set Months=Months-1
+		while Months>0 {
+			set currentMonth=currentMonth-1
+			if currentMonth=0 {
+				set currentMonth=12
+				set currentYear=currentYear-1
+				set YearList=YearList_","_currentYear
+			}
+			set MonthList=MonthList_","_currentMonth
+			set Months=Months-1
+		}
+		set arrPeriod(currentYear_","_currentMonth)=""
+		;set MonthList=$LISTFROMSTRING(MonthList,",")
+		;set YearList=$LISTFROMSTRING(YearList,",")
+	}
+	
+	if verbose =1 w "Calculating consumptions...",!
+	set NetworkTotal=0
+	$$$Order2(^VARCMMLinha,YM,sProduto)
+		set productCount=productCount+1
+		set ProdTotal=0 //Total for product
+		set year=""
+		set year=$Order(^VARCMMLinha(YM,sProduto,year),-1)
+		while year'="" {
+			set numMonth=""
+			set numMonth=$Order(^VARCMMLinha(YM,sProduto,year,numMonth),-1)
+			while numMonth'="" {
+				
+				set Retrieve=1
+				if Months'="" {
+					if '$data(arrPeriod(year_","_numMonth)) set Retrieve=0
+					;if $LISTFIND(MonthList,numMonth)=0 set Retrieve=0 
+					;if $LISTFIND(YearList,year)=0 set Retrieve=0
+				}
+				if Retrieve=1 {
+					$$$Order5(^VARCMMLinha,YM,sProduto,year,numMonth,sLocal)
+						$$$Order6(^VARCMMLinha,YM,sProduto,year,numMonth,sLocal,sDocumento)
+							//Getting the consumption document
+							set CMMOBJ=$get(^VARCMMLinha(YM,sProduto,year,numMonth,sLocal,sDocumento,1))
+							//Get the value consumed for that entry
+							set sValue=0
+							set sValue=$piece(CMMOBJ,Y,2)
+							;set sValue=0-sValue  ; Not required
+							set ProdTotal=ProdTotal+sValue
+							//Add up to the product total
+						$$$End
+						//Add 
+						set LocYearMonthTotal(sLocal,year,-1,numMonth)=sValue
+					$$$End
+				}
+				set numMonth=$Order(^VARCMMLinha(YM,sProduto,year,numMonth),-1)
+			}
+			set year=$Order(^VARCMMLinha(YM,sProduto,year),-1)
+		}
+		//Creates a temporary global to store the product total consumed value
+		set ^VARCMMABCTemp(ProdTotal,sProduto)=1
+		//Incrementes the total value consumed on the network
+		set NetworkTotal=NetworkTotal+ProdTotal
+	$$$End
+	
+	if verbose =1 w productCount_" products calculated, running classification...",!
+
+	//Calculating the points to compare the total value
+	SET pointC=NetworkTotal*C
+	SET pointB=pointC+(NetworkTotal*B)
+	SET pointA=pointB+(NetworkTotal*A)
+	
+	//The routine now goes thru the products, ordered by consumed value, adding up the incrementedValue variable and comparing it to the points set previously
+	set incrementedValue=0
+	$$$Order1(^VARCMMABCTemp,value)
+		$$$Order2(^VARCMMABCTemp,value,product)
+		
+			//Compare the incrementedValue
+			set incrementedValue=incrementedValue+value
+			set classification=""
+			if incrementedValue<=pointC set classification="C"
+			if ((incrementedValue>pointC) && (incrementedValue<=pointB)) set classification="B"
+			if (incrementedValue>pointB) set classification="A"
+			
+			if verbose=1 w product,"->",classification,!
+			//Sets the classification
+			//Saves on the Item Master Data
+			
+			set objINART=$get(^INART(YM,product,1))
+			IF objINART'="" {
+				set $$$INARTItemClassification(objINART)=classification
+				set strStatus=$$Save^COMUtils("INART",product,objINART,1)
+				if verbose=1 {
+					IF strStatus'=1 W "Error updating ABC classification for product ",product," Error Message->",strStatus,!
+				}
+			}
+			//Saves on the ABC report Line
+			set ^VARABCLine(YM,Company,productCount,1)=product_"~"_classification_"~"_value_"~"_incrementedValue
+			set productCount=productCount-1
+			//
+			
+			
+		$$$End
+	$$$End
+	if verbose =1 w "Routine finished...",!
+	q
+	
+ClearABC(verbose=0)
+	$$$Order2(^INART,YM,product)
+		set objINART=$get(^INART(YM,product,1))
+		IF objINART'="" {
+			if $$$INARTItemClassification(objINART)'="" {
+				set $$$INARTItemClassification(objINART)=""
+				set strStatus=$$Save^COMUtils("INART",product,objINART,1)
+				if verbose=1 {
+					IF strStatus'=1 W "Error clearing ABC classification for product ",product," Error Message->",strStatus,!
+				}
+			}
+		}
+		
+	$$$End
+	q
+CheckValues(YFELD="")
+	if $get(YFELD)="" q 0
+	if $piece(YFELD,Y,1)>0 && $piece(YFELD,Y,2)>0 {
+		if $piece(YFELD,Y,1)+$piece(YFELD,Y,2)<100 q 1
+	}
+	q 0
+	
+CalculateC(YFELD="")
+	if $get(YFELD)="" q 0
+	set intReturn=0
+	set intReturn=100
+	set intReturn=intReturn-$piece(YFELD,Y,1)-$piece(YFELD,Y,2)
+	q intReturn
+	
+OnAfterDataFields(Company)
+	new objABC
+	set objABC=$get(^VARABC(YM,Company,1))
+	if objABC="" q
+	if $$$VARABCMsgStatus(objABC)="" {
+		write "<br />"
+		write "	<div style=border-width:1px;border-style=dashed;border-color=gray;padding-left:10px;padding-top:7px;padding-bottom:7px;background-color:#E3E3E3;>"
+		write "		<strong>Status:</strong>"
+		write "		<br />Rotina de Cálculo ABC não foi executada nesse ambiente."
+		write "	</div>"
+		write "<br />"
+	}else {
+		write "<br />"
+		write "	<div style=border-width:1px;border-style=dashed;border-color=gray;padding-left:10px;padding-top:7px;padding-bottom:7px;background-color:#E3E3E3;>"
+		write "		<strong>Status:</strong>"
+		write "		<br />"_$$$VARABCMsgStatus(objABC)
+		write "	</div>"
+		write "<br />"
+	}
+	
+	//Só apresenta o resultado caso o usário tenha clicado em exibir relatório
+	quit:('$$isAfterSaveLogged^VARUtil(YBED,YFORM))
+	do ClearVARLogAterSave^VARUtil(YBED,YFORM)
+	do ShowABCReport(Company)
+		
+	q
+
+TriggerReport(Company)
+	do VARLogAfterSave^VARUtil(YBED,YFORM)
+	do GoToForm^COMUtilForm("VARABC",Company)
+	q
+	
+ShowABCReport(Company)
+	//Tabela
+	set acumulatedValue=0
+	set totalAcumulatedValue=0
+   	new lstHeader
+ 	set lstHeader = ""
+  	set lstHeader = lstHeader_$listbuild("Produto","Descrição","Conta Contábil","Valor Consumido","Participação","Classificação")
+	set previousClassification=""
+	w "<strong>Relatório de Classificação ABC:</strong><br>"
+  	if $$Start^COMTable(lstHeader,,,,$$$NO) {
+		
+		$$$Order3(^VARABCLine,YM,Company,id)
+			set objABCLine=$get(^VARABCLine(YM,Company,id,1))
+			set product=$piece(objABCLine,Y,1)
+			set classification=$piece(objABCLine,Y,2)
+			set value=$piece(objABCLine,Y,3)
+			set incrementedValue=$piece(objABCLine,Y,4)
+			if previousClassification'=classification {
+				if previousClassification'="" {
+					set stringHeader="<strong>Total Classificação "_previousClassification_"</strong>&nbsp;"
+					do NewLine^COMTable("palegoldenrod")
+					do InsertCell^COMTable(stringHeader,,,,"right",,3)
+					do InsertCell^COMTable("<strong>R$ "_$$FormatCurrency^VARSQL(acumulatedValue)_"</strong>",,,,"right")
+					do InsertCell^COMTable("")
+					do InsertCell^COMTable("")
+					do EndLine^COMTable()
+				}
+				set stringHeader="<strong>Classificação "_classification_"</strong>"
+				do NewLine^COMTable("lightsteelblue")
+	
+				do InsertCell^COMTable(stringHeader,,,,,,6)
+				do EndLine^COMTable()
+				set acumulatedValue=0
+				set previousClassification=classification
+			}
+			set totalAcumulatedValue=totalAcumulatedValue+value
+			set acumulatedValue=acumulatedValue+value
+			if id=1 set total=incrementedValue
+			set percentage=0
+			if +total'=0 set percentage=value/total
+			set percentage=percentage*100
+			set percentage=$piece(percentage,".",1)
+			if ((percentage="") || (percentage<=0)) set percentage="<1"
+			set percentage=percentage_"%"
+			//SQLGetDescContaContabil(pCodigoContabil)
+			do NewLine^COMTable()
+			do InsertCell^COMTable(product,"INART",,,"LEFT",,1)
+		    do InsertCell^COMTable($$SQLGetDescricaoProduto^VARSQL(product),,,,"LEFT",,,,,$$$YES)
+		    do InsertCell^COMTable($$SQLGetDescContaContabil^VARSQL($$SQLGetContaContabil^VARSQL(product)),,,,"CENTER")
+		    do InsertCell^COMTable("R$ "_$$FormatCurrency^VARSQL(value),,,,"RIGHT")
+		    //do InsertCell^COMTable("R$ "_$$FormatCurrency^VARSQL(incrementedValue),,,,"RIGHT")
+		    do InsertCell^COMTable(percentage,,,,"CENTER")
+		    do InsertCell^COMTable(classification,,,,"CENTER")    
+			do EndLine^COMTable()
+		$$$End
+		
+		if previousClassification'="" {
+			set stringHeader="<strong>Total Classificação "_previousClassification_"</strong>&nbsp;"
+			do NewLine^COMTable("palegoldenrod")
+			do InsertCell^COMTable(stringHeader,,,,"right",,3)
+			do InsertCell^COMTable("<strong>R$ "_$$FormatCurrency^VARSQL(acumulatedValue)_"</strong>",,,,"right")
+			do InsertCell^COMTable("")
+			do InsertCell^COMTable("")
+			do EndLine^COMTable()
+		}
+		
+		set stringHeader="<strong>TOTAL CLASSIFICAÇÃO ABC</strong>&nbsp;"
+		do NewLine^COMTable("palegoldenrod")
+		do InsertCell^COMTable(stringHeader,,,,"right",,3)
+		do InsertCell^COMTable("<strong>R$ "_$$FormatCurrency^VARSQL(totalAcumulatedValue)_"</strong>",,,,"right")
+		do InsertCell^COMTable("")
+		do InsertCell^COMTable("")
+		do EndLine^COMTable()	
+  	}
+
+
+	quit
+
+Run(Company)
+	new objABC,A,B,C,months
+	set objABC=$get(^VARABC(YM,Company,1))
+
+	if objABC="" do GoToForm^COMUtilForm("VARABC",Company)
+	if $$$VARABCStatus(objABC)=1 {
+		$$$Alert("Rotina não pode ser processada pois está em execução")
+		do GoToForm^COMUtilForm("VARABC",Company)
+	}
+
+	set A=$$$VARABCA(objABC)
+	set B=$$$VARABCB(objABC)
+	set C=$$$VARABCC(objABC)
+	set Total=A+B+C
+	set months=$$$VARABCMeses(objABC)
+	if (Total=100) {
+		if ((A>0) && (B>0) && (C>0)) {
+			set $$$VARABCMsgStatus(objABC)="<font color ='red'><strong>Cálculo ABC está em execução...</strong></font>"
+			set $$$VARABCStatus(objABC)=1
+			set strStatus=$$Save^COMUtils("VARABC",Company,objABC,1)
+	
+			IF strStatus'=1 { //HARD FAIL, save directly on the global to prevent several jobs running
+				set $$$VARABCMsgStatus(objABC)="<font color ='red'><strong>Cálculo ABC está em execução...</strong></font>"
+				SET $$$VARABCStatus(^VARABC(YM,Company,1))=0
+			}
+			job JobABC(Company,A,B,C,months)
+		}else {
+			$$$Alert("Erro, Os valores A, B e C devem obrigatoriamente serem superiores a 0.")
+		}
+	}else {
+
+		$$$Alert("Erro, Os valores A, B e C somados não resultam em um total de 100.")
+	}
+
+	do GoToForm^COMUtilForm("VARABC",Company)
+	q
+
+CanRun(Company)
+	set YQ=1
+	new objABC
+	set objABC=$get(^VARABC(YM,Company,1))
+	if objABC="" q
+	if $$$VARABCStatus(objABC)=1 {
+		set Q = $$$QDontSave
+		set YQ=1_"Rotina não pode ser processada pois está em execução"
+		q
+	}
+	set YQ=0
+	q
+	
+CanSave(Company)
+	set YQ=1
+	new objABC
+	set objABC=$get(^VARABC(YM,Company,1))
+	if objABC="" q
+	if $$$VARABCStatus(objABC)=1 {
+		set Q = $$$QDontSave
+		$$$Alert("Formulário não pode ser salvo, o cálculo ABC está em execução")
+		q
+	}
+	set Q=$$$QSave
+	q
+]]></Routine>
+</Export>

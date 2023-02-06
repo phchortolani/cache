@@ -1,0 +1,875 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARRecRegional" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARRecRegional
+#include COMSYS
+#include INConst
+#include COMConst
+#include WWWConst
+#include COMGridEdit31
+
+#define EnumTypeStandard	0
+#define EnumTypeBonus		2
+	
+#define IsItemLine   ((enumLineType=$$$EnumTypeStandard) || (enumLineType=$$$EnumTypeBonus))
+
+OnBeforeButtonLine(pidReceipt)
+	;-------------------------------------------------------------------------------
+	; Lista os produtos que podem ser recebidos de acordo com os produtos homologados
+	; na compra do PDPAS (compra regional).
+	;
+	; History:
+	; 19-Nov-2013	Gustavo  Cria COMTempList que gera os produtos neste recebimento	
+	;-------------------------------------------------------------------------------	
+	new objRecebimento	
+
+	if '$$$NoKey(pidReceipt) {
+	
+		set objRecebimento = $get(^INREC(YM,pidReceipt,1))
+			
+		if $$$INRECStatus(objRecebimento) '= $$$EnumINSTATUSUnprocessed {
+			set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+		}
+
+		do ListProdutos
+	}
+	
+	quit
+
+OnAfterDataFields(pidReceipt,pobjReceipt)  
+	; YSEITE = 2 adaptado de INReceipt
+	
+	if (YSEITE = 1){
+		do LoadGrid(pidReceipt)
+	
+	} elseif (YSEITE = 2) {
+		set idForm = "INReceiptLine"
+		set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+		set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 400
+		set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+		set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+		set $$$COMGridEditParameterContainer(YAUSWAHL)     = YFORM
+		
+		if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1))) ||
+			+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1))) ||
+			+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+			if $$$COMGridEditParameterEnabled(YAUSWAHL) {
+				if $$$INRECFREE30(pobjReceipt) = $$$YES {
+					set $$$COMGridEditParameterEnabled(YAUSWAHL)   = $$$NO
+				}
+			}
+		}
+		
+		set ^CacheTemp(YUSER,"GridLine") = YPARA
+		
+		$$$GRIDStart(idForm,pidReceipt)
+		$$$StartScript()
+		
+		set idSummary = ""
+		for {
+			set idSummary = $order(^WWWDATEN(0,+$horolog,YUSER,"INRECSummary","V","REFERENCEROW",idSummary))
+			quit:idSummary=""
+			continue:$$$KilledRecord($translate(idSummary,".","x"),"INRECSummary")
+			continue:$data($$$WWWDATEN("REFERENCEROW",idSummary))     ; FIXME : This is based on YFORM - may be looking at container - INReceipt ???
+			
+			set objINRECSummary = $$GetYFELDEX^COMGridEdit31G("INRECSummary",idSummary)
+			set enumLineType    = $$$INRECSummaryLineType(objINRECSummary)
+			set objTest = objINRECSummary
+			set $$$INRECSummaryLineType(objTest)     = ""
+			set $$$INRECSummaryExtendedCost(objTest) = ""
+			
+			if ($translate(objTest,Y,"")'="") && $$$IsItemLine {
+				set objRECLine = $$CreateINRECLine^INRECSummary(pidReceipt,idSummary,objINRECSummary)
+				do AddLine^COMGridEdit31Add(objRECLine,idSummary,"INReceiptLine",$$$NO)
+			}
+		}
+
+		$$$EndScript()
+	}
+	
+ 	quit
+ 	
+OnBeforeSave(pYKEY,pYFELD)
+	new strStatus, idCompraPDPAS, objCompraPDPAS, fornecedor, found, item, objCompraPDPASLinha
+	
+	set idCompraPDPAS = $$$INRECFREE10(pYFELD)
+	
+ 	set objCompraPDPAS = $get(^VARSESCOMPRAS(YM,idCompraPDPAS,1))
+ 	if (objCompraPDPAS = "") {	 	
+	 	set Q = $$$QDontSave
+	 	quit Q
+ 	
+ 	} else {
+		
+	 	//Validando se o processo pode ser escolhido
+		 if ( ($piece(objCompraPDPAS,Y,7) = 8) || ($piece(objCompraPDPAS,Y,7) = 11) || (($piece(objCompraPDPAS,Y,7) = 12) && (pYKEY '= "")) ) {
+		 } else {		 
+		 	$$$StartScript()
+		 	w "alert('Processo escolhido não foi finalizado, por favor escolha um processo finalizado.');"
+		 	$$$EndScript()		 	
+		 	set Q = $$$QDontSave
+	 		quit Q
+	 	}
+		
+		//Validando se o local do usuário é apropriado para o recebimento
+	 	if $piece(objCompraPDPAS,Y,36) '= YLOCATION {
+		 	$$$StartScript()
+		 	w "alert('Local corrente é diferente do local de entrega especificado no processo de compra.');"
+		 	$$$EndScript()
+		 	set Q = $$$QDontSave
+	 		quit Q
+	 	}
+
+	 	//Validando se o fornecedor escolhido venceu algum item
+	 	set fornecedor = $$$INRECSupplier(pYFELD)
+	 	set found = $$$NO
+	 	
+	 	set item = $order(^VARSESCOMPRASPropostaLinha(YM,idCompraPDPAS,""))	 	
+	 	while (item '= "") {
+		 	
+		 	set objCompraPDPASLinha = $get(^VARSESCOMPRASPropostaLinha(YM,idCompraPDPAS,item,fornecedor,1))
+		 	
+		 	if (objCompraPDPASLinha '= "") {
+			 	if ($piece(objCompraPDPASLinha,Y,26) = 1) {
+				 	set found = $$$YES
+			 	}
+		 	}
+		 	set item = $order(^VARSESCOMPRASPropostaLinha(YM,idCompraPDPAS,item))
+	 	}
+	 	
+	 	if (found = $$$NO) {
+		 	$$$StartScript()
+		 	w "alert('Fornecedor escolhido não foi aprovado no processo de compra escolhido.');"
+		 	$$$EndScript()
+		 	set Q = $$$QDontSave
+	 		quit Q
+	 	}
+ 	}	
+	
+	new intTotalLinhas, status,count,arrObjGrid,idKeyGrid1,idKeyGrid2,arrItem,arrObjGrid,objDataGrid
+		
+	set intTotalLinhas = $order(^VARSESCOMPRASLinha(0,idCompraPDPAS,""),-1) ;FIX - Faulty logic, grid lines can be deleted
+ 	do GetGridContents^COMGridEdit31G(.arrObjGrid)
+ 	
+ 	if $data(arrObjGrid) {
+	 	set status = $$$OK
+	 	set count = 0
+	 	$$$Order1(arrObjGrid,idKeyGrid1)
+	 		$$$Order2(arrObjGrid,idKeyGrid1,idKeyGrid2)
+	 			set count = count + 1
+
+	 			set objDataGrid = $get(arrObjGrid(idKeyGrid1,idKeyGrid2))
+	 			set idItemGrid = $piece(objDataGrid,Y,1)
+	 			if idItemGrid'="" {
+		 			if $data(arrItem(idItemGrid)) {
+			 			set idLinhaGrid = $get(arrItem(idItemGrid))
+			 			set status = "Produto já Existente - Linha "_idLinhaGrid
+			 			$$$StartScript()
+		 				w "alert('"_status_"');"
+		 				$$$EndScript()
+		 				quit
+			 		}
+		 			else {
+		 				set arrItem(idItemGrid) = idKeyGrid2
+		 			}
+	 			}
+	 			
+	 		$$$End
+	 	$$$End
+	 	
+	 	if $$$ISERR(status) {
+		 	set Q = $$$QDontSave
+ 			quit Q
+	 	}
+ 	}
+	
+	set strStatus = $$$GRIDSave(pYKEY)	
+	if $$$ISOK(strStatus) {
+	} else {
+		set Q = $$$QDontSave
+	}
+	
+	quit
+ 	
+LoadGrid(pid="")
+	new objInvoice,YFORM,YKEY,YAUSWAHL,YFELD,objVARTRKATARequest,strData
+	set YFORM="VARRecRegionalLinha"
+	set YFELD=""
+	set YKEY=$get(pid)
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)=1
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL)=290
+	set $$$COMGridEditParameterGridName(YAUSWAHL)=YFORM
+	set $$$COMGridEditParameterEnabled(YAUSWAHL) = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)="VARRecRegional"
+
+	if (($$$KEY1(YKEY) '= "") && $$$INRECFirmed($get(^INREC(YM,$$$KEY1(YKEY),1)))) { 
+		set $$$COMGridEditParameterEnabled(YAUSWAHL) = $$$WWW120AuthorizationToModifyData(YVOR)=5
+		set $$$COMGridEditParameterEnabled(YAUSWAHL) = $$$NO
+	}
+	
+	do ^COMGridEdit31
+	
+	quit	
+
+IsFirmable(pidReceipt,pobjReceipt)
+	new strStatus
+	// Adaptado de -> $$IsFirmable^INReceiptButton(pYKEY,$get(pYFELD))
+	
+    new preRecebido, PermiteProcessar, Usuario 
+    
+    set Usuario = YBED
+    set PermiteProcessar = 1 ;$piece($get(^WWW013(YM,Usuario,1)),Y,124)
+    set strStatus = $$$OK
+    
+    if pidReceipt '="" {
+    	set pobjEntrada = $get(INREC(YM,pidReceipt,1))
+	    set preRecebido = $$$INRECFirmed(pobjReceipt)
+	    
+	    if PermiteProcessar '= 1 {
+			set YQ = 1_"O usuário não tem permissão para confirmar o recebimento."_$char(10)_"Caso tenha dúvidas, entre em contato com o suporte."			
+					
+		} elseif $$$INRECSupplier(pobjReceipt)= "" {
+			set YQ = 1_"Fornecedor não foi informado."
+			
+		} elseif $$$INRECLocation(pobjReceipt) '= YLOCATION {
+			set YQ = $$$YQDisable()
+		} else { 
+			set YQ = $$$YQEnable
+		}
+		
+		set strStatus = $$ValidaTotalRecRegional(pidReceipt)
+		if ($$$ISERR(strStatus)){
+			set YQ = 1_$$$Text(strStatus)
+		}
+    }
+    
+	if ($$$ISOK(strStatus)) set strStatus = $$IsFirmable^INReceiptButton(pidReceipt,$get(pobjReceipt))
+	
+	quit strStatus
+
+ValidaTotalRecRegional(pidReceipt)
+	new arrGrid,fltCAD,fltCalcTot,idLine,objLine
+		
+	$$$GRIDGetContents(.arrGrid)
+
+	set idLine = ""
+	set fltCalcTot = ""
+	for {
+		set idLine = $order(arrGrid(pidReceipt,idLine))
+		quit:idLine=""
+		
+		set objLine = $get(^INRECSummary(YM,pidReceipt,idLine,1))
+
+		set fltCAD = ($$$INRECSummaryUnitCost(objLine) * $$$INRECSummaryUnitQtyReceived(objLine))
+
+		if fltCAD'="" set fltCalcTot = fltCalcTot + fltCAD
+	}
+
+	if ($$^WWWTR(1,8,$$^WWWTR(0,8,fltCalcTot)) = $$$INRECSummaryTotal($get(^INREC(YM,pidReceipt,1)))){
+		set strStatus = $$$OK
+	} else {
+		set strStatus = $$$MakeStatus("Valor recebido divergente do total informado. "_$char(10)_"Valor do documento informado: R$ "_$$^WWWTR(0,8,$$$INRECSummaryTotal($get(^INREC(YM,pidReceipt,1))))_" "_$char(10)_"Valor do Recebimento: R$ "_$$^WWWTR(0,8,fltCalcTot)_"")
+	}
+	
+	quit strStatus
+
+CanProcess(pidEntrada)
+    new preRecebido, PermiteProcessar, Usuario, objRecebimento, notafiscal, isNotaEstornada
+    
+    set Usuario = YBED
+    set PermiteProcessar = 1 ;$piece($get(^WWW013(YM,Usuario,1)),Y,124)
+    
+    if (pidEntrada '= "") {
+    	set objRecebimento = $get(^INREC(YM,pidEntrada,1))
+	    set preRecebido    = $$$INRECFirmed(objRecebimento)
+	    
+	    set idFornecedor = $$$INRECSupplier(objRecebimento)
+	    set notafiscal	 = $$$INRECInvoiceNumber(objRecebimento)
+	    
+	    if ($$$INRECStatus(objRecebimento) = 1){
+			set YQ = 1_"Esse recebimento já foi processado."
+		
+		} elseif preRecebido '= 1 {
+			set YQ = 1_"Este recebimento ainda não foi confirmado. Clique no botão confirmar para confirmá-lo."
+	 
+		} elseif PermiteProcessar '= 1 {
+			set YQ = 1_"O usuário não tem permissão para processar o recebimento."_$char(10)_"Caso tenha dúvidas, entre em contato com o suporte."			
+					
+		} elseif (pidEntrada '= "") && ($order(^INRECLine(YM, pidEntrada,"")) = "") {
+			set YQ = 1_"A entrada tem que ter pelo menos 1 item."
+			
+		} elseif $$$INRECSupplier(objRecebimento) = "" {
+			set YQ = 1_"Fornecedor não foi informado."
+			
+		} elseif $$$INRECLocation(objRecebimento) '= YLOCATION {
+			set YQ = 1_"Local corrente não é o local recebedor."
+		
+		} else {
+	 		set YQ = $$$YQEnable
+		}
+		
+		//do ValidaTotalRecIncorporacao(pidEntrada)  ;Validação já existe no V3
+ 		//do ValidaTotalRecAno(pidEntrada) 			 ;Funcionalidade desativada para reavaliação: SESDF-325
+ 		
+ 		if (YQ = $$$YQEnable) {
+ 			do ValidaQuantidadeLinhas(pidEntrada)		
+ 		}
+ 		
+ 		if (YQ = $$$YQEnable) {
+ 			do IsReceivable^INReceiptButtonP(pidEntrada,$get(objRecebimento))
+ 		}
+    }
+    
+	/*			
+		//Validando (mas não impedindo), se alguma linha possui uma marca diferente da estabelecida no processo
+		set processo=$piece(pobjEntrada,Y,23)
+		
+	 	set linha=""
+	 	set linha=$order(^VARSESEntradaLinha(YM,pidEntrada,linha))
+	 	while linha'="" {
+		 	set linhaObj=$get(^VARSESEntradaLinha(YM,pidEntrada,linha,1))
+		 	set produto=$piece(linhaObj,Y,1)
+		 	set marca=$piece(linhaObj,Y,15)
+		 	
+		 	set item=$order(^VARSESCOMPRASPropostaLinha(YM,processo,""))
+ 	
+			while item'="" {
+				set propostalinhaData=$get(^VARSESCOMPRASPropostaLinha(YM,processo,item,fornecedor,1))
+				if propostalinhaData'="" {
+				 	if (($piece(propostalinhaData,Y,26)=1) && ($piece(propostalinhaData,Y,11)=produto)) {
+					 	if marca'=$piece(propostalinhaData,Y,19) {
+						 	$$$StartScript()
+		 					write "alert('Atenção !Marca do item "_item_", "_marca_", difere da marca escolhida no processo-> "_$piece(propostalinhaData,Y,19)_"');"
+		 					$$$EndScript()
+					 	}
+				 	}
+				 }
+				 set item=$order(^VARSESCOMPRASPropostaLinha(YM,processo,item))
+			 } 	
+		 	
+		 	set linha=$order(^VARSESEntradaLinha(YM,pidEntrada,linha))
+	 	}
+	*/;
+    
+
+ValidaQuantidadeLinhas(pidEntrada)
+	new objRecebimento, recLine, objRecSummary, Produto, Quantidade, processo, fornecedor,
+		item, objPropostaLinha
+	
+	set objRecebimento = $get(^INREC(YM,pidEntrada,1))
+
+	set processo   = $$$INRECFREE10(objRecebimento)
+	set fornecedor = $$$INRECSupplier(objRecebimento)
+	
+	$$$Order3(^INRECSummary,YM,pidEntrada,recLine)
+		
+		set objRecSummary = $get(^INRECSummary(YM,pidEntrada,recLine,1))
+		
+		set Produto    	  = $$$INRECSummaryItem(objRecSummary)
+		set Quantidade 	  = $$$INRECSummaryQuantityReceived(objRecSummary)
+		set PrecoUnitario = $$$INRECSummaryUnitCost(objRecSummary)  	
+		set ValorLinha    = (Quantidade * PrecoUnitario)
+		
+		set item = $order(^VARSESCOMPRASPropostaLinha(YM,processo,""))
+
+		while (item '= "") {
+			set objPropostaLinha = $get(^VARSESCOMPRASPropostaLinha(YM,processo,item,fornecedor,1))		
+
+			if (objPropostaLinha '= "") {
+				if $piece(objPropostaLinha,Y,26) = 1 { //Resultado
+					
+					if Produto = $piece(objPropostaLinha,Y,11) {
+
+						if Quantidade > $piece(objPropostaLinha,Y,16) {
+							set YQ = 1_"Quantidade digitada para o produto "_Produto_" ultrapassa a quantidade aprovada ("_$piece(objPropostaLinha,Y,16)_") no processo escolhido."
+							quit
+							
+						} else {
+							do ValidaQuantidadeRecebida(processo,fornecedor,Produto,Quantidade,$piece(objPropostaLinha,Y,16),pidEntrada)
+						}
+						
+						if PrecoUnitario '= $piece(objPropostaLinha,Y,17) {
+							set YQ = 1_"Preço unitário digitado para o produto "_Produto_" difere do preço unitário, de R$ "_$piece(objPropostaLinha,Y,17)_", no processo escolhido."
+							quit
+						}
+						
+					}
+				}				
+			}
+			
+			set item = $order(^VARSESCOMPRASPropostaLinha(YM,processo,item))
+		}		
+	
+	$$$End
+	
+	quit
+
+ValidaQuantidadeRecebida(processo,fornecedor,Produto,Quantidade,QuantidadeOriginal,pidEntrada)
+ 	
+	set total = Quantidade
+	
+	$$$Order5(^INRECs,YM,200,$$$Index(processo),1,status)
+		$$$Order6(^INRECs,YM,200,$$$Index(processo),1,status,id)
+			
+			//Ignorando recebimento atual
+			continue:(id = pidEntrada)
+			
+			if fornecedor = $$$INRECSupplier($get(^INREC(YM,id,1))) {									
+				$$$Order3(^INRECSummary,YM,id,idLine)				
+					set objLine = $get(^INRECSummary(YM,id,idLine,1))				
+					if ($$$INRECSummaryItem(objLine) = Produto) {
+						set total = total + $$$INRECSummaryQuantityReceived(objLine)															
+					}
+				$$$End
+			}	
+
+		$$$End
+	$$$End
+	
+	if (total > QuantidadeOriginal) {
+		set total = total - Quantidade
+		set YQ = 1_"A quantidade digitada para o produto "_Produto_" ultrapassa o total de "_QuantidadeOriginal_" determinado no processo escolhido. Quantidade já recebida = "_total
+	}
+	
+	quit
+
+ValidaTotalRecAno(pidEntrada) 	
+ 	/* 	
+ 	;Funcionalidade desativada para reavaliação: SESDF-325
+ 	;Se for reativada, precisa de refactory para funcionar no v3
+ 		- VARSESEntrada = INREC
+ 		- VARSESEntradaLinha = INRECSummary
+ 		- Corrigir pieces/macros e os índices devidos
+ 	
+	set anocorrente=$extract($ZD($piece($H,",",1),8),1,4)
+	set Local=YLOCATION
+	set idline=""
+	set idline=$order(^VARSESEntradaLinha(YM, pidEntrada,idline))
+	while idline'="" {
+		set objLinhaRecebimento = $get(^VARSESEntradaLinha(YM,pidEntrada,idline,1))
+		set Produto				= $piece(objLinhaRecebimento,"~",1)
+		set Quantidade    		= $piece(objLinhaRecebimento,"~",2)
+		set PrecoUnitario 		= $piece(objLinhaRecebimento,"~",9)    	
+		set ValorLinha       	= (Quantidade * PrecoUnitario)
+		set TotalRec=ValorLinha
+		set nextRec=""
+		set nextRec=$order(^VARSESEntradas(YM,10,7,1,Local,nextRec))
+		while nextRec'="" {
+			set objRecebimento=$get(^VARSESEntrada(YM, nextRec,1))
+			set anorec=$piece(objRecebimento,"~",9)
+			set anorec=$piece(anorec,",",1)
+			set anorec=$extract($ZD(anorec,8),1,4)
+			if anocorrente=anorec {
+				set nextLine=""
+				set nextLine=$order(^VARSESEntradaLinhas(YM,5, Produto,nextRec,nextLine))
+				while nextLine'="" {
+					set objLinhaRecebimento = $get(^VARSESEntradaLinha(YM,nextRec,nextLine,1))
+					if $piece(objLinhaRecebimento,Y,16)=1 {
+						set Quantidade    		= $piece(objLinhaRecebimento,"~",2)
+						set PrecoUnitario 		= $piece(objLinhaRecebimento,"~",9)    	
+						set ValorLinhaNext       	= (Quantidade * PrecoUnitario)
+						set TotalRec=TotalRec+ValorLinhaNext
+					} 
+					set nextLine=$order(^VARSESEntradaLinhas(YM,5, Produto,nextRec,nextLine))
+				}
+			}
+			set nextRec=$order(^VARSESEntradas(YM,10,7,1,Local,nextRec))
+		}
+		if TotalRec>8000 {
+			set TotalRec=TotalRec-ValorLinha
+			set YQ = 1_"Valor disponível de R$8.000,00 para recebimento anual do produto "_Produto_" foi ultrapassado. Valor informado para esse recebimento R$"_$$^WWWTR(0,8,ValorLinha)_" , valor já recebido para o ano R$"_$$^WWWTR(0,8,TotalRec)
+		}
+		set idline=$order(^VARSESEntradaLinha(YM, pidEntrada,idline))
+	}
+	q
+	*/
+	
+Process(pidReceipt,pblnReloadForm=$$$YES) 
+	new strStatus, objReceipt
+	
+	set objReceipt = $get(^INREC(0,pidReceipt,1))
+	
+	do CanProcess(pidReceipt)
+	
+ 	if YQ = $$$YQEnable {
+		;set strStatus = $$Transaction^COMTransaction("ProcessTxn^VAREntrada("""_pidReceipt_""")",1)
+		set strStatus = $$Transaction^COMTransaction("PostTxn^INReceiptButtonP("""_pidReceipt_""","""_objReceipt_""")",$$$YES)
+ 		
+ 		if $$$ISOK(strStatus) {	 		
+	 		set strStatus = $$AtualizaCompraPDPAS(pidReceipt)
+ 		}
+ 
+		if $$$ISOK(strStatus) && pblnReloadForm { // SR15090
+			do ReloadForm^COMUtilForm()
+		}
+ 	} else {
+	 	do ReturnError^COMUtils($$$YQMessage)
+ 	}
+ 
+	quit strStatus
+
+AtualizaCompraPDPAS(pidRecebimento)
+	new strStatus, blnCompraTotalRecebida, idCompraPDPAS, intLinha, objCompraPDPAS
+	
+	set strStatus = 0
+	
+	// Varrer as linhas da compra (VARSESCOMPRASLinha) e verificar se todas foram totalmente recebidas
+	set blnCompraTotalRecebida = 1
+	set idCompraPDPAS = $$$INRECFREE10($get(^INREC(YM,pidRecebimento,1)))
+	
+	set intLinha = $order(^VARSESCOMPRASLinha(0,idCompraPDPAS,""))
+
+	while ((intLinha '= "") && (blnCompraTotalRecebida)) {				
+		if ($$GetVencedorQuantidade^VARSESCOMPRASParecer(idCompraPDPAS,intLinha) > $$GetQuantRecByProcessoItem(idCompraPDPAS,$piece(^VARSESCOMPRASLinha(0,idCompraPDPAS,intLinha,1),"~",2))) {
+			set blnCompraTotalRecebida = 0
+		}
+		set intLinha = $order(^VARSESCOMPRASLinha(0,idCompraPDPAS,intLinha))
+	}
+
+	if (blnCompraTotalRecebida)  {
+
+		set objCompraPDPAS = $get(^VARSESCOMPRAS(YM,idCompraPDPAS,1))	
+		;Posição do Processo
+		if ($piece(objCompraPDPAS,Y,7) = 11) {
+			set $piece(objCompraPDPAS,Y,7) = 12
+			set strStatus = $$$Save("VARSESCOMPRAS",idCompraPDPAS,objCompraPDPAS,1)
+		}
+	}	
+
+	quit strStatus
+
+CanUnFirm(pidReceipt,pobjReceipt="")
+	new strStatus
+	// Adaptado de -> $$CanUnFirm^INReceiptButton(YKEY,$get(YFELD))
+	set strStatus = $$$OK
+	if ($$$INRECStatus(pobjReceipt) '= 0) {						
+		set strStatus = $$$MakeStatus("IN00377")           ; "Record already processed"
+		$$$YQHandler(strStatus)
+	} 
+	if ($$$ISOK(strStatus)) {
+		set strStatus = $$CanUnFirm^INReceiptButton(YKEY,$get(YFELD))
+	}
+
+	quit strStatus
+	
+CanViewReport()
+ 	if (YKEY) {	 	
+		if $$$INRECFirmed(YFELD) '= 1 {
+			set YQ = 1_"O recebimento precisar ter sido processado ou confirmado."
+		} else { 
+			set YQ = $$$YQEnable
+		} 	
+ 	} 
+	quit
+	
+Imprimir(pYKEY)
+	;do RunReport...^VARJasperRunReport(pYKEY)
+	IF (YBED'="" ){
+			set User=YBED
+			set NomeUsuario=$ZCONVERT($piece($get(^WWW013(YM,User,1)),Y,1),"O","HTML")
+	} 
+	else { 
+		set User="NOUSER"
+	}
+		
+
+	set link=$$Start^VARJasperRun("VARRecebimentoPDPAS")
+	set link=$$addParameter^VARJasperRun(link,YKEY,1)
+	set link=$$addParameter^VARJasperRun(link,YBED,2)
+	set link=$$addParameter^VARJasperRun(link,NomeUsuario,3)
+	
+	do ViewInForm^VARJasperRun(link,"Recebimento PDPAS")
+	quit
+	quit	
+
+ListProdutos
+	;-------------------------------------------------------------------------------
+	; Monta a lista de produtos que podem ser recebidos a partir da compra
+	;
+	; History:
+	; 19-Nov-2013	Gustavo		Criado - Refatorado da SESDF-v1
+	;-------------------------------------------------------------------------------			
+	kill ^COMTempList(YM,YUSER,"VARRecRegionalProdutos")
+	
+	quit:( (YKEY = "") || (YKEY = "+") )
+ 
+ 	new objRecRegional, processo, fornecedor, item, propostalinhaData, produto
+ 	
+ 	set objRecRegional = $get(^INREC(YM,YKEY,1))
+ 
+	set processo   = $$$INRECFREE10(objRecRegional)
+	set fornecedor = $$$INRECSupplier(objRecRegional)
+	
+	quit:(processo = "")
+ 	set item = $order(^VARSESCOMPRASPropostaLinha(YM,processo,""))
+ 	
+	while item '= "" {
+		set propostalinhaData = $get(^VARSESCOMPRASPropostaLinha(YM,processo,item,fornecedor,1))
+		
+		if (propostalinhaData '= "") {
+		 	if $piece(propostalinhaData,Y,26) = 1 {			 	
+			 	set produto = $piece(propostalinhaData,Y,11)
+			 	set ^COMTempList(YM,YUSER,"VARRecRegionalProdutos",produto,1) = $piece(propostalinhaData,Y,12)		 	
+		 	}
+		 }
+		 
+		 set item = $order(^VARSESCOMPRASPropostaLinha(YM,processo,item))
+	 }
+ 
+	quit
+
+GoToOcorrenciaFornecedor(YKEY)
+	quit:( (YKEY = "") || (YKEY = "+") )
+	
+	new objRecebimento, idFornecedor, idAFM
+	set objRecebimento = $get(^INREC(YM,YKEY,1))
+	quit:(objRecebimento = "")
+		
+	set idFornecedor = $piece($get(^INREC(YM,YKEY,1)),"~",49)
+	do GoToForm^COMUtilForm("VARFornecedorOcorrencia",idFornecedor)
+	
+	quit
+
+CheckRecebimento(pProcesso,pFornecedor="",pItem="")
+	new strStatus, rec, objEntrada, recLine, objEntradaLinha
+ 	
+ 	set strStatus = 0
+	quit:(pProcesso = "") strStatus
+
+	$$$Order5(^INRECs,YM,200,$$$Index(pProcesso),1,status)
+		$$$Order6(^INRECs,YM,200,$$$Index(pProcesso),1,status,rec)
+
+			if ((rec '= "") && (strStatus=0)) {		
+				if ((pFornecedor = "") && (pItem = "")) {			
+					set strStatus = 1
+				}		
+				if ((pFornecedor '= "") && (pItem = "")) {			
+					set objRecebimento = $get(^INREC(YM,rec,1))
+					if $$$INRECSupplier(objRecebimento) = pFornecedor {
+						set strStatus = 1
+					}
+				}
+				if ((pFornecedor '= "") && ( pItem '= "")) {						
+					set objRecebimento = $get(^INREC(YM,rec,1))
+			
+					if $$$INRECSupplier(objRecebimento) = pFornecedor {			
+				
+						set recLine = ""				
+						set recLine = $order(^INRECSummary(YM,rec,recLine))				
+						while recLine '= "" {
+					
+							set objRecSummary = $get(^INRECSummary(YM,rec,recLine,1))
+							if (($$$INRECSummaryItem(objRecSummary) = pItem) && ($$$INRECSummaryStatus(objRecSummary) = 1)) {
+								set strStatus = 1
+							}					
+							set recLine = $order(^INRECSummary(YM,rec,recLine))
+						}
+					}
+				}
+		
+				if ((pFornecedor = "") && (pItem '= "")) {
+					set recLine = ""
+					set recLine = $order(^INRECSummarys(YM,2,pItem,rec,recLine))
+					if recLine '= "" {
+						set objRecSummary=$get(^INRECSummary(YM,rec,recLine,1))
+						if $$$INRECSummaryStatus(objRecSummary) {
+							set strStatus = 1
+						}
+					}
+				}
+			$$$End
+		$$$End
+	}
+
+	quit strStatus
+
+GetQuantRecByProcessoItem(pProcesso="",pItem="")
+	new qtReturn, rec, objEntrada, recLine, objEntradaLinha
+	
+	set qtReturn = 0
+	
+	quit:( (pProcesso = "") || (pItem="") ) 0
+
+	$$$Order5(^INRECs,YM,200,$$$Index(pProcesso),1,status)
+		$$$Order6(^INRECs,YM,200,$$$Index(pProcesso),1,status,rec)
+
+			$$$Order3(^INRECSummary,YM,rec,recLine)
+
+				set objRecSummary =$get(^INRECSummary(YM,rec,recLine,1))
+
+				if (($$$INRECSummaryItem(objRecSummary) = pItem) && ($$$INRECSummaryStatus(objRecSummary) = 1)) {
+					set qtReturn = qtReturn + $$$INRECSummaryQuantityReceived(objRecSummary)
+				}
+
+			$$$End
+		$$$End
+	$$$End
+ 
+    set qtReturn = qtReturn + $$GetQtdRecebidaPDPASLinha^VARRecebimentoPDPASV1(pProcesso,pItem)	// Soma com os recebimentos do PDPAS do V1
+ 
+	quit qtReturn
+
+QuantRecebimento(pProcesso="",pFornecedor="",pItem="")
+	new qtReturn, status, rec, objRecebimento, recLine, objRecSummary
+	
+	set qtReturn = 0
+	
+	quit:(pProcesso = "") 0
+	quit:(pFornecedor = "") 0
+	quit:(pItem = "") 0
+	
+	$$$Order5(^INRECs,YM,200,$$$Index(pProcesso),1,status)
+		$$$Order6(^INRECs,YM,200,$$$Index(pProcesso),1,status,rec)	
+			
+			set objRecebimento = $get(^INREC(YM,rec,1))
+			
+			if $$$INRECSupplier(objRecebimento) = pFornecedor {
+				
+				$$$Order3(^INRECSummary,YM,rec,recLine)				
+					set objRecSummary =$get(^INRECSummary(YM,rec,recLine,1))
+
+					if (($$$INRECSummaryItem(objRecSummary) = pItem) && ($$$INRECSummaryStatus(objRecSummary) = 1)) {
+						set qtReturn = qtReturn + $$$INRECSummaryQuantityReceived(objRecSummary)
+					}
+					
+				$$$End
+			}
+		
+		$$$End
+	$$$End
+
+	quit qtReturn
+
+PostAtualizaRecebimentoPDPAS(YKEY,YFELD)
+ 	        
+ 	$$$StartScript()
+ 	 	w "alert('Recebimento atualizado com sucesso.'); "
+	$$$EndScript()
+	quit
+	
+	/*
+;-----------------------------------------------------------------------------------------------------------------------
+; As rotinas abaixo estão obsoletas do v1 para o v3 pois o Estorno deverá ser feito pela tela de estorno de recebimento
+;-----------------------------------------------------------------------------------------------------------------------
+
+CanReturn(pidEntrada, pobjEntrada)
+    set Usuario = YBED
+    set PermiteProcessar = 1
+    set YQ = $$$YQEnable
+    
+    if pidEntrada '="" {
+    
+	    set preRecebido = $$$VARSESEntradaPreFirmado(pobjEntrada)
+	    
+	    if $$$VARSESEntradaFirmado(pobjEntrada)'=1 {
+			set YQ = 1_"Esse recebimento não foi processado,nenhum item pode ser estornado."
+			q
+	    }
+	     if $$$VARSESEntradaLocalRecebedor(pobjEntrada) '= YLOCATION {
+			set YQ = 1_"Local corrente não é o local recebedor."
+			q
+		}
+		set bool=0
+		set line=""
+		set line=$order(^VARSESEntradaLinha(YM,pidEntrada,line))
+		while line'="" {
+			set objLinha=$get(^VARSESEntradaLinha(YM,pidEntrada,line,1))
+			if (($piece(objLinha,Y,16)=1) && ($piece(objLinha,Y,17)=1)) set bool=1
+			set line=$order(^VARSESEntradaLinha(YM,pidEntrada,line))
+		}
+	    if bool=0 {
+		    set YQ = 1_"Nenhuma linha recebida foi selecionada para realizar estorno."
+			q
+	    }
+    } else {
+	    set YQ = 1_"Esse recebimento não foi processado,nenhum item pode ser estornado."
+    }
+	q
+	
+Return(pIdEntrada,pblnReloadForm=$$$YES)
+	// Andre, 20/05/2008:
+	// Processes the Entrada, making use of transaction.
+	// Remember, when calling this routine from a button, to use the following command, 
+	// to ensure lock is done to ^VARSESEntrada(0,YKEY,1):
+	// do Perform^COMTransaction(YFORM,YKEY,"Process^VARSESEntrada(YKEY)","IN00377")
+ 
+	new strStatus, objEntrada
+	
+	// It's required to retrieve object from global because variable
+	// YFELD is not available when calling this routine from inside 
+	// Perform^COMTransaction:
+	set objEntrada = $get(^VARSESEntrada(0,pIdEntrada,1))
+	
+	do CanReturn(pIdEntrada,objEntrada)
+	
+ 	if YQ = $$$YQEnable {
+		set strStatus = $$Transaction^COMTransaction("ReturnTxn^VARSESRecRegional("""_pIdEntrada_""")",1)
+		if $$$ISOK(strStatus) {
+ 		$$$StartScript()
+ 	     	w "alert('Item Estornado com Sucesso'); "
+			$$$EndScript() 
+		}
+		if $$$ISOK(strStatus) && pblnReloadForm { // SR15090
+			do ReloadForm^COMUtilForm()
+		}
+ 	} else {
+	 	do ReturnError^COMUtils($$$YQMessage)
+ 	}
+ 
+	quit strStatus	
+
+ReturnTxn(pIdEntrada)
+	new strStatus, idProcesso, processodata
+	set strStatus = 0
+	/*
+	set line=""
+	set line=$order(^VARSESEntradaLinha(YM,pIdEntrada,line))
+	while line'="" {
+		set objLinha=$get(^VARSESEntradaLinha(YM,pIdEntrada,line,1))
+		if (($piece(objLinha,Y,16)=1) && ($piece(objLinha,Y,17)=1)) { //Validando o status e booleano para estorno
+			set $piece(^VARSESEntradaLinha(YM,pIdEntrada,line,1),Y,2)=0-$piece(objLinha,Y,2) //Alterando a quantidade para um valor negativo
+		}
+		set line=$order(^VARSESEntradaLinha(YM,pIdEntrada,line))
+	}
+	*/
+	/*
+	set strStatus = $$SetVariablesandRun^VARSESINWEFREI(pIdEntrada,1) //Processar o estorno
+	if strStatus=1 {
+		set line=""
+		set line=$order(^VARSESEntradaLinha(YM,pIdEntrada,line))
+		while line'="" {
+			set objLinha=$get(^VARSESEntradaLinha(YM,pIdEntrada,line,1))
+			if (($piece(objLinha,Y,16)=1) && ($piece(objLinha,Y,17)=1)) {
+				set $piece(objLinha,Y,16)=2 //Alterando Status para estornado
+				set $piece(objLinha,Y,17)=0 //Desmarcando booleano para estorno
+				set $piece(objLinha,Y,18)=YBED //Usuário que realizou o estorno
+				set $piece(objLinha,Y,19)=$H //Data e Hora que o estorno foi realizado
+				//set $piece(objLinha,Y,2)=0-$piece(objLinha,Y,2) //Retornando a quantidade para o valor positivo
+				set strStatus = $$Save^COMUtils("VARSESEntradaLinha",pIdEntrada_","_line,objLinha,1)
+				if strStatus'=1 {
+					set strStatus=0_"Erro ao salvar o status no recebimento! ->"_strStatus
+					q
+				}
+			}
+			set line=$order(^VARSESEntradaLinha(YM,pIdEntrada,line))
+		}
+		
+		// retornar status das compras totalmente recebidas de 12 para 11 (Processo de Compra Finalizado)
+		if strStatus = 1 {
+			set idProcesso = $piece($get(^VARSESEntrada(YM,pIdEntrada,1)),Y,23)
+			set processodata = $get(^VARSESCOMPRAS(YM,idProcesso,1))
+			
+			if ($piece(processodata,Y,7) = 12)  {
+				set $piece(processodata,Y,7) = 11
+				set strStatus = $$$Save("VARSESCOMPRAS",idProcesso,processodata,1)
+			}
+		}
+	}
+	
+	quit strStatus
+	
+	*/
+	
+]]></Routine>
+</Export>

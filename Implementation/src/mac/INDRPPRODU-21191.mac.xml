@@ -1,0 +1,275 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INDRPPRODU" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INDRPPRODU
+#include INConst
+#include COMSYS
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		ÜBERMITTLUNG BEDARF AUS PRODUKTION NACH DRP
+	;
+	; Inputs : 
+	;
+	;
+	; ByRef :
+	;	VORG(1)		Order No
+	;	VORG(2)		Order Line No
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 20-Jul-2007	GRF		Doco
+	; 20.08.2001	FIS
+	;-------------------------------------------------------------------------------
+	NEW AUF,POS
+	
+	quit:'$$$INVORGDRPActivated($GET(^INVORG(YM,YM,1)))  ;DRP NICHT AKTIVIERT ;DRP Not 
+	
+	SET AUF=$GET(VORG(1))
+	IF (AUF=0) || (AUF="") DO ^WWWINFO($$^WWWTEXT(32292))  QUIT      ; "Check Please!"
+	
+	SET POS=$GET(VORG(2))
+	IF POS=0 SET POS=""
+	DO START(AUF,POS,1)
+	QUIT
+	
+START(YAUF,YPOS,EXECUTE)
+	;-------------------------------------------------------------------------------
+	;		ACHTUNG EINSPRUNG !AUFTRAG, POSITION
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Feb-2007	JW		SR15304: Macros, cleaned up.
+	;-------------------------------------------------------------------------------
+	new objINVORG
+	
+	;EXECUTE=1=AUTOMATISCH STARTEN ;launching 
+	IF $GET(EXECUTE)'=1 LOCK +^INPROPJOB(YM):0 IF '$TEST DO  QUIT  ;HINTERGRUND AKTIV ;foil ENABLED 
+	. IF ($GET(YAUF)="") || ($GET(YPOS)="") QUIT  
+	. SET ^INARTJOB(YM,$$^WWWNEXT("INARTJOB"),1)="DO START^INDRPPRODU("""_$GET(YAUF)_""","_$GET(YPOS)_",1)"  ;EXECUTE
+	
+	IF $GET(EXECUTE)'=1 LOCK -^INPROPJOB(YM)
+	NEW (YAUF,YPOS) // FIXME: Shouldn't be doing this, is very expensive.
+	DO ^WWWVAR  ;HOLEN VARIABLEN ;send for 
+	
+	set objINVORG = $GET(^INVORG(YM,YM,1))
+	IF $$$INVORGDRPActivated(objINVORG)'=1 QUIT  ;DRP NICHT AKTIVIERT ;DRP Not 
+	SET YBED = $$$INVORGUserIdentifierDRPProcess(objINVORG)   ;DRP HINTERGRUNDJOB
+	IF YBED="" SET YBED="UNKNOWN"
+	
+	SET AUF=$GET(YAUF)
+	QUIT:AUF=""
+	SET POS=$GET(YPOS)
+	DO BEDARF
+	QUIT
+	
+BEDARF
+	;-------------------------------------------------------------------------------
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Feb-2007	JW		SR15304: Macros, cleaned up, doco.
+	;-------------------------------------------------------------------------------
+	NEW BETRIEB,blnNetChange,blnBlocked
+	
+	;BEDARFSERMITTLUNG
+	SET AUF1=$GET(^INAUF(YM,AUF,1))
+	QUIT:AUF1=""
+	QUIT:$$$INAUFOrderType(AUF1)=2  ;LIEFERANTENBESTELLUNG
+	
+	SET BETRIEB = $$$INAUFLocation(AUF1)
+	IF BETRIEB="" SET BETRIEB=$GET(YLOCATION)
+	
+	QUIT:BETRIEB=""
+	
+	set YLOCATION    = BETRIEB    ; JW SR12380 - When WWWNEXT is called, BETRIEB should be used for the numerator, not YLOCATION.
+	set blnNetChange = $$$INVORGDRPOnlyForNetChange($GET(^INVORG(YM,YM,1)))
+	set blnBlocked   = $$$INAUFBlockPurchaseOrder(AUF1)		//SR15304
+	
+	if POS'="" {
+		do OrderLine(AUF,POS,BETRIEB,blnBlocked,blnNetChange)
+	} else {
+		$$$Order3(^INAUFP,YM,AUF,POS)
+			do OrderLine(AUF,POS,BETRIEB,blnBlocked,blnNetChange)
+		$$$End
+	}
+	quit
+	
+OrderLine(AUF,POS,BETRIEB,pblnBlocked,pblnNetChange)
+	;-------------------------------------------------------------------------------
+	; Update demands associated with an MO line
+	;
+	; Params:	pblnBlocked - whether the MO is blocked
+	; 			pblnNetChange - whether we are using net change
+	;
+	; Returns:	nil
+	;
+	; History:
+	; 09-Feb-2007	JW		SR15304: Encapsulated. Block component demands if MO is blocked.
+	;-------------------------------------------------------------------------------
+	new POS1,SUCH,TEIL,TEIL1,OBER,YI,YZ,DEMAND,SATZ,OK,ID,KEY
+	new idLevelItem,dteProdStart,objINAUFPT
+	
+	SET POS1=$GET(^INAUFP(YM,AUF,POS,1))
+	
+	quit:$$$INAUFPSource(POS1)'=3  ;Production
+	
+	;SUCHEN TEILE UND UNTERTEILE ;seek And 
+	$$$Query("^INAUFPXL("""_YM_""","""_AUF_""","_POS_")",SUCH)
+		SET TEIL=$PIECE(SUCH,",",4,99)		// The rest of the INAUFPXL keys are the components
+		SET TEIL=$TRANSLATE(TEIL,",)","..")
+		
+		SET TEIL1=@SUCH
+		
+		set idLevelItem = $$$INAUFPXLLevelItemNumber(TEIL1)
+		if idLevelItem'="" {
+			IF pblnNetChange SET ^INDRPNETCHANGE(YM,idLevelItem,1)=""	;FIS;29.04.05;SR12200
+			
+			set dteProdStart = $$$INAUFPXLBeginningOfManufacturing(TEIL1)
+			IF dteProdStart="" {
+				
+				// What the hell is the following block doing? Trying to find the first date?
+				// Hey, lets make a simple idea excrutiating to read AND get it wrong!
+				// It doesn't look at the last component.
+				
+				FOR YZ=1:1:10 {		// Why only 10 ?  
+					QUIT:dteProdStart'=""
+					
+					SET OBER="^INAUFPXL("""_YM_""","""_AUF_""","_POS
+					FOR YI=1:1 QUIT:$PIECE(TEIL,".",YI+YZ)=""  SET OBER=OBER_","_$PIECE(TEIL,".",YI)  ;ÜBERGEORDNETER KEY
+					SET OBER=OBER_")"
+					IF $DATA(OBER)=11 {
+						SET dteProdStart = $$$INAUFPXLBeginningOfManufacturing(@OBER)
+					}
+				}
+			}
+			
+			;If we already have a demand, just update the date.
+			set DEMAND = $$$INAUFPXLDRPIDNo(TEIL1)
+			IF DEMAND'="" {
+				SET SATZ=$GET(^INDRPDEMAND(YM,BETRIEB,DEMAND,1))
+				if SATZ'="" {
+					SET $$$INDRPDEMANDDueOnBefore(SATZ) = dteProdStart
+					set $$$INDRPDEMANDBlocked(SATZ) = pblnBlocked				//SR15304
+					SET OK=$$$Save("INDRPDEMAND",BETRIEB_","_DEMAND,SATZ,1)
+				}
+			} else {
+				SET SATZ=""
+				set $$$INDRPDEMANDRequestingLocation(SATZ) 	= BETRIEB
+				SET $$$INDRPDEMANDOrderNo(SATZ)				= AUF_"-"_POS
+				SET $$$INDRPDEMANDCreatedon(SATZ) 			= +$HOROLOG
+				SET $$$INDRPDEMANDItemNo(SATZ)				= idLevelItem
+				SET $$$INDRPDEMANDDueOnBefore(SATZ) 		= dteProdStart
+				SET $$$INDRPDEMANDDemandType(SATZ)			= 2             ;FERTIGUNG
+				SET $$$INDRPDEMANDPriority(SATZ)			= 0 
+				SET $$$INDRPDEMANDItemStructure(SATZ)		= AUF_"."_POS_"."_TEIL
+				SET $$$INDRPDEMANDQuantity(SATZ) 			= $select($$$INAUFPXLItemType(TEIL1)'=2:$$$INAUFPXLOutput1(TEIL1),
+																								  1:$$$INAUFPXLOutput1(TEIL1)*$$$INAUFPXLProductionInTheTimeOf(TEIL1))
+				set $$$INDRPDEMANDBlocked(SATZ) = pblnBlocked					//SR15304
+				
+				SET ID = $$^WWWNEXT("INDRPDEMAND")
+				SET OK = $$$Save("INDRPDEMAND",BETRIEB_","_ID,SATZ,1)
+				
+				// This line must be a direct set as INAUFPXL does not conform to @net standard
+				SET $$$INAUFPXLDRPIDNo(@(SUCH))=ID  ;DRP NUMMER IN AUFTRAG SPEICHERN ;DRP numeral within order Save 
+				
+				set objINAUFPT = $get(^INAUFPT(YM,AUF,POS,TEIL,1))
+				set $$$INAUFPTDRPIDNo(objINAUFPT)=ID
+				set OK = $$$Save("INAUFPT",AUF_","_POS_","_TEIL,objINAUFPT,1)
+			}
+		}
+	$$$End
+	
+	QUIT
+	
+	
+	/* SR15304 - Rewritten above
+BEDARF
+	NEW POS1,SUCH,TEIL,TEIL1,OBER,YZ,DEMAND,SATZ,OK,BETRIEB,ID,KEY
+	;BEDARFSERMITTLUNG
+	SET AUF1=$GET(^INAUF(YM,AUF,1))
+	QUIT:AUF1=""
+	QUIT:$PIECE(AUF1,Y,2)=2  ;LIEFERANTENBESTELLUNG
+	SET BETRIEB=$PIECE(AUF1,Y,6)
+	IF BETRIEB="" SET BETRIEB=$GET(YLOCATION)
+	QUIT:BETRIEB=""
+	
+	set YLOCATION = BETRIEB	; JW SR12380 - When WWWNEXT is called, BETRIEB should be used for the numerator, not YLOCATION.
+	
+	;AUFTRAGSPOSITION
+	DO:POS'=""  IF POS="" FOR  SET POS=$ORDER(^INAUFP(YM,AUF,POS)) QUIT:POS=""  DO
+	. SET POS1=$GET(^INAUFP(YM,AUF,POS,1))
+	. QUIT:POS1=""
+	. QUIT:$PIECE(POS1,Y,7)'=3  ;EIGENFERTIGUNG
+	. ;
+	. ;SUCHEN TEILE UND UNTERTEILE ;seek And 
+	. SET SUCH="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS_")"
+	. FOR  DO  QUIT:SUCH=""
+	. . SET SUCH=$QUERY(@SUCH)
+	. . IF $TRANSLATE($PIECE(SUCH,",",2),"""")'=AUF SET SUCH="" QUIT  ;21.06.04;FAN;25794; WENN alphanumerischen Auftragsnummern SOLL DATEN AUCH AUFBAUEN.
+	. . ;IF $PIECE(SUCH,",",2)'=AUF SET SUCH="" QUIT  ;21.06.04;FAN;25794;  ;FALSCHER AUFTRAG
+	. . IF $PIECE(SUCH,",",3)=POS DO
+	. . . SET TEIL=$PIECE(SUCH,",",4,99)
+	. . . SET TEIL=$TRANSLATE(TEIL,",)","..")
+	. . . QUIT:'$DATA(@SUCH)
+	. . . SET TEIL1=@SUCH
+	. . . ;
+	. . . QUIT:$PIECE(TEIL1,Y,4)=""  ;KEIN ARTIKEL ;no item 
+	. . . IF $PIECE($GET(^INVORG(YM,YM,1)),Y,217)=1 SET ^INDRPNETCHANGE(YM,$PIECE(TEIL1,Y,4),1)=""  ;FIS;29.04.05;SR12200
+	. . . ;QUIT:$PIECE(TEIL1,Y,26)=2  ;LEISTUNG
+	. . . ;
+	. . . IF $PIECE(TEIL1,Y,168)="" DO  ;FERTIGUNGSBEGINN
+	. . . . FOR YZ=1:1:10 QUIT:$PIECE(TEIL1,Y,168)'=""  DO
+	. . . . . SET OBER=""
+	. . . . . SET OBER="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS
+	. . . . . FOR YI=1:1 QUIT:$PIECE(TEIL,".",YI+YZ)=""  SET OBER=OBER_","_$PIECE(TEIL,".",YI)  ;ÜBERGEORDNETER KEY
+	. . . . . SET OBER=OBER_")"
+	. . . . . IF $DATA(OBER)=11 DO
+	. . . . . . SET $PIECE(TEIL1,Y,168)=$PIECE(@(OBER),Y,168)
+	. . . ;
+	. . . ;BEDARF BEREITS IM DRP DANN NUR TERMIN NEU ;yet DRP only recent 
+	. . . IF $PIECE(TEIL1,Y,200)'="" DO  QUIT
+	. . . . NEW DEMAND,YFORM,YVOR,OK
+	. . . . SET DEMAND=$PIECE(TEIL1,Y,200)
+	. . . . SET SATZ=$GET(^INDRPDEMAND(YM,BETRIEB,DEMAND,1))
+	. . . . QUIT:SATZ=""
+	. . . . SET $PIECE(SATZ,Y,6)=$PIECE(TEIL1,Y,168)   ;BEDARFSTERMIN NEU ;recent 
+	. . . . SET OK=$$^WWWSPEI("INDRPDEMAND",BETRIEB_","_DEMAND,SATZ,1)
+	. . . . ;DO ^WWWSKILL("INDRPDEMAND",BETRIEB_","_DEMAND,1)  ;LÖSCHEN SORTKEY
+	. . . . ;SET $PIECE(^INDRPDEMAND(YM,BETRIEB,DEMAND,1),Y,6)=$PIECE(TEIL1,Y,168)   ;BEDARFSTERMIN NEU
+	. . . . ;DO ^WWWSSORT("INDRPDEMAND",BETRIEB_","_DEMAND)  ;NEU AUFBEREITEN SORTKEY
+	. . . ;
+	. . . ;DATENSATZ ARTIKELTEILE ;data record 
+	. . . SET SATZ=""
+	. . . SET $PIECE(SATZ,Y,1)=$PIECE(AUF1,Y,6)  ;BETRIEB
+	. . . IF $PIECE(SATZ,Y,1)="" SET $PIECE(SATZ,Y,1)=$GET(YLOCATION)
+	. . . SET $PIECE(SATZ,Y,2)=AUF_"-"_POS  ;AUFTRAGSNUMMER
+	. . . SET $PIECE(SATZ,Y,3)=+$HOROLOG  ; Date 
+	. . . SET $PIECE(SATZ,Y,4)=$PIECE(TEIL1,Y,4)  ;ARTIKEL ;item 
+	. . . SET $PIECE(SATZ,Y,5)=$PIECE(TEIL1,Y,39)  ;PRODUKTIONSMENGE
+	. . . ;I SET $PIECE(SATZ,Y,5)="" SET $PIECE(SATZ,Y,5)=$PIECE(TEIL1,Y,5)  ;MENGE
+	. . . IF $PIECE(TEIL1,Y,26)=2 SET $PIECE(SATZ,Y,5)=$PIECE(TEIL1,Y,45)*$PIECE(TEIL1,Y,39)  ;AUSFÜHRUNGSZEIT BEI LEISTUNG ;execution time next to performance 
+	. . . SET $PIECE(SATZ,Y,6)=$PIECE(TEIL1,Y,168)  ;FERTIGUNGSBEGINN/BEDARFSTERMIN
+	. . . SET $PIECE(SATZ,Y,70)=2  ;FERTIGUNG
+	. . . SET $PIECE(SATZ,Y,71)=0  ;PRIORITÄT NORMAL ;priority normal 
+	. . . SET $PIECE(SATZ,Y,72)=AUF_"."_POS_"."_TEIL
+	. . . ;
+	. . . ;SPEICHERN DATENSATZ ;Save data record 
+	. . . SET ID=$$^WWWNEXT("INDRPDEMAND")
+	. . . IF $DATA(^INDRPDEMAND(YM,BETRIEB,ID)) FOR  SET ID=$$^WWWNEXT("INDRPDEMAND")  QUIT:'$DATA(^INDRPDEMAND(YM,BETRIEB,ID))   ;1 WEITER ;ulterior 
+	. . . DO
+	. . . . NEW YFORM,YVOR,KEY,OK
+	. . . . SET KEY=BETRIEB_","_ID
+	. . . . SET OK=$$^WWWSPEI("INDRPDEMAND",KEY,SATZ,1)
+	. . . SET $PIECE(@(SUCH),Y,200)=ID  ;DRP NUMMER IN AUFTRAG SPEICHERN ;DRP numeral within order Save 
+	. . . SET $PIECE(^INAUFPT(YM,AUF,POS,TEIL,1),Y,200)=ID  ;DRP NUMMER IN AUFTRAG SPEICHERN ;DRP numeral within order Save 
+	QUIT
+	*/
+		
+]]></Routine>
+</Export>

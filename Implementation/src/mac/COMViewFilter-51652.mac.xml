@@ -1,0 +1,1893 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMViewFilter" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[COMViewFilter ; entry point for COMView
+	
+#include WWWConst
+#include COMConst
+#include COMView
+#include COMGridEdit31
+	
+	; Set the row limit to MAX(+$get(^SysSetup("COMViewLimit",YM)),59)
+#define RowLimit	$select(+$get(^SysSetup("COMViewLimit",YM))>=59:+$get(^SysSetup("COMViewLimit",YM)),1:59)
+	
+#define Separator	";:;"
+	
+LoadCOMViewGrid(pstrParentForm,pstrGridForm,pstrTabList="")
+	;-------------------------------------------------------------------------------
+	; Allow a COMViewGrid to be shown
+	;
+	; Params:
+	; 	pstrTabList		Only process if current tab is in comma-delimited list;
+	; 					Empty list means load for all tabs
+	;
+	; ByRef :  YSEITE	Current Tab
+	; 
+	; Returns:
+	;
+	; History:
+	; 29-Apr-2010	GRF		-: clarify pidSite => pidTabNo
+	; 09-Feb-2007	RPW		SR15426: Created
+	;-------------------------------------------------------------------------------
+	if pstrTabList'="" {
+		quit:'$find($$$COMMA_pstrTabList_$$$COMMA,$$$COMMA_YSEITE_$$$COMMA)
+	}
+	
+	kill ^CacheTempView(YUSER)
+	$$$StartScript()
+	do AfterDataFields(pstrParentForm_":"_pstrGridForm,$$$YES,$$$YES)
+	$$$EndScript()
+	quit	
+	
+	
+AfterDataFields(pstrForm="",pblnHyper=$$$NO,pblnInForm=$$$NO,pblnBackArrow=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Called from @Net form COMView search. Setups up screen.
+	;
+	; History:
+	; 06-Dec-2013	shobby	CORE-292: Resize the grid after COMView is draw so scrollbars appear if required.
+	; 23-Aug-2013	shobby	CORE-215: COMView created on a manual form (INARTStockHistory) would not show Mega Menu
+	; 23-Aug-2011	shobby	SR17874: Need to be careful to use , or ~ appropriately
+	;							with Primary Key or Data Field.
+	; 04-Nov-2010	GRF		SR17531: rename idForms and strForm to strFormList and
+	;							strViewForm to better distinguish from idForm and
+	;							pstrForm
+	; 13-Aug-2010	shobby	SR17469: In firefox there was a form heading visible when
+	; 							the COMView is supposed to cover the whole screen.
+    ; 17-Jul-2010	shobby	SR17418: Can't use setExpression for recalculating height.
+	; 29-Apr-2009	PPP		SR16499: Used ColSel to create new Javascript COMView
+	; 							Global - GLOBALblnColSelect
+	; 27-Apr-2009	shobby	SR16108: Optionally include a back arrow.
+    ; 09-Sep-2008	PP		SR15866:Update COMView to Objects
+	; 07-Nov-2007	GRF		SR15610: Make form name dynamic on Help button tooltip
+	; 20-Jun-2007	KARINE	SRBR014541: Make sure that the Default favourite works
+	;							for non COMViewGrid forms
+	; 22-May-2007	RPW		SR15524: If no views to show, do not show do anywork
+	; 30-Mar-2007	RPW		SRBR014416: Handle the grid when the COMView is hidden
+	;							from view.
+	; 15-Feb-2007	Steve S	SR15431: Use standard alert, not VBConfirm
+	; 09-Feb-2007	RPW		SR15426: Add the ability for a COMView to exist on the
+	;							main page & sub COMViews to work correctly as well
+	; 11-Dec-2006	JW		SR15299: Check for language translation
+	; 19-Sep-2006	JW		SR14937: Don't show select all button, if not a pop up.
+	; 14-Sep-2006	RPW		SR15001: Set the value of GLOBALblnMultiSelect so that
+	;							the colourisation of clicked and highlighted lines 
+	;							only shows for multi-select grids
+	; 12-Sep-2006	RPW		SR15029: Fixed so that when the Use Key Stroke is on,
+	;							then we show more records, otherwise don't show any
+	; 29-Aug-2006	JW		SR14763: Language text
+	; 08-Aug-2006	RPW		SR14896: kill old SQL for this user and form.
+	; 22-Jun-2006	Pablo	SR14221: Removed hard coding 'User' package
+	; 28-Apr-2006	JW		SR14427: Added calling form CacheTemp
+	; 19-Apr-2006	JW		SR14429: Added functionality for views
+	;  7-Oct-2005	JW		SR13637: WWWDATEN is not shared
+	; 28-Sep-2005	JW		SR13447: Store field type and number
+	; 23-Aug-2005	JW		SR12876: Removed appended value
+	; 21-Jun-2005	Paul K	Compile @Net instead of compile class.
+	; 25-May-2005	Paul K	SR12268: Use Grid Value if Not null (don't worry about
+	; 							form type) 
+	; 11-May-2005	PO/PK	SR12142: Enabling select all feature
+	; 03-May-2005	PO		SR12268: WWWDATEN approach for grid does not work,
+	;							adjusted to work correctly.
+	; 14-Apr-2005	PO		If value to filter on not passed in just pull straight
+	;							out of WWWDATEN
+	; 16-Feb-2005	PO/PK	SR11661: Populate default filter with value
+	;							from field search being performed upon.
+	; 30-Nov-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new appendValue,FilterLoop,KeyStrokeDelay     ; FIXME : prefixes
+	
+	new arrValues,arrViews,blnObj,blnOk,blnUseKeyStroke
+	new idCallingForm,idClass,idFieldNo,idFieldType,idForm,idGridValue,idKey
+	new idParent,idParentUser,idRelation,idUser,idView,lstFilters
+	new objWWW012,objCompiledClass,strFormList,strHeight,strPackage,strValue,strViewForm
+	
+	;--------------------------------------- PRESERVE USER
+	set idUser = YUSER
+	
+	if +$get(^CacheTempView(YUSER,YUCI,"InForm")) {   ; We have an In-Form COMView already on the screen.
+		set idUser = $$GetChildUser^WWWUSER(YUSER)
+		merge ^CacheTempFixedField(idUser) = ^CacheTempFixedField(YUSER)
+		set idParentUser = YUSER
+	}
+	new YUSER
+	set YUSER = idUser
+	;---------------------------------------
+	
+	kill ^CacheTempView(YUSER)
+	kill ^CacheTempSQL($$$SQLID)
+	
+ 	set ^CacheTempView(YUSER,"BackArrow") = pblnBackArrow
+	
+	set ^CacheTempView(YUSER,"LastSQL")   = 1
+	
+	if $get(idParentUser)'="" {
+		set ^CacheTempView(idParentUser,YUCI,"YUSER") = YUSER
+	}
+	if 'pblnInForm {
+		// This is not based on the value of YNOFOOT, it's based on it the fact the YNOFOOT is defined or not ""
+		set YNOFOOT = 1  ; stops showing crap at botton of popup.
+	}
+	
+	set idFieldType = ""
+	set idFieldNo   = ""
+	
+	if $$IsList^COMUtils(pstrForm) {
+		set idForm      = $listget(pstrForm,1)
+		set idRelation  = $listget(pstrForm,2)
+		set idKey       = $listget(pstrForm,3)
+		set strValue    = $listget(pstrForm,4)
+		set idGridValue = $listget(pstrForm,5)
+		
+		set idParent = ""
+		do GetFieldDetails^COMUtilForm(idRelation,,.idFieldType,.idFieldNo)
+		
+		if strValue="" {
+		;	do GetFieldDetails^COMUtilForm(idRelation,,.idFieldType,.idFieldNo)
+			if idGridValue'="" {
+				set strValue = idGridValue
+			} else {
+				if ($get(idForm)'="") && ($get(idFieldType)'="") && ($get(idFieldNo)'="") {
+					set strDaten = $get(^WWWDATEN(0,+$horolog,$$$GetParentUser(YUSER),idForm,idFieldType,1))  ;SR17874
+	;SR17874		set strValue = $piece(strDaten,Y,idFieldNo)
+					if idFieldType="P" {																	;SR17874
+						set strValue = $piece(strDaten,",",idFieldNo)										;SR17874
+					} else {																				;SR17874
+						set strValue = $piece(strDaten,Y,idFieldNo)											;SR17874
+					}																						;SR17874
+				}
+			}
+		}
+		
+	} else {   ;   [ idParent : ] idForm , idRelation , idKey1 [, idKey2 [, ...] ]
+		set strFormList = $piece(pstrForm,",",1)
+		if pblnInForm {
+			set idForm   = $piece(strFormList,":",2)
+			set idParent = $piece(strFormList,":",1)
+		} else {
+			set idForm   = $piece(strFormList,":",1)
+			set idParent = ""
+		}
+		
+		set idRelation = $piece(pstrForm,",",2)
+		set idKey      = $piece(pstrForm,",",3,$length(pstrForm,","))
+		
+	}
+	
+	set idCallingForm = idForm
+	set idClass = ""
+	if $get(idRelation)'="" set idForm = $$GetRelationForm(idRelation,.idClass,idKey)
+	
+	; No Form exists - treat as class
+	kill ^CacheTempObj(YUSER)
+	if (idForm'="") && '$data(^WWW120(0,idForm)) {
+		if '$data(^WWW001(0,idForm)) set ^CacheTempObj(YUSER,"Object") = 1  ; Only if no @NM class exists
+		set (idClass,idParent) = idForm
+	}
+	
+	if (idForm'="") && $data(^WWW120(0,idForm)) || (idClass'="") {
+		if idClass="" set idClass = $$$WWW120ClassUsedInForm($get(^WWW120(0,idForm,1)))
+		
+		// SR12876 - Removed appended value
+		set appendValue = $get(^CacheTempView(YUSER,"AppendValue"))
+		if (appendValue'="") && ($extract(strValue,1,$length(appendValue))=appendValue) {
+			set $extract(strValue,1,$length(appendValue)) = ""
+		}
+		if idKey'="" do SetKeyFields(idClass,idKey)
+		set ^CacheTempView(YUSER,"Form")            = idForm         ; Relation Form or Calling Form
+		set ^CacheTempView(YUSER,"Class")           = idClass
+		set ^CacheTempView(YUSER,"FilterValue")     = $get(strValue)
+		set ^CacheTempView(YUSER,"FieldType")       = idFieldType
+		set ^CacheTempView(YUSER,"FieldNo")         = idFieldNo
+		set ^CacheTempView(YUSER,"CallingForm")     = idCallingForm  ; Calling Form
+		set ^CacheTempView(YUSER,YUCI,"ParentForm") = idParent       ; ? Parent Form or Calling Class or Relation Class [ or null? ]
+		
+		// SR15299 - set language class details if it exists
+		if (idClass'="") && (idFieldNo'="") do SetLangRelation(idClass,idCallingForm,idFieldType,idFieldNo)
+		
+		if idClass'="" {
+			set blnOk = $$$YES
+			
+			if $extract(idClass,1,4)="VIEW" {
+				set strPackage = $$$REPFolder
+				set ^CacheTempView(YUSER,"View") = $$$YES
+				
+			} elseif $zconvert($extract(idClass,1,2),"U")="AL" {
+				set strPackage = $piece(idClass,".")
+				
+			} else {
+				if $length(idClass, ".") = 1 {
+					set strPackage = "SQLUser"
+					if '##Class(%Dictionary.CompiledClass).%ExistsId("User."_idClass) {
+						do CompileAtNet^COMViewUtils(idClass)
+						set blnOk = ##Class(%Dictionary.CompiledClass).%ExistsId("User."_idClass)
+					}
+				
+				} else {
+					if '##Class(%Dictionary.CompiledClass).%ExistsId(idClass) {
+						do CompileAtNet^COMViewUtils(idClass)
+						set blnOk = ##Class(%Dictionary.CompiledClass).%ExistsId(idClass)
+					}
+					if ##Class(%Dictionary.CompiledClass).%ExistsId(idClass) {
+						set objCompiledClass = ##Class(%Dictionary.CompiledClass).%OpenId(idClass)
+						set strPackage = objCompiledClass.SqlSchemaName
+						do objCompiledClass.%Close()
+					}
+				}
+			}
+			set ^CacheTempView(YUSER,"Package")     = strPackage
+			set ^CacheTempView(YUSER,YUCI,"InForm") = pblnInForm
+			
+			if blnOk {
+				if 'pblnHyper {
+					$$$StartScript()
+					if $get(^CacheTempSel(YUSER,"ColSel")) {
+						write "GLOBALblnColSelect=true;"
+					}
+					write "GLOBALblnMultiSelect=true;"
+					write "document.WWW.YUSER.value='"_YUSER_"';"
+					do CopyParent^WWWUSER(YUSER)
+					
+				} else {
+					write "BarHeight="_$$GetSearchHeight^COMView(idClass)_";"
+					write "GLOBALblnMultiSelect=false;"
+				}
+				
+				set objWWW012 = $get(^WWW012(0,0,1))
+				set KeyStrokeDelay = $$$COMViewConfigKeystrokeDelay($get(^COMViewConfig(0,0,1)))
+				if KeyStrokeDelay="" set KeyStrokeDelay = 200
+				set blnUseKeyStroke = $$UseKeyStroke^COMViewConfig()
+				
+				write "NetBorderColor='"     _($$Colour^COMUtilStr($$$WWW012FrameBodyColor(objWWW012),"LIGHTGREY"))_"';"
+				write "NetBorderColorLight='"_($$Colour^COMUtilStr($$$WWW012FrameColorForLight(objWWW012),"LIGHTGREY"))_"';"
+				write "NetBorderColorDark='" _($$Colour^COMUtilStr($$$WWW012FrameColorForDark(objWWW012),"LIGHTGREY"))_"';"
+				write "KeyStrokeDelay="_(KeyStrokeDelay)_";"
+				write "FilePath='"_($zconvert(YGIF,"o","JS"))_"';"
+				
+				if pblnInForm {
+					do GetViews^COMViewFavourite(idClass,YLOCATION,YBED,.arrViews)
+					quit:'$data(arrViews)              ; FIXME : EARLY EXIT ***WITHOUT*** RETURN VALUE - CALLED WITHOUT $$?
+				}	
+				write "GLOBALstrFormName='",$$$JSText($$^WWWFORMNAME(idForm)),"';"
+				write "BuildCOMViewStructure('"_pblnInForm_"','"_$$SuperUser^COMViewUtils()_"',"_$select(blnUseKeyStroke:"true",1:"false")_");" // SR15426
+				; :pblnInForm - Always do the following code otherwise select all button hidden for popups
+				write:'pblnInForm "if (window.opener!=null) document.getElementById('SelectAll').style.display='"_($select($get(^CacheTempView(YUSER,"CallBack"))'="":"inline",1:"none"))_"';" // SR15426
+				do Setup^COMView(idClass)
+				do SetupControls^COMViewFilterControl(idClass)
+				if 'pblnInForm                   do DisplayHeader^COMViewFilterColumn(idClass)
+				if blnUseKeyStroke || pblnInForm do DisplayGrid()
+				
+				do Show^COMViewDescription()
+				if 'pblnHyper {
+					write "searchbar.style.display='none';",!
+					write "document.getElementById('WWW').style.display='none';"             //SR17469
+					
+					;if (YUSERAGENT'="MSIE") {
+						;write "document.getElementById('objDIV').style.width='98%';"         //SR17469
+						;write "document.getElementById('objDIV').style.paddingRight='0px';"  //SR17469
+					;}
+					write "objDIV.style.display='block';",!                                  //SR17253
+					write "bdyDiv.style.height=Math.max(document.body.clientHeight-getPageOffsetTop(bdyDiv)-30,0);",!  //SR17418
+				//	write "bdyDiv.style.setExpression('height','document.body.clientHeight-getPageOffsetTop(bdyDiv)','JScript');",!  //SR17418
+					write "document.body.style.overflow='hidden';",!
+					write:blnUseKeyStroke "AddMore(1);",!
+					write "objDIV.focus();",!                                            //SR17253
+				    write "window.attachEvent('onresize',SetWindowSize);",!
+				    write "window.attachEvent('onload',function() {SearchSetFocus; SetWindowSize();});",!               //SR17378 //SR17430  ;CORE-292
+				    write "document.attachEvent('onbeforeunload',SetWindowPosition);",!  //SR17378
+					write "if ((document.getElementById('MegaMenu')) && (document.getElementById('FRAME_Header')!=null)) { document.getElementById('objDIV').insertBefore(document.getElementById('FRAME_Header'),document.getElementById('objDIV').children[0]); }" ;CORE-215
+					$$$EndScript()
+				}
+				
+				// If I am not being shown, reset the grids height.
+				set strViewForm = $$GetForm()
+				if $get(^CacheTempToggleView(YUSER,YUCI,strViewForm,"Type"))="none" {
+					set strHeight = $get(^CacheTempToggleView(YUSER,YUCI,strViewForm,"Height"))
+					write "SetGridHeight('"_(+strHeight)_"','"_($piece(strHeight,"+",2))_"');"
+				}
+				write !
+				
+			} else {  ; "Class %1 cannot be compiled. Contact Support."
+				if 'pblnHyper {
+					write "<font size=3><B>"_$$$Text($listbuild("Com00107",idClass))_"<B></font>"
+				} else {
+					$$$Alert($listbuild("Com00107",idClass))
+				}
+			}
+		}
+	}
+	quit $$$OK
+	
+	
+OnBeforeDisplayGrid(penumType=$$$EnumDisplayTypeCOMView,pobjOutput="")
+	;-------------------------------------------------------------------------------
+	; Kill the temp data before exporting the data.
+	;
+	; Params:
+	; penumType : How this is being output, defaults to COMView.
+	; pobjOutput: Where to store the output.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Feb-2007	RPW		SR15426: Ignore the main form and reget the correct data.
+	; 08-Aug-2006	RPW		SR14896: Created
+	;-------------------------------------------------------------------------------
+	new blnInForm
+	
+	kill ^CacheTempSQL($$$SQLID)
+	set blnInForm = $get(^CacheTempView(YUSER,YUCI,"InForm"))
+	kill ^CacheTempView(YUSER,YUCI,"InForm")
+	do DisplayGrid(,$$$YES,,,,penumType,pobjOutput)
+	set ^CacheTempView(YUSER,YUCI,"InForm") = blnInForm
+	kill ^CacheTempSQL($$$SQLID)
+	
+	quit
+	
+	
+GetMaximum(pidClass,pidView,pblnLoadAll)
+	;-------------------------------------------------------------------------------
+	; Works out the maximum number of records to return in the result set.
+	; Code taken out of DisplayGrid and additional tests to improve performance and reliability
+	; if OnBeforeDataAccess and OnBeforeSQL logic exists.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Apr-2010	GRF		-: Fix pidClass not idClass
+	; 08-Dec-2009	shobby	SR17075: Created
+	;-------------------------------------------------------------------------------
+	new intMaxCount,YSQL,YODBA,strStatus
+	
+	if $$$COMViewRetrieveAllRecords($get(^COMView(0,pidClass,pidView,1))) {
+		set intMaxCount = 99999999999999
+		
+	} else {
+		set intMaxCount = $$GetMaximum^COMViewConfig(pblnLoadAll)
+		set YSQL = ""
+		set strStatus = $$ExecuteHook^WWW001Hook(pidClass,$$$EnumWWWEVENTTYPEOnBeforeSQL,,,$get(^CacheTempView(YUSER,"CallingForm")))
+		if YSQL="" {
+			set YODBA = $$$NO
+			do DataAccess(pidClass," ","")
+			if YODBA = $$$YES set intMaxCount = 99999999999999
+		}
+	}
+	quit intMaxCount
+	
+	
+DisplayGrid(pintIgnoreRows=0,pblnLoadAll=$$$NO,pstrKey="",pintLevel="",
+			pblnManual=$$$NO,penumType=$$$EnumDisplayTypeCOMView,pobjOutput="")
+	;-------------------------------------------------------------------------------
+	; Refreshed the result grid on the screen. Uses a combination of
+	; sql and global checking for results.
+	; 
+	; Parameters:
+	;	penumType : The type of export, -1 = COMView, 0 = Excel, 1 = CSV 
+	;	pobjOutput: The file type to output (not used for COMView export)
+	;
+	; Returns: $$$OK
+	;
+	; History:
+    ; 23-Sep-2013	shobby	UFH-11.24: Change Row to idRow in 2010 the Library.Resul]]><![CDATA[tSet may modify the Row variable
+	; 21-Oct-2010	shobby	SR17532: Refresh screen if COMView CacheTemp data has
+	;							been deleted by another session.
+	; 19-Nov-2009	shobby	SR17075: Call out to GetMaximum.
+	; 01-Oct-2009	SCR		SR16921: Added Logging
+	; 08-Oct-2008	PPP		SR16016: Flag an error and display it to the user if
+	; 							there is an error executing the SQL query
+    ; 09-Sep-2008	PPP		SR15866:Update COMView to Objects
+	; 03-Sep-2008	shobby	SRBR014977	Replaced = with '<. Possible that if rows
+	; 							are ignored the test doesn't trigger because it
+	; 							never returns exactly equal.  Don't remember the
+	; 							exact details but this was an emergency patch made
+	; 							to SES.
+	; 25-Jun-2008	GRF		SRBR014953:	$$$COMViewUserLastView may return a view id
+	;							that is no longer current and this will then report
+	;							as an undefined COMView record.  Force to default
+	;							view (0) and use $get to ensure even this can't be
+	;							missed.
+	; 09-Jun-2008	shobby	SRBR014953:	A new field on COMView 'RetrieveAllRecords'.
+	;							This forces an override of the 'Maximum Results
+	;							Returned' property of 'COMViewConfig' to handle the
+	;							case where there is an OnFilter routine to limit the
+	;							result set, and the returned results may not fall
+	;							within the TOP x results returned by the query.
+	;							(Refer to SR for more detailed information on how to
+	;							configure COMView for best performance)
+	; 05-Feb-2008	shobby	SRBR014892: If a COMView is called with 'Start Form With
+	;							Search Function' from a menu option then YFORM does
+	;							not contain the form of the search items but
+	;							'COMViewSearch
+	; 28-Oct-2007	shobby	SRBR014744: Change previous check to a $data
+	; 23-Oct-2007	shobby	SRBR014744: Don't call the onFilter without finding
+	;							a data record.
+	; 09-Oct-2007	shobby	SRBR014744: Speed Up OnFilter.  If no callouts found
+	;							stop doing check.
+	; 02-Oct-2007	shobby	SRBR014726: Allow filtering of which records can be
+	;							displayed using a call out to core and var routines.
+	; 22-Feb-2007	Steve S	SR15440: New routine SaveCache^COMViewSession()
+	; 09-Feb-2007	RPW		SR15426: Do not show the entire data set, just call the
+	;							code to show the grid.
+	; 04-Sep-2006	RPW		SR15005: Get the maximum number of rows. If we have
+	;						enough data, add a plus to the rowcount.
+	; 01-Sep-2006	RPW		SR14992: Increase row count from 9 to 19.
+	; 25-Aug-2006	JW		SR14763: Cleanup where clause. Remove row count. Set status.
+	; 25-Aug-2006	RPW		SR14857: Corrected 'where' clause replacement to
+	;							generate the same sql as before.
+	; 14-Aug-2006	RPW		SR14896: Use a $C(0) delimiter instead of Y, quick fix
+	;							to make sure showing the plan doesn't crash.
+	; 08-Aug-2006	RPW		SR14896: Made this routine only prepare the data once
+	;							if the SQL has not changed.
+	; 07-Aug-2006	PO		SR14871: Removed call to RowCount^COMViewSQL - Just don't
+	;							call if not going to use
+	; 12-Jul-2006	RPW		SR14254: Use the fastest construct first in an if test
+	;							Added code to handle exporting to Excel and CSV.
+	; 14-Jun-2006	Steve S	SR14613: Don't re-construct where clause if no submission
+	; 28-Sep-2005	JW		SR13447: Only increment row if adding (by ref)
+	; 30-May-2005	Paul K	AddMore if first time through. SR:12466
+	; 30-Nov-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new blnData,blnErrorMsg,blnFinished,blnInForm,blnIsShared,blnMax,blnNewWhere
+	new blnObj,blnOnDataAccess,blnOnFilter,blnView
+	new dteStart,idClass,idKey,idParentForm,idRef,idView
+	new intColumn,intDisplayRow,intMaxCount,intRow,intRowCount,KeyLoop,lstColumns
+	new objResult,idRow,sc,strName,strRecordCount,strRef,strSQL
+	
+ 	if $get(^CacheTempView(YUSER,"Class"))="" {
+	 	do Recover^COMViewDisaster()   ; SR17532
+ 		
+ 	} else {
+	 	set blnErrorMsg = $$$NO        ; SR17267
+		set blnObj      = +$get(^CacheTempObj(YUSER,"Object"))
+		
+		if penumType=$$$EnumDisplayTypeCOMView do SaveCache^COMViewSession()
+		
+		set blnInForm   = $get(^CacheTempView(YUSER,YUCI,"InForm"))
+		set blnNewWhere = (pblnManual || $$UseKeyStroke^COMViewConfig())
+		
+		set idClass     = $get(^CacheTempView(YUSER,"Class"))
+		set idRow         = 0
+		set dteStart    = $ztimestamp
+		set blnFinished = $$$YES
+		
+		if blnInForm set pblnLoadAll = $$$YES
+		
+		set idView = $$$COMViewUserLastView($get(^COMViewUser(0,idClass,YBED,1)))
+		
+		; User may be set to a deleted favourite - use default
+		if idView="" set idView = 0
+		if '$data(^COMView(0,idClass,idView,1)) set idView = 0
+		
+		set intMaxCount = $$GetMaximum(idClass,idView,pblnLoadAll)			;SR17075
+		
+		set lstColumns	= $$GetColumns^COMViewFilterColumn(idClass)
+		set strSQL		= $$GenerateSQL^COMViewSQL(idClass,lstColumns,pstrKey,pintLevel,,,,intMaxCount,blnInForm)
+		set blnView     = +$get(^CacheTempView(YUSER,"View"))
+		
+		if blnInForm || ($get(^CacheTempSQL($$$SQLID))'=strSQL) {   // Populate
+			set ^CacheTempSQL($$$SQLID) = strSQL
+			kill ^CacheTempSQL($$$SQLID,"Data")
+			kill ^CacheTempSQL($$$SQLID,"Row")
+			kill ^CacheTempSQL($$$SQLID,"Key")
+			
+			set objResult = ##class(%SQL.Statement).%New()
+			
+			// If we are populating the Query, look through and keep the data
+			do objResult.%Prepare(strSQL)
+			kill ^zzsilmar
+			set ^zzsilmar($now()) = strSQL
+			set sc      = objResult.%Execute()
+			set blnData = sc.%Next()
+			if $get(%objlasterror)'="" {
+				set strSQL = $$GenerateSQL^COMViewSQL(idClass,lstColumns,pstrKey,pintLevel,1,,,intMaxCount)
+				do objResult.%Prepare(strSQL)
+				set sc      = objResult.%Execute()
+				set blnData = sc.%Next()
+			}
+			do LogSQL^COMViewLog(strSQL,"",$$DateDiff^COMUtilDate(dteStart,$ztimestamp),$$$YES)  ; SR16921
+			
+			set idKey           = ""
+			set blnMax          = $$$NO
+			set blnOnFilter     = $$$YES
+			set blnOnDataAccess = $$$YES
+			while blnData {
+				set blnMax = ((idRow=intMaxCount) && (intMaxCount'=0))
+				quit:blnMax
+				
+				if 'blnView {
+					set idRef  = sc.%Get("ID")
+					set idKey  = ""
+				
+					set strRef = "^"_idClass_"("
+					set blnIsShared = ($$$WWW001SharedFile($get(^WWW001(0,idClass,1))))
+					if blnIsShared set strRef = strRef_"0,"
+					for KeyLoop=1:1:$length(idRef,"||") {
+						set strRef=strRef_""""_$piece(idRef,"||",KeyLoop)_""","
+						if (KeyLoop'=1) || blnIsShared {
+							if idKey'="" set idKey = idKey_","
+							set idKey = idKey_$translate($piece(idRef,"||",KeyLoop),",","|")
+						}
+					}
+					set strRef = strRef_"1)"
+				}
+				
+				if 'blnObj {
+					if $data(@strRef) && ('blnOnFilter || $$OnFilter(idKey,@strRef,.blnOnFilter)) {
+						if ('($data(^CacheTempLockInterest(YUSER)) && $$IsExternallyLocked^COMLock(idClass,idKey)) && 
+						     ('blnOnDataAccess || $$DataAccess(idClass,idKey,.blnOnDataAccess))                    ) {
+						
+							for intColumn=1:1:objResult.%Metadata.columns.Count() {
+								set strName = objResult.%Metadata.columns.GetAt(intColumn).colName
+								
+								if 'blnView && (strName="ID") {
+									set ^CacheTempSQL($$$SQLID,"Data",idRow,strName)    = idKey_$$$NULLCHAR_strRef
+									set ^CacheTempSQL($$$SQLID,"Key",$$$Index(idKey)) = idRow_$$$NULLCHAR_strName
+								} else {
+									set ^CacheTempSQL($$$SQLID,"Data",idRow,strName)    = sc.%Get(strName)
+								}
+							}
+							set idRow = $increment(idRow)
+						}
+					}
+					
+				} else {
+					for intColumn=1:1:objResult.%Metadata.columns.Count() {
+						set strName = objResult.%Metadata.columns.GetAt(intColumn).colName
+					
+						if (strName="ID") {    ; FIXME : without "Key" this test is unnecessary.
+							set ^CacheTempSQL($$$SQLID,"Data",idRow,strName) = sc.%Get(strName)
+						//	set ^CacheTempSQL($$$SQLID,"Key",$$$Index(idKey)) = idRow_$$$NULLCHAR_strName
+						} else {
+							set ^CacheTempSQL($$$SQLID,"Data",idRow,strName) = sc.%Get(strName)
+						}
+					}
+					set idRow = $increment(idRow)
+				}
+				set blnData = sc.%Next()
+			}
+			
+			if $$$ISOK(sc) {
+				set ^CacheTempSQL($$$SQLID,"RowCount") = idRow_$select(blnMax:"+",1:"")
+			} else {
+				set ^CacheTempSQL($$$SQLID,"RowCount") = $$DecodeCacheError^COMUtilError(sc)_" 0"
+				set blnErrorMsg = $$$YES
+			}
+			kill sc
+		}	
+		
+		if penumType=$$$EnumDisplayTypeCOMView {
+			;SR17267 $$$SetStatus
+			write "SetStatus('"_$$$Text($listbuild("Com00255",$$$RowCount))_"');",!
+			if blnErrorMsg write "SetupWarning(document.getElementById('bdystatus'),'"_$$$JSText($$$Text("Com00331"))_"')",!
+		} ; "Check 'Allow Extrinsic Functions in SQL Statements' settings in Cache ..."
+		
+		if 'blnInForm {
+			set intRow      = 0
+			set intRowCount = +$get(^CacheTempSQL($$$SQLID,"RowCount"))
+			
+			if ((pintIgnoreRows=0) || (intRowCount=0)) && (penumType=$$$EnumDisplayTypeCOMView) {
+				write "ClearRows(bdy);",!
+				write "CurrentRow=null;",!
+				kill ^CacheTempSQL(YUSER_"-"_YFORM,"Row")
+			}
+			
+			if (pintIgnoreRows'=intRowCount) {
+				// Loop through and display the new data.
+				set blnFinished   = $$$NO
+				set idRow           = $get(^CacheTempSQL($$$SQLID,"Row"))
+				set intDisplayRow = pintIgnoreRows
+				
+				write "document.getElementById('objDIV').style.cursor='wait';",!
+				
+				for {
+					set idRow = $order(^CacheTempSQL($$$SQLID,"Data",idRow))
+					if idRow="" {
+						set blnFinished = $$$YES
+						quit
+					}
+					
+					do AddRow(.intDisplayRow,idClass,lstColumns,0,.intRow,penumType,pobjOutput,idRow)
+					set intRow = 1-intRow
+					
+					quit:((intDisplayRow-pintIgnoreRows)'<$$$RowLimit)&&('pblnLoadAll)
+				}
+				write "document.getElementById('objDIV').style.cursor='default';",!
+							
+				// Store the last row used.
+				set ^CacheTempSQL($$$SQLID,"Row") = idRow
+				
+				if penumType=$$$EnumDisplayTypeCOMView {
+					if blnFinished      write "bdy.Finished=true;",!
+					if pintIgnoreRows=0 write "AddMore(1);",! ; If more to display, initiate call to get another lot of records.
+				}
+			}
+		} else {
+			do OnChangeData()
+		}
+		do LogSQL^COMViewLog(strSQL,"",$$DateDiff^COMUtilDate(dteStart,$ztimestamp),pblnManual)
+ 	}
+	quit $$$OK
+	
+	
+OnFilter(YKEY="",YFELD="",&pblnCheck=$$$YES,pidClass="")
+	;-------------------------------------------------------------------------------
+	; If a COMView is called with 'Start Form With Search Function' from a menu option
+	; then YFORM does not contain the form of the search items but 'COMViewSearch'
+	; 
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jul-2011	GRF		SR17751: dot prefix on call to OnFilter was missing
+	; 19-Jun-2008	shobby	SRBR014956: Only get the YFORM from CallingForm if the
+	;							form is related to the class.  (If not then this is
+	;							a popup search on a field)
+	; 05-Feb-2008	shobby	SRBR014892: Created
+	;-------------------------------------------------------------------------------
+	new objWWW120,idForm
+	
+	if ($get(YFORM)="") || ($extract($get(YFORM),1,7)="COMView") {
+		set idForm = $get(^CacheTempView(YUSER,"CallingForm"))
+		if idForm'="" {
+			set objWWW120 = $get(^WWW120(0,idForm,1))
+			if $$$WWW120ClassUsedInForm(objWWW120)'="" {
+				if $$$WWW120ClassUsedInForm(objWWW120)=$get(^CacheTempView(YUSER,"Class")) {
+					new YFORM
+					set YFORM = $get(^CacheTempView(YUSER,"CallingForm"))
+				}
+			}
+		}
+	}
+	quit $$OnFilter^WWWSOR(YKEY,YFELD,.pblnCheck)    ; SR17751
+	
+	
+ManualSubmit()
+	;-------------------------------------------------------------------------------
+	; Call back from JavaScript when the manual submit button is clicked.
+	; 
+	; Called by JS: SubmitQuery()
+	; 
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Jun-2006	SteveS	SR14613: Created
+	;-------------------------------------------------------------------------------
+	do DisplayGrid(,,,,$$$YES)
+	
+	quit $$$OK
+	
+	
+ExpandRow(pstrRow,pstrSeparator,&pobjRow,pstrTemp)
+	;-------------------------------------------------------------------------------
+	; The result set can now display multiple lines for the same record.  Ie if searching
+	; for all the INREC's that contain a particular item in the INRECLine
+	;
+	; Inputs:	pstrRow:		The current 'single' row.
+	;			pstrSeparator:	The separator used to delineate the rows
+	;			pobjRow			The returned expanded version
+	; Returns:
+	;
+	; History:
+	; 22-Sep-2014	SCR		SMSPE-85: Use alternate array
+	; 19-Feb-2008	shobby	SRBR014900: Created
+	;-------------------------------------------------------------------------------
+	new idxRows,intColumn,intLine,strColumn1,strColumn2,strRow,strRow2
+	
+	kill @pstrTemp
+	set @pstrTemp@(1) = pstrRow
+	for intColumn=1:1:$length(pstrRow,Y) {
+		set strColumn1 = $piece(pstrRow,Y,intColumn)
+		set strColumn2 = $piece(strColumn1,$$$Separator,1)
+		for intLine=2:1:$length(strColumn1,$$$Separator) {
+			if $$$NEVER {
+				set strColumn2 = strColumn2_pstrSeparator_$piece(strColumn1,$$$Separator,intLine)
+			} else {
+				if '$data(@pstrTemp@(intLine)) {
+					merge @pstrTemp@(intLine) = @pstrTemp@(intLine-1)
+				}
+				set $piece(@pstrTemp@(intLine),Y,intColumn) = $piece(strColumn1,$$$Separator,intLine)
+			}
+		}
+		set $piece(@pstrTemp@(1),Y,intColumn) = strColumn2
+	}
+	set idxRows = ""
+	for {
+		set idxRows = $order(@pstrTemp@(idxRows))
+		quit:idxRows=""
+		
+		if $find(Y_@pstrTemp@(idxRows)_Y,Y_"####################"_Y) {
+			kill @pstrTemp@(idxRows)
+		}
+	}
+	quit
+	
+	
+AddRow(Row=0,pidClass,plstColumns,pintLevel,pintRow=0,
+	   penumType=$$$EnumDisplayTypeCOMView,pobjOutput="",pintLogicalRow)
+	;-------------------------------------------------------------------------------
+	; Adds a row to the grid.
+	;
+	; Params:	Row = LastRow to be added (by Ref)
+	; pintRow
+	; penumType : The type of export, -1 = COMView, 0 = Excel, 1 = CSV 
+	; pobjOutput: The file type to output (not used for COMView export)
+	;
+	; History:
+	; 
+	; 22-Sep-2014	SCR		SMSPE-85: Check size of sub rows and use global if to large
+	; 17-Oct-2013	shobby	CORE-286: Some bad data found in classification field of INART could
+	;							cause COMView to crash.  Limit the returned text to 460 characters	
+	; 12-Apr-2011	shobby	SR17130: Call out to TwoPart
+ 	; 28-Apr-2009	PPP		SR16499: Removed code which gets the last part of the ID
+ 	; 							only for Objects.  Not necessary was corrupting the ID
+	; 07-Oct-2008	PPP		SR15960:Updated the Column Heading to include the Parent Field.
+    ; 09-Sep-2008	PPP		SR15866:Update COMView to Objects
+	; 21-Feb-2008	shobby	SRBR014900: For referenced classes need to pass the form id.
+	; 20-Feb-2008	shobby	SRBR014900: Added support for Expand rows in the result
+	;							set to show for example, one row for each different
+	;							item in an INREC that has INRECLines with multiple
+	;							items.
+	; 21-Jan-2008	shobby	SRBR014860: Remove the characters that will cause a new
+	;							cell when pasted into Excel.
+	; 11-Dec-2006	JW		SR15299: Check for language translation
+	; 04-Sep-2006	RPW		SR15005: We now always do the loop
+	; 11-Aug-2006	RPW		SR14896: Make sure that this is not doing any work to get the data.
+	; 12-Jul-2006	RPW		SR14254: Use the fastest construct first in an if test
+	;							Added code to handle exporting to Excel and CSV
+	; 18-Jul-2006	RPW		SR14760: If the field type is P, remove any leading and trailing quotes.
+	; 01-Jun-2006	PO		SR14266: Shifted the set of strPiece2 to ensure undefined errors do not occur
+	; 11-May-2006	RW		SR14220: Don't show if locked
+	; 19-Apr-2006	JW		SR14429: Added View support
+	;  POSTPONED 27-Feb-2006	PO		SR14266: set strPiece2 when pobjResult.Data(idField) exists
+	; 28-Sep-2005	JW		SR13447: Data Access for records
+	; 05-May-2005	Paul K	Changed "|"s to space then &nbsp;(SR#11888)
+	; 07-Apr-2005	Paul K	Dont use a <br> bfore the ....s(SR#11888)
+	; 14-Mar-2005	Paul K	Changed pipes ("|") into "&nbsp;"s (SR#11888)
+	; 01-Mar-2005	Paul K	Ensure no "~" in data sent to screen
+	; 07-Feb-2005	PO		SR10965 Adding support for related classes.
+	;-------------------------------------------------------------------------------
+	new blnValueShort,blnObj,blnView,idClass,idField,idForm,idKey,idRef
+	new idxRows,intCount,intField,intLen,loop,lstValue,objRef,objRow
+	new strAlign,strBlnValuesShort,strCellAlign,strColName,strItem,strLangRef
+	new strPiece2,strPiece3,strRef,strRow,strValue,strTemp
+	
+	if penumType=$$$EnumDisplayTypeCOMView {
+		set strRow = $$GetCommands^COMViewCommand()
+		if strRow'="" {
+			set strAlign          = Y
+			set strBlnValuesShort = Y
+		} else {
+			set strAlign          = ""
+			set strBlnValuesShort = ""
+		}
+	} else {
+		set strRow            = ""
+		set strAlign     ]]><![CDATA[     = ""
+		set strBlnValuesShort]]><![CDATA[ = ""
+	}
+	
+	set blnObj = $get(^CacheTempObj(YUSER,"Object"))	//SR15866
+	set blnView = $get(^CacheTempView(YUSER,"View"))
+	
+	if blnView {
+		set objRef = ""
+		set idKey  = ""
+		
+	} elseif blnObj {
+		set objRef = ""
+		set idRef  = $get(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,"ID"))
+		set idKey  = idRef
+		
+	} else {
+		set strRef = "^"_pidClass_"("
+		set idRef  = $get(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,"ID"))
+		set idKey  = $piece(idRef,$$$NULLCHAR,1)
+		set strRef = $piece(idRef,$$$NULLCHAR,2)
+		set objRef = $get(@strRef)
+	}
+	
+	for loop=1:1:$listlength(plstColumns) {
+		set (idField,strColName) = $listget(plstColumns,loop)
+		if loop'=1 {
+			set strRow            = strRow_Y
+			set strAlign          = strAlign_Y
+			set strBlnValuesShort = strAlign_Y
+		}           
+		
+		if idField="RowCount" {
+			if $data(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,idField)) {
+				set strRow = strRow_$get(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,idField))
+			} else {
+				set strRow = strRow_1
+			}
+			set strAlign = strAlign_"right"
+		
+		} else {
+			set strCellAlign = "left"
+			set idClass      = pidClass
+			set strPiece2    = $piece(idField,".",2)
+			
+ 			if blnObj {
+ 				set idClass = $$GetClass^COMViewObject(idClass,idField)
+ 				// if Item->ItemId  get ItemId
+ 				set strColName = $translate(idField,"->","_")
+ 				set idField = $piece(idField,"->",$length(idField,"->"))
+ 			}
+			
+			if $data(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,strColName)) {
+				set strValue = $get(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,strColName))
+	 			if blnObj {
+	 				set idClass = $$GetClass^COMViewObject(idClass,idField)
+	 				// if Item->ItemId  get ItemId
+	 				set idField = $piece(idField,"->",$length(idField,"->"))
+	 			}
+				
+			} else {
+				set strValue  = ""
+				set strPiece3 = $piece(idField,".",3)
+				
+				if $extract(strPiece2)="C" {
+					set idClass = $extract(strPiece2,2,$length(strPiece2))
+					set idField = strPiece3
+					set idForm  = idClass
+				}
+				
+				set intField = $piece($extract(idField,2,99),".",1)
+				
+				set blnValueShort=$$$NO
+				if $extract(strPiece2)="C" {
+					set idKey         = $$TwoPart(idClass,idKey,idField)    ;SR17130
+					set lstValue      = $$GetData^COMViewCellData(idClass,idKey,idField,.strCellAlign,,$listget(plstColumns,loop),idForm,$$$Separator)
+					set blnValueShort = $listget(lstValue,1)
+					set strValue      = $listget(lstValue,2)
+					
+				} elseif $find(idField,".") {
+					set strValue = $$SubClass^COMViewCellData(pidClass,idKey,objRef,idField)
+						
+				} elseif $extract(idField)="P" {
+					if blnView {
+						set strValue = $get(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,$$$WWW002PropertyName($get(^WWW002(0,idClass,intField,1)))))
+					} else {
+						set strValue = $piece(idKey,",",intField)
+					}
+					
+					if $extract(strValue)="""" {
+						set strValue = $extract(strValue,2,$length(strValue)-1)
+					}
+					
+				} elseif $extract(idField)="D" {
+					if blnView {
+						set strValue = $get(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,$$$WWW002PropertyName($get(^WWW003(0,idClass,intField,1)))))
+					} else {
+						// If there is a language class AND we have the relational field AND we have the main class,
+						// look up the translated relation.  If it doesn't exist, use the default.
+						if ($get(^CacheTempView(YUSER,"RelField"))=intField) && ($get(^CacheTempView(YUSER,"Class"))=idClass) {
+							set strLangRef = "^"_$get(^CacheTempView(YUSER,"RelLang"))_"("_$piece(strRef,"(",2)
+							set $piece(strLangRef,",",$length(strLangRef,",")) = "SPRACHE,1)"
+							
+							xecute "set strValue = $get("_strLangRef_")"
+						}
+						if strValue="" {
+							set strValue = $piece(objRef,Y,intField)
+						}
+					}
+					set strValue=$extract(strValue,1,460) ;CORE-286
+				} elseif $extract(idField)="C" {
+					set strValue = $$GetCalculatedValue(pidClass,idField,idKey,objRef,pintLogicalRow) ;SR13213
+				}
+			}
+			
+			if $extract(strPiece2)'="C" {
+	 			if 'blnObj {
+					set lstValue = $$DisplayValue(idClass,idField,strValue,idKey,.strCellAlign)
+	 			} else {
+					set lstValue = $$DisplayValueForObject^COMViewObject(idClass,idField,strValue,idKey,.strCellAlign)		 		
+	 			}
+				set blnValueShort = $listget(lstValue,1)
+				set strValue      = $listget(lstValue,2)
+				set strValue      = $$Replace^COMUtilStr($listget(lstValue,2),"|"," &nbsp;")
+				set strRow        = strRow_$translate(strValue,Y,"-")
+				if blnValueShort {
+					set strRow = strRow_"&nbsp;..."
+				}
+				
+			} else {
+				set strRow=strRow_$translate(strValue,Y,"-")
+			}
+			
+			set strAlign          = strAlign_strCellAlign
+			set strBlnValuesShort = strBlnValuesShort_blnValueShort
+		}
+	}
+	set strTemp	= "objRow"
+	if $length(strRow,$$$Separator)>100 {
+		set strTemp	= "^CacheTempView(YUSER,""Expand"")"
+	}
+	kill @strTemp
+	do ExpandRow(strRow,$$$Separator,.objRow,strTemp)
+	
+	set idxRows = ""
+	for {
+		set idxRows = $order(@strTemp@(idxRows))
+		quit:idxRows=""
+		
+		set strRow = @strTemp@(idxRows)
+		if penumType'=$$$EnumDisplayTypeCOMView {
+			set intLen = $length(strRow,Y)
+			do:penumType=$$$EnumDisplayTypeExcel pobjOutput.WriteLine("<tr>")
+			for intCount=1:1:intLen {
+				set strItem=$piece(strRow,Y,intCount)
+				if penumType=$$$EnumDisplayTypeExcel {
+					do pobjOutput.WriteLine("<td "_$select(pintRow:"class='row'",1:"")_" style='text-align="_$piece(strAlign,Y,intCount)_";'>")
+					set strItem = $$FullReplace^COMUtilStr(strItem,"<p />","")
+					set strItem = $$FullReplace^COMUtilStr(strItem,"<p/>","")
+					set strItem = $$FullReplace^COMUtilStr(strItem,"</p>","")
+					set strItem = $$FullReplace^COMUtilStr(strItem,"<p>","")
+					set strItem = $$FullReplace^COMUtilStr(strItem,"<br />","")
+					set strItem = $$FullReplace^COMUtilStr(strItem,"<br>","")
+					do pobjOutput.WriteLine(strItem)
+					do pobjOutput.WriteLine("</td>")
+				} else {
+					if strItem[","     set strItem = """"_strItem_""""
+					if intCount<intLen set strItem = strItem_","
+					do pobjOutput.Write(strItem)
+				}
+			}
+			if penumType=$$$EnumDisplayTypeExcel {
+				do pobjOutput.WriteLine("</tr>")
+			} else {
+				do pobjOutput.WriteLine()
+			}
+			set Row = $increment(Row)
+		} else {
+			write "Add(bdy,"_$increment(Row)_",'"_$zconvert(strRow,"o","JS")_"','"_$zconvert(idKey,"o","JS")_"','"_strAlign_"','"_strBlnValuesShort_"');"		// SR13447
+		}
+	}
+	quit
+	
+	
+TwoPart(pidClass,pidKey,pidField)
+	;-------------------------------------------------------------------------------
+	; If the class has a two part primary key where the first is related to WWW0121
+	; then assume YLOCATION.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Jun-2011	shobby	SR17130: Removed WWW003 processing.  Don't know why that
+	;							would have been added.
+	; 12-Apr-2011	shobby	SR17130: Created
+	;-------------------------------------------------------------------------------
+	new objWWW002,objWWW003
+	
+	if (pidClass'="") {
+		set objWWW002 = $get(^WWW002(0,pidClass,1,1))
+		if $$$WWW002RelationClass(objWWW002)="WWW0121" {
+			if $get(YLOCATION)'="" {
+				set pidKey = YLOCATION_","_pidKey
+			}
+		}
+	}
+	quit pidKey
+	;if (pidClass'="") {
+	;	if $extract(pidField)="P" {
+	;		set objWWW002 = $get(^WWW002(0,pidClass,1,1))
+	;		if $$$WWW002RelationClass(objWWW002)="WWW0121" {
+	;			if $get(YLOCATION)'="" {
+	;				set pidKey = YLOCATION_","_pidKey
+	;			}
+	;		}
+	;	} elseif $extract(pidField)="D" {
+	;		set objWWW003 = $get(^WWW003(0,pidClass,1,1))
+	;		if $$$WWW003RelationDatabase(objWWW003)="WWW0121" {
+	;			if $get(YLOCATION)'="" {
+	;				set pidKey = YLOCATION_","_pidKey
+	;			}
+	;		}
+	;	}
+	;}
+	;quit pidKey
+	
+		
+DataAccess(pidClass,pidKey,&pblnCheck=$$$YES) 
+	;-------------------------------------------------------------------------------
+	; Call Data Access function on record if there is one AND not on masterdata search
+	;
+	; Params:	pidClass	- class of data
+	;			pidKey		- data key
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Dec-2009	shobby	SR17075: If a single space is passed in as the key we just
+	; 							want to know if a valid test exists and don't care about the result.
+	; 09-Oct-2007	shobby	SRBR014744: If no callouts then don't keep checking.
+	; 09-Oct-2007	shobby	SRBR014744: Pass the class that is being used to
+	;							populate the list in to the DataAccess call
+	; 28-Apr-2006	JW		SR14427: Corrected form
+	; 28-Sep-2005	JW		SR13447: Created
+	;-------------------------------------------------------------------------------
+	new blnValid,idFieldNo,idFieldType,idForm,strCallBack
+	
+	set blnValid    = $$$YES
+	
+	set strCallBack = $$$WWW001DataAccess($get(^WWW001(0,pidClass,1)))
+	set pblnCheck   = $get(pblnCheck)
+	
+	if strCallBack'="" {
+		set idForm      = $get(^CacheTempView(YUSER,"CallingForm"))
+		set idFieldType = $get(^CacheTempView(YUSER,"FieldType"))
+		set idFieldNo   = $get(^CacheTempView(YUSER,"FieldNo"))
+		
+		;SR17075vvvv
+		if (pidKey=" ")||(idFieldNo'="") || ($$$WWW120ClassUsedInForm($get(^WWW120(0,idForm,1)))'=pidClass) {		// Not on own master data
+			set blnValid = $$DataAccess^WWWFieldValidation(strCallBack,pidKey,idForm,idFieldType,idFieldNo,,pidClass,.pblnCheck)
+	;	FIXME : <GRF> Parameter 6 is Error code - should we we processing an error
+	;	              condition? (Pre-existing situation)
+		}
+	}
+	quit blnValid
+	
+	
+GetCalculatedValue(pidClass,pidField,pidKey,pobjRef,pintLogicalRow) 
+	;-------------------------------------------------------------------------------
+	; Get the value of a calculated field - Filter type "C"
+	;
+	; Params:
+	;	pinRow (added)        : The row number to be displayed
+	;	pintLogicalrow (added): The logical row to be displayed
+	;
+	; Returns: The result of a function call with substitution of {Parameter} entries.
+	;
+	; History:
+	; 24-Jan-2011	GRF		-: use idxClass rather than idClass; idxParam already set
+	; 03-Sep-2009	PPP		SR16842: Calculated fields within Calculated Fields
+	; 							update fix
+	; 11-Aug-2006	RPW		SR14896: No longer need the result set
+	; 27-Apr-2006	JW		SR14423: Convert date for calc fields.
+	; 19-Apr-2006	JW		SR14429: Added pobjResult param
+	; 03-Jan-2006	SteveS	SR14116: Use $$GetParamString^WWW001CalcFields
+	; 23-Sep-2005	shobby	SR13213: Company is a special case of a property.
+	;							(Implicitly defined primary key)
+	; 22-Sep-2005	shobby	SR13213: Created
+	;-------------------------------------------------------------------------------
+	; e.g. a calculation with the code string "$$SupplierDetail^INRPAUF({Company},{OrderSupplier},8)"
+	;      might generate "$$SupplierDetail^INRPAUF(0,"ABC123",8)" if the OrderSuppler "ABC123" was part
+	;      of pidKey or pobjRef
+	;      This is then executed to generate strValue which is returned.
+	;---------------------------------------
+	new idField,idPiece,idStrField,idxClass,idxParam,loop
+	new objWWW003Calc,strCode,strData,strParameter,strParamList,strValue
+	
+	set strValue = ""
+	set idxClass = $$$Index(pidClass)
+	set idField  = $extract(pidField,2,99)
+	
+	if (pidClass'="") && (pidField'="") {
+		set objWWW003Calc = $get(^WWW003Calc(0,pidClass,idField,1))
+		set strCode = $$$WWW003CalcCode(objWWW003Calc)
+
+		if strCode'="" {
+			set strParamList = $$GetParamString^WWW001CalcFields(strCode)  ; e.g. "{Company},{OrderSupplier}"
+			set strParameter = ""
+			for loop=2:1:$length(strParamList,"{") {
+				set strParameter = $piece($piece(strParamList,"{",loop),"}",1)
+				set idxParam     = $$$Index(strParameter)
+			
+				if $data(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,strParameter)) {
+					set strData = $get(^CacheTempSQL($$$SQLID,"Data",pintLogicalRow,strParameter))
+				
+				} else {
+					; Set value
+					if strParameter="Company" {
+						set strData = 0    ;= YM
+				
+					; Parameter is the result of another calculation for this class	
+					} elseif $data(^WWW003Calcs(0,1,idxParam,pidClass)) {
+						set idStrField = +$order(^WWW003Calcs(0,1,idxParam,pidClass,""))
+						set strData = $$GetCalculatedValue(pidClass,"C"_idStrField,pidKey,pobjRef,pintLogicalRow)
+					
+					; Parameter is key value or a data value
+					} else {
+			;			set idxParam = $$$Index(strParameter)
+						set idPiece  = $order(^WWW002s(0,3,idxClass,idxParam,pidClass,""))
+						if idPiece'="" {
+							set strData = $piece(pidKey,",",idPiece)
+						} else {
+							set idPiece = $order(^WWW003s(0,3,idxClass,idxParam,pidClass,""))
+							if idPiece'="" {
+								set strData = $piece(pobjRef,Y,idPiece)
+							}
+						}
+					}
+				}
+				set strCode = $$Replace^COMUtilStr(strCode,"{"_strParameter_"}",""""_strData_"""")
+			}
+			xecute "set strValue="_strCode
+		}
+		if $$$WWW003CalcDataType(objWWW003Calc)="%Date" {
+			set strValue = $$$FormatDate(strValue)
+		}
+	}
+	quit strValue
+	
+	
+DisplayValue(pidClass="",pidField="",pstrValue="",pidKey="",pstrAlign,blnTruncate=$$$YES,pblnIsControl=$$$NO,pidForm="")
+	;-------------------------------------------------------------------------------
+	; Converts a value for display. If the field has a relation, show it.
+	; 
+	; 
+	; NOTE re Macros : $$$WWW002* and $$$WWW003* share many matching fields
+	; 
+	;
+	; Returns:String
+	;
+	; History:
+	; 07-Jan-2011	GRF		SR17579: Use explicit tag for WWWTR calls
+	; 23-Nov-2010	shobby	SR17618: Support COMView searching on formulas
+	; 05-Jan-2010	GRF		SR15525: Call to $$Convert^WWWTR rather than $$^WWWTR
+	; 17-Nov-2009	GRF		SR16871: convert »CostCentre« into YLOCATION value
+	; 							(allow US spelling as well as English); replace
+	; 							$$$Add with $$$AddQuotes
+	; 02-Jul-2009	PPP		SR16663: Add the Calculated Relation Display Fields
+	; 20-Feb-2008	shobby	SRBR014900: Allow greater intMaxDataLength if we are
+	;							going to expand the line into multiple lines.
+	; 23-Nov-2007	shobby	SRBR014790: New parameter pidForm, this is passed in to
+	;							GetRelation to allow translating of cells that belong
+	;							to referenced classes, not the current class/form
+	;							that we are looking at.
+	; 11-Dec-2006	JW		SR15299: Check for language translation
+	; 06-Sep-2006	RPW		SRBR014073: Handle type of Date, added parameter 
+	;							pblnIsControl as both data and control come through
+	;							here and there is no way to tell the difference.
+	;							Note that a control has a date in display format,
+	;							whereas data has it in horolog format.
+	; 28-Oct-2005	JW		SR13074: Exchange Rate type
+	; 19-Jun-2005	Paul K	SR12577: Don't display relations if WWW002RelationDisplayOptions()=2
+	; 09-May-2005	Paul K	Added support for file names being in an applicaction parameter.
+	; 14-Mar-2005	Paul K	SR11888: If data too long, return maxlength characters (not 100)
+	; 10-Feb-2005	PO		SR10965: Changed over to returning list, including
+	;							whether value cut short
+	; 06-Dec-2004	Paul K	Fixed Bad data error.
+	;-------------------------------------------------------------------------------
+	new blnContinue,blnLang,idClass,idInputType,idLangClass,idRelationClass
+	new intCompany,intMaxDataLen,Loop,lstValue,objCOMViewConfig,objRef,objWWW003
+	new strCalcDisplay,strDisplay,strGlobal,strLangGlobal,strRelation,strUCValue,strValue
+	
+	;=======================================
+	; "»" = $char(187)     "«" = $char(171)
+	;=======================================
+	
+	if ($extract(pstrValue)="»") && ($extract($reverse(pstrValue))="«") {  ;Used for things like YUSER,YBED,YLOCATION etc...
+		set strValue=$extract(pstrValue,2,$length(pstrValue)-1)	
+		
+		set strUCValue = $zconvert(strValue,"u")
+		if ((strUCValue="COSTCENTRE") || (strUCValue="COSTCENTER")) && ($data(YLOCATION)=1) {
+			set pstrValue = $$GetCostCentre^INCostCentre(YLOCATION)
+		
+		} elseif (strValue'="") && ($data(@strValue)=1) {
+			set pstrValue = @strValue					
+		}
+	}
+	
+	set strValue  = ""
+	set pstrAlign = "left"
+	
+	set objCOMViewConfig = $get(^COMViewConfig(0,YM,1))
+	
+	if $$ExpandSelection^COMViewConfig() {
+		set intMaxDataLen = 10000
+	} else {
+		set intMaxDataLen = $$$COMViewConfigMaxdatalength(objCOMViewConfig)
+		if intMaxDataLen'>0 set intMaxDataLen = 100
+	}
+	
+	if (pidClass'="") && (pidField'="") {
+		set objWWW003 = $$GetRelation^COMViewUtils(.pidClass,pidField,pidForm,$$$YES)
+		
+		set idInputType     = $$$WWW002InputType(objWWW003)
+		set idRelationClass = $$$WWW002RelationClass(objWWW003)
+		
+		if $find(",4,8,12,18,",","_$$$WWW002InputType(objWWW003)_",") {
+			set pstrAlign="right"
+		}
+		if idInputType=2 {
+			set pstrValue = ''pstrValue
+			set strValue  = $$$SysEnum("JA/NEIN",pstrValue)
+		
+		} elseif idInputType=5 {                          ; password
+			set strValue = "*****"
+		
+		} elseif idInputType=10 {
+			if p]]><![CDATA[strValue'="" {
+				if idRelationClass="WWW101" {    ; idRelationClass = COMDirectoryListing
+					set pstrValue = $$GetEnumDescription^COMUtils($piece($$$WWW002RelationalPrimaryKeys(objWWW003),"""",2),pstrValue)
+				}
+				
+				if $extract(pidClass,1,3)="WWW" {  ;not quite sure how to determine if a pic is system or user...
+					set strValue = "<img src='"_YGIF_pstrValue_"' title='"_$zconvert(pstrValue,"o","HTML")_"'>"
+				} else {
+					set strValue = "<img src='"_YGIF1_pstrValue_"' title='"_$zconvert(pstrValue,"o","HTML")_"'>"
+				}
+			}
+		
+		} elseif pblnIsControl && (idInputType=1) {                // date types
+			set strValue = pstrValue
+		
+		} else {
+			if (idInputType'=3)       &&  (pstrValue'="")              &&
+			   (idRelationClass'="")  &&  (idRelationClass'=pidClass)  &&
+			   ($$$WWW002RelationDisplayOptions(objWWW003)'=2)             {  ; 2 : "Don't Display Relations"
+				if ($extract(pstrValue,1,3)="@$$") {
+					xecute "set strValue="_$extract(pstrValue,2,$length(pstrValue))  ;SR17618
+				
+				} else {
+					set blnContinue = $$$YES
+					// check for language translation
+					set idLangClass = $$$WWW001LanguageClassForRelations($get(^WWW001(0,idRelationClass,1)))
+					set blnLang     = (idLangClass'="")
+				
+					set idClass     = idRelationClass
+					set intCompany  = $$$WWWYM(idClass)
+					set strGlobal   = "("_$$$AddQuotes(intCompany)
+				
+					if $$$WWW002RelationalPrimaryKeys(objWWW003)'="" {
+						for Loop=1:1:$length($$$WWW002RelationalPrimaryKeys(objWWW003),",") {
+							set strRelation = $piece($$$WWW002RelationalPrimaryKeys(objWWW003),",",Loop)
+							if (+strRelation'=strRelation) && ('$find(strRelation,"""")) {
+								if '$data(@strRelation) {
+									do FindRelation^COMViewUtils(pidClass,strRelation,pidKey)
+								}
+								if $data(@strRelation) {
+									set strRelation = $$$AddQuotes(@strRelation)
+								} else {
+									set strRelation = ""
+								}
+							}
+							if (strRelation="")||(strRelation="""""") set blnContinue = $$$NO
+							set strGlobal=strGlobal_","_strRelation
+						}
+					}
+					for Loop=1:1:$length(pstrValue,",") {
+						if $piece(pstrValue,",",Loop)=""           set blnContinue = $$$NO
+						if $length($piece(pstrValue,",",Loop))>255 set blnContinue = $$$NO
+						set strGlobal=strGlobal_","_$$$AddQuotes($piece(pstrValue,",",Loop))
+					}
+				
+					// SR15299 - check for language translation
+					if blnContinue && blnLang {
+						set strLangGlobal = "^"_idLangClass_strGlobal_","_$$$QUOTE(SPRACHE)_",1)"
+						set objRef = $get(@strLangGlobal)
+					
+						if objRef'="" {
+							set blnContinue = $$$NO
+							set strValue = " - "_$piece(objRef,Y,1)
+						}
+					}
+				
+					//set strGlobal=strGlobal_",1)"
+				
+					if blnContinue {
+						set strGlobal = "^"_idClass_strGlobal_",1)"
+						set objRef=$get(@strGlobal)
+						if objRef'="" {
+							set strValue=" -"
+							//SR16663
+							set strDisplay=$$$WWW002RelationalDisplayItems(objWWW003)
+							set strCalcDisplay=$$$WWW003CalcRelationalDisplayItems(objWWW003)
+							if (strCalcDisplay'="") {
+								for Loop=1:1:$length(strCalcDisplay,";") {
+									set strValue =strValue_" "_$$GetCalculatedValue^WWWFOR71($$$WWW002RelationClass(objWWW003),$piece(strCalcDisplay,";",Loop),$$$WWW002RelationalPrimaryKeys(objWWW003)_","_pstrValue,objRef)
+								}
+							} else {
+								if (strDisplay="") set strDisplay=1
+								for Loop=1:1:$length(strDisplay,";") {
+									set lstValue=$$DisplayValue($$$WWW002RelationClass(objWWW003),"D"_$piece(strDisplay,";",Loop),$piece(objRef,Y,$piece(strDisplay,";",Loop)),,,blnTruncate,,$$$WWW002RelationClass(objWWW003))
+									set strValue=strValue_" "_$listget(lstValue,2)
+								}
+							}
+						}
+					}
+				}
+			}
+			set strValue = $$GetLiteral^WWWTR($$$WWW003InputType(objWWW003),pstrValue)_strValue
+		}
+	}
+	if blnTruncate && ($length(strValue)>intMaxDataLen) {
+		set lstValue = $listbuild($$$YES,$extract(strValue,1,intMaxDataLen))
+	} else {
+		set lstValue = $listbuild($$$NO,strValue)
+	}
+	quit lstValue
+	
+	
+GridClick(pidKey="",YBACK="",pblnJump=0,pidField,pblnBackToSearch=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Get Link for Form & Key then open form.
+	; 
+	; Called By : CallBack^COMViewCustom [only 3 arguments]
+	;             CallBack functions from JS function GridClick in COMViewSetupJS1
+	; 
+	; Returns:1
+	;
+	; History:
+	; 10-Nov-2010	shobby		SR17580: pblnBackToSearch
+	; 29-Oct-2010	shobby		SR17583: window.returnValue needs to be top.window.returnValue
+	;									for Firefox. (Same with close)
+    ; 28-Apr-2009	PPP			SR16499:1. Added the pidField parameter
+    ; 									2. Added the pidField parameter to Callback
+    ; 09-Sep-2008	PPP			SR15866:Update COMView to Objects (If 'V' do nothing)
+	; 13-Dec-2007	shobby		SRBR014844: Only use the 'AppendValue' if the field
+	;								being populated is of type 10-Filename
+	; 12-Aug-2007	shobby		SRBR014665: Close the window if specified in the
+	;								parameter regardless of what ever else is happening.
+	; 28-Mar-2006	JW			SR13102: Keep YBACK
+	; 23-Aug-2005	JW			SR12876: Check AppendValue
+	; 20-Dec-2004	Paul K		Only return the last key if popup (SR#11298)
+	; 19-Nov-2004	Paul K/SCR	Created
+	;-------------------------------------------------------------------------------
+	new strLink,idForm,idClass,idFilter,strCallBack,strRelation,retVal,idCallingForm,objWWW122
+	
+	set idClass       = $get(^CacheTempView(YUSER,"Class"))
+	set idForm        = $get(^CacheTempView(YUSER,"Form"))
+	set strRelation   = $get(^CacheTempView(YUSER,"Relation"))
+	set idCallingForm = $get(^CacheTempView(YUSER,"CallingForm"))
+	
+ 	if ($extract(strRelation,1)'="V") {
+		if (strRelation'="") && 'pblnJump { 
+			if $get(^CacheTempView(YUSER,"CallBack"))'="" {
+				//SR16499
+			//	write "if (window.opener!=null) {window.opener.CallBack('CallBack^COMViewCustom','"_
+			//	       $zconvert(pidKey,"o","JS")_
+			//	       "');} else {window.setTimeout(""CallBack('CallBack^COMViewCustom','"_
+			//	       $zconvert(pidKey,"o","JS")_"')"",50);}"
+				write "if (window.opener!=null) {"
+				write "window.opener.CallBack('CallBack^COMViewCustom','"
+				write $zconvert(pidKey,"o","JS")_"','0','"_$get(pidField)_"');} "
+				write "else {window.setTimeout(""CallBack('CallBack^COMViewCustom','"
+				write $zconvert(pidKey,"o","JS")_"','0','"_$get(pidField)_"')"",50);}"
+			
+			} elseif $get(^CacheTempView(YUSER,"ReturnValue")) {
+				set retVal = $piece(pidKey,",",$length(pidKey,","))
+				if $get(^CacheTempView(YUSER,"AppendValue"))'="" {
+					set objWWW122 = $$Get^WWW122(idCallingForm,$extract($piece(strRelation,idCallingForm,2),2,9999))
+					if $$$WWW122InputType(objWWW122)=10 {                              ; FileName
+						set retVal = $get(^CacheTempView(YUSER,"AppendValue"))_retVal
+					}
+				}
+				;if ($get(YUSERAGENT) = "CHROME") {
+					set xYUSER = YUSER
+					if ('$data(^CacheTempViewRetorno(xYUSER))) {
+						set xYUSER = $piece(YUSER,"x",1)
+					}
+					
+					set campoRetorno 						= $get(^CacheTempView(YUSER,"Relation")) ;_ $get(^CacheTempView(YUSER,"FieldNo"))
+					set campoRetornoGrid 				= $piece($get(^CacheTempViewRetorno(xYUSER)),"~",1)
+					set tipoCampoRetornoGrid 		= $piece($get(^CacheTempViewRetorno(xYUSER)),"~",2)
+					set tipoCampoRetornoObjeto 	= $piece($get(^CacheTempViewRetorno(xYUSER)),"~",3)
+					write "retornaValorPOPUP('"_retVal_"','"_campoRetorno_"', '"_campoRetornoGrid_"', '"_tipoCampoRetornoGrid_"', '"_tipoCampoRetornoObjeto_"');"
+					kill ^CacheTempViewRetorno(xYUSER)
+				;}else{
+				;	write "top.window.returnValue='"_$zconvert(retVal,"o","JS")_"';"  ;SR17583
+				;}
+			} else {
+				if ($extract(strRelation,1)="S")||($extract(strRelation,1)="J") {
+					write "window.opener.CallBack('CallBack^COMViewCustom','"_$zconvert(pidKey,"o","JS")_"');"
+					
+				} else {
+					do RedirectForm(idForm,pidKey,YFORM_",")   // This code never appears to be run...
+				}
+			}
+		} elseif (idForm'="")&&(pidKey'="") {
+			do RedirectForm(idForm,pidKey,YBACK,,pblnBackToSearch) ;SR17580
+		}
+		if $extract(strRelation,1)="Y" {
+			write "top.window.close();"		; SR17583
+		}
+ 	}
+	quit 1
+	
+	
+RedirectForm(pidForm,pidKey,YBACK,pblnWrite=$$$YES,pblnBackToSearch=$$$NO)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Nov-2010	shobby		SR17580: additional parameter pblnBackToSearch
+	;-------------------------------------------------------------------------------
+	;
+	new strLink
+	
+	set strLink = YAKTION_"EP=WWWFORM"
+	set strLink = strLink_"&YFORM="_pidForm
+	set strLink = strLink_"&YKEY="_pidKey
+	
+	if (pblnBackToSearch) {
+		set strLink = strLink_"&YBACK=WWWSEAR,"  ;SR17580
+	} else {
+		set strLink = strLink_"&YBACK="_YBACK
+	}
+	set strLink = strLink_"&YUCI="_YUCI             ; NAMESPACE
+	set strLink = strLink_"&YBED="_YBED             ; User ID
+	set strLink = strLink_"&YM="_YM                 ; Company (0)
+	set strLink = strLink_"&YUSER="_YUSER           ; Session No
+	set strLink = "document.location='"_strLink_"';"
+
+	if pblnWrite write strLink
+	quit strLink
+	
+	
+GetGroupedProperties()
+	new strFilterTypes,FilterLoop,strFilterType,idFilter,objFilter,strGroupedProps
+	
+	set strGroupedProps = ""
+	set strFilterTypes = "FixedFilter,Filter"
+	
+	for FilterLoop=1:1:$length(strFilterTypes,",") {
+		set strFilterType = $piece(strFilterTypes,",",FilterLoop)
+		set idFilter = ""
+		for {
+			set idFilter = $order(^CacheTempView(YUSER,strFilterType,idFilter))
+			quit:idFilter=""
+			
+			set objFilter = $get(^CacheTempView(YUSER,strFilterType,idFilter))
+			if $$$COMViewFilterGroupBy(objFilter) {
+				if strGroupedProps'="" set strGroupedProps = strGroupedProps_","
+				set strGroupedProps = strGroupedProps_$$$COMViewFilterField(objFilter)
+			}
+		}
+	}
+	quit strGroupedProps
+	
+	
+GetRelationForm(pidRelation="",pidClass,pidKey)
+	;-------------------------------------------------------------------------------
+	; Sets relations for a particular field and key.
+	; 
+	; For manual field filtering, set the global ^CacheTempFixedField
+	; 
+	; Returns:ID (WWW120)
+	;
+	; History:
+	; 21-Apr-2011	GRF		-: Get strSortCodes once
+	; 13-Dec-2007	shobby	SRBR014790: Use the form that corresponds to the class
+	; 							name if available.
+	; 19-Sep-2005	JW		SR13525: Define vars properly.
+	; 10-Jun-2005	PK / PO	SR12523: Include support for new WWW0022/WWW0032 filters
+	; 14-Apr-2005	PO		Mod'd to use new GetFieldDetails procedure
+	; 22-Dec-2004	Paul K	Added merge
+	; 02-Dec-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new idForm,idClass,idField,Loop,char,objField,strSortCodes,intIndex,objFilter
+	new idFilter,strRelation,strFieldType,intLoop,idRelFilter,objWWW0022,objWWW0032,idClassField
+	
+	set ^CacheTempView(YUSER,"Relation") = pidRelation
+	
+	if (pidRelation'="") {
+		merge ^CacheTempView(YUSER,"FixedFilter") = ^CacheTempFixedField(YUSER,pidRelation,"Filter")
+		merge ^CacheTempView(YUSER,"Command")     = ^CacheTempFixedField(YUSER,"Command")
+		set ^CacheTempView(YUSER,"CallBack")      = $get(^CacheTempFixedField(YUSER,pidRelation,"CallBack"))
+		set ^CacheTempView(YUSER,"ReturnValue")   = $get(^CacheTempFixedField(YUSER,"ReturnValue"))
+	}
+	kill ^CacheTempFixedField(YUSER)
+	
+	do GetFieldDetails^COMUtilForm(pidRelation,.idForm,.strFieldType,.idField)
+	set idField = strFieldType_idField
+	
+	if (idForm'="") && ($data(^WWW120(0,idForm))) {
+		if idField'="D0" {  ;special case.
+			set idClass  = $$$WWW120ClassUsedInForm($get(^WWW120(0,idForm,1)))
+			set objField = $$GetRelation^COMViewUtils(idClass,idField,idForm)
+			set pidClass = $$$WWW002RelationClass(objField)
+			
+			set strSortCodes = $$$WWW003DisplayIfSortKeyEqual(objField)    ; Index#,$$$Index(Value)
+			if strSortCodes'="" {
+				set intIndex     = $piece(strSortCodes,",",1)
+				set strSortCodes = $piece(strSortCodes,",",2,$length(strSortCodes,","))
+				if strSortCodes'="" {
+					for Loop=1:1:$length(strSortCodes,",") {
+						set objFilter = ""
+						set $$$COMViewFilterField(objFilter)      = $$GetFieldForIndex(pidClass,intIndex,Loop)
+						set $$$COMViewFilterValue1(objFilter)     = $piece(strSortCodes,",",Loop)
+						set $$$COMViewFilterComparator(objFilter) = $$$EnumCOMVIEWCOMPARATOREquals
+						
+						set idFilter = $order(^CacheTempView(YUSER,"FixedFilter",""),-1)+1
+						set ^CacheTempView(YUSER,"FixedFilter",idFilter) = objFilter
+					}
+				}
+			}
+			if (idClass'="") && ($extract(idField)="D") {
+				set idClassField = $extract(idField,2,99)
+				set idRelFilter  = ""
+				for {
+					set idRelFilter = $order(^WWW0032(0,idClass,idClassField,idRelFilter))
+					quit:idRelFilter=""
+					
+				    set objWWW0032 = $get(^WWW0032(0,idClass,idClassField,idRelFilter,1))
+					set objFilter  = ""
+					set $$$COMViewFilterField(objFilter)      = "D"_$$$WWW0032Field(objWWW0032)
+					set $$$COMViewFilterValue1(objFilter)     = $$$WWW0032Value1(objWWW0032)
+					set $$$COMViewFilterComparator(objFilter) = $$$WWW0032Comparator(objWWW0032)
+					
+					set idFilter = $order(^CacheTempView(YUSER,"FixedFilter",""),-1)+1
+					set ^CacheTempView(YUSER,"FixedFilter",idFilter) = objFilter
+				}
+			}
+			if (idClass'="") && ($extract(idField)="P") {
+				set idClassField = $extract(idField,2,99)
+				set idRelFilter  = ""
+				for {
+					set idRelFilter = $order(^WWW0022(0,idClass,idClassField,idRelFilter))
+					quit:idRelFilter=""
+					
+				    set objWWW0022 = $get(^WWW0022(0,idClass,idClassField,idRelFilter,1))
+					set objFilter  = ""
+					set $$$COMViewFilterField(objFilter)      = "D"_$$$WWW0022Field(objWWW0022)
+					set $$$COMViewFilterValue1(objFilter)     = $$$WWW0022Value1(objWWW0022)
+					set $$$COMViewFilterComparator(objFilter) = $$$WWW0022Comparator(objWWW0022)
+					
+					set idFilter = $order(^CacheTempView(YUSER,"FixedFilter",""),-1)+1
+					set ^CacheTempView(YUSER,"FixedFilter",idFilter) = objFilter
+				}
+			}
+			if $$$WWW002RelationalPrimaryKeys(objField)'="" {
+				for Loop=1:1:$length($$$WWW002RelationalPrimaryKeys(objField),",") {
+					set strRelation = $piece($$$WWW002RelationalPrimaryKeys(objField),",",Loop)
+					
+					if (+strRelation'=strRelation) && '$find(strRelation,"""") {
+						// SR13525  Add this "correct" function in
+						do DefineKeys^WWWFieldValidation(idForm,strRelation)
+						if '$data(@strRelation) {
+							do FindRelation^COMViewUtils(idClass,strRelation,$get(^CacheTempView(YUSER,"RelationKey")))
+						}
+						
+						set strRelation = $get(@strRelation)
+						
+					} else {
+						set strRelation = $translate(strRelation,"""")
+					}
+					set objFilter = ""
+					set $$$COMViewFilterField(objFilter)      = "P"_Loop
+					set $$$COMViewFilterValue1(objFilter)     = strRelation
+					set $$$COMViewFilterComparator(objFilter) = $$$EnumCOMVIEWCOMPARATOREquals
+					
+					set idFilter = $order(^CacheTempView(YUSER,"FixedFilter",""),-1)+1
+					set ^CacheTempView(YUSER,"FixedFilter",idFilter) = objFilter	
+				}
+			}
+			if (pidClass'="") && $data(^WWW120(0,pidClass)) {
+				set idForm = pidClass  ; Use the form that corresponds to the class name if available.
+			} else {
+				set idForm = $order(^WWW120s(0,1,$$$Index(pidClass),""))
+			}
+		}
+	}
+	quit idForm
+	
+	
+GetFieldForIndex(pidClass,pintIndex,pstrPart)
+	;-------------------------------------------------------------------------------
+	; Look through the key and field definitions for the right key
+	;
+	; Returns:Field (D1 or P3 etc...)
+	;
+	; History:
+	; 03-Dec-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+    new idField,idKey,objKey,intIndex,Loop
+    
+	set idField = ""
+	if pidClass'="" {
+		set idKey = ""
+		for {
+			set idKey = $order(^WWW002(0,pidClass,idKey))
+			quit:idKey=""
+			
+			set objKey   = $get(^WWW002(0,pidClass,idKey,1))
+			set intIndex = $$$WWW002IndexKey(objKey)
+			if intIndex'="" {
+				for Loop=1:1:$length(intIndex) {
+					if pstrPart=1 if $piece(intIndex,",",Loop)=pintIndex  set idField = "P"_idKey
+					if $piece(intIndex,",",Loop)=(pintIndex_"."_pstrPart) set idField = "P"_idKey
+					quit:idField'=""
+				}
+			}
+			quit:idField'=""
+		}
+		if idField="" {
+			set idKey = ""
+			for {
+				set idKey = $order(^WWW003(0,pidClass,idKey))
+				quit:idKey=""
+				
+				set objKey   = $get(^WWW003(0,pidClass,idKey,1))
+				set intIndex = $$$WWW003IndexKey(objKey)
+				if intIndex'="" {
+					for Loop=1:1:$length(intIndex) {
+						if pstrPart=1 if $piece(]]><![CDATA[intIndex,",",Loop)=pintIndex  set]]><![CDATA[ idField = "D"_idKey
+						if $piece(intIndex,",",Loop)=(pintIndex_"."_pstrPart) set idField = "D"_idKey
+						quit:idField'=""
+					}
+				}
+				quit:idField'=""
+			}
+		}
+	}
+	quit idField
+	
+	
+SetKeyFields(pidClass,pidKey)
+	;-------------------------------------------------------------------------------
+	; If we are on a "Sub form" add fixed filters of "header" primary keys.
+	;
+	; History:
+	; 15-Mar-2005	Paul K	Commented
+	;-------------------------------------------------------------------------------
+	new intNumKeys,idFilter,objFilter,loop
+	
+	set intNumKeys = $order(^WWW002(0,pidClass,""),-1)
+	set ^CacheTempView(YUSER,"RelationKey") = pidKey
+	
+	for loop=1:1:(intNumKeys-1) {
+		if $piece(pidKey,",",loop)'="" {
+			set objFilter=""
+			set $$$COMViewFilterField(objFilter)      = "P"_loop
+			set $$$COMViewFilterValue1(objFilter)     = $piece(pidKey,",",loop)
+			set $$$COMViewFilterComparator(objFilter) = $$$EnumCOMVIEWCOMPARATOREquals
+			
+			set idFilter = $order(^CacheTempView(YUSER,"FixedFilter",""),-1)+1
+			set ^CacheTempView(YUSER,"FixedFilter",idFilter) = objFilter
+		}
+	}
+	quit
+	
+	
+SetLangRelation(pidForm,pidRelClass,pidFieldType,pidFieldNo)
+	;-------------------------------------------------------------------------------
+	; Check for language translation
+	;
+	; Params:	pidRelClass		- class to check for translation
+	;			pidForm			- calling form
+	;			pidFieldType	- calling field type
+	;			pidFieldNo		- calling field num
+	;			
+	; ByRefs:
+	;
+	; Returns:	
+	;
+	; History:
+	; 11-Dec-2006	JW		SR15299: Created
+	;-------------------------------------------------------------------------------
+	new idLangClass,idClass,objWWW003,idField
+	
+	set idLangClass = $$$WWW001LanguageClassForRelations($get(^WWW001(0,pidRelClass,1)))
+	
+	if idLangClass'="" {
+		set idClass=$$$WWW120ClassUsedInForm($get(^WWW120(0,pidForm,1)))
+		set objWWW003=$$GetRelation^COMViewUtils(idClass,pidFieldType_pidFieldNo)
+		
+		set idField = +$$$WWW003RelationalDisplayItems(objWWW003)  // just get first one
+		if idField=0 set idField = 1		// default
+		
+		set ^CacheTempView(YUSER,"RelField") = 1
+		set ^CacheTempView(YUSER,"RelLang")  = idLangClass
+	}
+	quit
+	
+	
+OnChangeData()
+	;-------------------------------------------------------------------------------
+	; Link the COMView data into the COMGridEdit
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Dec-2009	GRF		SR17007: separate tags for multi-lock operations
+	; 06-Mar-2007	PO		SR15466: Support case where header and lines do not relate
+	; 09-Feb-2007	RPW		SR15426: Created
+	;-------------------------------------------------------------------------------
+	new idContainerKey,idKey,idParentKey,idRootKey,idUser,intLength
+	new objData,strData,strForm,strOldStatus,strQuery,strSQLID,strStatus,YFORM
+	
+	set strForm = $get(^CacheTempView(YUSER,YUCI,"ParentForm"))
+	set YFORM   = $get(^CacheTempView(YUSER,"Form"))
+	
+	set idUser  = YUSER
+	new YUSER
+	set YUSER   = $$$GetParentUser(idUser)
+	
+	;---------------------------------------
+	
+	set idContainerKey = $$$GRIDYKEYContainer
+	
+	// Nasty trick here, get the current parent's keys, kill the grid and reset this. Is needed by AddLine and Batch Stop.
+	
+	set idParentKey = $get(^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V","REFERENCEKEY"))
+	do CleanUpPreviousInstance^COMGridEdit31Tools(YFORM,$$$YES)
+	set ^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V","REFERENCEKEY") = idParentKey
+	
+	do ClearOld^WWWMultiLock(YUSER)
+	
+	set intLength = $length(idParentKey,$$$COMMA)
+	
+	$$$GRIDAddBatchStart
+	
+	set strSQLID=YUSER_"-"_strForm
+	
+	set strQuery="^CacheTempSQL("""_strSQLID_""",""Data"")"
+	set %3 = $qlength(strQuery)
+	set %4 = $name(@strQuery,%3)
+	for {
+		set strQuery = $query(@strQuery)
+		quit:(strQuery="")
+		quit:($name(@strQuery,%3)'=%4)
+		
+		set objData   = @strQuery
+		set idRootKey = $piece(objData,$$$NULLCHAR,1)
+		set idKey     = $piece(idRootKey,$$$COMMA,intLength+1,$length(idRootKey,$$$COMMA))
+		set strData   = $piece(objData,$$$NULLCHAR,2)
+		
+	;	do GetLock^WWWMultiLock(strForm,YFORM,idRootKey)   ; SR17007
+		set strStatus = $$LockSet^WWWMultiLock(strForm,YFORM,idRootKey)
+		if idContainerKey = "" {
+			set idKey = $piece(@strQuery,$$$NULLCHAR,1)
+			if '($$$NoKey(idKey) || (idKey = " ")) {
+				do AddLine^COMGridEdit31Add($get(@strData),idKey,YFORM,,,,$$$YES)
+			}
+		} else {
+			do AddLine^COMGridEdit31Add($get(@strData),idKey,YFORM)
+		}
+	}
+	
+	set strOldStatus = $get(^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V","STATUS",1))
+	
+	set ^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V","STATUS",1) = 2
+	$$$GRIDAddBatchStopNoDraw
+	set ^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V","STATUS",1) = strOldStatus
+	
+	write $$$GRIDGoToPage(1,$$$GRIDNumPages,"T",0)
+	
+	quit
+	
+	
+CleanupCOMView(pstrForm)
+	;-------------------------------------------------------------------------------
+	; If we have changed forms, then kill the COMView data.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Feb-2007	RPW		SR15426: Created
+	;-------------------------------------------------------------------------------
+	if (pstrForm'="COMViewSearch") && (pstrForm'="WWWPARA") && (pstrForm'=$get(^CacheTempView(YUSER,YUCI,"ParentForm"))) {
+		kill ^CacheTempView(YUSER)
+	}
+	quit
+	
+	
+AddExternalFilter(pidForm,pstrField,pstrValue,penumComparator,pblnDisplay=$$$ANNO,pstrDataAccess="",pstrStoreValue="")
+	;-------------------------------------------------------------------------------
+	; Store the external filter ready to be used.
+	;
+	; Params:
+	; pidForm			- Form with COMView
+	; pstrField			- Field in result area
+	; pstrValue			- Value
+	; penumComparator	- Comparator
+	; pblnDisplay       - Whether or not to display the filter.  NO is represented by null rather than 0
+	; pstrDataAccess	- Routine call from DataAccess
+	; 
+	; Returns:
+	;
+	; History:
+	; 04-Sep-2007	shobby	SRBR014677: If a location is defined store a temporary
+	;							value to repopulate the control with screen redraw
+	; 31-Jul-2007	Karine	SR15548: Data Access filter
+	; 28-May-2007	RPW		SR15513: Allow the caller to determine if the filter
+	;						should be shown
+	; 16-Feb-2007	RPW		SR15426: Created
+	;-------------------------------------------------------------------------------
+	new idFilter,objFilter
+	
+	if 'pblnDisplay set pblnDisplay = $$$ANNO
+	
+	set objFilter=""
+	set $$$COMViewFilterField(objFilter)        = pstrField
+	set $$$COMViewFilterValue1(objFilter)       = pstrValue
+	set $$$COMViewFilterComparator(objFilter)   = penumComparator
+	set $$$COMViewFilterDisplay(objFilter)      = pblnDisplay
+	set $$$COMViewFilterGroupBy(objFilter)      = $$$ANNO
+	set $$$COMViewFilterNoconversion(objFilter) = $$$ANNO
+	set $$$COMViewFilterDataAccess(objFilter)	= pstrDataAccess
+	set $$$COMViewFilterStoreValue(objFilter)	= pstrStoreValue
+	
+	set idFilter = $order(^CacheTempViewExternal(YUSER,YUCI,pidForm,"Filter",""),-1)+1
+	set ^CacheTempViewExternal(YUSER,YUCI,pidForm,"Filter",idFilter) = objFilter
+	
+	quit
+	
+	
+ToggleHeader(pstrType="none",pintHeight)
+	;-------------------------------------------------------------------------------
+	; When the header is toggled, store the height of the grid and the view of the COMView
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Mar-2007	RPW		SRBR014416: Created
+	;-------------------------------------------------------------------------------
+	new strViewForm
+	
+	set strViewForm = $$GetForm()
+	set ^CacheTempToggleView(YUSER,YUCI,strViewForm,"Type")   = pstrType
+	set ^CacheTempToggleView(YUSER,YUCI,strViewForm,"Height") = pintHeight
+	
+	quit ""
+	
+	
+GetForm()
+	;-------------------------------------------------------------------------------
+	; Get the correct form. Defaults to ParentForm; if this is blank, use the Form.
+	; 
+	; Called By: AfterDataFields^COMViewFilter, ToggleHeader^COMViewFilter
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 06-Sep-2010	PPP		SR17531:If no Form get the CallingForm
+	; 29-Mar-2007	RPW		SRBR014416: Created
+	;-------------------------------------------------------------------------------
+	new strParent
+	 
+	set strParent = $get(^CacheTempView(YUSER,YUCI,"ParentForm"))
+	if strParent="" {
+		set strParent = $get(^CacheTempView(YUSER,"Form"))
+		if strParent="" {
+			set strParent = $get(^CacheTempView(YUSER,"CallingForm"))		
+		}
+	}
+	quit strParent]]></Routine>
+</Export>

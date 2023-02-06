@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWWDataDictionary" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWWDataDictionary
+#include COMSYS
+#include WWWConst
+ 
+FindRelations(pidRelClass,&parrRels,pstrRelKeys)
+	;-------------------------------------------------------------------------------
+	; Find fields and keys that are related to a given class.
+	;
+	; Params:	pidRelClass	- class id to find relations for
+	; 			pstrRelKeys	- (optional) check rel keys as well
+	;
+	; ByRefs:	parrRels	- array of keys/fields. format: parrRels(A,B,C) = ""
+	; 							where: 	A = WWW class id - WWW002/WWW003/WWW121/WWW122
+	; 									B = 1st key - class/form id
+	; 									C = 2nd key - field id
+	;
+	; Returns:	
+	;
+	; History:
+	; 24-Nov-2006	JW		BR014285: Created
+	;-------------------------------------------------------------------------------
+	new strSQL,blnCheckKeys,idClass,objResult
+	
+	kill parrRels
+	
+	set blnCheckKeys = $data(pstrRelKeys)
+	
+	set strSQL("WWW002") = "select class c,PrimaryKeyNumber p from WWW002 where RelationClass = '"_pidRelClass_"'"
+	if blnCheckKeys $$$Append(strSQL("WWW002")," and RelationalPrimaryKeys = '"_pstrRelKeys_"'")
+	
+	set strSQL("WWW003") = "select class c,PropertyNumber p from WWW003 where RelationDatabase = '"_pidRelClass_"'"
+	if blnCheckKeys $$$Append(strSQL("WWW003")," and RelationalPrimaryKeys = '"_pstrRelKeys_"'")
+	
+	set strSQL("WWW121") = "select FormDescription c,PrimaryKeyNumber p from WWW121 where RelationFile = '"_pidRelClass_"'"
+	if blnCheckKeys $$$Append(strSQL("WWW121")," and RelationPrimaryKeys = '"_pstrRelKeys_"'")
+	
+	set strSQL("WWW122") = "select FormName c,DataItemNumber p from WWW122 where RelationClass = '"_pidRelClass_"'"
+	if blnCheckKeys $$$Append(strSQL("WWW122")," and RelationalPrimaryKey = '"_pstrRelKeys_"'")
+	
+	for idClass = "WWW002","WWW003","WWW121","WWW122" {
+		set objResult = ##class(%Library.ResultSet).%New()
+		do objResult.Prepare(strSQL(idClass))
+		do objResult.Execute()
+		while objResult.Next() {
+			set parrRels(idClass,objResult.Data("c"),objResult.Data("p")) = ""
+		}
+	}
+	
+	quit
+ 
+ 
+ConvertAllRelations(pidRelClass,parrConversion,&parrError)
+	;-------------------------------------------------------------------------------
+	; Convert every instance in the database that is related to a specified class,
+	; using an array of conversions.
+	; 
+	; NOTE: Currently does not support shared classes!
+	; 
+	; Params:	pidRelClass		- class id to convert relations for
+	;			parrConversion	- array of conversions. ie: parrConversion(old) = new
+	;			
+	; ByRefs:	parrError - array of errors. eg: 	arr(count) = lang text
+	; 						Note: count will start at arr+1
+	;
+	; Returns:
+	;
+	; History:
+	; 09-May-2011	GRF		replace $$$Order/$$$Query
+	; 27-Nov-2006	JW		BR014285: Created
+	;-------------------------------------------------------------------------------
+	new arrRels,idClass,strGlobal,strQuery,strStatus
+	new intKey,strOldKeys,idOldKey,idNewKey,strNewKeys
+	new strKeys,strData,strOldFld,strNewFld,intFld
+	
+	do FindRelations(pidRelClass,.arrRels)
+	
+	// For primary keys, need to save new record and delete old one
+	set idClass = ""
+	for {
+		set idClass = $order(arrRels("WWW002",idClass))
+		quit:idClass=""
+		continue:$$$WWW001SharedFile($get(^WWW001(0,idClass,1)))	// Doesn't support shared files
+		
+		set intKey = ""
+		for {
+			set intKey = $order(arrRels("WWW002",idClass,intKey))
+			quit:intKey=""
+			
+			do ConvertKey(idClass,intKey,.parrConversion,.parrError)
+		}
+	}
+	
+	set idClass = ""
+	for {
+		set idClass = $order(arrRels("WWW003",idClass))
+		quit:idClass=""
+		continue:$$$WWW001SharedFile($get(^WWW001(0,idClass,1)))	// Doesn't support shared files
+		
+		set intFld = ""
+		for {
+			set intFld = $order(arrRels("WWW003",idClass,intFld))
+			quit:intFld=""
+			
+			do ConvertField(idClass,intFld,.parrConversion,.parrError)
+		}
+	}
+	quit
+	
+	
+ConvertKey(pidClass,pintKey,parrConversion,&parrError)
+	;-------------------------------------------------------------------------------
+	; For every data record in a class, convert a given key using an array of conversions.
+	; NOTE: Currently does not support shared classes!
+	;
+	; Params:	pidClass		- class with keys to convert
+	; 			pintKey			- key to convert
+	;			parrConversion	- array of conversions. ie: parrConversion(old) = new
+	;			
+	; ByRefs:	parrError - array of errors. eg: 	arr(count) = lang text
+	; 						Note: count will start at arr+1
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Dec-2006	JW		BR014285: Created
+	;-------------------------------------------------------------------------------
+	new strGlobal,strQuery,strOldKeys,idOldKey,idNewKey,strNewKeys,strStatus,intKeys
+	
+	set intKeys = $order(^WWW002(0,pidClass,""),-1)+2		// number of keys in global
+			
+	// loop through all records in this class, checking specific key
+	set strGlobal = "^"_pidClass_"(0)"
+	set strQuery  = strGlobal
+	set %3 = $qlength(strQuery)
+	set %4 = $name(@strQuery,%3)
+	for {
+		set strQuery = $query(@strQuery)
+		quit:(strQuery="")||($name(@strQuery,%3)'=%4)
+		continue:intKeys'=$qlength(strQuery)     // skip malformed global
+	
+		set strOldKeys = $$$DEQUOTE($$$QueryANKey(strQuery))
+		set idOldKey = $piece(strOldKeys,",",pintKey)
+		
+		set idNewKey = $get(parrConversion(idOldKey))
+		if (idNewKey="") {                       // Log non-existant translation
+			set parrError($increment(parrError)) = $listbuild("WWW00055",pintKey,idOldKey,pidClass,strOldKeys)
+			; "No conversion for key (%1) %2 was found. Class '%3', keys '%4' skipped."
+			
+		} elseif (idOldKey'=idNewKey) {          // Only translate if different
+			set strNewKeys = strOldKeys
+			set $piece(strNewKeys,",",pintKey) = idNewKey
+			set strStatus = $$$Save(pidClass,strNewKeys,@strQuery,$$$YES)
+			
+			if $$$ISOK(strStatus) set strStatus = $$$Kill(pidClass,strOldKeys)
+			
+			if $$$ISERR(strStatus) {             // log error
+				set parrError($increment(parrError)) = strStatus
+			}
+		}
+	}
+	quit
+	
+	
+ConvertField(pidClass,pintFld,parrConversion,&parrError)
+	;-------------------------------------------------------------------------------
+	; For every data record in a class, convert a given field using an array of conversions.
+	; NOTE: Currently does not support shared classes!
+	; 
+	; Params:	pidClass		- class with field to convert
+	; 			pintFld			- field to convert
+	;			parrConversion	- array of conversions. ie: parrConversion(old) = new
+	;			
+	; ByRefs:	parrError - array of errors. eg: 	arr(count) = lang text
+	; 						Note: count will start at arr+1
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Dec-2006	JW		BR014285: Created
+	;-------------------------------------------------------------------------------
+	new strGlobal,strQuery,strKeys,strData,strOldFld,strNewFld,strStatus
+	new intLoop,strOldVal,strNewVal,intKeys
+	
+	set intKeys = $order(^WWW002(0,pidClass,""),-1)+2		// number of keys in global
+	
+	// loop through all records in this class, checking specific field
+	
+	set strGlobal = "^"_pidClass_"(0)"
+	set strQuery  = strGlobal
+	set %3 = $qlength(strQuery)
+	set %4 = $name(@strQuery,%3)
+	for {
+		set strQuery = $query(@strQuery)
+		quit:(strQuery="")||($name(@strQuery,%3)'=%4)
+		continue:intKeys'=$qlength(strQuery)     // skip malformed global
+		
+		set strKeys = $$$DEQUOTE($$$QueryANKey(strQuery))
+		set strData = @strQuery
+		set strOldFld = $piece(strData,Y,pintFld)
+		
+		if strOldFld'="" {
+			set strNewFld = strOldFld            // initalise
+			
+			for intLoop=1:1 {                    // Consider multiple values  (; separated)
+				set strOldVal = $piece(strOldFld,";",intLoop)
+				quit:strOldVal=""
+				
+				set strNewVal = $get(parrConversion(strOldVal))
+				if (strNewVal="") {
+					// Log non-existant translation
+					set parrError($increment(parrError)) = $listbuild("WWW00056",pintFld,strOldVal,pidClass,strKeys)
+					; "No conversion for field (%1) %2 was found. Class '%3', keys '%4' skipped."
+					
+				} else {
+					set $piece(strNewFld,";",intLoop) = strNewVal
+				}
+			}
+			
+			if (strOldFld'=strNewFld) {          // Only translate if different
+				set $piece(strData,Y,pintFld) = strNewFld
+				set strStatus = $$$Save(pidClass,strKeys,strData,$$$YES)
+				
+				if $$$ISERR(strStatus) {        // log error
+					set parrError($increment(parrError)) = strStatus
+				}
+			}
+		}
+	}
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvPrePostDisplay" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvPrePostDisplay
+#include FINConst
+#include INConst
+#include COMSYS
+	
+#define Currency1(%obj,%type) "<span style='width:100%;text-align:right;font-size:12;color:"_$get(YBLUE,"darkblue")_"'>"_$$FormatCurrency^COMTable(%obj)_" "_%type_"</span>"
+#define Currency2(%obj)       "<span style='width:100%;text-align:right;font-size:14;'>"_$$FormatCurrency^COMTable(%obj)_"</span>"
+#define Currency3(%obj)       "<span style='width:100%;text-align:right;font-size:16;'>"_$$FormatCurrency^COMTable(%obj)_"</span>"
+#define Currency4(%obj,%type) "<span style='width:100%;text-align:right;font-size:18;color:"_$get(YBLUE,"darkblue")_"'>"_$$FormatCurrency^COMTable(%obj)_" "_%type_"</span>"
+	
+	;------------------------------------------------------------------------------
+	; Invoice '<idInvoice>' has been posted to interface batch '<idBatch>' (Block <idBlock>).
+	; 
+	; [c] Supplier <idSupp> - <strSuppName> - Account: <idGLAcct>           $$$$$ CR
+	; [-]  [c] Goods Received Not Invoiced                          $$$$$
+	;      [+]  [c] Account: <idGLAcct> - <strAcctName>             $$$$$
+	; [-]  [c] Rounding Adjustment                                  $$$$$
+	;      [+]  [c] Account: <idGLAcct> - <strAcctName>             $$$$$
+	; [-]  [c] Line Surcharge                                       $$$$$
+	;      [-]  [c] Account: <idGLAcct> - <strAcctName>             $$$$$
+	;                [c] Line: 1.  Product: <idItem> - <strDesc>    $$$$$ DR
+	;------------------------------------------------------------------------------
+	
+Display(pidInvoice="")
+	;------------------------------------------------------------------------------
+	; Sets the tree up for display.
+	; 
+	; History:
+	; 29-Jul-2009	GRF		SR16667: cleanup
+	; 24-Nov-2005	RPW		SR13895: Change $lb to $listbuild as per standard.
+	; 23-Nov-2005	PO		SR13895: For rounding adjustment applied, display amount
+	; 							in appropriate column ie. DR/CR.
+	; 19-Oct-2005	PO		SR13613: Include rounding adjustment
+	; 11-Oct-2005	PO		SR13611: Reverted SR13461 - only included due to other
+	; 							incorrect changes to AddInvoice^FINAPInvPost.
+	; 16-Sep-2005	PO		SR13489: Take base amount discrepancy into account.
+	; 08-Sep-2005	RPW		SR13461: Add the FCVar to the Supplier Total
+	; 07-Sep-2005	RPW		SR13446: Now use the base currency amounts.
+	; 07-Sep-2005	RPW		SR13446: Use FCUpdate to correctly handle the summations.
+	; 05-Aug-2005	RPW		SR13097: Handle Credit on line when ordering by Account.
+	; 27-Jul-2005	RPW		SR13097: Handle incorrect calculations of the foreign
+	; 							currency. Have fixed this by summing the base amounts
+	; 							and if they are different from the converted total,
+	; 							adding the difference if it's less than 10c.
+	; 14-Mar-2005	PO		SR11349 FC support
+	; 11-Feb-2005	RobertW	Added CR & DR suffixes to the amounts for Currency 1 & 2
+	; 							These are Fin00661 and Fin00662.
+	; 04-Feb-2005	RobertW	Fixed undefined variable strRef,objInvoice
+	; 25-Jan-2005	PK		Created
+	;------------------------------------------------------------------------------
+	new arrAmount,blnLTZero,blnModified,blnPosted,curAmount,curTmp,curVARFC
+	new fltDifference,fltRate,fltInvoiceRate,fltTotalAmount,curDiscrepancy
+	new idAccount,intType,idLine,lstAmount,objInvoice,objLine,objPostLine
+	new strInvoice,strSort,strDescription,strRef,strOldYFORM,strParent
+	new objFINAPInvPrePostTtl
+	
+	set blnModified    = $$$NO
+	set fltTotalAmount = 0
+	set strSort        = "BA"
+	
+	if $IsObject($get(%session)) {
+		set strSort = $get(%session.Data("GTOGGLE"),"BA")
+	}
+	
+	set strRef=pidInvoice
+	set pidInvoice=$piece(pidInvoice,",",1)
+	if pidInvoice'="" {
+		
+		set objInvoice=$get(^FINAPInv(YM,pidInvoice,1))
+		
+		if objInvoice'="" {
+			set fltInvoiceRate = $$$FINAPInvExchangeRate(objInvoice)
+			set strDescription = ""
+			set lstAmount      = ""
+			
+			set blnPosted=($get(YFORM)="FINAPInvPost")
+			
+			do StartTree^COMTree(YPARA)
+			
+			set curVARFC = 0
+			set intType  = ""
+			for {
+				set intType = $order(^FINAPInvPrePost(YM,pidInvoice,intType))
+				quit:intType=""
+				
+				set strDescription = $$GetVarianceDescription(intType)
+				
+				set idLine = ""
+				for {
+					set idLine = $order(^FINAPInvPrePost(YM,pidInvoice,intType,idLine))
+					quit:idLine=""
+					
+					set objLine     = $get(^FINAPInvLine(YM,pidInvoice,idLine,1))
+					set objPostLine = $get(^FINAPInvPrePost(YM,pidInvoice,intType,idLine,1))
+					
+					set idAccount = $$$FINAPInvPrePostAccount(objPostLine)
+					set curAmount = $$$FINAPInvPrePostAmount(objPostLine)
+					
+					if (intType=$$$EnumFINAPVARIANCEPOSTFCExpense)   ||
+					   (intType=$$$EnumFINAPVARIANCEPOSTFCInventory) ||
+					   (intType=$$$EnumFINAPVARIANCEPOSTSupplier)       {
+						   
+						   set curVARFC = curVARFC+$$$FCBase(curAmount)
+					   }
+				  	
+					set lstAmount = $select(curAmount<0:$listbuild("",$$$Currency1(-curAmount,$$$Text($listbuild("Fin00661")))),
+					                                  1:$listbuild($$$Currency1(curAmount,$$$Text($listbuild("Fin00662"))),""))
+					if strSort="BA" {
+						set curTmp = $get(arrAmount(intType))+$$$FCBase(curAmount)
+						set arrAmount(intType) = curTmp
+						set curTmp = $get(arrAmount(intType,idAccount))+$$$FCBase(curAmount)
+						set arrAmount(intType,idAccount) = $$$FCBase(curTmp)
+	 
+						do AddNode^COMTree(pidInvoice_","_intType_","_idAccount,
+						                   pidInvoice_","_intType_","_$justify(idLine,3),
+						                   "",
+						                   $$$Text($listbuild("Fin00590",idLine,$$GetItemAndDescription(pidInvoice,idLine))),
+						                   "",YFORM,"",strRef=(pidInvoice_","_intType_","_idLine),lstAmount,blnPosted,
+						                   "",pidInvoice_","_intType_","_idLine,blnPosted) ; "Line: %1. Product: %2"
+					
+					} else {
+						set curTmp = $get(arrAmount(idLine))+curAmount
+						set arrAmount(idLine) = curTmp
+						do AddNode^COMTree(pidInvoice_","_idLine,
+						                   intType_","_pidInvoice_","_idLine_","_idAccount,
+						                   "",
+						                   $$$Text($listbuild("Fin00591",idAccount_" - "_$$$FINGLAccountDescription($get(^FINGLAccount(YM,idAccount,1)))_" ("_strDescription_")")),
+						                   "",YFORM,"","",lstAmount,blnPosted,"",
+						                   pidInvoice_","_intType_","_idLine,blnPosted) ; "Account: %1"
+					}
+				}
+				
+				if (strSort="BA") {
+					set curAmount = $get(arrAmount(intType))
+					set blnLTZero = $$$FCLTZero(curAmount)
+					set curTmp	  = $$$FCUpdate(curAmount,fltInvoiceRate,1)
+					set fltTotalAmount = fltTotalAmount+$$$FCBase(curAmount)
+					set curAmount = $select(blnLTZero:$$$FCSign(curAmount),1:curAmount)
+					set lstAmount = $select(blnLTZero:$listbuild("",$$$Currency3(curAmount)),1:$listbuild($$$Currency3(curAmount),""))
+					do AddNode^COMTree(pidInvoice,
+					                   pidInvoice_","_intType,
+					                   "",
+					                   strDescription,
+					                   "",YFORM,"","",lstAmount,$$$YES)
+					
+					set idAccount = ""
+					for {
+						set idAccount = $order(arrAmount(intType,idAccount),1,curAmount)
+						quit:idAccount=""
+						
+						set lstAmount = $select(curAmount<0:$listbuild("",$$$Currency2($$$FCSign(curAmount))),
+						                                  1:$listbuild($$$Currency2(curAmount),""))
+						do AddNode^COMTree(pidInvoice_","_intType,
+						                   pidInvoice_","_intType_","_idAccount,
+						                   "",
+						                   $$$Text($listbuild("Fin00591",idAccount_" - "_$$$FINGLAccountDescription($get(^FINGLAccount(YM,idAccount,1))))),
+						                   "",YFORM,"","",lstAmount,$$$YES) ; "Account: %1"
+					}
+				}
+			}
+	 		
+			if (strSort="BL") {
+				set idLine = ""
+				for {
+					set idLine = $order(arrAmount(idLine),1,curAmount)
+					quit:idLine=""
+					
+					; SR13097: Need to sum the amounts, so perform some of the checks externally and add
+					
+					set blnLTZero = $$$FCLTZero(curAmount)
+					set curAmount = $select(blnLTZero:$$$FCSign(curAmount),1:curAmount)
+					set fltRate   = $$$FCRate(curAmount)
+					if fltRate="" set fltRate = 1
+					set fltTotalAmount = fltTotalAmount+$$$FCBase(curAmount)
+					
+					set lstAmount = $select(blnLTZero:$listbuild("",$$$Currency2(curAmount)),
+					                                1:$listbuild($$$Currency2(curAmount),""))
+					do AddNode^COMTree(pidInvoice,
+					                   pidInvoice_","_idLine,
+					                   "",
+					                   $$$Text($listbuild("Fin00590",idLine,$$GetItemAndDescription(pidInvoice,idLine))),
+					                   "",YFORM,"",strRef=(pidInvoice_","_intType_","_idLine),lstAmount,$$$YES,
+					                   "",pidInvoice_","_intType_","_idLine) ; "Line: %1. Product: %2"
+				}
+			}
+			
+			set intType = "" ; SR13613
+			for {
+				set intType = $order(^FINAPInvPrePostTtl(YM,pidInvoice,intType))
+				quit:intType=""
+				
+				set objFINAPInvPrePostTtl = $get(^FINAPInvPrePostTtl(YM,pidInvoice,intType,1))
+				set curAmount = $$$FINAPInvPrePostTtlAmount(objFINAPInvPrePostTtl)
+				set idAccount = $$$FINAPInvPrePostTtlAccount(objFINAPInvPrePostTtl)
+				set lstAmount = $select($$$FCLTZero(curAmount):$listbuild("",$$$Currency2($$$FCSign(curAmount))),
+				                                             1:$listbuild($$$Currency2(curAmount),""))
+				do AddNode^COMTree(pidInvoice,
+				                   pidInvoice_","_intType,
+				                   "",
+				                   $$$Text("Fin00923"),
+				                   "",YFORM,"","",lstAmount,$$$YES,
+				                   "",pidInvoice_","_intType)        ; "Rounding Adjustment to match Invoice Total"
+				
+				do AddNode^COMTree(pidInvoice_","_intType,
+				                   pidInvoice_","_intType_",1",
+				                   "",
+				                   $$$Text($listbuild("Fin00591",idAccount_" - "_$$$FINGLAccountDescription($get(^FINGLAccount(YM,idAccount,1))))),
+				                   "",YFORM,"","",lstAmount,,
+				                   "",pidInvoice_","_intType_",1")   ; "Account: %1"
+			}
+			
+			do GetSupplierAccount^FINAPInvPrePost(.idAccount,pidInvoice)
+			set strDescription = $$$FINAPInvSupplier(objInvoice)_" - "_$$$FINAPSupplierSupplierName($get(^FINAPSupplier(YM,$$$FINAPInvSupplier(objInvoice),1)))
+			set strDescription = $$$Text($listbuild("Fin00592",strDescription,idAccount)) ; "Supplier %1 - Account: %2"
+			
+			; SR13097: Need to sum the amounts, so perform some of the checks externally and
+			; sum the amounts
+			
+			set curAmount      = $$$FINAPInvActualTotal(objInvoice)
+			set curAmount      = $$$FCSign(curAmount)
+			set blnLTZero      = $$$FCLTZero(curAmount)
+			set curAmount      = $$$FCBase($$$FCSign(curAmount))
+			set curDiscrepancy = $$TotalInvoiceDiscrepancy^FINAPInvPrePopulate(pidInvoice)
+			set curAmount      = curAmount + curDiscrepancy
+			if curDiscrepancy'=0 set strDescription = strDescription_" #"
+			
+			set lstAmount = $select(blnLTZero:$listbuild("",$$$Currency4(curAmount,$$$Text($listbuild("Fin00661")))),
+			                                1:$listbuild($$$Currency4(curAmount,$$$Text($listbuild("Fin00662"))),""))
+	
+			do AddNode^COMTree("",pidInvoice,"",strDescription,"","","","",lstAmount,$$$YES)
+			do StopTree^COMTree(1)
+		}
+	}
+	quit
+	
+	
+GetVarianceDescription(intType="")
+	;-------------------------------------------------------------------------------
+	; Get the variance type description from a given number (intType)
+	;
+	; Returns: variance description
+	;
+	; History:
+	; 07-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new strDescription
+	
+	set strDescription = $$GetEnumDescription^COMUtils("FINAPVARIANCEPOST",intType)
+	if strDescription="" set strDescription=$$GetPropertyName^COMConst("INFIBPAR",intType)
+	if strDescription="" if $extract(intType,1,3)="TAX"       set strDescription = $$$Text($listbuild("Fin00695",$extract(intType,4,99)))  ;Tax
+	if strDescription="" if $extract(intType,1,8)="LINEDISC"  set strDescription = $$$Text("Fin00878")  ;Line Discount ; _$extract(intType,9,999)
+	if strDescription="" if $extract(intType,1,9)="TOTALDISC" set strDescription = $$$Text("Fin00880")  ;Total Discount
+	if strDescription="" if $extract(intType,1,8)="LINESURC"  set strDescription = $$$Text("Fin00881")  ;Line Surcharge
+	if strDescription="" if $extract(intType,1,9)="TOTALSURC" set strDescription = $$$Text("Fin00882")  ;Total Surcharge
+ 
+	quit strDescription
+	
+	
+GetItemAndDescription(pidInvoice,pidLine)
+	;-------------------------------------------------------------------------------
+	; Get Item and it's description from an invoice line.
+	;
+	; Params: Invoice number and line number
+	;
+	; Returns: string containing both
+	;
+	; History:
+	; 10-Feb-2005	RPW		idLine should be pidLine, use the correct variables.
+	; 09-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new objLine,strMsg
+	
+	set strMsg = ""
+	
+	if (pidInvoice'="")&&(pidLine'="") {
+		set objLine=$get(^FINAPInvLine(YM,pidInvoice,pidLine,1))
+		set strMsg = $$$FINAPInvLineItem(objLine)_" - "_$$$FINAPInvLineItemDescription(objLine)
+	}
+	quit strMsg
+]]></Routine>
+</Export>

@@ -1,0 +1,260 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDPrescriptionAutoClose" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDPrescriptionAutoClose
+#include COMSYS
+#include MEDConst
+Process()
+	;-------------------------------------------------------------------------------
+	; Prescription Auto Close
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Aug-2013	SCR		HEVA-1119: Use Status 8 for Auto Close
+	; 12-Mar-2013	SCR		HEVA-880: Close Rxs with no lines
+	; 04-Jan-2013	SCR		HEVA-738: Change Rx Status 
+	; 03-Jan-2013	SCR		HEVA-738: Handel 'Rejected' Status
+	; 07-Jun-2012   SCR   	SR17993: Created
+	;-------------------------------------------------------------------------------
+#dim idLog,LogEntry,idRx,idLine,objLine,idStatus,dtDate,tmTime,objRx,idRxStatus,dtLast,idNewStatus,idItem,objSetup as %String
+#dim intScanned,intClosed,intNowSecs,intCloseSecs,intOpenDelay as %Integer
+#dim blnChanged as %Boolean
+	new idLog,LogEntry,intScanned,intClosed,idRx,idLine,objLine,idStatus,dtDate,tmTime,objRx
+	new idRxStatus,intNowSecs,idNewStatus,idItem,dtLast,blnChanged,intCloseSecs,sc,objSetup,intOpenDelay
+	new intSavedSecs
+	set intScanned=0
+	set intClosed=0
+	set intNowSecs=+$h*86400+$piece($h,",",2) ; seconds since 1/1/1841 to Now
+	set dtLast=$h
+	set objSetup=$get(^MEDPrescriptionSetup(YM,YM,1))
+	set intOpenDelay=  $$$MEDPrescriptionSetupDaysToAutoClose(objSetup)
+	do StartLog^COMLog($$$Text("MED01272"),.idLog) 	;Prescription Auto Close
+	
+	set idRx=""
+	for {
+		set idRx=$order(^MEDPrescription(YM,idRx))
+		quit:idRx=""
+		set objRx=$get(^MEDPrescription(YM,idRx,1))
+		set idRxStatus=$$$MEDPrescriptionStatus(objRx)
+		set idLine=""
+		set blnChanged=$$$NO
+		for {
+			set idLine=$order(^MEDPrescriptionLine(YM,idRx,idLine))
+			quit:idLine=""
+			set objLine=$get(^MEDPrescriptionLine(YM,idRx,idLine,1))
+			set idStatus=+$$$MEDPrescriptionLineStatus(objLine)
+			set intScanned=intScanned+1
+			;set:idStatus=10 idStatus=2.5 ; HEVA-738
+			if (idStatus<5) {     // Change 6 to 5 by heva-1282 rules     						  ; This needs to be confirmed
+				set dtDate=$$$MEDPrescriptionLineToDate(objLine)
+				set tmTime=$$$MEDPrescriptionLineToTime(objLine)
+				continue:'dtDate 						; can not process when no 'to' date
+				set:'tmTime dtDate=dtDate+1 			; No time, wait to then end off day
+				;if idStatus=0 { //commented by heva-1282
+				continue:'intOpenDelay
+				set dtDate=dtDate+intOpenDelay		; if not processed wait the predefined days
+				;} //commented by heva-1282
+				set intCloseSecs=dtDate*86400+tmTime 	; seconds since 1/1/1841 to Close
+				if intNowSecs>intCloseSecs {
+					set idNewStatus=8  ; HEVA-1119
+					;set:idStatus=2.5 idStatus=10 ; HEVA-738
+					set idItem= $$$MEDPrescriptionLineItem(objLine)
+					set $$$MEDPrescriptionLineStatus(objLine)=idNewStatus
+					set blnChanged=$$$YES
+					set sc=$$$Save("MEDPrescriptionLine",idRx_","_idLine,objLine,1)
+					if sc=$$$OK {
+						do AddMessage^COMLog(idLog,$$$Text($listbuild("MED01274",idRx,idLine,idItem,idStatus,idNewStatus)))  ;Prescription %1 Line %2 Drug %3 status change %4 to %5
+					} else {
+						do AddMessage^COMLog(idLog,$$$Text($listbuild("MED01275",idRx,idLine,idItem,idStatus,idNewStatus)))  ;Error processing Prescription %1 Line %2 Drug %3 status change %4 to %5
+					}
+					kill LogEntry
+					set intClosed=intClosed+1
+				}
+  
+			}
+			do:blnChanged UpdateRxStatus(idRx,idLog)
+			if dtLast'=$h {
+				set dtLast=$h
+				do AddMessage^COMLog(idLog,$$$Text($listbuild("MED01273",intScanned,intClosed)),.LogEntry)	  ;Checking Prescriptions, Scanned %1 , Closed %2
+
+			}
+			
+		}
+		; HEVA-880 vvvv
+		if '$data(^MEDPrescriptionLine(YM,idRx))&intOpenDelay {
+			set dtDate		= $$$MEDPrescriptionCreatedOn(objRx)
+			set tmTime		= $piece(dtDate,",",2)
+			set intSavedSecs= (dtDate+intOpenDelay)*86400+tmTime
+			if intNowSecs>intSavedSecs {
+				set idNewStatus	= 8  ; HEVA-1119
+				set idStatus 	= $$$MEDPrescriptionStatus(objRx)
+				if idNewStatus'=idStatus {
+					set $$$MEDPrescriptionStatus(objRx)=idNewStatus
+					set sc			= $$$Save("MEDPrescription",idRx,objRx,1)
+					if sc=$$$OK {
+						do:idLog'="" AddMessage^COMLog(idLog,$$$Text($listbuild("MED01276",idRx,idStatus,idNewStatus)))  ;Prescription %1 status change %2 to %3
+					} else {
+						do:idLog'="" AddMessage^COMLog(idLog,$$$Text($listbuild("MED01277",idRx,idStatus,idNewStatus)))  ;Error processing Prescription %1 status change %2 to %3
+					}	
+				}
+			}
+		}
+		; HEVA-880 ^^^^
+	}
+	do AddMessage^COMLog(idLog,$$$Text($listbuild("MED01273",intScanned,intClosed)),.LogEntry)	  ;Checking Prescriptions, Scanned %1 , Closed %2
+	do AddMessage^COMLog(idLog,$$$Text("MED01022"))  ;Process Completed
+
+	quit
+	
+UpdateRxStatus(pidRx,pidLog="",pidForce="")
+	;-------------------------------------------------------------------------------
+	; Update Prescription Status, if all the lines are the same status set the prescription status to it
+	;
+	; If is single solution line is recjected, ignore it unless all solution lines are rejected then the solution is rejected
+	;
+	; Param: 	Rx, 
+	;			Log Id 		Optional Logging for auto close
+	;			pidForce	Optional, force pre scription and all lines to a status
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Aug-2013	SCR		HEVA-1119: If any line has a status of 8 (Auto Close) the Rx is set to 8 (Auto Close)
+	; 23-Aug-2013	SCR		HEVA-1119: Reset Reject status for logging
+	; 15-Jan-2013	SCR		HEVA-751: Disable Solution "ignore Rejection" logic 
+	; 13-Jan-2013	SCR		HEVA-751: Process Solution Status. 
+	; 04-Jan-2013	SCR		HEVA-738: Change Rx Status order 'Awaiting Validation' then 'Awaiting Dispense' then 'Rejected'
+	; 03-Jan-2013	SCR		HEVA-738: Handle 'Rejected' Status
+	; 15-Nov-2012	SCR		SR18195: Set Rx to lowers line status
+	; 08-Jun-2012   SCR   	SR17993: Created
+	;-------------------------------------------------------------------------------
+#dim intLineCount as %Integer
+#dim idNewStatus,strStatus as %String
+#dim arrStatus as %ArrayOfDataTypes
+	new arrStatus,idLine,objLine,objRx,idRxStatus,idStatus,strStatus,intLineCount,idNewStatus
+	new intLowest,arrLine,idSol,arrSol,blnAllRecjected,blnAutoClosed
+	set strStatus=$$$OK
+	set idLine=""
+	set intLowest=9 ; SR18195
+	for intLineCount=0:1 {
+		set idLine=$order(^MEDPrescriptionLine(YM,pidRx,idLine))
+		quit:idLine=""
+		set objLine=$get(^MEDPrescriptionLine(YM,pidRx,idLine,1))
+		if pidForce'="" {
+			set $$$MEDPrescriptionLineStatus(objLine)=pidForce
+			set strStatus=$$$Save("MEDPrescriptionLine",pidRx_","_idLine,objLine,1)
+			quit:strStatus'=$$$OK
+		}
+		set idStatus=+$$$MEDPrescriptionLineStatus(objLine)
+		; HEVA-751 vvvv
+		set idSol =  $$$MEDPrescriptionLineSolution(objLine)
+		if idSol {
+			set arrSol(idSol,idLine) = idStatus
+		} else {
+			set arrLine(idLine) = idStatus
+		}
+	}
+	set idSol = "" 
+	for {
+		set idSol = $order(arrSol(idSol))
+		quit:idSol=""
+		set blnAllRecjected = $$$YES
+		set idLine=""
+		for {
+			set idLine		= $order(arrSol(idSol,idLine))
+			quit:idLine=""
+			set idStatus 	= arrSol(idSol,idLine)
+			set:idStatus'=10 blnAllRecjected=$$$NO ; At least 1 line is not rejected
+			quit:blnAllRecjected=$$$NO
+		}
+		set idLine=""
+		for {
+			set idLine		= $order(arrSol(idSol,idLine))
+			quit:idLine=""
+			set idStatus 	= arrSol(idSol,idLine)
+			if blnAllRecjected = $$$YES {
+				set arrLine(idLine) = idStatus
+			} else {
+				; set:idStatus'=10 arrLine(idLine) = idStatus  ; HEVA-751 Disable ignore Rejected logic
+				set arrLine(idLine) = idStatus
+			}
+		}
+	}
+	set blnAutoClosed	= $$$NO ; HEVA-1119
+	set idLine=""
+	for {
+		set idLine = $order(arrLine(idLine))
+		quit:idLine=""
+		set idStatus = arrLine(idLine)
+		; HEVA-751 ^^^^
+		set:idStatus=10 idStatus=2.5 ; HEVA-738 Treat Rejected between 1 and 2 (Awaiting Validation, Rejected, Awaiting Dispense)
+		set:(idStatus<intLowest)&&(idStatus'=6) intLowest=idStatus ; SR18195
+		set:idStatus=8 blnAutoClosed=$$$YES
+	}
+	if strStatus=$$$OK {
+		set objRx=$get(^MEDPrescription(YM,pidRx,1))
+		set idRxStatus= $$$MEDPrescriptionStatus(objRx)
+		set idNewStatus=idRxStatus
+		if intLineCount {
+			set idNewStatus=intLowest ; SR18195
+		}
+		set:idNewStatus=2.5 idNewStatus=10 ; HEVA-738 Change back!	
+		set:idRxStatus=2.5 idRxStatus=10 ; HEVA-1119 Reset status
+		set:blnAutoClosed=$$$YES idNewStatus=8 ; HEVA-1119 If any line has been Auto Closed then Rx is Auto Closed	
+		if idNewStatus'=idRxStatus {
+			set $$$MEDPrescriptionStatus(objRx)=idNewStatus
+			set strStatus=$$$Save("MEDPrescription",pidRx,objRx,1)
+			if strStatus=$$$OK {
+				do:pidLog'="" AddMessage^COMLog(pidLog,$$$Text($listbuild("MED01276",pidRx,idRxStatus,idNewStatus)))  ;Prescription %1 status change %2 to %3
+			} else {
+				do:pidLog'="" AddMessage^COMLog(pidLog,$$$Text($listbuild("MED01277",pidRx,idRxStatus,idNewStatus)))  ;Error processing Prescription %1 status change %2 to %3
+			}	
+
+		}
+	}
+	quit strStatus
+
+SolutionStatus(pidRx,pidSol)
+	;-------------------------------------------------------------------------------
+	; Return Solution Status
+	;
+	; 
+	; Param: 	Rx, 
+	;			Sol		
+	;
+	; Returns: Status
+	;
+	; History:
+	; 15-Jan-2013	SCR		HEVA-751 Created
+	;-------------------------------------------------------------------------------
+	new idLine,idNewStatus,intLineCount,objLine ,idSol,arrLine,blnAllRecjected,intLowest,idStatus
+	set idLine = ""
+	set blnAllRecjected = $$$YES
+	for intLineCount=0:1 {
+		set idLine=$order(^MEDPrescriptionLine(YM,pidRx,idLine))
+		quit:idLine=""
+		set objLine=$get(^MEDPrescriptionLine(YM,pidRx,idLine,1))
+		set idStatus=+$$$MEDPrescriptionLineStatus(objLine)
+		set idSol =  +$$$MEDPrescriptionLineSolution(objLine)
+		continue:+pidSol'=idSol
+		set arrLine(idLine) = idStatus
+		set:idStatus'=10 blnAllRecjected=$$$NO
+	}
+	set intLowest=9
+	set idLine=""
+	for {
+		set idLine		= $order(arrLine(idLine))
+		quit:idLine=""
+		set idStatus 	=  arrLine(idLine)
+		set:idStatus=10 idStatus=2.5 ; HEVA-738 Treat Rejected between 1 and 2 (Awaiting Validation, Rejected, Awaiting Dispense)
+		set:(idStatus<intLowest)&&(idStatus'=6) intLowest=idStatus ; SR18195
+	}
+	set idNewStatus=intLowest
+	set:idNewStatus=2.5 idNewStatus=10
+	set:'$data(arrLine) idNewStatus=0 ; No lines = New
+		
+	quit idNewStatus
+
+]]></Routine>
+</Export>

@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Class name="VAR.SMS.Service">
+<ClassType/>
+<IncludeCode>MEDConst,VARConst</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%SOAP.WebService</Super>
+
+<Parameter name="ADAPTER">
+<Internal>1</Internal>
+</Parameter>
+
+<Parameter name="SERVICENAME">
+<Default>AgendamentoSMS</Default>
+</Parameter>
+
+<Parameter name="NAMESPACE">
+<Default>http://alphalean.logplanning.com.br</Default>
+</Parameter>
+
+<Method name="getAdmissoes">
+<FormalSpec>pRequest:VAR.SMS.buscarAgendamento.Request</FormalSpec>
+<ReturnType>VAR.SMS.buscarAgendamento.Response</ReturnType>
+<WebMethod>1</WebMethod>
+<Implementation><![CDATA[	#Define STSNaoEnviado 0
+#Define STSEnviado 1
+#Define STSConfirmado 2
+#Define STSNaoConfirmado 3
+#Define STSErroEnvio 4
+#Define STSPacienteSemTelefone 5
+
+	$$$VAR
+	Set YM 		= 0
+	Set Y 		= "~"
+	Set YBED 	= "ADMIN"
+	;
+	Set arrayAdmissoes = []
+	;
+	Set strStatus 				 	= $$$OK	
+	Set codPais 						= 55
+	Set response						= ##class(VAR.SMS.buscarAgendamento.Response).%New()
+	Set response.status 		= $$$OK
+	Set dataChamada					= +$Horolog
+	Set horaChamada					= $Piece($Horolog,",",2)
+
+	Try {
+		Set objVARParametroCliente = $Get(^VARParametroCliente(YM, YM, 1))
+		;
+		If (+$$$VARParametroClienteSMSdeAgendamento(objVARParametroCliente) '= 1) {
+			Return response	
+		}
+		;	
+		Set objWWW0121 = $Get(^WWW0121(YM, YM, 1, 1))
+		;
+		Set dataAgendamento = $Horolog + $$$VARParametroClienteDiasdeAntecedencia(objVARParametroCliente)	
+		Set remetente				= $$$WWW0121LocationName(objWWW0121)
+		;
+		If (horaChamada < $$$VARParametroClienteHorasdoEnvioSMS(objVARParametroCliente)) {
+			Return response	
+		}
+		;
+		If ($Data(^VARControleIntegracaoSMS(YM, dataChamada))) {
+			Return response	
+		}
+		Set ^VARControleIntegracaoSMS(YM, dataChamada, 1) = horaChamada
+		;
+		Set meuSQL = "Select * From SQLUser.MEDAdmission Where Company = 0 "
+		Set meuSQL = meuSQL _ "And DataAgendamento = '"_dataAgendamento_"' "
+		Set meuSQL = meuSQL _ "And %Upper(DateDischarged) = ' ' "
+		;Set meuSQL = meuSQL _ "And DateAdmitted is null And (StatusSMS = '' Or StatusSMS = 0)"
+		Set meuSQL = meuSQL _ "And DateAdmitted is null And NVL(StatusSMS,0) = 0"
+		
+		Set rSet = ##class(%SQL.Statement).%ExecDirect("",meuSQL)
+		Set qtdeAdmission = 0
+		While (rSet.%Next()) {
+			Set codAdmissao 		= rSet.%Get("AdmissionID")
+			Set codPaciente 		= rSet.%Get("Patient")
+			Set dataAgendamento = rSet.%Get("DataAgendamento")
+			Set horaAgendamento = rSet.%Get("HoraAgendamento")
+
+			Set objMEDPatient = $Get(^MEDPatient(YM, codPaciente, 1))	
+			If (objMEDPatient = "") Continue
+			Set flagFaltaTelefone = 0
+			If ($$$MEDPatientTel(objMEDPatient) = "" && ($$$MEDPatientFREE2(objMEDPatient) = "")) {
+				S ^VARContSMS.log(codAdmissao) = "Paciente sem telefone"
+				Do ..alterarStatusAdmissao(codAdmissao, $$$STSPacienteSemTelefone, YBED, "Paciente sem telefone")
+				Continue
+			}
+			Set telefone = $$$MEDPatientTel(objMEDPatient) 
+			If (telefone = "") {
+				Set telefone = $$$MEDPatientFREE2(objMEDPatient)
+			}
+			Set telefone = $Replace(telefone," ","")
+			Set telefone = $Replace(telefone,"+","")
+			Set telefone = $Replace(telefone,"-","")
+			If (telefone?13N&&($Extract(telefone,1,2)?1"55")) {
+				Set telefone = $Extract(telefone,3,13)
+			}
+			If (telefone?11N) {
+				Set telefone = "("_$Extract(telefone,1,2)_")"_$Extract(telefone,3,11)
+			}
+			If ($Extract(telefone,1)'="(") {
+				S ^VARContSMS.log(codAdmissao) = "Telefone formato inválido (XX)XXXXXXXXX"
+				Do ..alterarStatusAdmissao(codAdmissao, $$$STSPacienteSemTelefone, YBED, "Telefone formato inválido (XX)XXXXXXXXX")
+				Continue	
+			}
+			Set ddd = $Extract($Piece(telefone,")",1),2,3)
+			Set telefone = $Piece(telefone,")",2)
+			If ($Extract(telefone,1)<6) {
+				S ^VARContSMS.log(codAdmissao) = "Telefone não é celular. Celular Inicia de 6 a 9."
+				Do ..alterarStatusAdmissao(codAdmissao, $$$STSPacienteSemTelefone, YBED, "Telefone não é celular. Celular Inicia de 6 a 9.")
+				Continue	
+			}
+			If ($Length(telefone)'=9) {
+				S ^VARContSMS.log(codAdmissao) = "Telefone não é celelular. Celular são 9 digitos."
+				Do ..alterarStatusAdmissao(codAdmissao, $$$STSPacienteSemTelefone, YBED, "Telefone não é celelular. Celular são 9 digitos.")
+				Continue	
+			}
+			
+			S ^VARContSMS.log(codAdmissao) = "OK"
+			Set to		 		= codPais_ddd_telefone
+			Set mensagem 	= $$$VARParametroClienteMensagemSMS(objVARParametroCliente)
+			Set nomePaciente = $ZConvert($Translate($ZConvert($Piece($$$MEDPatientName(objMEDPatient)," ",1),"U"),"ÃÕÁÉÍÓÚÀÈÌÒÙÂÊÎÔÛÄËÏÖÜ","AOAEIOUAEIOUAEIOUAEIOU"),"W")
+			Set mensagem = $Replace(mensagem,"NOME",nomePaciente)
+			Set mensagem = $Replace(mensagem,"EMPRESA",remetente)
+			Set mensagem = $Replace(mensagem,"DATA",$ZDate(dataAgendamento,4))
+			Set mensagem = $Replace(mensagem,"HORA",$ZTime(horaAgendamento,2))
+	
+			Set objAdmissoes = ##Class(VAR.SMS.buscarAgendamento.Admissoes).%New()
+			Set objAdmissoes.remetente		= remetente
+			Set objAdmissoes.destinatario = to
+			Set objAdmissoes.numAdmissao 	= codAdmissao
+			Set objAdmissoes.mensagem			= mensagem
+			Do response.admissoes.SetAt(objAdmissoes, $Increment(posicao))
+			
+			Do ..alterarStatusAdmissao(codAdmissao, $$$STSEnviado, YBED)
+	
+		}
+	}
+	Catch(err){
+		#Dim err As %Exception.SystemException
+		Set strStatus = err.DisplayString()
+		Set response.status = '$$$OK
+		Set response.mensagem = strStatus
+	}
+	Return response]]></Implementation>
+</Method>
+
+<Method name="postAdmissoes">
+<FormalSpec>pRequest:VAR.SMS.retornaAgendamento.Request</FormalSpec>
+<ReturnType>VAR.SMS.retornaAgendamento.Response</ReturnType>
+<WebMethod>1</WebMethod>
+<Implementation><![CDATA[	#Define STSNaoEnviado 0
+#Define STSEnviado 1
+#Define STSConfirmado 2
+#Define STSNaoConfirmado 3
+#Define STSErroEnvio 4
+#Define STSPacienteSemTelefone 5
+	
+	#Dim objAdmissao As VAR.SMS.retornaAgendamento.Admissoes
+
+	$$$VAR
+	Set YM 		= 0
+	Set Y 		= "~"
+	Set YBED 	= "ADMIN"
+	;
+	Set strStatus 				 	= $$$OK	
+	Set response						= ##class(VAR.SMS.retornaAgendamento.Response).%New()
+	Set response.status 		= $$$OK
+
+	Try {
+	
+		For index = 1 : 1 : pRequest.admissoes.Count() {
+			Set objAdmissao =  pRequest.admissoes.GetAt(index)
+			
+			Set codAdmissao = objAdmissao.numAdmissao
+			Set msgRetorno 	= $ZConvert($Zstrip(objAdmissao.mensagem,"<>","W "),"U")
+			Set statusSMS 	= $$$STSNaoConfirmado
+			If ($Data(^VARPARA(YM, "CONFAGENDAMENTO", "PT", msgRetorno))) {
+				Set statusSMS = $Piece(^VARPARA(YM, "CONFAGENDAMENTO", "PT", msgRetorno,1),Y,2)
+			}
+			Do ..alterarStatusAdmissao(codAdmissao, statusSMS, YBED, msgRetorno)
+		}
+	
+	}
+	Catch(err){
+		#Dim err As %Exception.SystemException
+		Set strStatus = err.DisplayString()
+		Set response.status = '$$$OK
+		Set response.mensagem = strStatus
+	}
+	Return response]]></Implementation>
+</Method>
+
+<Method name="alterarStatusAdmissao">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pAdmissao,pStatus,pYBED,pMensagem=""</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	$$$VAR
+	Set YM = 0
+	Set Y = "~"
+	Set YBED = pYBED
+	
+	Set objMEDAdmission = $Get(^MEDAdmission(YM, pAdmissao, 1))
+	Set $$$MEDAdmissionStatusSMS(objMEDAdmission) = pStatus
+	Set $$$MEDAdmissionRespostaSMS(objMEDAdmission) = pMensagem
+	If (pStatus = 1 || (pStatus = 4) || (pStatus = 5)) {
+		Set $$$MEDAdmissionDataEnvioSMS(objMEDAdmission) = +$Horolog
+		Set $$$MEDAdmissionHoraEnvioSMS(objMEDAdmission) = $Piece($Horolog,",",2)
+	}
+	If (pStatus = 6) { ;Cancelar
+			Set $$$MEDAdmissionStatus(objMEDAdmission) = 1
+			Set $$$MEDAdmissionDateDischarged(objMEDAdmission) = +$Horolog
+			Set $$$MEDAdmissionTimeDischarged(objMEDAdmission) = $Piece($Horolog,",",2)
+	}
+	Return $$$Save("MEDAdmission", pAdmissao, objMEDAdmission, 1)]]></Implementation>
+</Method>
+</Class>
+</Export>

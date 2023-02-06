@@ -1,0 +1,594 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPADJ" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPADJ
+	;----------------------------------------------------------------------------------------
+	; History
+	; 22-Mar-2005	GRF		Use Boolean Macros/QSave Macros
+	; 08-Jul-2003	SCR     Bug Fixes from Code Checking
+	; 21-May-2003	shobby	Copied from FINARADJ and adjusted to work with Suppliers.
+	; ---------------------------------------------------------------------------------------
+#include COMConst
+#include FINConst
+#include COMSYS
+	
+OnBeforeButtonLine(pYKEY,pYVOR)
+	;-------------------------------------------------------------------------------
+	; Routines called Before Button Line
+	; 
+	; History
+	; 26-Jun-2006	RPW			SR13173: Check if the effective date has expired
+	; 							and if so, let the user know.
+	; 19-Apr-2005	Paul K		Pass pYVOR by reference SR:12180
+	; 06-Jul-2003	shobby		Creation (TR005552)
+	;-------------------------------------------------------------------------------
+	do ReadOnly(pYKEY,.pYVOR)
+	do OnPost(pYKEY)
+	do CheckGLEffectiveDateExpiration^FINAPUtilities() // SR13173
+	quit
+	
+Postable(pidAdjustment="")
+	;-------------------------------------------------------------------------------
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Jun-2006	RPW		SR13173: Make sure the GL Effective Date is valid
+	; 29-Sep-2004	Paul K	Added "Security" to postable
+	; 02-Aug-2004	shobby	Adjustment coming from YKEY may now be from FINAPADJLine,
+	; 						strip off line part.
+	; 29-Jun-2003	SCR		Bug Fix 
+    ;-------------------------------------------------------------------------------
+	new objAdjustment,strStatus
+	
+	set pidAdjustment=$piece(pidAdjustment,",",1)
+	
+	set strStatus=$$$OK
+	
+	if $$$NoKey(pidAdjustment) set strStatus=$listbuild("Fin00089")  ;No Record Selected. // SR14461
+	
+	if $$$ISOK(strStatus) {
+		set objAdjustment=$get(^FINAPADJ(0,pidAdjustment,1))
+	
+		set strStatus=$$ValidGLEffectiveDate^FINGLEffectiveDate($$$FINAPADJTransactionDate(objAdjustment),$$$FINAPADJTransactionDate(objAdjustment),$$$FldFINAPADJTransactionDate)
+		;if $$$ISOK(strStatus) if pidAdjustment="" set strStatus=$listbuild("Fin00089")  ;No Record Selected. // SR14461
+		if $$$ISOK(strStatus) if '$data(^FINAPADJLine(0,pidAdjustment)) set strStatus=$$$Text("Fin00359")  ;Adjustment must have Lines.
+		if $$$ISOK(strStatus) {
+			set objAdjustment=$get(^FINAPADJ(0,pidAdjustment,1))
+			set strStatus     = $$Editable^FINSYSReview("FINAPADJ",$$$FINAPADJStatus(objAdjustment))
+		}
+	}
+	
+	
+	;if $$$ISOK(strStatus) if pidAdjustment="" set strStatus=$listbuild("Fin00089")  ;No Record Selected. // SR14461
+	if $$$ISOK(strStatus) if '$data(^FINAPADJLine(0,pidAdjustment)) set strStatus=$$$Text("Fin00359")  ;Adjustment must have Lines.
+	if $$$ISOK(strStatus) {
+		set objAdjustment=$get(^FINAPADJ(0,pidAdjustment,1))
+		set strStatus     = $$Editable^FINSYSReview("FINAPADJ",$$$FINAPADJStatus(objAdjustment))
+	}
+	
+	if $$$ISOK(strStatus) {
+		set YQ=$$$QSave
+	} else {
+		set YQ=$$$QDontSave_" "_$$$Text(strStatus) // SR14461: Remove the comment, it was wrong.
+	}
+	quit
+ 
+OnPost(pidAdjustment="")
+    ;-------------------------------------------------------------------------------
+    ; Checks if any suppliers are on payment hold before doing any 
+    ; posting. If any are found, the user is warned and then has the
+    ; option to proceed with payments or cancel the postings.
+	; 
+    ; Returns: String
+    ;
+    ; History:
+    ; 26-May-2005	JW		SR12470: Removed reference to old button.
+    ; 12-Oct-2004	Steve S	SR10423: Created
+    ;-------------------------------------------------------------------------------
+	new adjLine,onHoldList,objADJLine,idSupplier,holdStatus
+	new objSupplier,arrSuppliers
+	
+	set adjLine   =""
+	set onHoldList=""
+	
+	if pidAdjustment'="" {
+		for {
+			set adjLine=$order(^FINAPADJLine(0,pidAdjustment,adjLine))
+			quit:adjLine=""
+			
+			; ... get the supplier ID and check the hold status
+			set objADJLine=$get(^FINAPADJLine(0,pidAdjustment,adjLine,1))
+			set idSupplier=$$$FINAPADJLineSupplier(objADJLine)
+			if idSupplier'="" {
+				if '$data(arrSuppliers(idSupplier)) {
+					set arrSuppliers(idSupplier)=1
+					set objSupplier=$get(^FINAPSupplier(0,idSupplier,1))
+					if $$$FINAPSupplierOnHold(objSupplier) {                 ; ... is supplier on hold?
+						if onHoldList'="" set onHoldList=onHoldList_","      ; if yes, add to the list
+						set onHoldList=onHoldList_idSupplier_"("_$$$FINAPSupplierSupplierName(objSupplier)_")"
+					}
+				}
+			}
+		}
+	}
+	
+	if onHoldList'="" {
+		set onHoldList=$$$Text($listbuild("Fin00382",onHoldList))  ;Suppliers: '%1' are on payment hold. Proceed with payments?
+	}
+ 
+	set $$$WWW124AcknowledgementTextBefore(^WWW124(0,"FINAPADJ",SPRACHE,2,1))=onHoldList
+	;set $$$WWW124AcknowledgementTextBefore(^WWW124(0,"FINAPADJLine",SPRACHE,1,1))=onHoldList  ;SR12470
+ 
+	quit onHoldList
+	
+	;=====================================   Post   ================================
+	
+ 
+PostTxn(pidAdjustment="")
+    ;-------------------------------------------------------------------------------
+    ; Transaction protected 'Post' code.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 26-Jun-2006	RPW			SR13173: Make sure the GL Effective Date is valid
+    ; 06-Nov-2005	SCR			SR13578: Add Source details to interface for drill down.
+    ; 20-Oct-2005	PO			SR12943: Included Posted By and changed over to use $$$ISOK
+    ; 04-May-2005	shobby		Created SR11875
+    ;-------------------------------------------------------------------------------
+    ;
+	new strStatus,objAdjustment,blnPost,intStatus,Batch,Block
+	new idLocation,dteTransaction,idCreator,idDepartment
+	new strComment,strForm,strDetail
+ 
+	set strStatus=$$$OK
+	set blnPost=$$$OK
+	set objAdjustment=$get(^FINAPADJ(0,pidAdjustment,1))
+	
+	// SR13173
+	if $$$ISOK(strStatus) {
+		set strStatus=$$ValidGLEffectiveDate^FINGLEffectiveDate($$$FINAPADJTransactionDate(objAdjustment),$$$FINAPADJTransactionDate(objAdjustment),$$$FldFINAPADJTransactionDate)
+	}
+ 
+	if $$$ISOK(strStatus) set strStatus=$$Editable^FINSYSReview("FINAPADJ",$$$FINAPADJStatus(objAdjustment),.blnPost,.intStatus)
+	
+	if $$$ISOK(strStatus) {
+		if blnPost {
+			set idLocation     = $$$FINAPADJCreatorsLocation(objAdjustment)
+			set dteTransaction = $$$FINAPADJTransactionDate(objAdjustment)
+			set idCreator      = $$$FINAPADJCreatedBy(objAdjustment)
+			set idDepartment   = $$$FINAPADJCreatorsDepartment(objAdjustment)
+			; SR13578 - Source Details for Drill Down - Start
+			set strComment	   = $$$FINAPADJComment(objAdjustment)				; Get the Comments, used in the details
+			set strForm		   = $$CheckForm^FINUtils($get(YFORM),"FINAPADJ")	; Get the form using YFORM, with validation
+			set strDetail 	   = "Fin00928,"_pidAdjustment_","_$translate(strComment,","," ")  ;AP Adjustment %1, %2 ; Block Source Details ; SR13578
+			if $$$ISOK(strStatus) set strStatus=$$Allocate^FININTBatch(.Batch,.Block,"APADJ",idLocation,dteTransaction,,idCreator,idDepartment,strForm,pidAdjustment,strDetail)
+			;if $$$ISOK(strStatus) set strStatus=$$Allocate^FININTBatch(.Batch,.Block,"APADJ",idLocation,dteTransaction,,idCreator,idDepartment)
+			; SR13578 - Source Details for Drill Down - End
+			if $$$ISOK(strStatus) set strStatus=$$PostLines(pidAdjustment,Batch,.Block)
+			if $$$ISOK(strStatus) set strStatus=$$PostBlock^FININTBatch(Batch,Block)
+			if $$$ISOK(strStatus) set $$$FINAPADJPostedDate(objAdjustment)=$horolog
+			if $$$ISOK(strStatus) set $$$FINAPADJPostedBy(objAdjustment)  =$get(YBED,"UNKNOWN")
+		}
+		if $$$ISOK(strStatus) {
+			set $$$FINAPADJStatus(objAdjustment)=intStatus
+			set strStatus = $$$Save("FINAPADJ",pidAdjustment,objAdjustment,1)
+		}
+	}
+	quit strStatus
+ 
+ 
+Post(pidAdjustment="")
+	;-------------------------------------------------------------------------------
+	; Post Adjustment to Interface
+	;
+	; History:
+	; 04-May-2006	Steve S	Use ReloadForm^COMUtilForm() (as per Customer Adj.)
+	; 05-May-2005	shobby	SR11875.  Managed transactions to handle rollback after cache errors.
+	; 19-Apr-2005	SCR		SR11476 Pass YLOCATION to Allocate Block
+	; 27-Jan-2005	RobertW	Fixed TCOMMIT and TROLLBACK (SR11273)
+	; 02-Aug-2004	shobby	Number coming from YKEY may now be from FINAPADJLine,
+	; 						strip off line part.
+	; 21-May-2003	shobby	Fixed some error handling issues.
+	; ------------------------------------------------------------------------------
+	;
+	new strStatus
+	
+	set strStatus=$$Transaction^COMTransaction("PostTxn^FINAPADJ("""_pidAdjustment_""")",1)
+	
+	if $$$ISOK(strStatus) {
+		do ReloadForm^COMUtilForm()
+		;do RedirectForm^COMUtils("FINAPADJ",pidAdjustment,"FINAPADJ,",YPARA,1)
+		
+	}
+	quit strStatus
+ 
+	
+PostLines(pidFINAPADJ="",pintBatch,pintBlock)
+	;-------------------------------------------------------------------------------
+	; Posts all the lines.
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Aug-2004	shobby	Check for No lines.
+	; 19-Feb-2004	shobby	Creation (Pulled out of Post)
+	;-------------------------------------------------------------------------------
+	new intLine,strStatus
+	
+	set strStatus=$$$NO
+	
+	if '$data(^FINAPADJLine(0,pidFINAPADJ)) {
+		set strStatus=$$$Text("Fin00359")  ;Adjustment must have Lines.
+	} else {
+		set intLine = ""
+		for {
+			set intLine = $order(^FINAPADJLine(0,pidFINAPADJ,intLine))
+			quit:intLine=""
+			
+			set strStatus = $$PostLine(pidFINAPADJ,intLine,pintBatch,.pintBlock)
+			quit:strStatus'=$$$OK
+			
+			if (intLine/1000)=(intLine\1000) {
+				set strStatus = $$$Save("FINProgress","FINAPADJ",intLine,$$$YES)
+			}
+		}
+	}
+	
+	quit strStatus
+	
+	
+PostLine(Number,Line,Batch,Block)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 07-Oct-2004	Paul K	Added header comments to detail field of invoice.
+	; 02-Jun-2004	shobby	FC adjustments.
+	; 23-May-2004	shobby	Corrected last to parameters on AddLine for APADJ
+	; 29-Jun-2003	SCR		Added Invoice Date
+	; 10-Jun-2003	SCR		Added Sub Block Number
+	; 04-Jun-2003	SCR		Reversed Sign
+	; 21-May-2002	shobby	Fixed the error handling code
+	; ------------------------------------------------------------------------------
+	new Status,Rec,Supplier,Control,Account,Invoice,Charge,Credit,Amount,Due,Discount
+	new Params,CusRec,Date,objAdjustment,Detail
+	
+	set Status=$$$OK
+	set Rec=$get(^FINAPADJLine(0,Number,Line,1))
+	set objAdjustment=$get(^FINAPADJ(0,Number,1))
+	if Rec="" Set Status=$$$NO
+	if Status=$$$OK {
+		set Supplier = $$$FINAPADJLineSupplier(Rec)
+		set Invoice  = $$$FINAPADJLineRef(Rec)
+		set Charge   = $$$FINAPADJLineCharge(Rec)
+		set Credit   = $$$FINAPADJLineCredit(Rec)
+		set Due      = $$$FINAPADJLineDue(Rec)
+		set Discount = $$$FINAPADJLineDiscount(Rec)
+		set Account  = $$$FINAPADJLineGLAccount(Rec)
+		set Date     = $$$FINAPADJLineInvoiceDate(Rec)
+		set Detail   = $$$FINAPADJComment(objAdjustment) ;SR 10425
+	;	set Amount   = Charge-Credit
+		set Amount   = $$$FCSub(Charge,Credit)
+		set Params   = Supplier_","_Invoice_","_Due_","_Discount_","_Date_",,"_Detail ;SR 10425
+	}
+	
+	//if $$$NEVER {
+	//	set ^*($i(^*),"ADJ","Charge")=$g(Charge)
+	//	set ^*($i(^*),"ADJ","Credit")=$g(Credit)
+	//	set ^*($i(^*),"ADJ","Amount")=$g(Amount)
+	//}
+	
+	if Supplier="" set Status=$listbuild("Fin00163")  ; Supplier Number Required
+	if Status=$$$OK {
+		do SubBlockNumber^FININTBatch(.Block) ; Increment Sub Block Number
+		set CusRec=$get(^FINAPSupplier(0,Supplier,1))
+		if CusRec="" set Status=$listbuild("Fin00164",Supplier)  ; Supplier number %1 not Found
+	}
+	if Status=$$$OK {
+		set Control=$$$FINAPSupplierControlAccount(CusRec)
+		if Control="" set Status=$listbuild("Fin00165",Supplier)  ; Supplier control account not valid for Supplier %1
+	}
+	if Status=$$$OK {	
+		set Status=$$AddLine^FININTBatch(Batch,Block,Control,$$$FCSign(Amount),"APADJ",Params,Number_","_Line,Supplier)
+	}
+	if Status=$$$OK {
+		set Status=$$AddLine^FININTBatch(Batch,Block,Account,Amount,"APADJGL",Supplier,Supplier_","_Invoice,Number_","_Line)
+	}
+ 
+	quit Status
+	;=====================================   Post End  =============================
+		
+	/*	
+LastGLAccount(Key)
+	;-------------------------------------------------------------------------------
+	; Get the Last Account, used for the default GL account the next line
+	; 
+	; History:
+	; 13-Nov-2006	JW			SR14550: Redundant due to edit grid
+	;-------------------------------------------------------------------------------
+	new LastLine,Number,Acc,Rec
+	
+	set Number=$piece(Key,",",1)
+	set (Rec,Acc)=""
+	if Number'="" {
+		set LastLine=$order(^FINAPADJLine(0,Number,""),-1)  ; Get Last Line
+		if LastLine {
+			set Rec=$get(^FINAPADJLine(0,Number,LastLine,1))
+			set Acc=$$$FINAPADJLineGLAccount(Rec)
+		}
+	}
+ 
+	quit Acc
+	
+	
+AfterLineFormLoad(pidAdjustment="")
+	;-------------------------------------------------------------------------------
+	; Shows totals for adjustment
+	;
+	; History:
+	; 23-Jun-2006	JW			SR12775: Redundant due to edit grid
+	; 24-Mar-2005	Paul K		Passed in YKEY as param
+	;-------------------------------------------------------------------------------
+	new Charges,Credits,Total,Line,objAdjustment,lstHeader
+	
+	set lstHeader=""
+	set lstHeader=lstHeader_$listbuild($$^WWWTEXT("Fin00155"))  ; Adjustment
+	set lstHeader=lstHeader_$listbuild($$^WWWTEXT("Fin00156"))  ; Total Charges
+	set lstHeader=lstHeader_$listbuild($$^WWWTEXT("Fin00157"))  ; Total Credits
+	set lstHeader=lstHeader_$listbuild($$^WWWTEXT("Fin00158"))  ; Adjustment Total
+	
+	do Start^COMTable(lstHeader)
+	set pidAdjustment=$p(pidAdjustment,",",1)
+	if pidAdjustment'="" {
+		set objAdjustment=$get(^FINAPADJ(0,pidAdjustment,1))
+		do NewLine^COMTable()
+		do InsertCell^COMTable(pidAdjustment)
+		do InsertCurrencyCell^COMTable($$$FINAPADJTotalCharges(objAdjustment),$$$YES)
+		do InsertCurrencyCell^COMTable($$$FINAPADJTotalCredits(objAdjustment),$$$YES)
+		do InsertCurrencyCell^COMTable($$$FINAPADJTotalAdjustments(objAdjustment),$$$YES)
+		do EndLine^COMTable()
+		}
+	do Stop^COMTable()
+	quit
+	*/
+	
+OldBalance(Number) 
+	;-------------------------------------------------------------------------------
+	; Recalculate the balance on the Adjustment from the lines
+	;
+	;	**** NO LONGER IN USE *** JW 30-11-2004 *** New Balance() below ***
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Jun-2004	shobby	Foreign Currency.
+	; 18-Feb-2004	shobby	Change to Save to set the lock flag to 1
+	; ??-???-????	??????	Creation
+	;-------------------------------------------------------------------------------
+	new Line,Total,Charges,Credits,Rec,RecSave,strStatus
+	
+	set strStatus = $$$OK
+	
+	if $get(Number)="+" set Number=""
+	
+	if $get(Number)'="" {
+		set Total   = 0
+		set Charges = 0
+		set Credits = 0
+		
+		set Line = ""
+		for {
+			set Line = $order(^FINAPADJLine(0,Number,Line))
+			quit:Line=""
+			
+			set Rec     = $get(^FINAPADJLine(0,Number,Line,1))
+			set Charges = $$$FCAdd(Charges,$$$FINAPADJLineCharge(Rec))
+			set Credits = $$$FCAdd(Credits,$$$FINAPADJLineCredit(Rec))
+		}
+		set Total   = $$$FCSub(Charges,Credits)
+		set Rec     = $get(^FINAPADJ(0,Number,1))
+		set RecSave = Rec
+		set $$$FINAPADJTotalCharges(Rec)     = Charges
+		set $$$FINAPADJTotalCredits(Rec)     = Credits
+		set $$$FINAPADJTotalAdjustments(Rec) = Total
+		if Rec'=RecSave {
+			set strStatus = $$$Save("FINAPADJ",Number,Rec,$$$YES)
+		}
+	}
+	quit strStatus
+	
+ReadOnly(pidAdjustment,pobjForm="")  
+	;-----------------------------------------------------------------------------
+	; Make Lines Read Only if Posted
+	;
+	; Returns nothing (pobjForm is passed by reference to YVOR)
+	; History:
+	; 24-Mar-2005	Paul K	Pass in Form object
+	; 06-Oct-2004	Paul K	Test for "+"
+	; 29-Sep-2004	Paul K	New Editable routine.
+	; 06-Jul-2003	shobby	Disabled 'Copy' button. (TR005552)
+	;-----------------------------------------------------------------------------
+	new strButtons
+	
+	set pidAdjustment = $$$KEY1(pidAdjustment)
+	if (pidAdjustment'="")&&(pidAdjustment'="+") {
+		if '$$Editable^FINSYSReview("FINAPADJ",$$$FINAPADJStatus($get(^FINAPADJ(0,pidAdjustment,1)))) {
+			set $$$WWW120AuthorizationToModifyData(pobjForm) = $$$EnumReadOnly
+			set $$$WWW120DoNOTDisplayStandardButto(pobjForm) = $$AddItem^FINUtils($$$WWW120DoNOTDisplayStandardButto(pobjForm),"15")  ;TR005552
+		}
+	}
+	quit
+	
+OnAfterDataFields(pYKEY,pYSEITE)
+    ;-------------------------------------------------------------------------------
+    ; Code to run after data fields
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 07-Sep-2005	PO		SR12943: Only load grid for fisrt page
+    ; 14-Dec-2004	shobby	Removed null YKEY test (SR11176)
+    ; ??-Dec-2004	Shobby	Created
+    ;-------------------------------------------------------------------------------
+ 
+	if pYSEITE=1 {
+		do LoadGrid(pYKEY)
+	}
+	quit
+	
+LoadGrid(pYKEY)
+	;-----------------------------------------------------------------------------
+	; Apply the edit grid to this form
+	;
+	; History:
+	; 30-Sep-2005	JW		SR11573: Simplified update fields
+    ; 10-Dec-2004	shobby	Removed null YKEY test (SR11175)
+	;  7-Dec-2004	JW		SR11146: Set default fields.
+	; 22-Nov-2004	PO		SR10540
+	;-----------------------------------------------------------------------------
+	new YFORM,YKEY,YAUSWAHL,YFELD
+	
+	set YFORM="FINAPADJLine"
+	set YKEY=$get(pYKEY)
+	set YFELD=""
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 400
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = YFORM
+	;set $$$COMGridEditParameterUpdateFields(YAUSWAHL)  = "#YFINAPADJD8=3;#YFINAPADJD9=4;#YFINAPADJD10=3-4"
+	set $$$COMGridEditParameterUpdateFields(YAUSWAHL)  = "D8=3;D9=4;D10=3-4"
+	set $$$COMGridEditParameterClearFields(YAUSWAHL)   = "3,4;4,3"
+	set $$$COMGridEditParameterDefaultFields(YAUSWAHL) = 7
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)     = "FINAPADJ"
+	do ^COMGridEdit31
+	
+	quit
+	
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	;
+	; History:
+	; 07-Sep-2005	PO		SR12943: On first save store location and department details
+	; 14-Apr-2005	Paul K	Moved foreign currency checks from header to lines.
+	; 29-Mar-2005	shobby	Replace 0 with YM in WWWDATEN access.
+	; 22-Mar-2005	PO		Reworked procedure to actually prevent save
+	; 12-Jan-2005	PO		SR11389
+	;-------------------------------------------------------------------------------
+	new strStatus,objEmployeeData
+ 
+	set strStatus=$$$GRIDSave(pYKEY)
+	if $$$ISERR(strStatus) {
+		set Q=$$$QDontSave
+	} else {
+		if $$$FINAPADJCreatedBy(pYFELD) = "" {
+			set objEmployeeData = $get(^WWW013(0,$get(YBED,"UNKNOWN"),1))
+			set $$$FINAPADJCreatorsLocation(pYFELD)   = $get(YLOCATION)
+			set $$$FINAPADJCreatorsDepartment(pYFELD) = $$$WWW013HomeDepartment(objEmployeeData)
+		}
+	}
+	quit
+	
+Balance(Number,pobjFINAPADJ="",pblnSave=$$$YES) ; Recalculate the balance on the Adjustment from the lines
+    ;-------------------------------------------------------------------------------
+    ; Copied from FINARADJ
+    ;
+    ; NOTE: If changes are made here, might need to update for Customers also.
+    ;
+    ; History:
+    ; 30-Nov-2004	JW		Created
+    ;-------------------------------------------------------------------------------
+	new Total,Charges,Credits,Status,Rec,RecSave
+	
+	set Status=$$$OK
+	if Number="+" set Number=""
+	
+	if $get(Number)'="" {
+		do GetBalance(Number,.Charges,.Credits)
+		set Total=$$$FCSub(Charges,Credits)
+		if pobjFINAPADJ="" set pobjFINAPADJ=$get(^FINAPADJ(0,Number,1))
+		set RecSave=pobjFINAPADJ
+		set $$$FINAPADJTotalCharges(pobjFINAPADJ)     = Charges
+		set $$$FINAPADJTotalCredits(pobjFINAPADJ)     = Credits
+		set $$$FINAPADJTotalAdjustments(pobjFINAPADJ) = Total
+		if pblnSave && (pobjFINAPADJ'=RecSave) {
+			set Status = $$$Save("FINAPADJ",Number,pobjFINAPADJ,$$$YES)
+			}
+		}
+	quit Status
+	
+GetBalance(pidNumber,pcurCharges,pcurCredits,pcurTotal) ; Recalculate the balance on the Adjustment from the lines
+    ;-------------------------------------------------------------------------------
+    ; Copied from FINARADJ
+    ;
+    ; NOTE: If changes are made here, might need to update for Customers also.
+    ;
+    ; History:
+    ; 30-Nov-2004	JW	Created
+    ;-------------------------------------------------------------------------------
+	new Line,objFINAPADJLine
+	
+	set Line=""
+	set pcurCharges=0
+	set pcurCredits=0
+ 
+	if pidNumber="+" set pidNumber=""
+	
+	if $get(pidNumber)'="" {
+		for {
+			set Line=$order(^FINAPADJLine(0,pidNumber,Line))
+			quit:Line=""
+			
+			set objFINAPADJLine=$get(^FINAPADJLine(0,pidNumber,Line,1))
+			set pcurCharges=$$$FCAdd(pcurCharges,$$$FINAPADJLineCharge(objFINAPADJLine))
+			set pcurCredits=$$$FCAdd(pcurCredits,$$$FINAPADJLineCredit(objFINAPADJLine))
+		}
+	}
+	quit
+	
+	/* RPW	SR13173: Obsolete
+OnBlurEffectiveDate(pYFELD="")
+	;-------------------------------------------------------------------------------
+	; On Blur of GL Effective Date
+	;
+	; Parameters:
+	; pYFELD	This contains the data of the Invoice Match/Voucher
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Jul-2005	RobertW		SR12958: Pass in 0 instead of 1.
+	; 01-Jul-2005	RobertW		SR12230: Created
+	;-------------------------------------------------------------------------------
+	new dteGLEffective
+	
+	set dteGLEffective = $$$FINAPADJTransactionDate(pYFELD)
+	
+	if dteGLEffective'="" {
+		do SetGLEffectiveDate^FINGLEffectiveDate(dteGLEffective,dteGLEffective,$$$FldFINAPADJTransactionDate)
+	} else {
+		; Handle when the field has been deleted, there MUST be a value here.
+		do SetGLEffectiveDate^FINGLEffectiveDate(0,dteGLEffective,$$$FldFINAPADJTransactionDate) ; SR12958
+	}
+	
+	quit
+	*/
+	
+GetType()
+	;-------------------------------------------------------------------------------
+	; Get the Type for the Effective Date
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; The type of the effective date
+	;
+	; History:
+	; 26-Jun-2006	RPW		SR13173: Created
+	;-------------------------------------------------------------------------------
+ 
+	quit "APADJ"
+]]></Routine>
+</Export>

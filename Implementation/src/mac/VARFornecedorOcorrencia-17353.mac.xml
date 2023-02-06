@@ -1,0 +1,421 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARFornecedorOcorrencia" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARFornecedorOcorrencia
+	#include COMSYS
+	#include INConst
+	#include VARConst
+	#import VAR.infra.webservice.alphalinc
+	#import VAR.infra.integracao
+	quit
+
+OnBeforeEditAcessHook(objFornecedorOcorrencia)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Deixa o formulário somente leitura caso a ocorrência de fornecedor foi
+    ;   criada via carga de dados.
+    ;
+    ; Chamado por:
+    ;	Hook OnBeforeEditAccess da classe VARFornecedorOcorrencia.
+    ; 
+    ; Histórico:
+    ; 	14-Oct-2011		Criado
+    ;-------------------------------------------------------------------------------	
+	if ($$$VARFornecedorOcorrenciaCarga(objFornecedorOcorrencia) = $$$YES) {
+		quit $$$NO
+	}
+	quit $$$YES
+
+OnBeforeButtonLine(YAUSWAHL, &YFELD, &YOPTION)
+	if (($length(YAUSWAHL, "INREC=") = 2) &&
+		($length($piece(YFELD, Y, 9)) = 0)) {
+		set $piece(YFELD, Y, 9) = $piece(YAUSWAHL, "INREC=", 2)
+	}
+
+	set ^CacheTempFornecedorOcorrenciaSup(YUSER) = $$$KEY1(YKEY)
+	set ^CacheTempFornecedorOcorrenciaRec(YUSER) = $piece(YFELD, Y, 9)
+	do DefinirValoresManuaisRecebimento()
+	do DefinirValoresManuaisLinhaRecebimento()
+	quit
+
+OnBeforeSave(pYKEY, pYFELD)
+	new strStatus
+
+	set strStatus = $$ValidaRecebimento(pYFELD)
+	if ($$$ISOK(strStatus)) {
+		set strStatus = $$ValidaQuantidadeRecebida(pYFELD)
+	}
+	if ($$$ISOK(strStatus)) {
+		set strStatus = $$ValidaQuantidadeSegregada(pYFELD)
+	}
+	if ('$$$ISOK(strStatus)) {
+		set Q = $$$QDontSave
+		do ReturnError^COMUtilError(strStatus)
+	}
+	quit
+
+OnAfterSaveHook(pYKEY)
+	new CodFornecedor, NumOcorrencia
+
+	set CodFornecedor = $$$KEY1(YKEY)
+	set NumOcorrencia = $$$KEY2(YKEY)
+	if ($$$NoKey(CodFornecedor) || $$$NoKey(NumOcorrencia)) quit $$$OK
+	
+	set objOcorrencia = $get(^VARFornecedorOcorrencia(YM, CodFornecedor, NumOcorrencia, 1))
+    if ($$$VARFornecedorOcorrenciaMotivo(objOcorrencia) = 14) quit $$$OK
+    if ($$$VARFornecedorOcorrenciaRecebimento(objOcorrencia) = "") quit $$$OK
+	
+	// verifica se o fornecedor foi cadastrado via integração
+	if (+$$$INLIEFFREE18($get(^INLIEF(YM, CodFornecedor, 1)))) {
+		do ##class(ObtemOcorrenciasFornecedor).LimpaNumeroOcorrenciaInfoSaude(YM, CodFornecedor, NumOcorrencia)
+
+		do ##class(GerenciaFilaPendencias).RegistraEvento(
+			##class(GerenciaFilaPendencias).%GetParameter("ENTIDADEOCORRENCIA"),
+			CodFornecedor,
+			NumOcorrencia,
+			##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+			##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+			##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+			##class(GerenciaFilaPendencias).%GetParameter("ACAOSALVAR"))
+	}
+
+	quit $$$OK
+
+OnBeforeDeleteHook(pYKEY)
+	new CodFornecedor, NumOcorrencia
+
+	set CodFornecedor = $$$KEY1(YKEY)
+	set NumOcorrencia = $$$KEY2(YKEY)
+	if ($$$NoKey(CodFornecedor) || $$$NoKey(NumOcorrencia)) quit $$$OK
+
+	set objOcorrencia = $get(^VARFornecedorOcorrencia(YM, CodFornecedor, NumOcorrencia, 1))
+    if ($$$VARFornecedorOcorrenciaMotivo(objOcorrencia) = 14) quit $$$OK
+    if ($$$VARFornecedorOcorrenciaRecebimento(objOcorrencia) = "") quit $$$OK
+
+	// verifica se o fornecedor foi cadastrado via integração
+	if (+$$$INLIEFFREE18($get(^INLIEF(YM, CodFornecedor, 1)))) {
+		set objFornecedorOcorrencia = $get(^VARFornecedorOcorrencia(YM, CodFornecedor, NumOcorrencia, 1))
+		do ##class(ObtemOcorrenciasFornecedor).GravaNumeroOcorrenciaInfoSaude(YM, CodFornecedor, NumOcorrencia,
+			$$$VARFornecedorOcorrenciaNDocIntegrado(objFornecedorOcorrencia))
+
+		// Registra Evento na Tabela de Gerenciamento da Integração
+		do ##class(GerenciaFilaPendencias).RegistraEvento(
+			##class(GerenciaFilaPendencias).%GetParameter("ENTIDADEOCORRENCIA"),
+			CodFornecedor,
+			NumOcorrencia,
+			##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+			##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+			##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+			##class(GerenciaFilaPendencias).%GetParameter("ACAOEXCLUIR"))
+	}
+
+	quit $$$OK
+
+OnAfterDataFields(pYVOR, pYKEY)
+	new count, codFornecedor, codOcorrencia,idMotivo, outro, data,
+		observacoes, recebimento, objOcorrencia, key, motivo,strD9Name
+	
+	if ($$$NoKey(YKEY)) quit
+
+	;Executar somente se estiver no form de Ocorrências (aba 1) (previne execução na INLIEF)
+	if (YFORM = "VARFornecedorOcorrencia") {	
+		if (YSEITE = 1) {
+			set strD9Name = "Y"_YFORM_"D9"
+	
+			$$$StartScript()
+			&js<
+				document.#(YHTMFORM)#.#(strD9Name)#.onblur();
+			>
+			$$$EndScript()
+		}
+	}
+
+	set count = 0
+
+	//Monta cabeçalho da tabela
+   	new lstHeader
+ 	set lstHeader=""
+  	set lstHeader=lstHeader_$listbuild("Seq.", "Cód. Ocorrência", "Motivo",
+  		"Outro", "Data", "Observações", "Nº Recebimento")
+
+  	if $$Start^COMTable(lstHeader,"<div style=margin:3px;>Ocorrências registradas para o fornecedor</div>",,,$$$NO) {
+
+	 	set rs = ##class(%ResultSet).%New()
+	    do rs.Prepare("SELECT   CodFornecedor, CodOcorrencia, Motivo, "_
+	    	          "         Outro, Data, Observacoes, Recebimento "_
+	    	          "FROM     VARFornecedorOcorrencia "_
+	    	          "WHERE    CodFornecedor = ? "_
+	    	          "ORDER BY Data DESC")
+	    do rs.Execute($$$KEY1(YKEY))
+
+	    while rs.Next() {
+			if ($SYSTEM.Status.IsOK(rs)) {  // check if this succeeded without errors		
+        	
+	        	//Pegando valores da query
+	        	set codFornecedor = rs.GetData(1)
+	        	set codOcorrencia = rs.GetData(2)
+	        	set idMotivo 	  = rs.GetData(3)
+	        	set outro	 	  = rs.GetData(4)
+	        	set data		  = rs.GetData(5)
+	        	set observacoes   = rs.GetData(6)
+	        	set recebimento   = rs.GetData(7)
+	        					
+				set count = $i(count)
+				
+				set key = codFornecedor_","_codOcorrencia
+				
+    			do NewLine^COMTable()
+    			do InsertCell^COMTable(count,"VARFornecedorOcorrencia",key)
+			    do InsertCell^COMTable(codOcorrencia,"VARFornecedorOcorrencia",key)
+			    do InsertCell^COMTable(idMotivo_" - "_$piece($get(^VARPARA(YM,"OCORRENCIAFORNECEDOR",SPRACHE,idMotivo,1)),Y,1),"VARFornecedorOcorrencia",key)
+			    do InsertCell^COMTable(outro,"VARFornecedorOcorrencia",key)
+			    do InsertCell^COMTable($zdate(data,4),"VARFornecedorOcorrencia",key)
+			    do InsertCell^COMTable(observacoes,"VARFornecedorOcorrencia",key,,,,,,,1)
+			    do InsertCell^COMTable(recebimento,"VARFornecedorOcorrencia",key, , "CENTER")
+		        do EndLine^COMTable()		        		                	       
+			}
+	    }
+	    
+	    if (count = 0) {
+			do NewLine^COMTable()
+			do InsertCell^COMTable("Nenhuma ocorrência registrada para este fornecedor.",,,,,,7)
+			do EndLine^COMTable()   
+	    }
+	    
+		do NewLine^COMTable("lightsteelblue")
+		do InsertCell^COMTable("<strong>Cadastrar nova ocorrência</strong>",
+			"VARFornecedorOcorrencia", $$$KEY1(YKEY), , "RIGHT", , 7)
+		do EndLine^COMTable()	    
+	    
+	 	do Stop^COMTable()
+  	}
+
+	quit
+
+OnBlurRecebimento()
+	new strStatus
+
+	if ($get(^CacheTempFornecedorOcorrenciaRec(YUSER)) '= $piece(YFELD, Y, 9)) {
+		set ^CacheTempFornecedorOcorrenciaRec(YUSER) = $piece(YFELD, Y, 9)
+		set $piece(YFELD, Y, 11) = ""
+	}
+
+	do DefinirValoresManuaisRecebimento()
+	do OnBlurLinhaRecebimento()
+	set %TXT(1) = %TXT(1)_"#Y"_YFORM_"D28~"_GblNotaFiscal_
+						  "#Y"_YFORM_"D29~"_$$^WWWDATE(GblDataEmissao)
+	
+
+	set strStatus = $$ValidaRecebimento(YFELD)
+	if ('$$$ISOK(strStatus)) {
+		set %TXT(1) = %TXT(1)_"#FUNCTION~alert('"_strStatus_"');"
+	}
+	quit
+
+IsRecebimentoInvalido(YFELD)
+	quit '$$$ISOK($$ValidaRecebimento(YFELD))
+
+OnBlurLinhaRecebimento()
+	do DefinirValoresManuaisLinhaRecebimento()
+	set %TXT(1) = "#Y"_YFORM_"D21~"_GblProduto_
+		"#Y"_YFORM_"D22~"_GblLote_
+		"#Y"_YFORM_"D23~"_$$^WWWDATE(GblValidade)_
+		"#Y"_YFORM_"D24~"_GblMarca_
+		"#Y"_YFORM_"D25~"_$$^WWWTR(0, 12, GblQuantidadeRecebida)
+	
+	if (($piece(YFELD, Y, 11)="") && ($$$VARFornecedorOcorrenciaMotivo(YFELD) = 14)) {
+		do ToggleReadOnly^COMUtilForm("28;29",$$$NO,YFORM)
+	}
+	elseif ($$$VARFornecedorOcorrenciaMotivo(YFELD) = 14) {
+		do ToggleReadOnly^COMUtilForm("28;29",$$$YES,YFORM)
+	}
+	
+	quit
+
+OnQuantidadeSegregadaBlur()
+	new strStatus
+
+	set strStatus = $$ValidaQuantidadeSegregada(YFELD)
+	if ('$$$ISOK(strStatus)) {
+		set %TXT(1) = "#FUNCTION~alert('"_strStatus_"');"
+	}
+
+	quit
+
+IsQuantidadeSegregadaInvalida(YFELD)
+	quit '$$$ISOK($$ValidaQuantidadeSegregada(YFELD))
+
+OnAfterNotivisa()
+	write "<strong><font size='-1'>"_
+		"<a href='http://www8.anvisa.gov.br/notivisa/frmlogin.asp' target='_blank'>"_
+		"NOTIVISA</a></font></strong>"
+	quit
+
+CanViewReportComunicadoDesvioQualidade(pYKEY)
+	new strStatus, key1, key2, objFornecedorOcorrencia
+
+	set strStatus = $$$OK
+
+	set key1 = $$$KEY1(pYKEY)
+	set key2 = $$$KEY2(pYKEY)
+	if ($$$NoKey(key1) || $$$NoKey(key2)) {
+		set strStatus = $$$MakeStatus(32072) ; "Please Select A Data Record First."
+	}
+	else {
+		set objFornecedorOcorrencia = $get(^VARFornecedorOcorrencia(YM,
+			$$$KEY1(pYKEY), $$$KEY2(pYKEY), 1))
+		if ($$$VARFornecedorOcorrenciaMotivo(objFornecedorOcorrencia) '= 14) {
+			set strStatus = "O relatório de Comunicado de Desvio de Qualidade "_
+				"somente pode ser impresso para as ocorrências com o motivo "_
+				"'Desvio de Qualidade'."
+		}
+	}
+
+	$$$YQHandler(strStatus)
+	quit
+
+ImprimeRelatorioComunicadoDesvioQualidade(pYKEY)
+	do RunReportComunicadoDesvioQualidade^VARJasperRunReport($$$KEY1(pYKEY),
+		$$$KEY2(pYKEY))
+	quit
+
+DefinirValoresManuaisRecebimento()
+	new idINREC, objINREC
+	
+	if (($$$KEY1(YKEY) '= "") && (($$$KEY2(YKEY) '= "") && ($$$KEY2(YKEY) '= "+"))){
+		set objOcorrencia = $get(^VARFornecedorOcorrencia(0,$$$KEY1(YKEY),$$$KEY2(YKEY),1))
+		if (objOcorrencia '= "") {
+				set GblNotaFiscal =  $$$VARFornecedorOcorrenciaNotaFiscal(objOcorrencia)
+				set GblDataEmissao =  $$$VARFornecedorOcorrenciaDataEmissaoNF(objOcorrencia)
+		}
+	}
+	else {
+		set GblNotaFiscal = ""
+		set GblDataEmissao = ""
+	}
+	
+	set idINREC = $piece(YFELD, Y, 9)
+	if ($length(idINREC) = 0) quit
+
+	set objINREC = $get(^INREC(YM, idINREC, 1))
+
+	set GblNotaFiscal = $$$INRECInvoiceNumber(objINREC)
+	set GblDataEmissao = $$$INRECInvoiceDate(objINREC)
+	quit
+
+DefinirValoresManuaisLinhaRecebimento()
+	new idINREC, idINRECLine, objINRECLine, idINART, objINART
+	
+	if (($$$KEY1(YKEY) '= "") && (($$$KEY2(YKEY) '= "") && ($$$KEY2(YKEY) '= "+"))){
+		set objOcorrencia = $get(^VARFornecedorOcorrencia(0,$$$KEY1(YKEY),$$$KEY2(YKEY),1))
+		if (objOcorrencia '= "") {
+			set GblProduto = $$$VARFornecedorOcorrenciaProduto(objOcorrencia)
+			set GblLote = $$$VARFornecedorOcorrenciaLote(objOcorrencia)
+			set GblValidade =  $$$VARFornecedorOcorrenciaValidade(objOcorrencia)
+			set GblMarca = $$$VARFornecedorOcorrenciaMarca(objOcorrencia)
+			set GblQuantidadeRecebida = $$$VARFornecedorOcorrenciaQuantidadeRecebida(objOcorrencia)
+		}
+	}
+	else {
+		set GblProduto = ""
+		set GblLote = ""
+		set GblValidade = ""
+		set GblMarca = ""
+		set GblQuantidadeRecebida = ""
+	}
+	
+	if ('$$$ISOK($$ValidaRecebimento($get(YFELD)))) quit
+
+	set idINREC = $piece(YFELD, Y, 9)
+	set idINRECLine = $piece(YFELD, Y, 11)
+	if (($length(idINREC) = 0) || ($length(idINRECLine) = 0)) quit
+
+	set objINRECLine = $get(^INRECLine(YM, idINREC, idINRECLine, 1))
+	set idINART = $$$INRECLineItem(objINRECLine)
+	if ($length(idINART) = 0) quit
+
+	set objINART = $get(^INART(YM, idINART, 1))
+
+	set GblProduto = idINART
+	set GblLote = $$$INRECLineLotNumber(objINRECLine)
+	set GblValidade = $$$INRECLineExpirationDate(objINRECLine)
+	set GblMarca = $$$INRECLineBrand(objINRECLine)
+	set GblQuantidadeRecebida = $$$INRECLineUnitQuantity(objINRECLine)
+	quit
+
+ValidaRecebimento(YFELD)
+	new strStatus, idINREC, objINREC
+
+	set strStatus = $$$OK
+
+	set idINREC = $piece(YFELD, Y, 9)
+	if ($length(idINREC) = 0) quit strStatus
+
+	set objINREC = $get(^INREC(YM, idINREC, 1))
+	if ($$$INRECStatus(objINREC) = $$$EnumINSTATUSUnprocessed) {
+		;set strStatus = "O recebimento selecionado ainda não foi processado."
+	}
+
+	quit strStatus
+
+ValidaQuantidadeSegregada(YFELD)
+	new strStatus
+
+	set strStatus = $$$OK
+
+	do DefinirValoresManuaisRecebimento()
+	do DefinirValoresManuaisLinhaRecebimento()
+
+	if ($$$VARFornecedorOcorrenciaQuantidadeSegregada(YFELD) > $$$VARFornecedorOcorrenciaQuantidadeRecebida(YFELD)) {
+		set strStatus = "A quantidade segregada não pode ser maior que a "_
+			"quantidade recebida."
+	}
+	if ($$$VARFornecedorOcorrenciaQuantidadeSegregada(YFELD) < 0) {
+		set strStatus = "A quantidade segregada não pode ser negativa."
+	}
+
+	quit strStatus
+
+OnQuantidadeRecebidaBlur()
+	new strStatus
+
+	set strStatus = $$ValidaQuantidadeRecebida(YFELD)
+
+	if ('$$$ISOK(strStatus)) {
+		set %TXT(1) = "#FUNCTION~alert('"_strStatus_"');"
+	}
+
+	quit
+	
+ValidaQuantidadeRecebida(YFELD)
+	new strStatus
+
+	set strStatus = $$$OK
+
+	do DefinirValoresManuaisRecebimento()
+	do DefinirValoresManuaisLinhaRecebimento()
+
+	if ($$$VARFornecedorOcorrenciaQuantidadeRecebida(YFELD) < 0) {
+		set strStatus = 0_" A quantidade recebida não pode ser negativa."
+	}
+
+	quit strStatus
+
+IsQuantidadeRecebidaInvalida(YFELD)
+	quit '$$$ISOK($$ValidaQuantidadeRecebida(YFELD))
+	
+	
+OnBlurMotivo()
+
+	;Desvio de qualidade
+	if (YINHALT = 14) {
+		do ToggleReadOnly^COMUtilForm("28;29",$$$NO,YFORM)
+	}
+	else {
+		do ToggleReadOnly^COMUtilForm("28;29",$$$YES,YFORM)
+	}
+
+	quit
+
+]]></Routine>
+</Export>

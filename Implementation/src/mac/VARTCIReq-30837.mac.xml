@@ -1,0 +1,630 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARTCIReq" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARTCIReq
+#include COMSYS
+#include INConst
+#include %occInclude
+
+	quit
+
+CanConfirm(pYKEY)
+ 	quit:(pYKEY = "")
+ 	
+ 	new isConfirmed	
+	set isConfirmed = $piece($get(^INReq(YM,pYKEY,1)),Y,19)
+	
+	if (isConfirmed = 1) {
+		set YQ = $$$YQDisable("Esta requisição já está confirmada.")
+	} elseif ($order(^INReqLine(YM,pYKEY,"")) = "") {
+		set YQ = $$$YQDisable("Não existem produtos na requisição.")
+	} else { 
+		set YQ = $$$YQEnable
+	}
+	quit
+	
+Confirm(pYKEY)
+	quit:(pYKEY = "")
+	
+	new strStatus, objReq
+	set strStatus = $$$OK
+	
+	set objReq = $get(^INReq(YM,pYKEY,1))			
+	
+	if $piece(objReq,Y,19) = "" {
+		set $piece(objReq,Y,19) = 1
+		set strStatus = $$$Save("INReq",pYKEY,objReq,1)
+		if $$$ISERR(strStatus) { 
+			$$$StartScript()
+			w "alert('Não foi possível confirmar a requisição. Favor verificar.');"
+			$$$EndScript()
+		}	
+		do GoToForm^COMUtilForm("INReq",pYKEY)	
+	}
+	quit
+	
+	
+CheckReadOnly()
+	if ($piece($get(^WWW013(YM,YBED,1)),Y,3) = 211) quit $$$YES  //Perfil 211 = ME-REQUISITANTE
+	quit $$$NO
+	
+QtyReadOnly(pYKEY)
+	if ($piece($get(^INReq(YM,$$$KEY1(pYKEY),1)),Y,19) = 1) quit $$$YES  //Campo 19 = QTDE REQUISITADA
+	quit $$$NO
+	
+OnBlurVARQtyRequired(GROW,YINHALT,YFELD)
+	;-------------------------------------------------------------------------
+	;19-Jul-2010	Karine 	SESAU-81:Alterado para pegar o novo parâmetro de cliente
+	;-------------------------------------------------------------------------
+	
+	new isValidating
+	set isValidating = $$$NO
+	
+	if (YINHALT '= $$$NULLOREF) {
+	
+		set isValidating = $$getValidaQtdReq^VARParametroCliente(YM)
+		
+		if ((isValidating = $$$OK) || (isValidating = "")) {
+		
+			;Verifica se tem estoque para o Item,Local
+			new idRequisition, objRequisition, idLocation
+			set idRequisition  = $$$KEY1(YKEY)
+			set objRequisition = $get(^INReq(YM,idRequisition,1))
+			set idLocation     = $$$INReqFromLocn(objRequisition)
+		
+			new vItem
+			set vItem = $piece(YFELD,Y,1)
+			if vItem '= "" {
+				if $$GetSOHItem(vItem,idLocation) < YINHALT {
+					set strMessage = "Não há estoque suficiente do produto "_vItem_" no local "_idLocation_"."
+					&js<
+						alert("<%=strMessage%>");
+					>
+					;Limpa o campo Produto
+					//set $piece(YFELD,Y,1)  = ""
+					;Limpa o campo Qtde Solicitada
+					set $piece(YFELD,Y,21) = ""
+					;set YFELD = ""
+				
+					quit				
+				}
+			}
+		}
+	
+		;setando o campo qty ordered
+		do OnBlurQtyRequisitada(GROW,YINHALT,YFELD)
+	
+		;Setando o campo qty required
+		do OnBlurQtyOrdered^INReqLine(GROW,YINHALT,.YFELD)
+	}
+	
+	quit
+
+OnBlurQtyRequisitada(pintGridRow,pstrFieldValue,&pstrFieldData)
+	new fltQuantity,idItem,idUnit	
+	do UpdateManualField^COMGridEdit31Interface(pintGridRow,8,pstrFieldValue)
+	quit
+	
+	
+GetSOHItem(pItem="",pLocation="")
+	;$$GetSOHItem^VARTCIReq(Item,Location)
+
+	new StockOnHand
+	set StockOnHand = 0
+	
+	if pItem '= "" {
+
+		&sql(SELECT nvl( sum(alSOH.dBundleStock.QtyOnHand),0)
+			   INTO :StockOnHand
+			   FROM alSOH.dBundleStock
+			  WHERE item = :pItem
+                AND (Storage->Location = :pLocation)
+                AND ((Storage->StorageIsBlocked = 0) OR (Storage->StorageIsBlocked is null))
+
+		    )
+		    
+		if (SQLCODE '= 0) {
+			quit 0
+		}   
+	}
+	
+	quit StockOnHand
+	
+	
+GetQtyBlockedItem(pItem="",pLocation="")
+	;$$GetQtyBlockedItem^VARTCIReq(Item,Location)
+
+	new QtyBlocked
+	set QtyBlocked = 0
+	
+	if pItem '= "" {
+
+		&sql(SELECT nvl( sum(alSOH.dBundleStock.QtyOnHand),0)
+			   INTO :QtyBlocked
+			   FROM alSOH.dBundleStock
+			  WHERE item = :pItem
+			    AND (Storage->Location = :pLocation)
+                AND ( (Storage->StorageIsBlocked = 1) OR (Storage->Physical->StorageIsBlocked = 1) )
+		    )
+		    
+		if (SQLCODE '= 0) {
+			quit 0
+		}  		    
+	}
+	
+	quit QtyBlocked
+
+	
+
+
+OnFilterHook(pYKEY,pFORM,pintTypeOfTest=1)
+ 	;$$OnFilterHook^VARTCIReq(.YKEY,YFORM,1)
+ 	;
+  	;19/05/2011 SLV		Adicionada nova regra de locais de aprovação e limpeza
+ 	;10/05/2011 SLV		Retirada a verificação de perfis
+ 	;05/10/2009	Petik	Filtra para que o usuário consulte apenas as requisições de seu Local.
+ 	
+    new blnFilter, perfilUsuario, strLocaisApr, lstLocaisApr, objRequisicao, idLocalDestino,
+    idLocalOrigem, idLocalUsuario
+    
+    set blnFilter	   = $$$NO
+    
+    set perfilUsuario  = $piece($get(^WWW013(YM,YBED,1)),Y,3)
+	quit:(perfilUsuario= 1) $$$YES //Filtro não aplicado aos usuários Administradores.
+	
+	if pFORM ="" set pForm  = $get(YFORM)
+	
+	set strLocaisApr   = $piece($get(^VARParametroCliente(0,YM,1)),Y,12) //Locais de aprovação
+	set lstLocaisApr   = $listfromstring(strLocaisApr,";") // Converte a string de locais em uma lista
+	
+	set objRequisicao  = $get(^INReq(YM,pYKEY,1))
+	set idLocalDestino = $piece(objRequisicao,Y,3)
+	set idLocalOrigem  = $piece(objRequisicao,Y,4)
+	set idLocalUsuario = YLOCATION
+	 
+	//Somente visualizando as requisições do mesmo local do usuário se
+	// o mesmo não estiver cadastrado em um dos locais de aprovação.
+	if (pintTypeOfTest = 1) {
+		
+		if ((strLocaisApr '= "") && ($listfind(lstLocaisApr,idLocalUsuario)) || (strLocaisApr = "") || 
+		(idLocalDestino = idLocalUsuario)) {		
+    		set blnFilter = $$$YES
+		}
+		else {
+			set YKEY = ""
+		}			
+	}
+	
+   quit blnFilter	
+
+ShowItems(pidEvent,pidParameters)
+	// DESCONTINUADO
+	// 27-Jan-2011	Karine: As alterações foram feitas diretamente no código core:ShowItems^INReqTable
+	// Upgrade 1.66         Isso por causa da chamada no metadado: ^WWW120DynTable(0,"INReq",1,1)="3~~1~ShowItems^INReqTable~~~INReqLine~1~1~1~"
+	//                      Esse metadado do form INReq, imposibilita o rastreamento pelo ASDE.
+	//                      Decisão sugerida e feita pelo Pablo. Adaptação de versão 1.66 feitas por mim.
+	/*
+	;do ShowItems^VARTCIReq(1, "INReq"_$$$DELIM_"INReqLine"_$$$DELIM_1_$$$DELIM_1)	
+	;Petik 05/10/2009
+	;Copiado do método CORE ShowItems^INReqTable
+	;Gustavo 03/11/2009
+	;Re-copiado e adaptado do método CORE ShowItems^INReqTable
+	;Esse método está sendo chamado no método CORE OnBlurItem^INReqLine
+	;e também é usado na Tabela Dinâmica da INReq abaixo
+	;^WWW120DynTable(0,"INReq",1,1)="3~~1~ShowItems^INReqTable~~~INReqLine~1~1~1~" 
+	;
+	
+	set blnIsRequisitante = $$CheckReadOnly^VARTCIReq()
+	quit:(blnIsRequisitante = 1)
+
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Jul-2009	PPP		SR16688:If Kit Requisition do not show the Table
+	; 29-Jun-2009	PPP		SR16688: Corrected usage, gets YFELDContainer instead or YMFELDContainer
+	;						Updated the return parameters with the ATP
+	; 01-Jun-2009	PPP		SR16599: Add Row highlight & click functionality
+	; 12-Mar-2009	HQN		SR16417: Don't assume YLOCATION is the ToLocn, explicitly
+	; 							take from Header
+	; 23-Nov-2007	PPP		SR15339: Creation
+	;-------------------------------------------------------------------------------
+	new arrLocations,blnHide,dteDate,fltATP,fltBOH,fltQty
+	new idCurLoc,idGrid,idItem,idKey,idLine,idLocn,idToLocn,idRequisition,idxItem,lstColTypes,lstHeaders
+	new objLine,objLocn,objRequisition,strStatus,strFunction
+			
+	set blnHide = +$$$WWW012HideRelationClassIDs($get(^WWW012(0,YM,1)))
+	set idGrid  =  $$$DYNTABLEGridLineFocusGrid(pidParameters)            // SR15339
+	
+	set lstHeaders=""
+	set lstColTypes=""
+		
+	//kill ^CacheTempDynamicTable(YUCI,YUSER,1)		//SR16599
+	kill ^CacheTempDynamicTable(YUCI,YUSER)		//SR16599
+	
+	set idKey         = $$ReferenceKey^COMGridEdit31Interface(idGrid,$$$DYNTABLEGridLineFocusRow(pidParameters)) // SR15339
+	set idRequisition = $$$KEY1(idKey)
+	set idLine        = $$$KEY2(idKey)
+	
+	if '$$Editable^INReq(idRequisition) quit
+	//if '$$Editable^INReqKit()    		quit                    ; *** EARLY EXIT ***
+	
+	set objRequisition = $$GetYFELDContainer^COMGridEdit31G()	//SR16688
+	set objLine        = $$$GRIDGetYFELD(idLine)
+	if $$$INReqType(objRequisition)=4	quit                     ; *** EARLY EXIT ***	//SR16688
+
+	set strStatus      = $$GetLock^WWWMultiLock("INReq",idGrid,idRequisition_$$$COMMA_idLine,$$$NO)      // SR15339
+	
+	set strFunction = "FillLine"
+	
+	set idToLocn = $$$INReqToLocn(objRequisition)               ; SR16417
+	set idItem   = $$$INReqLineItem(objLine)
+	set idxItem  = $$$Index(idItem)
+	set fltQty   = $$$INReqLineQtyRequired(objLine)
+	set idCurLoc = $$$INReqLineFromStockLocn(objLine)
+	set dteDate  = $$$INReqLineDueDate(objLine)        if dteDate = "" set dteDate = +$horolog	
+
+	set idFromLocn = $$$INReqFromLocn(objRequisition)
+
+	set QtdeRequisitada = $$$INReqLineFREE10(objLine)
+
+	;Petik 26/08/2010
+	;Essas variáveis precisam receber 0 (zero) para quando não existir estoque
+	;imprimir uma linha em branco (zerada).
+	;Também movi essas linhas para dentro do for, pois quando existia mais de um local
+	;de estoque com o mesmo produto as quantidades estavam aparecendo iguais em todas as linhas.
+	;vvvvv
+	;set QtdeDisponivel  = $$GetSOHItem^VARTCIReq(idItem,idFromLocn)
+	;set QtdeBloqueada   = $$GetQtyBlockedItem^VARTCIReq(idItem,idFromLocn)
+	;set QtdeTotal       = QtdeDisponivel + QtdeBloqueada
+	
+	set QtdeDisponivel  = 0
+	set QtdeBloqueada   = 0
+	set QtdeTotal       = 0
+	
+	
+	if $$$ISERR(strStatus) {
+		write "function "_strFunction_"() {"
+		write "alert('"_$$$JSText($$$Text(strStatus))_"');"
+		write "}"
+	} else {
+		write "function "_strFunction_"() {"
+		write "CallBack(""WarehouseLine^INReqTable"", getRowNum(getFocusField()), this.DiscData[0]);"
+		write "}"
+	}
+ 
+	;set lstHeaders  = $listbuild($$^WWWFELDNAME("INReqLine","D",$$$FldINReqLineFromStockLocn),
+	;							 $$^WWWTEXT("IN00694"),                            ;BOH   (Balance On Hand)
+	;							 $$^WWWTEXT(32483))
+								 
+	set lstHeaders  = $listbuild($$^WWWFELDNAME("INReqLine","D",$$$FldINReqLineFromStockLocn),
+								 "Quant. Requisitada",
+								 "Quant. Disponível",
+								 "Quant. Bloq.",
+								 "Quant. Total")	
+	
+	
+	//set lstColTypes = $listbuild($listbuild("left","link"),
+	//							 $listbuild("right","link"),
+	//							 $listbuild("right","link"))
+
+	;set lstColTypes = $listbuild($listbuild("left","display"),
+	;							 $listbuild("right","display"),
+	;							 $listbuild("right","display"))
+								 
+	set lstColTypes = $listbuild($listbuild("left","link"),
+								 $listbuild("right","link"),
+								 $listbuild("right","link"),
+								 $listbuild("right","link"),
+								 $listbuild("right","link"))
+								 
+
+	do GetWarehouseLocations^INReqTable(.arrLocations,idItem,dteDate,fltQty)
+	set idLocn=""
+	
+	set Passou = $$$NO
+	
+	for {
+		set idLocn=$order(arrLocations(idLocn))
+		quit:idLocn=""
+		
+		set Passou = $$$YES		
+
+		continue:idLocn=idToLocn ; SR16417
+		
+		;Petik 26/08/2010
+		;Adicionadas essas linhas dentro do for
+		;Pois quando existia mais de um local de estoque com o mesmo produto
+		;As quantidades estavam aparecendo iguais em todas as linhas.
+		;vvvvvvvvvv
+		set QtdeDisponivel  = $$GetSOHItem^VARTCIReq(idItem,idLocn)
+		set QtdeBloqueada   = $$GetQtyBlockedItem^VARTCIReq(idItem,idLocn)
+		set QtdeTotal       = QtdeDisponivel + QtdeBloqueada
+		
+		set fltBOH = $piece(arrLocations(idLocn),Y,1)
+		set fltATP = $piece(arrLocations(idLocn),Y,2)
+		set ^CacheTempDynamicTable(YUCI,YUSER,1,$increment(idLine),"data") = idLocn_Y_fltATP		//SR16688
+		set objLocn = $get(^WWW0121(0,YM,idLocn,1))
+		;set ^CacheTempDynamicTable(YUCI,YUSER,1,idLine) = $select(blnHide:"",1:"("_idLocn_") ")_$$$WWW0121LocationName(objLocn)_Y_
+		;												  fltBOH_Y_
+		;												  fltATP
+														  
+		set ^CacheTempDynamicTable(YUCI,YUSER,1,idLine) = $select(blnHide:"",1:"("_idLocn_") ")_$$$WWW0121LocationName(objLocn)_Y_
+														  QtdeRequisitada_Y_
+														  QtdeDisponivel_Y_
+														  QtdeBloqueada_Y_
+														  QtdeTotal
+	}
+	
+	;Desenha uma linha com qtdes zeradas se não entrou no for acima
+	if (idLocn="") && (Passou=$$$NO) {
+		set Local = idFromLocn
+		set objLocn = $get(^WWW0121(0,YM,Local,1))
+		set ^CacheTempDynamicTable(YUCI,YUSER,1,$increment(idLine),"data") = Local		
+		set ^CacheTempDynamicTable(YUCI,YUSER,1,idLine) = $select(blnHide:"",1:"("_Local_") ")_
+		      $$$WWW0121LocationName(objLocn)_Y_
+			  QtdeRequisitada_Y_
+			  QtdeDisponivel_Y_
+			  QtdeBloqueada_Y_
+			  QtdeTotal	
+		
+	}	
+	
+	//SR16599
+	//The last paramater (after pidEvent) needs to be set for the RowClick event, will be used by RowClick^WWW120DynTable
+	//	e.g. "WarehouseLine^INReqTable"
+	//	will be called with the following parameters
+	//	1. Row ID
+	//	2. Each entry in ^CacheTempDynamicTable(...,data) seperated by "~" will be a new parameter
+	//			in this routines case : do WarehouseLine^INReqTable(pidRow,idLocn) will be executed on Row click
+	do DrawTable^WWW120DynTable(lstHeaders,1,lstColTypes,pidParameters,strFunction,pidEvent,"WarehouseLine^INReqTable")
+	
+	//kill ^CacheTempDynamicTable(YUCI,YUSER,1)
+	kill ^CacheTempDynamicTable(YUCI,YUSER)		//SR16599
+	
+	quit
+*/
+
+OldShowItems(pidEvent,pidParameters)
+	;do ShowItems^VARTCIReq(1, "INReq"_$$$DELIM_"INReqLine"_$$$DELIM_1_$$$DELIM_1)	
+	;Petik 05/10/2009
+	;Copiado do método CORE ShowItems^INReqTable
+	;Esse método está sendo chamado no método CORE OnBlurItem^INReqLine
+	;e também é usado na Tabela Dinâmica da INReq abaixo
+	;^WWW120DynTable(0,"INReq",1,1)="3~~1~ShowItems^INReqTable~~~INReqLine~1~1~1~" 
+	;
+	
+	set blnIsRequisitante = $$CheckReadOnly^VARTCIReq()
+	quit:(blnIsRequisitante = 1)
+
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Mar-2009	HQN		SR16417: Don't assume YLOCATION is the ToLocn, explicitly
+	; 							take from Header
+	; 23-Nov-2007	PPP		SR15339: Creation
+	;-------------------------------------------------------------------------------
+	new arrLocations,blnHide,dteDate,fltATP,fltBOH,fltQty
+	new idCurLoc,idGrid,idItem,idKey,idLine,idLocn,idToLocn,idRequisition,idxItem,lstColTypes,lstHeaders
+	new objLine,objLocn,objRequisition,strStatus,strFunction
+			
+	set blnHide = +$$$WWW012HideRelationClassIDs($get(^WWW012(0,YM,1)))
+	set idGrid  =  $$$DYNTABLEGridLineFocusGrid(pidParameters)            // SR15339
+	
+	set lstHeaders=""
+	set lstColTypes=""
+		
+	
+	kill ^CacheTempDynamicTable(YUCI,YUSER,1)
+	
+	set idKey         = $$ReferenceKey^COMGridEdit31Interface(idGrid,$$$DYNTABLEGridLineFocusRow(pidParameters)) // SR15339
+	set idRequisition = $$$KEY1(idKey)
+	set idLine        = $$$KEY2(idKey)
+	
+	if '$$Editable^INReq(idRequisition) quit                       ; *** EARLY EXIT ***
+	
+	set objRequisition = $$GetYMFELDContainer^COMGridEdit31G()
+	set objLine        = $$$GRIDGetYFELD(idLine)
+	set strStatus      = $$GetLock^WWWMultiLock("INReq",idGrid,idRequisition_$$$COMMA_idLine,$$$NO)      // SR15339
+	
+	set strFunction = "FillLine"
+	
+	set idToLocn = $$$INReqToLocn(objRequisition)               ; SR16417
+	set idItem   = $$$INReqLineItem(objLine)
+	set idxItem  = $$$Index(idItem)
+	set fltQty   = $$$INReqLineQtyRequired(objLine)
+	set idCurLoc = $$$INReqLineFromStockLocn(objLine)
+	set dteDate  = $$$INReqLineDueDate(objLine)        if dteDate = "" set dteDate = +$horolog	
+	
+	set idFromLocn = $$$INReqFromLocn(objRequisition)
+	
+	set QtdeRequisitada = $$$INReqLineFREE10(objLine)
+	set QtdeDisponivel  = $$GetSOHItem^VARTCIReq(idItem,idFromLocn)
+	set QtdeBloqueada   = $$GetQtyBlockedItem^VARTCIReq(idItem,idFromLocn)
+	set QtdeTotal       = QtdeDisponivel + QtdeBloqueada
+	
+	if $$$ISERR(strStatus) {
+		write "function "_strFunction_"() {"
+		write "alert('"_$$$JSText($$$Text(strStatus))_"');"
+		write "}"
+	} else {
+		write "function "_strFunction_"() {"
+		write "CallBack(""WarehouseLine^INReqTable"", getRowNum(getFocusField()), this.DiscData[0]);"
+		write "}"
+	}
+	
+	;set lstHeaders  = $listbuild($$^WWWFELDNAME("INReqLine","D",$$$FldINReqLineFromStockLocn),
+	;							 $$^WWWTEXT("IN00694"),                            ;BOH   (Balance On Hand)
+	;							 $$^WWWTEXT(32483))
+								 
+	set lstHeaders  = $listbuild($$^WWWFELDNAME("INReqLine","D",$$$FldINReqLineFromStockLocn),
+								 "Quant. Requisitada",
+								 "Quant. Disponível",
+								 "Quant. Bloq.",
+								 "Quant. Total")
+
+						 
+								 
+	;set lstColTypes = $listbuild($listbuild("left","link"),
+	;							 $listbuild("right","link"),
+	;							 $listbuild("right","link"))
+
+	set lstColTypes = $listbuild($listbuild("left","link"),
+								 $listbuild("right","link"),
+								 $listbuild("right","link"),
+								 $listbuild("right","link"),
+								 $listbuild("right","link"))					 
+								 	
+	do GetWarehouseLocations^INReqTable(.arrLocations,idItem,dteDate,fltQty)
+	set idLocn=""
+	set Passou = $$$NO
+	for {
+		set idLocn=$order(arrLocations(idLocn))
+		quit:idLocn=""
+
+		set Passou = $$$YES
+		
+	;	continue:idLocn=YLOCATION
+	//	continue:idLocn=idCurLoc					; Exclude if the Loc is currently defined on the line
+		continue:idLocn=idToLocn ; SR16417
+		
+		set fltBOH = $piece(arrLocations(idLocn),Y,1)
+		set fltATP = $piece(arrLocations(idLocn),Y,2)
+	//	if (fltBOH'=0) && (fltATP'=0) {
+			set ^CacheTempDynamicTable(YUCI,YUSER,1,$increment(idLine),"data") = idLocn
+			set objLocn = $get(^WWW0121(0,YM,idLocn,1))
+			
+			;set ^CacheTempDynamicTable(YUCI,YUSER,1,idLine) = $select(blnHide:"",1:"("_idLocn_") ")_$$$WWW0121LocationName(objLocn)_Y_
+			;												  fltBOH_Y_
+			;												  fltATP
+			
+			set ^CacheTempDynamicTable(YUCI,YUSER,1,idLine) = $select(blnHide:"",1:"("_idLocn_") ")_$$$WWW0121LocationName(objLocn)_Y_
+															  QtdeRequisitada_Y_
+															  QtdeDisponivel_Y_
+															  QtdeBloqueada_Y_
+															  QtdeTotal	
+															  
+
+	//	}
+	}
+	
+	;Desenha uma linha com qtdes zeradas se não entrou no for acima
+	if (idLocn="") && (Passou=$$$NO) {
+		set Local = idFromLocn
+		set objLocn = $get(^WWW0121(0,YM,Local,1))
+		set ^CacheTempDynamicTable(YUCI,YUSER,1,$increment(idLine),"data") = Local		
+		set ^CacheTempDynamicTable(YUCI,YUSER,1,idLine) = $select(blnHide:"",1:"("_Local_") ")_
+		      $$$WWW0121LocationName(objLocn)_Y_
+			  QtdeRequisitada_Y_
+			  QtdeDisponivel_Y_
+			  QtdeBloqueada_Y_
+			  QtdeTotal	
+		
+	}
+	
+	
+	do DrawTable^WWW120DynTable(lstHeaders,1,lstColTypes,pidParameters,strFunction,pidEvent)
+	
+	kill ^CacheTempDynamicTable(YUCI,YUSER,1)
+	
+	quit
+
+CanViewReportComprovante(pYKEY)
+	;19-Oct-2009	Karine	Criado
+	
+	quit:pYKEY=""
+	set objReq = $get(^INIssue(0,pYKEY,1))
+	
+	set vStatus = $piece(objReq,Y,1)
+	
+	//Ativo/Pendente
+	if (vStatus < 7) {
+		new strStatus
+	    set strStatus = "Não é possível gerar Comprovante de Entrega."	
+	    $$$YQHandler(strStatus)
+	
+	}
+	quit 
+	
+CanViewListaSeparacao(pYKEY)
+	;19-Oct-2009	Karine	Criado
+	
+	quit:pYKEY=""
+	set objReq = $get(^INIssue(0,pYKEY,1))
+	
+	set vStatus = $piece(objReq,Y,1)
+	
+	if vStatus = 9 {
+		new strStatus
+	    set strStatus = "Não é possível gerar Lista de Separação."	
+	    $$$YQHandler(strStatus)	
+	}
+	quit
+
+CheckIfHasSOHForApproval(pidReq)
+	;-------------------------------------------------------------------------------
+	; Bloqueia a aprovação de itens que não tenham quantidade suficiente em estoque.
+	; Inputs: pidReq - ID Req
+	;         pidType (as defined above)
+	;
+	; Returns: YQ = 0 Enable, YQ = 1 Disable
+	;
+	; History:
+	; 06-Abr-2011	Karine	Created: JIRA -> TCI-81
+	;-------------------------------------------------------------------------------
+	new arrCount,fltAvail,fltReq,idItem,idType,intLine,objReqLine, strStatus
+	
+	set strStatus = $$$OK
+	
+	//New register
+	if pidReq'="" {
+		//No Lines
+		if $data(^INReqLine(0,pidReq)) {
+	
+			set strStatus = $$$OK
+	
+			set isValidating = $$getValidaQtdReq^VARParametroCliente(YM)
+		
+			if isValidating '= $$$OK {   ;deixa requisitar produtos com estoque zerado
+						
+				set intLine = ""
+				for {
+					set intLine = $order(^INReqLine(0,pidReq,intLine))
+					quit:intLine=""
+
+					set objReqLine = $get(^INReqLine(0,pidReq,intLine,1))
+
+					set idItem     = $$$INReqLineItem(objReqLine)
+					set fltReq     = $$$INReqLineFREE10(objReqLine) ;quantidade requisitada
+					set fltOrd	   = $$$INReqLineQtyOrdered(objReqLine)  ; quantidade aprovada
+					set fltAvail = $$GetQuantityOnHand^INARTMENGE(idItem,$$$INReqLineFromStockLocn(objReqLine))
+		
+					if fltOrd > fltAvail {
+
+						set strStatus = "0 O item "_idItem_" não tem estoque suficiente para ser aprovado. "
+			
+					}
+				}
+			}	
+		}
+	}	
+	quit strStatus
+]]></Routine>
+</Export>

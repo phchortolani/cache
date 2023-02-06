@@ -1,0 +1,991 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInv" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInv
+	;-------------------------------------------------------------------------------
+	; History:
+	; 23-Mar-2005	GRF		Use Boolean/QSave macros
+	;-------------------------------------------------------------------------------
+ 
+	; TODO : Move utilities out of strictly FORM based requirements to reduce size
+ 
+#include FINConst
+#include INConst
+#include COMConst
+#include COMSYS
+	
+#define LineIndex "^CacheTemp(YUSER,""FINAPInvLines"")"
+	
+#define LogR(%1,%2)		;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^FINAPInv("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Save(pidFINAPInv="")
+	;-------------------------------------------------------------------------------
+	; Saves the data modified by the 'Update' routine prior to the Update Costs being called.
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Feb-2005	RobertW	OnBeforeSave requires YFELD BGOTW
+	; 03-Feb-2005	Shobby	Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new strStatus,YFELD
+	
+	set strStatus = $$$NO
+	set YFELD     = $$$GRIDYFELDContainer
+	do OnBeforeSave(pidFINAPInv,.YFELD)
+	if Q=$$$QSave do OnAfterSave(pidFINAPInv)
+	quit
+	
+	
+GetQtyOnHand(pobjFINAPInvLine)
+	quit $$GetSOHForItem^FINAPInvLineUtils($$$FINAPInvLineItem(pobjFINAPInvLine))
+	
+	
+OnAfterSave(pidInvoice="")
+	;-------------------------------------------------------------------------------
+	; Code to run after saving.
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Mar-2005	PO		Use NoKey macro
+	; 14-Feb-2005	RPW		Removed commented out code, which is no longer used.
+	; 07-Feb-2005	shobby	CodeCheck.
+	; 01-Feb-2005	Shobby	Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new objInvoice
+	if '$$$NoKey(pidInvoice) {
+		do CleanUpOrphanedVariances(pidInvoice)
+		do UpdateToNewExchangeRate^FINAPInvCurrency(pidInvoice) ; TODO: Needs to be done OnBlur otherwise calculations are out until save
+		set objInvoice=$get(^FINAPInv(0,pidInvoice,1))
+		if '$$$FINAPInvCostsPosted(objInvoice) {
+			kill ^FINAPInvPrePost(0,pidInvoice)
+		}
+	}
+	quit
+	
+	
+CleanUpOrphanedVariances(pidFINAPInv)
+	;-------------------------------------------------------------------------------
+	; Remove any unused FINAPInvLineVariance data.
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Feb-2005	Shobby	Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new idLine,idVarianceType,objFINAPInvLine,blnDelete
+	
+	if '$$$NoKey(pidFINAPInv) {
+		set idLine = ""
+		for {
+			set idLine = $order(^FINAPInvLineVariance(0,pidFINAPInv,idLine))
+			quit:idLine=""
+			
+			set idVarianceType = ""
+			for {
+				set idVarianceType = $order(^FINAPInvLineVariance(0,pidFINAPInv,idLine,idVarianceType))
+				quit:idVarianceType=""
+
+				set objFINAPInvLine = $get(^FINAPInvLine(0,pidFINAPInv,idLine,1))
+				set blnDelete = $$$NO
+				if ($$$FINAPInvLineVariancePosting(objFINAPInvLine)'=$$$EnumFINAPVARIANCEPOSTSplit)        && (idVarianceType="TV")		  {
+					set blnDelete=$$$YES
+				
+				} elseif ($$$FINAPInvLineVarianceINVQPost(objFINAPInvLine)'=$$$EnumFINAPVARIANCEPOSTSplit) && (idVarianceType="IQ") {
+					set blnDelete=$$$YES
+				
+				} elseif ($$$FINAPInvLineVarianceINVDPost(objFINAPInvLine)'=$$$EnumFINAPVARIANCEPOSTSplit) && (idVarianceType="ID") {
+					set blnDelete=$$$YES
+				
+				} elseif ($$$FINAPInvLineVarianceOTHDPost(objFINAPInvLine)'=$$$EnumFINAPVARIANCEPOSTSplit) && (idVarianceType="OD") {
+					set blnDelete=$$$YES
+				}
+				if blnDelete {
+					do KILL^FINSYS("FINAPInvLineVariance",pidFINAPInv_","_idLine_","_idVarianceType)
+				}
+			}
+		}
+	}
+	quit
+	
+	
+Editable(pidInvoice,pblnIgnoreCostsPosted=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Check whether record is editable
+	;
+	; Params:	pidInvoice - 3WM id
+	; 			pblnIgnoreCostsPosted - whether the flag "Costs Posted" should be ignored
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 20-Jul-2006	JW		SR14860: Created (encapsulated from OnBeforeButtonLine)
+	;-------------------------------------------------------------------------------
+	new objInvoice,strStatus
+	
+	set strStatus = $$$OK
+	
+	if $data(^FINAPInv(0,pidInvoice,1)) {
+		set objInvoice = $get(^FINAPInv(0,pidInvoice,1))
+		
+		set strStatus = $$Editable^FINSYSReview("FINAPInv",$$$FINAPInvStatus(objInvoice)) ;*****
+		if $$$ISOK(strStatus) {
+			if 'pblnIgnoreCostsPosted {
+				if $$$FINAPInvCostsPosted(objInvoice)  set strStatus = $listbuild("Fin00634",pidInvoice)
+			 ; "Costs Posted for Invoice %1."
+				
+			} else {
+				if '$$$FINAPInvCostsPosted(objInvoice) set strStatus = $listbuild("Fin00655",pidInvoice)
+			} ; "Costs not yet posted for invoice %1."
+		}
+	}	
+	quit strStatus
+	
+	
+OnBeforeButtonLine(pidInvoice="",pblnIgnoreCostsPosted=$$$NO,pobjForm="")
+	;-------------------------------------------------------------------------------
+	; Called from header of Sup Inv to set form as readonly.
+	; 
+	; History:
+	; 21-Jul-2006	JW		SR14860: Encapsulated editable check
+	; 30-Jan-2006	SteveS	SR13497: Clear the ^CacheTemp3WMTotal on form load
+	; 13-Oct-2005	RPW		SR13678: If the id of this record does not match the
+	;							previous id, or the id is blank or +, then reset
+	;							currency to that of the supplier.
+	; 22-Sep-2005	JW		SR12880: Added code from AfterButtonLine. YOPTION only
+	;							on 1st page
+	; 10-Jul-2005	RPW		If we are in the build, do not do the redirect
+	; 24-Mar-2005	PaulK	Passed in pobjForm
+	; 10-Mar-2005	PO		Use NoKey macro
+	; 22-Feb-2005	JW		SR11405: Added Is Voucher Check
+	; 04-Feb-2005	RPW		We must check for an invalid invoice because
+	; 							Editable returns an error for a blank status
+	; 							and when we save a completely blank IM, and
+	; 							click back on the error message, we get a 
+	; 							record with a Number. This number is unsaved
+	; 							but this routine would lock it due to Editable
+	; 							returning the error message.
+	; 03-Feb-2005 sh/pk/rw	Corrected name in Editable.
+	; 27-Jan-2004	PaulK	Created
+	;-------------------------------------------------------------------------------
+    new idSupplier,objInvoice,strForm,strStatus
+    
+    kill ^CacheTemp3WMTotal(YUSER)
+    
+    set strStatus  = $$$OK
+    set pidInvoice = $$$KEY1(pidInvoice)
+    
+    if ('$$$NoKey(pidInvoice)) {
+		set objInvoice = $get(^FINAPInv(0,pidInvoice,1))
+		if objInvoice'="" {
+			if $$$FINAPInvIsVoucher(objInvoice) && '$get(^IsInBuild) {
+				$$$AlertInScript("Fin00682")   ; "This invoice is for Voucher Entry. Redirecting..."
+				do RedirectForm^COMUtils("FINAPVoucher",pidInvoice,"","","")
+			
+			} else {
+				set strStatus = $$Editable(pidInvoice)
+				if $$$ISERR(strStatus) {
+    				set $$$WWW120AuthorizationToModifyData(pobjForm) = $$$EnumReadOnly
+				}
+				
+				set strForm = YFORM
+				if strForm="" set strForm = " "
+				
+				kill ^CacheTemp(YUSER,strForm,"Display Currency")
+				kill ^CacheTemp(YUSER,strForm,"Disable Coins")
+				
+				// If the previous id is not the same as this one, clean up.
+				if $get(^CacheTemp(YUSER,strForm,"Toggles","PrevID"))'=pidInvoice {
+					kill ^CacheTemp(YUSER,strForm,"Toggles")
+				}
+	
+				if $$ForeignCurrencyToBeUsed^FINAPInvCurrency(pidInvoice) {
+					if $get(^CacheTemp(YUSER,strForm,"Toggles","Currency"))'="Base" {
+						set YOPTION = 1
+				
+						set idSupplier = $$$FINAPInvInvoiceSupplier($get(^FINAPInv(0,pidInvoice,1)))
+						set ^CacheTemp(YUSER,strForm,"Toggles","Currency") = "Foreign"
+						set ^CacheTemp(YUSER,strForm,"Toggles","PrevID")   = pidInvoice
+						set ^CacheTemp(YUSER,strForm,"Display Currency")   = $$GetFCCode^FINAPSupplier(idSupplier)
+						set ^CacheTemp(YUSER,strForm,"Disable Coins")      = $$$YES
+					} else {
+						set YOPTION = 0
+					}
+				
+				} else {
+					kill ^CacheTemp(YUSER,strForm,"Toggles")
+					set YOPTION = 2
+				}
+				if $get(YSEITE)'=1 {
+					set YOPTION = ""		// Not on 1st page - don't want to show button
+				}
+			}
+		}
+    } else { // This will fix the loading of a FC inv, always display in right mode for the first time.
+		set strForm=YFORM
+		if strForm="" set strForm = " "
+		kill ^CacheTemp(YUSER,strForm,"Toggles")
+    }
+	quit strStatus
+	
+	
+ForeignCurrencyToBeUsed(pidInvoice="")
+	;-------------------------------------------------------------------------------
+	; Set @netManager "Don't Save" flag
+	; 
+	; Returns: True if able to save (opposite logic to Q usage) 
+	;
+	; History:
+	; 15-Jun-2005	PO		SR:12589 Only check if record selected
+	; 06-Apr-2005	RPW		SR11349: Moved to ^FINAPInvCurrency
+	; 23-Mar-2005	GRF		Use QSave Macros and clarify return
+	; 15-Mar-2005	PO		SR11349 Created
+	;-------------------------------------------------------------------------------
+	if pidInvoice'="" do ForeignCurrencyToBeUsed^FINAPInvCurrency(pidInvoice)
+ 
+    quit 
+ 
+OnAfterButtonLine()
+	;-------------------------------------------------------------------------------
+	; Hide FC supplier specific fields if supplier dealing in base currency
+	;
+	; History:
+	; 14-Aug-2006	RPW		SR14678: This IS required field is already populated, so
+	; 							we must check that it is valid.
+	; 27-Jul-2006	SC		SR14678: Speedup. Not needed unless a record selected.
+	; 26-Jun-2006	RPW		SR13173: Check if the GL effective data is expired
+	; 22-Sep-2005	JW		SR12880: Moved functionality to OnBeforeButtonLine
+	; 01-Jul-2005	RobertW	SR12230: Check if the user session date has expired
+	; 08-Jun-2005	PO		Moved currency detail to OnAfterDataFields
+	; 02-Jun-2005	shobby	CodeCheck.
+	; 08-Apr-2005	RobertW	SR11839: Modified call to use the one in FINAPInvCurrency
+	; 08-Mar-2005	PO		SR11349 Created
+	;------------------------------------------------------------------------------
+	do CheckGLEffectiveDateExpiration^FINAPUtilities()
+ 	
+	quit
+ 
+OnAfterDataFields(pYKEY,pYFELD,pYSEITE)
+	;-------------------------------------------------------------------------------
+	; Code to run after data fields
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Aug-2006	RPW&JW	SR14578: Use start/end script() macros. Removed NoKey check
+	; 27-Jul-2006	SC		SR14578: Remove PopulateAccount call to speed up form.
+	;							No longer used.
+	; 23-Sep-2005	JW		SR12880: Switch field for tax page.
+	; 07-Sep-2005	PO		SR12943: Only run this procedure if on first page
+	; 14-Jul-2005	JW		Removed khaki colour
+	; 08-Jun-2005	PO		Currency detail now display between header and grid
+	; 28-Feb-2005	RobertW	For build reasons, guard %session
+	; 27-Jan-2005	RobertW	Kill the GTOGGLE data and add the ID for the invoice match
+	; 28-Dec-2004	RPW		Added field colors for variances (SR10061)
+	; 21-Dec-2004	Shobby	Created (SR10061)
+	;-------------------------------------------------------------------------------
+ 	if pYSEITE=3 {
+	 	$$$StartScript()
+	 	do SwitchFields^FINAPInvLineTax2(pYFELD,pYKEY)
+	 	$$$EndScript()
+	 	
+ 	} elseif pYSEITE=1 {
+ 		if '$$$NoKey(pYKEY) {
+			$$$StartScript()
+			&html<
+			document.WWW2.YFINAPInvM11.style.backgroundColor='darkorange';
+			document.WWW2.YFINAPInvM12.style.backgroundColor='darkorange';
+			document.WWW2.YFINAPInvM15.style.backgroundColor='darkorange';
+			document.WWW2.YFINAPInvM35.style.backgroundColor='#($select($$IsForeignCurrency^FINAPInvCurrency():"CornflowerBlue",1:"darkorange"))#';
+			>
+			$$$EndScript()
+	 
+			if $case($get(^CacheTemp(YUSER,YFORM,"Toggles","Currency")),"Foreign":0,"":0,:1) { ; SR11349
+				$$$StartScript()
+				&html<
+				document.WWW2.YFINAPInvD5.readOnly = true;
+				document.WWW2.YFINAPInvD5.style.backgroundColor="lightgrey";
+				document.WWW2.YFINAPInvD25.readOnly = true;
+				document.WWW2.YFINAPInvD25.style.backgroundColor="lightgrey";
+				document.WWW2.YFINAPInvD8.readOnly = true;
+				document.WWW2.YFINAPInvD8.style.backgroundColor="lightgrey";
+				>
+				$$$EndScript()
+			}
+		
+			if ($get(^CacheTemp(YUSER,YFORM,"Exchange Rate"))="") {
+				set ^CacheTemp(YUSER,YFORM,"Exchange Rate") = $$$FINAPInvExchangeRate($get(^FINAPInv(0,pYKEY,1)))
+			}
+		}
+		kill ^CacheTemp(YUSER,"FINAPInvLineVariance") ; JW - kill temp variance data
+		
+		do DisplayText^COMUtilForm("["_$$CurrentCurrency^COMUtilCurrency()_"]",,,,1)
+ 	}
+	do LoadGrid(pYKEY)
+	quit
+ 	
+ 	
+LoadGrid(pidFINAPInv="")
+	;-------------------------------------------------------------------------------
+	; Display the Line Items associated with this Receive.
+	;
+	; Returns:
+	;
+	; History:
+	; SR14578
+	; 05-Dec-2008	GRF		Clarify Enabled test
+	; 01-Jun-2005	shobby	SR12487: Don't show expanded lines yet.  Code hasn't
+	;							been finished.
+	; 04-Apr-2005	PO/RPW	SR11349 FC support
+	; 01-Apr-2005	shobby	Now use FINAPInvCharge2 form.
+	; 15-Mar-2005	shobby	ExpandLines - to support Additional charges.
+	; 20-Jan-2005	JW		Moved from FINAPInvLine
+	; 19-Jan-2005	RPW		Modified to check if the variance should be total or not
+	; 14-Jan-2005	JW		Lines are now selected from search
+	; 15-Dec-2004	Shobby	Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new objInvoice,YFORM,YKEY,YAUSWAHL,YFELD,objFINAPInvLine,strData
+	
+	set YFORM = "FINAPInvLine"
+	set YFELD = ""
+	set YKEY  = $get(pidFINAPInv)
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 290
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = YFORM
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)     = "FINAPInv"
+	
+	if '$$$NoKey(pidFINAPInv) {
+		set objInvoice = $get(^FINAPInv(0,pidFINAPInv,1))
+		set YOPTION    = +$$$FINAPInvShowTotalVariance(objInvoice)+($select($$GetFCCode^FINAPSupplier($$$FINAPInvInvoiceSupplier(objInvoice))="":0,1:30))
+	}
+	set $$$COMGridEditParameterExpandLines(YAUSWAHL) = $$$YES
+	set $$$COMGridEditParameterLinks(YAUSWAHL)       = "FINAPInvCharge2"
+	
+	if '$$$NoKey(pidFINAPInv) {   ; Create dummy record to attach total discounts to
+		set strData = ""
+		set $piece(strData,"~",33) = 1
+		do Save^COMUtils("FINAPInvLine",YKEY_",Total",strData)    ; FIXME : Should this have $$$YES as arg 4?
+	}
+	do ^COMGridEdit31
+	quit
+	
+	
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Get the grid to save its contents
+	;
+	; Returns:
+	;
+	; History:
+	; 21-Jul-2006	JW		SR14860: Check whether record is editable.
+	; 22-Sep-2005	PO		SR12943: Save creators Location and Department.
+	; 03-May-2005	RobertW	SR12227: Removed check for Supplier Invoice Number as 
+	; 							this is now a mandatory field
+	; 16-Mar-2005	PO		SR11349 Sup. and Inv Sup. not allowed to deal in
+	; 							differing FCs
+	; 							Note: either or both Suppliers can use base currency
+	; 18-Jan-2005	JW		Save all variances
+	; 21-Dec-2004	Shobby	Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new strStatus,strInvSupCur,strSupCur,idSup,idSupInv
+	new curAmount,fltExchangeRate,curAmountCalcd,strFCCode,curOther
+	new strCurToUse,objEmployeeData
+	
+	set strStatus = $$Editable(pYKEY)
+	
+	if $$$ISOK(strStatus) {
+		set idSup     = $$$FINAPInvSupplier($get(pYFELD))
+		set idSupInv  = $$$FINAPInvInvoiceSupplier($get(pYFELD))
+		set strStatus = $$SaveAllVariances^FINAPInvLineVariance(pYKEY)
+		
+		if $$$ISOK(strStatus) {
+			set strStatus=$$$GRIDSave(pYKEY)
+		
+			if $$$ISOK(strStatus) {
+				set strSupCur    = $$GetFCCode^FINAPSupplier(idSup)
+				set strInvSupCur = $$GetFCCode^FINAPSupplier(idSupInv)
+				if $$$CurIsFC(strSupCur)&&$$$CurIsFC(strInvSupCur)&&(strSupCur'=strInvSupCur) {
+					set strStatus = $listbuild("Fin00703",idSupInv,idSup)
+				} ; "Invoice Supplier `%1` and Supplier `%2` must either use the same Foreign Currency or at least one use Base Currency."
+			}
+		}
+	}
+	if $$$ISOK(strStatus) {
+		set Q = $$$QSave
+		if $$$FINAPInvCreatedBy(pYFELD) = "" {
+			set objEmployeeData = $get(^WWW013(0,$get(YBED,"UNKNOWN"),1))
+			set $$$FINAPInvCreatorsLocation(pYFELD)   = $get(YLOCATION)
+			set $$$FINAPInvCreatorsDepartment(pYFELD) = $$$WWW013HomeDepartment(objEmployeeData)
+		}
+	} else {
+		set Q = $$$QDontSave
+		do ReturnError^COMUtilError(strStatus)
+	}
+	quit
+	
+	
+OnAfterDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Remove the associated lines
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Jan-2005	RPW		Removed the IMID from the %session we don't need it now.
+	; 20-Jan-2005	JW		Now use delete subform in the form definition.
+	; 19-Jan-2005	RPW		DELETE the grid once done.
+	; 14-Jan-2005	JW		Moved from FINAPInvLine
+	; 05-Jan-2005	RPW		Modified to delete any/all line variances.
+	; 27-Dec-2004	Shobby	Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new idLineItem
+	
+	do DELETE^COMGridEdit31Interface()
+	set %session.Data("IMID")=""
+	quit
+	
+	
+SupplierHasRemitAddr(pstrSupplier)
+	;-------------------------------------------------------------------------------
+	; Check whether there is a type 18 address on INLIEFA for the given supplier
+	;
+	; Returns: True (1) if there is one, otherwise False (0)
+	;
+	; History:
+	; 28-Dec-2004	RPW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new objINLIEFA
+	
+	set objINLIEFA = ""
+	if $get(pstrSupplier)'="" {
+		set objINLIEFA = $get(^INLIEFA(0,pstrSupplier,18,1))
+	}
+	
+	quit $select(objINLIEFA="":$$$NO,1:$$$YES)
+	
+	
+GetAddress(YFELD)
+	;-------------------------------------------------------------------------------
+	; Determines the address for the given supplier.
+	;
+	; Returns:
+	;
+	; History:
+	; 24-May-2005	shobby		Created SR12319
+	;-------------------------------------------------------------------------------
+	new strAddress,objFINAPInv,idSupplier
+	
+	set strAddress = ""
+	if $get(YFELD)'="" {
+		set objFINAPInv = $get(YFELD)
+		if objFINAPInv'="" {			
+			set idSupplier = $$$FINAPInvInvoiceSupplier(objFINAPInv)
+			if idSupplier'="" {
+				set strAddress = $$UpdateAddress(idSupplier)
+			}
+		}
+	}
+	quit strAddress
+	
+	
+ValidSupplier(pstrSupplier)
+	quit (''$data(^FINAPSupplier(0,$get(pstrSupplier," "),1)))
+ 	
+ 	
+UpdateAddress(pstrSupplier)
+	;-------------------------------------------------------------------------------
+	; Update address field
+	;
+	; Returns: String (Address)
+	;
+	; History:
+	; 10-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+    new strAddress
+    
+    set strAddress = $$PopulateAddress($get(^INLIEFA(0,pstrSupplier,18,1)))
+    if strAddress="" set strAddress = $$PopulateAddress($get(^INLIEF(0,pstrSupplier,1)))
+	quit strAddress
+	
+	
+PopulateAddress(objObject="")
+	;-------------------------------------------------------------------------------
+	; This routines get the data from the passed in object.
+	; It works for both INLIEF and INLIEFA as they use the same class properties.
+	;
+	; Note: To get the full state, you must get the full country first
+	;
+	; Returns:String
+	;
+	; History:
+	; 04-May-2005	Paul K	Simplified Code.
+	; 16-Feb-2005	JW		Removed null check - as empty address wasn't being used
+	; 28-Dec-2004	RPW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new strAddress,strPiece,strState,strCountry,strCountryShort
+	
+	set strAddress=""
+	if objObject'="" {
+		set strAddress=$$$INLIEFName1(objObject)
+		if $$$INLIEFName2(objObject)		'="" set strAddress=strAddress_YCR_$$$INLIEFName2(objObject)
+		if $$$INLIEFAName3(objObject)		'="" set strAddress=strAddress_YCR_$$$INLIEFAName3(objObject)
+		if $$$INLIEFAStreet(objObject)		'="" set strAddress=strAddress_YCR_$$$INLIEFAStreet(objObject)
+		if $$$INLIEFAPlaceName(objObject)	'="" set strAddress=strAddress_YCR_$$$INLIEFAPlaceName(objObject)
+		if ($$$INLIEFAState(objObject)		'="")&&($$$INLIEFACountry(objObject)'="") set strAddress=strAddress_YCR_$$$WWW102Text($get(^WWW102(0,"BUNDESLAND",$$$INLIEFACountry(objObject),$$$INLIEFAState(objObject),1)))
+		if $$$INLIEFACountry(objObject)		'="" set strAddress=strAddress_YCR_$$GetEnumDescription^COMUtils("LAND",$$$INLIEFACountry(objObject),$$$YES)
+		if strAddress="" set strAddress=" "
+	}	
+	quit strAddress
+	
+	
+ToggleHeader(pstrType="none",pintHeight)
+	;-------------------------------------------------------------------------------
+	; This routine is used to attempt to keep the grid knowledge inside the grid
+	; and not have developers know about other things.
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Mar-2004	shobby	Grid,Container is the correct solution.  The javascript
+	; 							event that calls ToggleHeader comes from within the
+	; 							grid.  At some point the issue of custom application
+	; 							code being contained within the grid has to be
+	; 							addressed.
+	; 29-Dec-2004	RPW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new strForm
+	
+	// Temporary - Shobby to fix - work out why YFORM can't be used here.
+	set strForm = $get(^CacheTemp(YUSER,"Grid","Container"))
+	
+	do PopulateDataField^COMUtils(strForm,$$$FldFINAPInvToggleHeader,";"_pstrType_";"_pintHeight)
+	quit ""
+	
+	
+CheckInvoiceNumber
+	;-------------------------------------------------------------------------------
+	; After the user has blurred the invoice number, check that the data has not
+	; been used
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Jul-2005	RPW		SR12981: Moved CheckDuplicate Call to FINAPInv2
+	; 19-Jan-2005	RPW		Modified to use YFKEY as YKEY is not defined
+	; 14-Jan-2005	RPW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new blnDuplicate,strStatus,strSupplier
+	
+	set blnDuplicate = $$$NO
+	set strStatus    = $$$OK
+	
+	set strSupplier=$$$FINAPInvInvoiceSupplier(YFELD)
+	if (strSupplier'="") && (YINHALT'="") {
+		do CheckDuplicate^FINAPInv2(strSupplier,YINHALT,YFKEY)
+	}
+	quit
+	
+	
+CheckSupplier(pstrSupplier,pstrYFKEY,pstrYFELD)
+	;-------------------------------------------------------------------------------
+	; After the user has blurred the Invoice Supplier, check that the data has not
+	; been used
+	;
+	; History:
+	; 15-Jul-2005	RPW		SR12981: Moved CheckDuplicate Call to FINAPInv2
+	; 03-May-2005	Paul K	Removed return.
+	; 29-Mar-2005	JW		Added parameter pstrYFELD
+	; 19-Jan-2005	RobertW	Added parameter pstrYFKEY to handle the key.
+	; 14-Jan-2005	RPW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	if $$$FINAPInvSuppliersInvoiceNumber(pstrYFELD)'="" {
+		do CheckDuplicate^FINAPInv2(pstrSupplier,$$$FINAPInvSuppliersInvoiceNumber(pstrYFELD),pstrYFKEY)
+	}
+	quit	
+	
+	
+OnBlur
+	;-------------------------------------------------------------------------------
+	; If there is no YFKEY do not recalculate the header totals.
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Mar-2005	JW		SR11916: Headers now calculated from Grid End.
+	; 19-Jan-2005	RPW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	if YFKEY'="" {
+		do UpdateContainer^COMGridEdit31Interface()
+	}
+	quit
+	
+	
+OnBlurSupplierNos(pUpdSup="",pstrSupplier="",pYKEY="",pYFELD="")
+	;-------------------------------------------------------------------------------
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Jul-2005	JW		Check currency being used, not whether there's a key.
+	; 							Remove khaki colour.
+	; 01-Jul-2005	RPW		Fixed $$$Text in $$$Alert
+	; 27-Apr-2005	PO		SR11836 Only apply Exchange Rate policy if invoice
+	; 							supplier is dealing in FC
+	; 15-Apr-2005	PO		SR11349 Disable currency fields if no key and a FC Inv
+	; 							Sup is selected. Prevents currency issues
+	; 08-Apr-2005	RPW		SR11836 Modified to get the FC Rate from the supplier
+	; 17-Mar-2005	PO		SR11349 Created
+	;-------------------------------------------------------------------------------
+	new fltRate,idSup,idSupInv,strInvSupCur,strSupCur
+			
+	if (pstrSupplier'="") && '$$ValidSupplier(pstrSupplier) {
+		set %TXT(1) = "#Y"_YFORM_"D"_$$$FldFINAPInvInvoiceSupplier_Y
+		if $$$FINAPInvSupplier(pYFELD)=pstrSupplier {
+			set %TXT(1) = %TXT(1)_"#Y"_YFORM_"D"_$$$FldFINAPInvSupplier_Y
+		}
+		$$$Alert($listbuild("Fin00268",pstrSupplier))  ; "´%1´ is not a valid Supplier."
+	
+	} else {
+		if pYFELD'="" {
+			set idSup        = $$$FINAPInvSupplier(pYFELD)
+			set idSupInv     = $$$FINAPInvInvoiceSupplier(pYFELD)
+			set strSupCur    = $$GetFCCode^FINAPSupplier(idSup)
+			set strInvSupCur = $$GetFCCode^FINAPSupplier(idSupInv)
+ 			
+			do ApplyPolicy^FINAPInvCurrency(idSupInv)
+			if $$$CurIsFC(strSupCur) && $$$CurIsFC(strInvSupCur) && (strSupCur'=strInvSupCur) {
+				$$$Alert($listbuild("Fin00703",idSupInv,idSup))
+			} ; "Invoice Supplier `%1` and Supplier `%2` must either use the same Foreign Currency or at least one use Base Currency."
+			
+			if pUpdSup'="" {
+				do UpdateSupplier^FINAPInv2(pstrSupplier,.pYFELD)
+			}
+			if ($$$CurrencyToUse'="Base") {
+				if $$$CurIsFC(strInvSupCur) {
+					do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvActualTotal,"")
+					do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvOtherTotal,"")
+					do ToggleReadOnly^COMUtilForm($$$FldFINAPInvActualTotal)
+					do ToggleReadOnly^COMUtilForm($$$FldFINAPInvOtherTotal)
+				
+				} else {
+					do ToggleReadOnly^COMUtilForm($$$FldFINAPInvActualTotal,$$$NO)
+					do ToggleReadOnly^COMUtilForm($$$FldFINAPInvOtherTotal,$$$NO)
+				}
+			}
+		}
+	}
+	quit
+	
+	
+Postable(pidInvoice="") 
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 13-Jul-2009	GRF		SR16691: Test for not "Total" also needs to show exists
+	; 29-Jun-2009	GRF		SR16691: Additional testing before considered postable
+	; 21-Oct-2005	PO		SR13702: Created
+	;-------------------------------------------------------------------------------
+	new blnSomeLinesTaxable,idLine,objInvoice,objLine,strStatus
+	
+	set strStatus = $$$OK
+ 
+	if '$$$NoKey(pidInvoice) {         ; FIXME : Will "Total" be okay with other languages? see SR16748 <GRF>
+		if $data(^FINAPInvLine(0,pidInvoice)) && ($order(^FINAPInvLine(0,pidInvoice,""))'="Total") {  ; Must have loaded the invoice lines
+			set blnSomeLinesTaxable = $$$NO
+			set objInvoice = $get(^FINAPInv(0,pidInvoice,1))
+			
+			set strStatus = $$ValidGLEffectiveDate^FINGLEffectiveDate($$$FINAPInvGLEffectiveDate(objInvoice),$$$FINAPInvGLEffectiveDate(objInvoice),$$$FldFINAPInvGLEffectiveDate)
+			
+	 		if $$$ISOK(strStatus) {
+				if +$$$FINAPInvTaxTotal(objInvoice)'=0 {
+					set idLine = ""
+					for {
+						set idLine = $order(^FINAPInvLine(0,pidInvoice,idLine))
+						quit:idLine=""
+					
+						set objLine = $get(^FINAPInvLine(0,pidInvoice,idLine,1))
+						if +$$CombinedTaxRate^COMTAX($$$FINAPInvLineTaxCode(objLine),$$$FINAPInvTaxLocation(objInvoice),$$$FINAPInvInvoiceDate(objInvoice),1)'=0 {
+							set blnSomeLinesTaxable = $$$YES
+						}
+					}
+					if 'blnSomeLinesTaxable {
+						set strStatus = $listbuild("Fin00696")
+					} ; "Tax Total must be zero, as no lines are taxable."
+				}
+	 		}
+		} else {                       ; SR16691 vvv
+			set strStatus = $$$MakeStatus("Fin01092")
+		;	set strStatus = $listbuild("Fin01092")
+		}       ; "Load matching lines first"
+	
+	} else {    ; "Please Select A Data Record First."
+		set strStatus = $$$MakeStatus(32072)
+	}                                  ; SR16691 ^^^
+	quit strStatus
+	
+	
+CanUseButton(pYKEY,pblnToPost=$$$NO)
+	;-------------------------------------------------------------------------------
+	; If this invoice has already been posted then Searching for Orders/Receives is
+	; not valid. **Also, for other buttons.
+	;
+	; Params: 	pidInvoice - invoice key
+	; 			pblnToPost - does button want to post?
+	;
+	; Returns: nil
+	;
+	; History:
+	; 13-Jul-2009	GRF		SR16691: Don't include space before don't save message
+	; 29-Jun-2009	GRF		SR16691: parameter prefix; macro
+	; 21-Oct-2005	PO		SR13702: Call Postable check
+	; 23-Feb-2005	JW		Rewrote to properly encompass "Costs Posted" and "Posted"
+	; 14-Feb-2005	JW		Changed name so can be more widely used.
+	; 07-Feb-2005	Shobby	Commented
+	;-------------------------------------------------------------------------------
+    new idInvoice,objInvoice,strStatus
+    
+    set idInvoice = $$$KEY1($get(pYKEY))
+	
+	set strStatus = $$$OK
+	if idInvoice'="" {
+		set objInvoice = $get(^FINAPInv(0,idInvoice,1))
+		set strStatus  = $$Editable^FINSYSReview("FINAPInv",$$$FINAPInvStatus(objInvoice))
+		
+		if $$$ISOK(strStatus) && 'pblnToPost && $$$FINAPInvCostsPosted(objInvoice) {
+			set strStatus = $listbuild("Fin00637",idInvoice)
+		}  ; "Costs already updated for Invoice %1."
+	}
+	
+	if $$$ISOK(strStatus) && pblnToPost set strStatus = $$Postable(pYKEY)
+	
+	if $$$ISOK(strStatus) {
+		set Q = $$$QSave
+	} else {
+		set Q = $$$QDontSave_$$$Text(strStatus)
+	}
+	quit
+	
+	
+IsPosted(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Checks whether invoice is posted.
+	; 
+	; Params:	pidInvoice - invoice number
+	; Returns:	boolean
+	;
+	; History:
+	; 27-Jan-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	quit:$get(pidInvoice)="" $$$NO
+	
+	quit ($$$FINAPInvStatus($get(^FINAPInv(0,pidInvoice,1))) = $$$EnumFINSYSSTATUSPosted)
+	
+	
+OnBlurDates(pYFELD="")
+	;-------------------------------------------------------------------------------
+	; On Blur of discount term and invoice date
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Jun-2006	RPW		SR13173: Make sure the GL Effective Date is valid
+	; 31-Jan-2006	Steve S	SR13497: Update discount amount when changing terms
+	; 01-Jul-2005	RobertW	SR12230: When blurring the Invoice Date, we must check that 
+	; 						the GL Effective Date is the General Parameters says we are 
+	; 						using this field as the post date.
+	; 23-May-2005	JW		SR12112: Moved from FINAPVoucher
+	; 22-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new idTerms,dteInvoice,dueDate
+	
+	set idTerms    = $$$FINAPInvDiscountTerm(pYFELD)
+	set dteInvoice = $$$FINAPInvInvoiceDate(pYFELD)
+	
+	if (dteInvoice'="") {
+		if (idTerms'="") {
+			set dueDate = $$GetDueDate^FINAPSupplier($$$FINAPInvInvoiceSupplier(pYFELD),dteInvoice,idTerms)
+			do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvDueDate,$$^WWWDATE(dueDate))
+			
+			if (YLFN'=$$$FldFINAPInvInvoiceDate) {
+				do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvDiscountPercent,$$$FINSYSTermDiscount1($get(^FINSYSTerm(0,idTerms,1))))
+			}
+		}
+		
+		if $$IsGLEffectiveDateInvoiceDate^FINGeneralSetup() {
+			do SetGLEffectiveDate^FINGLEffectiveDate(dteInvoice,$$$FINAPInvGLEffectiveDate(pYFELD),$$$FldFINAPInvGLEffectiveDate) // SR13173
+		}
+	}
+	quit
+	
+	
+OnBeforeFormConstruction(YKEY="",YFELD="",pidField="")
+	;-------------------------------------------------------------------------------
+	; Goods supplier field
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Nov-2005	JW		SR13834: Check already exists in OnLineAdded/Deleted on FINAPInvLine
+	; 23-Sep-2005	JW		SR12880: Changed from After to Before
+	;-------------------------------------------------------------------------------
+	new idSupplier
+	
+	if pidField=$$$FldFINAPInvSupplier {
+		set idSupplier = $$$FINAPInvSupplier(YFELD)
+		if idSupplier'="" {
+			if $data(^INSUPDiscount(0,idSupplier)) {
+				write "<font color=red title='"_$$$Text("Fin00854")_"'>***</font>"
+			} ; "There are Supplier Discounts for this Supplier"
+		}
+	}
+	quit
+	
+	
+TaxAppliedTo(pYKEY,pYFELD) 
+	;-------------------------------------------------------------------------------
+	; Params:
+	; 	pYKEY		
+	; 	pYFELD		objFINAPInv
+	;
+	; Returns:
+	;	strResult	Tax message
+	;
+	; History:
+	; 23-Sep-2005	JW		SR12880: Moved from FINAPVoucher. Use for Invoice Match as well.
+	; 07-Sep-2005	PO		SR12880: Created
+	;-------------------------------------------------------------------------------
+	new strResult
+	
+ 	set strResult = ""
+	if '$$$NoKey(pYKEY) {
+		if '$$$FINAPInvTaxInvoice(pYFELD) {
+			set strResult = $$$Text("Fin00885")            ; "No Tax"
+		
+		} elseif '$$$FINAPInvLinesIncludeTax(pYFELD) {
+			set strResult = $$$Text("Fin00071")            ; "Total"
+		
+		} else {
+			if $$$FINAPInvIsVoucher(pYFELD) {
+				set strResult = $$$Text("Fin00041")        ; "Lines"
+			
+			} elseif +$$$FINAPInvShowLinesasTotals(pYFELD) {
+				set strResult = $$$Text("Fin00896")        ; "Line Totals"
+			
+			} else {
+				set strResult = $$$Text("Fin00897")        ; "Unit Price"
+			}
+		}
+	}
+	quit strResult
+	
+	
+GetType()
+	;-------------------------------------------------------------------------------
+	; Get the Type for the Effective Date
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; The type of the effective date
+	;
+	; History:
+	; 26-Jun-2006	RPW		SR13173: Created
+	;-------------------------------------------------------------------------------
+	quit "APINV"
+	
+	
+CreateInvoice(pidFINAPInv,pstrSuppInv,pidSupp,pidLocn,pdteInv,pfltDiscPct,pfltDiscAmt,penumFCCode,pfltActTotal,pidTaxLocn,penumDis]]><![CDATA[cTerm="")  ;pidxFINAPInv
+	;-------------------------------------------------------------------------------
+	; Create the FINAPInv record as needed to do 3WM.
+	; Called by PostInvoice^INReceiptInvoice - creates the records directly from 
+	; INRECSummary, and posts to the ledger directly from the INReceipt form using 
+	; the Invoice Tab.
+	; 
+	; Params:
+	; idxFINAPInv   = next primary key for FINAPInv
+	; strSuppInv    = Suppliers Invoice Number
+	; idSupp        = Supplier ID Number
+	; fltActTotal   = Suppliers cost of Order
+	; 
+	; History:
+	; 21-May-2009	DWR		SR16363: fixed parameter to be id not idx, and added
+	; 							missing  key when getting FINAPinvLine
+	; 20-Apr-2009	DWR		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new dteToday,fltFCRate,idControl,idDiscAccount,idTax
+	new objFINAPInv,objLine,objSupplier,objTax,strStatus
+	
+	$$$LogR("CreateInvoice",pidFINAPInv_","_pstrSuppInv_","_pidSupp)
+ 
+	quit:pidFINAPInv=""
+	
+	set strStatus = $$$OK
+	set fltFCRate = $$FindConversionRate^WWWZAHL(penumFCCode,$horolog)
+	
+	set objSupplier = $get(^FINAPSupplier(0,pidSupp,1))
+	if objSupplier'="" {
+		set idDiscAccount = $$$FINAPSupplierDiscountGLAccount(objSupplier)
+		if (idDiscAccount="") {
+			set idControl = $$$FINAPSupplierControlAccount(objSupplier)
+			if (idControl'="") {
+				set idDiscAccount = $$$FINAPAccountDiscountAccount($get(^FINAPAccount(0,idControl,1)))
+			}
+		}
+	
+	} else {
+		set idDiscAccount = ""
+	}
+	
+	set objFINAPInv =""
+	set dteToday = +$horolog
+	set $$$FINAPInvSupplier(objFINAPInv)               = pidSupp
+	set $$$FINAPInvInvoiceSupplier(objFINAPInv)        = pidSupp	
+	set $$$FINAPInvSuppliersInvoiceNumber(objFINAPInv) = pstrSuppInv
+	set $$$FINAPInvActualTotal(objFINAPInv)            = pfltActTotal
+	set $$$FINAPInvStatus(objFINAPInv)                 = 0           ; UnPosted
+	set $$$FINAPInvExchangeRate(objFINAPInv)           = fltFCRate
+	set $$$FINAPInvTaxLocation(objFINAPInv)            = pidTaxLocn
+	set $$$FINAPInvInvoiceDate(objFINAPInv)            = pdteInv
+	set $$$FINAPInvEnteredDate(objFINAPInv)            = dteToday
+	set $$$FINAPInvDiscountPercent(objFINAPInv)        = pfltDiscPct
+	set $$$FINAPInvDiscountAmount(objFINAPInv)         = pfltDiscAmt
+	set $$$FINAPInvCreatedBy(objFINAPInv)              = YBED
+	set $$$FINAPInvCreatedDate(objFINAPInv)            = dteToday
+	set $$$FINAPInvGLEffectiveDate(objFINAPInv)        = dteToday
+	set $$$FINAPInvCreatorsLocation(objFINAPInv)       = pidLocn
+	set $$$FINAPInvDiscountGLAccount(objFINAPInv)      = idDiscAccount
+	set $$$FINAPInvDiscountTerm(objFINAPInv)           = penumDiscTerm
+	
+	;set $$$FINAPInvDefaultTaxCode(objFINAPInv) = idTax
+	
+	set objLine = $get(^FINAPInvLine(0,pidFINAPInv,"Total",1))
+	if objLine="" {
+		set $$$FINAPInvLineReceiveLocation(objLine) = pidLocn
+		set strStatus = $$$Save("FINAPInvLine",pidFINAPInv_$$$COMMA_"Total",objLine,$$$YES)
+	}
+		
+	if $$$ISOK(strStatus) {
+		set strStatus = $$$Save("FINAPInv",pidFINAPInv,objFINAPInv,$$$YES)
+	} 
+	quit strStatus
+	
+]]></Routine>
+</Export>

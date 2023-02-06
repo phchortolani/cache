@@ -1,0 +1,1334 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReqLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReqLine
+	
+#include COMSYS
+#include INConst
+#include COMGridEdit31
+#include %occInclude
+	
+#define FORMFldINReqLineItem	1
+#define FORMFldINReqLineUnit	2
+#define FORMFldINReqLineReqdQty	3
+#define FORMFldINReqLineATP		6
+#define FORMFldINReqLineMthCons	11
+	
+	//SR17641
+#define FORMFldINReqLineTotalCost 30
+	
+#define DELIM	$char(31)
+#define ClassPropertyId(%FormFieldId)	$piece($get(^WWW122(0,YFORM,%FormFieldId,1)),Y,1)
+	
+	;-------------------------------------------------------------------------------
+	; Contains routines for the INReqLine FORMSPEC
+	; 
+	; History :
+	; 03-Nov-2010	GRF		SR17491: remove SR15753 comments
+	; 13-Nov-2007	GRF		Modify to Coding Standards for load to DEV
+	; 03-Oct-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;  FIXME : <GRF>
+	;  It may be better to include .ATP/&ATP in those subroutines setting ATP rather
+	;  than simply letting it "float" back to the form.
+	;+++++++++++++++++++++++++++++++++++++++
+IsManuallyCloseable()
+	;-------------------------------------------------------------------------------
+	; Can this line be closed
+	;	
+	; Called By : Button
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 13-Sep-2010	shobby	SR17485:Created
+	;-------------------------------------------------------------------------------
+	do IsManuallyCloseable^INReq(YM,"INReq",YKEY,$$$GRIDYFELDContainer)
+	quit
+	
+	
+ManuallyClose(pYM=0,pYFORM="",YKEY="",pYFELD="")
+	;-------------------------------------------------------------------------------
+	; Closes a line on a requisition
+	;	
+	; Called By : Button
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 20-Sep-2010	shobby	SR17485: Reinstated call to ManuallyCloseRelatedTransfers
+	; 17-Sep-2010	shobby	SR17485: Reinstated code for ManuallyCloseRelatedIssues
+	; 13-Sep-2010	shobby	SR17485: Created
+	;-------------------------------------------------------------------------------
+	new objReqLine,sc,strStatus,YFORM,YKEY,intLine,intCount,intStatus,objThisReqLine
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	tstart
+	;+++++++++++++++++++++++++++++++++++++++
+	set (strStatus,sc) = $$$OK
+	
+	set YFORM = pYFORM
+	set YKEY  = $$$GRIDGetCurrentYKEY
+	set objReqLine = ##class(alREQ.dUReqLine).%OpenId("0||"_$$$KEY1(YKEY)_"||"_$$$KEY2(YKEY))
+	
+	if objReqLine'= $$$NULLOREF {
+		set intStatus = objReqLine.Status.StatusCode
+		if intStatus=1 {
+			set strStatus = $$$MakeStatus("IN01046")    ; "Not yet firmed"
+			
+		} elseif (intStatus=8) || (intStatus=9) {
+			set strStatus = $$$MakeStatus("alREQ0002")  ; "Already Closed"
+		}
+		
+		if $$$ISOK(strStatus) {
+			set intCount = 0
+			for intLine=1:1:objReqLine.Requisition.ReqLines.Count() {
+				set objThisReqLine = objReqLine.Requisition.ReqLines.GetAt(intLine)
+				set intStatus      = objThisReqLine.Status.StatusCode
+				if objThisReqLine.IsClosable() set intCount=intCount+1
+			}
+		}
+		if $$$ISOK(strStatus) {	
+			if intCount=1 {
+				set sc = objReqLine.Requisition.ManuallyClose()
+			} else {
+				set sc = objReqLine.ManuallyClose()	
+				if $$$ISOK(sc) set sc = objReqLine.ManuallyCloseRelated()
+				if $$$ISOK(sc) set sc = objReqLine.%Save()
+				do objReqLine.%Close()
+			}
+		}
+	}	
+	if $$$ISERR(sc) set strStatus = $$ISStatusToDLStatus^COMUtilError(sc,$$$NO)
+		
+	set YFORM="INReq"
+	;+++++++++++++++++++++++++++++++++++++++
+	if $$$ISERR(strStatus) {
+		$$$Alert(strStatus)
+		trollback
+	} else {
+		tcommit
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+	do GoToForm^COMUtilForm(YFORM,$$$KEY1(YKEY))
+	
+	;$$$YQHandler(strStatus)
+	quit 
+	
+	
+HasOpenLines(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Finds out if there are any 'open' requisition lines for this item.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Nov-2010	PPP		SR17613: Get the details from the Grid 
+	; 03-Nov-2010	GRF		SR17491: Clean up unused variables; Get current ToLocn
+	;							outside for loop
+	; 28-Oct-2010	PPP		SR17491.4: Change Message from IN01257 to IN01271
+	; 13-Oct-2010	PPP		SR17491.3: Do not included current Req
+	; 16-Sep-2010	shobby	SR17491.2: Removed 3rd parameter to HasOpenLines
+	; 16-Sep-2010	shobby	SR17491.2: Quantity for tooltip was being sourced incorrectly
+	; 09-Sep-2010	shobby	SR17491: Corrected a bug which wasn't always finding data.
+	; 18-Aug-2010	shobby	SR17491: Created
+	;-------------------------------------------------------------------------------
+	new blnResult,idCurrentToLocn,idItem,idOtherReqNo,idReqNo,idStatus
+	new idxItem,objOtherReqn,strTooltip
+	new objRequisition
+	
+	set strTooltip = ""
+	set blnResult  = $$$NO
+	set idReqNo    = $$$KEY1(pYKEY)
+	//SR17613
+	set objRequisition = $$$GRIDYFELDContainer
+	
+	if (idReqNo'="") && (pYFELD'="") {
+		//SR17613
+		//set idCurrentToLocn = $$$INReqToLocn($get(^INReq(0,idReqNo,1)))
+		set idCurrentToLocn = $$$INReqToLocn(objRequisition)
+		
+		if $$$INReqLineStatus(pYFELD)<2 {
+			set idItem = $$$INReqLineItem(pYFELD)
+			if idItem'="" {
+				set idxItem = $$$Index(idItem)
+				for idStatus=1:1:7 {
+					set idOtherReqNo = ""
+					for {
+						set idOtherReqNo = $order(^INReqLines(0,4,idStatus,idxItem,idOtherReqNo))
+						quit:idOtherReqNo=""
+						continue:idReqNo=idOtherReqNo   ; skip current record        //SR17491.3
+						
+						set objOtherReqn = $get(^INReq(0,idOtherReqNo,1))
+						if $$$INReqToLocn(objOtherReqn) = idCurrentToLocn {
+							set blnResult  = $$$YES
+							set strTooltip = $$$Text($listbuild("IN01271"))	;SR17491.4
+						} ; "Item is currently on order in the requisitions listed below."
+						quit:blnResult
+					}
+				}
+			}
+		}	
+	}
+	if blnResult set YTOOLTIP = strTooltip
+	
+	quit blnResult
+	
+	
+OnAfterPrimaryKey(pYM,pYFORM,pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Setup ATP and TOTALCOST
+	; 
+	; Inputs : 
+	;
+	; ByRef : Returns ATP and TOTALCOST for form use
+	;
+	; Returns : nothing
+	; 
+	; History :
+	; 19-Apr-2011	PPP		SR17641: Add/Show Total Cost
+	; 13-Jul-2009	PPP		SR16692:If duedate not present get Today's date.
+	; 29-Jun-2009	PPP		SR16688:If Line From Locn not set use the Header value
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new dteDue,idLocn
+	
+	set idLocn = $$$INReqLineFromStockLocn(pYFELD)
+	if idLocn = "" {
+		set idLocn = $$$INReqFromLocn($$$GRIDYFELDContainer)
+	}
+	
+	set dteDue = $$$INReqLineDueDate(pYFELD)
+	if dteDue = ""	set dteDue = +$horolog
+	
+	set ATP = $$^INATP1($$$INReqLineItem(pYFELD),idLocn,$$$INReqLineQtyRequired(pYFELD),dteDue,1)
+	//SR17641
+	set TOTALCOST = $justify($$$INReqLineUnitPrice(pYFELD)*$$$INReqLineQtyOrdered(pYFELD),0,$$DPforInventoryCost^INVORG())
+
+	quit
+	
+	
+DeleteAll(YFORM)   ;SR17267
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 22-Apr-2010	shobby	SR17267: Line Form could be INReqKitLine, INReqCancel etc.
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	;SR17267 new YFORM
+	
+	;SR17267 set YFORM = "INReqLine"
+	quit $$DeleteAll^COMGridEdit31S()
+	
+	
+UpdateATP(pGridRow,pYFELD)
+	;-------------------------------------------------------------------------------
+	; only update ATP if all required fields & Monthly Consumption
+	; 
+	; Returns : ATP for form use
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; History :
+	; 04-Jan-2010	GRF		SR17090: use macro
+	; 30-Jun-2009	PPP		SR16814: Added Monthly Consumption (removed from 
+	;							OnBlurItem^INReqKitLine as it gets called anyway)
+	; 03-Apr-2008	GRF		Coding Standards for parameters
+	; 17-Dec-2007	PPP		If the dueDate is null, set it to today (required for
+	;							ATP) otherwise does not include demands for today
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new dteDue,fltATP,fltConsumption
+	
+	set dteDue = $$$INReqLineDueDate(pYFELD)
+	if dteDue = ""	set dteDue = +$horolog
+	set fltATP = $$^INATP1($$$INReqLineItem(pYFELD),$$$INReqLineFromStockLocn(pYFELD),$$$INReqLineQtyRequired(pYFELD),dteDue,1)
+	$$$GRIDUpdateManualField(pGridRow,$$$FORMFldINReqLineATP,fltATP)
+	
+	// -> Cycle     1 - Monthly, 2 - Weekly, 3 - Quarterly, 4 - Half Yearly, 5 - Yearly		    = 1
+	// -> History   No of Cycles																= 3
+	if (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+		set fltConsumption = $$GetDM^VARReposicao($$$INReqLineItem(pYFELD),$$$INReqToLocn($$$GRIDYFELDContainer))
+	}
+	else {
+		set fltConsumption = ##class(alSOH.iSOHBalance).GetAvgConsumption($$$INReqLineItem(pYFELD),$$$INReqToLocn($$$GRIDYFELDContainer),1,1)
+	}
+	$$$GRIDUpdateManualField(pGridRow,$$$FORMFldINReqLineMthCons,fltConsumption)
+	; FIXME : F11=> D12 FREE1 - should this be made a core field and what is implication of updating manual field when actually is a data field?
+	
+	quit
+	
+	
+OnAfterDataFields(pYM,pYFORM,pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Executes within a <script> block
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	quit
+	
+	
+OnBeforeDisplayLine(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	quit $$$YES
+	
+	
+OnBeforeDisplayCombo(pstrKeys,pobjReq,pintCol,&pSUCH)
+	;-------------------------------------------------------------------------------
+	; Populates the Unit with the UOM as defined in INARTPACK only, excludes
+	; units that the item does not come in.
+	; 
+	; set pSUCH as the items to be used when you override the list (set via blnOverride)
+	;
+	; Called By: COMGridEdit executable
+	; 
+	; Inputs:
+	;	pstrKeys		YKEY
+	;	pobjSummary		YFELD
+	; 
+	; Returns: $$$YES or $$$NO (override the data) 
+	;
+	; History:
+	; 15-Jul-2011	GRF		SR17669: Call common code
+	; 03-Nov-2009	DavidR	SR16983: Created
+	;-------------------------------------------------------------------------------
+	new blnOverride,enumLineType,enumUnit,idClassField,idItem
+	
+	set blnOverride = $$$NO
+	
+	; Unit
+	;---------------------------------------
+	if pintCol = $$$FORMFldINReqLineUnit {      ; SR17669 vvv
+		set blnOverride = $$LoadCombo^INARTPACK($$$INReqLineItem(pobjReq),blnOverride,.pSUCH)
+	}
+	quit blnOverride
+	/*
+	if pintCol = $$$FORMFldINReqLineUnit  {
+		kill pSUCH
+		set pSUCH  = "SUCH"
+		set idItem = $$$INReqLineItem(pobjReq)
+		if idItem '= "" {
+			set enumUnit = ""
+			for {
+				set enumUnit = $order(^INARTPACK(0,idItem,enumUnit))
+				quit:enumUnit=""
+				
+				set pSUCH(enumUnit) = enumUnit
+			}
+			set blnOverride = $$$YES
+		}
+	}
+	quit blnOverride
+	*/                                           ; SR17669 ^^^
+	
+		
+OnBeforeFormat(pYFIELDNAME,pYTEXT,pYFELD)
+	;-------------------------------------------------------------------------------
+	;	Highlights Errors in Red
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;	pYFIELDNAME	-	FORMSPEC Field Name
+	;	pYTEXT - Value to be displayed
+	;	YFELD is the Class Record! Should be the FORMSPEC!
+	;
+	; ByRef :
+	;	YKEY
+	;	YBACKGROUNDCOLOR
+	;	YTOOLTIP
+	;
+	; Returns : $$$YES (why?)
+	;
+	;
+	; History :
+	; 23-Mar-2009	GRF		SR16428: Call common code for CellColours; return $$$YES
+	;							is not required; strWarningColor for hardcoded RED;
+	;							YFONTCOLOR handled in CellColours call
+	; 06-Feb-2009	GRF		SR16328: EnumReadOnly Macro; use $$Get^WWW122 to include
+	;							customisations
+	; 30-Oct-2008	HQN		SR16109: Only recolor/tooltip if record is Open
+	; 03-oct-2008	Luke	SR15946 Added check for due date 
+	; 12-Sep-2008	HQN		SR15903: Added color handling
+	; 03-Apr-2008	GRF		SR15625? Macros; elseif rather than 2nd test; correct test
+	; 17-Dec-2007	PPP		Added Language Text for TOOLTIP
+	; 07-Dec-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new intCol,intRow,objHeader,strDefaultColor,strDisabledColor,strRequiredColor,strWarningColor
+	
+	set objHeader  = $$$GRIDYFELDContainer
+	quit:$$$INReqStatus(objHeader)>1             ; Active
+	
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pYFIELDNAME,intRow,intCol)
+	
+	; Quantity Issued
+	;---------------------------------------
+	if ($$$ClassPropertyId(intCol) = $$$FldINReqLineQtyOrdered) {
+		if ($$$INReqLineQtyOrdered(pYFELD) = 0) {
+			set YWARNING = $$$YES
+			set YTOOLTIP = $$$Text("INREQ19")    ; "Ordered Quantity cannot be zero"
+		
+		} elseif ($$$INReqLineQtyOrdered(pYFELD) < 0) {
+			set YWARNING = $$$YES
+			set YTOOLTIP = $$$Text("INREQ20")    ; "Ordered Quantity must be set"
+		}
+	
+	; Quantity To Receive
+	;---------------------------------------
+	} elseif ($$$ClassPropertyId(intCol) = $$$FldINReqLineQtyToReceive) {
+		if ($$$INReqLineStatus(pYFELD) > 2) {
+			set YTOOLTIP = $$$Text("INREQ21")_": "_$$$INReqLineQtyIssued(pYFELD)  ; "Quantity Issued:"
+		}		
+	
+	; From Site Location [*** Bad Property names - suggests storage ***]
+	;---------------------------------------
+	} elseif ($$$ClassPropertyId(intCol) = $$$FldINReqLineFromStockLocn) {
+		if ($$$INReqStatus($$$GRIDYFELDContainer) = 0) {
+			if $$$INReqLineFromStockLocn(pYFELD) = $$$INReqToLocn($get(^INReq(0,$$$KEY1(YKEY),1))) {
+				set YWARNING = $$$YES
+				set YTOOLTIP = $$$Text("IN00404")     ; "Requisition requires different locations"
+			}
+		}
+	
+	; Due Date
+	;---------------------------------------
+	} elseif ($$$ClassPropertyId(intCol) = $$$FldINReqLineDueDate) {
+		
+		if ($$$INReqStatus($$$GRIDYFELDContainer) = 1) {
+			if ($$$INReqLineDueDate(pYFELD) '= "") {
+				if $$$INReqLineDueDate(pYFELD) < $horolog  {
+					set YWARNING = $$$YES
+					set YTOOLTIP = $$$Text("INREQ23") ; "Due Date can only be today or later"
+				}	
+			}
+		}
+	}
+	quit
+		
+	
+OnLineAdded(pintRowCount,pstrKey)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 29-May-2009	PPP		SR16586: Simplify Process (remove unnecessary calls to
+	;							Script Engine/State Engine)
+	; 03-Sep-2008	HQN		SR15830: FIXME: Removing formatting, breaks on tab navigation
+	; 24-Jan-2008	HQN		SR15625 Changed class signature dREQ to dUReq
+	; 24-Jan-2008	HQN		SR15625 Changed class signature dREQLine to dUReqLine
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new dteCalc,objReqLine,objStatus,sc,strStatus
+	
+	set strStatus = $$$OK
+	
+	//new objReq,dteDate
+	//set strStatus = $$ExecuteRule(YFORM,YM,YKEY,"New",pintRowCount)
+	
+	set objReqLine = ##class(alREQ.dUReqLine).%New()
+	
+	if objReqLine'=$$$NULLOREF {
+		set objReqLine.LineNumber = pintRowCount
+		set objReqLine.Company    = 0
+		
+		set objStatus = ##class(alSYS.Status.dUStatus).%OpenId("0||INReq||1")
+		set objReqLine.Status = objStatus 
+	//	do objReq.upDateStatus()
+		set sc = objReqLine.%Close()	
+		
+	//	set sc = ##class(alSYS.Script.iScriptEngine).RunRule(objReq,pstrMethod,pidForm)
+		do objReqLine.%Close()	
+		set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	}
+	
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError(strStatus)
+	}
+	quit
+	
+	
+OnBeforeDelete(pYM,pYFORM,pstrKey,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	$$$YQHandler($$$QDontSave)
+	quit
+	
+	
+OnLineDeleted(pstrYFORM,pstrYKEY,pintRowCount)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 13-Oct-2010	PPP		SR17566: Language Text
+	; 08-Sep-2009	DWR		SR16873: Added clearing of dynamic grid
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new idParameters
+	
+	; Clear DynTable
+	set idParameters = "INReq"_$$$DELIM_"INReqLine"_$$$DELIM_"dStockBundle"_$$$DELIM_""
+	kill ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle")
+	; "No Item Selected"   SR17566
+	do DrawTable^WWW120DynTable($listbuild($$$Text("IN01142")),"dStockBundle",$listbuild($listbuild("left","display")),
+	                            idParameters,"",$$$EnumWWWDYNTABLEAfterDataFields)
+	quit
+	
+	
+OnBeforeCopy(pstrKey,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By : No call found Jan 2010
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 30-Nov-2007	HQN		Created 
+	;-------------------------------------------------------------------------------
+	;-------------------------------------------------------------------------------
+	; After a line is deleted from the grid (ie from memory, as opposed to deleted from disk)
+	;-------------------------------------------------------------------------------
+	quit
+	
+	
+OnBeforeSave(pidKey,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 25-Sep-2008	Luke	SR15946 allow "" to be processed
+	; 24-Sep-2008	Luke	SR15946 Created Added check for date & response back to user
+	;-------------------------------------------------------------------------------
+	new strStatus  
+	
+	set strStatus  = $$$OK
+	if ($$$INReqDueDate(pobjLine)'="") && ($$$INReqLineDueDate(pobjLine)<$horolog)  {
+		set YRETVAL = $$$Text($listbuild("INREQ23"))
+	} ; "Due Date can only be today or later"
+	
+	quit strStatus
+	
+OnBeforeSaveClass(pidKey,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; On Before Save Class level
+	; History :
+	; 21-Oct-2013	SCR		SESDF-669 - Upgrade Requisitions for Transfer
+	;-------------------------------------------------------------------------------
+	new strStatus,idReq,objReq,idToLoc
+	
+	set strStatus	= $$$OK
+	set idReq		= $$$KEY1(pidKey)
+	set objReq		= $get(^INReq(YM,idReq,1))
+	set idToLoc		= $$$INReqToLocn(objReq)
+	set $$$INReqLineToLocation(pobjLine)	= idToLoc
+	Quit strStatus
+	
+	
+OnBlurDueDate(pidGridRow,pCOL,pdteDue,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By : Form INReqLine F7
+	;		
+	; Inputs : (GROW,GCOL,YINHALT,.YFELD)
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 08-Apr-2010	shobby	SR15753: Let @netManager do the work.
+	; 04-Jan-2010	GRF		SR17090: & on argument
+	; 24-Sep-2008	Luke	SR15946 Added check for date and response back to user
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	if (pdteDue '= "") {
+		if $$$INReqLineDueDate(pobjLine) < $horolog  {
+			set YTOOLTIP = $$$Text("INREQ23")              ; "Due Date can only be today or later"
+			set YWARNING = $$$YES
+		
+		} else {
+			do UpdateATP(pidGridRow,pobjLine)
+		}	
+	}
+	quit
+	
+	
+OnBlurFromLocation(pYKEY,pidGridRow,pidLocn,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By : Form INReqLine F4, INPOReqLine F4
+	;		
+	; Inputs : (YKEY,GROW,YINHALT,.YFELD)
+	;
+	; ByRef :
+	;	GCOL ; Grid Column
+	; Returns :
+	;
+	; History :
+	; 08-Apr-2010	shobby	SR15753: Let @netManager do the work.
+	; 04-Jan-2010	GRF		SR17090: & on argument
+	; 12-Sep-2008	HQN		SR15903: Added UI Check on FromLocation
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new objReq
+	
+	if (pidLocn '= "") {
+		do UpdateATP(pidGridRow,pobjLine)
+	}
+	quit
+	
+	
+	/*
+OnBlurItem(pidGridRow,pidItemNo,&pobjLine) ; Replaced under SR17274
+	;-------------------------------------------------------------------------------
+	; On Blur from Item
+	;	Updates ATP field
+	;	Populates Unit dropdown
+	;
+	; Called By : form INReqLine F1 
+	;		
+	; Params:	(GROW,YINHALT,.YFELD)
+	;
+	; ByRefs:	pobjLine	- current line object
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Apr-2010	shobby	SR15753: Let @netManager do the work.
+	; 04-Jan-2010	GRF		SR17090: consistent variables; call OnBlurQtyOrdered
+	; 23-Sep-2009	PPP		SR16905: Set YGRIDWHITE if it does not exist
+	; 02-Sep-2008	Luke	SR15943: Correct the Item Field style update
+	; 23-Sep-2008	Luke	SR15943: Added Item Validity check and report back
+	; 03-Apr-2008	GRF		SR15598: Remove duplicated unit extraction
+	; 03-Dec-2007	HQN		SR15598: Updated, implemented Unit Of Measure population
+	;-------------------------------------------------------------------------------
+	new idItem,objItem
+	
+	if (pidItemNo '= "") {
+		set objItem = ##class(alINV.iUINV).GetItem(pidItemNo)
+		if objItem '= $$$NULLOREF {
+			set idItem = $$$INReqLineItem(pobjLine)
+			
+			// Populate Unit Listing
+			if idItem'=""{
+			;	set $$$INReqLineUnit(pobjLine) = $$LoadUnitOfMeasureList^INARTUtilities($$$INReqLineItem(pobjLine))
+				set $$$INReqLineUnit(pobjLine) = $$$INARTUnitofMeasure($get(^INART(0,idItem,1)))
+				do OnBlurQtyOrdered(pidGridRow,$$$INReqLineQtyOrdered(pobjLine),.pobjLine) ; SR17090
+			}
+			
+			// Load the Dynamic Grid
+			do UpdateATP(pidGridRow,pobjLine)
+			do ShowItems^INReqTable(1,"INReq"_$$$DELIM_"INReqLine"_$$$DELIM_1_$$$DELIM_1)
+		}
+	}
+	quit
+	*/
+	;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+	
+	
+OnBlurItem(pidGridRow,pidItemNo,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; On Blur from Item
+	;	Updates ATP field
+	;	Populates Unit dropdown
+	;
+	; Called By : form INReqLine F1 & VARTFRReq
+	;		
+	; Params:	(GROW,YINHALT,.YFELD)
+	;
+	; ByRefs:	pobjLine	- current line object
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Sep-2010	shobby	SR17491.2: Removed 3rd parameter to HasOpenLines
+	; 07-May-2010	GRF		SR17274: Text in strStatus; remove SR15753 comments
+	; 20-Apr-2010	Karine	SR17274: Block duplicate item on Requisition
+	; 08-Apr-2010	shobby	SR15753: Let @netManager do the work.
+	; 04-Jan-2010	GRF		SR17090: consistent variables; call OnBlurQtyOrdered
+	; 23-Sep-2009	PPP		SR16905: Set YGRIDWHITE if it does not exist
+	; 02-Sep-2008	Luke	SR15943: Correct the Item Field style update
+	; 23-Sep-2008	Luke	SR15943: Added Item Validity check and report back
+	; 03-Apr-2008	GRF		SR15598: Remove duplicated unit extraction
+	; 03-Dec-2007	HQN		SR15598: Updated, implemented Unit Of Measure population
+	;-------------------------------------------------------------------------------
+	new arrItemList,dteToday,idDataLine,idFoundRow,objItem,strStatus
+	new strContainer,objReq
+	
+	if (pidItemNo '= "") {
+		set objItem = ##class(alINV.iUINV).GetItem(pidItemNo)
+		if objItem '= $$$NULLOREF {
+			if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+				if ('+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+					// 12-Maio-2010  Check if Item is inactive
+					new itemStatus
+					set itemStatus = $piece($get(^INART(YM,pidItemNo,1)),Y,66)				
+					if (itemStatus = 1) {
+						w "javascript:alert('O produto "_pidItemNo_" está inativo. Favor verificar com a CAF.');"
+						set $$$INReqLineItem(pobjReqLine) = ""
+						quit
+					}
+				}
+			}
+			
+		// SR17274:  vvvvv
+			do IncludedItems(.arrItemList)
+			set dteToday = +$horolog
+			
+			set idFoundRow = $order(arrItemList(pidItemNo,""))
+			if idFoundRow=pidGridRow set idFoundRow = $order(arrItemList(pidItemNo,idFoundRow))
+			
+			if idFoundRow'="" {
+				set idDataLine = $piece($get(^WWWDATEN(0,dteToday,YUSER,YFORM,"V","REFERENCEKEY",idFoundRow,1)),$$$COMMA,2)
+				
+				set $$$INReqLineItem(pobjLine) = ""   
+				set strStatus = $$$MakeStatus("IN01228",pidItemNo,idDataLine) ; "Item %1 has already been included in line %2."
+				$$$Alert(strStatus)                                           ; "Item %1 já foi incluída na linha %2." [PT]
+				
+			} else {
+				if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {				
+					// 06-Jun-2012 Lucas: Check if Item is 'Multidose - Coletivo' (INART-FREE15 = 1)
+					if (pidItemNo '= ""){
+						set objINART = ^INART(0,pidItemNo,1)
+						if ($$$INARTFREE15(objINART) = 1){
+							write "javascript:alert('ATENÇÃO! \n É necessária a devolução das embalagens vazias para atendimento da requisição pela farmácia.');"
+						}
+					}
+				}
+				set objReq	= $$$GRIDYFELDContainer
+				set $$$INReqLineToSOH(pobjLine)					= ##class(alSOH.iSOH).GetQtyAvailable(pidItemNo, $$$INReqToLocn(objReq),,$$$YES)
+				set $$$INReqLineFromSOH(pobjLine)				= ##class(alSOH.iSOH).GetQtyAvailable(pidItemNo, $$$INReqFromLocn(objReq),,$$$YES)
+				set $$$INReqLineMonthlyConsumption(pobjLine)	= $$GetLocationConsumption^INARTConsumption(pidItemNo,$$$INReqToLocn(objReq))
+				if (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+					do OnBlurItem^VARTFRReqLine(pidGridRow,pidItemNo,.pobjLine)
+				}
+				
+				//Populate Unit Listing
+				set $$$INReqLineUnit(pobjLine) = $$LoadUnitOfMeasureList^INARTUtilities($$$INReqLineItem(pobjLine))  ; [IU]
+				do OnBlurQtyOrdered(pidGridRow,$$$INReqLineQtyOrdered(pobjLine),.pobjLine) ; SR17090
+				
+				//Load the Dynamic Grid
+				do UpdateATP(pidGridRow,pobjLine)
+				set strContainer = $get(^CacheTemp(YUSER,"Grid","Container"))
+				do ShowItems^INReqTable(1,strContainer_$$$DELIM_YFORM_$$$DELIM_1_$$$DELIM_1)
+				
+			}
+			if $$HasOpenLines^INReqLine(YKEY,YFELD) {
+				$$$Alert(YTOOLTIP) 
+			}
+			
+			if ( (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) || 
+			(+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+			(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) ) {
+				
+				new clientParam,itemPadro
+				
+				set clientParam = $piece($get(^VARParametroCliente(YM,YM,1)),Y,76)
+				set itemPadro	= $piece($get(^INART(YM,pidItemNo,1)),Y,280)
+				
+				if ( (clientParam = 1) && (itemPadro = 0) ) {
+					$$$Alert("Não é permitida a requisição de produtos não padronizados.")
+					set YFELD = ""
+					
+				}
+				
+			}	
+		}
+	}
+	quit
+	
+	
+IncludedItems(&arrItemList)
+	;-------------------------------------------------------------------------------
+	; Returns list of item codes already included in the current Transfer Requisition.              
+	;
+	; History:
+	; 07-May-2010	GRF		SR17274: Merged with cleanup; rewritten with array
+	; 20-Apr-2010	Karine	SR17274: Created - Block duplicate item on Requisition 
+	;--------------------------------------------------------------------------------
+	new dteToday,idGridRow,idItem,strItemList
+	
+	kill arrItemList
+	
+	set dteToday = +$horolog
+	set strItemList = ""
+	
+	// Loop on grid lines:
+	set idGridRow = ""
+	for {
+		set idGridRow = $order(^WWWDATEN(0,dteToday,YUSER,"INReqLine","V","REFERENCEKEY",idGridRow))
+		quit:idGridRow=""
+		
+		set idItem = $get(^WWWDATEN(0,dteToday,YUSER,"INReqLine","V","Y"_idGridRow_"_"_$$$FORMFldINReqLineItem,1))
+		continue:idItem=""
+		
+		// If grid line was not deleted, include item code in the list of already included items:
+		if '$get(^WWWDATEN(0,dteToday,YUSER,"INReqLine","V","KILLEDRECORD",idGridRow)) {
+			set arrItemList(idItem,idGridRow) = idGridRow
+		}
+	}
+	quit
+	
+	
+IsItemIncluded(pidItemNo)
+	;-------------------------------------------------------------------------------
+	; Returns a Boolean, if the Item already exist on the Grid or not.
+	; Used by UseTemplate - Load lines using a template
+	;
+	; History:
+	; 20-Aug-2010	PPP	SR17274: Created
+	;--------------------------------------------------------------------------------
+	new arrItemList
+	
+	do IncludedItems(.arrItemList)
+	
+	quit +$order(arrItemList(pidItemNo,""))
+	
+	
+	/*
+ItemsAlreadyIncludedV1()
+	;-------------------------------------------------------------------------------
+	;    Returns the list of item codes already included in the current Transfer Requisition.              
+	;      new counter, date, gridLine, gridColumnForItemCode, strItemList
+	;
+	; History:
+	; 07-May-2010	GRF		SR17274: Merged with cleanup
+	; 20-Apr-2010	Karine	SR17274: Created - Block duplicate item on Requisition 
+	;--------------------------------------------------------------------------------
+	new dteToday,idGridRow,idItem,strItemList
+	
+	set dteToday = +$horolog
+	set strItemList = ""
+	
+	// Loop on grid lines:
+	set idGridRow = ""
+	for {
+		set idGridRow = $order(^WWWDATEN(0,dteToday,YUSER,"INReqLine","V","REFERENCEKEY",idGridRow))
+		quit:idGridRow=""
+		
+		set idItem = $get(^WWWDATEN(0,dteToday,YUSER,"INReqLine","V","Y"_idGridRow_"_"_$$$FORMFldINReqLineItem,1))
+		continue:idItem=""
+		
+		// If grid line was not deleted, include item code in the list of already included items:
+		if '$get(^WWWDATEN(0,dteToday,YUSER,"INReqLine","V","KILLEDRECORD",idGridRow)) {
+			set $piece(strItemList,Y,idGridRow) = idItem
+		}
+	}
+	quit strItemList
+	*/
+	
+	;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	
+	
+OnBlurQtyOrdered(pidGridRow,pfltQty,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By : Form INReqLine F8
+	;		
+	; Inputs : (GROW,YINHALT,.YFELD)
+	;	pfltQty - Qty expressed in Requisition Unit
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 19-Apr-2011	PPP		SR17641: Add Unit Price/Total Cost to the INReqLine
+	; 04-Feb-2011	GRF		SR17579: Rename CalculateBaseQuantity
+	; 02-Feb-2011	GRF		SR17579: Clarify variable contents
+	; 02-Mar-2010	GRF		SR17090.1: Test pfltQty for null not $$$NULLOREF; still
+	;							clear QtyRequired if null
+	; 04-Jan-2010	GRF		SR17090: consistent variables; ISERR wrong test
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new fltQtyInIU,idItem,idUnit
+	//SR17641
+	new idLoc
+	new fltTotalCost
+	
+	set idItem = $$$INReqLineItem(pobjLine)
+	set idUnit = $$$INReqLineUnit(pobjLine)
+
+	if (pfltQty '= "") {  ; SR17090.1
+		
+		set fltQtyInIU = $$CalcInventoryQty^INUOMConversion(idItem,idUnit,pfltQty) ; SR17579
+		if fltQtyInIU {
+			set $$$INReqLineQtyRequired(pobjLine) = fltQtyInIU
+		}
+	
+	} else {  ; SR17090.1
+		set $$$INReqLineQtyRequired(pobjLine) = 0
+	}
+
+	//SR17641
+	set idLoc = $$$INReqFromLocn($$$GRIDYFELDContainer)
+	set $$$INReqLineUnitPrice(pobjLine) = $$GetCost^INItemCost(idItem,idLoc)*$$GetUOMConversion^INUOMConversion(idItem,idUnit)
+	set fltTotalCost = $justify($$$INReqLineUnitPrice(pobjLine)*pfltQty,0,$$DPforInventoryCost^INVORG())
+	do UpdateTotalCost(pidGridRow,fltTotalCost)
+
+	quit
+
+UpdateTotalCost(pidGridRow,fltTotalCost)
+	;-------------------------------------------------------------------------------
+	; Update Total Cost
+	; 
+	; Called By :OnBlurQtyOrdered
+	;		
+	; Inputs : 	pidGridRow
+	;			fltTotalCost
+	; ByRef :
+	;
+	; History :
+	; 19-Apr-2011	PPP		SR17641: Created
+	;						Add Unit Price/Total Cost to the INReqLine and Update
+	;-------------------------------------------------------------------------------
+
+	$$$GRIDUpdateManualField(pidGridRow,$$$FORMFldINReqLineTotalCost,fltTotalCost)
+	
+	quit
+	
+OnBlurUnit(pidGridRow,penumUnit,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By : Form INReqLine F2, INPOReqLine F2
+	;		
+	; Inputs : (GROW,YINHALT,.YFELD)
+	;
+	; Returns :
+	;
+	; History :
+	; 04-Jan-2010	GRF		SR17090: consistent variables
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	do OnBlurQtyOrdered(pidGridRow,$$$INReqLineQtyOrdered(pobjLine),.pobjLine)
+	quit
+	
+	
+OnBlurRequiredQuantity(pidGridRow,pfltQty,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; Called By : OnBlurRequiredQuantity^INReqKitLine
+	;             Form INReqLine F3, INPOReqLine F3
+	;		
+	; Inputs : (GROW,YINHALT,.YFELD)
+	;
+	; Returns :
+	;
+	; History :
+	; 04-Jan-2010	GRF		SR17090: consistent variables
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	if (pfltQty'="") {
+		do UpdateATP(pidGridRow,pobjLine)
+	}
+	quit
+	
+	
+GetReqFromLocn(pstrKEY)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 03-Apr-2008	GRF		SR15625: Single exit (use idLocn); remove 4th $piece arg
+	; 24-Jan-2008	HQN		SR15625: Changed class signature dREQ to dUReq
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new idLocn,objReq
+	
+	set idLocn = ""
+	set objReq = ##class(alREQ.dUReq).%OpenId("0||"_$piece($translate(pstrKEY,"""",""),",",1))
+	if (objReq '= $$$NULLOREF) {
+		se]]><![CDATA[t idLocn = objReq.FromLocn.Location
+	}
+	quit idLocn
+	
+	
+UseTemplate(pidTemplate)
+	;-------------------------------------------------------------------------------
+	; Append template Lines to the Requisition
+	; 
+	; Called By:
+	;	UseTemplate^INReqKitLine
+	;	TemplateSelected^INReqTemplate
+	; 
+	; Params:
+	;	pidTemplate		Selected Template
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Feb-2011	GRF		SR17579: Rename CalculateBaseQuantity
+	; 11-Nov-2009	PPP		SR17613: Updated so that the blank line is deleted when
+	; 							the template is loaded
+	;							If Req is not a 4 (Kit) use Addline^INReq to load 
+	;							lines from the template
+	; 20-Aug-2010	PPP		SR17274: If Item is already on the Grid - ignore, re-entering it
+	; 10-Apr-2010	GRF		SR17177: arrGrid rather than arrGridContent; GRID Macros
+	; 13-Oct-2009	DWR		SR16905: Check the form to make sure that you are adding
+	;							to the correct grid.
+	; 31-Jul-2009	DWR		SR16812: Changed the call to $$$GRIDAddLine to return the
+	;							line number then use this to simulate bluring of
+	;							Item field.  If this doesn't happen, the COMTempList
+	;							may not have been created displaying a number only
+	;							on the grid for unit. work done in SR16814
+	; 11-Jun-2009	DWR		SR16544: call to JS function to delete empty lines before
+	;							loading in a fixed template.
+	;							If it is a kit requisition, ensure all lines have the 
+	;							same fromlocn as the header record. cant have a kit
+	;							requisition from multiple locations.
+	; 10-Jun-2009	DWR		SR16544: Manually disable the grid if the type is 4 (kit) 
+	;							and the selected template does not allow variations. 
+	; 09-Jun-2009	DWR		SR16544: Update the header field if type is 4 - Kit Req
+	;							Dont load a template that doesnt allow variances and 
+	;							there are already lines on the grid.
+	; 04-Jun-2007	PPP		SR16612:If Template Location is not defined get the
+	;							location from the Requistion Header
+	; 22-Nov-2007	GRF		SR15614: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,blnAllowVar,blnCanLoad,blnHasLine,fltQty
+	new idItem,idFrom,idLastLine,idReq,idRowAdded,idUnit,intRowCount,intTemplateLine
+	new objGridLine,objReqLine,objTemplate,objTemplateLine,strMessage,strStatus,strYFELD
+	
+	set blnCanLoad  = $$$YES
+	set intRowCount = $get($$$GRIDRowCount)
+	set strYFELD    = $$$GRIDYFELDContainer
+	set idReq       = $$$GRIDYKEYContainer
+	set objTemplate = $get(^INReqTemplate(0,pidTemplate,1))
+	
+	; Find out if lines already exist or it a blank line
+	set blnHasLine = $$$NO 
+	do GetGridContents^COMGridEdit31G(.arrGrid)					;SR17267
+	
+	set idLastLine = ""
+	for {
+		set idLastLine = $order(arrGrid(idReq,idLastLine))
+		quit:idLastLine=""
+		
+		set objGridLine = $get(arrGrid(idReq,idLastLine))
+		if ($$$INReqLineItem(objGridLine)'="")       ||
+		   ($$$INReqLineUnit(objGridLine)'="")       ||
+		   ($$$INReqLineQtyOrdered(objGridLine)'="")   {
+			
+			set blnHasLine = $$$YES
+			quit
+		}
+	}
+	
+	if $$$INReqType(strYFELD) = 4 {                        ; Kit Requisition
+		set objTemplate = $get(^INReqTemplate(0,pidTemplate,1))
+				
+		set blnAllowVar = ''$$$INReqTemplateAllowVariation(objTemplate)
+		if (blnHasLine=$$$NO)                              ||
+		   ((blnHasLine=$$$YES) && (blnAllowVar = $$$YES))   {
+			   
+			if (blnAllowVar = $$$NO) || (blnHasLine=$$$NO) {
+				; vvv delete the empty lines before continuing flag of "1" removed the confirm box.
+				$$$StartScript()
+				write "DeleteAllGridLines(1);"
+				write "EventValue("""_YUCI_""","""_YUSER_""","""_YFORM_""",""FIX"",""AddKitLines^INReqKitLine"","""_pidTemplate_""",""6"","""_strYFELD_""");"
+				set blnCanLoad = $$$NO				
+				$$$EndScript()
+			}
+			do UpdateHeaderField^COMGridEdit31Interface("D"_$$$FldINReqKitCode,pidTemplate)
+			do UpdateHeaderField^COMGridEdit31Interface("D"_$$$FldINReqAllowVariation,blnAllowVar)
+			;****************************************
+			; the below line disables the grid directly. 
+			; Has been implemented to disable the grid
+			; despite it not being saved yet.
+			; Don't want to be able to amend lines if 
+			; a fixed kit has been selected.
+			; After it has been saved, it used the normal 
+			; LoadGrid parameters from INReqKitLine
+			;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+			if blnAllowVar '=$$$YES { 
+				set $piece(^CacheTemp($get(YUSER),"Grid","INReqKitLine","YVOR"),"~",23) = $$$EnumReadOnly 
+			}  
+		
+		} else {
+			set blnCanLoad = $$$NO
+			$$$Alert("IN01071")	// "The Kit cannot be loaded, \n\n Lines already exist, Template does not Allow Variance"
+			//$$$StartScript()
+			//w "alert('"_$$$Text("The kit cannot be loaded, \n\n lines already exist and this template does not allow variance")_"'); "		//FIXME Language Text
+			//$$$EndScript()
+		}
+	
+	} else {
+		if (blnHasLine=$$$NO) {
+		   	; Delete the empty lines before continuing flag of "1" removed the confirm box.
+			$$$StartScript()
+			write "DeleteAllGridLines(1);"
+			write "EventValue("""_YUCI_""","""_YUSER_""","""_YFORM_""",""FIX"",""AddLines^INReqLine"","""_pidTemplate_""",""6"","""_strYFELD_""");"
+			set blnCanLoad = $$$NO				
+			$$$EndScript()
+		}
+	}
+	
+	if blnCanLoad {
+		set intTemplateLine = ""
+		for {
+			set intTemplateLine = $order(^INReqTemplateLine(0,pidTemplate,intTemplateLine))
+			quit:intTemplateLine=""
+			
+			set objTemplateLine = $get(^INReqTemplateLine(0,pidTemplate,intTemplateLine,1))
+			
+			set objReqLine = ""
+			set ($$$INReqLineItem(objReqLine),idItem)       = $$$INReqTemplateLineItem(objTemplateLine)
+			set ($$$INReqLineUnit(objReqLine),idUnit)       = $$$INReqTemplateLineUnit(objTemplateLine)
+			set ($$$INReqLineQtyOrdered(objReqLine),fltQty) = $$$INReqTemplateLineRequiredQty(objTemplateLine)
+			set $$$INReqLineQtyRequired(objReqLine)         = $$CalcInventoryQty^INUOMConversion(idItem,idUnit,fltQty) ; SR17579
+			
+			set idFrom = $$$INReqTemplateLineFromStockLocn(objTemplateLine)
+			if idFrom = "" {
+				set $$$INReqLineFromStockLocn(objReqLine)   = $$$INReqFromLocn(strYFELD)
+			}
+			// if the type is a kit, only allow the From Locn on the line
+			// to be the same as the header (can't have a kit from multiple locations)
+			if $$$INReqType(strYFELD)=4 {
+				set $$$INReqLineFromStockLocn(objReqLine)   = $$$INReqFromLocn(strYFELD)
+			}
+			
+			set $$$INReqLineFromStockLocn(objReqLine)       = idFrom
+			set $$$INReqLineStatus(objReqLine)              = 1
+			set $$$INReqLineDueDate(objReqLine)             = $$$INReqDueDate($get(^WWWDATEN(0,+$horolog,YUSER,"INReq","D",1)))
+			
+			if $$IsItemIncluded(idItem) {   //SR17274
+				set strMessage = $$$MakeStatus("IN01259",idItem) ; "Item %1 has already been included; Line not added."
+				$$$Alert(strMessage)
+				continue
+			}
+			
+			if YFORM="INReqKit" {
+				$$$GRIDAddLine(objReqLine,,"INReqKitLine",$$$YES,"",$$$NO,$$$NO,$$$NO,.idRowAdded)
+				do SimulateBlurOnAdd^COMGridEdit31Scan(idRowAdded,objReqLine,"","INReqKitLine",$$$FldINReqLineItem)
+				
+			} else {
+				$$$GRIDAddLine(objReqLine,,"INReqLine",$$$YES,"",$$$NO,$$$NO,$$$NO,.idRowAdded)
+				do SimulateBlurOnAdd^COMGridEdit31Scan(idRowAdded,objReqLine,"","INReqLine",$$$FldINReqLineItem)
+			}
+		}
+	}
+	quit
+	
+	
+AddLines(pidTemplate,strYFELD)
+	;-------------------------------------------------------------------------------
+	; Adds line from a template to the grid
+	; 
+	; CalledBy:
+	; 	Javascript EventCall in UseTemplate^INReqLine, needs to be done this way
+	; 	or else all lines will be deleted after save.
+	; 
+	; History:
+	; 04-Feb-2011	GRF		SR17579: Rename CalculateBaseQuantity
+	; 11-Nov-2010	shobby	SR17613: Code check variable
+	; 11-Nov-2009	PPP		SR17613: Created
+	;-------------------------------------------------------------------------------
+	new fltQty,idItem,idUnit,intTemplateLine,objReqLine,objTemplateLine
+	new idRowAdded,strMessage
+	
+	set intTemplateLine = ""
+	for {
+		set intTemplateLine = $order(^INReqTemplateLine(YM,pidTemplate,intTemplateLine))
+		quit:intTemplateLine=""
+		
+		set objTemplateLine = $get(^INReqTemplateLine(YM,pidTemplate,intTemplateLine,1))
+		
+		set objReqLine = ""
+		set ($$$INReqLineItem(objReqLine),idItem)       = $$$INReqTemplateLineItem(objTemplateLine)
+		set ($$$INReqLineUnit(objReqLine),idUnit)       = $$$INReqTemplateLineUnit(objTemplateLine)
+		set ($$$INReqLineQtyOrdered(objReqLine),fltQty) = $$$INReqTemplateLineRequiredQty(objTemplateLine)
+		set $$$INReqLineQtyRequired(objReqLine)         = $$CalcInventoryQty^INUOMConversion(idItem,idUnit,fltQty) ; SR17579
+		set $$$INReqLineFromStockLocn(objReqLine)       = $$$INReqFromLocn(strYFELD)
+		set $$$INReqLineStatus(objReqLine)              = 1
+		set $$$INReqLineDueDate(objReqLine)             = $$$INReqDueDate($get(^WWWDATEN(YM,+$horolog,YUSER,"INReq","D",1)))
+		
+		if $$IsItemIncluded(idItem) {   //SR17274
+			set strMessage = $$$MakeStatus("IN01259",idItem) ; "Item %1 has already been included; Line not added."
+			$$$Alert(strMessage)
+			continue
+		}
+		$$$GRIDAddLine(objReqLine,,"INReqLine",$$$YES,"",$$$NO,$$$NO,$$$NO,.idRowAdded)
+		do SimulateBlurOnAdd^COMGridEdit31Scan(idRowAdded,objReqLine,"","INReqLine",$$$FldINReqLineItem)
+		
+	}
+	quit 1
+	
+	
+	/*
+ShowRequisitions(pidReq,pidItem,pidLocn,pX)
+	;-------------------------------------------------------------------------------
+	; Displays a popup form with information
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Sep-2010	shobby	SR17491: Deprecated.  Using dynagrid instead.
+	; ??-Sep-2010	shobby	SR17491: Created
+	;-------------------------------------------------------------------------------
+	new idItem,strTooltip,objINReq,idINReq,idStatus,idxItem,objINReqCurrent
+	
+	set strTooltip="<TABLE id=""otherRequisitions"">"
+	set strTooltip=strTooltip_"<THEAD>"
+	set strTooltip=strTooltip_"<TR><TD><B>"_$$$Text("IN01258")_"</B></TD></TR>"  ;Open Requisitions for this item
+	set strTooltip=strTooltip_"</THEAD>"
+	set strTooltip=strTooltip_"<TBODY>"
+	if pidItem'="" {
+		set idxItem=$$$Index(pidItem)
+		set idStatus=""
+		for {
+			set idStatus=$order(^INReqLines(0,4,idStatus))
+			quit:idStatus=""
+			
+			if idStatus<8 {
+				set idINReq=""
+				for {
+					set idINReq=$order(^INReqLines(0,4,idStatus,idxItem,idINReq))
+					quit:idINReq=""
+					continue:pidReq=idINReq
+					
+					set objINReq=$get(^INReq(0,idINReq,1))
+					if pidLocn=$$$INReqToLocn(objINReq) {
+						set strTooltip=strTooltip_"<TR>"
+						set strTooltip=strTooltip_"<TD><FONT SIZE=2>"
+						set strTooltip=strTooltip_"<A HREF='Javascript:CallBack(""GoToForm^COMUtilForm"",""INReq"","""_idINReq_""",1,1,1)'>"
+						set strTooltip=strTooltip_idINReq_" "_$$^WWWFELDNAME("INReqLine","P",2)_" "_$order(^INReqLines(0,4,idStatus,idxItem,idINReq,""))_" ("_$$GetDescription^WWWStatus("INReqLine",idStatus,SPRACHE)_")"
+						set strTooltip=strTooltip_"</FONT></TD>"
+						set strTooltip=strTooltip_"</TR>"
+					}
+				}
+			}
+		}
+	}
+	set strTooltip=strTooltip_"</TBODY>"
+	set strTooltip=strTooltip_"</TABLE>"
+	
+	do Show^WWWPopupMessage(strTooltip)
+	quit 1
+	*/
+	
+	/*	
+OnDisplayRightClickMenu(pidKey="",pobjRecord="",pidForm="")
+	;-------------------------------------------------------------------------------
+	; Determine the additional menu items for the context menu
+	;
+	; Params:
+	; pidKey - Key
+	; pobjRecord - Record
+	; pidForm - Form Id
+	;
+	; Returns: List of additional menu items
+	;
+	; History:
+	; 16-Sep-2010	shobby	SR17491.2: Removed 3rd parameter to HasOpenLines
+	; 10-Sep-2010	shobby	SR17491: Deprecated.  Using dynagrid instead.
+	; 19-Aug-2010	shobby	SR17491 Created
+	;-------------------------------------------------------------------------------
+	new lstNewMenuItems,idINReq,objINReqCurrent
+	
+	set lstNewMenuItems = ""
+	set pidKey = $translate($get(pidKey),"""")
+	
+	quit:(pobjRecord="")||(pidKey="") lstNewMenuItems
+	
+	set idINReq=$$$KEY1(pidKey)
+	set objINReqCurrent=$get(^INReq(0,idINReq,1))
+	if $$HasOpenLines(idINReq,pobjRecord) {
+		set lstNewMenuItems = lstNewMenuItems_$listbuild($listbuild("warning.ico",$$$Text("IN01256") ,"CallBack(""ShowRequisitions^INReqLine"","""_idINReq_""","""_$$$INReqLineItem(pobjRecord)_""","""_$$$INReqToLocn(objINReqCurrent)_""");",,$$$YES)) ;Used in Requisitions...
+	}
+	quit lstNewMenuItems
+	*/
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,768 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMIndex" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMIndex
+ 
+#include COMSYS
+#include WWWConst
+#include COMConst
+	
+	;-------------------------------------------------------------------------------
+	; CompileCode will generate a routine idx.INABC.mac for @netManager Class INABC.
+	; 
+	; If the actual code generated for these idx.* is modified below then the
+	; version number returned by Version() needs to be updated.
+	;-------------------------------------------------------------------------------
+	
+ReIndexAll(Verbose=$$$NO,Log=0,Classes="")
+    ;-------------------------------------------------------------------------------
+    ; ReIndex a Class
+    ; 
+    ; Verbose   = Show output
+    ; Log		= Log Number for logging
+    ; ---Removed---	User		= YBED User
+    ; Classes	= Optional list of classes
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 31-May-2007	HeberB	BR014465: Nonexistent parameters
+    ; 29-Mar-2006	SC		SR13942: No longer need YUSER and YBED parameter for
+    ; 							background processes. Use JobWrapper^COMUtilsJob
+    ; 							instead.
+    ; 14-Dec-2005	GRF		Boolean Macros
+    ; 06-Apr-2005	SCR		SR12040: Created
+    ;-------------------------------------------------------------------------------
+	new Class,Keys
+	
+	set Class=""
+	for {
+		set Class=$order(^WWW001(0,Class))
+		quit:Class=""
+		
+		do GetKeys(Class,.Keys)
+		if $order(Keys(""))'="" {  								; Only do this when there is an index.
+			if Classes'="" {
+				if (";"_Classes_";")'[(";"_Class_";") continue  ; Classes filter
+			}
+			if Verbose {
+				write !,Class
+			}
+			do ReIndex(Class,Verbose,Log)
+		}
+	}
+	quit
+	
+ValidateAll(Verbose=$$$NO,Log=0)
+	;-------------------------------------------------------------------------------
+    ; Validate the Index for all Classes
+    ; 
+    ; Class 	= Class Name
+    ; Verbose   = Show output
+    ; Log		= Log Number for logging
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 25-Oct-2013	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Class,Keys,intCount
+	
+	kill ^CacheTempCOMIndexSave($znspace)
+	set Class=""
+	set intCount=0
+	for {
+		set Class=$order(^WWW001(0,Class))
+		quit:Class=""
+		
+		do GetKeys(Class,.Keys)
+		if $order(Keys(""))'="" {  								; Only do this when there is an index.
+			if Verbose {
+				write "Validaing "_Class,!
+			}
+			set intCount=intCount+$$Validate(Class,Verbose,Log)
+		}
+	}
+	zw ^CacheTempCOMIndexSave($znspace)
+	write:Verbose intCount," Errors",!
+
+	quit
+    
+Validate(Class,Verbose=$$$NO,Log=0)
+	;-------------------------------------------------------------------------------
+    ; Validate the Index for a Class
+    ; 
+    ; Class 	= Class Name
+    ; Verbose   = Show output
+    ; Log		= Log Number for logging
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 25-Oct-2013	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Code,intCount,strGloIndex,strGloSave,intLen
+	
+	kill ^CacheTempCOMIndex($znspace)
+	
+	set intCount		= 0
+	write:Verbose "Saving Current Index for Class "_Class
+	set Code			= "merge ^CacheTempCOMIndex($znspace)=^"_Class_"s"
+	xecute Code
+	write:Verbose " Done"
+	do ReIndex(Class,Verbose ,Log)
+	;w "Job = "_$j for i=1:1:100 h 1
+	write:Verbose "Checking for missing Keys",!
+	set strGloIndex		= "^"_Class_"s"
+	for {
+		set strGloIndex		= $q(@strGloIndex)
+		quit:strGloIndex=""
+		set strGloSave="^CacheTempCOMIndex($znspace,"_$piece(strGloIndex,"(",2,99)
+		if '$data(@strGloSave) {
+			set intCount	= intCount+1
+			write:Verbose "Missing: "_strGloIndex,!
+			set ^CacheTempCOMIndexSave($znspace,Class,"Missing",strGloIndex)=""
+		}
+	}
+	write:Verbose "Checking for extra Keys",!
+	set strGloSave	= "^CacheTempCOMIndex("""_$znspace_""")"
+	set intLen		= $length(strGloSave)+1 ; Speed up checking
+	for {
+		set strGloSave		= $q(@strGloSave)
+		quit:strGloSave=""
+		quit:$qs(strGloSave,1)'=$znspace
+		set strGloIndex		= "^"_Class_"s("_$extract(strGloSave,intLen,9999)
+		if '$data(@strGloIndex) {
+			set intCount	= intCount+1
+			write:Verbose "Extra: "_strGloIndex,!
+			set ^CacheTempCOMIndexSave($znspace,Class,"Extra",strGloIndex)=""
+		}
+	}
+	write:Verbose intCount," Errors",!
+	quit intCount
+	
+
+	
+	
+
+ReIndex(Class="",Verbose=$$$NO,Log=0) ;SR13942 
+    ;-------------------------------------------------------------------------------
+    ; ReIndex a Class
+    ; 
+    ; Class 	= Class Name
+    ; Verbose   = Show output
+    ; Log		= Log Number for logging
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 22-Sep-2006	RPW		Let's no do Shared Classes more than once.
+    ; 29-Mar-2006	SC		SR13942: No longer need YUSER and YBED parameter for
+    ; 							background processes. Use JobWrapper^COMUtilsJob
+    ; 							instead.
+    ; 19-Jun-2005	SCR		SR12696 Check,Clear & Log Index Dirty
+    ; 06-Apr-2005	SCR		SR12040	Added COMIndex & COMIndexHist Data Logging
+    ; 14-Feb-2005	SCR/PO	SR11483 Do reindex for all companies.
+    ; 11-Jan-2005	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Code,Count,Duration,Entry,HistRec,IndexDirty,Rec,StartTime,intCompany
+ 
+	do CheckCode(Class)
+	
+	set intCompany = ""
+	for {
+		set intCompany = $order(^WWW012(0,intCompany))
+		quit:intCompany=""
+		
+		quit:($$$WWW001SharedFile($get(^WWW001(0,Class,1))))&&(intCompany>0)
+		
+		set StartTime = $horolog
+		set Duration  = $zhorolog
+		set Count     = 0
+		
+		set Rec = $get(^COMIndex(intCompany,Class,1))
+		set $$$COMIndexLastIndexStartTime(Rec) = StartTime
+		set $$$COMIndexStatus(Rec)             = "Index Started"
+		set IndexDirty = $$$COMIndexIndexDirty(Rec)	; get the "Index Dirty" flag
+		
+		set HistRec=""
+		set $$$COMIndexHistStartTime(HistRec) = StartTime
+		set $$$COMIndexHistUser1(HistRec)     = $get(YBED)
+		set $$$COMIndexHistStatus(HistRec)    = "Index Started"
+		set $$$COMIndexHistType(HistRec)      = "Index"
+		set Entry=$order(^COMIndexHist(intCompany,Class,""),-1)+1
+ 
+		set ^COMIndexHist(intCompany,Class,Entry,1) = HistRec
+		set ^COMIndex(intCompany,Class,1)           = Rec
+ 
+		set Code="Do ReIndex^idx."_Class_"(Verbose,Log,intCompany,.Count)"
+		xecute Code
+		
+		set Rec=$get(^COMIndex(intCompany,Class,1))
+ 
+		set Duration=+$justify($zh-Duration,0,2)
+		set $$$COMIndexLastIndexEndTime(Rec)  = $horolog
+		set $$$COMIndexDurationInSeconds(Rec) = Duration
+		set $$$COMIndexNumberofRecords(Rec)   = Count
+		set $$$COMIndexStatus(Rec)            = "Complete"
+		if $$$COMIndexIndexDirty(Rec)=IndexDirty {	; Check for no change in "Index Dirty" flag
+			set $$$COMIndexIndexDirty(Rec)    = ""	; Clear "Index Dirty"
+			set $$$COMIndexHistType(HistRec)  = "Index,Clean"
+		}
+		set ^COMIndex(intCompany,Class,1)     = Rec
+		
+		set $$$COMIndexHistEndTime(HistRec)           = $horolog
+		set $$$COMIndexHistDurationInSeconds(HistRec) = Duration
+		set $$$COMIndexHistNumberofRecords(HistRec)   = Count
+		set $$$COMIndexHistUser1(HistRec)             = $get(YBED)
+		set $$$COMIndexHistStatus(HistRec)            = "Complete"
+		set ^COMIndexHist(intCompany,Class,Entry,1)   = HistRec
+		
+		If Verbose {
+			write " Complete ",Count," Records in ",Duration," Seconds",!
+		}
+	}
+	quit
+	
+	
+SetIndexDirty(Class="")
+    ;-------------------------------------------------------------------------------
+    ; Set the Dirty Flag / TimeStamp on a Class
+    ; This will be checked during the check class method & reset during a re-index.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 19-Jun-2005	SCR		SR12696: Created
+    ;-------------------------------------------------------------------------------
+    new Rec,Entry,HistRec,intCompany
+    
+    set intCompany = +$get(YM) ; Assume YM is set up!
+    
+	if Class'="" {
+		set Rec = $get(^COMIndex(intCompany,Class,1))
+		set $$$COMIndexIndexDirty(Rec)    = $horolog
+		set ^COMIndex(intCompany,Class,1) = Rec
+ 
+		set HistRec = ""
+		set $$$COMIndexHistStartTime(HistRec) = $horolog
+		set $$$COMIndexHistUser1(HistRec)     = $get(YBED)
+		set $$$COMIndexHistStatus(HistRec)    = "Complete"
+		set $$$COMIndexHistType(HistRec)      = "Set Dirty Flag"
+		set $$$COMIndexHistEndTime(HistRec)   = $horolog
+		set Entry = $order(^COMIndexHist(intCompany,Class,""),-1)+1
+		set ^COMIndexHist(intCompany,Class,Entry,1) = HistRec
+ 
+	}
+	quit
+	
+	
+GetData(Class="",Key="",Data="",Time=0)
+    ;-------------------------------------------------------------------------------
+    ; Get Data for a Class
+    ; 
+    ; Class 	= Class Name
+    ; Key		= Class Key
+    ; Data 		= Data to Pass Back
+    ; Time		= Time Flag
+    ;
+    ; Returns: Status  0 = Ok
+    ;
+    ; History:
+    ; 24-Jan-2005	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Code,Status
+	
+	do CheckCode(Class)
+	set Code = "set Status=$$Update^idx."_Class_"(Key,.Data,0,Time)"  ; Sets Status
+	xecute Code
+	quit $get(Status)
+	
+	
+SetData(Class="",Key="",Data="",Time=0)
+    ;-------------------------------------------------------------------------------
+    ; Set Data for a Class
+    ; 
+    ; Class 	= Class Name
+    ; Key		= Class Key
+    ; Data 		= Data 
+    ; Time		= Time Flag
+    ;
+    ; Returns: Status  0 = Ok
+    ;
+    ; History:
+    ; 24-Jan-2005	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Code,Status
+	
+	do CheckCode(Class)
+	set Code = "set Status=$$Update^idx."_Class_"(Key,Data,1,Time)" ; Sets Status
+	xecute Code
+	quit $get(Status)
+	
+	
+GetLoc(Class="",Key="",Data="",Time=0)
+    ;-------------------------------------------------------------------------------
+    ; Get Location for Class and Data
+    ; 
+    ; Class 	= Class Name
+    ; Key		= Class Key
+    ; Data 		= Location (pass back) 
+    ; Time		= Time Flag
+    ;
+    ; Returns: Status  0 = Ok
+    ;
+    ; History:
+    ; 24-Jan-2005	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Code,Status
+	
+	do CheckCode(Class)
+	set Code = "set Status=$$Update^idx."_Class_"(Key,Data,2,Time)" ; Sets Status
+	xecute Code
+	quit $get(Status)
+
+RemoveKeys(Class,Key)
+    ;-------------------------------------------------------------------------------
+    ; Removes Keys Class and Id
+    ; 
+    ; Class 	= Class Name
+    ; Key		= Class Key
+    ;
+    ; Returns: Status  0 = Ok
+    ;
+    ; History:
+	; 08-Dec-2013	SCR		SESDF-655: Created
+    ;-------------------------------------------------------------------------------
+	new Code,Status,blnIndexs
+	
+	do CheckCode(Class,.blnIndexs)
+	if blnIndexs {
+		set Code = "do Index^idx."_Class_"(Key,1)"
+		xecute Code
+	}
+	quit $$$OK
+
+SetKeys(Class,Key)
+    ;-------------------------------------------------------------------------------
+    ; Set Keys Class and Id
+    ; 
+    ; Class 	= Class Name
+    ; Key		= Class Key
+    ;
+    ; Returns: Status  0 = Ok
+    ;
+    ; History:
+	; 08-Dec-2013	SCR		SESDF-655: Created
+    ;-------------------------------------------------------------------------------
+	new Code,Status,blnIndexs
+	
+	do CheckCode(Class,.blnIndexs)
+	if blnIndexs {
+		set Code = "do Index^idx."_Class_"(Key)"
+		xecute Code
+	}
+	quit $$$OK
+	
+	
+CheckCode(Class="",&pblnIndex)
+    ;-------------------------------------------------------------------------------
+    ; Check Code
+    ;
+    ; Returns:
+    ;
+    ; History:
+ 	; 08-Dec-2013	SCR		SESDF-655: Pass Back Indexes Flag
+  	; 06-Apr-2005	SCR		SR12040 Pass in Class to Version
+    ; 11-Jan-2005	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Code,Version
+    
+    set $ztrap="CheckCodeError"
+    
+    set Version = ""
+   	set Code    = "set Version=$$Version^idx."_Class_"(.pblnIndex)"
+	xecute Code
+	if Version'=$$Version(Class) {
+		do CompileCode(Class)
+	}
+	quit
+	
+CheckCodeError ; Internal Tag for Errors
+	set $zt=""
+	do CompileCode(Class)
+	set pblnIndex	= $$$YES
+	quit
+	
+	
+Version(Class="") 
+    ;-------------------------------------------------------------------------------
+    ; Get Version Number
+    ; 
+    ; Update this when ever the Compiled code changes
+    ;
+    ; Returns:
+    ;
+    ; History:
+	; 08-Dec-2013	SCR		SESDF-655: Add Cache Index
+    ; 11-May-2011	shobby	SR17754: Force rebuild of all indices.
+    ; 31-May-2007	HeberB	BR014465:To recreate the code
+    ; 06-Apr-2005	SCR		SR12040 Include Indexes in version number
+    ; 11-Jan-2005	SCR		Created
+    ;-------------------------------------------------------------------------------
+    new Version,Index,Indexes,Keys,objClass,idCacheIndex
+    
+    if Class="" set Class = " "
+ 
+    ;SR17754 2.050
+    set Version = "2.056"   ; <<<<<<<<<<<----------------  Update this version number to force a recreate of the code
+    
+	do GetKeys(Class,.Keys) 	; Get keys for Class
+	set objClass	= $get(^WWW001(0,Class,1))
+	set idCacheIndex= $$$WWW001CacheIndex(objClass)
+	set Indexes		= ""
+	set Index		= ""
+	for {
+		set Index = $order(Keys(Index))
+		quit:Index=""
+		
+		set Indexes = Indexes_","_Index_"="_$get(Keys(Index)) ; Build Indexes
+	}  
+	set Version = "Version: "_Version_" Indexes: "_$extract(Indexes,2,9999) ; Add Version Number & Indexes
+	set:idCacheIndex Version	= Version_" CacheIndex"
+	quit Version
+	
+	
+GetKeys(Class="",Keys)
+    ;-------------------------------------------------------------------------------
+    ; Get Keys for a Class ( a wrapper for WWWSORTKEY )
+    ; 			Class		= @NM Class
+    ; ByRef :	Keys		= Pass back Keys
+    ;
+    ; Returns: Nothing
+    ;
+    ; History:
+    ; 17-Dec-2014	shobby	HEVA-1664: Scope the YA variable so it isn't lost in WWWSORTKEY
+    ; 20-Sep-2011	SCR		SR17885 Force No Index option
+    ; 06-Apr-2005	SCR		Created SR12040
+    ;-------------------------------------------------------------------------------
+	new YSKEY,YA ;HEVA-1664
+	
+	kill Keys
+	set YSKEY = ""
+	;do ^WWWSORTKEY(Class) 	; Get keys for Class
+	do ^WWWSORTKEY(Class,$$$YES) 	; SR17885 Get keys for Class
+	merge Keys = YSKEY
+	quit
+	
+	
+CompileCode(Class)
+    ;-------------------------------------------------------------------------------
+    ; Compile Index Code
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 11-May-2011	shobby	SR17754: Redirected translation through $$Index as the
+    ;							direct translation would produce incorrect results.
+    ; 31-May-2007	HeberB	BR014465:Add new characters
+    ; 20-Apr-2005	SCR		SR12040 Remove Space from raw data for Index
+    ; 18-Apr-2005	SCR		SR12040	Added Skip Code to ReIndex
+    ; 06-Apr-2005	SCR		SR12040 Put Quotes on version, Update History & Change
+    ;							WWWSORTKEY to GetKeys
+    ; 24-Mar-2005	Paul K	Newed YSKEY
+    ; 15-Mar-2005	Paul K	Added macro usage
+    ; 20-Feb-2005	SCR		SR11483: Check for bad Index Structure by Defaulting
+    ; 							missing indices to "F0" 
+    ; 14-Feb-2005	SCR/PO	SR11483: Generate procedure ReIndex with YM parameter.
+    ; 24-Jan-2005	SCR		Added Global Access ('Update')
+    ; 11-Jan-2005	SCR		Added Remove Index option
+    ; 11-Jan-2005	SCR		Added Logging
+    ; 01-Dec-2004	SCR		Sortend Bug Fix, Null Index fix (1.1,,1.2), Multi part
+    ; 03-Oct-2004	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new ClassRec,Coy,Data,DataList,DataLoc,DataSet,FirstKey
+	new Indent,Index,IndexCode,IndexKey,IndexLoc,IndexSet
+	new Key,Keys,LastData,ListLoc,Loc,LoopEndCode,LoopStartCode
+	new NewList,Num,objRtn
+	new ReNewList,Rtn,Status,Sub,SubList,Subs,SubSet,Type,Var
+	new blnIndex,blnCacheIndex
+ 
+	do GetKeys(Class,.Keys)	; Setup YSKEY
+	set blnIndex = $$$NO
+	set Subs     = $order(^WWW002(0,Class,""),-1)
+	;SR17754 set NewList  = "Data,Rec,lc,uc,SubKey,Key1"
+	set NewList  = "Data,Rec,SubKey,Key1"				;SR17754 
+	set ClassRec = $get(^WWW001(0,Class,1))
+	set Coy      = "YM"
+	set blnCacheIndex	= $$$WWW001CacheIndex(ClassRec)
+	if $$$WWW001SharedFile(ClassRec)=1 set Coy = 0
+	set SubList  = ""
+	for Sub=1:1:Subs {
+		set Var     = "Sub"_Sub
+		set NewList = NewList_","_Var
+		set $piece(SubList,",",Sub) = Var
+		set SubSet(Sub) = " set "_Var_"=$piece(Key,"","","_Sub_") if "_Var_"="""" quit"
+	}
+	set IndexLoc = "^"_Class_"s("_Coy
+	set DataLoc  = "^"_Class_"("_Coy_","_SubList_",1)"
+	set IndexSet = 0
+	set Index    = "" 
+	for {
+		set Index = $order(Keys(Index))
+		quit:Index=""
+		
+		set blnIndex = $$$YES
+		set Keys     = $get(Keys(Index))
+		set LastData = "F0"					; Default Data location for missing Keys SR11483
+		set FirstKey = $piece(Keys,",",1)
+		if FirstKey="" set FirstKey = LastData
+		
+		set IndexCode = " for SubKey=1:1:$length("_FirstKey_","";"") {"
+		set IndexSet  = IndexSet+1
+		set IndexSet(IndexSet) = IndexCode
+		
+		set IndexCode = "  set Key1=$piece("_FirstKey_","";"",SubKey)"
+		set IndexSet  = IndexSet+1
+		set IndexSet(IndexSet) = IndexCode
+		
+		set IndexCode = "  set:Key1="""" Key1="" """
+		set IndexSet  = IndexSet+1
+		set IndexSet(IndexSet) = IndexCode
+		
+		set IndexKey = IndexLoc_","_Index
+		for Key=1:1:$length(Keys,",") {
+			set Data = $piece(Keys,",",Key)
+			if Data="" set Data = LastData       ; This is wrong but is the Intraprend way!
+			set DataList(Data) = ""
+			if Key=1 set Data = "Key1"
+			set IndexKey = IndexKey_","_Data
+			set LastData = Data
+		}
+		set IndexKey = IndexKey_","_SubList_")"		
+		set IndexSet = IndexSet+1
+		set IndexSet(IndexSet) = "  set:'Remove "_IndexKey_"="""""
+		
+		set IndexSet = IndexSet+1
+		set IndexSet(IndexSet) = "  kill:Remove "_IndexKey
+		
+		set IndexSet = IndexSet+1
+		set IndexSet(IndexSet)=" }"
+	}
+	set Data = ""
+	for {
+		set Data = $order(DataList(Data))
+		quit:Data="" 
+		
+		set Type    =  $extract(Data)
+		set Num     = +$extract(Data,2,99)
+		set NewList = NewList_","_Data
+		set Loc     = "$piece(Rec,Y,"_Num_")"
+		if Type="K" {
+			set Loc = "$get(Sub"_Num_")"
+		}
+		if blnCacheIndex {
+			set DataSet(Data) = " set "_Data_"=$extract($$CacheIndex^COMUtilIndex("_Loc_"),1,150)" ;SR17754
+		} else {
+			set DataSet(Data) = " set "_Data_"=$extract($$Index^COMUtilIndex("_Loc_"),1,150)" ;SR17754
+		}
+	}
+	; ReIndex setup
+	set ReNewList="Key,Ret"
+	set ListLoc="^"_Class_"("_Coy
+ 
+	for Sub=1:1:Subs {
+		set Indent    = $justify("",Sub)
+		set Var       = "Sub"_Sub
+		set ReNewList = ReNewList_","_Var
+		set ListLoc   = ListLoc_","_Var
+		
+		set LoopStartCode($increment(LoopStartCode)) = Indent_"set "_Var_"="""""
+		set LoopStartCode($increment(LoopStartCode)) = Indent_"for {"
+		set LoopStartCode($increment(LoopStartCode)) = Indent_" set "_Var_"=$order("_ListLoc_"))"
+		set LoopStartCode($increment(LoopStartCode)) = Indent_" quit:"_Var_"="""""
+		set LoopStartCode($increment(LoopStartCode)) = Indent_" quit:'Status"
+		set LoopStartCode($increment(LoopStartCode)) = Indent_" set $piece(Key,"","","_Sub_")="_Var
+		if Sub=Subs {
+			set LoopStartCode($increment(LoopStartCode)) = Indent_" do Index(Key)"
+			set LoopStartCode($increment(LoopStartCode)) = Indent_" set Counter=Counter+1"
+			set LoopStartCode($increment(LoopStartCode)) = Indent_" set Sort=Sort+1"
+			set LoopStartCode($increment(LoopStartCode)) = Indent_" if Sort>1000000 set Sort=0 set Ret=$sortEnd(^"_Class_"s) set Ret=$sortBegin(^"_Class_"s)"
+			set LoopStartCode($increment(LoopStartCode)) = Indent_" if LastTime'=($zh\10) {"
+			set LoopStartCode($increment(LoopStartCode)) = Indent_"  set LastTime=($zh\10)"
+			set LoopStartCode($increment(LoopStartCode)) = Indent_"  if Verbose write !,$fn(Counter,"",""),"" "",$zdt($h,3)"
+			set LoopStartCode($increment(LoopStartCode)) = Indent_"  if Log'="""" do AddMessage^COMLog(Log,""ReIndexing Class "_Class_"   ""_$fn(Counter,"","")_"" Records Indexed"",.LogEntry)"
+			set LoopStartCode($increment(LoopStartCode)) = Indent_"  if $get(^COMIndexSkip(0,Class)) set Status=""0~Skipped"""
+			set LoopStartCode($increment(LoopStartCode)) = Indent_" }"
+		}
+		set LoopEndCode($increment(LoopEndCode)) = Indent_"}"
+	}
+	
+	set Rtn    = "idx."_Class
+	set objRtn = ##class(%Routine).%New(Rtn_".mac")
+	set Status = objRtn.Clear()
+ 
+	do objRtn.WriteLine(Class_"  ; Class Index compiled by routine 'COMIndex' Method CompileCode "_$zdt($h,3))
+	do objRtn.WriteLine("Index(Key,Remove=0)")
+	do objRtn.WriteLine(" new "_NewList)
+	if blnIndex {	
+		set Sub = ""
+		for {
+			set Sub = $order(SubSet(Sub))
+			quit:Sub=""
+			
+			do objRtn.WriteLine(SubSet(Sub))
+		}
+		do objRtn.WriteLine(" set Rec=$get("_DataLoc_")")
+		
+		set Data = ""
+		for {
+			set Data = $order(DataSet(Data))
+			quit:Data=""
+			
+			do objRtn.WriteLine(DataSet(Data))
+		}
+		
+		set Index = ""
+		for {
+			set Index = $order(IndexSet(Index))
+			quit:Index=""
+			
+			do objRtn.WriteLine(IndexSet(Index))
+		}
+	}
+	do objRtn.WriteLine(" quit")
+	
+	; Update Code ;********************************************************************
+	do objRtn.WriteLine("Update(Key,Data="""",GetSet=0,Time=0)")
+	do objRtn.WriteLine(" New Status,DataLoc,"_SubList)
+	do objRtn.WriteLine(" Set Status=0 ; Ok")
+	do objRtn.WriteLine(" Set DataLoc=""^"_Class_"""_$select(Time=1:""t"",1:"""")_""(""""""")
+	do objRtn.WriteLine(" Set DataLoc=DataLoc_"_Coy_"_"""""",""")
+	for Sub=1:1:Subs {
+		do objRtn.WriteLine(" Set "_Var_"=$piece(Key,"","","_Sub_") set:"_Var_"="""" Status=2 Set DataLoc=DataLoc_""""""""_"_Var_"_"""""",""")
+	}
+	do objRtn.WriteLine(" Set DataLoc=DataLoc_""1)""")
+	do objRtn.WriteLine(" if Status'=0    { Set Data=""Error""} ; Error")
+	do objRtn.WriteLine(" ElseIf GetSet=0 { Set Data=$get(@DataLoc) } ; Get Data")
+	do objRtn.WriteLine(" Elseif GetSet=1 { Set @DataLoc=Data      } ; Set Data")
+	do objRtn.WriteLine(" Elseif GetSet=2 { Set Data=DataLoc       } ; Get DataLoc")
+	do objRtn.WriteLine(" Else            { Set Status=3           } ; Poor GetSet Code")
+	do objRtn.WriteLine(" Quit Status")
+	
+	; Reindex Code
+	do objRtn.WriteLine("ReIndex(Verbose=0,Log=0,YM=0,Counter)") ; SR11483
+	do objRtn.WriteLine(" new LastTime,LogEntry,Sort,Status,"_ReNewList)
+	do objRtn.WriteLine(" kill ^"_Class_"s("_Coy_")")
+	do objRtn.WriteLine(" set Status=1")	
+	if blnIndex {
+		do objRtn.WriteLine(" set Ret=$sortbegin(^"_Class_"s)")	
+		do objRtn.WriteLine(" set Counter=0")	
+		do objRtn.WriteLine(" set Sort=0")	
+		do objRtn.WriteLine(" set LastTime=$zh")	
+		
+		set Sub = ""
+		for {
+			set Sub = $order(LoopStartCode(Sub))
+			quit:Sub=""
+			
+			do objRtn.WriteLine(LoopStartCode(Sub))
+		}
+		
+		set Sub = ""
+		for {
+			set Sub = $order(LoopEndCode(Sub))
+			quit:Sub=""
+			
+			do objRtn.WriteLine(LoopEndCode(Sub))
+		}
+		do objRtn.WriteLine(" set Ret=$sortend(^"_Class_"s)")	
+		do objRtn.WriteLine(" if Log'="""",Counter do AddMessage^COMLog(Log,""ReIndexing Class "_Class_" Complete  ""_$fn(Counter,"","")_"" Records Indexed, Company ""_YM,.LogEntry)") ; SR11483
+	}
+	do objRtn.WriteLine(" quit Status")	
+	do objRtn.WriteLine("Version(&pblnIndex)")
+	do objRtn.WriteLine(" set pblnIndex="_blnIndex)	
+	do objRtn.WriteLine(" Quit """_$$Version(Class)_"""")
+	do objRtn.Compile("-d")
+	do objRtn.%Close()
+	quit
+
+
+GetIndex(class, &arrIndex)
+	kill arrIndex
+	set lowerCase = "áàãâéèêíìîóòõôúùûçÜÄÖüäöß][\}{|abcdefghijklmnopqrstuvwxyz,()@#$%^&*_=+<>?/"_$CHAR(128)_""""_" "
+	set upperCase = "ÁÀÃÂÉÈÊÍÌÎÓÒÕÔÚÙÛÇUAOUAOSUAOUAOABCDEFGHIJKLMNOPQRSTUVWXYZ                   "
+	set classeUpper = $translate(class, lowerCase, upperCase)
+	
+	set indexedKey = ""
+	set indexedKey = $order(^WWW002s(0,4,classeUpper,indexedKey))
+	while (indexedKey '= "") {
+		if (indexedKey '= " ") {
+			set field = ""
+			set field = $order(^WWW002s(0,4,classeUpper,indexedKey,class,field))
+			while (field '= "") {
+				set indexKey = $$$WWW002IndexKey($get(^WWW002(0,class,field,1)))
+				for i=1:1:$length(indexKey,",") {
+					set index = $piece(indexKey,",",i)
+					set pieceIndex(1) = $piece(index,".",1)
+					set pieceIndex(2) = $piece(index,".",2)
+					if (+pieceIndex(1) = 0) quit
+					if (+pieceIndex(2) = 0) set pieceIndex(2) = 1
+					set $piece(arrIndex(pieceIndex(1)),",",pieceIndex(2))="K"_field
+				}				
+				set field = $order(^WWW002s(0,4,classeUpper,indexedKey,class,field))
+			}
+		}
+		set indexedKey = $order(^WWW002s(0,4,classeUpper,indexedKey))
+	}
+
+	set indexedKey = ""
+	set indexedKey = $order(^WWW003s(0,4,classeUpper,indexedKey))
+	while (indexedKey '= "") {
+		if (indexedKey '= " ") {
+			set field = ""
+			set field = $order(^WWW003s(0,4,classeUpper,indexedKey,class,field))
+			while (field '= "") {
+				set indexKey = $$$WWW003IndexKey($get(^WWW003(0,class,field,1)))
+				for i=1:1:$length(indexKey,",") {
+					set index = $piece(indexKey,",",i)
+					set pieceIndex(1) = $piece(index,".",1)
+					set pieceIndex(2) = $piece(index,".",2)
+					if (+pieceIndex(1) = 0) quit
+					if (+pieceIndex(2) = 0) set pieceIndex(2) = 1
+					set $piece(arrIndex(pieceIndex(1)),",",pieceIndex(2))="F"_field
+				}				
+				set field = $order(^WWW003s(0,4,classeUpper,indexedKey,class,field))
+			}
+		}
+		set indexedKey = $order(^WWW003s(0,4,classeUpper,indexedKey))
+	}
+	
+	quit
+
+DeleteIndex(fromGlobalNode, globalNodeData, &arrIndex)
+	set class = $extract($qsubscript(fromGlobalNode,0),2,$length($qsubscript(fromGlobalNode,0)))
+	set index = ""
+	set index = $order(arrIndex(index))
+	while (index '= "") {
+		set keyIndex = YM_","_index
+		for i=1:1:$length(arrIndex(index),",") {
+			set fieldIndex = $piece(arrIndex(index),",",i)
+			if ($extract(fieldIndex) = "K") {
+				set keyIndex = keyIndex_","""_$$Index^COMUtilIndex($qsubscript(fromGlobalNode,1 + $extract(fieldIndex,2,$length(fieldIndex))),class)_""""
+			}
+			elseif ($extract(fieldIndex) = "F") {
+				set keyIndex = keyIndex_","""_$$Index^COMUtilIndex($piece(globalNodeData,Y,$extract(fieldIndex,2,$length(fieldIndex))),class)_""""
+			}
+		}
+		for i=2:1:$qlength(fromGlobalNode)-1 {
+			set keyIndex = keyIndex_","""_$qsubscript(fromGlobalNode,i)_""""
+		}
+		set fromIndex = "^"_class_"s("_keyIndex_")"
+		kill @fromIndex
+		set index = $order(arrIndex(index))
+	}
+	
+	quit
+]]></Routine>
+</Export>

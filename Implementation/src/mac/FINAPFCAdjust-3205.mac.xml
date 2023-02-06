@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPFCAdjust" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLAPAdjust  ;  Foreign Currency Adjustment
+ 
+ 	#Include FINConst
+	#Include FIN
+ 
+OnBeforeButtonLine() 
+    ;-------------------------------------------------------------------------------
+    ; Restore the remembered selection screen values
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 25-Oct-2005	shobby		SR13278:Used VORG for variables to satisfy code check.
+    ; 24-Aug-2005	shobby		SR13278 Created
+    ;-------------------------------------------------------------------------------
+	
+	;FIXME: Is there a better way to handle these variables??? <Steve S>
+	
+	set VORG("Date")=$get(^CacheTempAPADJ(YM,YUSER,"Date"),$h)
+	set VORG("Post")=$get(^CacheTempAPADJ(YM,YUSER,"Post"))
+	set VORG("Time")=$get(^CacheTempAPADJ(YM,YUSER,"Time"),$h)
+	quit
+	 
+AfterSave(Date="",Post=0,Time="")
+    ;-------------------------------------------------------------------------------
+    ; After Save
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 25-Oct-2005	shobby		SR13278:Used VORG for variables to satisfy code check.
+    ; 24-Aug-2005	shobby		SR13278:Remember the input values.
+    ; 23-Aug-2005	shobby		SR13278:Include Time parameter.
+	; 05-May-2005	shobby		SR11875.  Managed transactions to handle rollback after cache errors.
+    ; 27-Jan-2005	RobertW		Fixed TCOMMIT and TROLLBACK (SR11273)
+    ; 03-Jun-2004	SCR			Created
+    ;-------------------------------------------------------------------------------
+	new strStatus
+	set strStatus=$$Transaction^COMTransaction("AfterSaveTxn^FINAPFCAdjust("""_Date_""","""_Post_""","""_Time_""")",1)
+	
+	set ^CacheTempAPADJ(YM,YUSER,"Date")=$get(VORG("Date"))
+	set ^CacheTempAPADJ(YM,YUSER,"Post")=$get(VORG("Post"))
+	set ^CacheTempAPADJ(YM,YUSER,"Time")=$get(VORG("Time"))
+	if $$$ISOK(strStatus) {
+		do ^WWWFORM
+	}
+	quit
+	
+ 
+AfterSaveTxn(Date="",Post=0,Time="")
+    ;-------------------------------------------------------------------------------
+    ; Transaction protected 'AfterSave' code.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 23-Aug-2005	shobby		SR13278:Include Time parameter.
+    ; 04-May-2005	shobby		Created SR11875
+    ;-------------------------------------------------------------------------------
+    ;
+	quit $$Adjust(Date,Post,1,Time)
+	
+	
+AfterDataFields(Date="",Time="")
+    ;-------------------------------------------------------------------------------
+    ; After Data Fields
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 23-Aug-2005	shobby		SR13278:Include Time parameter.
+    ; 07-Jun-2004	SCR			Created
+    ;-------------------------------------------------------------------------------
+	Do Adjust(Date,,,Time)
+	quit
+	
+Adjust(Date="",Post=$$$NO,Silent=0,Time="")
+    ;-------------------------------------------------------------------------------
+    ; Adjust FC Account
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 28-Oct-2005	JW			SR13074: Translate Exchange Rate
+    ; 23-Aug-2005	shobby		SR13278:Include Time parameter.
+	; 19-Apr-2005	SCR			SR11476 Pass YLOCATION to Allocate Block
+    ; 08-Apr-2005	RobertW		SR11836: Change FCMake to FCJoin
+    ; 07-Jun-2004	SCR			Added Silent
+    ; 04-Jun-2004	SCR			Added Post Option
+    ; 03-Jun-2004	SCR			Created
+    ;-------------------------------------------------------------------------------
+	new Status,lstHeader,Supplier,FCCode,Invoice,VarianceAccount,Variance
+	new OldBalance,OldBase,OldRate,NewRate,NewBalance,NewBase,Ref,Foreign
+	new History,Batch,Block,Line,SupplierRec,Control,ControlRec,Amount
+	
+	set Status=$$$OK
+	
+	kill ^CacheTemp("FINCFADJ",$job)
+	set lstHeader=$listBuild(
+				$$$StrFINGLAccountNumber,
+				$$$Text("Fin00153",0),
+				$$$Text("Fin00039",0),
+				$$$Text("Fin00331",0),
+				$$$Text("Fin00333",0),
+				$$$Text("Fin00330",0))
+	if 'Silent do Start^COMTable(lstHeader)
+	set Batch=""
+	set Supplier=""
+	for {
+		set Supplier=$order(^FINAPSupplier(YM,Supplier))
+		quit:Supplier=""
+		set FCCode=$$GetFCCode^FINAPSupplier(Supplier)
+		if FCCode'="" {
+			set Invoice=""
+			set SupplierRec=$get(^FINAPSupplier(YM,Supplier,1))
+			set Control=$$$FINAPSupplierControlAccount(SupplierRec)
+			if Control="" set Control=" "
+			set ControlRec=$get(^FINAPAccount(YM,Control,1))
+			set VarianceAccount=$$$FINAPAccountForeignCurrencyFluctuatio(ControlRec)
+			for {
+				set Invoice=$order(^FINAPInvoice(YM,Supplier,Invoice))
+				quit:Invoice=""
+				quit:Status'=$$$OK
+				set OldBalance=$$GetInvoiceBalance^FINAPSupplier(Supplier,Invoice,Date)
+				if '$$$FCZero(OldBalance) {
+					set OldBase=$$$FCBase(OldBalance)
+					set OldRate=$$$FCRate(OldBalance)
+					set NewRate=$$GetRate^FINGLFC(FCCode,Date,Time)
+					set NewBalance=$$$FCUpdate(OldBalance,NewRate,1)
+					set NewBase=$$$FCBase(NewBalance)
+					set Variance=NewBase-OldBase
+					set Foreign=$$$FCAmount(NewBalance)
+					set Ref="Old: "_OldBase_" @ "_OldRate_"  New: "_NewBase_" @ "_NewRate
+					set ^CacheTemp("FINCFADJ",$job,Supplier)=Variance_Y_VarianceAccount_Y_Ref
+					if 'Silent {
+						do NewLine^COMTable()
+						do InsertCell^COMTable(Supplier_" "_$$$FINAPSupplierSupplierName(SupplierRec),"FINAPSupplier",Supplier)
+						do InsertCell^COMTable(Invoice,"FINAPSupplier",Supplier)
+						do InsertCell^COMTable(FCCode_" "_$$FormatCurrency^COMTable(Foreign),"FINAPSupplier",Supplier)
+						do InsertCell^COMTable($$FormatCurrency^COMTable(OldBase)_" @ "_$$^WWWTR(0,18,OldRate),,"FINAPSupplier",Supplier)	//SR13074
+						do InsertCell^COMTable($$FormatCurrency^COMTable(NewBase)_" @ "_$$^WWWTR(0,18,NewRate),,"FINAPSupplier",Supplier)
+						do InsertCurrencyCell^COMTable(Variance,,"FINAPSupplier",Supplier)
+						do EndLine^COMTable()
+					}
+					if (Variance)&&(Post)&&(Status=$$$OK) {  ; Start of Posting Code
+						
+						if Batch="" {  ; If first transaction create header
+							set History=$order(^FINAPFCAdjHist(YM,""),-1)+1
+							set ^FINAPFCAdjHist(YM,History,1)=""
+							set Status=$$Allocate^FININTBatch(.Batch,.Block,"APFC",$get(YLOCATION),Date)
+							set ^FINAPFCAdjHist(YM,History,1)=$horolog_Y_Batch
+						}
+						set Amount=$$$FCJoin(Variance,0,FCCode,NewRate)
+						do SubBlockNumber^FININTBatch(.Block) ; Increment Sub Block Number
+						if Status=$$$OK set Status=$$AddLine^FININTBatch(Batch,Block,Control,$$$FCSign(Amount),"APFC",Supplier_","_Invoice,Ref,Supplier)
+						if Status=$$$OK set Status=$$AddLine^FININTBatch(Batch,Block,VarianceAccount,Amount,"APFCGL",Supplier,Supplier_","_Invoice,"")
+					}
+				}
+			}
+		}
+	}
+	if (Batch'="")&&$$$ISOK(Status) {
+		set Status=$$PostBlock^FININTBatch(Batch,Block)
+	}
+	if 'Silent do Stop^COMTable()
+	
+	quit Status
+	
+ 
+]]></Routine>
+</Export>

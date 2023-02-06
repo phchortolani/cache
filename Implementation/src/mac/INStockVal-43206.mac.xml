@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INStockVal" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INStockVal
+#include INConst
+#include COMSYS
+	
+#define DeleteStockLocation		$$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+	
+#define enumAverageCost		9
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^INStockVal("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Update(pidItem,pidLocn,pidStore,pblnAdd,pfltQty,pcurValue) 
+	;-------------------------------------------------------------------------------
+	; Update value of SOH
+	; 
+	; Called By:	INERECH1              : StockVal           (possibly deprecated)
+	; 				INFINInterface        : Receipt, Issue, Movement
+	; 				INARTHIST             : Receipt, Issue, Movement    [DEPRECATED]
+	; 				INSHIPINFOCOSTSAllocn : StockValSC                  [DEPRECATED]
+	; 
+	; Params:
+	;	pblnAdd		0=ISS, 1=REC
+	;	pfltQty		change quantity, always +ve
+	;	pcurValue	change value, may be -ve if pfltQty is zero.
+	; 
+	;   
+	; Returns:
+	;
+	; Updates :		^INStockVal			(Create, Modify, Kill)
+	;
+	; History:
+	; 13-Jun-2006	GRF		Additional doco.
+	; 08-May-2006	GRF		SR14622: Don't retain empty entries - if residual value.
+	; 						exists it will be cleared in next auto-update. JW - locking
+	; 06-Apr-2006	GRF		SR14529: Don't process Non-stock items
+	; 04-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	new objItem,objStockVal
+	
+	$$$LogR("Update",pidItem_","_pidLocn_"||"_pidStore_","_pblnAdd_","_pfltQty_","_pcurValue)
+	
+	quit:pidItem=""
+	set objItem = $get(^INART(0,pidItem,1))
+ 	quit:$$$INARTItemWithoutInventoryMaint(objItem)         ; don't maintain for non-stock items
+ 	
+ 	;---------------------------------------
+ 	
+	if pidStore '= $$$DeleteStockLocation {		// Do not update the delete storage
+		
+		;+++++++++++++++++++++++++++++++++++
+		lock +^INStockVal(0,pidItem,pidLocn,pidStore):10        ; force through if time out
+		;+++++++++++++++++++++++++++++++++++
+		
+		set objStockVal = $get(^INStockVal(0,pidItem,pidLocn,pidStore,1))
+	$$$LogRx("1:"_objStockVal)
+		
+		if 'pblnAdd {
+			set pfltQty   = -pfltQty
+			set pcurValue = -pcurValue
+		}
+		
+		set $$$INStockValQuantity(objStockVal)     = $$$INStockValQuantity(objStockVal) + pfltQty
+		set $$$INStockValValue1(objStockVal)       = $$$INStockValValue1(objStockVal)   + pcurValue
+		set $$$INStockValLastModified(objStockVal) = $horolog
+		
+		; no indices so doesn't need to go through WWWSPEI, etc.
+		if (+$$$INStockValQuantity(objStockVal)=0) && ($$$INStockValValue1(objStockVal)>-0.01) && ($$$INStockValValue1(objStockVal)<0.01) {
+			kill ^INStockVal(0,pidItem,pidLocn,pidStore,1)
+		
+		} else {
+			set ^INStockVal(0,pidItem,pidLocn,pidStore,1) = objStockVal
+		}
+		
+	$$$LogRx("2:"_objStockVal)
+		
+		;+++++++++++++++++++++++++++++++++++
+		lock -^INStockVal(0,pidItem,pidLocn,pidStore)#"I"
+		;+++++++++++++++++++++++++++++++++++
+	}
+	
+	quit
+	
+	
+DataLoad() 
+	;-------------------------------------------------------------------------------
+	; Create the INStockVal structure for each item in this company
+	; 
+	; Called By : Manual process for initial creation.
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Aug-2010	GRF		SR17529: Get Deletion Storage once; fix idStore to split
+	;							from location
+	; 29-Oct-2009	GRF		SR16871: INItemCost with location replaces INARTCOST;
+	; 							relocate inside loop
+	; 12-Oct-2009	GRF		SR16878: Replace call to INARTKOST with INARTCOST
+	; 15-Nov-2005	JW		SR13862: Loop through INART, not INARTAVG.
+	; 06-Nov-2005	JW		SR13920: Created
+	;-------------------------------------------------------------------------------
+	new idDeleteStorage,idItem,intCount
+	
+	set idDeleteStorage = $$$DeleteStockLocation  ; SR17529
+	
+	set idItem = ""
+	for intCount=0:1 {
+		set idItem = $order(^INART(0,idItem))
+		quit:idItem=""
+	}
+	write !,intCount," Items - Start : ",$$^WWWTIME($piece($horolog,",",2)),!
+	
+	set idItem = ""
+	for intCount = 0:1 {
+		set idItem = $order(^INART(0,idItem))
+		quit:idItem=""
+		
+		if intCount#200=0 write intCount,":",idItem,"   "
+		
+		do LoadItem(idItem,"",idDeleteStorage)     ; SR17529
+	}
+	quit
+	
+	
+NamespaceLoad(pidEntity="") ; OPERATION NOT VERIFIED YET
+	;-------------------------------------------------------------------------------
+	; Create the INStockVal structure for each item - where "Entity" namespace-based
+	; mapping is used.  (Use DataLoad if only a single namespace.)
+	; 
+	; Assumes INAvgCost and INStockVal are mapped to particular namespaces.
+	; 
+	; Called By : Manual process for initial creation - cannot perform tx processing
+	;             during operation.
+	; 
+	; Params:
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 31-Aug-2010	GRF		SR17529: Created from DataLoad for UFH
+	;-------------------------------------------------------------------------------
+	new idDeleteStorage,idItem,intCount
+	
+	quit:pidEntity=""
+	
+	do ^WWWVAR
+	set idDeleteStorage = $$$DeleteStockLocation
+	
+	set intCount = 0
+	set idItem   = ""
+	for {
+		set idItem = $order(^INART(0,idItem))
+		quit:idItem=""
+		
+		set intCount = intCount+1
+		if intCount#200=0 write intCount,":",idItem,"   "
+		
+		do LoadItem(idItem,pidEntity,idDeleteStorage)
+	}
+	quit
+	
+	
+OldLoadItem(pidItem,pidEntity="",pidDeleteStorage)
+	;-------------------------------------------------------------------------------
+	; Create the INStockVal structure for an item - where "Entity" namespace-based
+	; mapping is used
+	; 
+	; Called By : Manual process for initial creation.
+	;             If called separately, need to kill ^INStockVal(0,pidItem,idLocn)
+	;             for locations within Entity.
+	; 
+	; Params:
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 14-Dec-2010	GRF		SR17529: Split from NamespaceLoad for single Item test;
+	;							kill INStockVal entries here on item by item basis
+	;							subject to locking.
+	;							(idItem cf idItem,idLocn,idStore locking works)
+	;-------------------------------------------------------------------------------
+	new curCost,fltSOH,idLocn,idStore,loop,objLocn,objStockVal,strData,strSOH
+	
+	set $$$INStockValLastModified(objStockVal) = $horolog  ; common for all; overwrite other pieces
+	
+	;+++++++++++++++++++++++++++++++++++
+	lock +^INStockVal(0,pidItem):10        ; force through if time out
+	;+++++++++++++++++++++++++++++++++++
+	set idLocn = ""
+	for {
+		set idLocn = $order(^WWW0121(0,0,idLocn))
+		quit:idLocn=""
+		
+		kill ^INStockVal(0,pidItem,idLocn)
+		
+		set objLocn = $get(^WWW0121(0,0,idLocn,1))
+		continue:((pidEntity'="") && ($$$WWW0121Entity(objLocn)'=pidEntity))
+		
+		set curCost = $$GetCost^INItemCost(pidItem,idLocn,$$$enumAverageCost)
+		set strSOH  = $$GetQty^INARTMENGE(pidItem,1,idLocn,$$$NO,2)
+		set strSOH  = $piece(strSOH,"#",2)
+		
+		for loop=1:1 {
+			set strData = $piece(strSOH,";",loop)
+			quit:strData=""
+			
+			set fltSOH  = $piece(strData,"*",1)
+			set idStore = $piece($piece(strData,"*",2),"||",2)
+			
+			if fltSOH && (idStore'=pidDeleteStorage) {
+				set $$$INStockValValue1(objStockVal)       = $justify(curCost * fltSOH,0,2)
+				set $$$INStockValQuantity(objStockVal)     = fltSOH
+				
+				set ^INStockVal(0,pidItem,idLocn,idStore,1) = objStockVal
+			}
+		}
+	}
+	;+++++++++++++++++++++++++++++++++++
+	lock -^INStockVal(0,pidItem)#"I"
+	;+++++++++++++++++++++++++++++++++++
+	quit
+	
+	
+LoadItem(pidItem,pidEntity="",pidDeleteStorage)
+	;-------------------------------------------------------------------------------
+	; Create the INStockVal structure for an item - where "Entity" namespace-based
+	; mapping is used
+	; 
+	; Called By : Manual process for initial creation.
+	;             If called separately, need to kill ^INStockVal(0,pidItem,idLocn)
+	;             for locations within Entity.
+	; 
+	; Params:
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 14-Dec-2010	GRF		SR17529: Split from NamespaceLoad for single Item test;
+	;							kill INStockVal entries here on item by item basis
+	;							subject to locking.
+	;							(idItem cf idItem,idLocn,idStore locking works)
+	;-------------------------------------------------------------------------------
+	new curCost,fltSOH,idLocn,idLocnStore,idStore,intLength,objLocn,objStockVal,strBase
+	
+	set $$$INStockValLastModified(objStockVal) = $horolog  ; common for all; overwrite other pieces
+	
+	;+++++++++++++++++++++++++++++++++++
+	lock +^INStockVal(0,pidItem):10        ; force through if time out
+	;+++++++++++++++++++++++++++++++++++
+	set idLocn = ""
+	for {
+		set idLocn = $order(^WWW0121(0,0,idLocn))
+		quit:idLocn=""
+		
+		kill ^INStockVal(0,pidItem,idLocn)
+		
+		set objLocn = $get(^WWW0121(0,0,idLocn,1))
+		continue:((pidEntity'="") && ($$$WWW0121Entity(objLocn)'=pidEntity))
+		
+		set curCost = $$GetCost^INItemCost(pidItem,idLocn,$$$enumAverageCost)
+		set strBase = idLocn_"||"
+		set intLength   = $length(strBase)
+		set idLocnStore = strBase
+		for {
+			set idLocnStore = $order(^alSOH.dSOHD(pidItem,idLocnStore))
+			quit:$extract(idLocnStore,1,intLength)'=strBase
+			
+			set fltSOH  = $listget(^alSOH.dSOHD(pidItem,idLocnStore),2)
+			set idStore = $piece(idLocnStore,"||",2)
+			if fltSOH && (idStore'=pidDeleteStorage) {
+				set $$$INStockValValue1(objStockVal)   = $justify(curCost * fltSOH,0,2)
+				set $$$INStockValQuantity(objStockVal) = fltSOH
+				
+				set ^INStockVal(0,pidItem,idLocn,idStore,1) = objStockVal
+			}			
+		}
+	}
+	;+++++++++++++++++++++++++++++++++++
+	lock -^INStockVal(0,pidItem)#"I"
+	;+++++++++++++++++++++++++++++++++++
+	quit
+
+	
+	
+Audit(pidEntity="") 
+	;-------------------------------------------------------------------------------
+	; Check the INStockVal quantities against the alSOH.dSOH or alSOH.dStockBalance
+	; quantities and collect differences
+	; 
+	; Assumes INAvgCost & INStockVal are mapped to particular namespaces if Entity
+	; is specified.  For Cost Centre-based processing, call without an argument.
+	; 
+	; Report as : zw ^CacheTempStockValAudit
+	;             shows alSOH qty & INStockVal qty
+	; 
+	; Called By : Manual process for initial creation.
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 13-Dec-2010	GRF		SR17529: Correct logic test
+	; 31-Aug-2010	GRF		SR17529: Created
+	;-------------------------------------------------------------------------------
+	new arrSV,fltSOH,fltSVQty,idDeleteStorage,idItem,idLocn,idStore,intCount,loop
+	new objLocn,strData,strEntity,strSOH
+	
+	do ^WWWVAR
+	set idDeleteStorage = $$$DeleteStockLocation
+	set strEntity = $select(pidEntity'="":pidEntity,1:" ")
+	
+	kill ^CacheTempStockValAudit
+	
+	set intCount = 0
+	set idItem = ""
+	for {
+		set idItem = $order(^INART(0,idItem))
+		quit:idItem=""
+		
+		set intCount = intCount+1
+		if intCount#200=0 write idItem,"  "
+		
+		kill arrSV
+		merge arrSV = ^INStockVal(0,idItem)
+		
+		set idLocn = ""
+		for {
+			set idLocn = $order(^WWW0121(0,0,idLocn))
+			quit:idLocn=""
+			
+			set objLocn = $get(^WWW0121(0,0,idLocn,1))
+			continue:((pidEntity'="") && ($$$WWW0121Entity(objLocn)'=pidEntity))   ; SR17529
+			
+			set strSOH  = $$GetQty^INARTMENGE(idItem,1,idLocn,$$$NO,2)
+			set strSOH  = $piece(strSOH,"#",2)
+			
+			for loop=1:1 {
+				set strData = $piece(strSOH,";",loop)
+				quit:strData=""
+				
+				set fltSOH  = +$piece(strData,"*",1)
+				set idStore =  $piece($piece(strData,"*",2),"||",2)
+				
+				if (idStore'=idDeleteStorage) {
+					set fltSVQty = +$get(arrSV(idLocn,idStore,1))
+					if fltSVQty'=fltSOH {
+						set ^CacheTempStockValAudit(idItem,idLocn,idStore) = fltSOH_Y_fltSVQty
+					}
+					kill arrSV(idLocn,idStore)
+				}
+			}
+		}
+		set idLocn = ""
+		for {
+			set idLocn = $order(arrSV(idLocn))
+			quit:idLocn=""
+			
+			set idStore = ""
+			for {
+				set idStore = $order(arrSV(idLocn,idStore))
+				quit:idStore=""
+			
+				set fltSVQty = +$get(arrSV(idLocn,idStore,1))
+				set ^CacheTempStockValAudit(strEntity,idItem,idLocn,idStore) = 0_Y_fltSVQty
+			}
+		}
+	}
+	quit
+	
+]]></Routine>
+</Export>

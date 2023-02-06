@@ -1,0 +1,1141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Routine name="VARStockHistory" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[VARStockHistory
+#include COMSYS
+#include INConst
+#include MEDConst
+#define SIMPLIFICADO 2
+#define DETALHADO 1
+
+OnAfterSave
+	new Item, Location, dteInicial, dteFinal, pPrograma, pFiltroEnd, pVisualizacao, pLote
+	set Item  	        = $get(VORG(1))
+	set Location        = $get(VORG(2))
+	set dteInicial      = $get(VORG(3))
+	set dteFinal        = $get(VORG(4))
+	set pVisualizacao	= "1" ;1 = completo, 2 = Simplificado
+	if (pVisualizacao = $$$SIMPLIFICADO) {
+		set pLote		= ""
+		set pFiltroEnd	= ""
+		set pPrograma   = ""
+	}else{
+		set pLote		= $get(VORG(8))
+		;set pFiltroEnd	= $get(VORG(6))
+		set pPrograma   = $get(VORG(5))
+	}
+	
+	set $piece(^VARTempStockHistory(YM,YBED,1),Y,1) = Item
+	set $piece(^VARTempStockHistory(YM,YBED,1),Y,2) = Location
+	set $piece(^VARTempStockHistory(YM,YBED,1),Y,3) = dteInicial
+	set $piece(^VARTempStockHistory(YM,YBED,1),Y,4) = dteFinal
+	set $piece(^VARTempStockHistory(YM,YBED,1),Y,5) = pPrograma
+	set $piece(^VARTempStockHistory(YM,YBED,1),Y,6) = "1" ;Mostrar sempre como completo e mostrar enderecos como o SESDF
+	set $piece(^VARTempStockHistory(YM,YBED,1),Y,7) = pVisualizacao
+	set $piece(^VARTempStockHistory(YM,YBED,1),Y,8) = pLote
+	
+	do VARLogAfterSave^VARUtil(YBED,YFORM)
+	do GoToForm^COMUtilForm("VARStockHistory",1,,,,,) ;03-Fev-2010 Karine
+	
+	quit
+
+OnAfterDataFields
+	;----------------------------------------------------------------------------
+	;
+	; History:
+	; 10-Mai-2022   Paulo H		Lean-313: Migrar o modelo da Kardex da SESDF para o ambiente LEAN
+	; 01-Mai-2012	Gustavo		Incluído VARLogAfterSave
+	; 08-Ago-2011	RGB			Alteração para verificar se o endereço de armazenagem é um paciente.
+	;							Previamente ele validava apenas se o local era uma farmacia judicial,
+	;							alterando o header incorretamente para "Paciente", independente do endereço de armazenagem.
+	; 03-Fev-2010	Karine		TCI: Including Bundle= Program 
+	; 27-Apr-2010	Sósthenes   Modificado a forma como é gerado o Grid e adicionado filtro de Endereços.
+	;
+    ;----------------------------------------------------------------------------
+	quit:('$data(^VARTempStockHistory(YM,YBED,1)))
+
+	//Só apresenta os resultados da consulta caso o usuário tenha clicado no botão 'Ok' do form.
+	quit:('$$isAfterSaveLogged^VARUtil(YBED,YFORM))
+	do ClearVARLogAterSave^VARUtil(YBED,YFORM)
+	
+	new filterItem, filterLocation, filterdteInicial, filterdteFinal, filterPrograma, filterEndereco, filterVisualizacao, filterLote, ID, 
+		idItem, dteMovimentacao, hour, txnType, qty, idLocation, strLocation, txnCode, lot, dteExpiry, 
+	    strTxnLink, strEouS, responsavel, Endereco, objReport, idPrograma, nomePrograma, strMovmtFromTo,
+	    ItemPolicyHasProgram, ItemPolicyHasBrand, idMarca, nomeMarca, physicalStorage, txnCodeLine,
+	    objStorage, FromStorage, ToStorage, txnCodeLink
+	
+	set filterItem         = $piece($get(^VARTempStockHistory(YM,YBED,1)),Y,1)
+	set filterLocation     = $piece($get(^VARTempStockHistory(YM,YBED,1)),Y,2)
+	set filterdteInicial   = $piece($get(^VARTempStockHistory(YM,YBED,1)),Y,3)
+	set filterdteFinal     = $piece($get(^VARTempStockHistory(YM,YBED,1)),Y,4)
+	set filterPrograma     = $piece($get(^VARTempStockHistory(YM,YBED,1)),Y,5)
+	set filterEndereco     = $piece($get(^VARTempStockHistory(YM,YBED,1)),Y,6)
+	set filterVisualizacao = $piece($get(^VARTempStockHistory(YM,YBED,1)),Y,7)
+	set filterLote 		   = $piece($get(^VARTempStockHistory(YM,YBED,1)),Y,8)
+	
+
+	
+	/*
+	
+	write !, "<script language=""javascript"">"
+	&js<
+		addEvent(window, 'load', OnLoadWindow);
+ 
+		function OnLoadWindow() {
+			document.#(YHTMFORM)#.#("Y"_YFORM_"M8")#.onblur();
+		}
+ 
+		function addEvent(obj, evType, fn) {
+ 			if (obj.addEventListener) {
+   				obj.addEventListener(evType, fn, false);
+   				return true;
+ 			}
+ 			else if (obj.attachEvent) {
+   				return obj.attachEvent('on' + evType, fn);
+ 			}
+ 			else {
+   				return false;
+ 			}
+		}	
+	>
+	write !, "</script>"
+	
+	*/
+
+	;28-Oct-2008 Karine Report 
+	kill ^VARTempStockHistoryReport(YM,YBED)
+	
+	Set StockHistorySQL = ##class(%ResultSet).%New()  ;Create Result Set Object
+	set EstoqueWhere= ""
+	set dataWhere = ""
+	
+ 	set meuSQL = "select "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.ID, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.Item->ItemId  AS Item, "
+	set meuSQL = meuSQL_" (alSOH.dStockHistory.DateConfirmed) AS TxDate, " 
+	set meuSQL = meuSQL_" (alSOH.dStockHistory.TimeConfirmed) AS TxTime, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.TxType AS TxType, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.MovementType as MovmtType, "
+	
+	if (filterVisualizacao = $$$SIMPLIFICADO) {
+		set meuSQL = meuSQL_" SUM(alSOH.dStockHistory.QtyMoved) AS Qty, "
+	}else{
+		set meuSQL = meuSQL_" alSOH.dStockHistory.QtyMoved AS Qty, "
+	}
+	
+	set meuSQL = meuSQL_" alSOH.dStockHistory.Location->Code AS Location, "  
+	set meuSQL = meuSQL_" alSOH.dStockHistory.Storage as Storage, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.Location->Name AS LocationDesc, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.Reference AS Source, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.Bundle->LotNumber as LotNumber, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.Bundle->UseByDate as UseByDate, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.Bundle->Program as Program, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.Bundle->Brand as Brand, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.PhysicalStorage as PhysicalStorage, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.LineNumber as LineNumber, "
+	set meuSQL = meuSQL_" alSOH.dStockHistory.QOHLocn as Stock "
+	set meuSQL = meuSQL_" FROM alSOH.dStockHistory "
+
+	set EstoqueWhere = EstoqueWhere_" WHERE UPPER(Item) = '"_filterItem_"'"
+	set EstoqueWhere = EstoqueWhere_" AND UPPER(Location) = '"_filterLocation_"'"
+	set dataWhere = dataWhere_" AND alSOH.dStockHistory.DateConfirmed >= "_filterdteInicial
+	set dataWhere = dataWhere_" AND alSOH.dStockHistory.DateConfirmed <= "_filterdteFinal
+	set EstoqueWhere = EstoqueWhere_"  AND alSOH.dStockHistory.Storage->Code != 'X'"
+	
+	if (filterLote '= ""){
+		set EstoqueWhere = EstoqueWhere_" AND alSOH.dStockHistory.Bundle->LotNumber = '"_filterLote_"' "
+	}
+	
+	if (filterEndereco '= "1") {
+		set EstoqueWhere = EstoqueWhere_" AND $$SQLGetMovTypeNumber^VARSQL(alSOH.dStockHistory.MovementType) <> 5 "
+		set EstoqueWhere = EstoqueWhere_" AND $$SQLGetMovTypeNumber^VARSQL(alSOH.dStockHistory.MovementType) <> 51 "
+		set EstoqueWhere = EstoqueWhere_" AND alSOH.dStockHistory.Storage->Code != 'EmTransito'"
+	}
+	if (filterPrograma '= "") {
+	    set EstoqueWhere = EstoqueWhere_"AND alSOH.dStockHistory.Bundle->Program = "_filterPrograma
+		}
+	
+	if (filterVisualizacao = $$$SIMPLIFICADO) {
+		set meuSQL = meuSQL_EstoqueWhere_dataWhere_" GROUP BY alSOH.dStockHistory.Reference "
+	}
+	
+	set meuSQL = meuSQL_EstoqueWhere_dataWhere_"ORDER by TxDate, TxTime "
+	do StockHistorySQL.Prepare(meuSQL)  ;Prepare Query
+	do StockHistorySQL.Execute()  ;Execute Query
+	
+	
+	set count=0
+	do PrintHeader^VARStock(filterItem,"")
+	set CMMRede	     = +$$GetCMM^VARReposicao(filterItem)
+	set CMMiRede	 = +$$getCMMi^VARReposicao(filterItem)
+	set PrincipalStock = $piece($get(^INART(YM,filterItem,1)),"~",345)
+	
+	set EstoqueAtualResumo = 0
+	///Se tiver CMM, CMMiRede ou Estoque principal, deverá mostrar igual SESDF - FICHA KARDEX -
+	
+	if (PrincipalStock '= ""){
+		write "<table style='font-size:12px; margin-left: 6px;' cellspacing='2'><tr><td>Estoque Principal:</td><td colspan='2'>"_PrincipalStock_"</td></tr></table>"
+	}
+	
+	
+	if (CMMRede > 0) || (CMMiRede > 0){
+		write "<table style='font-size:12px; margin-left: 6px;' cellspacing='2'>"
+		write "<tr><td>CMM (Rede): "_$$^WWWTR(0,12,CMMRede)_"</a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Consumo Médio Mensal Informado (CMMi):&nbsp;"_$$^WWWTR(0,12,CMMiRede)_"</td></tr>"
+		write "</table>"	
+	}
+
+	//Tabela
+	w "<div style='margin-left: 6px;'>"
+   	new lstHeader
+ 	set lstHeader = ""
+ 	
+	set ItemPolicyHasProgram = $$CheckItemPolicyHasProgram^VARINART(filterItem)
+	set ItemPolicyHasBrand   = $$CheckItemPolicyHasBrand^VARINART(filterItem) 	
+ 	
+ 	if (filterVisualizacao = $$$DETALHADO) {
+ 		set lstHeader = lstHeader_$listbuild("Seq.","Documento","Tipo","E/S","Origem / Destino","Data","Hora","Quantidade","Endereço","Lote","Validade","Estoque Local")
+ 	}else{
+	 	set lstHeader = lstHeader_$listbuild("Seq.","Data","Documento","Origem / Destino","Tipo","Quantidade Entrada","Quantidade Saída")
+	}
+ 	
+ 	if (filterVisualizacao = $$$SIMPLIFICADO){
+ 	
+ 	}
+	elseif (ItemPolicyHasProgram = $$$YES) {  	
+		set lstHeader = lstHeader_$listbuild("Programa")
+	}
+	
+	if (filterVisualizacao = $$$DETALHADO) {
+		if (ItemPolicyHasBrand = $$$YES) {
+			set lstHeader = lstHeader_$listbuild("Marca")				
+		}
+	
+		set lstHeader = lstHeader_$listbuild("Responsável")
+ 	}
+ 	
+  	new somaQtdEntrada, somaQtdSaida, somaQtdTotal
+  	set somaQtdEntrada = 0
+  	set somaQtdSaida = 0
+  	set somaQtdTotal = 0
+  
+  
+  	if $$Start^COMTable(lstHeader) {
+	 
+		set count = 0
+		set qtTemp = 0
+		set UltimoEstoque = 0
+	
+		While (StockHistorySQL.Next()) {
+			if count = 0{	
+				set estoqueAnteriorSQL = "select top(1) alSOH.dStockHistory.ID,"_
+				"(alSOH.dStockHistory.DateConfirmed) AS TxDate,"_
+				"(alSOH.dStockHistory.TimeConfirmed) AS TxTime,"_
+ 				"alSOH.dStockHistory.QtyMoved AS Qty,"_
+ 				"alSOH.dStockHistory.Location->Code AS Location,"_
+ 				"alSOH.dStockHistory.Storage as Storage,"_
+ 				"alSOH.dStockHistory.Location->Name AS LocationDesc,"_
+ 				"alSOH.dStockHistory.QOHLocn as Stock"_
+ 				" FROM alSOH.dStockHistory"_EstoqueWhere_
+ 				" and alSOH.dStockHistory.DateConfirmed = "_StockHistorySQL.GetData(3)
+ 				
+ 				if (filterLote '= ""){
+	
+				set estoqueAnteriorSQL = estoqueAnteriorSQL_" AND alSOH.dStockHistory.Bundle->LotNumber = '"_filterLote_"' "
+				}
+				
+ 				set estoqueAnteriorSQL = estoqueAnteriorSQL_" ORDER by TxDate, TxTime"
+			
+			set estoqueExecuteSql = ##class(%ResultSet).%New()
+			do estoqueExecuteSql.Prepare(estoqueAnteriorSQL)  ;Prepare Query
+			do estoqueExecuteSql.Execute()
+			
+			set estoqAntes = 0
+			set estoqAtual = 0
+			while(estoqueExecuteSql.Next()){
+				set UltimoEstoque = estoqueExecuteSql.Data("Stock")
+				set qtTemp = UltimoEstoque
+			}
+				if (filterVisualizacao = "1") {
+					do NewLine^COMTable()
+					do InsertCell^COMTable("Estoque Anterior",,,,,,11)
+					do InsertCell^COMTable($$^WWWTR(0,12,UltimoEstoque),,,,"RIGHT")
+					do InsertCell^COMTable("",,,,,,3)
+			}
+			
+			}
+			
+			set objReport = "" 
+				
+			set ID		        = StockHistorySQL.GetData(1)
+			set idItem          = StockHistorySQL.GetData(2)
+			set dteMovimentacao = StockHistorySQL.GetData(3)
+			set hour            = StockHistorySQL.GetData(4)
+			set txnType         = StockHistorySQL.GetData(5)
+			set MovmtType       = StockHistorySQL.GetData(6)
+			set qty             = StockHistorySQL.GetData(7)
+			set idLocation      = StockHistorySQL.GetData(8)
+			set Endereco        = StockHistorySQL.GetData(9)
+			set strLocation     = StockHistorySQL.GetData(10)
+			set txnCode         = StockHistorySQL.GetData(11)
+			set lot             = StockHistorySQL.GetData(12)
+			set dteExpiry       = StockHistorySQL.GetData(13)
+			set idPrograma      = StockHistorySQL.GetData(14)
+			set idMarca	        = StockHistorySQL.GetData(15)
+			set physicalStorage = StockHistorySQL.GetData(16)
+			set txnCodeLine     = StockHistorySQL.GetData(17)
+			set qtyStock        = StockHistorySQL.GetData(18)
+			
+
+			set debugedMovmtType = $listget(MovmtType, 1)
+			;set Endereco = $piece(Endereco,"||",2)
+			
+			// Quando for movimento de realocação, mostrar somente um vetor de quantidade
+			if ( (debugedMovmtType = 5) || (debugedMovmtType = 51) ) {
+				continue:(qty < 0)
+			}
+			
+			set count = $i(count)
+
+		/*	if (qty > 0) {
+				set somaQtdEntrada = somaQtdEntrada + qty
+			}else{
+				set somaQtdSaida = (somaQtdSaida - (qty))
+			}
+			*/
+			if (($piece(txnCode,"||",2))'=""){
+					set txnCode=$replace(txnCode,"||",",")
+			}
+			
+
+			set strMovmtType   = $$GetMovmtType(debugedMovmtType,txnCode)
+			set strMovmtLink   = $$GetMovmtLink(debugedMovmtType,txnCode)
+			set strMovmtVetor  = $$GetMovmtVetor(debugedMovmtType,qty)
+			set strMovmtFromTo = $$GetMovmtFromTo(debugedMovmtType,txnCode,physicalStorage,txnCodeLine,txnType)
+			set responsavel    = $$GetProcessedBy(debugedMovmtType,txnCode)
+			set nomePrograma = $$GetProgramName^VARSQL(idPrograma)
+			set nomeMarca	 = $$GetBrandName^VARSQL(idMarca)
+			
+			if filterLocation = $$getFarmaciaAcoesJudiciais^VARParametroCliente(YM) {
+				//Validar se o endereço de armazenagem é um paciente
+				set nomePaciente=""
+				set nomePaciente=$$GetNomePaciente^VARMEDPatient(idLocation,Endereco)
+			
+				if nomePaciente'="" {
+					set Endereco =nomePaciente
+				}
+			}
+
+			//Não mostrar as movimentações para o EmTransito
+			continue:($piece(Endereco,"||",2) = "EmTransito")
+			
+			if ((filterVisualizacao = $$$SIMPLIFICADO) && (count = 1) ){
+				;do NewLine^COMTable()
+				;do InsertCell^COMTable("",,,,,,6)
+				;do InsertCell^COMTable($$^WWWTR(0,12,qtyStock),,,,"RIGHT")
+		    	;do InsertCell^COMTable("Início do Periodo")
+		    	;do EndLine^COMTable()
+		    	;set qtyStockInicio = qtyStock
+			}
+			
+			if (($$CheckMEDDispenseType(txnCode)) && (debugedMovmtType = 11)){
+				set txnCodeLink = $$GetMEDDispenseID(txnCode)
+			}
+			else {
+				set txnCodeLink = txnCode
+			}
+				
+		
+			do NewLine^COMTable()
+			
+	    	if (filterVisualizacao = $$$DETALHADO) {
+		    	// 16 - Mai - 2022 Paulo Hortolani  LEAN-313 Migrar alteracao SESDF-1608 para o Lean 
+		   
+				if (debugedMovmtType=30)
+				{
+					set checkStatusTransf = $$isFullyAccepted^INTFR(txnCode)
+					if (checkStatusTransf=0) set strMovmtType = strMovmtType_" <span style='color:red'> *</span>"
+				}
+		    	
+		    	do InsertCell^COMTable(count)
+		    	do InsertCell^COMTable(txnCode,strMovmtLink,txnCodeLink)
+				do InsertCell^COMTable(strMovmtType,strMovmtLink,txnCodeLink,,,,,,,$$$YES)
+				do InsertCell^COMTable(strMovmtVetor)
+				do InsertCell^COMTable(strMovmtFromTo,,,,,,,,,$$$YES)
+				do InsertCell^COMTable($zdate(dteMovimentacao,4))
+				do InsertCell^COMTable($ztime(hour))
+				do InsertCell^COMTable($$^WWWTR(0,12,qty),,,,"RIGHT")
+				do InsertCell^COMTable($piece(Endereco,"||",2))			
+				do InsertCell^COMTable(lot)
+				set DataFormatada = ""
+			
+				if dteExpiry '= "" {
+					set DataFormatada = $zdate(dteExpiry,4) 
+				}
+				
+				do InsertCell^COMTable(DataFormatada)
+	
+			  	
+				  	if (qty > 0){
+				  	 	set qtTemp = qtyStock + qty
+				  	 	if (strMovmtVetor '= "Realocação"){
+				   		set somaQtdEntrada = somaQtdEntrada + qty
+				  	 	}
+					} else {
+				   		set qtTemp = (qtTemp - (-1 * qty))
+				   		if (strMovmtVetor '= "Realocação"){
+				   		set somaQtdSaida = (somaQtdSaida + (-1 * qty))
+				   		}
+			
+				}
+				  
+			   	
+				do InsertCell^COMTable($$^WWWTR(0,12,qtTemp),,,,"RIGHT")
+			
+				set EstoqueAtualResumo = qtTemp 
+				
+				if (filterVisualizacao = $$$SIMPLIFICADO){
+				
+				}
+				elseif (ItemPolicyHasProgram = $$$YES) {  				
+					do InsertCell^COMTable(nomePrograma,,,,,,,,,$$$YES)
+				}
+			
+				if (ItemPolicyHasBrand = $$$YES) {
+					do InsertCell^COMTable(nomeMarca,,,,,,,,,$$$YES)
+				}
+			
+				do InsertCell^COMTable(responsavel,,,,,,,,,$$$YES)		
+		    	do EndLine^COMTable()
+
+			    set $piece(objReport,Y,1) = txnCode
+		    	set $piece(objReport,Y,2) = strMovmtType
+		    	set $piece(objReport,Y,3) = strMovmtVetor
+		    	set $piece(objReport,Y,4) = dteMovimentacao
+		    	set $piece(objReport,Y,5) = hour
+		    	set $piece(objReport,Y,6) = qty
+		    	set $piece(objReport,Y,7) = $piece(Endereco,"||",2)
+		    	set $piece(objReport,Y,8) = lot
+		    	set $piece(objReport,Y,9) = dteExpiry
+		    	set $piece(objReport,Y,10) = responsavel
+		    	set $piece(objReport,Y,11) = filterItem
+		    	set $piece(objReport,Y,12) = filterdteInicial
+		    	set $piece(objReport,Y,13) = filterdteFinal
+		    	set $piece(objReport,Y,14) = filterLocation
+		    	set $piece(objReport,Y,15) = nomePrograma
+		    	set $piece(objReport,Y,16) = strMovmtFromTo
+		    	set $piece(objReport,Y,17) = nomeMarca
+		    	set stKey = YBED_","_count 
+		    	set status = $$$Save("VARTempStockHistoryReport",stKey,objReport,1)
+		    	
+			
+		    	
+	    	}else{
+ 
+		    	do InsertCell^COMTable(count)
+				do InsertCell^COMTable($zdate(dteMovimentacao,4))
+		    	do InsertCell^COMTable(txnCode,strMovmtLink,txnCodeLink)
+				do InsertCell^COMTable(strMovmtFromTo,,,,,,,,,$$$YES)
+				//do InsertCell^COMTable($$^WWWTR(0,12,qtySto]]><![CDATA[ckInicio+qty),,,,"RIGHT")
+				do InsertCell^COMTable(strMovmtType,strMovmtLink,txnCodeLink,,,,,,,$$$YES)
+				if (qty > 0) {
+					do InsertCell^COMTable($$^WWWTR(0,12,qty),,,,"RIGHT")
+				}else{
+					do InsertCell^COMTable("-",,,,"RIGHT")
+				}
+				if (qty < 0) {
+					do InsertCell^COMTable($$^WWWTR(0,12,(-1*qty)),,,,"RIGHT")
+				}else{
+					do InsertCell^COMTable("-",,,,"RIGHT")
+				}
+				if (filterVisualizacao '= $$$SIMPLIFICADO){
+					do InsertCell^COMTable(nomePrograma,,,,,,,,,$$$YES)			
+				}
+				;set qtyStockInicio = qtyStockInicio + qty
+	
+			}
+			
+		}
+		
+		
+		if (count = 0) {
+			do NewLine^COMTable()
+			if (filterVisualizacao = $$$DETALHADO) {
+				do InsertCell^COMTable("Nenhum registro encontrado.",,,,,,15)
+			}else{
+				do InsertCell^COMTable("Nenhum registro encontrado.",,,,,,7)
+			}
+	    	do EndLine^COMTable()
+		}
+		
+		set somaQtdTotal = somaQtdEntrada + somaQtdSaida
+		
+		if (filterVisualizacao = $$$SIMPLIFICADO) {
+			
+			do NewLine^COMTable("lightsteelblue")
+			do InsertCell^COMTable("<strong>Total:</strong>",,,,"RIGHT",,5)
+			do InsertCell^COMTable("<strong>"_$$^WWWTR(0,12,somaQtdEntrada)_"</strong>",,,,"RIGHT")
+			do InsertCell^COMTable("<strong>"_$$^WWWTR(0,12,(-1*somaQtdSaida))_"</strong>",,,,"RIGHT")
+			
+			do NewLine^COMTable("lightsteelblue")
+			do InsertCell^COMTable("<strong>Total Geral:</strong>",,,,"RIGHT",,6)
+			do InsertCell^COMTable("<strong>"_$$^WWWTR(0,12,somaQtdTotal)_"</strong>",,,,"RIGHT")
+			
+		}	
+		
+		do Stop^COMTable()		
+  	}
+  	
+  	set qtReservada = $$Floor^COMUtilNum($$GetEstoqueReservado^VARReposicao(filterItem,filterLocation))
+	
+	set somaQtdTotal = (somaQtdTotal-qtReservada)
+	if (somaQtdTotal < 0) set somaQtdTotal = 0
+	
+	w "</div>"
+  	write "<br />"
+	write "<table style='padding:5px;font-size:13px;margin-left:6px;border:0px'>"
+	write "<td style='font-size:20px;color:red'><strong>&nbsp;*&nbsp;</strong></td>"
+	write "<td>&nbsp;Indica transferências com itens pendentes de aceite</td></tr>"
+	write "</table> <br />"
+	
+
+	
+	write "<br />"
+	write "<table cellspacing='3' style='padding:5px;font-size:13px;margin-left:6px;border:1px solid #666666'>"
+	write "<tr style='background-color:#bababa'><td colspan='2' style='padding:3px 5px'><strong>Resumo do Período</strong></td></tr>"
+	write "<tr><td style='padding-left:5px;padding-right:5px'><strong>Total de Entradas:</strong></td><td style='padding-left:5px;padding-right:5px;text-align:right'>"_$$^WWWTR(0,12,somaQtdEntrada)_"</td></tr>"
+	write "<tr><td style='padding-left:5px;padding-right:5px'><strong>Total de Saídas:</strong></td><td style='padding-left:5px;padding-right:5px;text-align:right'>"_$$^WWWTR(0,12,somaQtdSaida)_"</td></tr>"
+	write "<tr><td style='padding-left:5px;padding-right:5px'><strong>Total de Reservas:</strong></td><td style='padding-left:5px;padding-right:5px;text-align:right'>"_$$^WWWTR(0,12,(qtReservada))_"</td></tr>"
+	write "<tr><td style='padding-left:5px;padding-right:5px'><strong>Estoque Atual:</strong></td><td style='padding-left:5px;padding-right:5px;text-align:right'>"_$$^WWWTR(0,12,EstoqueAtualResumo)_"</td></tr>"
+	
+	write "</table>"
+	
+	write "<br />"
+	write "<table cellspacing='3' style='padding:5px;font-size:13px;margin-left:6px;border:1px solid #666666'>"
+	write "<td style='background-color:#bababa;padding:3px 5px'><strong>Endereço</strong></td>"
+	write "<td style='background-color:#bababa;padding-left:5px;padding-right:5px'><strong>Quantidade</strong></td>"
+	set (tEndereco,tQuantidade)=""
+	set tQtdTotal = 0
+	
+	&sql(declare cEndereco cursor for
+		  SELECT alSOH.dBundleStock.Storage->Code,
+		  		+alSOH.dBundleStock.QtyOnHand
+		    INTO :tEndereco, :tQuantidade
+		    FROM alSOH.dBundleStock 
+		   WHERE alSOH.dBundleStock.Item = :filterItem 
+		     AND alSOH.dBundleStock.Storage->Location = :filterLocation
+			 AND ((:filterPrograma IS NULL) OR (alSOH.dBundleStock.Bundle->Program = :filterPrograma)) 
+		   ORDER BY +alSOH.dBundleStock.QtyOnHand)
+		   
+	&sql(open cEndereco)
+	&sql(fetch cEndereco)
+	
+	if (SQLCODE'=0){
+		write "<tr><td colspan='2' style=padding-left:6px;padding-right:4px;><em>Nenhum endereço encontrado</em></td></tr>"
+	}
+	//LEAN-313 - Agrupar a quantidade dos endereços por endereço indepentende do local
+	if ($data(andress)) kill andress
+	
+	while (SQLCODE = 0){
+		set andress(tEndereco) = ""_($get(andress(tEndereco)) + tQuantidade)_"~"_tEndereco
+	
+		set tQtdTotal = tQtdTotal + tQuantidade
+	    
+	    &SQL(fetch cEndereco)
+	}
+	set currentAndress = ""
+	
+	if ($data(andress("EmTransito"))){
+		w "<tr>"_
+		"<td style=padding-left:6px;padding-right:4px;>"_$piece(andress("EmTransito"),"~",2)_"</td>"_
+		"<td align=right style=padding-left:6px;padding-right:4px;>"_$piece(andress("EmTransito"),"~",1)_"</td>"_
+		"</tr>"	
+		}
+	
+	
+	while($order(andress(currentAndress)) '= "")
+	{
+		set currentAndress = $order(andress(currentAndress))
+	
+		if ((currentAndress '= "") && (currentAndress '= "EmTransito")) {
+		w "<tr>"_
+		"<td style=padding-left:6px;padding-right:4px;>"_$piece(andress(currentAndress),"~",2)_"</td>"_
+		"<td align=right style=padding-left:6px;padding-right:4px;>"_$piece(andress(currentAndress),"~",1)_"</td>"_
+		"</tr>"	
+		}
+		
+	}
+	
+	
+	write "<tr>"
+	write "<td height=20px style=padding-left:6px;padding-right:6px;border-top-width:1px;border-top-color:999999;border-top-style:solid><em>Total</em>&nbsp;</td>"
+	write "<td align=right style=padding-right:4px;border-top-width:1px;border-top-color:999999;border-top-style:solid>"_tQtdTotal_"</td>"
+	write "</tr>"
+	write "</table>"
+	&sql(close cEndereco)
+	
+	do StockHistorySQL.Close()
+
+    quit
+    
+GetEstoqueReservado(pidItem,pidLocal="")
+	if (pidItem = "") quit 0
+	new strValue
+	
+	set strValue = 0
+	
+	&sql(SELECT SUM(QtyRequired) AS QtyReservada into :strValue
+			FROM alDRP.dPlannedMovement 
+			WHERE 
+				State->StateId=3	  AND
+				Item=:pidItem         AND 
+				((:pidLocal IS NULL) OR (FromLocn=:pidLocal))
+	)
+	if (SQLCODE'=0)||(strValue="") set strValue = 0
+ 
+	quit strValue
+
+getDebugedMovmtType(MovmtType)
+	new debugedMovmtType
+	set debugedMovmtType = $listget(MovmtType, 1)
+	q debugedMovmtType
+	
+shouldShow(pMovementType,pQty)
+	set strStatus=1
+	if ( (pMovementType = 5) || (pMovementType = 51) ) {
+		if (pQty < 0) set strStatus=0
+	}
+	q strStatus		
+
+GetMovmtType(pMovmtType,pTxnCode)
+	if (pMovmtType = "") quit ""
+
+	new strMovmtType, tipoProducao
+	
+	if (pMovmtType = 1) {
+		set strMovmtType = "Recebimento"	
+	
+	} elseif (pMovmtType = 5) {
+		set strMovmtType = "Movimentação no local"	
+	
+	} elseif (pMovmtType = 7) {
+		set strMovmtType = "Estorno de recebimento"		
+
+	} elseif (pMovmtType = 8) {
+		set strMovmtType = "Devolução ao fornecedor"		
+
+	} elseif (pMovmtType = 11) {
+		if (pTxnCode = "") quit ""
+
+		set objIssue 		  = $get(^INIssue(YM,pTxnCode,1))
+		set idDestinationLocn = $$$INIssueToLocn(objIssue)
+
+		if ($$CheckMEDDispenseType(pTxnCode) = $$$YES) {
+			set strMovmtType = "Dispensação via prescrição"
+		
+		} elseif (idDestinationLocn '= "") {
+				set objWWW0121 = $get(^WWW0121(YM,YM,idDestinationLocn,1))
+				set StorageLocn = $$$WWW0121StorageLocn(objWWW0121)			
+				if (StorageLocn = $$$YES) {
+					set strMovmtType = "Saída/Transferência"
+				} else {			
+					set strMovmtType = "Requisição"
+				}
+		} else {
+			set strMovmtType = "Requisição"
+		}
+
+	} elseif (pMovmtType = 21) {
+		set strMovmtType = "Dispensação ao paciente"
+
+	} elseif (pMovmtType = 22) {
+		set strMovmtType = "Devolução ao estoque"		
+
+	} elseif (pMovmtType = 30) {
+		set strMovmtType = "Transferência"
+	
+	} elseif (pMovmtType = 31) {
+		set strMovmtType = "Aceite de transferência"
+	
+	} elseif (pMovmtType = 32) {
+		set strMovmtType = "Estorno de transferência"
+	
+	} elseif (pMovmtType = 35) {
+		set strMovmtType = "Saída de produtos para produção"
+		;HEVA-1195
+		if (pTxnCode '= "") {
+			set tipoProducao = $$GetTipoProducao^VARFechamentoContabil(pTxnCode)
+			if (tipoProducao = 2) {
+				set strMovmtType = "Saída Via Requisição"
+			}
+		}
+		
+	} elseif (pMovmtType = 36) {
+		set strMovmtType = "Recebimento da produção"
+	
+	} elseif (pMovmtType = 37) {
+		set strMovmtType = "Estorno de componente da produção"
+	
+	} elseif (pMovmtType = 38) {
+		set strMovmtType = "Estorno da produção"
+	
+	} elseif (pMovmtType = 40) {
+		if (pTxnCode = "") quit ""
+
+		set idAdjType = $piece($get(^INADJ(YM,pTxnCode,1)),Y,1)
+		
+		if idAdjType = 5 {
+			set strMovmtType = "Doação"
+		} elseif idAdjType = 0 {
+			set strMovmtType = "Descarte de produto vencido"
+
+		} elseif idAdjType = 1 {
+			set strMovmtType = "Perda por quebra/avaria"
+		
+		} elseif idAdjType = 9 {
+			set strMovmtType = "Outras saídas"
+		}
+		
+		else {
+			set strMovmtType = "Ajuste"
+		}
+		
+	} elseif (pMovmtType = 41) {
+		set strMovmtType = "Inventário"
+	
+	} elseif (pMovmtType = 51) {
+		set strMovmtType = "Movimentação no armazém (palete)"
+	
+	} else {
+		set strMovmtType = pMovmtType		
+	}
+	
+	quit strMovmtType
+	
+GetMovmtLink(pMovmtType,pTxnCode)
+	if (pMovmtType = "") || (pTxnCode = "") quit ""
+
+	new strMovmtLink, idAdjType
+	
+	if (pMovmtType = 1) {
+		set strMovmtLink = "INReceipt"	
+	
+	} elseif (pMovmtType = 5) {
+		set strMovmtLink = "INMOV"	
+	
+	} elseif (pMovmtType = 7) {
+		set strMovmtLink = "INRECReverse"	
+	
+	} elseif (pMovmtType = 8) {
+		set strMovmtLink = "INReturnToSupplier"
+	
+	} elseif (pMovmtType = 11) {
+		if ($$CheckMEDDispenseType(pTxnCode) = $$$YES) {
+			set strMovmtLink = "MEDDispense"	
+		}
+		else {
+			set strMovmtLink = "INIssue"	
+		}
+	
+	} elseif (pMovmtType = 21) {
+		set strMovmtLink = "INDispenseToPatient"	
+	
+	} elseif (pMovmtType = 22) {
+		set strMovmtLink = "INIssueRev"
+
+	} elseif (pMovmtType = 30) {
+		set strMovmtLink = "INTFR"
+
+	} elseif (pMovmtType = 31) {
+		set strMovmtLink = "INRECTFR"
+
+	} elseif (pMovmtType = 32) {
+		set strMovmtLink = "INTFRRev"
+
+	} elseif (pMovmtType = 35) {
+		set strMovmtLink = "INMOIssue"
+
+	} elseif (pMovmtType = 36) {
+		set strMovmtLink = "INMOREC"
+
+	} elseif (pMovmtType = 37) {
+		set strMovmtLink = "INMORev"
+
+	} elseif (pMovmtType = 38) {
+		set strMovmtLink = "INMORev"
+
+	} elseif (pMovmtType = 40) {		
+		set idAdjType = $piece($get(^INADJ(YM,pTxnCode,1)),Y,1)		
+		
+		if idAdjType = 5 {
+			set strMovmtLink = "VARINADJDoacao"		
+		} else {
+			set strMovmtLink = "VARINADJ"	
+		}	
+	
+	} elseif (pMovmtType = 41) {
+		set strMovmtLink = "INADJ" ;INWEINVP
+	
+	} elseif (pMovmtType = 51) {
+		set strMovmtLink = "INMOVByPallet"
+
+	} else {
+		set strMovmtLink = ""		
+	}
+	
+	quit strMovmtLink	
+	
+	
+GetMovmtVetor(pMovmtType,pQty)
+	if pMovmtType = "" quit ""
+
+	new strMovmtVetor
+	set strMovmtVetor = ""
+
+	if (pMovmtType = 1) {
+		set strMovmtVetor = "Entrada"	
+	
+	} elseif ( (pMovmtType = 5) || (pMovmtType = 51) ) {
+		set strMovmtVetor = "Realocação"	
+	
+	} elseif (pMovmtType = 7) {
+		set strMovmtVetor = "Saída"
+
+	} elseif (pMovmtType = 8) {
+		set strMovmtVetor = "Saída"
+
+	} elseif (pMovmtType = 11) {
+		if pQty > 0 {
+			set strMovmtVetor = "Entrada"
+		} elseif pQty < 0 {
+			set strMovmtVetor = "Saída"
+		}
+
+	} elseif (pMovmtType = 21) {
+		set strMovmtVetor = "Saída"
+	
+	} elseif (pMovmtType = 22) {
+		if pQty > 0 {
+			set strMovmtVetor = "Entrada"
+		} elseif pQty < 0 {
+			set strMovmtVetor = "Saída"
+		}
+	
+	} elseif (pMovmtType = 30) {
+		set strMovmtVetor = "Saída"
+	
+	} elseif (pMovmtType = 31) {
+		if pQty > 0 {
+			set strMovmtVetor = "Entrada"
+		} elseif pQty < 0 {
+			set strMovmtVetor = "Saída"
+		}
+	
+	} elseif (pMovmtType = 32) {
+		set strMovmtVetor = "Entrada"
+	
+	} elseif (pMovmtType = 35) {
+		set strMovmtVetor = "Saída"
+	
+	} elseif (pMovmtType = 36) {
+		set strMovmtVetor = "Entrada"
+	
+	} elseif (pMovmtType = 37) {
+		set strMovmtVetor = "Entrada"
+	
+	} elseif (pMovmtType = 38) {
+		set strMovmtVetor = "Saída"
+	
+	} elseif (pMovmtType = 40) {
+		if pQty > 0 {
+			set strMovmtVetor = "Entrada"
+		} elseif pQty < 0 {
+			set strMovmtVetor = "Saída"
+		}
+		
+	} elseif (pMovmtType = 41) {
+		if pQty > 0 {
+			set strMovmtVetor = "Entrada"
+		} elseif pQty < 0 {
+			set strMovmtVetor = "Saída"
+		}
+	
+	} else {
+		set strMovmtVetor = ""
+	}
+	
+	quit strMovmtVetor
+	
+GetMovmtFromTo(pMovmtType,pTxnCode,pPhysicalStorage="",pTxnCodeLine="",pTxnType="")
+	if $get(YM)="" do ^WWWVAR
+	if (pMovmtType = "") || (pTxnCode = "") quit ""
+	
+	new strMovmtFromTo, idFornecedor, idLocal, idTransfer, idPaciente, idAdjType, idEntidadeDoacao, 
+		idSaida, idRecSource, idMEDDispense, idIssue, idDestinationLocn, idSupplyingLocn
+	
+	set strMovmtFromTo = ""
+
+	if (pMovmtType = 1) {  		//Recebimento
+		set idFornecedor = $piece($get(^INREC(YM,pTxnCode,1)),Y,49)
+		set strMovmtFromTo = $$SQLGetDescFornecedor^VARSQL(idFornecedor)
+
+	} elseif (pMovmtType = 5) {
+		
+		set objStorage = $get(^INMOVLine(YM,pTxnCode,pTxnCodeLine,1))
+		set FromStorage = $piece(objStorage,Y,2)
+		set ToStorage   = $piece(objStorage,Y,7)	
+		set strMovmtFromTo = FromStorage_" -> "_ToStorage
+	
+	} elseif (pMovmtType = 7) {
+		set idRecSource = $piece($get(^INREC(YM,pTxnCode,1)),Y,78)
+		if (idRecSource '= "") {
+			set idFornecedor = $piece($get(^INREC(YM,idRecSource,1)),Y,49)
+			set strMovmtFromTo = $$SQLGetDescFornecedor^VARSQL(idFornecedor)
+		} else { 
+			set strMovmtFromTo = ""
+		}	
+
+	} elseif (pMovmtType = 8) {
+		set idFornecedor = $piece($get(^INIssue(YM,pTxnCode,1)),Y,34)
+		set strMovmtFromTo =  $$SQLGetDescFornecedor^VARSQL(idFornecedor)
+
+	} elseif (pMovmtType = 11) {
+		
+		set objIssue = $get(^INIssue(YM,pTxnCode,1))
+		set idDestinationLocn = $$$INIssueToLocn(objIssue)
+		set idSupplyingLocn   = $$$INIssueFromLocn(objIssue)
+			
+		if (pTxnType = 7) {
+				
+			if ($$CheckMEDDispenseType(pTxnCode) = $$$YES) {					
+				set idMEDDispense = $$GetMEDDispenseID(pTxnCode)
+				set idIssue = $piece($get(^MEDDispense(YM,idMEDDispense,1)),Y,9)
+				set idPatient = $$$INIssueCustomerName($get(^INIssue(YM,idIssue,1)))
+
+				if (idDestinationLocn '= "") {
+					set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idDestinationLocn)_" ("_$$SQLGetPatientName^VARSQL(idPatient)_")"
+				} else {
+					set strMovmtFromTo = $$SQLGetPatientName^VARSQL(idPatient)					
+				}
+
+			} else {
+				set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idDestinationLocn)
+			}
+				
+		} elseif (pTxnType = 8){
+			set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idSupplyingLocn)
+		
+		} else {
+			set idLocal = $piece($get(^INIssue(YM,pTxnCode,1)),Y,2)
+			set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idLocal)
+		}
+
+	} elseif (pMovmtType = 21) {
+		set idPaciente = $piece($get(^INIssue(YM,pTxnCode,1)),Y,23)
+		set strMovmtFromTo = $$SQLGetPatientName^VARSQL(idPaciente)
+
+	} elseif (pMovmtType = 22) {
+		set idLocal = $piece($get(^INIssueRev(YM,pTxnCode,1)),Y,4)
+		
+		//Setor
+		set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idLocal)
+		
+		//Paciente
+		if strMovmtFromTo = "" {
+			set idSaida = $piece($get(^INIssueRev(YM,pTxnCode,1)),Y,1)
+			;25/10/2013 - HEVA-1262
+			;Devido a demanda CORE-93 o número da Saída (INIssue) passou para a linha da Devolução (INIssueRevLine)
+			;Porém os registros antigos ainda estão apontando para o cabeçalho (INIssueRev)
+			;Por isso foi feita a verificação abaixo:
+			if (idSaida '= ""){
+				set idPaciente = $piece($get(^INIssue(YM,idSaida,1)),Y,23)
+				set strMovmtFromTo = $$SQLGetPatientName^VARSQL(idPaciente)
+			}
+			;Caso o idSaida esteja em branco é necessário pegar o idSaida da linha (INIssueRevLine)
+			else{
+				set idSaida           = $$$INIssueRevLineIssue($get(^INIssueRevLine(YM,pTxnCode,pTxnCodeLine,1)))
+				set idPaciente        = $piece($get(^INIssue(YM,idSaida,1)),Y,23)
+				set strMovmtFromTo    = $$SQLGetPatientName^VARSQL(idPaciente)
+			}
+		}	
+	
+	} elseif (pMovmtType = 30) {
+		set idLocal = $piece($get(^INTFR(YM,pTxnCode,1)),Y,4)
+		set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idLocal)
+	
+	} elseif (pMovmtType = 31) {
+		set idTransfer = $piece($get(^INREC(YM,pTxnCode,1)),Y,19)
+		set idLocal = $piece($get(^INTFR(YM,idTransfer,1)),Y,3)
+		set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idLocal)
+	
+	} elseif (pMovmtType = 32) {
+		if $length(pTxnCode,"||")>1 set pTxnCode=$piece(pTxnCode,"||",1)_","_$piece(pTxnCode,"||",2)
+		set idLocal = $piece($get(^INTFRRev(YM,$$$KEY1(pTxnCode),$$$KEY2(pTxnCode),1)),Y,4)
+		set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idLocal)
+
+	} elseif (pMovmtType = 35) {
+		set idLocal = $$$INIssueToLocn($get(^INIssue(YM,pTxnCode,1)))
+		set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idLocal)
+
+	} elseif (pMovmtType = 36) {
+		set idLocal = $$$INRECLocation($get(^INREC(YM,pTxnCode,1)))
+		set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idLocal)
+
+	} elseif (pMovmtType = 37) {
+		set idLocal ]]><![CDATA[= $$$INMORevSupplyingLocation($ge]]><![CDATA[t(^INMORev(YM,pTxnCode,1)))
+		set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idLocal)
+
+	} elseif (pMovmtType = 38) {
+		set idLocal = $$$INMORevSupplyingLocation($get(^INMORev(YM,pTxnCode,1)))
+		set strMovmtFromTo = $$SQLGetLocationName^VARSQL(idLocal)
+
+	} elseif (pMovmtType = 40) {
+
+		set idAdjType = $piece($get(^INADJ(YM,pTxnCode,1)),Y,1)
+		
+		if idAdjType = 5 {
+			set idEntidadeDoacao = $piece($get(^INADJ(YM,pTxnCode,1)),Y,11)
+			set strMovmtFromTo = $$SQLGetNomeEntidadeDoacao^VARSQL(idEntidadeDoacao)
+		} else {
+			set strMovmtFromTo = ""
+		}
+	
+	} elseif (pMovmtType = 51) {
+		set strMovmtFromTo = $piece(pPhysicalStorage,"||",1)_" -> "_$piece(pPhysicalStorage,"||",2)
+	
+	} else {
+		set strMovmtFromTo = ""
+	}
+	
+	quit strMovmtFromTo
+
+GetProcessedBy(pMovmtType,pTxnCode)
+	if (pMovmtType = "") || (pTxnCode = "") quit ""
+	
+	new processedBy
+	if (pMovmtType = 1) {  		//Recebimento
+		set processedBy = $piece($get(^INREC(YM,pTxnCode,1)),Y,7)
+	
+	} elseif ( (pMovmtType = 5) || (pMovmtType = 51) ) {   //Movimentação no Armazém
+		set processedBy = $piece($get(^INMOV(YM,pTxnCode,1)),Y,25)
+	
+	} elseif (pMovmtType = 7) {  //Estorno de Recebimento
+		set processedBy = $piece($get(^INREC(YM,pTxnCode,1)),Y,7)
+	
+	} elseif (pMovmtType = 8) {  //Devolução ao Fornecedor
+		set processedBy = $piece($get(^INIssue(YM,pTxnCode,1)),Y,10)
+		if processedBy = "" set processedBy = $piece($get(^INIssue(YM,pTxnCode,1)),Y,8)
+	
+	} elseif (pMovmtType = 11) {  //Requisição/Saída
+		set processedBy = $piece($get(^INIssue(YM,pTxnCode,1)),Y,10)
+		if processedBy = "" set processedBy = $piece($get(^INIssue(YM,pTxnCode,1)),Y,8)
+	
+	} elseif (pMovmtType = 21) {  //Dispensação ao Paciente
+		set processedBy = $piece($get(^INIssue(YM,pTxnCode,1)),Y,10)
+		if processedBy = "" set processedBy = $piece($get(^INIssue(YM,pTxnCode,1)),Y,8)
+	
+	} elseif (pMovmtType = 22) {  //Devolução ao Estoque
+		set processedBy = $piece($get(^INIssueRev(YM,pTxnCode,1)),Y,11)
+		if processedBy = "" set processedBy = $piece($get(^INIssueRev(YM,pTxnCode,1)),Y,9)
+	
+	} elseif (pMovmtType = 30) {  //Transferência
+		set processedBy = $piece($get(^INTFR(YM,pTxnCode,1)),Y,16)
+	
+	} elseif (pMovmtType = 31) {  //Aceite de Transferência
+		set processedBy = $piece($get(^INREC(YM,pTxnCode,1)),Y,7)
+	
+	} elseif (pMovmtType = 32) {  //Estorno de Transferência
+		if $length(pTxnCode,"||")>1 set pTxnCode=$piece(pTxnCode,"||",1)_","_$piece(pTxnCode,"||",2)
+		set processedBy = $piece($get(^INTFRRev(YM,$$$KEY1(pTxnCode),$$$KEY2(pTxnCode),1)),Y,16)
+	
+	} elseif (pMovmtType = 35) {  //Recebimento da produção
+		set processedBy = $$$INIssueChangedBy($get(^INIssue(YM,pTxnCode,1)))
+	
+	} elseif (pMovmtType = 36) {  //Saída de Produtos para Produção
+		set processedBy = $$$INRECProcessedBy($get(^INREC(YM,pTxnCode,1)))
+	
+	} elseif (pMovmtType = 37) {  //Estorno de componente da produção
+		set processedBy = $$$INMORevModifiedBy($get(^INMORev(YM,pTxnCode,1)))
+	
+	} elseif (pMovmtType = 38) {  //Estorno da produção
+		set processedBy = $$$INMORevModifiedBy($get(^INMORev(YM,pTxnCode,1)))
+	
+	} elseif (pMovmtType = 40) {  //Saída Material Vencido
+		set processedBy = $piece($get(^INADJ(YM,pTxnCode,1)),Y,33)
+	
+	} elseif (pMovmtType = 41) {  //Inventário
+		set processedBy = $piece($get(^INADJ(YM,pTxnCode,1)),Y,33)
+	
+	} else {
+		set processedBy = ""
+	}
+	
+	if processedBy '= "" quit $piece($get(^WWW013(YM,processedBy,1)),Y,1)	
+	
+	quit processedBy
+	
+CanViewReport()
+	
+	if ($piece($get(^VARTempStockHistory(YM,YBED,1)),Y,1) = ""){
+		new strStatus
+	    set strStatus = "Selecione um registro para gerar o relatório"	
+	    $$$YQHandler(strStatus)
+	}
+	quit
+
+BlurVisualizacao()
+	if ($piece($$$GetFormData(YFORM,"M"),Y,8) = $$$SIMPLIFICADO) {
+		set %TXT(1) = "#Y"_YFORM_"M7~"_
+					  "#Y"_YFORM_"M7~READ"_
+					  "#Y"_YFORM_"M6~READ"_
+					  "#Y"_YFORM_"M5~READ"_
+					  "#Y"_YFORM_"M6~UNCHECKED"
+	}else{
+		set %TXT(1) = "#Y"_YFORM_"M7~WRITE"_
+					  "#Y"_YFORM_"M6~WRITE"_
+					  "#Y"_YFORM_"M5~WRITE"
+	}
+	quit
+	
+ImprimeRelatorio()
+	new Item, Location, dteInicial, dteFinal, pFiltroEnd
+	
+	if ($piece($$$GetFormData(YFORM,"M"),Y,8) = $$$DETALHADO) {
+		do RunReportMovEstoqueProduto^VARJasperRunReport(YBED)
+	}else{
+		set Item = $piece(^VARTempStockHistory(YM,YBED,1),Y,1)
+		set Location = $piece(^VARTempStockHistory(YM,YBED,1),Y,2)
+		set dteInicial = $piece(^VARTempStockHistory(YM,YBED,1),Y,3)
+		set dteFinal = $piece(^VARTempStockHistory(YM,YBED,1),Y,4)
+		set pProgram = $piece(^VARTempStockHistory(YM,YBED,1),Y,5)
+		set pFiltroEnd = $piece(^VARTempStockHistory(YM,YBED,1),Y,6)
+		do RunReportFichaDeEstoque^VARJasperRunReport(Item, Location, dteInicial, dteFinal, pFiltroEnd, pProgram)
+	}
+	quit
+	
+GetMovmtType2(pMovmtType,pTxnCode)
+	quit $$GetMovmtType($listget(pMovmtType, 1),pTxnCode)
+ 
+GetMovmtFromTo2(pMovmtType,pTxnCode)
+	quit $$GetMovmtFromTo($listget(pMovmtType, 1),pTxnCode)
+	
+CheckMEDDispenseType(pTxnCode)
+	;Incluída também a validação da existência do idPatient para garantir que a Issue vem de um registro da MEDDispense.
+	quit:(pTxnCode = "") ""
+	new idDispense, objDispense, objIssue
+	set objIssue = $get(^INIssue(0,pTxnCode,1))
+	set idDispense = $$$INIssueReference(objIssue)
+	set idPatient  = $$$INIssueCustomerName(objIssue)
+	quit:( (idDispense = "") || (idPatient = "") ) ""
+	set objDispense = $get(^MEDDispense(0,idDispense,1))
+	if (objDispense '= "") quit $$$OK
+	quit ""
+	
+GetMEDDispenseID(pTxnCode)
+	quit:(pTxnCode = "") ""
+	new idDispense, objDispense, objIssue
+	set objIssue = $get(^INIssue(0,pTxnCode,1))
+	set idDispense = $$$INIssueReference(objIssue)
+	quit:(idDispense = "") ""
+	set objDispense = $get(^MEDDispense(0,idDispense,1))
+	if (objDispense '= "") quit idDispense
+	quit ""]]></Routine>
+</Export>

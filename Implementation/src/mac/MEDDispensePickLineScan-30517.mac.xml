@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDDispensePickLineScan" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDDispensePickLineScan
+	
+#include COMGridEdit31
+#include INConst
+#include %occInclude
+#def1arg WWWDATEN(%args) ^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V",%args)
+#include WWWConst
+#include COMSYS
+#include MEDConst
+	
+AddScanLine(pidScan)
+    ;-------------------------------------------------------------------------------
+    ; Routine to Add a new line to a Grid after a Scan is validated
+    ;
+    ; Assumptions :
+    ;  YFORM	-	 Form Name
+    ; 
+    ; Returns:
+    ; 	Status
+    ;
+    ; History:
+    ; 02-Oct-2014	SCR		HEVA-1363: Lot Number Required
+    ; 02-Oct-2014	SCR		HEVA-1363: Return 1st Zero Line for the item
+	; 29-Sep-2014	SCR		HEVA-1363: Exclude Completed lines
+	; 14-Nov-2012	SCR		SR18198: Corrected operation with lot scanning
+	; 12-Nov-2012	SCR		SR18198: Update Pick Qty
+	; 10-May-2012	PPP		SR18002: Created
+    ;-------------------------------------------------------------------------------
+	new arrBundle,arrComLines,arrFields,blnItemExists,idBundle,idClass,idFromLocn
+	new idIssue,idItem,idLine,idLot,idOriginalLine,idStorage,idToLocn,idType,objHeader
+	new objLine,objOldData,sc,strDelim,strKey,strStatus,idFirstZeroLine
+ 	
+ 	set strDelim 	= $$$ScanDelim
+ 	set strStatus	= $$$OK
+	set idItem 		= ""	
+	if $get(YFORM)'="" {
+		set idClass       = $$$GetClass(YFORM)
+		set objLine       = ""
+		set idItem        = $piece(pidScan,strDelim,1)
+		set idLot         = $piece(pidScan,strDelim,2)
+		set objHeader     = $$$GRIDYFELDContainer
+	 	set idFromLocn    = $$$MEDDispenseSupplyingLocation(objHeader)
+	 	set idToLocn      = $$$MEDDispenseDestinationLocation(objHeader)
+	 	set idType        = $$$MEDDispenseIssueType(objHeader)
+  		set blnItemExists = $$$NO
+		
+		set idIssue       = $$$KEY1($$$GRIDYKEYContainer)
+ 		if idLot="" {
+	 		set strStatus	=	$$$MakeStatus("MED01439")  ;Lot Number Required
+	 		quit strStatus
+ 		}
+ 		// For Picking Screens Only
+ 		// arrBundle(Bundle ID ,Storage ID) = Qty
+ 		set sc = $$GetBundleForAttData^WWW120Scan(idItem,idFromLocn,pidScan,.arrBundle,.idBundle,.idStorage)
+  
+ 		if $$$ISERR(sc) set strStatus = $$ISStatusToDLStatus^COMUtilError(sc) quit strStatus    //EARLY EXIT
+		
+		//Process only if Bundle Exist for the Item/Lot combination and has Qty
+		if $get(idBundle)'="" {
+ 
+			//Get the data for the Item if it already exists
+			//Need to update arrBundle if lines already exist
+			do CheckCompeltedLines(idIssue,.arrComLines)
+			set idLine = $$GetRowLineWithQtyChecks^COMGridEdit31Scan(idItem, 
+			                                                         $$$FldMEDDispensePickLineItem, 
+			                                                         $$$FldMEDDispensePickLineBundle, 
+			                                                         $$$FldMEDDispensePickLineFromStorage, 
+			                                                         $$$FldMEDDispensePickLinePickQty, 
+			                                                         .idBundle,
+			                                                         .idStorage,
+			                                                         .arrBundle, 
+			                                                         .blnItemExists,,,
+			                                                         .arrComLines,
+			                                                         .idFirstZeroLine)
+			if idLine {
+				kill arrFields
+			}
+			if ('idLine)&&(idFirstZeroLine'="") {
+				set idLine	= idFirstZeroLine
+				kill arrFields
+				set $$$MEDDispensePickLineBundle(objLine)			= idBundle
+				set $$$MEDDispensePickLineFromStorage(objLine)		= idStorage
+				set arrFields($$$FldMEDDispensePickLineBundle)		= $$$MEDDispensePickLineBundle(objLine)
+				set arrFields($$$FldMEDDispensePickLineFromStorage)	= $$$MEDDispensePickLineFromStorage(objLine)
+			}	
+			if idLine {
+				set (objLine,objOldData) = $$$GRIDGetYFELD(idLine)
+				set $$$MEDDispensePickLinePickQty(objLine)   = $$$MEDDispensePickLinePickQty(objLine) + 1 ; SR18198
+				
+				//set the array for the fields that are updated
+				set arrFields($$$FldMEDDispensePickLinePickQty)= $$$MEDDispensePickLinePickQty(objLine)		//UPDATE SR18198
+				;set arrFields($$$FldMEDDispensePickLineIssueQty)= $$$MEDDispensePickLineIssueQty(objLine)		//UPDATE
+				
+				//Updates the Row and Displayes it (for existing lines)
+				//If the row is on another page displays the lines at the top of the grid
+				do UpdateRow^COMGridEdit31Scan(YFORM, idLine, .arrFields, objOldData)
+	 
+			} else {
+				if $get(idBundle)'="" {
+					if (blnItemExists = $$$YES) {
+						set idOriginalLine = $$GetIssueLine(idIssue,idItem,.arrComLines)
+						
+						if idOriginalLine'="" {
+							// This is specific to INIssue , Copy the original Data and Update Relevant details
+							// Cannot create new data records only copies, has important info DEMAND NO, REFERENCE etc.
+							set strStatus = $$DuplicateOnly^COMGridEdit31Scan(idIssue_$$$COMMA_idOriginalLine,.objLine,.strKey)
+							// Create line with quantity 0 to after call AddScanLine and increment quantity and update data fields <<< HEVA-1207 >>>
+							set $$$MEDDispensePickLinePickQty(objLine)   	= 0
+							do OnBlurPickQty^MEDDispensePickLine(YKEY, "",$$$MEDDispensePickLinePickQty(objLine), .objLine) 			; SR18198 init qty
+
+							;set $$$MEDDispensePickLineIssueQty(objLine)   	= 1
+							set $$$MEDDispensePickLineRequestedQty(objLine) = $$$MEDDispensePickLineRequestedQty($get(^MEDDispensePickLine(0,idIssue,idOriginalLine,1)))
+							set $$$MEDDispensePickLineFromStorage(objLine) 	= idStorage
+							set $$$MEDDispensePickLineBundle(objLine)      	= idBundle
+							do AddLine^COMGridEdit31Add(objLine,strKey,,$$$YES,"",$$$YES,$$$NO,$$$NO)
+							do UpdateContainer^COMGridEdit31G()
+							// call AddScanLine to increment quantity and update data fields <<< HEVA-1207 >>>
+							do AddScanLine(pidScan)
+						}
+						
+					} else {
+						set strStatus = $$$MakeStatus("IN01039")
+					}   ; "Cannot Add Lines to Current Record"
+				}
+			}		
+			
+		} else {
+			set strStatus = $$$MakeStatus("IN01040",idItem,idFromLocn)
+		}   ; "Stock Unavailable for Item %1 at Location %2"
+ 
+	}
+	
+	quit strStatus
+	
+	
+GetIssueLine(pidIssue, pidItem,&parrComLines)
+    ;-------------------------------------------------------------------------------
+    ; Get the IssueLine associated with the given Item
+    ; Assumptions :
+    ;  YFORM	-	 Form Name
+    ; 
+    ; Returns:
+    ; 	idLine
+    ;
+    ; History:
+	; 29-Sep-2014	SCR		HEVA-1363: dont check completed lines
+	; 10-May-2012	PPP		SR18002: Created
+    ;-------------------------------------------------------------------------------
+	new idIssueLine,objIssueLine
+
+	set idIssueLine = ""
+	for {
+		set idIssueLine = $order(^MEDDispensePickLine(0,pidIssue,idIssueLine))
+		quit:idIssueLine=""
+		continue:$get(parrComLines(idIssueLine))
+
+		set objIssueLine = $get(^MEDDispensePickLine(0,pidIssue,idIssueLine,1))
+		if $$$MEDDispensePickLineItem(objIssueLine) = pidItem quit
+	}
+
+	quit idIssueLine
+
+CheckCompeltedLines(pidDispense,&parrComLines)
+	;-------------------------------------------------------------------------------
+    ; Check For Completed Lines
+    ;
+    ; History:
+	; 29-Sep-2014	SCR		HEVA-1363: Created
+    ;-------------------------------------------------------------------------------
+	new arrLine,fltReq,idDataLine,idPres,objDispense,objGridLine
+
+	kill arrLine
+	kill parrComLines
+	set objDispense	= $get(^MEDDispense(YM,pidDispense,1))
+	set idPres		= $$$MEDDispensePrescription(objDispense) 
+	set idDataLine = "" 
+	for {
+		set idDataLine = $order($$$WWWDATEN("REFERENCEROW",idDataLine))
+		quit:idDataLine=""
+		continue:($get($$$WWWDATEN("KILLEDRECORD",$get($$$WWWDATEN("REFERENCEROW",idDataLine,1))))=$$$YES)
+		set objGridLine = $$$GRIDGetYFELD(idDataLine)
+		set arrLine(idDataLine\1) = $get(arrLine(idDataLine\1)) + $$$MEDDispensePickLinePickQty(objGridLine)
+					
+	}
+	set idDataLine = "" 
+	for {
+		set idDataLine = $order($$$WWWDATEN("REFERENCEROW",idDataLine))
+		quit:idDataLine=""
+		continue:($get($$$WWWDATEN("KILLEDRECORD",$get($$$WWWDATEN("REFERENCEROW",idDataLine,1))))=$$$YES)
+		set objGridLine = $$$GRIDGetYFELD(idDataLine)
+		;do GetRx^MEDDispenseProcess(pidDispense,idPres,idDataLine,.idRx,.idRxLine)
+		if $$$MEDPrescriptionLineStatus($get(^MEDPrescriptionLine(0,idPres,idDataLine,1)))=6 {
+			continue
+		} 
+		set fltReq = $$$MEDDispensePickLineRequestedQty(objGridLine)
+		if arrLine(idDataLine\1)'<fltReq {
+			set parrComLines(idDataLine)	= $$$YES
+		}
+	}
+	quit
+	
+]]></Routine>
+</Export>

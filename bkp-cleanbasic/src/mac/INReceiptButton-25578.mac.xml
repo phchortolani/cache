@@ -1,0 +1,805 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReceiptButton" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReceiptButton
+	;+++++++++++++++++++++++++++++++++++++++
+	; Receipt Button processing
+	; see INRECDoco
+	; 
+	; 31-Jul-2009	GRF		SR16602: Split "Post Receipt" tags to INReceiptButtonP
+	; 03-Jul-2009	GRF		SR16649: Split from INReceipt
+	;+++++++++++++++++++++++++++++++++++++++
+#include COMSYS
+#include INConst
+#include COMConst
+#include %occInclude
+#include COMGridEdit31
+#include INSYS
+	
+#define FORMINReceiptSuppOrder(%obj) $piece(%obj,"~",7)
+	
+#define EnumTypeStandard	0
+#define EnumTypeBonus		2
+#define IsItemLine   ((enumLineType=$$$EnumTypeStandard) || (enumLineType=$$$EnumTypeBonus))
+#define IsChargeLine ((enumLineType'="") && (enumLineType'=$$$EnumTypeStandard) && (enumLineType'=$$$EnumTypeBonus))
+
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReceiptButton("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+CanSearchOrders(pidReceipt,pobjReceipt)
+	;-------------------------------------------------------------------------------
+	; Disable buttons that allow you to search order and load the order if the
+	; receipt has already been firmed
+	; 
+	; History:
+	; 01-Jun-2009	GRF		SR16589: Use standard message (32072 replaces 374)
+	; 29-May-2009	DWR		SR16589: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	
+	if $$$NoKey(pidReceipt) {
+		set strStatus = $$$MakeStatus(32072)          ; "Please Select A Data Record First."
+	} 
+	
+	if $$$ISOK(strStatus) && $$$INRECFirmed(pobjReceipt) {
+		set strStatus = $$$MakeStatus("IN01035")      ; "Receipt already firmed"
+	}
+	
+	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	
+ListSuppliers()
+	;-------------------------------------------------------------------------------
+	; Lists suppliers with open orders
+	; 
+	; History:
+	; 05-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	$$$LogR("ListSuppliers","")
+	quit
+	
+	
+ListOrders()							;FIXME not being called yet
+	;-------------------------------------------------------------------------------
+	; Lists Orders that have outstanding lines with no received qty
+	; 
+	; Changes required Pending changeover to INPO
+	; 
+	; History:
+	; 17-Mar-2009	DavidR	SR16363: modifed filters not to show oders that have been
+	;							completed.
+	; 05-Mar-2009	HQN		SR16363: Added additional filters
+	; 03-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new idSupplier
+	
+	$$$LogR("ListOrders","")
+	
+	set idSupplier = $$$INRECSupplier($get(^WWWDATEN(YM,+$horolog,YUSER,"INReceipt","D",1)))
+	do Initialise^COMViewCustom("INAUF","",$$$YES)
+	; 05-Mar-2009 vvvv
+	do AddFilter^COMViewCustom("P1.CINAUF.D60",$$$EnumCOMVIEWCOMPARATORNotEquals,"1")    ; Only open order
+	;do AddFilter^COMViewCustom("P1.CINAUFP.D109",$$$EnumCOMVIEWCOMPARATORLessThan," ")  ; nothing received Incoming Goods Qty
+	if '(+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+		do AddFilter^COMViewCustom("P1.CINAUFP.D60",$$$EnumCOMVIEWCOMPARATORNotEquals,"1")   ; Not Completed
+	}
+	do AddFilter^COMViewCustom("D2","=",2)                                               ; Purchase Order
+	if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+		;16-Nov-2009  Karine  Don't show Orders unprocessed - Free 14 customized
+		do AddFilter^COMViewCustom("D348",">",0)
+		do AddFilter^COMViewCustom("D348",$$$EnumCOMVIEWCOMPARATORNotEquals,"3")
+	}
+	; 05-Mar-2009 ^^^^
+	do:idSupplier'="" AddFilter^COMViewCustom("D12","=",idSupplier)
+	
+	do Start^COMViewCustom("WWW2.YINReceiptM7")
+	quit
+	
+	
+SelectOrder()
+	;-------------------------------------------------------------------------------
+	; Add all valid lines to the INRECSummary grid. And displays an error if no lines
+	; loaded
+	;
+	; Params:	none
+	;
+	; ByRefs:	none
+	;
+	; Returns:	none
+	;
+	; History:
+	; 03-Sep-2012	SCR		SR18099 Added Single/Multiple Order Load option
+	; 02-Oct-2009	PPP		SR16924: Created
+	;-------------------------------------------------------------------------------
+	new blnAdded, idOrder, exists, blnOtherError
+
+	set blnAdded = $$$NO
+	set blnOtherError = $$$NO				; SR18099
+	set exists = $$$NO
+
+	if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+		;17-Nov-2009  Karine Check if already has an Order chose on the line
+		set idDataLine = ""
+		for {
+			set idDataLine = $order(^WWWDATEN(YM,+$horolog,YUSER,"INRECSummary","V","REFERENCEROW",idDataLine))  ; 2.01
+			quit:idDataLine=""
+			set idGridRow = $get(^WWWDATEN(YM,+$horolog,YUSER,"INRECSummary","V","REFERENCEROW",idDataLine,1))   ; 2x01
+			continue:$data(^WWWDATEN(YM,+$horolog,YUSER,"INRECSummary","V","KILLEDRECORD",idGridRow)) ; 03-Mar-2009
+
+			set objRECSummary = $$$GRIDGetYFELD(idDataLine)
+			set orderChoose = $$$INRECSummaryPurchaseOrder(objRECSummary)
+
+			if orderChoose'= ""  {
+				$$$Alert("IN01804") ; Already exist purchase order to this receipt
+				set exists = $$$OK
+				quit
+			}
+
+		}
+		;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^END  Karine17-Nov-2009
+	}
+
+	if exists = $$$NO {
+		set idOrder = $$$FORMINReceiptSuppOrder($get(^WWWDATEN(YM,+$horolog,YUSER,"INReceipt","M",1)))
+		set idReceiptNo = $$$KEY1($get(^WWWDATEN(YM,+$horolog,YUSER,"INReceipt","P",1)))
+
+		;do LoadLines(.blnAdded)		
+		do LoadLines(.blnAdded,.blnOtherError)	; SR18099	
+
+		if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+			;17-Nov-2009  Karine Set piece 30, free10 = idOrder chosen, and don't let choose another order
+			do UpdateHeaderField^COMGridEdit31G("D30",idOrder)
+			;^^^^^^^^
+			if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+				do UpdateHeaderField^COMGridEdit31G("D36",$$$INAUFStandardCondition($get(^INAUF(YM,idOrder,1))))
+			}
+		}
+
+		;if 'blnAdded {
+		if ('blnAdded)&&('blnOtherError) { 		; SR18099
+			$$$Alert("IN00527")  	// "There are no applicable lines to receipt"
+		}
+	}
+	quit
+	
+	
+LoadLines(&pblnAdded,&pblnOtherError)
+	;-------------------------------------------------------------------------------
+	; TODO: Create orders from INPOLines instead of INAUFP
+	; 
+	; Inputs:
+	;   pblnAdded - By Ref = True if lines have been added to the Receipt Grid
+	;
+	; ByRef:
+	;	YGRIDWHITE
+	;	YGRIDGRAY
+	;	
+	; History:
+	; 03-Sep-2012	SCR		SR18099 Added Single/Multiple Order Load option
+	; 03-Nov-2010	GRF		SR17492: get idItem once; move objINVORG outside for loop
+	; 09-Sep-2010	PPP		SR17492: Get the Supplier Item Number from the Item
+	;							Supplier Details
+	; 20-Oct-2009	PPP		SR17051: Check if the Order Exists before loading it
+	; 09-Oct-2009	GRF		SR16924: replaced continue with if block since too far
+	; 							from FOR for easy maintenance - copied and cleaned
+	; 							up code
+	; 02-Oct-2009	PPP		SR16924: Changed the subroutine name to LoadLines from
+	; 							SelectOrder; Added By Ref parameter - pblnAdded
+	; 28-Aug-2009	GRF		SR16815: use intermediate variables to simplify later
+	; 							calculations; doco
+	; 18-Aug-2009	DWR		SR16797: After further discussions, changes reinstated
+	; 14-Aug-2009	DWR		SR16797: included call to Update^COMGridEdit31Interface
+	; 							at end, reverted earlier changes in favour of this.
+	; 13-Aug-2009	PPP		SR16815: Update the REC Line using the Suppliers Details
+	;								 if they exist else just use Order Line Details
+	; 07-Aug-2009	DWR		SR16822: Created callouts to INRECSummaryUtil for values
+	; 							and validation based on the order.
+	; 06-Aug-2009	PPP		SR16815: Extended Cost based on UnitQty
+	; 30-Jul-2009	DWR		SR16797: Passed in extra parameter that doesnt call for
+	; 							a screen update when adding the row, this will just
+	; 							trigger core rules check because have no OnBeforeFormat
+	; 26-Jun-2009	GRF		SR16661: tighten testing for default grid
+	; 18-Jun-2009   DWR		SR16652: moved the call to calculate the summary total, 
+	;							before the $$$GridAddBatchStop call.
+	; 01-Jun-2009	GRF		SR16589: Initial quit with reorganisation and relocation
+	;							of call to CalculateSummTotal
+	; 28-May-2009	DWR		SR16583: Added population of Extended Cost and Cost After
+	;							discount of Summary Line, when loading from order.
+	;							Made call to Update the Summary Total field in the 
+	;							header based on all lines added (and existing) onto
+	;							the grid. 
+	; 27-May-2009	DWR		SR16580: Commented out call to SwitchReadOnly^COMGridEdit31G
+	;							not correct usage, and not the right place to format
+	;							the grid. formatting now done in 
+	;							OnBeforeFormat^INRECSummary
+    ; 25-May-2009	PPP		SR16565: Scanning Prompt for Grid,If a Scanning Form
+    ;							then clearout Qty
+	; 01-Apr-2009	DWR		SR16363: Set Line type to Standard when creating lines
+	; 18-Mar-2009	DavidR	SR16363: added a check to see if order exists on another 
+	;							open receipt, and provides a warning
+	; 11-Mar-2009	DavidR	SR16363: modified the look for checkbox to come from 
+	;							parameter set in form INVORG
+	; 10-Mar-2009	DavidR	SR16363: include look for checkbox to auto fill qty 
+	;							received if checked. (reverted 11-Mar-2009 in favour
+	;							of system setting) 
+	; 06-Mar-2009	HQN		SR16363: Hardcoded setting to mimic record loading.
+	; 05-Mar-2009	HQN		SR16363: Default Units and Qty Received
+	;							Removed setting values to first line, too many 
+	;							side effects
+	; 02-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new blnOnlyDefaultRow,fltConv,fltQtyReceived,fltQtyRemaining,fltUnitCost
+	new idFirstRow,idItem,idLastRow,idOrder,idOrderLine,idOrderSup,idReceiptNo
+	new idReceivedUnit,idSupp,intLFDAT,loopPieces,objINVORG,objOrder,objOrderLine
+	new objRECLine,objRow1,objSummaryLine,strDataItem,strLFDAT,strSupDetails,blCreateLineError
+	
+	$$$LogR("LoadLines","")
+	
+	set idOrder = $$$FORMINReceiptSuppOrder($get(^WWWDATEN(0,+$horolog,YUSER,"INReceipt","M",1)))
+	quit:idOrder=""
+	quit:'$data(^INAUF(0,idOrder))
+	set pblnOtherError=$$$NO	; SR18099
+	
+	set idSupp  = $$$INRECSupplier($get(^WWWDATEN(0,+$horolog,YUSER,"INReceipt","D",1)))
+	
+	set YGRIDWHITE = "white"
+	set YGRIDGRAY  = "gainsboro"
+	
+	set objOrder   = $$GetObjOrder^INRECSummaryUtil(idOrder)
+	set idOrderSup = $$GetSupplierID^INRECSummaryUtil(objOrder)
+	if idSupp '= idOrderSup {
+		if ('(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))){
+			$$$Alert($$$Text($listbuild("IN00931",idOrder,idOrderSup,idSupp)))
+			; "Cannot load order %1. Supplier %2 does not match this receipt supplier %3."
+		}
+	
+	} else {
+		set idReceiptNo = $$$KEY1($get(^WWWDATEN(0,+$horolog,YUSER,"INReceipt","P",1)))
+		do CheckOrderNo(idOrder,idReceiptNo)
+		
+		$$$GRIDAddBatchStart
+		set objINVORG = $get(^INVORG(0,0,1))     ; Moved outside for loop - doesn't change ; SR17492
+		
+		; SR18099 vvvvvvvvvvvvvv
+		if '$$$INVORGMultipleOrdersinasingleRe(objINVORG) {
+			$$$GRIDGetContents(.arrGrid,"INRECSummary")
+			set idLine=""
+			for { 
+				set idLine = $order(arrGrid(idReceiptNo,idLine))
+				quit:idLine=""
+			
+				set objOrderLine = $get(arrGrid(idReceiptNo,idLine))
+				set idOrderLoaded = $$$INRECSummaryPurchaseOrder(objOrderLine)
+				if (idOrderLoaded'="")&&(idOrderLoaded'=idOrder) {
+					$$$Alert($listbuild("IN01337",idOrderLoaded))  ;Can not load Multiple Orders, %1 is already loaded
+					set pblnOtherError=$$$YES 
+					quit
+				}
+
+			}
+		}
+		if pblnOtherError=$$$NO {
+		; SR18099 ^^^^^^^^^^^^^^	
+			set idOrderLine = ""
+			set blCreateLineError = $$$NO
+			for {
+				set idOrderLine = $order(^INAUFP(0,idOrder,idOrderLine))
+			;	set idOrderLine = $order(^INPOLine(0,idOrder,idOrderLine))      ; Pending changeover to INPO
+				quit:idOrderLine=""
+			
+				; FIXME : Can we do $$LineExistsOnGrid test here BEFORE building a summary line we won't use? <GRF>
+				;         Modify LineExistsOnGrid to pass in idOrder and idOrderLine.
+			
+				set objOrderLine = $get(^INAUFP(0,idOrder,idOrderLine,1))
+			;	set objOrderLine = $get(^INPOLine(0,idOrder,idOrderLine,1))     ; Pending changeover to INPO
+			
+				if $$$ISOK($$CanCreateViaOrderLine^INRECSummary(idOrder_$$$COMMA_idOrderLine,objOrderLine)) {
+					set objSummaryLine = $$CreateViaOrderLine^INRECSummary(idOrder_$$$COMMA_idOrderLine,objOrderLine)
+					set idItem         = $$$INRECSummaryItem(objSummaryLine)
+				
+					set $$$INRECSummaryStatus(objSummaryLine)   = 0 ; Unprocessed
+					set $$$INRECSummaryLineType(objSummaryLine) = 0 ; Standard
+					set $$$INRECSummaryFlag(objSummaryLine)     = $order(^INWEMERKER(0,""))
+				
+					set strSupDetails  = $$GetRecDetailsForSup^INRECSummaryUtil(idOrder,idOrderLine,objOrderLine)
+					set fltQtyReceived = +$piece(strSupDetails,Y,1)
+					set idReceivedUnit =  $piece(strSupDetails,Y,2)
+					set fltUnitCost    = +$piece(strSupDetails,Y,3)
+					set $$$INRECSummaryUnitQtyReceived(objSummaryLine)  = fltQtyReceived  ; in Supp units
+					set $$$INRECSummaryReceivedUnit(objSummaryLine)     = idReceivedUnit  ;    Supp Unit
+					if ('(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))){
+						set $$$INRECSummaryUnitCost(objSummaryLine)         = fltUnitCost     ; in Supp units
+					}
+					set $$$INRECSummarySupplierItemCode(objSummaryLine) = $$GetSupplierItemNo^INARTUtilities(idItem,idSupp) //SR17492
+
+					if fltQtyReceived {        ; Must have quantity
+						if ($$$INVORGAutoLoadQtyFrmOrder(objINVORG)=$$$YES) && '$$IsScanReq^WWW120Scan("INRECSummary") {
+							set fltConv = $$GetUOMConversion^INUOMConversion(idItem,idReceivedUnit)   ; in Inventory Units   ; SR17492
+							set $$$INRECSummaryQuantityReceived(objSummaryLine) = $$$INRECSummaryUnitQtyReceived(objSummaryLine) * fltConv
+							set $$$INRECSummaryExtendedCost(objSummaryLine)     = $$$INRECSummaryUnitQtyReceived(objSummaryLine) * fltUnitCost
+						
+						} else {
+							set $$$INRECSummaryQuantityReceived(objSummaryLine) = 0
+							set $$$INRECSummaryUnitQtyReceived(objSummaryLine)  = 0
+							set $$$INRECSummaryExtendedCost(objSummaryLine)     = 0
+						}
+					
+						set $$$INRECSummaryCostAfterDiscount(objSummaryLine) = $$$INRECSummaryExtendedCost(objSummaryLine)                                               ;SR16583
+					
+						; Check first to see that the order line in question is not already on the receipt.
+						if '$$LineExistsOnGrid^INRECSummary(objSummaryLine) {
+					
+						; FIXME - SR16661 if second order is loaded after line 1 for first order was deleted is overwriting line 2 <GRF>
+						;         Due to AddLine^COMGridEdit31Add?
+					
+						; Start from row 1 - ignoring automatic row for manual entry if present
+						;-----------------------
+					
+						; Progressively eliminate cases
+						; 1) Check for a single row
+						;   a) ROWCOUNT '= 1 indicates can't be default  - append\
+						;   b) REFERENCEROW : If first'=last then some have been killed to leave ROWCOUNT=1
+						; 
+						; 2) If only line 1 is present check if it is a default line or an actual one
+						;    - Load objRow1 and clear preset data
+						;    - Check to see if all fields are null
+						;    
+						; NOTE : If lines exist in REFERENCEROW (even if killed), the new
+						;        order will have lines numbered after those already there.
+						;        This may appear to leave gaps in the numbering.
+						;        An order loaded onto a grid where the default line has
+						;        been deleted will start at line number 2.  This should
+						;        be an unusual situation.
+					
+							set blnOnlyDefaultRow = ($get(^WWWDATEN(0,+$horolog,YUSER,"INRECSummary","V","ROWCOUNT")) = 1)
+					
+							if blnOnlyDefaultRow {
+								set idFirstRow = $order(^WWWDATEN(0,+$horolog,YUSER,"INRECSummary","V","REFERENCEROW",""))
+								set idLastRow  = $order(^WWWDATEN(0,+$horolog,YUSER,"INRECSummary","V","REFERENCEROW",""),-1)
+								set blnOnlyDefaultRow = ((idFirstRow=idLastRow) && (idFirstRow=1))
+							}
+					
+							if blnOnlyDefaultRow {
+								set objRow1 = $$$GRIDGetYFELD(1)    ; only obtained to see if it is empty except for default field valued
+								set $$$INRECSummaryLineType(objRow1)     = ""
+								set $$$INRECSummaryExtendedCost(objRow1) = ""
+						
+								set blnOnlyDefaultRow = ($translate(objRow1,Y,"")="")
+							}
+		
+			; 2 problems in this area <GRF>
+			;   1. On loading an order into a default grid (starts with 1 blank line)
+			;      Fields are all shown as enabled (ivory)                               OUTSTANDING SR16598 (test if block - unsuccessful)
+			;   2. If 2 lines saved and line 1 deleted and saved, shows as line 2.
+			;      Loading another order overwrites line 2                               FIXED       SR16661 (test else block)
+					
+							if blnOnlyDefaultRow {   
+								; FIXME vvvv Doesn't colour correctly
+								set strLFDAT = ""
+								set intLFDAT = 1
+								for loopPieces=1:1:$length(objSummaryLine,Y) {
+									set strDataItem = $piece(objSummaryLine,Y,loopPieces)
+									if strDataItem'="" {
+										; objSummary : 20484~1~~0~0~fsm~~20~5~0~5~~~0~0~~~~~~~~~~~~~~~~~"
+										; strLFDAT   : 1,20484~2,1~4,0~5,0~6,fsm~8,20~9,5~10,0~11,5~15,0~15,0
+										set $piece(strLFDAT,Y,intLFDAT) = loopPieces_$$$COMMA_strDataItem
+										set intLFDAT = intLFDAT+1
+									}
+								}
+								set VORG(1) = idItem  ; SR17492   ; FIXME: Referenced based on Form definition ; 06-Mar-2009
+								; FIXME ^^^^ Doesn't color correctly vvv SR16797
+								if (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+									do SetRecord^COMGridEdit31S1("INRECSummary",1,strLFDAT,,$$$YES)   ; => ^WWWDATEN
+								}
+								else {
+									do SetRecord^COMGridEdit31S1("INRECSummary",1,strLFDAT,,$$$NO)   ; => ^WWWDATEN
+								}
+								set pblnAdded = $$$YES
+					
+						; Append new row to existing rows
+						;-----------------------
+							} else {	
+			    				if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+									set idLine = 0
+									for {
+										set idLine = $order(^WWWDATEN(YM,+$horolog,YUSER,"INRECSummary","V","DISPLAYLIST",idLine))
+										if ($length(idLine) = 0) quit
+										set campoItem = "Y"_idLine_"_"_$$$FldINRECSummaryItem
+										set item  = ^WWWDATEN(0,+$horolog,YUSER,"INRECSummary","V",campoItem,1)
+										if ($Length(item) = 0) {
+											do StartScript^COMUtiljavascript()
+											write "try{"
+											write "objLinha = document.getElementById('td"_campoItem_"').parentNode;"
+											write "objLinha.parentNode.deleteRow(objLinha.rowIndex);"
+											write "}catch(e){}"
+											do EndScript^COMUtiljavascript()
+											kill ^WWWDATEN(YM,+$horolog,YUSER,"INRECSummary","V","DISPLAYED",idLine)
+										}
+									}
+								}
+								do AddLine^COMGridEdit31Add(objSummaryLine,,"INRECSummary",$$$YES,"",$$$NO,$$$NO,$$$NO)
+								set pblnAdded = $$$YES
+							}
+						}
+					}
+				} else {
+					do AddOrderLineErrors^VARINReceipt(idOrder,idOrderLine)
+					set blCreateLineError = $$$YES
+				}
+			}
+			if ((blCreateLineError) && (pblnAdded)){
+				do AlertOrderLineErrors^VARINReceipt(idOrder)
+			}
+		}
+		do CalculateSummTotal^INRECSummary(idReceiptNo)
+		$$$GRIDAddBatchStop
+	}
+	quit
+	
+	
+CheckOrderNo(pidOrder,pidReceiptNo)
+	;-------------------------------------------------------------------------------
+	; Runs through all Receipts and checks all unprocessed receipts for all Lines
+	; that exist with the order that user is attempting to load. If an existing 
+	; receipt is found it warns the user.
+	; 
+	; pidOrder = Order number user is attempting to load into the receipt line
+	; 
+	; History:
+	; 14-Aug-2009	DWR		SR16825: improved to look for last line of INRECSummary
+	; 							in case the first line was not 1.
+	; 07-Aug-2009	DWR		SR16825: rewrote to check for only unprocessed receipts
+	; 							and write the id to a list that is used in the alert.
+	; 							modified "IN00905" as a result.
+	; 18-Mar-2009	DavidR 	SR16363: Created including "IN00905"
+	;-------------------------------------------------------------------------------
+	new blnFound,idReceipt,idSummaryLine,idxLine,idxOrder,objReceipt,strReceiptID
+	
+	$$$LogR("CheckOrderNo",pidOrder_","_pidReceiptNo)
+ 
+ 	if $$$NoKey(pidReceiptNo) set pidReceiptNo = ""   ; "+" or "" become ""
+	set idxOrder = $$$Index(pidOrder)
+	set strReceiptID = ""
+	set idReceipt = ""
+	set idxLine = ""
+	for {
+		set idxLine = $order(^INRECSummarys(0,1,idxOrder,idxLine),-1)
+		quit:idxLine=""
+		
+		for {
+			set idReceipt = $order(^INRECSummarys(0,1,idxOrder,idxLine,idReceipt))
+			quit:idReceipt=""
+			continue:idReceipt=pidReceiptNo
+			
+			set idSummaryLine = $order(^INRECSummary(0,idReceipt,""),-1)      ;14-Aug-2009
+			set objReceipt = $get(^INRECSummary(0,idReceipt,idSummaryLine,1))
+			if objReceipt'=$$$NULLOREF {
+				if $$$INRECSummaryStatus(objReceipt) = $$$EnumINSTATUSUnprocessed {
+					if strReceiptID '[ idReceipt {
+						set strReceiptID = strReceiptID_" "_idReceipt
+					}
+				}
+			}
+		}
+	}
+	if strReceiptID'="" {
+		$$$StartScript()
+		; "An open receipt exists containing order (%1) \n\n Receipts: %2" 
+		write "alert('"_$$$Text($listbuild("IN00905",pidOrder,strReceiptID))_".'); "
+		$$$EndScript()
+	}	
+	quit
+	
+	
+CheckForDeletedOrder(pidReceipt)
+	;-------------------------------------------------------------------------------
+	; Check whether any of the order lines on the receipt have been deleted since
+	; the order was loaded.
+	; 
+	; Returns : strStatus - OK if all order lines still exist
+	;                       Otherwise details
+	; History:
+	; 03-Jul-2009	GRF		SR16649: Created
+	;-------------------------------------------------------------------------------
+	new idSummary,idOrder,idOrderLine,objSummLine,strStatus
+	
+	set strStatus = $$$OK
+	set idSummary = ""
+	for {
+		set idSummary = $order(^INRECSummary(0,pidReceipt,idSummary))
+		quit:idSummary=""
+		
+		set objSummLine = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+		set idOrder     = $$$INRECSummaryPurchaseOrder(objSummLine)
+		set idOrderLine = $$$INRECSummaryPurchaseOrderLine(objSummLine)
+		continue:(idOrder="")||(idOrderLine="")
+		
+		if '$data(^INAUFP(0,idOrder,idOrderLine,1)) {
+			set strStatus = $$$MakeStatus("IN01072",idOrder,idOrderLine,idSummary)
+			quit             ; "Order Line %1,%2 does not exist (Receipt Line %3)"
+			
+		} elseif $$$INAUFOrderType($get(^INAUF(0,idOrder,1)))'=2 {
+			set strStatus = $$$MakeStatus("IN01073",idOrder,idSummary)
+			quit             ; "Order %1 is not a Supplier Order (Receipt Line %2)"
+		}
+	}
+		
+	quit strStatus
+	
+	
+IsFirmable(pidReceipt,pobjReceipt="")
+	;-------------------------------------------------------------------------------
+	; Can this record be "Firmed"?
+	; 
+	; CalledFrom:
+	;	Firm Receipt Button INReceipt Form
+	; 
+	; History:
+	; 23-Jun-2011	PPP		SR17802: If Scanning is enabled - do not show this button
+	; 21-Aug-2009	DWR		SR16837: Changed piece to use in conversion
+	; 19-Aug-2009	DWR		SR16821: moved second part of flag check inside the
+	; 							if order'="", stop crash if no order.
+	; 18-Aug-2009	DWR		SR16821: check INWEMERKER flags.
+	; 17-Aug-2009	GRF		SR16820: validation based on UnitQtyReceived not on
+	; 							QuantityReceived
+	; 06-Aug-2009	DWR		SR16820: Refined INRECSummary check to distinguish what
+	; 							qty has been entered or if empty.
+	; 14-Jul-2009	DWR		SR16737: added check for default storage before firming
+	; 08-Jul-2009	GRF		SR16689: Check for bonus with cost; missing quit from
+	;							for on error; common variable use between subr.
+	; 03-Jul-2009	GRF		SR16649: Call CheckForDeletedOrder
+	; 09-Jun-2009	GRF		SR16598: validation limited to item-based Line Types
+	; 07-May-2009	DWR		DR16363: add check : don't allow firm if qty received=0
+	; 07-Apr-2009	GRF		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new blnLines,enumLineType,enumUnit,fltConv,fltOrderQty,fltOtherQty,fltReceiveQty
+	new idFlag,idItem,idLocn,idSummary,objIncomingGoodsFlag,objLocn
+	new objSummLine,strStatus
+	
+	;$$$LogR("IsFirmable",pidReceipt)
+	
+	set strStatus = $$$OK
+
+	//SR17802
+	if '$$IsScanReq^WWW120Scan("INRECScanLine") {
+
+		if $$$NoKey(pidReceipt) {
+			set strStatus = $$$MakeStatus("374")               ; "Select Data Record"
+	
+		} elseif ($$$INRECStatus(pobjReceipt) '= 0) {						
+			set strStatus = $$$MakeStatus("IN00377")           ; "Record already processed"
+	
+		} elseif $$$INRECFirmed(pobjReceipt) {
+			set strStatus = $$$MakeStatus("IN01035")           ; "Receipt already firmed"
+		
+		} else {       ; perform other INRECSummary validation
+			set blnLines = $$$NO
+			set idSummary = ""
+			for {
+				set idSummary = $order(^INRECSummary(0,pidReceipt,idSummary))
+				quit:idSummary=""
+				continue:(idSummary\1)'=idSummary
+			
+				set blnLines = $$$YES
+				set objSummLine  = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+				set enumLineType = $$$INRECSummaryLineType(objSummLine)
+			
+				if $$$IsItemLine {
+					set idItem   = $$$INRECSummaryItem(objSummLine)
+					set enumUnit = $$$INRECSummaryReceivedUnit(objSummLine)
+					if ($$$INRECSummaryUnitQtyReceived(objSummLine)="") {
+						set strStatus = $$$MakeStatus("IN01084",idSummary)    ; "Quantity Received required on line %1"
+					
+					} elseif ($$$INRECSummaryUnitQtyReceived(objSummLine)'>0) {
+						set strStatus = $$$MakeStatus("IN01085",idSummary)    ; "Quantity Received must be greater than 0 on line %1"
+					
+					} elseif (enumUnit="") || '$data(^INARTPACK(0,idItem,enumUnit,1)) {
+						set strStatus = $$$MakeStatus("IN01037",idSummary)    ; "Inappropriate unit on line %1"
+					} elseif (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+						if ( ($$$INRECFREE10(pobjReceipt) '= "") && ($$$INRECSummaryPurchaseOrder(objSummLine) = "") ) {
+							set strStatus = 0_"Não é possível adicionar itens em um recebimento com ordem de compra associada."
+						}
+					}	
+				}
+			
+				if $$$ISOK(strStatus) && ($$$INRECSummaryPurchaseOrder(objSummLine)'="") {
+					set idFlag = $$$INRECSummaryFlag(objSummLine)
+				
+					if idFlag = "" {
+						set strStatus = $$$MakeStatus("IN00752",idSummary)   ;	"Line %1 is missing a required status flag."
+				
+					} else {
+						set objIncomingGoodsFlag = $get(^INWEMERKER(0,idFlag,1))
+					
+						if $$$INWEMERKERReceiptExceedsOrder(objIncomingGoodsFlag) = $$$EnumWWWTRISTATE1Disallow {
+							set fltConv       = $$GetUOMConversion^INUOMConversion($$$INRECSummaryItem(objSummLine),$$$INRECSummaryOrderedUnit(objSummLine))
+							set fltOrderQty   = $$$INRECSummaryQuantityOrdered(objSummLine) * fltConv	
+				 			set fltOtherQty   = $$ReceiptQuantities^INRECSummary(objSummLine,pidReceipt)
+				 			set fltReceiveQty = $$$INRECSummaryQuantityReceived(objSummLine)
+ 						
+							if fltReceiveQty > (fltOrderQty - fltOtherQty) {
+								set strStatus = $$$MakeStatus("IN00514",fltOtherQty,idSummary)
+							} ; "Receipt has exceeded ordered quantity in line ´%2´, other existing receipts account for ´%1´."
+						}
+					}
+				}
+				quit:$$$ISERR(strStatus)
+			}
+		
+			if $$$ISOK(strStatus) && 'blnLines {
+				set strStatus = $$$MakeStatus("IN01038")
+			} ; "No summary lines"
+		}		
+	
+		if $$$ISOK(strStatus) set strStatus = $$CheckForDeletedOrder(pidReceipt)
+		if $$$ISOK(strStatus) {
+			set idLocn = $$$INRECLocation(pobjReceipt)
+			set objLocn = $get(^WWW0121(0,0,idLocn,1))
+			if $$$WWW0121ReceiptStorage(objLocn)="" {
+				set strStatus = $$$MakeStatus("IN01076",idLocn)
+			} ; "Default Receipt Storage not found for location %1"
+		} 
+
+		if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+		   (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+			if ($$$INRECFREE10(pobjReceipt) '= ""){
+				if $$$ISOK(strStatus) set strStatus = $$ValidaOCLinhas^VARINReceipt(pidReceipt,$$$INRECFREE10(pobjReceipt))
+			}
+		}
+			
+		$$$YQHandler(strStatus)
+
+	} else {
+
+		set YQ = 2
+	}
+
+	quit strStatus
+	
+	
+FirmReceipt(pidReceipt,RedirectForm=1)
+	;-------------------------------------------------------------------------------
+	; 
+	; History:
+	; 20-Aug-2014	Henrique Dias	MARKANTI-26		Setting New Owner
+	; 13-Jul-2009	GRF		SR16689: Don't create INRECLine entries for INRECSummary
+	; 							invoice charges
+	; 12-May-2009	DWR		SR16363: redirect straight to tab 2 of the newly saved
+	;							record if all is OK. 
+	; 07-Apr-2009	GRF		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new enumLineType,idSummary,objRecLine,objReceipt,objSummLine,strStatus
+
+	$$$LogR("FirmReceipt",pidReceipt)
+	set objReceipt = $get(^INREC(0,pidReceipt,1))
+	
+	set strStatus='$$$OK
+	set idSummary = ""
+	for {
+		set idSummary = $order(^INRECSummary(0,pidReceipt,idSummary))
+		quit:idSummary=""
+		continue:(idSummary\1)'=idSummary
+		
+		set objSummLine  = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+		set enumLineType = $$$INRECSummaryLineType(objSummLine)
+		continue:'$$$IsItemLine
+		
+		set objRecLine = $$CreateINRECLine^INRECSummary(pidReceipt,idSummary,objSummLine)
+		set strStatus  = $$$Save("INRECLine",pidReceipt_$$$COMMA_idSummary,objRecLine,$$$YES)
+		quit:$$$ISERR(strStatus)
+		
+		if (+$$$WWWClientParamCoreChangesMARKANTI($get(^WWWClientParam(YM,YM,1)))) 
+		{
+			//	20-Aug-2014	Henrique Dias	MARKANTI-26		Setting New Owner
+			do SetProprietarioRecebimento^VARProprietario(pidReceipt)
+		}
+	}
+	if $$$ISOK(strStatus) {
+		set $$$INRECFirmed(objReceipt) = $$$YES
+		set strStatus = $$$Save("INREC",pidReceipt,objReceipt,$$$YES)
+	}
+	if $$$ISOK(strStatus) {
+		;do ReloadForm^COMUtilForm()
+		if (YFORM '= "INReceipt"){
+			do GoToForm^COMUtilForm(YFORM,pidReceipt,2,YPARA) ; go straight to tab 2
+		} else {
+			do GoToForm^COMUtilForm("INReceipt",pidReceipt,2,YPARA) ; go straight to tab 2
+		}
+	}
+	quit strStatus
+	
+	
+CanUnFirm(pidReceipt,pobjReceipt="")
+	;-------------------------------------------------------------------------------
+	; 
+	; History:
+	; 28-Oct-2009	GRF		SR16363: Missing parentheses around IF clause
+	; 22-Apr-2009	DWR		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	if pobjReceipt'="" {
+		if $$$INRECFirmed(pobjReceipt) '= $$$YES {
+			set strStatus = $$$MakeStatus("IN01028")    ; "Receipt not Firmed"
+		}
+		if $$$ISOK(strStatus) && ($$$INRECStatus(pobjReceipt) = $$$EnumINSTATUSProcessed) {
+			set strStatus = $$$MakeStatus("IN00377")    ; "Record already Processed"
+		}
+	}
+	$$$YQHandler(strStatus)
+	
+	quit strStatus
+	
+	
+ReverseFirm(pidReceipt)
+	;-------------------------------------------------------------------------------
+	; Unfirms the INREC record in case error has been made, also deletes INRECLine
+	; records that are created when you firm the receipt
+	; 
+	; Called by:
+	; button 5 INReceipt - Un-Firm
+	; 
+	; History:
+	; 14-Jul-2009	DWR		SR16601: Modified to delete INRECLine records when unfirm
+	; 22-Apr-2009	DWR		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new idLine,objReceipt,strStatus
+	
+	set objReceipt = $get(^INREC(0,pidReceipt,1))
+	
+	if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1))))||
+		(+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1))))||
+		(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))){
+		
+		if ( ($$$INRECStatus(objReceipt) > 0) && (objReceipt '= "") ){
+			$$$Alert("Este registro já foi processado.")
+			if (YFORM '= "INReceipt"){
+				do GoToForm^COMUtilForm(YFORM,pidReceipt,1,YPARA) ; go back to receipt tab
+			} else {
+				do GoToForm^COMUtilForm("INReceipt",pidReceipt,1,YPARA) ; go back to receipt tab
+			}			
+			quit
+		}
+	}
+	
+	set $$$INRECFirmed(objReceipt) = $$$NO
+	if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+		set $$$INRECFREE30(objReceipt) = ""
+		set $$$INRECFREE31(objReceipt) = ""
+		set $$$INRECFREE32(objReceipt) = ""
+		set $$$INRECFREE33(objReceipt) = ""
+	}
+	set strStatus = $$$Save("INREC",pidReceipt,objReceipt,$$$YES)
+	
+	if $$$ISOK(strStatus) {     ; <<< SR16601
+		set idLine= ""
+		for {
+			set idLine = $order(^INRECLine(0,pidReceipt,idLine))
+			quit:idLine=""
+			
+			set strStatus = $$KILL^COMUtils("INRECLine",pidReceipt_$$$COMMA_idLine)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		;do ReloadForm^COMUtilForm()		
+		if (YFORM '= "INReceipt"){
+			do GoToForm^COMUtilForm(YFORM,pidReceipt,1,YPARA) ; go back to receipt tabb
+		} else {
+			do GoToForm^COMUtilForm("INReceipt",pidReceipt,1,YPARA) ; go back to receipt tab
+		}
+	}
+	quit
+	
+]]></Routine>
+</Export>

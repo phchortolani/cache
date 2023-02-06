@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLTranIC" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLTranIC
+ 
+#include COMSYS
+#include FINConst
+#include WWWConst
+ 
+#define VALIDATEDATA	$$SendTran($$$YES,.arrSites)
+#define SAVEDATA		$$SendTran($$$NO,.arrSites,pidTran,$get(^FINGLTran(YM,pidTran,1)),YM_Y_$$$WWW012CompanyName($get(^WWW012(0,YM,1)))_Y)
+#define GATHERDATA      GatherICData(pidTran,.arrSites)
+ 
+Post(pidTran) 
+    /*-------------------------------------------------------------------------------
+	; Send a GL Tran from one company to another.
+	;
+	; Params:
+	; pidTran: The JL Transaction record to send
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; strStatus: The status of the send.
+	;
+	; History:
+	; 23-Jan-2006	RobertW		SR13087: Created
+	;-------------------------------------------------------------------------------*/
+	new strStatus,arrSites
+	
+	set strStatus=$$$OK
+	
+	// Prepare the data to be sent across
+	do $$$GATHERDATA
+	set strStatus=$$$VALIDATEDATA
+	set:$$$ISOK(strStatus) strStatus=$$$SAVEDATA
+	
+	quit strStatus
+	
+ReceiveTran(parrTran,pidTran="",pobjSendTran="",pidCompanyDetails="")
+	;-------------------------------------------------------------------------------
+	; Process the Array data to create(or validate) a Tran(or a list of accounts).
+	;
+	; Returns:Status
+	; 	      (pstrTranHist passed by reference)
+	;
+	; History:
+	; 23-Feb-2006	RPW		SR13816: Modified to call FINGLJournal instead of local version
+	; 25-Jan-2006	RPW		SR13087: Copied from FINGLJournalIC and modified from Journal to Tran
+	;-------------------------------------------------------------------------------
+	new strStatus,blnCreate,idTranLine,objLine,idLine
+	new idAccount,curAmount,idTran,objTran,strData
+		
+	set strStatus=$$$OK
+	
+	set blnCreate=pidTran'=""
+	
+	if blnCreate {
+		set idTran=$$^WWWNEXT("FINGLTran")
+		set objTran=pobjSendTran
+		set $$$FINGLTranPostedDate(objTran)=""
+		set $$$FINGLTranInterCompany(objTran)=$$$NO
+		set $$$FINGLTranSource(objTran)=""
+		set $$$FINGLTranNotes(objTran)=$$$Text($listbuild("Fin00953",pidTran,$piece(pidCompanyDetails,Y,2),$piece(pidCompanyDetails,Y,1),$piece(pidCompanyDetails,Y,3)))  ;Transaction %1, sent from %2 (%3), via Intercompany %4
+		
+		// Populate the GL Tran here
+		
+		set strStatus=$$Save^COMUtils("FINGLTran",idTran,objTran,1)
+	}
+	
+	if $$$ISOK(strStatus) {
+		
+		set idLine=""
+		for {
+			set idLine=$order(parrTran(idLine))
+			quit:idLine=""
+			
+			set idAccount=""
+			for {
+				set idAccount=$order(parrTran(idLine,idAccount))
+				quit:idAccount=""
+				
+				set curAmount=$get(parrTran(idLine,idAccount))
+				if 'blnCreate {
+					set strStatus = $$ValidateAccount^FINGLAccount(idAccount,curAmount)
+					
+					if $$$ISERR(strStatus) {
+						if idLine=0 { // "To Account"
+							set strStatus=$listbuild("Fin00825",idAccount,$$$Text(strStatus)) ;`To Account` %1 failed. Reason: %2
+						} else {
+							set strStatus=$listbuild("Fin00385",idLine,$$$Text(strStatus)) ; Line %1 failed. Reason: %2
+						}
+					}
+					
+				} else {
+					
+					set objLine=""
+					set idTranLine=$order(^FINGLTranLine(YM,idTran,""),-1)+1
+					set $$$FINGLTranLineAccount(objLine)=idAccount
+					set strData=$get(parrTran(idLine))
+					if idLine=0 {
+						set strData=+$h
+					}
+					set $$$FINGLTranLineReference(objLine)=$piece(strData,Y,2)
+					set $$$FINGLTranLineTransactionDate(objLine)=$piece(strData,Y,1)
+					if curAmount>0 {
+						set $$$FINGLTranLineDebit(objLine)=curAmount
+					} else {
+						set $$$FINGLTranLineCredit(objLine)=-curAmount
+					}
+					set strStatus=$$Save^COMUtils("FINGLTranLine",idTran_","_idTranLine,objLine,1)
+					
+				}
+				
+				quit:$$$ISERR(strStatus)
+			}
+			quit:$$$ISERR(strStatus)
+		}
+		
+		if $$$ISOK(strStatus) && blnCreate {
+			set strStatus=$$Post^FINGLTran(idTran,$$$YES)
+		}
+	}
+	
+	quit strStatus
+	
+PostableLine(pidCompany,pidCompanyAccount)
+	;-------------------------------------------------------------------------------
+	; Check whether postable
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Jan-2005	RPW		SR13087: Created (well copied from FINGLJournalIC)
+	;-------------------------------------------------------------------------------
+	new strStatus,idCompany,idAcct,strMsg,objICSetup
+	
+	set strStatus=$$$OK
+	
+	if pidCompany'="" { // IC
+		set objICSetup = $get(^FINICSetup(YM,pidCompany,1))
+		
+		if $$$FINICSetupFromAccount(objICSetup)="" {
+			set strStatus = $listbuild("Fin00829",pidCompany)  ;Company %1 has no "From Account" set up.
+			
+		} else {
+			if pidCompanyAccount="" {
+				set strStatus = $listbuild("Fin00186")  ;Account Required
+				
+			} elseif $data(^FINICAccount(YM,pidCompany,pidCompanyAccount,1)) {  ; IC account in IC list - Get reason
+				if $$$FINICAccountBlockedReason($get(^FINICAccount(YM,pidCompany,pidCompanyAccount,1)))'="" {
+					set strStatus = $listbuild("Fin00831",pidCompanyAccount)  ;Account %1 is blocked.
+				}
+				
+			} elseif '$$$FINICSetupOtherAccountsAllowed(objICSetup) {  ; Account not in IC list - and not allowed
+				set strStatus = $listbuild("Fin00824",pidCompanyAccount)  ;Account %1 not in Inter Company List
+			}
+		}
+	}
+	
+	quit strStatus
+	
+GatherICData(pidTran,&parrSites) private
+    /*-------------------------------------------------------------------------------
+	; Gather the InterCompany data from the transaction
+	;
+	; Params:
+	; pidTran  : The id of the FINGLTran to interrogate
+	; parrSites: The array of site information to return
+	; 
+	; 		parrSites(idCompany,idLine)           contains the transaction date and reference
+	; 		parrSites(idCompany,idLine,idAccount) contains the account amount
+	; 		parrSites(idCompany,0,idFromAcct)     contains the remainder left of zero from the other accounts
+	;
+	; ByRefs:
+	; parrSites
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Jan-2006	RobertW		SR13087: Created
+	;-------------------------------------------------------------------------------*/
+	new idLine,objLine,idCompany,idAccount,curAmount,strReference,dteTransaction,objIC,idFromAcct
+	
+	set idLine=""
+	for {
+		set idLine=$order(^FINGLTranLine(YM,pidTran,idLine))
+		quit:idLine=""
+		
+		set objLine=$get(^FINGLTranLine(YM,pidTran,idLine,1))
+		
+		set idCompany=$$$FINGLTranLineCompany1(objLine)
+		continue:idCompany=""
+		
+		set idAccount      = $$$FINGLTranLineCompanyAccount(objLine)
+		set curAmount      = $$$FINGLTranLineDebit(objLine)-$$$FINGLTranLineCredit(objLine)
+		set strReference   = $$$FINGLTranLineReference(objLine)
+		set dteTransaction = $$$FINGLTranLineTransactionDate(objLine)
+		
+		set parrSites(idCompany,idLine)=dteTransaction_Y_strReference
+		set parrSites(idCompany,idLine,idAccount)=curAmount
+		
+		set objIC=$get(^FINICSetup(YM,idCompany,1))
+		set idFromAcct = $$$FINICSetupFromAccount(objIC)
+		if idFromAcct = "" set idFromAcct=" "
+				
+		// Sum up the "From Account" values in the first line
+		set parrSites(idCompany,0,idFromAcct) = $get(parrSites(idCompany,0,idFromAcct))-curAmount
+	}
+	
+	quit
+	
+	
+SendTran(pblnTest,&parrSites,pidTran="",pobjTran="",pstrTran="") private
+	;--------------------------------------------------------------------------------
+	; Send the whole data regardless of the location.
+	;
+	; Params:
+	; pblnTest : Should we validate or save, $$$NO = Validate, $$$YES = Save
+	; parrSites: This site data, see GatherICData for more information
+	; pidTran  : The id of the GL Transaction to sent
+	; pobjTran : The data for the GL Transaction to be sent
+	; pstrTran : The keys for the XReference.
+	;
+	; ByRefs:
+	; parrSites
+	;
+	; Returns:
+	; strStatus: The  state of the real work
+	;
+	; History:
+	; 21-Dec-2006	GRF		SR14039: strStatus not initialised
+	; 25-Jan-2006	RobertW	SR13087: Created
+	;---------------------------------------------------------------------------------
+	new arrTran,idCompany,objIC,strIC,strStatus,strTran
+	
+	set strStatus = $$$OK          ; SR14039
+	set strIC     = ""
+	if pblnTest {
+		set pidTran  = ""
+		set pobjTran = ""
+		set pstrTran = ""
+		set strTran  = ""
+	}
+	
+	set idCompany = ""
+	for {
+		set idCompany = $order(parrSites(idCompany))
+		quit:idCompany=""
+		
+		set objIC=$get(^FINICSetup(YM,idCompany,1))
+		kill arrTran
+		merge arrTran = parrSites(idCompany)
+		set:'pblnTest strTran = pstrTran_idCompany ; Set the XRef string.
+		set strStatus = $$$ExecuteSite($$$FINICSetupSite(objIC),"ReceiveTran^FINGLTranIC",.arrTran,pidTran,pobjTran,strTran)
+		quit:$$$ISERR(strStatus)
+		
+		if 'pblnTest {
+			set strIC = strIC_$$$Text($listbuild("Fin00952",idCompany))_"|" ;Sent To Company %1"
+		}
+	}
+	
+	if 'pblnTest && ($$$ISOK(strStatus)) && (strIC'="") {
+		set $$$FINGLTranNotes(pobjTran) = $extract(strIC,1,$length(strIC)-1) ; get rid of the last |
+		set strStatus = $$$Save("FINGLTran",pidTran,pobjTran,1)
+	}
+	
+	quit strStatus
+	
+]]></Routine>
+</Export>

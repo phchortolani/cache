@@ -1,0 +1,995 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INDRUCK71" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INDRUCK71	;INDRUCK71;FIS;EINZELBUCHUNG AUSGANGSRECHNUNGEN;08.03.2005  ; Compiled March 14, 2005 14:18:41
+#include INConst
+#include COMSYS
+#define SalesInvoiceType 2
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		EINZELBUCHUNG AUSGANGSRECHNUNGEN
+	;      SINGLE POSTING SALES CALCULATIONS
+	; 
+	;	EINZELBUCHUNG
+	;	=============
+	;	1.) BUCHUNG GESAMT = ZUSAMMENSTELLEN BUCHUNGSSATZ FÜR GESAMTBETRAGSBUCHUNG (NICHT FÜR ALLE FIBUS, ABER ABACUS !)
+	;	    a) ZUSATZKOSTEN IM AUFTRAG
+	;	    b) SPEZIALZUSCHLÄGE AUS POSITIONEN
+	;	    c) POSITIONEN
+	;	    d) BUCHEN GESAMTBUCHUNGSBETRAG (ABACUS)
+	;	2.) BUCHEN ZUSATZKOSTEN IM AUFTRAG (FRACHT, VERSICHERUNG, .. UND KONDITIONSAUFSCHLAG)
+	;	3.) BUCHUNG SPEZIALZUSCHLÄGE JE POSITION
+	;	4.) BUCHEN POSITIONEN (ODER AUFBEREITEN KUMULIERTE WERTE)
+	;	5.) BUCHEN KUMULIERTE WERTE
+	;	6.) ERSTELLEN LASTSCHRIFTDATEI
+	;	7.) STARTEN DCM-ÜBERTRAGUNG (DISCLINC)
+	;	--------------------------------------------------------
+	;	Single Posting
+	;	==============
+	;	1.) RESERVATION ENTIRE 
+	;	    ARRANGING POSTING RECORD FOR TOTAL AMOUNT RESERVATION (NOT FOR ALL Finance Systems - only ABACUS!)
+	;	    a) AUXILIARY COSTS IN the ORDER; 
+	;	    b) SPECIAL IMPACTS FROM POSITIONS; 
+	;	    c) POSITIONS; 
+	;	    d) BOOK WHOLE RESERVATION AMOUNT (ABACUS)
+	;	2.) BOOK AUXILIARY COSTS IN THE ORDER (FREIGHT, INSURANCE,.. AND CONDITION IMPACT)
+	;	3.) RESERVATION OF SPECIAL IMPACTS FOR EACH POSITION
+	;	4.) BOOK POSITIONS (OR PREPARING CUMULATED VALUES)
+	;	5.) CUMULATED TO BOOK VALUES
+	;	6.) PROVIDE DEBIT FILE
+	;	7.) START DCM TRANSMISSION (DISCLINC)
+	; 
+	;	--------------------------------------------------------
+	;   Calls => INARTPLUS
+	;               vvv
+	;         => INARTHIST			"MVI", "SAL"
+	;               vvv
+	;         => FIBU^INARTHIST
+	;               vvv
+	;         => INFIBBUCH   converts A/BUCHUNG to Interface Message
+	;	--------------------------------------------------------
+	;
+	; Called By : BUCHEN^INDRUCK7
+	; 
+	; Inputs : 
+	;   BUCHEN  	Booking flag
+	;   POS1		
+	;
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 06-Nov-2006	GRF		SR15183: remove blnGRF since now functional; !=>||; quits.
+	; 05-Oct-2006	RPW		SR14746: Removed no longer used code
+	; 21-SEP-2006 FAN SR14746 Sales statistics incorrect
+	; 24-Jan-2006	GRF		SR14105: Doco; boolean macros; $$$SalesInvoiceType
+	; 12-Sep-2005	GRF		SR13476: Need to ensure site location is present in
+	; 						finance record else can't get location characteristics;
+	; 						Call to FIBU^INARTHIST needs Stock Location arg moved.
+	; 09-Sep-2005	JW		SR13423: Don't change amount
+	; 29-Jul-2005	JW		SR12992: Making tax consistent
+	; 02-Jun-2005	RobertW	We don't need to check for the existence of a COM routine.
+	; 10-May-2005	GRF		SR12335:  Checkbox is too dangerous - use DCM to block
+	; 						transmissions to finance.
+	; 31-Mar-2005	GRF		English comments
+	; FIS	08.03.2005  
+	;-------------------------------------------------------------------------------
+	
+	set blnGRF = $$$YES
+	
+	IF $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,45)=1 KILL ^WWWSOR(YUSER_"KUMUL")  ;FIS;EINZELBUCHUNGEN KUMULIEREN;04.03.05
+	IF $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,15)=4 kill ^CacheTempSale(YUSER)   ;FIS;DISC;11.06.03;ZWISCHENSPEICHERUNG FÜR DCM EVENT
+	SET A=""  ;BUCHUNGSSATZ ;entry formula 
+	SET GESAMTQ=0
+	
+	;1.) PRÜFLAUF GESAMTBUCHUNG
+	;==========================
+	;a) Additional Costs - Order				// JW SR11997: TODO: TAX MAKES NO SENSE
+	;--------------------
+	
+	;---------------------------------------
+	; Previously YZUSATZ(1 thru 6) were set to ^INFIBPAR D12 rather than D33 as a default
+	;	D12		$$$INFIBPARAccountsMiscellaneousReve()
+	;	D33		$$$INFIBPARSalesAccount()
+	;	
+	;	D23		$$$INFIBPARPackingAccount()
+	;	D24		$$$INFIBPARFreightAccount()
+	;	D25		$$$INFIBPARInsuranceAccount()
+	;	D26		$$$INFIBPARTrafficAccount()
+	;	D29		$$$INFIBPARAccountSpecialChargesOut()
+	;	
+	;	D14		$$$INFIBPARCostCentre()
+	;---------------------------------------
+	IF BUCHEN=$$$YES DO
+	. NEW YZUS,MWPOX
+	. IF '$DATA(YVERPACK)   SET YVERPACK   = 0
+	. IF '$DATA(YKMGELD)    SET YKMGELD    = 0
+	. IF '$DATA(YVERSICH)   SET YVERSICH   = 0
+	. IF '$DATA(YFRACHT)    SET YFRACHT    = 0
+	. IF '$DATA(YZUSATZ)    SET YZUSATZ    = 0
+	. IF '$DATA(YZUSCHLAG)  SET YZUSCHLAG  = 0
+	. IF '$DATA(YKONDITION) SET YKONDITION = 0
+	. SET YZUSATZ="YVERPACK,YKMGELD,YFRACHT,YVERSICH,YZUSCHLAG,YKONDITION"  ;VARIABLEN  ;GGF. AUCH FÜR DISC IN INFIBBUCH4 ÄNDERN ;too to DISC within alter 
+	. ;
+	. SET YZUSATZ(1)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,23)  ;KONTO VERPACKUNG ;acct. wrapping 
+	. IF YZUSATZ(1)="" SET YZUSATZ(1)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(2)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,26)  ;KM PAUSCH
+	. IF YZUSATZ(2)="" SET YZUSATZ(2)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(3)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,24)  ;KONTO FRACHT ;acct. loading 
+	. IF YZUSATZ(3)="" SET YZUSATZ(3)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(4)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,25)  ;KONTO VERSICHERUNG ;acct. insurance 
+	. IF YZUSATZ(4)="" SET YZUSATZ(4)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(5)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,29)  ;KONTO SPEZIALZUSCHLAG ;SPECIAL COSTS FIS;03.12.04;26933
+	. IF YZUSATZ(5)="" SET YZUSATZ(5)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(6)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,29)  ;KONTO ZUSCHLAG AUS KONDITION ;FIS;07.03.05;27445  ; ACCOUNT ADDITION FROM CONDITION
+	. IF YZUSATZ(6)="" SET YZUSATZ(6)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. ;
+	. FOR YZUS=1:1:6 DO
+	. . SET ZUS(1)=$PIECE(YZUSATZ,",",YZUS)
+	. . QUIT:+@ZUS(1)=0  ;KEIN BETRAG ;no Sum 
+	. . IF $PIECE(YAUFTRAG1,Y,101)'="" QUIT:$PIECE(YAUFTRAG1,Y,101)'=+$HOROLOG  ;BUCHUNGSDATUM SPEICHER DATEN NUR DANN ,WENN NICHT WIEDERHOLUNGSDRUCK
+	. . ;
+	. . SET GESAMTP=$JUSTIFY(@ZUS(1),0,2)  ;GESAMT MINUS RABATT VOR STEUER ;total minus deduction pre-tax 
+	. . SET MWST=""
+	. . SET MWPOX=""
+	. . DO MWSTZUSATZ  ;ERMITTELN STEUERSATZ JE ZUSATZKOSTENART
+	. . IF STEUER'=0 IF MWST="" SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,1,1)),Y,1),MWPOX=1  ;DFLT. 1 = 16 %
+	. . ;SET MWSTP=0	// SR12992 - Redundant line
+	. . SET MWSTP   = $JUSTIFY(GESAMTP/100*MWST,0,2)
+	. . SET GESAMTP = GESAMTP+MWSTP
+	. . SET KONTKST = $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,14)  ;VORGABE KOSTENSTELLE ;default cost centre 
+	. . ;
+	. . SET ERLOESE = YZUSATZ(YZUS)  ;KONTO ERLÖS INLAND AUS POS ;acct. net profits out of 
+	. . IF ERLOESE="" SET ERLOESE = "ERLOESE"
+	. . ;
+	. . SET WAGR = $PIECE(POS1,Y,30)
+	. . IF WAGR="" SET WAGR = $$$INVORGDefaultItemGroup($GET(^INVORG(YM,YM,1)))     ; D13
+	. . IF WAGR="" SET WAGR = 0
+	. . SET GESAMTQ = GESAMTQ+GESAMTP
+	. .;SET A = Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_STEUER_Y_RECHNUNG_Y_Y  ;AUSGANGSRECHNUNG
+	. . SET A = Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_MWPOX_Y_RECHNUNG_Y_Y   ;AUSGANGSRECHNUNG ;FIS;22.02.05
+	. . IF $PIECE(A,Y,8)="" SET $PIECE(A,Y,8) = $$^WWWTEXT(32161)               ; "Invoice" 
+	. . IF $PIECE(A,Y,3)<0  SET $PIECE(A,Y,8) = "GU "_YKUNDE
+	. . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8)'="" DO 
+	. . . IF SPRACHE="DE" SET $PIECE(A,Y,8) = "AR "_$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8) QUIT
+	. . . SET $PIECE(A,Y,8) = $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8)
+	. . ;
+	. . SET $PIECE(A,Y,12) = KONTKST  ;KOSTENSTELLE ;cost centre 
+	. . SET $PIECE(A,Y,13) = $PIECE(YAUFTRAG1,Y,75)  ;TAGE
+	. . SET $PIECE(A,Y,14) = $PIECE(YAUFTRAG1,Y,74)  ;SKONTO
+	. . SET $PIECE(A,Y,15) = $PIECE(YAUFTRAG1,Y,76)  ;NETTO
+	. . IF $PIECE($GET(YADRES),Y,102)'="" SET $PIECE(A,Y,24) = $PIECE($GET(YADRES),Y,102)  ;ZAHLUNGSWEG
+	
+	
+	;b) Additional Costs - Order Lines ;FIS;07.03.05;27445		// JW SR11997: TODO: TAX MAKES NO SENSE
+	;---------------------------
+	IF BUCHEN=$$$YES DO
+	. NEW YZUS,MWPO,KONTO,AUF,POS,KONTOX,MWST,MWSTP,ERLOESE,KONTKST
+	. IF '$DATA(YPOSEXTRA) QUIT
+	. SET KONTO=""
+	. FOR  SET KONTO=$ORDER(YPOSEXTRA(KONTO)) QUIT:KONTO=""  DO
+	. . SET KONTOX=KONTO
+	. . IF KONTOX=" " SET KONTOX=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,29)  ;DFLT KONTO = KONTO SPEZIALZUSCHLAG
+	. . IF KONTOX=""  SET KONTOX=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. . QUIT:+$GET(YPOSEXTRA(KONTO))=0  ;KEIN BETRAG
+	. . ;
+	. . SET GESAMTP=$JUSTIFY(YPOSEXTRA(KONTO),0,2)
+	. . SET MWST=0,MWPO=""
+	. . IF STEUER'=0 DO  ;ERMITTELN STEUERSATZ VERSICHERUNG;FIS;21.02.05;26024
+	. . . SET MWPO=1     ;MWST KENNZEICHEN
+	. . . SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,MWPO,1)),Y,1)  ;MWST SATZ
+	. . ;
+	. . ;SET MWSTP=0	// SR12992 - Redundant line
+	. . SET MWSTP   = $JUSTIFY(GESAMTP/100*MWST,0,2)
+	. . SET GESAMTP = GESAMTP+MWSTP
+	. . SET KONTKST = $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,14)  ;VORGABE KOSTENSTELLE
+	. . ;
+	. . SET ERLOESE = KONTOX  ;KONTO ERLÖS INLAND AUS POS ;acct. net profits out of 
+	. . IF ERLOESE="" SET ERLOESE = "ERLOESE"
+	. . SET GESAMTQ = GESAMTQ+GESAMTP
+	. . SET A = Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_MWPO_Y_RECHNUNG_Y_Y  ;AUSGANGSRECHNUNG ;FIS;22.02.05
+	. . SET $PIECE(A,Y,8) = $$^WWWTEXT(32161)                ; "Invoice"      ;AUSGANGSRECHNUNG
+	. . IF $PIECE(A,Y,3)<0 SET $PIECE(A,Y,8) = "GU "  ;_YKUNDE
+	. . IF $PIECE($GET(YAUFTRAG1),Y,8)'="" DO 
+	. . . IF SPRACHE="DE" SET $PIECE(A,Y,8) = "AR "_$PIECE(YAUFTRAG1,Y,8) QUIT
+	. . . SET $PIECE(A,Y,8) = $PIECE(YAUFTRAG1,Y,8)
+	. . ;
+	. . SET $PIECE(A,Y,12) = KONTKST                 ;KOSTENSTELLE ;cost centre 
+	. . SET $PIECE(A,Y,13) = $PIECE(YAUFTRAG1,Y,75)  ;TAGE
+	. . SET $PIECE(A,Y,14) = $PIECE(YAUFTRAG1,Y,74)  ;SKONTO
+	. . SET $PIECE(A,Y,15) = $PIECE(YAUFTRAG1,Y,76)  ;NETTO
+	. . IF $PIECE($GET(YADRES),Y,102)'="" SET $PIECE(A,Y,24) = $PIECE($GET(YADRES),Y,102)  ;ZAHLUNGSWEG
+	
+	
+	SET YZUSKONTO=""  ;FIS;03.09.03;24155;KONTO FÜR ZUSATZKOSTEN
+	
+	;c) Order line
+	;---------------------
+	IF BUCHEN=$$$YES DO
+	. SET GESAMTP=""
+	. IF $GET(YSUMINVOICE)=1 DO ;SAMMELRECHNUNG;29,1,2005
+	. . DO:YAUFTRAG'=""  IF YAUFTRAG="" SET YAUFTRAG=$ORDER(^WWWSOR(YUSER,"SUMINVOICE","")) QUIT:YAUFTRAG=""  DO  ;1. AUFTRAG REICHT
+	. . . SET POS=""
+	. . . FOR  SET POS=$ORDER(^WWWSOR(YUSER,"SUMINVOICE",YAUFTRAG,POS)) QUIT:POS=""  SET YAUFTRAG(POS)=""
+	. ;
+	. SET POS=""
+	. FOR  SET POS=$ORDER(YAUFTRAG(POS)) QUIT:POS=""  DO
+	. . QUIT:$GET(YAUFTRAG(POS))="X"  ;NUR ANZEIGE, KEINE BERECHNUNG;FIS;09.07.04
+	. . SET POS1 = $GET(^INAUFP(YM,YAUFTRAG,POS,1))
+	. . QUIT:$$$INAUFPTransferredIntoAccounting(POS1)'=""  ;BUCHUNGSDATUM SPEICHER DATEN NUR DANN ,WENN NICHT WIEDERHOLUNGSDRUCK
+	. . NEW MWPOX
+	. . ;
+	. . //SR12992: Use COMTAX. Note: YBELEG=10 is not below as it is in INDRUCKTAX. Important?
+	. . set MWST = $$INDRUCKTAX^INTAX(YBELEG,POS1,$get(YEKK),$get(YFELDPZ),$get(YKUNDE),$get(YLIEFER),.MWPOX)
+	. . ;
+	. . ; SET MWPOX=$$$INAUFPSalesTax(POS1)  ;POSTIONS MWST ;Tax 
+	. . ; IF (YBELEG=3) || (YBELEG=13) SET MWPOX=$PIECE(YEKK,Y,30)  ;STEUERKZ FÜR AUFTRAGSPOSITION ;to 
+	. . ; IF MWPOX="" SET MWPOX=1
+	. . ; SET MWST=0
+	. . ; ;IF STEUER'=0 SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,STEUER,1)),Y,1)
+	. . ; IF STEUER'=0 SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,+MWPOX,1)),Y,1)  ;FIS;22.03.04;;25372;MWST '= STEUER !
+	. . ;
+	. . SET SORTI=$$$INAUFPCategory(POS1)
+	. . IF SORTI="" SET SORTI=" "
+	. . ;
+	. . SET WAGR=$$$INAUFPItemGroup(POS1)
+	. . IF WAGR="" SET WAGR=$$$INVORGDefaultItemGroup($GET(^INVORG(YM,YM,1)))
+	. . IF WAGR="" SET WAGR=0
+	. . ;
+	. . SET GESAMTP=$JUSTIFY($$$INAUFPNetSalesPrice(POS1),0,2)  ;GESAMT MINUS RABATT VOR STEUER ;total minus deduction pre-tax 
+	. . ;
+	. . ;SET MWSTP=0	// SR12992 - Redundant line
+	. . SET MWSTP=$JUSTIFY(GESAMTP/100*MWST,0,2)
+	. . SET GESAMTP=GESAMTP+MWSTP
+	. . ;
+	. . //SR12992: Remove use of INKSTL*. Use INLAND variable.
+	. . ;
+	. . SET KONTKST=$$$INAUFPCostCenter(POS1)  ;KOSTENSTELLE AUS POSITION ;cost centre out of 
+	. . IF KONTKST="" SET KONTKST=$$$INFIBPARCostCentre($GET(^INFIBPAR(0,YM,YBETRIEB,1)))
+	. . ;
+	. . SET KONTCOGS=$$$INFIBPARCostOfSalesAccount($GET(^INFIBPAR(0,YM,YBETRIEB,1)))
+	. . ;
+	. . IF INLAND  SET ERLOESE=$$$INAUFPRevenueAccountInland(POS1)   ;KONTO ERLÖS INLAND AUS POS ;acct. net profits out of 
+	. . IF 'INLAND SET ERLOESE=$$$INAUFPRevenueAccountForeign(POS1)  ;KONTO ERLÖS AUSLAND POS ;acct. net profits foreign country 
+	. . ;
+	. . ; SET KONTEN=$GET(^INKSTL(YM,YBETRIEB,WAGR,STEUERKZ,1,1))  ;AUS PARAMETER ;out of parameter 
+	. . ; IF $GET(^INKSTLUST(YM,YBETRIEB,WAGR,STEUERKZ,1,+MWPOX,1))'="" SET KONTEN=^(1)  ;KONTEN JE STEUERSATZ;FIS;17.03.04;25372
+	. . ; IF KONTEN="" SET KONTEN=$GET(^INKSTL1(YM,YBETRIEB,SORTI,STEUERKZ,1,1))  ;AUS VORGABE SORTIMENT ;out of default 
+	. . ; IF KONTEN="" IF $$$INVORGDefaultItemGroup($GET(^INVORG(YM,YM,1)))'="" DO
+	. . ; . SET KONTEN=$GET(^INKSTL(YM,YBETRIEB,$$$INVORGDefaultItemGroup($GET(^INVORG(YM,YM,1))),STEUERKZ,1,1))  ;AUS VORGABE SONSTIGES ;out of default 
+	. . ; . IF $GET(^INKSTLUST(YM,YBETRIEB,$$$INVORGDefaultItemGroup($GET(^INVORG(YM,YM,1))),STEUERKZ,1,+MWPOX,1))'="" SET KONTEN=$GET(^INKSTLUST(YM,YBETRIEB,$PIECE($GET(^INVORG(YM,YM,1)),Y,13),STEUERKZ,1,+MWPOX,1))  ;KONTEN JE STEUERSATZ;FIS;17.03.04;25372
+	. . ; . QUIT
+	. . ; IF KONTEN="" SET KONTEN=$GET(^INKSTL(YM,YBETRIEB,0,STEUERKZ,1,1))  ;AUS VORGABE SONSTIGES ;out of default 
+	. . ; 
+	. . ; SET KONTKST=$PIECE(POS1,Y,33)  ;KOSTENSTELLE AUS POSITION ;cost centre out of 
+	. . ; IF KONTKST="" SET KONTKST=$PIECE(KONTEN,Y,1)  ;AUS PARAMETER ;out of parameter 
+	. . ; IF KONTKST="" SET KONTKST=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,14)  ;VORGABE KOSTENSTELLE ;default cost centre 
+	. . ; 
+	. . ; SET KONTCOGS=$PIECE(KONTEN,Y,4)  ;FIS;25830;28.06.04;VORGABE PRODUKTKOSTENKONTO
+	. . ; IF KONTCOGS="" SET KONTCOGS=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,34)
+	. . ;
+	. . ; SET ERLOESE=$PIECE(POS1,Y,31)  ;KONTO ERLÖS INLAND AUS POS ;acct. net profits out of 
+	. . ; IF STEUER=0 SET ERLOESE=$PIECE(POS1,Y,32)  ;KONTO ERLÖS AUSLAND POS ;acct. net profits foreign country 
+	. . ; IF ERLOESE="" DO
+	. . ; . SET ERLOESE=$PIECE(KONTEN,Y,3)
+	. . ; . IF STEUER=0 SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,32)=ERLOESE QUIT  ;SPEICHERN IN AUFTRAGSPOSITION ;Save within 
+	. . ; . SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,31)=ERLOESE  ;SPEICHERN IN AUFTRAGSPOSITION ;Save within 
+	. . ;
+	. . IF ERLOESE'="" SET YZUSKONTO=ERLOESE  ;FIS;24155;03.09.03;MERKEN LETZTES POSITIONSKONTO FÜR ZUSATZKOSTEN
+	. . IF ERLOESE=""  SET ERLOESE="ERLOESE"
+	. . ;
+	. . SET GESAMTQ=GESAMTQ+GESAMTP  ;GESAMTSUMME FUER PFENNIG DIFFERERENZ ;total amount pfennig 
+	. . IF $ORDER(YAUFTRAG(POS))="" IF +GESAMTQ'=+GESAMT DO
+	. . . IF GESAMTQ>GESAMT SET GESAMTP=GESAMTP-(GESAMTQ-GESAMT)  ;WENN ZUVIEL ; if too much 
+	. . . IF GESAMTQ<GESAMT SET GESAMTP=GESAMTP+(GESAMT-GESAMTQ)  ;WENN ZUWENIG ; if too litle
+	. . ;
+	. .;SET A=Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_STEUER_Y_RECHNUNG_Y_Y  ;AUSGANGSRECHNUNG
+	. . SET A=Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_MWPOX_Y_RECHNUNG_Y_Y   ;AUSGANGSRECHNUNG;FIS;22.02.05
+	. . SET $PIECE(A,Y,8)=$$^WWWTEXT(32161)                                   ; "Invoice"
+	. . IF $PIECE(A,Y,3)<0 SET $PIECE(A,Y,8)="GU "_YKUNDE
+	. . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8)'="" DO 
+	. . . IF SPRACHE="DE" SET $PIECE(A,Y,8)="AR "_$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8) QUIT
+	. . . SET $PIECE(A,Y,8)=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8)
+	. . ;
+	. . SET $PIECE(A,Y,12)=KONTKST  ;KOSTENSTELLE ;cost centre 
+	. . SET $PIECE(A,Y,13)=$PIECE(YAUFTRAG1,Y,75)  ;TAGE
+	. . SET $PIECE(A,Y,14)=$PIECE(YAUFTRAG1,Y,74)  ;SKONTO
+	. . SET $PIECE(A,Y,15)=$PIECE(YAUFTRAG1,Y,76)  ;NETTO
+	. . SET $PIECE(A,Y,34)=$PIECE(YAUFTRAG1,Y,56)  ;kondition
+	. . SET $PIECE(A,Y,35)=KONTCOGS  ;FIS;25830;28.06.04;VORGABE PRODUKTKOSTENKONTO
+	. . IF $PIECE($GET(YADRES),Y,102)'="" SET $PIECE(A,Y,24)=$PIECE($GET(YADRES),Y,102)  ;ZAHLUNGSWEG
+	
+	
+	
+	QUIT:A=""  ;KEINE BUCHUNG VORHANDEN !! ;no record found 
+	;======================================
+	;;QUIT:+GESAMTQ=0  ;KEIN GESAMTBETRAG ODER FALSCH  ;FIS: AUSGESCHALTET, WEGEN BESTANDSKORREKTUR
+	SET GESAMTQQ=GESAMTQ  ;FIS;24.09.04;FÜR PRÜFUNG 0-RECHNUNG (SIEHE UNTEN) ;to check
+	
+	
+	;d) BUCHEN GESAMTBETRAG  ;TEILBUCHUNG FÜR ABACUS
+	;----------------------
+	; For ABACUS finance package
+	; 
+	; No TYPE passed through so not used by INFIBBUCH4 for DISCLINC Finance
+	;	D39		$$$INFIBPARPostingOfValue0()
+	DO
+	. IF +$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,15)=5 QUIT  ;NICHT SIMBA;FIS;06.12.04;26705
+	. IF +$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,15)=4 QUIT  ;NICHT DISC;FIS;27.12.04;26560
+	. SET $PIECE(A,Y,3)=GESAMT
+	. IF +$PIECE(A,Y,3)=0 QUIT:$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,39)'=$$$YES   ;BUCHEN IN FIBU  ;FIS;02.10.02;24365;BUCHEN AUCH WENN 0 (EVTL. FRACHTKOSTEN)
+	. set $piece(A,Y,16)=YBETRIEB  ; SR13476
+	. SET KEY=$$^INFIBBUCH(A,YBETRIEB,1,KEY)   ;BUCHEN IN FIBU GESAMT AUF GEGENKONTO SOLL 1.BUCHUNG
+	
+	
+	;EINZELBUCHUNGEN
+	;===============
+	
+	;2.) ZUSATZKOSTEN AUFTRAG ;additional costs					// JW SR11997: TODO: TAX MAKES NO SENSE
+	;--------------------
+	;---------------------------------------
+	; Previously YZUSATZ(1 thru 6) were set to ^INFIBPAR D12 rather than D33 as a default
+	;	D12		$$$INFIBPARAccountsMiscellaneousReve()
+	;	D33		$$$INFIBPARSalesAccount()
+	;	
+	;	D23		$$$INFIBPARPackingAccount()
+	;	D24		$$$INFIBPARFreightAccount()
+	;	D25		$$$INFIBPARInsuranceAccount()
+	;	D26		$$$INFIBPARTrafficAccount()
+	;	D29		$$$INFIBPARAccountSpecialChargesOut()
+	;	
+	;	D14		$$$INFIBPARCostCentre()
+	;---------------------------------------
+	SET A=""
+	SET GESAMTQ=0
+	IF BUCHEN=$$$YES IF YBELEG'=12 DO               ; not Partial Payment Invoice
+	. NEW YZUS,MWPOX
+	. IF '$DATA(YVERPACK)   SET YVERPACK   = 0 
+	. IF '$DATA(YKMGELD)    SET YKMGELD    = 0 
+	. IF '$DATA(YVERSICH)   SET YVERSICH   = 0 
+	. IF '$DATA(YFRACHT)    SET YFRACHT    = 0
+	. IF '$DATA(YZUSCHLAG)  SET YZUSCHLAG  = 0
+	. IF '$DATA(YKONDITION) SET YKONDITION = 0
+	. ;  
+	. SET YZUSATZ="YVERPACK,YKMGELD,YFRACHT,YVERSICH,YZUSCHLAG,YKONDITION"  ;VARIABLEN  ;GGF. AUCH FÜR DISC IN INFIBBUCH4 ÄNDERN ;too to DISC within alter 
+	. ;
+	. SET YZUSATZ(1)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,23)  ;KONTO VERPACKUNG ;acct. wrapping 
+	. IF YZUSATZ(1)="" SET YZUSATZ(1)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(2)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,26)  ;KM PAUSCH
+	. IF YZUSATZ(2)="" SET YZUSATZ(2)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(3)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,24)  ;KONTO FRACHT ;acct. loading 
+	. IF YZUSATZ(3)="" SET YZUSATZ(3)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(4)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,25)  ;KONTO VERSICHERUNG ;acct. insurance 
+	. IF YZUSATZ(4)="" SET YZUSATZ(4)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(5)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,29)  ;KONTO SPEZIALZUSCHLAG ;SPECIAL COSTS FIS;03.12.04;26933
+	. IF YZUSATZ(5)="" SET YZUSATZ(5)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. SET YZUSATZ(6)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,29)  ;KONTO ZUSCHLAG AUS KONDITION ;FIS;07.03.05;27445
+	. IF YZUSATZ(6)="" SET YZUSATZ(6)=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. ;
+	. FOR YZUS=1:1:6 DO
+	. . SET ZUS(1)=$PIECE(YZUSATZ,",",YZUS)
+	. . QUIT:+@ZUS(1)=0  ;KEIN BETRAG ;no Sum 
+	. . ;
+	. . IF $PIECE(YAUFTRAG1,Y,101)'="" QUIT:$PIECE(YAUFTRAG1,Y,101)'=+$HOROLOG  ;BUCHUNGSDATUM SPEICHER DATEN NUR DANN ,WENN NICHT WIEDERHOLUNGSDRUCK
+	. . ;
+	. . SET GESAMTP=$JUSTIFY(@ZUS(1),0,2)  ;GESAMT MINUS RABATT VOR STEUER ;total minus deduction pre-tax 
+	. . SET MWST=""
+	. . SET MWPOX=""
+	. . DO MWSTZUSATZ  ;ERMITTELN STEUERSATZ JE ZUSATZKOSTENART
+	. . IF STEUER'=0 IF MWST="" SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,1,1)),Y,1),MWPOX=1  ;DFLT. 1=16%
+	. . ;SET MWSTP=0	// SR12992 - Redundant line
+	. . SET MWSTP=$JUSTIFY(GESAMTP/100*MWST,0,2)  ;MWST BETRAG
+	. . SET GESAMTP=GESAMTP+MWSTP
+	. . SET KONTKST=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,14)  ;VORGABE KOSTENSTELLE ;default cost centre 
+	. . ;
+	. . SET ERLOESE=YZUSATZ(YZUS)  ;KONTO ERLÖS INLAND AUS POS ;acct. net profits out of 
+	. . IF $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,38)=1 SET ERLOESE=YZUSKONTO  ;KONTO AUS LETZTER POSITION;FIS;24155;03.09.03
+	. . IF ERLOESE="" SET ERLOESE="ERLOESE"
+	. . ;
+	. . SET GESAMTQ=GESAMTQ+GESAMTP
+	. . ;SET A=Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_STEUER_Y_RECHNUNG_Y_Y  ;AUSGANGSRECHNUNG
+	. . SET A=Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_MWPOX_Y_RECHNUNG_Y_Y    ;AUSGANGSRECHNUNG;FIS;22.02.05
+	. . IF $PIECE(A,Y,8)="" SET $PIECE(A,Y,8)=$$^WWWTEXT(32161)                ; "Invoice"
+	. . IF $PIECE(A,Y,3)<0  SET $PIECE(A,Y,8)="GU "_YKUNDE
+	. . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8)'="" DO 
+	. . . IF SPRACHE="DE" SET $PIECE(A,Y,8)="AR "_$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8) QUIT
+	. . . SET $PIECE(A,Y,8)=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8)
+	. . ;
+	. . SET $PIECE(A,Y,12)=KONTKST                 ;KOSTENSTELLE ;cost centre 
+	. . SET $PIECE(A,Y,13)=$PIECE(YAUFTRAG1,Y,75)  ;TAGE
+	. . SET $PIECE(A,Y,14)=$PIECE(YAUFTRAG1,Y,74)  ;SKONTO
+	. . SET $PIECE(A,Y,15)=$PIECE(YAUFTRAG1,Y,76)  ;NETTO
+	. . IF $PIECE($GET(YADRES),Y,102)'="" SET $PIECE(A,Y,24)=$PIECE($GET(YADRES),Y,102)  ;ZAHLUNGSWEG
+	. . ;
+	. . SET $PIECE(A,Y,27)=ZUS(1)  ;ZUSATZKOSTEN  ;FIS;11.06.03;DISC FIBU
+	. . ;
+	. . ;QUIT:+$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,22)=0  ;0 MANUELL AUSGANGSRECHNUNG BUCHEN
+	. . QUIT:BUCHEN=0     ; 16-Jan-2006 PO: Note - Can't find anyway BUCHEN can become zero, unless it is through some indirection.
+	. . IF (+$PIECE(A,Y,3)=0) || (+GESAMTQQ=0) QUIT:$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,39)'=1  ;FIS;02.10.02;24365;BUCHEN AUCH WENN 0 (EVTL. FRACHTKOSTEN)
+	. . SET YLAST=YLAST+$PIECE(A,Y,3)
+	. . ;
+	. . IF $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,45)=1 DO  QUIT  ;FIS;27440;EINZELBUCHUNGEN KUMULIEREN;04.03.05
+	. . . SET KUMUL=$PIECE($GET(^WWWSOR(YUSER_"KUMUL",MWPOX,ERLOESE)),Y,3)  ;BETRAG AUS VORHERIGEN BUCHUNGEN
+	. . . SET $PIECE(A,Y,3)=$PIECE(A,Y,3)+KUMUL
+	. . . SET ^WWWSOR(YUSER_"KUMUL",MWPOX,ERLOESE)=A 
+	. . ;
+	. . set $piece(A,Y,16)=YBETRIEB  ; SR13476
+	. . SET KEY=$$^INFIBBUCH(A,YBETRIEB,4,KEY,$$$SalesInvoiceType)   ;BUCHEN IN FIBU
+	
+	
+	;3.) AUXILIARY COSTS FOR EACH LINE ;FIS;07.03.05;27445			// JW SR11997: TODO: TAX MAKES NO SENSE
+	;----------------------------
+	IF BUCHEN=$$$YES IF YBELEG'=12 DO                     ; not Partial Payment Invoice
+	. NEW YZUS,MWPO,KONTO,AUF,POS,KONTOX,MWST,MWSTP,ERLOESE,KONTKST
+	. IF '$DATA(YPOSEXTRA) QUIT
+	. SET KONTO=""
+	. FOR  SET KONTO=$ORDER(YPOSEXTRA(KONTO)) QUIT:KONTO=""  DO
+	. . SET KONTOX=KONTO
+	. . IF KONTOX=" " SET KONTOX=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,29)
+	. . IF KONTOX=""  SET KONTOX=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,33)
+	. . QUIT:+$GET(YPOSEXTRA(KONTO))=0  ;KEIN BETRAG
+	. . ;
+	. . SET GESAMTP=$JUSTIFY(YPOSEXTRA(KONTO),0,2)
+	. . SET MWST=0,MWPO=""
+	. . IF STEUER'=0 DO  ;ERMITTELN STEUERSATZ VERSICHERUNG;FIS;21.02.05;26024
+	. . . SET MWPO=1  ;MWST KENNZEICHEN
+	. . . SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,MWPO,1)),Y,1)  ;MWST SATZ
+	. . ;
+	. . ;SET MWSTP=0	// SR12992 - Redundant line
+	. . SET MWSTP   = $JUSTIFY(GESAMTP/100*MWST,0,2)
+	. . SET GESAMTP = GESAMTP+MWSTP
+	. . SET KONTKST = $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,14)  ;VORGABE KOSTENSTELLE
+	. . ;
+	. . SET ERLOESE=KONTOX  ;KONTO ERLÖS INLAND AUS POS ;acct. net profits out of 
+	. . IF ERLOESE="" SET ERLOESE="ERLOESE"
+	. . SET GESAMTQ=GESAMTQ+GESAMTP
+	. . SET A=Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_MWPO_Y_RECHNUNG_Y_Y  ;AUSGANGSRECHNUNG ;FIS;22.02.05
+	. . SET $PIECE(A,Y,8)=$$^WWWTEXT(32161)                    ; "Invoice"  ;AUSGANGSRECHNUNG
+	. . IF $PIECE(A,Y,3)<0 SET $PIECE(A,Y,8)="GU "  ;_YKUNDE
+	. . IF $PIECE($GET(YAUFTRAG1),Y,8)'="" DO 
+	. . . IF SPRACHE="DE" SET $PIECE(A,Y,8)="AR "_$PIECE(YAUFTRAG1,Y,8) QUIT
+	. . . SET $PIECE(A,Y,8)=$PIECE(YAUFTRAG1,Y,8)
+	. . ;
+	. . SET $PIECE(A,Y,12)=KONTKST  ;KOSTENSTELLE ;cost centre 
+	. . SET $PIECE(A,Y,13)=$PIECE(YAUFTRAG1,Y,75)  ;TAGE
+	. . SET $PIECE(A,Y,14)=$PIECE(YAUFTRAG1,Y,74)  ;SKONTO
+	. . SET $PIECE(A,Y,15)=$PIECE(YAUFTRAG1,Y,76)  ;NETTO
+	. . IF $PIECE($GET(YADRES),Y,102)'="" SET $PIECE(A,Y,24)=$PIECE($GET(YADRES),Y,102)  ;ZAHLUNGSWEG
+	. . SET $PIECE(A,Y,27)="YPOSEXTRA"  ;ZUSATZKOSTEN  ;FIS;11.06.03;DISC FIBU
+	. . ;
+	. . ;QUIT:+$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,22)=0  ;0 MANUELL AUSGANGSRECHNUNG BUCHEN
+	. . ;   FIXME : Where is BUCHEN reset?  Line appears unnecesary <GRF>
+	. . QUIT:BUCHEN=$$$NO
+	. . ;
+	. . ;SPEICHERN BUCHUNGSDATUM
+	. . IF $GET(YSUMINVOICE)'=1 DO
+	. . . NEW POSX,ZUS
+	. . . DO  ;IF $ORDER(YAUFTRAG(""))'="" DO
+	. . . . SET POSX=""
+	. . . . FOR  SET POSX=$ORDER(YAUFTRAG(POSX)) QUIT:POSX=""  DO
+	. . . . . SET ZUS=""
+	. . . . . FOR  SET ZUS=$ORDER(^INAUFPIMPACT(YM,YAUFTRAG,POSX,ZUS)) QUIT:ZUS=""  DO
+	. . . . . . SET ZUS(1)=$GET(^INAUFPIMPACT(YM,YAUFTRAG,POSX,ZUS,1))
+	. . . . . . QUIT:$PIECE(ZUS(1),Y,7)'=""  ;BEREITS BERECHNET
+	. . . . . . QUIT:+$PIECE(ZUS(1),Y,6)=0   ;KEINE KOSTEN
+	. . . . . . SET $PIECE(^INAUFPIMPACT(YM,YAUFTRAG,POSX,ZUS,1),Y,7)=+$HOROLOG  ;BERECHNET AM
+	. . ;
+	. . IF $GET(YSUMINVOICE)=1 DO
+	. . . NEW YAUFTRAGX,POSX,ZUS
+	. . . SET YAUFTRAGX=""
+	. . . FOR  SET YAUFTRAGX=$ORDER(^WWWSOR(YUSER,"SUMINVOICE",YAUFTRAGX)) QUIT:YAUFTRAGX=""  DO
+	. . . . SET POSX=""
+	. . . . FOR  SET POSX=$ORDER(^WWWSOR(YUSER,"SUMINVOICE",YAUFTRAGX,POSX)) QUIT:POSX=""  DO
+	. . . . . SET ZUS=""
+	. . . . . FOR  SET ZUS=$ORDER(^INAUFPIMPACT(YM,YAUFTRAGX,POSX,ZUS)) QUIT:ZUS=""  DO
+	. . . . . . SET ZUS(1)=$GET(^INAUFPIMPACT(YM,YAUFTRAGX,POSX,ZUS,1))
+	. . . . . . QUIT:$PIECE(ZUS(1),Y,7)'=""  ;BEREITS BERECHNET
+	. . . . . . QUIT:+$PIECE(ZUS(1),Y,6)=0  ;KEINE KOSTEN
+	. . . . . . SET $PIECE(^INAUFPIMPACT(YM,YAUFTRAGX,POSX,ZUS,1),Y,7)=+$HOROLOG  ;BERECHNET AM
+	. . ;
+	. . IF (+$PIECE(A,Y,3)=0) || (+GESAMTQQ=0) QUIT:$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,39)'=1  ;FIS;02.10.02;24365;BUCHEN AUCH WENN 0 (EVTL. FRACHTKOSTEN)
+	. . SET YLAST=YLAST+$PIECE(A,Y,3)
+	. . ;
+	. . IF $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,45)=1 DO  QUIT  ;FIS;27440;EINZELBUCHUNGEN KUMULIEREN;04.03.05
+	. . . SET KUMUL=$PIECE($GET(^WWWSOR(YUSER_"KUMUL",MWPO,ERLOESE)),Y,3)  ;BETRAG AUS VORHERIGEN BUCHUNGEN
+	. . . SET $PIECE(A,Y,3)=$PIECE(A,Y,3)+KUMUL
+	. . . SET ^WWWSOR(YUSER_"KUMUL",MWPO,ERLOESE)=A 
+	. . ;
+	. . set $piece(A,Y,16)=YBETRIEB  ; SR13476
+	. . SET KEY=$$^INFIBBUCH(A,YBETRIEB,4,KEY,$$$SalesInvoiceType)   ;BUCHEN IN FIBU
+	
+	
+	;4.) Order Items
+	;----------------------
+	IF $GET(YSUMINVOICE)=1 DO  ;FIS;EINZELBUCHUNG BEI SAMMELRECHNUNG;27440;04.03.05
+	. NEW YAUFTRAG,YAUFTRAGX,NOTLAST
+	. SET NOTLAST=1
+	. SET YAUFTRAGX=""
+	. FOR  SET YAUFTRAGX=$ORDER(^WWWSOR(YUSER,"SUMINVOICE",YAUFTRAGX)) QUIT:YAUFTRAGX=""  DO
+	. . KILL YAUFTRAG
+	. . SET YAUFTRAG=YAUFTRAGX
+	. . SET YAUFTRAG1=$GET(^INAUF(YM,YAUFTRAG,1))
+	. . SET POS=""
+	. . FOR  SET POS=$ORDER(^WWWSOR(YUSER,"SUMINVOICE",YAUFTRAG,POS)) QUIT:POS=""  DO
+	. . . SET YAUFTRAG(POS)=""
+	. . ;
+	. . IF $ORDER(^WWWSOR(YUSER,"SUMINVOICE",YAUFTRAGX))="" SET NOTLAST=""  ;LETZTER AUFTRAG
+	. . DO POSITIONEN
+	
+	IF $GET(YSUMINVOICE)'=1 DO POSITIONEN
+	
+	
+	;5.) BUCHEN KUMULIERTE WERTE
+	;---------------------------
+	;	D45		$$$INFIBPAR...   Single Postings Cumulative Transferred
+	IF $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,45)=$$$YES DO  ;FIS;27440;EINZELBUCHUNGEN KUMULIEREN;04.03.05
+	. NEW MWPOX,ERLOESE,KEY,A  ;KOSTART
+	. SET KEY=""
+	. DO  ;FOR KOSTART="ZUS","POS" DO
+	. . SET MWPOX=""
+	. . FOR  SET MWPOX=$ORDER(^WWWSOR(YUSER_"KUMUL",MWPOX)) QUIT:MWPOX=""  DO
+	. . . SET ERLOESE=""
+	. . . FOR  SET ERLOESE=$ORDER(^WWWSOR(YUSER_"KUMUL",MWPOX,ERLOESE)) QUIT:ERLOESE=""  DO
+	. . . . SET A=$GET(^WWWSOR(YUSER_"KUMUL",MWPOX,ERLOESE))
+	. . . . if $piece(A,Y,16)="" set $piece(A,Y,16)=YBETRIEB  ; SR13476
+	. . . . SET KEY=$$^INFIBBUCH(A,YBETRIEB,4,KEY,$$$SalesInvoiceType)   ;BUCHEN IN FIBU ;within
+	. ;
+	. KILL ^WWWSOR(YUSER_"KUMUL")
+	
+	
+	;6.) ERSTELLEN LASTSCHRIFTDATEI
+	;    PROVIDE DEBIT FILE
+	;------------------------------
+	;	D102		$$$INKUNDEMethodOfPayment()
+	;					3	Direct Debit
+	IF YKUNDE'="" IF $PIECE($GET(^INKUNDE(YM,YKUNDE,1)),Y,102)=3 DO LASTSCHRIFT^INDRUCK7
+	
+	
+	;7.) BUCHEN ZWISCHENDATEI (DISCLINC)
+	;-----------------------------------
+	;now run function that identifies what, if any, event(s) need to be added to the queue
+	;	D15		$$$INFIBPARAttachedGL()
+	;				4  DISC
+	IF $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,15)=4 DO  ;dcm  ;FIS;DISC;11.06.03;ÜBERLEITUNG IN FIBU-SCHNITTSTELLE
+	. QUIT:'$DATA(^mtemp($JOB,"CusInv")) ; GRF:07-Jan-2004:SR11346
+	. ;
+	. NEW OK
+	. ;
+	. ; SR14141: Possibly include code here to manipulate ^mtemp used by DCM. Only run if a certain global is set.
+	. ;
+	. ;SET OK=$$setRelevantEvents^COMDCMControlModule("DiscLinc","INCusInvoice","other","")  ;INTRAPREND=KENNUNG FÜR @-NET MANAGER ;to 
+	. set MessageType=$select($get(YBELEG)=17:"INCusReturn",1:"INCusInvoice")
+	. SET OK=$$setRelevantEvents^COMDCMControlModule("DiscLinc",MessageType,"other","")     ;INTRAPREND=KENNUNG FÜR @-NET MANAGER ;to 
+	
+	; SR15183
+	;. if 'blnGRF SET OK=$$setRelevantEvents^COMDCMControlModule("DiscLinc","INCusInvoice","other","")
+	;. if blnGRF  SET OK=$$setRelevantEvents^COMDCMControlModule("DiscLinc",MessageType,"other","")     ;INTRAPREND=KENNUNG FÜR @-NET MANAGER ;to 
+	
+	QUIT
+	
+POSITIONEN	;BUCHEN POSITIONEN
+	;-------------------------------------------------------------------------------
+	;
+	; History :
+	; 04-Apr-2008	GM		SRBR014923: Changed $$^WWWTEXT() to $$$Text() for language text (53) 
+	; 23-Feb-2007	GRF		SR15454: Property name clarified "INVORGBSubContractLocn"
+	; 05-Apr-2006	GRF		Doco
+	; 03-Mar-2006	PO		SR14290: Include document type 17 - Tax Credit
+	; 23-Jan-2005	PO		SR14109: Do not alter SOH in the case orders invoice is being corrected.
+	; 07-Jan-2006	PO		SR14152: For customer invoices "Transferred to accounting" only set if order line is sourced.
+	; 13-Sep-2005	JW		SR13434: Don't add discounts/tax on before transfer to FIN.
+	; 22-Aug-2005	JW		SR13297: Remove order discounts as well from price
+	; 29-Jul-2005	JW		SR12992: Making tax consistent
+	; 14-Jun-2005	GRF		Isolate TEXT from INARTHIST arguments
+	;-------------------------------------------------------------------------------
+	new TEXT
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	; POS1		objINAUFP			Order Line
+	; WE1X		objINWEAUF			Incoming Goods
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	DO 
+	. SET GESAMTP=""
+	. SET POS=""
+	. FOR  SET POS=$ORDER(YAUFTRAG(POS)) QUIT:POS=""  DO 
+	. . QUIT:$GET(YAUFTRAG(POS))="X"  ;NUR ANZEIGE, KEINE BERECHNUNG (EINSPRUNG AUS INDRUCKXML6) ;FIS;09.07.04
+	. . SET POS1=$GET(^INAUFP(YM,YAUFTRAG,POS,1))
+	. . ;
+	. . NEW MWPOX
+	. . ;
+	. . //SR12992: Use COMTAX. Note: YBELEG=10 is not below as it is in INDRUCKTAX. Important?
+	. . set MWST = $$INDRUCKTAX^INTAX(YBELEG,POS1,$get(YEKK),$get(YFELDPZ),$get(YKUNDE),$get(YLIEFER),.MWPOX)
+	. . ;
+	. . ; SET MWPOX=$PIECE(POS1,Y,36)  ;POSTIONS MWST ;Tax 
+	. . ; IF (YBELEG=3)||(YBELEG=13) SET MWPOX=$$$INAUFPKInputVATPurchase(YEKK)  ;STEUERKZ FÜR AUFTRAGSPOSITION ;to 
+	. . ; IF MWPOX="" SET MWPOX=1
+	. . ;
+	. . ;SN HISTORY
+	. . IF AUSSEN=0 IF $DATA(^INWEAUFS(YM,YAUFTRAG,POS)) DO           ; "Order Serial Number"
+	. . . NEW BET,LAP,WE,SN
+	. . . SET BET=""
+	. . . FOR  SET BET=$ORDER(^INWEAUFS(YM,YAUFTRAG,POS,BET)) QUIT:BET=""  DO
+	. . . . SET LAP=""
+	. . . . FOR  SET LAP=$ORDER(^INWEAUFS(YM,YAUFTRAG,POS,BET,LAP)) QUIT:LAP=""  DO
+	. . . . . SET WE=""
+	. . . . . FOR  SET WE=$ORDER(^INWEAUFS(YM,YAUFTRAG,POS,BET,LAP,WE)) QUIT:WE=""  DO
+	. . . . . . SET SN=""
+	. . . . . . FOR  SET SN=$ORDER(^INWEAUFS(YM,YAUFTRAG,POS,BET,LAP,WE,SN)) QUIT:SN=""  DO
+	. . . . . . . DO ^INSNHIST(SN,$$^WWWTEXT(31417)_" "_$$^WWWTEXT(32518)_" "_YAUFTRAG_"-"_POS,$PIECE(POS1,Y,4))  ;RECHNUNG ERSTELLT ;tab 
+	. . ;
+	. . ;LÖSCHEN/ERSTELLEN BESTAND / BZW. LAGERPLATZÄNDERUNG BEI LEIHLIEFERUNGEN
+	. . ;DELETE/PROVIDE EXISTENCE / AND/OR CHANGE OF STOCK PILE IN THE CASE OF BORROWING SUPPLIES
+	. . IF AUSSEN=0 IF +$PIECE(POS1,Y,5)>0 DO                 ;LAGERABGANG ; STOCK ISSUE
+	. . . ;ENTWEDER: LAGERUMBUCHUNG DA LEIHAUFTRAG
+	. . . ;EITHER: Stock Transfer POSTING THERE ORDER FOR BORROWING
+	. . . ;     not Partial Payment Invoice
+	. . . ;     D169		$$$INAUFPComplaintSparePart()		2  Customers Rented Items
+	. . . IF YBELEG'=12 IF $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,169)=2 IF $PIECE(POS1,Y,4)'="" DO  QUIT  ;LEIH-AUFTRAG  ;FIS;12.10.2001
+	. . . . NEW LAGER,BETX,LAPX,WEDX,WE1X,WEDY
+	. . . . ;		D1		$$$INVORGBOnHandLocation()
+	. . . . ;		D3		$$$INVORGBSubContractLocn()
+	. . . . SET LAGER=$PIECE($GET(^INVORGB(YM,YM,YLOCATION,1)),Y,3)  ;LEIH-LAGER  ; stock locn for goods sent to external supplier
+	. . . . IF LAGER="" SET LAGER=$PIECE($GET(^INVORGB(YM,YM,YLOCATION,1)),Y,1)  ;HANDLAGER
+	. . . . IF LAGER="" SET LAGER=0
+	. . . . SET BETX=""
+	. . . . FOR  SET BETX=$ORDER(^INWEAUF(YM,YAUFTRAG,POS,BETX)) QUIT:BETX=""  DO
+	. . . . . SET LAPX=""
+	. . . . . FOR  SET LAPX=$ORDER(^INWEAUF(YM,YAUFTRAG,]]><![CDATA[POS,BETX,LAPX)) QUIT:LAPX=""  DO
+	. . . . . . SET WEDX=""
+	. . . . . . FOR  SET WEDX=$ORDER(^INWEAUF(YM,YAUFTRAG,POS,BETX,LAPX,WEDX)) QUIT:WEDX=""  DO     ; "Incoming Goods"
+	. . . . . . . SET WE1X=$GET(^INWEAUF(YM,YAUFTRAG,POS,BETX,LAPX,WEDX,1))
+	. . . . . . . SET $PIECE(WE1X,Y,38)=YAUFTRAG
+	. . . . . . . SET $PIECE(WE1X,Y,39)=POS
+	. . . . . . . SET $PIECE(WE1X,Y,40)=+$HOROLOG
+	. . . . . . . ; **********
+	. . . . . . . ;
+	. . . . . . . ;---------------------------------------
+	. . . . . . . ;
+	. . . . . . . ; *** UPDATE INWE POINT ***
+	. . . . . . . ; 
+	. . . . . . . ; This comment marks where the INWE class is being
+	. . . . . . . ; saved or killed as an indication of where a
+	. . . . . . . ; common method may need to be located.     <GRF>
+	. . . . . . . ;
+	. . . . . . . ;---------------------------------------
+	. . . . . . . ;
+	. . . . . . . DO
+	. . . . . . . . IF '$DATA(^INWE(YM,$PIECE(POS1,Y,4),BETX,LAGER,WEDX,1)) SET ^INWE(YM,$PIECE(POS1,Y,4),BETX,LAGER,WEDX,1)=WE1X DO  QUIT  ;NEUER LAGERPLATZ ;stock location 
+	. . . . . . . . . DO ^WWWSSORT("INWE",$PIECE(POS1,Y,4)_","_BETX_","_LAGER_","_WEDX)
+	. . . . . . . . . ; do $$$Save("INWE",$piece(POS1,Y,4)_","_BETX_","_LAGER_","_WEDX,WE1X,$$$YES) // SR14546
+	. . . . . . . . . ;
+	. . . . . . . . . ;SERIENNUMMERN
+	. . . . . . . . . IF $DATA(^INWEAUFS(YM,YAUFTRAG,POS,BETX,LAPX,WEDX)) DO
+	. . . . . . . . . . NEW SN
+	. . . . . . . . . . SET SN=""
+	. . . . . . . . . . FOR  SET SN=$ORDER(^INWEAUFS(YM,YAUFTRAG,POS,BETX,LAPX,WEDX,SN)) QUIT:SN=""  DO
+	. . . . . . . . . . . SET ^INWES(YM,$PIECE(POS1,Y,4),BETX,LAGER,WEDX,SN,1)=$GET(^INWEAUFS(YM,YAUFTRAG,POS,BETX,LAPX,WEDX,SN,1))
+	. . . . . . . . . . . DO ^WWWSSORT("INWES",$PIECE(POS1,Y,4)_","_BETX_","_LAGER_","_WEDX_","_SN)
+	. . . . . . . . . . . ;DO ^INSNHIST(SN,$$^WWWTEXT(68)_" "_$$^WWWTEXT(32047)_" "_YAUFTRAG_"-"_POS_" "_$$^WWWTEXT(131)_" "_BETX_"/"_LAGER,$PIECE(POS1,Y,4))  ;UMLAGERUNG  NACH ;within  ;BR014923
+	. . . . . . . . . . . DO ^INSNHIST(SN,$$$Text($listbuild("53",$$^WWWTEXT(32047)))_" "_YAUFTRAG_"-"_POS_" "_$$^WWWTEXT(131)_" "_BETX_"/"_LAGER,$PIECE(POS1,Y,4))  ;UMLAGERUNG  NACH ;within 	;BR014923  ; From %1
+	. . . . . . . . ;
+	. . . . . . . . SET WEDY=WEDX
+	. . . . . . . . FOR  QUIT:'$DATA(^INWE(YM,$PIECE(POS1,Y,4),BETX,LAGER,WEDY,1))  DO  ;SOLANGE, BIS FREIER LAGERPLATZ
+	. . . . . . . . . SET WEDY=WEDY+1
+	. . . . . . . . ;
+	. . . . . . . . ;---------------------------------------
+	. . . . . . . . ;
+	. . . . . . . . ; *** UPDATE INWE POINT ***
+	. . . . . . . . ;
+	. . . . . . . . ;---------------------------------------
+	. . . . . . . . SET ^INWE(YM,$PIECE(POS1,Y,4),BETX,LAGER,WEDY,1)=WE1X
+	. . . . . . . . DO ^WWWSSORT("INWE",$PIECE(POS1,Y,4)_","_BETX_","_LAGER_","_WEDY)
+	. . . . . . . . ; do $$$Save("INWE",$piece(POS1,Y,4)_","_BETX_","_LAGER_","_WEDY,WE1X,$$$YES) // SR14546
+	. . . . . . . . ;
+	. . . . . . . . ;SERIENNUMMERN
+	. . . . . . . . IF $DATA(^INWEAUFS(YM,YAUFTRAG,POS,BETX,LAPX,WEDX)) DO
+	. . . . . . . . . NEW SN
+	. . . . . . . . . SET SN=""
+	. . . . . . . . . FOR  SET SN=$ORDER(^INWEAUFS(YM,YAUFTRAG,POS,BETX,LAPX,WEDX,SN)) QUIT:SN=""  DO
+	. . . . . . . . . . SET ^INWES(YM,$PIECE(POS1,Y,4),BETX,LAGER,WEDY,SN,1)=$GET(^INWEAUFS(YM,YAUFTRAG,POS,BETX,LAPX,WEDX,SN,1))
+	. . . . . . . . . . DO ^WWWSSORT("INWES",$PIECE(POS1,Y,4)_","_BETX_","_LAGER_","_WEDY_","_SN)
+	. . . . . . . . . . ;DO ^INSNHIST(SN,$$^WWWTEXT(68)_" "_$$^WWWTEXT(32047)_" "_YAUFTRAG_"-"_POS_" "_$$^WWWTEXT(131)_" "_BETX_"/"_LAGER,$PIECE(POS1,Y,4))  ;UMLAGERUNG  NACH ;within  ;BR014923
+	. . . . . . . . . . DO ^INSNHIST(SN,$$$Text($listbuild("53",$$^WWWTEXT(32047)))_" "_YAUFTRAG_"-"_POS_" "_$$^WWWTEXT(131)_" "_BETX_"/"_LAGER,$PIECE(POS1,Y,4))  ;UMLAGERUNG  NACH ;within  ;BR014923  ; From %1
+	. . . . . . . ; **********
+	. . . . . . . ;
+	. . . . . . . DO ^WWWSKILL("INWEAUF",YAUFTRAG_","_POS_","_BETX_","_LAPX_","_WEDX)
+	. . . . . . . ;
+	. . . . . . . ; ++++++++++++++++++++++++
+	. . . . . . . ; FIXME : "MVI" but no Stock Locations or TO Locn passed (arg #3,#9,#11,#14) - Is this right? <GRF>
+	. . . . . . . ;         From side will be blank but to side should be defined.
+	. . . . . . . ;         Should this be "MVI"?
+	. . . . . . . ; ++++++++++++++++++++++++
+	. . . . . . . ; 
+	. . . . . . . ; "From Order ###-# +### To ###/###"
+	. . . . . . . ;set TEXT = $$^WWWTEXT(68)_" "_$$^WWWTEXT(32047)_" "_YAUFTRAG_"-"_POS_" "_"+"_$PIECE(POS1,Y,5)_" "_$$^WWWTEXT(131)_" "_YLOCATION_"/"_LAGER   ;GRF;14-Jun-2005  ;BR014923
+	. . . . . . . set TEXT = $$$Text($listbuild("53",$$^WWWTEXT(32047)))_" "_YAUFTRAG_"-"_POS_" "_"+"_$PIECE(POS1,Y,5)_" "_$$^WWWTEXT(131)_" "_YLOCATION_"/"_LAGER   ;GRF;14-Jun-2005 ;BR014923  ; From %1
+	. . . . . . . ;DO ^INARTHIST($PIECE(POS1,Y,4),TEXT,BETX,,,$PIECE(POS1,Y,5))  ;+MENGE VON AUFTRAG NACH ;order within 
+	. . . . . . . ;INARTKOST of item ?????  SR13472
+	. . . . . . . DO ^INARTHIST($PIECE(POS1,Y,4),TEXT,BETX,,,$PIECE(POS1,Y,5),,($PIECE(WE1X,Y,4)*$PIECE(WE1X,Y,8)),,,,,,,,"MVI")  ;+MENGE VON AUFTRAG NACH ;FIS;10.01.05;26560
+	. . . . . . .;DO ^INARTHIST($PIECE(POS1,Y,4),TEXT,BETX,,,$PIECE(POS1,Y,5),,($PIECE(WE1X,Y,4)*$PIECE(WE1X,Y,8)),LAPX,,#11,,,#14,,"MVI")  ;possible correction <GRF>
+	. . . . . . . ;
+	. . . . . . . ;   3 BETRIEB  = TO Site Location		<<<<  BETX
+	. . . . . . . ;   9 LAGER    = TO Stock Location	<<<<  LAPX    or LAGER
+	. . . . . . . ;  11 LAGERALT = FROM Stock Location	<<<<  LAGER   or LAPX
+	. . . . . . . ;  14 BETRALT  = FROM Site Location	<<<<  BETX
+	. . . ;
+	. . . ;ODER: AUSBUCHUNG
+	. . . MERGE ^INWEAUFALT(YM,YAUFTRAG,POS)=^INWEAUF(YM,YAUFTRAG,POS)   ;ERFASSUNG WARENEINGGANG ;logging 
+	. . . DO ^WWWSSORT("INWEAUFALT",YAUFTRAG_","_POS)
+	. . . DO ^WWWSKILL("INWEAUF",YAUFTRAG_","_POS)
+	. . . MERGE ^INWEAUFALTS(YM,YAUFTRAG,POS)=^INWEAUFS(YM,YAUFTRAG,POS)
+	. . . DO ^WWWSSORT("INWEAUFALTS",YAUFTRAG_","_POS)
+	. . . DO ^WWWSKILL("INWEAUFS",YAUFTRAG_","_POS)
+	. . . DO
+	. . . . NEW BET,LAP,WED,WE1
+	. . . . SET BET=""
+	. . . . FOR  SET BET=$ORDER(^INWEAUFALT(YM,YAUFTRAG,POS,BET)) QUIT:BET=""  DO 
+	. . . . . ;GRF;10-May-2005;SR12335
+	. . . . . ;IF $PIECE($GET(^INFIBPAR(0,YM,BET,1)),Y,32)'=1 QUIT  ;WENN VERÄNDERUNG DANN IMMERHALB DES AUFTRAGES ;when mutation 
+	. . . . . SET LAP=""
+	. . . . . FOR  SET LAP=$ORDER(^INWEAUFALT(YM,YAUFTRAG,POS,BET,LAP)) QUIT:LAP=""  DO
+	. . . . . . SET WED=""
+	. . . . . . FOR  SET WED=$ORDER(^INWEAUFALT(YM,YAUFTRAG,POS,BET,LAP,WED)) QUIT:WED=""  DO
+	. . . . . . . SET WE1=$GET(^INWEAUFALT(YM,YAUFTRAG,POS,BET,LAP,WED,1))
+	. . . . . . . ;FIBU(ARTIKEL,PLUS,MINUS,MOVE,TEXT,
+	. . . . . . . ;     BETR,LIEFKUN,BETRAG,AUF,POS,
+	. . . . . . . ;     LAGER,LAGERALT,BETRALT,TRANTYPE,OBERTEIL,
+	. . . . . . . ;     FIBUREF,Reason)
+	. . . . . . .;DO FIBU^INARTHIST($PIECE(POS1,Y,4),,$PIECE(WE1,Y,4),,,BET,YDEBITOR,($PIECE(WE1,Y,4)*$PIECE(WE1,Y,8)),YAUFTRAG,POS,,LAP,BET,"SAL")  ;FIS;10.01.05;26560
+	. . . . . . . ;INARTKOST of item ?????  SR13472
+	. . . . . . . DO FIBU^INARTHIST($PIECE(POS1,Y,4),,$PIECE(WE1,Y,4),,,BET,YDEBITOR,($PIECE(WE1,Y,4)*$PIECE(WE1,Y,8)),YAUFTRAG,POS,LAP,,,"SAL")     ;SR13476
+	. . . ;
+	. . . ; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START ;GRF;27-Apr-2005;SR10478
+	. . . ;IF +$PIECE(POS1,Y,430)'=0 DO  ;TRANSACTION POSTING OF MATERIAL VALUE;FIS;14.04.05
+	. . . ;. NEW A,COS
+	. . . ;. SET COS=($PIECE(POS1,Y,430)-$PIECE(POS1,Y,432))  ;NOT POSTED VALUE
+	. . . ;. QUIT:+COS=0
+	. . . ;. SET A=""
+	. . . ;. SET $PIECE(A,Y,2)=+$HOROLOG              ;DATUM / DATE
+	. . . ;. SET $PIECE(A,Y,3)=$PIECE(POS1,Y,430)     ;MATERIAL OVERHEAD
+	. . . ;. SET $PIECE(A,Y,16)=YLOCATION             ;BETRIEB / LOCATION
+	. . . ;. SET $PIECE(A,Y,27)=YAUFTRAG              ;AUFTRAG / ORDER
+	. . . ;. SET $PIECE(A,Y,28)=POS                   ;POSITION / L.I.
+	. . . ;. SET $PIECE(A,Y,29)=$PIECE(POS1,Y,4)      ;ARTIKEL / ITEM
+	. . . ;. SET $PIECE(A,Y,50)="COS"                 ;TRANSACTION TYPE
+	. . . ;. SET OK=$$^INFIBBUCH(A,YLOCATION,"","",4) ;SERVICE COSTS
+	. . . ;. SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,432)=($PIECE(POS1,Y,432)+COS)  ;SAVE POSTED VALUE
+	. . . ;. ;DO FIBU^INARTHIST($PIECE(POS1,Y,4),,,,,BET,YDEBITOR,$PIECE(POS1,Y,430),YAUFTRAG,POS,,,,"COS")  ;FIS;14.04.05;26345;ASSIGNED INVENTORY COSTS
+	. . . ; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DISABLED BLOCK END
+	. . ;
+	. . ;SPEICHERN BESTAND BEI RUECKLIEFERUNG/GUTSCHRIFT
+	. . ;          IF AUSSEN=0   FAN ;Save next to buff 
+	. . IF YBELEG'=12 IF AUSSEN=0 IF +$PIECE(POS1,Y,5)<0 DO        ;LAGERZUGANG
+	. . . QUIT:$PIECE($GET(^INAUFP(YM,YAUFTRAG,POS,1)),Y,223)=""   ;KEIN LAGERPLATZ keine buchung ;no stock location None 
+	. . . QUIT:$PIECE($GET(^INAUFP(YM,YAUFTRAG,POS,1)),Y,234)'=""  ;BEREITS GEBUCHT ;yet 
+	. . . ; INARTPLUS calls INARTHIST
+	. . . SET YOK=$$^INARTPLUS(YAUFTRAG,POS,$PIECE(POS1,Y,4),$PIECE(POS1,Y,5),,$PIECE(POS1,Y,56),$PIECE(POS1,Y,198),,$PIECE(POS1,Y,253))
+	. . . ;                    AUFTRAG,POSITION,ARTIKEL,MENGE,"",SERIENNUMMER,LOT-NUMMER  (""=KEINE FERTIGUNG)
+	. . . SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,234)=+$HOROLOG  
+	. . . SET $PIECE(POS1,Y,234)=+$HOROLOG  
+	. . ;
+	. . ;HISTORY RECHNUNGSDRUCK ; Print History Calculation
+	. . IF AUSSEN=0 DO
+	. . . NEW BETRIEB
+	. . . SET BETRIEB=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,6)
+	. . . IF BETRIEB="" SET BETRIEB=YLOCATION
+	. . . set TEXT = $$^WWWTEXT(31417)_" "_$$^WWWTEXT(32518)_" "_YAUFTRAG_"-"_POS
+	. . . ; DO ^INARTHIST($PIECE(POS1,Y,4),TEXT,BETRIEB)  ;RECHNUNG ERSTELLT ;tab ; SR14109
+	. . . if '($$$OrderLinesInvoiceEndsWithDot(POS1) && ((YBELEG=7) || (YBELEG=17))) DO ^INARTHIST($PIECE(POS1,Y,4),TEXT,BETRIEB)  ;RECHNUNG ERSTELLT ;tab ; SR14109: Do not update SOH if Inv# ends with ., fix for same invoice number used on two orders ; SR14290
+	. . ;
+	. . ;QUIT:BUCHEN=0  ;  0 MANUELL AUSGANGSRECHNUNG BUCHEN       FAN
+	. .
+	. . QUIT:$$$INAUFPTransferredIntoAccounting(POS1)'=""  ;BUCHUNGSDATUM SPEICHER DATEN NUR DANN ,WENN NICHT WIEDERHOLUNGSDRUCK
+	. . ;SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,101)=+$HOROLOG   // SR14746;WANN ÜBERTRAGEN ;when transport 
+	. . ;SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,102)=YBED   ;WER ÜBERTRAGEN ;who transport 
+	. . DO
+	. . . NEW SATZ
+	. . . SET SATZ=$GET(^INAUF(YM,YAUFTRAG,1))
+	. . . SET $PIECE(SATZ,Y,101)=+$HOROLOG   // SR14746;WANN ÜBERTRAGEN ;when transport 
+	. . . SET $PIECE(SATZ,Y,102)=YBED   ;WER ÜBERTRAGEN ;who transport 
+	. . . SET strStatus=$$$Save("INAUF",YAUFTRAG,SATZ,$$$YES)     // SR14746
+	. . ;if (($$$INAUFPSource(POS1)'="") && (YBELEG=7)) || (YBELEG'=7) do ; SR14152
+	. . . ;SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,101)=+$HOROLOG   ;WANN ÜBERTRAGEN ;when transport 
+	. . . ;SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,102)=YBED   ;WER ÜBERTRAGEN ;who transport 
+	. . ;SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,101)=+$HOROLOG   ;WANN ÜBERTRAGEN ;when transport ; SR14152
+	. . ;SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,102)=YBED   ;WER ÜBERTRAGEN ;who transport ; SR14152
+	. . ;
+	. . ;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv BLOCK DISABLED 
+	. . ;IF $GET(YSUMINVOICE)=1 DO  ;SUMMENBELEG;TYB;29,1,2005
+	. . . ;NEW YAUFTRAG,POS
+	. . . ;SET YAUFTRAG="" FOR  SET YAUFTRAG=$ORDER(^WWWSOR(YUSER,"SUMINVOICE",YAUFTRAG)) QUIT:YAUFTRAG=""  DO
+	. . . . ;SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,101)=+$HOROLOG   // SR14746 ;WANN ÜBERTRAGEN ;when transport 
+	. . . . ;SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,102)=YBED   ;WER ÜBERTRAGEN ;who transport 
+	. . . . ;DO
+	. . . . . ;NEW SATZ
+	. . . . . ;SET SATZ=$GET(^INAUF(YM,YAUFTRAG,1))
+	. . . . . ;SET strStatus=$$$Save("INAUF",YAUFTRAG,SATZ,$$$YES)     // SR14746
+	. . . . ;SET POS="" FOR  SET POS=$ORDER(^WWWSOR(YUSER,"SUMINVOICE",YAUFTRAG,POS)) QUIT:POS=""  DO
+	. . . . . ;SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,101)=+$HOROLOG   ;WANN ÜBERTRAGEN ;when transport 
+	. . . . . ;SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,102)=YBED   ;WER ÜBERTRAGEN ;who transport 
+	. . ;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ END DISABLED BLOCK
+	. . ;
+	. . SET SORTI=$$$INAUFPCategory(POS1)
+	. . IF SORTI="" SET SORTI=" "
+	. . SET WAGR=$$$INAUFPItemGroup(POS1)
+	. . IF WAGR="" SET WAGR=$$$INVORGDefaultItemGroup($GET(^INVORG(YM,YM,1)))
+	. . IF WAGR="" SET WAGR=0
+	. . SET GESAMTP=$JUSTIFY($$$INAUFPNetSalesPrice(POS1),0,2)  ;GESAMT MINUS RABATT VOR STEUER ;total minus deduction pre-tax 
+	. . ;
+	. . ;	//////////////////////////////////////////////////////////////
+	. . ;	// SR13434: DON'T ADD TAX OR ORDER DISCOUNTS ON HERE !!!!!! //
+	. . ;	//////////////////////////////////////////////////////////////
+	. . ;
+	. . // SR13297: Remove order discounts as well
+	. . ;set GESAMTP=GESAMTP-$$DollarDiscount^INDRUCK7(YAUFTRAG,POS)
+	. . ;set GESAMTP=GESAMTP-$$PercentDiscount^INDRUCK7(YAUFTRAG,POS,$PIECE(^INAUF(YM,YAUFTRAG,1),Y,71))
+	. . ;
+	. . // SR12992: MWST is already set
+	. . ; SET MWST=0
+	. . ; ;IF STEUER'=0 SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,STEUER,1)),Y,1)
+	. . ; IF STEUER'=0 SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,+MWPOX,1)),Y,1)  ;FIS;22.03.04;;25372;MWST '= STEUER !
+	. . ;
+	. . ;SET MWSTP=0	// SR12992 - Redundant line
+	. . ;SET MWSTP=$JUSTIFY(GESAMTP/100*MWST,0,2)
+	. . ;SET GESAMTP=GESAMTP+MWSTP
+	. . ;
+	. . //SR12992: Remove use of INKSTL*. Use INLAND variable.
+	. . ;
+	. . SET KONTKST=$$$INAUFPCostCenter(POS1)  ;KOSTENSTELLE AUS POSITION ;cost centre out of 
+	. . IF KONTKST="" SET KONTKST=$$$INFIBPARCostCentre($GET(^INFIBPAR(0,YM,YBETRIEB,1)))
+	. . ;
+	. . SET KONTCOGS=$$$INFIBPARCostOfSalesAccount($GET(^INFIBPAR(0,YM,YBETRIEB,1)))
+	. . ;
+	. . IF INLAND  SET ERLOESE=$$$INAUFPRevenueAccountInland(POS1)   ;KONTO ERLÖS INLAND AUS POS ;acct. net profits out of 
+	. . IF 'INLAND SET ERLOESE=$$$INAUFPRevenueAccountForeign(POS1)  ;KONTO ERLÖS AUSLAND POS ;acct. net profits foreign country 
+	. . ;
+	. . ; SET KONTEN=$GET(^INKSTL(YM,YBETRIEB,WAGR,STEUERKZ,1,1))  ;AUS PARAMETER ;out of parameter 
+	. . ; IF $GET(^INKSTLUST(YM,YBETRIEB,WAGR,STEUERKZ,1,+MWPOX,1))'="" SET KONTEN=^(1)  ;KONTEN JE STEUERSATZ;FIS;17.03.04;25372
+	. . ; IF KONTEN="" SET KONTEN=$GET(^INKSTL1(YM,YBETRIEB,SORTI,STEUERKZ,1,1))  ;AUS VORGABE SORTIMENT ;out of default 
+	. . ; IF KONTEN="" IF $PIECE($GET(^INVORG(YM,YM,1)),Y,13)'="" DO
+	. . ; . SET KONTEN=$GET(^INKSTL(YM,YBETRIEB,$PIECE($GET(^INVORG(YM,YM,1)),Y,13),STEUERKZ,1,1))  ;AUS VORGABE SONSTIGES ;out of default 
+	. . ; . IF $GET(^INKSTLUST(YM,YBETRIEB,$PIECE($GET(^INVORG(YM,YM,1)),Y,13),STEUERKZ,1,+MWPOX,1))'="" SET KONTEN=$GET(^INKSTLUST(YM,YBETRIEB,$PIECE($GET(^INVORG(YM,YM,1)),Y,13),STEUERKZ,1,+MWPOX,1))  ;KONTEN JE STEUERSATZ;FIS;17.03.04;25372
+	. . ; . QUIT
+	. . ; IF KONTEN="" SET KONTEN=$GET(^INKSTL(YM,YBETRIEB,0,STEUERKZ,1,1))  ;AUS VORGABE SONSTIGES ;out of default 
+	. . ; ;
+	. . ; SET KONTKST=$PIECE(POS1,Y,33)  ;KOSTENSTELLE AUS POSITION ;cost centre out of 
+	. . ; IF KONTKST="" SET KONTKST=$PIECE(KONTEN,Y,1)  ;AUS PARAMETER ;out of parameter 
+	. . ; IF KONTKST="" SET KONTKST=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,14)  ;VORGABE KOSTENSTELLE ;default cost centre 
+	. . ; ;
+	. . ; SET KONTCOGS=$PIECE(KONTEN,Y,4)  ;FIS;25830;28.06.04;VORGABE PRODUKTKOSTENKONTO
+	. . ; IF KONTCOGS="" SET KONTCOGS=$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,34)
+	. . ; ;
+	. . ; SET ERLOESE=$PIECE(POS1,Y,31)  ;KONTO ERLÖS INLAND AUS POS ;acct. net profits out of 
+	. . ; IF STEUER=0 SET ERLOESE=$PIECE(POS1,Y,32)  ;KONTO ERLÖS AUSLAND POS ;acct. net profits foreign country 
+	. . ; IF ERLOESE="" DO
+	. . ; . SET ERLOESE=$PIECE(KONTEN,Y,3)
+	. . ; . IF STEUER=0 SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,32)=ERLOESE QUIT  ;SPEICHERN IN AUFTRAGSPOSITION ;Save within 
+	. . ; . SET $PIECE(^INAUFP(YM,YAUFTRAG,POS,1),Y,31)=ERLOESE  ;SPEICHERN IN AUFTRAGSPOSITION ;Save within 
+	. . ; . QUIT 
+	. . ;
+	. . IF ERLOESE="" SET ERLOESE="ERLOESE"
+	. . ;
+	. . SET GESAMTQ=GESAMTQ+GESAMTP  ;GESAMTSUMME FUER CENT DIFFERERENZ		// SR13243 - Disabled block. Don't change amount.
+	. . ;IF $ORDER(YAUFTRAG(POS))="" IF +GESAMTQ'=+GESAMT DO
+	. . ;IF $ORDER(YAUFTRAG(POS))="" IF $GET(NOTLAST)'=1 IF +GESAMTQ'=+GESAMT DO  ;FIS;SAMMELBUCHUNG;27440;04.03.05
+	. . ;. IF GESAMTQ>GESAMT SET GESAMTP=GESAMTP-(GESAMTQ-GESAMT)  ;WENN ZUVIEL
+	. . ;. IF GESAMTQ<GESAMT SET GESAMTP=GESAMTP+(GESAMT-GESAMTQ)  ;WENN ZUWENIG ;when 
+	. . ;
+	. . ;SET A=Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_STEUER_Y_RECHNUNG_Y_Y  ;AUSGANGSRECHNUNG
+	. . SET A=Y_DATUM_Y_GESAMTP_Y_YDEBITOR_Y_ERLOESE_Y_MWPOX_Y_RECHNUNG_Y_Y    ;AUSGANGSRECHNUNG;FIS;22,02,05
+	. . SET $PIECE(A,Y,8)=$$^WWWTEXT(32161)                                    ; "Invoice"
+	. . IF $PIECE(A,Y,3)<0 IF SPRACHE="DE" SET $PIECE(A,Y,8)="GU "_YKUNDE
+	. . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8)'="" DO 
+	. . . IF SPRACHE="DE" SET $PIECE(A,Y,8)="AR "_$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8) QUIT
+	. . . SET $PIECE(A,Y,8)=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,8)
+	. . ;
+	. . SET $PIECE(A,Y,12)=KONTKST                 ;KOSTENSTELLE ;cost centre 
+	. . SET $PIECE(A,Y,13)=$PIECE(YAUFTRAG1,Y,75)  ;TAGE
+	. . SET $PIECE(A,Y,14)=$PIECE(YAUFTRAG1,Y,74)  ;SKONTO
+	. . SET $PIECE(A,Y,15)=$PIECE(YAUFTRAG1,Y,76)  ;NETTO
+	. . SET $PIECE(A,Y,34)=$PIECE(YAUFTRAG1,Y,56)  ;kondition
+	. . SET $PIECE(A,Y,35)=KONTCOGS                ;FIS;25830;28.06.04;VORGABE PRODUKTKOSTENKONTO
+	. . IF $PIECE($GET(YADRES),Y,102)'="" SET $PIECE(A,Y,24)=$PIECE($GET(YADRES),Y,102)  ;ZAHLUNGSWEG
+	. . ;
+	. . SET $PIECE(A,Y,27)=YAUFTRAG           ;AUFTRAG          ;FIS;11.06.03;DISC FIBU
+	. . SET $PIECE(A,Y,28)=POS                ;POSITION         ;FIS;11.06.03;DISC FIBU
+	. . SET $PIECE(A,Y,29)=$PIECE(POS1,Y,4)   ;ARTIKEL          ;FIS;11.06.03;DISC FIBU
+	. . set $piece(A,Y,40)=$piece(POS1,Y,405) ;INVOICE LOCATION ;PP;2004-09-07;DISC
+	. . set $piece(A,Y,41)=$piece(POS1,Y,33)  ;COST CENTER      ;PP;2004-09-07;DISC
+	. . ;
+	. . ;QUIT:+$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,22)=0  ;  0 MANUELL AUSGANGSRECHNUNG BUCHEN
+	. . QUIT:BUCHEN=0
+	. . IF (+$PIECE(A,Y,3)=0) || (+GESAMTQQ=0) QUIT:$PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,39)'=1  ;FIS;02.10.02;24365;BUCHEN AUCH WENN 0 (EVTL. FRACHTKOSTEN)
+	. . SET YLAST=YLAST+$PIECE(A,Y,3)
+	. . ;
+	. . IF $PIECE($GET(^INFIBPAR(0,YM,YBETRIEB,1)),Y,45)=1 DO  QUIT  ;FIS;27440;EINZELBUCHUNGEN KUMULIEREN;04.03.05
+	. . . NEW SUM
+	. . . SET SUM=$PIECE($GET(^WWWSOR(YUSER_"KUMUL",MWPOX,ERLOESE)),Y,3)  ;BETRAG AUS VORHERIGEN BUCHUNGEN
+	. . . SET $PIECE(A,Y,3)=$PIECE(A,Y,3)+SUM
+	. . . SET $PIECE(A,Y,28)=""
+	. . . SET $PIECE(A,Y,29)=""
+	. . . SET ^WWWSOR(YUSER_"KUMUL",MWPOX,ERLOESE)=A 
+	. . ;
+	. . set $piece(A,Y,16)=YBETRIEB  ; SR13476
+	. . SET KEY=$$^INFIBBUCH(A,YBETRIEB,4,KEY,$$$SalesInvoiceType)   ;BUCHEN IN FIBU
+	
+	QUIT
+	
+MWSTZUSATZ	
+	/*------------------------------------------------------------------------------
+	;  ERMITTELN STEUERKENNZEICHUNG UND MWST-SATZ FÜR ZUSATZKOSTEN	
+	;  DETERMINE tax ??? AND VAT  - SET FOR AUXILIARY COSTS ?
+	;  
+	;  JW SR11997: TODO: TAX MAKES NO SENSE
+	; 
+	; Returns : 
+	;	MWST		
+	;	MWPOX		
+	;-----------------------------------------------------------------------------*/
+	; TODO : remove DO levels if unnecessary; single check for STEUER'=0
+	DO
+	. DO
+	. . IF STEUER'=0 IF YZUS=1 DO  ;ERMITTELN STEUERSATZ VERPACKUNG;FIS;21.02.05;26024
+	. . . NEW KEY,MWPO
+	. . . SET MWPO=""
+	. . . SET KEY(1)=""
+	. . . FOR  SET KEY(1)=$ORDER(^INVERPACK(YM,KEY(1)))  QUIT:KEY(1)=""  DO  QUIT:MWPO'=""
+	. . . . SET KEY(2)=""
+	. . . . FOR  SET KEY(2)=$ORDER(^INVERPACK(YM,KEY(1),KEY(2)))  QUIT:KEY(2)=""  DO  QUIT:MWPO'=""
+	. . . . . SET KEY(3)=""
+	. . . . . FOR  SET KEY(3)=$ORDER(^INVERPACK(YM,KEY(1),KEY(2),KEY(3)))  QUIT:KEY(3)=""  DO  QUIT:MWPO'=""
+	. . . . . . SET MWPO=$PIECE($GET(^INVERPACK(YM,KEY(1),KEY(2),KEY(3),1)),Y,3)  ;MWST KENNZEICHEN
+	. . . . . . IF MWPO'="" SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,MWPO,1)),Y,1),MWPOX=MWPO  ;MWST SATZ
+	. . ;
+	. . IF STEUER'=0 IF (YZUS=2) || (YZUS=3) DO  ;ERMITTELN STEUERSATZ FRACHT UND KM-GELD;FIS;21.02.05;26024
+	. . . NEW KEY,MWPO
+	. . . SET MWPO=""
+	. . . SET KEY(1)=""
+	. . . FOR  SET KEY(1)=$ORDER(^INTRANSPORT(YM,KEY(1)))  QUIT:KEY(1)=""  DO  QUIT:MWPO'=""
+	. . . . SET KEY(2)=""
+	. . . . FOR  SET KEY(2)=$ORDER(^INTRANSPORT(YM,KEY(1),KEY(2)))  QUIT:KEY(2)=""  DO  QUIT:MWPO'=""
+	. . . . . SET KEY(3)=""
+	. . . . . FOR  SET KEY(3)=$ORDER(^INTRANSPORT(YM,KEY(1),KEY(2),KEY(3)))  QUIT:KEY(3)=""  DO  QUIT:MWPO'=""
+	. . . . . . SET MWPO=$PIECE($GET(^INTRANSPORT(YM,KEY(1),KEY(2),KEY(3),1)),Y,3)  ;MWST KENNZEICHEN
+	. . . . . . IF MWPO'="" SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,MWPO,1)),Y,1),MWPOX=MWPO  ;MWST SATZ
+	. . ;
+	. . IF STEUER'=0 IF YZUS=4 DO  ;ERMITTELN STEUERSATZ VERSICHERUNG;FIS;21.02.05;26024
+	. . . NEW KEY,MWPO
+	. . . SET MWPO=""
+	. . . SET KEY(1)=""
+	. . . FOR  SET KEY(1)=$ORDER(^INVERSICH(YM,KEY(1)))  QUIT:KEY(1)=""  DO  QUIT:MWPO'=""
+	. . . . SET KEY(2)=""
+	. . . . FOR  SET KEY(2)=$ORDER(^INVERSICH(YM,KEY(1),KEY(2)))  QUIT:KEY(2)=""  DO  QUIT:MWPO'=""
+	. . . . . SET KEY(3)=""
+	. . . . . FOR  SET KEY(3)=$ORDER(^INVERSICH(YM,KEY(1),KEY(2),KEY(3)))  QUIT:KEY(3)=""  DO  QUIT:MWPO'=""
+	. . . . . . SET MWPO=$PIECE($GET(^INVERSICH(YM,KEY(1),KEY(2),KEY(3),1)),Y,3)  ;MWST KENNZEICHEN
+	. . . . . . IF MWPO'="" SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,MWPO,1)),Y,1),MWPOX=MWPO  ;MWST SATZ
+	. . ;
+	. . IF STEUER'=0 IF YZUS=5 DO  ;ERMITTELN STEUERSATZ SPEZIALZUSCHLAG;FIS;21.02.05;26024
+	. . . NEW KEY,MWPO
+	. . . SET MWPO=""
+	. . . SET KEY(1)=""
+	. . . FOR  SET KEY(1)=$ORDER(^INZUSCHLAG(YM,KEY(1)))  QUIT:KEY(1)=""  DO  QUIT:MWPO'=""
+	. . . . SET KEY(2)=""
+	. . . . FOR  SET KEY(2)=$ORDER(^INZUSCHLAG(YM,KEY(1),KEY(2)))  QUIT:KEY(2)=""  DO  QUIT:MWPO'=""
+	. . . . . SET KEY(3)=""
+	. . . . . FOR  SET KEY(3)=$ORDER(^INZUSCHLAG(YM,KEY(1),KEY(2),KEY(3)))  QUIT:KEY(3)=""  DO  QUIT:MWPO'=""
+	. . . . . . SET MWPO=$PIECE($GET(^INZUSCHLAG(YM,KEY(1),KEY(2),KEY(3),1)),Y,3)  ;MWST KENNZEICHEN
+	. . . . . . IF MWPO'="" SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,MWPO,1)),Y,1),MWPOX=MWPO  ;MWST SATZ
+	. . ;
+	. . IF STEUER'=0 IF YZUS=6 DO   ;ERMITTELN STEUERSATZZUSCHLAG AUS KONDITION;FIS;07.03.05
+	. . . SET MWPOX=1
+	. . . SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,1,1)),Y,1)
+	. . ;
+	. . IF STEUER'=0 IF MWST="" SET MWST=+$PIECE($GET(^WWW101(0,"MWST",SPRACHE,1,1)),Y,1),MWPOX=1  ;DFLT. 1 = 16 %
+	
+	QUIT
+	
+ProcessMovement()
+	quit
+]]></Routine>
+</Export>

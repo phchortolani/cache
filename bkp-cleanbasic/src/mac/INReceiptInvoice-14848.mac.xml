@@ -1,0 +1,329 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReceiptInvoice" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReceiptInvoice
+#include COMSYS
+#include INConst	
+	
+#define FORMFldINRECInvoiceTotal	19
+#define FORMFldINRECCalculatedTotal 30
+#define FORMFldTotalCharges         22 
+	
+#define EnumTypeStandard	0
+#define EnumTypeBonus		2
+#define IsItemLine   ((enumLineType=$$$EnumTypeStandard) || (enumLineType=$$$EnumTypeBonus))
+#define IsChargeLine ((enumLineType'="") && (enumLineType'=$$$EnumTypeStandard) && (enumLineType'=$$$EnumTypeBonus))
+	
+#define LogR(%1,%2)		;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReceiptInvoice("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+PostInvoice(pidReceipt,pidSummary,pidInvoice)
+	;-------------------------------------------------------------------------------
+	; 1) Generate FINAPInv, FINAPInvLine, FINAPInvCharge if not in existence
+	; 2) Build INERECH1 ?  (as in 3WM?)
+	; 3) Process as in 3WM
+	; 
+	; Called by : ProcessSummary^INReceiptButton
+	; 
+	; Inputs :
+	;	pidReceipt,pidSummary		INRECSummary keys
+	;
+	; History
+	; 30-Mar-2010	GRF		SR17244.1: Bonus (no cost) lines must still create line
+	;							in FINAPInvLine to permit associated charges to be
+	;							recognised in GetAdditionalCharges^FINAPINVCharge2.
+	; 29-Mar-2010	GRF		SR17244.1: Allow extra charges on bonus (no cost) lines
+	; 							[REVISED - Bonus => Finance line not charge]
+	; 28-Mar-2010	GRF		SR17244: process in-line discounts; distinguish between
+	; 							in-line and total charges
+	; 10-Dec-2009	GRF		SR16667: call to CreateInvoice^FINAPInvCharge was not
+	; 							passing GL Acct
+	; 17-Jul-2009	GRF		SR16689: Activate new code - rename
+	; 16-Jul-2009	GRF		SR16669: CostDistribution macro change
+	; 15-Jul-2009	GRF		SR16689: Correct INRECSummary property names in macros;
+	;							rename corresponding variables
+	; 10-Jul-2009	GRF		SR16689: Base FINAPInvLine on INRECLine rather than
+	; 							INRECSummary
+	; 07-Jul-2009	GRF		SR16689: Need to check for bonus with unit cost - plus
+	; 							double-handling get variables from INRECSummary;
+	; 							call to CreateInvoice^FINAPInvMatchCache now handled
+	; 							by ProcessSummary^INReceiptButton; remove
+	; 							superfluous test; use Line Type macros
+	; 21-May-2009	DWR		SR16363: Modified logic. Moved the building of a 
+	; 							FINAPInvMatchcache record, if the first line has an 
+	; 							order it would not go through area on another line.
+	; 13-May-2009	DWR		SR16363: Added a buiild of FINAPInvmatch Cache record if
+	; 							nor order is present.
+	; 17-Apr-2009   DWR		SR16363: Populated routine, created calls to CreateInvoice:
+	; 							FINAPInv, FINAPInvLine, FINAPInvCharge
+	; 15-Apr-2009	GRF		SR16363: created
+	;-------------------------------------------------------------------------------
+	new curActTotal,curDiscAmt,dteInv,enumAllocn,enumCDist,enumDisc,enumDiscTerm
+	new enumFCCode,enumInvUOM,enumLineType,enumOrdUOM
+	new fltAdjCost,fltCost,fltDiscPct,fltOrdUnit,fltRecvdQty
+	new idGenLed,idItem,idLocn,idOrder,idStorage,idSupp,idTaxLocn
+	new objCompany,objFINAPInv,objLocn,objINRECLine,objReceipt,objSummLine
+	new strStatus,strSuppInv
+	
+	$$$LogR("PostInvoice",pidReceipt_","_pidSummary_","_pidInvoice)
+	
+	set strStatus    = $$$OK
+	
+ 	set objReceipt   = $get(^INREC(YM,pidReceipt,1))
+ 	
+	set strSuppInv   = $$$INRECInvoiceNumber(objReceipt)
+	set idSupp       = $$$INRECSupplier(objReceipt)
+	set idLocn       = $$$INRECLocation(objReceipt)
+	set curActTotal  = $$$INRECInvoiceTotal(objReceipt)
+	set dteInv       = $$$INRECInvoiceDate(objReceipt)
+	set fltDiscPct   = $$$INRECDiscountPercent(objReceipt)
+	set curDiscAmt   = $$$INRECDiscountAmount(objReceipt)
+	set enumDiscTerm = $$$INRECDiscountTerm(objReceipt)
+ 
+	set objSummLine  = $get(^INRECSummary(YM,pidReceipt,pidSummary,1))
+	
+	set idOrder      = $$$INRECSummaryPurchaseOrder(objSummLine)
+	set enumLineType = $$$INRECSummaryLineType(objSummLine)
+ 	set idItem       = $$$INRECSummaryItem(objSummLine)
+	set fltRecvdQty  = $$$INRECSummaryQuantityReceived(objSummLine)
+	set fltOrdUnit   = $$$INRECSummaryUnitCost(objSummLine)
+	set fltAdjCost   = $$$INRECSummaryExtendedCost(objSummLine)
+ 	
+ 	if (enumLineType=$$$EnumTypeBonus) && fltAdjCost {          ; Bonus with Extended Cost
+	 	set strStatus = $$$MakeStatus("IN01075",pidSummary)
+ 	}  ; "Line %1 : Bonus item cannot have a cost - change to Standard or clear cost"
+ 	
+ 	
+ 	if $$$ISOK(strStatus) {
+	 	set objFINAPInv = $get(^FINAPInv(YM,pidInvoice,1))
+	 	if objFINAPInv = "" {
+			set objCompany = $get(^WWW012(0,YM,1))
+			set objLocn    = $get(^WWW0121(0,YM,idLocn,1))
+			set idTaxLocn  = $$$WWW0121TaxLocation(objLocn)
+			set enumFCCode = $$$WWW012StandardCurrency(objCompany)
+		    set strStatus  = $$CreateInvoice^FINAPInv(pidInvoice,strSuppInv,idSupp,idLocn,dteInv,
+		                                              fltDiscPct,curDiscAmt,enumFCCode,curActTotal,idTaxLocn,
+		                                              enumDiscTerm)
+	 	}
+ 	}
+ 	
+    if $$$ISOK(strStatus) {
+		set enumDisc   = $$$INRECSummaryDiscountCode(objSummLine)     ; SR17244 moved up for common use
+		if (enumLineType = $$$EnumTypeStandard) {
+			set strStatus   = $$CreateInvoice(pidReceipt,pidSummary,pidInvoice,objSummLine)
+		
+			; In-Line Discounts  ; SR17244
+			;---------------------------------------
+			if enumDisc'="" {
+				set fltCost    = $$$INRECSummaryCostAfterDiscount(objSummLine) - $$$INRECSummaryExtendedCost(objSummLine)
+				set enumCDist  = $$$INRECSummaryCostDistribution(objSummLine)
+				set enumAllocn = $$$INRECSummaryCostAllocation(objSummLine)
+				set idGenLed   = $$$INRECSummaryGLAccount(objSummLine)   
+		
+				set strStatus  = $$CreateInvoice^FINAPInvCharge(pidInvoice,pidSummary_"INLINE",enumLineType,fltAdjCost,fltCost,
+					                                                enumCDist,idGenLed,enumDisc,enumAllocn)
+			}
+
+		} elseif enumLineType=$$$EnumTypeBonus {     ; might have freight on bonus  ; SR17244.1 vvv
+			set strStatus   = $$CreateInvoice(pidReceipt,pidSummary,pidInvoice,objSummLine)
+			
+	;	} elseif enumLineType'=$$$EnumTypeBonus { ; Discount or Surcharge
+		} else  { ; Discount or Surcharge                                           ; SR17244.1 ^^^
+			set fltCost    = $$$INRECSummaryCostAfterDiscount(objSummLine)
+			set enumCDist  = $$$INRECSummaryCostDistribution(objSummLine)
+			set enumAllocn = $$$INRECSummaryCostAllocation(objSummLine)
+			set idGenLed   = $$$INRECSummaryGLAccount(objSummLine)   
+			
+		;	set strStatus  = $$CreateInvoice^FINAPInvCharge(pidInvoice,pidSummary,enumLineType,fltAdjCost,fltCost,
+		;	                                                enumCDist,enumAllocn,enumDisc,enumAllocn)   ; SR16667/SR16689
+			set strStatus  = $$CreateInvoice^FINAPInvCharge(pidInvoice,pidSummary,enumLineType,fltAdjCost,fltCost,
+			                                                enumCDist,idGenLed,enumDisc,enumAllocn)
+		}
+	}
+	
+	quit strStatus
+	
+	
+CreateInvoice(pidReceipt,pidSummary,pidInvoice,pobjSummLine) private
+	;-------------------------------------------------------------------------------
+	; Create an Invoice Line FINAPInvLine
+	;
+	;
+	; History:
+	; 28-Aug-2009	GRF		SR16815: rename enumInvUnit as enumRecvdUnit to clarify
+	; 27-Aug-2009	DWR		SR16815: convert the received unit and qty to be as the
+	; 							ordered qty for creating FINAPInvLine
+	; 04-Aug-2009	PPP		SR16815:enumOrdUnit is populated for Receipt w/o Order
+	; 							with enumInvUnit
+	; 17-Jul-2009	GRF		SR16689: Rename NewCreateInvoice^FINAPInvLine
+	; 10-Jul-2009	GRF		SR16689: Created
+	;-------------------------------------------------------------------------------
+	new curLineAmt,enumOrdUnit,enumRecvdUnit
+	new fltAllocQty,fltCalc,fltConvFactor,fltInvQty,fltRecvdQty,fltVariance
+	new idItem,idLocn,idOrder,idOrdLine,idRecLine,idStorage,objRecLine,strStatus
+	
+	$$$LogR("CreateInvoice",pidReceipt_","_pidSummary_":"_pidInvoice_">"_pobjSummLine_"<")
+	
+	set strStatus   = $$$OK
+	set enumOrdUnit = $$$INRECSummaryOrderedUnit(pobjSummLine)   ; D9 Order Unit
+	
+	;set curLineCost = $$$INRECSummaryCostAfterDiscount(pobjSummLine)   ; FIXME : With charges? <GRF>
+	set fltRecvdQty = $$$INRECSummaryQuantityReceived(pobjSummLine)
+	set fltVariance = 0
+	
+	set idRecLine = $order(^INRECLine(0,pidReceipt,pidSummary),-1)
+	for {
+		set idRecLine = $order(^INRECLine(0,pidReceipt,idRecLine))
+		quit:idRecLine=""
+		quit:idRecLine\1'=pidSummary
+		
+		set objRecLine = $get(^INRECLine(0,pidReceipt,idRecLine,1))
+		
+		set idOrder       = $$$INRECLineOrder1(objRecLine)
+		set idOrdLine     = $$$INRECLineOrderLine(objRecLine)
+		set idItem        = $$$INRECLineItem(objRecLine)
+		set idLocn        = $$$INRECLineLocation(objRecLine)
+		set idStorage     = $$$INRECLineStockLocation(objRecLine)
+		set fltInvQty     = $$$INRECLineQuantity(objRecLine)      ; D4/F4  in Inventory Units ;SR16815
+		set fltAllocQty   = $$$INRECLineUnitQuantity(objRecLine)  ; D64/F8 in Receipt Units   ;SR16815
+		set enumRecvdUnit = $$$INRECLineUnit(objRecLine)          ; D5/F5     Receipt units
+	//	set curLineAmt    = $$$INRECLineEach(objRecLine) * fltInvQty  
+		set curLineAmt    = $justify($$$INRECLineEach(objRecLine) * fltInvQty,0,2)
+				
+		if idOrder {   // SR16815   ; 1 OU = fltConv RU
+			set fltConvFactor = $$GetUOMConvBetweenUnits^INUOMConversion(idItem,enumRecvdUnit,enumOrdUnit)
+			set fltAllocQty   = fltAllocQty / fltConvFactor     ; now in Order Units
+		}
+		
+		if enumOrdUnit="" set enumOrdUnit = enumRecvdUnit   //SR16815
+		
+		set strStatus = $$CreateInvoice^FINAPInvLine(idOrder,idOrdLine,pidReceipt,idRecLine,pidInvoice,idItem,idLocn,idStorage,
+		                                               curLineAmt,fltAllocQty,enumRecvdUnit,enumOrdUnit)
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+	
+CalcCostAdj(pstrKeys,&pobjSummary)
+	;-------------------------------------------------------------------------------
+	; Calculate the additional cost or discount for the main line or overall
+	; 
+	; Called by : INRECSummary
+	; 
+	; History:
+	; 07-Apr-2010	GRF		SR17177: common recalculate cost after charges
+	; 25-Mar-2010	GRF		SR17244: Calculate CostAfterDisc for in-line discounts
+	; 06-Aug-2009	GRF		SR16815: Rate calc based on UnitQuantityReceived
+	; 17-Jul-2009	GRF		SR16669: Surcharge based on ^INSUPBuyingDiscount
+	; 13-Jul-2009	GRF		SR16689: use linetype macro
+	; 18-Jun-2009	GRF		SR16598: no charge value until type is defined
+	; 17-Jun-2009	GRF		SR16598: relocate sign inversion to apply to line and
+	; 							invoice-based discounts
+	; 02-Jun-2009	GRF		SR16595: Pass qty to discount calculations
+	; 21-May-2009	DWR		SR16363: modified logic to simplify and remove early quit
+	; 							instances. Removed unused paramters
+	; 22-Apr-2009	DWR		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new curChargeAmt,curExtCost,enumDiscType,enumLineType,fltDiscRate,fltQtyRecvd
+	new idDiscCode,idLine,idReceipt
+	
+	$$$LogR("CalcCostAdj",pstrKeys_":"_pobjSummary)
+	
+	set idReceipt = $$$KEY1(pstrKeys)
+	set idLine    = $$$KEY2(pstrKeys)
+	
+	set enumLineType = $$$INRECSummaryLineType(pobjSummary)
+	if (enumLineType'="") {
+	;	set fltQtyRecvd  = $$$INRECSummaryQuantityReceived(pobjSummary)        ; SR16815
+		set fltQtyRecvd  = $$$INRECSummaryUnitQtyReceived(pobjSummary)
+		set idDiscCode   = $$$INRECSummaryDiscountCode(pobjSummary)            ; SR16669
+		set enumDiscType = $$$INRECSummaryDiscountType(pobjSummary)
+		set curExtCost   = $$$INRECSummaryExtendedCost(pobjSummary)
+		set fltDiscRate  = $$$INRECSummaryDiscountRate(pobjSummary)
+		
+		set curChargeAmt = curExtCost
+		
+	;	if (enumLineType '= 0) && (enumLineType '= 2) {    ; Neither Standard nor Bonus line ; SR16689
+
+		if '$$$IsItemLine {
+			if (enumDiscType'="") || (idDiscCode'="") {
+		; SR17177 vvv
+		;		if idLine'["." {                           ; Invoice-based Charge lines
+		;			; NOTE: Change made to INRECSummaryC to stop invoice-based charge from being other than Fixed Amount Type
+		;			set curChargeAmt = +fltDiscRate        ; at present processes as Amount type regardless of enumDiscType TODO ?
+		;		
+		;		} else {                                   ; Line-specific Charge lines
+		;			set curChargeAmt = $$CalcCharge(enumDiscType,fltDiscRate,fltQtyRecvd,curExtCost)   ; SR17244 - use line's CostAfterDiscount?
+		;		}
+				set curChargeAmt = $$CalcCharge(enumDiscType,fltDiscRate,fltQtyRecvd,curExtCost)   ; SR17244 - use line's CostAfterDiscount?
+		; SR17177 ^^^
+				//if enumLineType = 1 {     ; SR16669
+				if '$$$INSUPBuyingDiscountSurcharge($get(^INSUPBuyingDiscount(0,idDiscCode,1))) {
+					 set curChargeAmt = -curChargeAmt    ; Invert sign for Discounts                 ; SR16598
+				}
+			
+			} else {
+				set curChargeAmt = ""
+			}
+			
+		} else {   ; Process any In-Line Discounts ; SR17244
+			if (enumDiscType'="") || (idDiscCode'="") {
+				set curChargeAmt = curExtCost - $$CalcCharge(enumDiscType,fltDiscRate,fltQtyRecvd,curExtCost)
+			}
+		}
+		set $$$INRECSummaryCostAfterDiscount(pobjSummary) = curChargeAmt
+	}
+	quit
+	
+	
+CalcCharge(penumDiscType,pfltDiscRate,pfltQtyRecvd,pcurExtCost)
+	;-------------------------------------------------------------------------------
+	; Calculate the surcharge or discount amount
+	; This will be stored under $$$INRECSummaryCostAfterDiscount
+	; 
+	; Called By :	CalcCostAdj^INReceiptInvoice
+	;				RefreshLineCharge^INRECSummaryAssoc
+	; 
+	; Inputs :
+	; 	penumDiscType		Calculation Type based on "INDISCOUNTTYPE" Application Parameter
+	; 						1 : Percentage, 2 : Amount, 3 : Rate (amount per item)
+	; 	pfltDiscRate		Percentage points ("10" = 10%), $ Actual, or $ per [RU]
+	; 	pfltQtyRecvd		Required for Rate type calculation  [RU]
+	; 	pcurExtCost			
+	; 	
+	; ByRef :
+	; 	YDECIMALLEN			Number of decimal places for currency
+	; 
+	; History:
+	; 06-Aug-2009	GRF/DR	SR16820: Wrong Enum values corrected
+	; 15-Jul-2009	GRF		SR16669: ensure curChargeAmt defined
+	; 03-Jun-2009	GRF		SR16595: round cur dp
+	; 02-Jun-2009	GRF		SR16595: Created - replaces AddToCost and SubtractCost
+	; 							which were created under SR16363
+	;-------------------------------------------------------------------------------
+	new curChargeAmt
+	
+	$$$LogR("CalcCharge",penumDiscType_","_pfltDiscRate_","_pfltQtyRecvd_","_pcurExtCost)
+	
+	if penumDiscType = 1 {                              ; Percentage
+		set curChargeAmt = (pfltDiscRate * pcurExtCost / 100)
+	
+	} elseif penumDiscType = 0 {                        ; Amount   ; 2 SR16820
+		set curChargeAmt = pfltDiscRate
+	
+	} elseif penumDiscType = 2 {                        ; Rate     ; 3 SR16820
+		set curChargeAmt = pfltDiscRate * pfltQtyRecvd
+		
+	} else {
+		set curChargeAmt = 0                            ; unrecognised
+	}
+	
+	if $get(YDECIMALLEN)="" set YDECIMALLEN=2
+	quit $justify(curChargeAmt,0,YDECIMALLEN)
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,671 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INSHIPINFOCOSTSAllocn" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INSHIPINFOCOSTSAllocn
+#include COMSYS
+#include INConst
+#include FINConst
+	/*------------------------------------------------------------------------------
+	; Description of Function :
+	;		CALCULATE ESTIMATED COSTS FOR IMPORT - Steps 2a) and 2b)
+	; 
+	; Called by : 
+	; 	Routines : INSHIPINFOCOSTS
+	; 
+	; History :
+	; 11-Oct-2006	GRF		SR15107: Moved to separate routine
+	;-----------------------------------------------------------------------------*/
+	
+GetTotal(IMPORT,TYPE,idxIMPORT,idAllocMethod,blnCustoms,&arrCustoms)
+	;-------------------------------------------------------------------------
+	;  Calculate Total of whatever property to allow pro rata allocation later 
+	; 
+	; History :
+	; 10-Oct-2006	GRF		SR15107: Split from main routine
+	;-------------------------------------------------------------------------
+	new AUF,Dim1,Dim2,Dim3,objINAUFP,POS,QuantityUnit,TOTAL,VOLUME
+	
+	set TOTAL=0
+	set AUF=""
+	for {
+		set AUF=$order(^INAUFPAs(YM,2,idxIMPORT,AUF))
+		quit:AUF=""
+		
+		set POS=""
+		for {
+			set POS=$order(^INAUFPAs(YM,2,idxIMPORT,AUF,POS))
+			quit:POS=""
+			
+			set objINAUFP = $get(^INAUFP(YM,AUF,POS,1))
+			
+			;-------------------------------
+			; FIXME : GetCustomsActual uses the current CDV value to determine the proportionate
+			;         distribution of the ACTUAL customs amount.  CDV is not automatically
+			;         updated, so the values are likely to remain in proportion even when FOREX
+			;         changes.  A discrepancy MAY arise however if some order lines are updated
+			;         manually and others aren't.                                         <GRF>
+			;-------------------------------
+			if blnCustoms {                                 ;SR14097
+			;	set arrCustoms(POS) = $$GetCustomsActual^INSHIPINFOCOSTSCustoms(idxIMPORT_","_TYPE,AUF,POS)         ; SR15035      ; 11-Oct-2006
+				set arrCustoms(AUF,POS) = $$GetCustomsActual^INSHIPINFOCOSTSCustoms(idxIMPORT_","_TYPE,AUF,POS)     ; 10-Oct-2006  ; 11-Oct-2006
+			;	set TOTAL = TOTAL + arrCustoms(POS)         ; SR15035 Import Shipment may have multiple orders with the same line no - overwriting array entries.
+				set TOTAL = TOTAL + arrCustoms(AUF,POS)     ; 10-Oct-2006
+			} else {
+				
+	;  "IsDutiable" means either ("Dutiable" cost with a duty rate) or (not a "Dutiable" cost)
+				
+				if $$IsDutiable^INWEAUF1(IMPORT,$get(^INSHIPINFOCOSTS(YM,IMPORT,TYPE,1)),AUF,POS) {
+			
+			;---------------------------------------
+			; 1. APPORTION BY VALUE
+			;---------------------------------------
+					if idAllocMethod=1 {
+					;	set TOTAL = TOTAL + $piece(objINAUFP,Y,47)
+					;	SR15107 : This is updated by INARTK between each cost update. <GRF>
+						set TOTAL = TOTAL + $$GetCurrentCost(IMPORT,AUF,POS,$$$YES)
+					
+			;---------------------------------------
+			; 2. APPORTION BY VOLUME
+			;---------------------------------------
+					} elseif  idAllocMethod=2 {
+						set VOLUME = +$piece(objINAUFP,Y,44)
+						set Dim1 = $$$INAUFPLength1(objINAUFP)       ; Dimensions
+						set Dim2 = $$$INAUFPWidth(objINAUFP)
+						set Dim3 = $$$INAUFPHeight(objINAUFP)
+						if Dim1 && Dim2 && Dim3 {                    ;length / width / height all have values
+	; FIXME : Verify don't want INAUFP D449 instead of D40 - doesn't consider user units - should use a unit type
+							set QuantityUnit = $$$INAUFPQuantityUnit(objINAUFP)
+							if (VOLUME=0) && (QuantityUnit=18) {     ;VOLUMEN RECHNEN  ;volume calculation  
+								set VOLUME = +$justify((Dim1/1000)*(Dim2/1000)*(Dim3/1000),0,4)
+							}
+							if (VOLUME=0) && (QuantityUnit=5) || (QuantityUnit=6) || (QuantityUnit=12)  {
+								set VOLUME = +$justify(Dim1*Dim2*Dim3,0,4)
+							}
+						}
+						set TOTAL = TOTAL + VOLUME
+ 
+			;---------------------------------------
+			; 3. APPORTION BY WEIGHT
+			;---------------------------------------
+					} elseif idAllocMethod=3 {
+						set TOTAL = TOTAL + $piece(objINAUFP,Y,43)
+					
+			;---------------------------------------
+			; 4. APPORTION BY QUANTITY
+			;---------------------------------------
+					} elseif idAllocMethod=4 {
+						set TOTAL = TOTAL + $piece(objINAUFP,Y,5)
+					
+			;---------------------------------------
+			; 5. APPORTION EVENLY
+			;---------------------------------------
+					} elseif idAllocMethod=5 {
+						set TOTAL = TOTAL + 1
+					} 
+			;---------------------------------------
+			; 6. ALLOCATION OF DUTY                      ; Calculation so doesn't generate TOTAL
+			;---------------------------------------
+				}
+			}
+		}
+	}
+	quit TOTAL
+	
+AllocateOrderLine(IMPORT,TYPE,AUF,POS,POS1,YFELD,idAllocMethod,TOTAL,blnCustoms,&arrCustoms)
+	;-------------------------------------------------------------------------------
+	;  Calculate line cost 
+	;   - Calculate the cost for each order line associated with the import.
+	;   - Update the INStockVal record.
+	;   - Build an INERECH1 record for the Invoice.
+	;   - Recalculate Average Cost History.
+	; 
+	; History :
+	; 10-Oct-2006	GRF		SR15107: Split from main routine
+	;-------------------------------------------------------------------------------
+	new arrCurrent,CostQuantity,curSCTotal,fltActualCosts,WE1
+	
+	set fltActualCosts = $$$INSHIPINFOCOSTSActualCosts(YFELD)           ; D2
+	
+	if blnCustoms {                                                  ; Customs Allocation
+		if TOTAL=0 {
+			set curSCTotal=0                                               ; SR14263
+		} else {
+			set curSCTotal = fltActualCosts/TOTAL*arrCustoms(AUF,POS)  ; SR14097 ; SR15035 ; 10-Oct-2006
+		}
+	} else {
+	;  "IsDutiable" means either ("Dutiable" cost with a duty rate) or (not a "Dutiable" cost)
+		if $$IsDutiable^INWEAUF1(IMPORT,$GET(^INSHIPINFOCOSTS(YM,IMPORT,TYPE,1)),AUF,POS) {
+			set curSCTotal = $$OtherAllocation(IMPORT,AUF,POS,POS1,YFELD,idAllocMethod,TOTAL,fltActualCosts)
+		} else {
+			set curSCTotal = 0
+		}
+	}
+	
+	;-------------------------------------------------------------------------------
+	;  >>>  curSCTotal now contains the allocation of the shipment cost (total rather than unit)
+	;  >>>  for the current Order/Line *** FOR ONE COST TYPE ***.
+	;  
+	;  Update the INStockVal records BEFORE losing accuracy.
+	;  
+	;  FIXME : Maybe - Somehow preserve the StockVal change and only update when whole of Invoice is transferred to Ledger <GRF>
+	;          This *** HAS *** to be the fix!      Otherwise we have to keep comparing current Actual to 
+	;          previous Actual which may no longer be in existence! <GRF>
+	;          Temp correction to block changes to "ACTUAL" on INSHIPINFOCOSTS once a value has been saved in "ACTUAL".
+	;-------------------------------------------------------------------------------
+	do StockValSC(AUF,POS,$$$INAUFPItemNumber(POS1),curSCTotal,TYPE) ; with Initial amount calculated in the subroutine
+	set curSCTotal=$JUSTIFY(curSCTotal,0,2)
+	
+	;---------------------------------------
+	;  SAVE INVOICE (INERECH1)
+	;---------------------------------------
+	
+	; FIXME : ??? Why do we need to generate an invoice for CUSTOMS if curSCTotal is zero? <GRF>
+	
+	IF (+curSCTotal'=0) || blnCustoms DO
+	. NEW YKEY,SATZ,INVOICE,YI
+	. SET INVOICE=$PIECE(YFELD,Y,7)_"#"_TYPE
+	. SET YKEY=AUF_","_POS_","_$PIECE(YFELD,Y,6)_","_INVOICE  ;ORDER, LI, SUPPLIER, INVOICE#
+	. SET SATZ=""
+	. ;IF $DATA(^INERECH1(YM,AUF,POS,$PIECE(YFELD,Y,6),INVOICE,1)) SET SATZ=^(1)
+	. ;  
+	. ;-----
+	. ; If we have an Invoice quit if it has been sent to the GL
+	. ; otherwise refresh INERECH1 record with new Actuals
+	. ; FIXME : Either need to block Avg Cost calc until GL Posting (with INStockVal update at same time)
+	. ;         or need to apply only nett change to actual to the INStockVal - rather than comparing
+	. ;         the new actual with the INWEAUF estimates.          <GRF>
+	. ;         
+	. ; TEMP FIX : changes to OnBeforeFormConstruction for D2 and for Button 1 on INSHIPINFOCOSTS
+	. ;         to make Actual Cost Read Only once it has been saved. <GRF>
+	. ;         
+	. IF $DATA(^INERECH1(YM,AUF,POS,$PIECE(YFELD,Y,6),INVOICE,1)) QUIT:$PIECE(YFELD,Y,12)'=""  ;FIS;NICHT NEU RECHNEN;22.11.04 ; 13-Jul-2006 DO Removed
+	. ;
+	. SET $PIECE(SATZ,Y,1) = $PIECE(YFELD,Y,8)  ;INVOICE DATE
+	. IF $PIECE(SATZ,Y,1)="" SET $PIECE(SATZ,Y,1) = +$HOROLOG
+	. SET $PIECE(SATZ,Y,16) = ""                ;NO INVOICE QTY           ; not needed since start from ""
+	. SET $PIECE(SATZ,Y,24) = 0                 ;INVOICE OK
+	. SET $PIECE(SATZ,Y,47) = ""                ;UNIT PRICE               ; not needed since start from ""
+	. SET $PIECE(SATZ,Y,12) = curSCTotal        ;NET AMOUNT
+	. SET $PIECE(SATZ,Y,13) = curSCTotal        ;TOTAL AMOUNT
+	. SET $PIECE(SATZ,Y,22) = curSCTotal        ;INVOICE OK
+	. FOR YI=2:1:7,9,10  SET $PIECE(SATZ,Y,YI) = ""                       ; not needed since start from ""
+	. SET $PIECE(SATZ,Y,80) = TYPE              ;COST TYPE
+	. ;
+	. NEW YOK,YFORM,YVOR,YFELD,YDATEI
+	. SET YOK=$$^WWWSPEI("INERECH1",YKEY,SATZ,1)
+	. ;
+	. SET YFORM  = "INERECH1"
+	. SET YDATEI = "INERECH1"
+	. SET YFELD  = SATZ
+	. DO ^INARTK                  ; can modify and re-save INERECH1, INAUFP, INARTK
+	
+	;-------------------------------------------------------------------------
+	;  RECALCULATE AVERAGE COST;FIS;13.04.05
+	;  
+	;  NOTE : Assume ^INAUFP has been updated - cannot rely on POS1
+	;  
+	;  Cost is the sum of the amounts already posted (from INAUFP)
+	;          plus the estimates of the un-invoiced shipping costs.
+	;-------------------------------------------------------------------------
+	set POS1 = $get(^INAUFP(YM,AUF,POS,1))        ; 11-Oct-2006
+	IF $$$INAUFPItemNumber(POS1)'="" IF $DATA(^INARTAVG(YM,$$$INAUFPItemNumber(POS1))) IF $$$INAUFPQuantity(POS1)>0 DO
+	. NEW AUFX,AVERAGE,AVG1,BET,DAT,DATX,LAP,MENGEX,POSX,POSX1,SKOST,SUCH,TOTALX,TYPEX,TYPEX1,UHR,UHRX,UnitCost,WED
+	. ;
+	. ;CALCULATION OF NEW UNIT COST
+	. ;SET KOST=$PIECE(^INARTAVG(YM,$PIECE(POS1,Y,4),DAT,UHR,1),Y,4)  ;OLD UNIT PRICE
+	. ;SET KOST=KOST-$PIECE(YFELD,Y,1)+COST  ;-> THIS WORKS ONLY 1ST TIME
+	. ;
+	. ;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Moved Disabled block below - replaced with call to GetCurrentCost
+	. ;
+	. ;-------------------------------
+	. ; For Each Receipt against an order line, update the Average Cost History.
+	. ; 
+	. ; All receipts for an order line are accumulated together for a total cost
+	. ; since they will share common shipping costs.  This is divided by the actual quantity received to get an each
+	. ;-------------------------------
+	. ;set KOST = $$GetCurrentCost                  ; 11-Oct-2006
+	. set CostQuantity = $$$INAUFPIncomingGoodsQuantity(POS1)
+	. if 'CostQuantity set CostQuantity = $$$INAUFPQuantity(POS1)
+	. set UnitCost = +$justify($$GetCurrentCost(IMPORT,AUF,POS,$$$NO)/CostQuantity,0,2)
+	. ;-------------------------------
+	. ; Determine which average cost entries to update and reset the "received unit
+	. ; value" field.  Call Revise^INARTAVG to recalculate the subsequent entries
+	. ; from the oldest entry updated.
+	. ;-------------------------------
+	. SET MENGEX=0
+	. SET DATX=""
+	. SET UHRX=""
+	. IF $DATA(^INWEAUF(YM,AUF,POS)) DO
+	. . SET BET=""
+	. . FOR  SET BET=$ORDER(^INWEAUF(YM,AUF,POS,BET)) QUIT:BET=""  DO
+	. . . SET LAP=""
+	. . . FOR  SET LAP=$ORDER(^INWEAUF(YM,AUF,POS,BET,LAP)) QUIT:LAP=""  DO
+	. . . . SET WED=""
+	. . . . FOR  SET WED=$ORDER(^INWEAUF(YM,AUF,POS,BET,LAP,WED)) QUIT:WED=""  DO
+	. . . . . SET WE1=$GET(^INWEAUF(YM,AUF,POS,BET,LAP,WED,1))
+	. . . . . IF $PIECE(WE1,Y,4)'>0 QUIT
+	. . . . . ;
+	. . . . . SET SUCH=$$^WWWUMLAU(AUF_"-"_POS_"-"_BET_"-"_LAP_"-"_WED,1)
+	. . . . . IF $DATA(^INARTAVGs(YM,1,SUCH)) DO
+	. . . . . . SET DAT=""
+	. . . . . . FOR  SET DAT=$ORDER(^INARTAVGs(YM,1,SUCH,$$$INAUFPItemNumber(POS1),DAT)) QUIT:DAT=""  DO
+	. . . . . . . SET UHR=""
+	. . . . . . . FOR  SET UHR=$ORDER(^INARTAVGs(YM,1,SUCH,$$$INAUFPItemNumber(POS1),DAT,UHR)) QUIT:UHR=""  DO
+	. . . . . . . .;SET $PIECE(^INARTAVG(YM,$$$INAUFPItemNumber(POS1),DAT,UHR,1),Y,4) = KOST/$$$INAUFPQuantity(POS1)  ;CHANGE UNIT PRICE
+	. . . . . . . . SET $PIECE(^INARTAVG(YM,$$$INAUFPItemNumber(POS1),DAT,UHR,1),Y,4) = UnitCost  ;CHANGE UNIT PRICE  ; 11-Oct-2006
+	. . . . . . . . ;
+	. . . . . . . . ; Save keys for start of recalc in Revise^INARTAVG
+	. . . . . . . . IF DATX=""     SET DATX=DAT,UHRX=UHR QUIT
+	. . . . . . . . IF DATX>DAT    SET DATX=DAT,UHRX=UHR QUIT
+	. . . . . . . . IF DATX=DAT IF UHRX>UHR SET UHRX=UHR
+	. ;
+	. do Revise^INARTAVG("INSHIPINFOCOSTS",IMPORT_","_TYPE_"|"_DATX_","_UHRX,$$$INAUFPItemNumber(POS1),DATX,UHRX)    ; SR14203 Use common code
+	
+	quit
+	
+	/*
+	;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Moved Disabled block from marked position
+	
+	. ;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv Disabled block start 14-Jul-2006
+	. SET KOST=$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,47)       ;NEW COST
+	. SET TYPEX=""
+	. FOR  SET TYPEX=$ORDER(^INSHIPINFOCOSTS(YM,IMPORT,TYPEX)) QUIT:TYPEX=""  DO:TYPEX'=TYPE
+	. . ;ONLY IF NOT INVOICED YET (OTHERWISE IT WOULD BE IN KOST ALREADY)
+	. . ;IF '$DATA(^INERECH1s(YM,2,$$^WWWUMLAU(TYPEX,1))) DO           ; 13-Jul-2006
+	. . IF '$DATA(^INERECH1s(YM,2,$$$Index(TYPEX),AUF,POS)) DO
+	. . . SET TYPEX1=$GET(^INSHIPINFOCOSTS(YM,IMPORT,TYPEX,1))
+	. . . SET SKOST=$PIECE(TYPEX1,Y,1)                         ;ESTIMATED NOT INVOICED COSTS
+	. . . QUIT:+SKOST=0
+	. . . ;
+	. . . ;
+	. . . ;
+	. . . SET TOTALX=0
+	. . . IF $PIECE(TYPEX1,Y,9)'=6 SET AUFX="" FOR  SET AUFX=$ORDER(^INAUFPAs(YM,2,idxIMPORT,AUFX)) QUIT:AUFX=""  DO
+	. . . . SET POSX=""
+	. . . . FOR  SET POSX=$ORDER(^INAUFPAs(YM,2,idxIMPORT,AUFX,POSX)) QUIT:POSX=""  DO
+	. . . . . SET POSX1=$GET(^INAUFP(YM,AUFX,POSX,1))
+	. . . . . IF +$PIECE(TYPEX1,Y,9)=5 SET TOTALX = TOTALX+1                   ;APPORTION EVENLY
+	. . . . . IF +$PIECE(TYPEX1,Y,9)=4 SET TOTALX = TOTALX+$PIECE(POSX1,Y,5)   ;APPORTION BY QUANTITY
+	. . . . . IF +$PIECE(TYPEX1,Y,9)=3 SET TOTALX = TOTALX+$PIECE(POSX1,Y,43)  ;APPORTION BY WEIGHT
+	. . . . . IF +$PIECE(TYPEX1,Y,9)=1 SET TOTALX = TOTALX+$PIECE(POSX1,Y,47)  ;APPORTION BY VALUE
+	. . . . . IF +$PIECE(TYPEX1,Y,9)=2 SET TOTALX = TOTALX+$PIECE(POSX1,Y,44)  ;APPORTION BY VOLUME
+	. . . ;
+	. . . ;
+	. . . ;
+	. . . IF $PIECE(TYPEX1,Y,9)'=6 QUIT:TOTALX=0                               ;FIS;19.11.2004;26593
+	. . . ;
+	. . . ;
+	. . . ;
+	. . . IF +$PIECE(TYPEX1,Y,9)=5 SET SKOST = SKOST/TOTALX                    ;APPORTION EVENLY
+	. . . IF +$PIECE(TYPEX1,Y,9)=4 SET SKOST = SKOST/TOTALX*$PIECE(POS1,Y,5)   ;APPORTION BY QUANTITY
+	. . . IF +$PIECE(TYPEX1,Y,9)=3 SET SKOST = SKOST/TOTALX*$PIECE(POS1,Y,43)  ;APPORTION BY WEIGHT
+	. . . IF +$PIECE(TYPEX1,Y,9)=1 SET SKOST = SKOST/TOTALX*$PIECE(POS1,Y,47)  ;APPORTION BY VALUE
+	. . . IF +$PIECE(TYPEX1,Y,9)=2 SET SKOST = SKOST/TOTALX*$PIECE(POS1,Y,44)  ;APPORTION BY VOLUME
+	. . . IF +$PIECE(TYPEX1,Y,9)=6 DO                                          ;ALLOCATION OF DUTY
+	. . . . NEW DUTY,CODE,ORIGIN
+	. . . . SET CODE=$PIECE(POS1,Y,3)  ;WARENNUMMER; DUTY CODE
+	. . . .;IF CODE="" IF $PIECE(POS1,Y,4)'="" SET CODE=$PIECE($GET(^INART(YM,$PIECE(POS1,Y,4),1)),Y,3)
+	. . . . IF CODE="" IF $$$INAUFPItemNumber(POS1)'="" SET CODE=$PIECE($GET(^INART(YM,$$$INAUFPItemNumber(POS1),1)),Y,3)
+	. . . . SET ORIGIN=""  ;URSPRUNGSLAND; COUNTRY OF ORIGIN
+	. . . . IF $DATA(^INWEAUF(YM,AUF,POS)) DO
+	. . . . . NEW BET,LAP,WED
+	. . . . . SET BET=""
+	. . . . . FOR  SET BET=$ORDER(^INWEAUF(YM,AUF,POS,BET)) QUIT:BET=""  DO  QUIT:ORIGIN'=""
+	. . . . . . SET LAP=""
+	. . . . . . FOR  SET LAP=$ORDER(^INWEAUF(YM,AUF,POS,BET,LAP)) QUIT:LAP=""  DO  QUIT:ORIGIN'=""
+	. . . . . . . SET WED=""
+	. . . . . . . FOR  SET WED=$ORDER(^INWEAUF(YM,AUF,POS,BET,LAP,WED)) QUIT:WED=""  DO  QUIT:ORIGIN'=""
+	. . . . . . . . set CountryOfOrigin = $PIECE($GET(^INWEAUF(YM,AUF,POS,BET,LAP,WED,1)),Y,112)    ; 13-Jul-2006 Replace Naked Reference
+	. . . . . . . . IF CountryOfOrigin'="" SET ORIGIN=CountryOfOrigin
+	. . . . ;
+	. . . .;IF ORIGIN="" IF $PIECE(POS1,Y,4)'="" IF $PIECE(POS1,Y,12)'="" SET ORIGIN=$PIECE($GET(^INARTK(YM,$PIECE(POS1,Y,4),$PIECE(POS1,Y,12),1)),Y,27)
+	. . . . IF ORIGIN="" IF $$$INAUFPItemNumber(POS1)'="" IF $PIECE(POS1,Y,12)'="" SET ORIGIN=$PIECE($GET(^INARTK(YM,$$$INAUFPItemNumber(POS1),$PIECE(POS1,Y,12),1)),Y,27)
+	. . . . SET DUTY=0
+	. . . . IF CODE'="" IF ORIGIN'="" SET DUTY=$PIECE($GET(^INZOLLSATZ(YM,CODE,ORIGIN,1)),Y,1)  ;DRITTLAND; 3RD COUNTRY
+	. . . . IF +$PIECE(POS1,Y,250)=0 SET $PIECE(POS1,Y,250)=$PIECE(POS1,Y,47)  ;URSPRÜNGLICHE KOSTEN ;ORIGIN ITEM COSTS
+	. . . . SET SKOST=(($PIECE(POS1,Y,250)/100)*DUTY)
+	. . . ;
+	. . . ;
+	. . . ;
+	. . . SET KOST=KOST+SKOST
+	. ;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Disabled block end */
+	
+OtherAllocation(IMPORT,AUF,POS,pobjINAUFP,YFELD,idAllocMethod,TOTAL,fltActualCosts)
+	;-------------------------------------------------------------------------
+	;  Other Allocation
+	;  
+	;  Split the Actual Cost for a cost type across the order lines associated
+	;  with the particular Import Shipment based on the Allocation method.
+	; 
+	; Inputs :
+	;	AUF,POS,pobjINAUFP,YFELD,idAllocMethod,TOTAL,fltActualCosts
+	; 
+	; History :
+	; 10-Oct-2006	GRF		SR15107: Split from main routine; braces format
+	;-------------------------------------------------------------------------
+	new BET,CODE,COST,CountryOfOrigin,Dim1,Dim2,Dim3,DUTY,LAP,ORIGIN,QuantityUnit,VOLUME,WED
+	
+	set COST=0                                                       ;SR12679
+ 
+	;---------------------------------------
+	; 1. APPORTION BY VALUE
+	;---------------------------------------
+	if idAllocMethod=1 {
+	;	set COST = fltActualCosts / TOTAL * $piece(pobjINAUFP,Y,47)    SR15107
+		set COST = fltActualCosts / TOTAL * $$GetCurrentCost(IMPORT,AUF,POS,$$$YES)
+	
+	;---------------------------------------
+	; 2. APPORTION BY VOLUME
+	;---------------------------------------
+	} elseif idAllocMethod=2 {
+		set VOLUME = +$piece(pobjINAUFP,Y,44)
+		set Dim1 = $$$INAUFPLength1(pobjINAUFP)                      ; Dimensions
+		set Dim2 = $$$INAUFPWidth(pobjINAUFP)
+		set Dim3 = $$$INAUFPHeight(pobjINAUFP)
+		if Dim1 && Dim2 && Dim3 {                                    ;length / width / height all have values
+	; FIXME : Verify don't want INAUFP D449 instead of D40 - doesn't consider user units - should use a unit type
+			set QuantityUnit = $$$INAUFPQuantityUnit(pobjINAUFP)
+			if (VOLUME=0) && (QuantityUnit=18) {                     ;VOLUMEN RECHNEN ;volume calculation 
+				set VOLUME = +$justify((Dim1/1000)*(Dim2/1000)*(Dim3/1000),0,4)
+			}
+			if (VOLUME=0) && ((QuantityUnit=5) || (QuantityUnit=6) || (QuantityUnit=12)) {
+				set VOLUME = +$justify(Dim1*Dim2*Dim3,0,4)
+			}
+		}
+		set COST = fltActualCosts / TOTAL * VOLUME
+	
+	
+	;---------------------------------------
+	; 3. APPORTION BY WEIGHT
+	;---------------------------------------
+	} elseif idAllocMethod=3 {
+		set COST = fltActualCosts / TOTAL * $piece(pobjINAUFP,Y,43)
+	
+	
+	;---------------------------------------
+	; 4. APPORTION BY QUANTITY
+	;---------------------------------------
+	} elseif idAllocMethod=4 {
+		; FIXME : Is it reasonable to allocate based on the original order
+		;         quantity rather than the quantity actually received?      <GRF>
+		set COST = fltActualCosts / TOTAL * $piece(pobjINAUFP,Y,5)
+	
+	
+	;---------------------------------------
+	; 5. APPORTION EVENLY
+	;---------------------------------------
+	} elseif idAllocMethod=5 {
+		set COST = fltActualCosts / TOTAL
+	
+	
+	;---------------------------------------
+	; 6. ALLOCATION OF DUTY                      ;FIS;19.11.04;26593
+	;---------------------------------------
+	} elseif idAllocMethod=6   {
+	
+	;	D3		$$$INAUFPIntrastat()		$$$INARTIntrastat()
+	;	D4		$$$INAUFPItemNumber(pobjINAUFP)
+	
+		set CODE=$PIECE(pobjINAUFP,Y,3)                              ;WARENNUMMER; DUTY CODE
+		if (CODE="") && ($$$INAUFPItemNumber(pobjINAUFP)'="") set CODE=$PIECE($GET(^INART(YM,$$$INAUFPItemNumber(pobjINAUFP),1)),Y,3)
+		
+		set ORIGIN=""                                                ;URSPRUNGSLAND; COUNTRY OF ORIGIN
+		if $data(^INWEAUF(YM,AUF,POS)) {
+			set BET=""
+			for {
+				set BET=$order(^INWEAUF(YM,AUF,POS,BET)) 
+				quit:BET=""
+				
+				set LAP=""
+				for {
+					set LAP=$order(^INWEAUF(YM,AUF,POS,BET,LAP))
+					quit:LAP=""
+					
+					set WED=""
+					for {
+						set WED=$order(^INWEAUF(YM,AUF,POS,BET,LAP,WED))
+						quit:WED=""
+						
+						set CountryOfOrigin = $piece($get(^INWEAUF(YM,AUF,POS,BET,LAP,WED,1)),Y,112)
+						if CountryOfOrigin'="" set ORIGIN = CountryOfOrigin
+						quit:ORIGIN'=""
+					}
+					quit:ORIGIN'=""
+				}
+				quit:ORIGIN'=""
+			}
+		}
+		
+		if (ORIGIN="") && ($$$INAUFPItemNumber(pobjINAUFP)'="") && ($PIECE(pobjINAUFP,Y,12)'="") {
+			set ORIGIN=$PIECE($GET(^INARTK(YM,$$$INAUFPItemNumber(pobjINAUFP),$PIECE(pobjINAUFP,Y,12),1)),Y,27)
+		}
+		set DUTY = 0
+		if (CODE'="") && (ORIGIN'="") set DUTY=$piece($get(^INZOLLSATZ(YM,CODE,ORIGIN,1)),Y,1)  ;DRITTLAND; 3RD COUNTRY
+		; D47		$$$INAUFPCost()
+		; D250		$$$INAUFPPreliminaryManufacturingC()   ...Costs
+		 
+		; FIXME : Do we really want to calculate Duty on pre-delivery line cost estimate? <GRF>
+		 
+		if +$piece(pobjINAUFP,Y,250)=0 set $piece(pobjINAUFP,Y,250)=$piece(pobjINAUFP,Y,47)  ;URSPRÜNGLICHE KOSTEN ;ORIGIN ITEM COSTS
+		set COST=(($piece(pobjINAUFP,Y,250)/100)*DUTY)
+	}
+	quit COST	
+	
+StockValSC(pOrderNo,pOrderLine,pItemNo,pCost,pCostType)
+	;-------------------------------------------------------------------------------
+	; An order line may be received over several deliveries (INWEAUF)
+	; Sum up the total quantity delivered for the line and then
+	; apportion the *** Shipping Cost *** across each location in proportion with
+	; the quantity received at an individual location.
+	; 
+	; NOTE : Any pro rata allocation based on other criteria is between order lines.
+	;        This is an allocation of the amount for an order line across multiple
+	;        receipts.
+	; 
+	; pCost the amount of the Shipping Cost allocated to this order line is
+	;       provided before rounding to avoid compounding any rounding loss.
+	; 
+	; History:
+	; 12-Jul-2006	GRF		SR14707: Calculate Estimate from INWEAUF inside the
+	; 						subroutine instead of subtracting InitialCost when called.
+	; 04-Jul-2006	GRF		SR14707: adjust
+	; 14-Jun-2006	GRF		SR14707: Created update
+	;-------------------------------------------------------------------------------
+	new arrQty,curShipCost,curTotalInit,dteRecvd,IncomingQty,Locn,objINWEAUF,ShipCostList,StkLocn,TotalQty,Value
+	
+	
+	set curTotalInit = 0     ; 12-Jul-2006
+	set TotalQty     = 0
+	
+	set Locn = ""
+	for {
+		set Locn = $order(^INWEAUF(YM,pOrderNo,pOrderLine,Locn))
+		quit:Locn=""
+		
+		set StkLocn = ""
+		for {
+			set StkLocn = $order(^INWEAUF(YM,pOrderNo,pOrderLine,Locn,StkLocn))
+			quit:StkLocn=""
+			
+			set dteRecvd = ""
+			for {
+				set dteRecvd = $order(^INWEAUF(YM,pOrderNo,pOrderLine,Locn,StkLocn,dteRecvd))
+				quit:dteRecvd=""
+				
+				set objINWEAUF  = $get(^INWEAUF(YM,pOrderNo,pOrderLine,Locn,StkLocn,dteRecvd,1))
+				set IncomingQty = $$$INWEAUFIncomingGoodsQuantity(objINWEAUF)       ; D4
+				set arrQty(Locn,StkLocn) = $get(arrQty(Locn,StkLocn)) + IncomingQty
+				set TotalQty = TotalQty + IncomingQty
+		; vvv 12-Jul-2006		
+				set ShipCostList = $$$INWEAUFFinanceTxRef(objINWEAUF)               ; D115
+				set curShipCost  = +$piece(ShipCostList,"%3B"_pCostType_"%7C",2)
+				set curTotalInit = curTotalInit + (curShipCost * IncomingQty)
+		; ^^^ 12-Jul-2006
+			}
+		}
+	}
+	
+	set pCost = pCost - curTotalInit    ; 12-Jul-2006
+	
+	; TODO : What if mixture of +ve and -ve?
+	;        Should we have TotalPosQty and TotalNegQty built from arrQty?
+	;        If TotalQty is zero can we have a cost?  <GRF>
+	
+	if TotalQty {
+		set Locn = ""
+		for {
+			set Locn = $order(arrQty(Locn))
+			quit:Locn=""
+			
+			set StkLocn = ""
+			for {
+				set StkLocn = $order(arrQty(Locn,StkLocn))
+				quit:StkLocn=""
+				
+				set IncomingQty = arrQty(Locn,StkLocn)
+				if IncomingQty {
+					set Value = $justify(pCost*IncomingQty/TotalQty,0,2)             ; TODO : Virtual rounding? <GRF>
+					do Update^INStockVal(pItemNo,Locn,StkLocn,$$$YES,0,Value)
+				}
+			}
+		}
+	}
+	quit
+	
+GetCurrentCost(pidImport,pidOrder,pidOrderLine,pblnExclEstimate=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Build from Invoiced and Uninvoiced Supply and Actual and Estimated Shipping Costs
+	; 
+	; Inputs :
+	; 	pidImport			
+	; 	pidOrder			
+	; 	pidOrderLine		
+	; 	pblnExclEstimate	Exclude Estimated Shipping Costs
+	; 						$$$NO   if getting value for Average Cost
+	; 						$$$YES  if getting current value for Shipping Cost Allocation
+	; Returns :
+	; 	Total Cost of item in order/line
+	;   
+	;   This amount needs to be divided by the total quantity received for that line
+	;   to give a new unit cost which can be applied to the separate receipts in the
+	;   average cost history record.
+	;   
+	; 
+	; History:
+	; 11-Oct-2006	GRF		SR15107: Revised calculation
+	; 19-Jul-2006	GRF		SR14707: Check for null subscripts even though should be
+	; 						trapped by OnBeforeSave
+	; 13-Jul-2006	GRF		SR14707: created
+	;-------------------------------------------------------------------------------
+	new arrActualCost,curActualSC,curEstimatedSC,curInvAmt,curInvoiced,curReceiptCost,curUninvoiced
+	new dteRecvd,idCache,idInvNum,idLocn,idShipCost,idStkLocn,idSupplier,IncomingQty
+	new idxImport,idxOrder,idxOrderLine,keyINWEAUF
+	new objCache,objINERECH1,objINWEAUF,objShipCost,ShipCostList,ShipCostNo,UninvoicedQty
+	
+	set idxImport     = $$$Index(pidImport)
+	set idxOrder      = $$$Index(pidOrder)
+	set idxOrderLine  = $$$Index(pidOrderLine)
+			
+	set curInvoiced     = 0
+	set curUninvoiced   = 0
+	set curActualSC     = 0
+	set curEstimatedSC  = 0
+	
+		;+++++++++++++++++++++++++++++++++++
+		; 1. a) Actual Shipping Costs 
+		;    b) Invoiced Supplies
+		;+++++++++++++++++++++++++++++++++++
+	
+	set idSupplier    = ""
+	for {
+		set idSupplier = $order(^INERECH1(YM,pidOrder,pidOrderLine,idSupplier))
+		quit:idSupplier=""
+		
+		set idInvNum = ""
+		for {
+			set idInvNum = $order(^INERECH1(YM,pidOrder,pidOrderLine,idSupplier,idInvNum))
+			quit:idInvNum=""
+			
+			set objINERECH1 = $get(^INERECH1(YM,pidOrder,pidOrderLine,idSupplier,idInvNum,1))
+			set curInvAmt   = $$$INERECH1InvoiceAmount(objINERECH1)    ; D22
+			
+			if idInvNum["#" {        ; Actual Shipping Costs
+				set idShipCost    = $piece(idInvNum,"#",2)
+				set arrActualCost(idShipCost) = $$$YES
+				set curActualSC = curActualSC + curInvAmt
+						
+			} else {                 ; Invoiced Supply
+				set curInvoiced   = curInvoiced + curInvAmt
+			}
+		}
+	}
+	
+		;+++++++++++++++++++++++++++++++++++
+		; 2. Uninvoiced Supplies
+		;+++++++++++++++++++++++++++++++++++
+	
+	; $$$FINAPInvMatchCachePreviouslyInvoicedValue(objInvMatch)) [for InvoicedQty]  D21
+	; $$$FINAPInvLineOrderEach(objFINAPInvLine) * UninvoicedQty                     D4
+	
+	set idCache       = $order(^FINAPInvMatchCaches(YM,1,idxOrder,idxOrderLine,""),-1)
+	set objCache      = $get(^FINAPInvMatchCache(YM,idCache,1))
+	set UninvoicedQty = $$$FINAPInvMatchCacheUnmatchedQuantity(objCache)
+	set keyINWEAUF    = $$$FINAPInvMatchCacheReceiveKeys(objCache)         ; ON,ONL,Loc,SLoc,Date
+	
+	set idLocn     = $piece(keyINWEAUF,$$$COMMA,3)
+	set idStkLocn  = $piece(keyINWEAUF,$$$COMMA,4)
+	set dteRecvd   = $piece(keyINWEAUF,$$$COMMA,5)
+	
+	if (idLocn'="") && (idStkLocn'="") && (dteRecvd'="") {
+		set objINWEAUF = $get(^INWEAUF(YM,pidOrder,pidOrderLine,idLocn,idStkLocn,dteRecvd,1))
+		
+		set curReceiptCost = $$$INWEAUFUnitPrice(objINWEAUF)
+		set curUninvoiced  = curUninvoiced + (curReceiptCost * UninvoicedQty)
+	}
+	
+		;+++++++++++++++++++++++++++++++++++
+		; 3. Estimated Shipping Costs
+		;    Extract Shipping Costs from paired entries in string : "%3B"_COSTTYPE_"%7C"_COST
+		;+++++++++++++++++++++++++++++++++++
+	
+	if 'pblnExclEstimate {
+		set idLocn = ""
+		for {
+			set idLocn = $order(^INWEAUF(YM,pidOrder,pidOrderLine,idLocn))
+			quit:idLocn=""
+			
+			set idStkLocn = ""
+			for {
+				set idStkLocn = $order(^INWEAUF(YM,pidOrder,pidOrderLine,idLocn,idStkLocn))
+				quit:idStkLocn=""
+				
+				set dteRecvd = ""
+				for {
+					set dteRecvd = $order(^INWEAUF(YM,pidOrder,pidOrderLine,idLocn,idStkLocn,dteRecvd))
+					quit:dteRecvd=""
+					
+					set objINWEAUF     = $get(^INWEAUF(YM,pidOrder,pidOrderLine,idLocn,idStkLocn,dteRecvd,1))
+					set IncomingQty    = $$$INWEAUFIncomingGoodsQuantity(objINWEAUF)                  ; D4
+					
+					set ShipCostList   = $$$INWEAUFFinanceTxRef(objINWEAUF)    ; D115  Shipping Charges
+					set ShipCostNo     = 1           ; always starts with delimiter
+					for {
+						set ShipCostNo  = ShipCostNo + 1
+						set objShipCost = $piece(ShipCostList,"%3B",ShipCostNo)
+						quit:objShipCost=""
+					
+						set idShipCost    = $piece(objShipCost,"%7C",1)
+					;	Don't consider those costs already updated
+						if '$get(arrActualCost(idShipCost)) {
+							set curEstimatedSC = curEstimatedSC + ($piece(objShipCost,"%7C",2) * IncomingQty)
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	quit (curInvoiced+curUninvoiced+curActualSC+curEstimatedSC)
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARWWW0121" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARWWW0121
+#include COMSYS
+#include INConst
+
+VarHookOnAfterSave()
+	new strStatus, LocationCompany, LocationCode
+
+	set LocationCompany = $piece(YKEY,YKOMMA,1)
+	set LocationCode = $piece(YKEY,YKOMMA,2)
+	
+	set strStatus = $$$OK	
+	
+	//Cria somente para locais do tipo Departamento
+	if $$$WWW0121LocationType(YFELD) '= 2 {
+		quit strStatus
+	}
+	
+	//Cria somente para locais do tipo armazenagem
+	if $$$WWW0121StorageLocn(YFELD) '= 1 {
+		quit strStatus
+	}
+
+	// Cria Endereço EmTransito
+	set strStatus = $$CreateInTransitStorage(LocationCode,YFELD)
+	quit:('strStatus) strStatus
+	
+	// Cria Transporte para o Local:
+	set strStatus = $$CreateTransport(LocationCode)
+	
+	//Have to run this in background
+	//Create INARTLOCPAR
+	if $$$WWW0121FREE8(YFELD)=1 {
+		job LoadINARTLOCPAR^VARWWW0121(LocationCode)
+	}ELSE {
+		job UnLoadINARTLOCPAR^VARWWW0121(LocationCode)
+	}
+	quit strStatus
+
+CreateInTransitStorage(pSiteLocation,pSiteLocationRecord)
+	// Para um site-location, cria a InTransit necessária
+	// Esta rotina é chamada por VarHookOnBeforeSave^VARWWW0121	
+	new strStatus
+	set strStatus = $$$OK
+	
+	// Cria o stock-location EmTransito (bloqueado):
+	if ('$data(^INLP(YM,pSiteLocation,"EmTransito",1))) {
+		set newINLPRecord = ""
+		set $$$INLPLocationHeight(newINLPRecord) = 0
+		set $$$INLPFieldWithMultipleLoads(newINLPRecord) = 1
+		set $$$INLPStockLocationIsLocked(newINLPRecord) = 1
+		set strStatus = $$Save^COMUtils("INLP",pSiteLocation_YKOMMA_"EmTransito",newINLPRecord,1)
+		quit:('strStatus) strStatus
+	}
+	
+	quit strStatus
+	
+CreateTransport(pSiteLocation)
+	// Cria transporte, se ainda não existe.
+	// Esta rotina é chamada por VarHookOnBeforeSave^VARWWW0121
+	new strStatus
+	set strStatus = $$$OK
+	
+	if ($data(^INDRPUMLKWs(YM,1,$$^WWWUMLAU(pSiteLocation,1))) '= 10) {
+		set recordData = $$$Text("MED01234")_" "_pSiteLocation_"~~~"_pSiteLocation_"~EmTransito~~"  ;Transporte ;use text macro;15-Sep-2008
+		set idNovoTransporte=$$^WWWNEXT("INDRPUMLKW")
+		set strStatus = $$Save^COMUtils("INDRPUMLKW",idNovoTransporte,recordData,1)
+		quit:('strStatus) strStatus
+	}
+	quit strStatus
+	
+OnBeforeFormConstructionCustom
+	//OnBeforeFormConstruction na customização do form WWW0121C
+	if (YSEITE = 0) {
+		set YSEITE = 50
+		set YOPTION = YPARA
+	}
+	
+	do LoadListaUnidades
+	
+	quit
+	
+LoadListaUnidades
+	//Popula COMTempList apenas com Unidades (ex: hospitais, clínicas, etc.)
+	
+	new idLocal, NomeLocal, unidadeLocal, unidadesPermitidasUsuario
+	
+ 	kill ^COMTempList(YM,YBED,"VARUnidades")
+	set unidadesPermitidasUsuario = $$GetUnidadesPermitidasUsuario(YBED)
+ 
+	&sql(
+		DECLARE CursorUnidades CURSOR FOR 
+		SELECT Location, LocationName
+		INTO :idLocal, :NomeLocal
+		FROM WWW0121
+ 		WHERE COMPANY = :YM
+ 		AND FREE12 = 1
+ 		ORDER BY to_number(Location) )
+ 		
+	
+	&sql(OPEN CursorUnidades)
+    IF (SQLCODE) {
+		QUIT
+    }
+    
+ 	FOR { &sql(FETCH CursorUnidades)
+		QUIT:SQLCODE
+		
+		/* Esconde os locais não permitidos caso não esteja na tela de cadastro de usuários.
+		  Proteção de acesso em outras telas, como VAREstoquePosicao, para que o usuário não 
+		  veja o estoque de uma unidade a qual não tem acesso.	*/		
+		if ( (YFORM '= "WWW0121") && (YFORM '= "WWW0121C") ) {
+			continue:( '$find(";"_unidadesPermitidasUsuario_";",";"_idLocal_";") )
+		}
+
+		set ^COMTempList(YM,YBED,"VARUnidades",idLocal,1) = NomeLocal
+   	}
+ 
+   	&sql(CLOSE CursorUnidades)
+ 
+	quit
+
+GetUnidadedoLocal(pidLocal)
+	//Retorna a unidade do local	
+	quit:(pidLocal = "") ""
+	quit $piece($get(^WWW0121(YM,YM,pidLocal,1)),Y,80)
+	
+GetUnidadesPermitidasUsuario(pidUsuario)
+	quit:(pidUsuario = "") ""
+	
+	new objUsuario, strLocaisPermitidos, cnt, idLocal, codUnidade, strUnidadesPermitidas
+	
+	set objUsuario = $get(^WWW013(YM,pidUsuario,1))		
+	set strLocaisPermitidos = $$$WWW013AllowedLocations(objUsuario)
+	
+	set strUnidadesPermitidas = ""
+	
+	for cnt = 1:1:$length(strLocaisPermitidos,";") {
+	   	set idLocal = $piece(strLocaisPermitidos,";",cnt)	   	
+	   	quit:(idLocal = "")
+	   	 	
+	   	set strUnidadesPermitidas = strUnidadesPermitidas_";"_idLocal
+	}
+	
+	quit strUnidadesPermitidas
+	
+	
+GetLocaisdeEstoqueUnidade(pidUnidade)
+	// Retorna os locais de estoque que pertencem a uma determinada unidade,
+	// onde unidade é representada por um local que tem o FREE12 = 1 (É Unidade de Saúde?),
+	// e os locais de estoque são aqueles em que o FREE13 apontam para o local que é unidade.	
+	quit:(pidUnidade = "") ""
+	
+	new CodLocal, NomeLocal, UnidadedoLocal, strLocaisEstoque
+	
+	&sql(
+		DECLARE CursorLocaisEstoque CURSOR FOR 
+		SELECT Location, LocationName, FREE13
+		INTO :CodLocal, :NomeLocal, :UnidadedoLocal
+		FROM WWW0121
+ 		WHERE COMPANY = :YM
+ 		  AND FREE13 = :pidUnidade
+ 		  AND UPPER(StorageLocn) = 1
+ 		ORDER BY to_number(Location) )
+ 		
+	&sql(open CursorLocaisEstoque)
+    if (SQLCODE) {
+		quit
+    }
+    
+    set strLocaisEstoque = ""
+    
+   	for { &sql(fetch CursorLocaisEstoque)
+		QUIT:SQLCODE
+		
+		;;Caso o local não esteja na lista de locais permitidos ao usuário, não popula
+		
+		if (strLocaisEstoque = "") {
+			set strLocaisEstoque = CodLocal
+		} else {
+			set strLocaisEstoque = strLocaisEstoque_";"_CodLocal
+		}
+   	}
+ 
+   	&sql(close CursorLocaisEstoque) 		
+	
+	quit strLocaisEstoque
+
+PrintMsgEstoquesDaUnidade(pidUnidade)	
+	;Exibe caixa com a mensagem de quais locais de estoque estão sendo considerados em uma determinada unidade
+	quit:(pidUnidade = "")
+	
+	new strLocaisEstoque, cnt, idLocal
+	
+	w "<br />"
+	w "<div style=border-color:999999;border-width:1px;border-style=solid;background-color:#E0E0E0;margin-top:6px;margin-bottom:5px;padding-top:4px;padding-right:12px;padding-bottom:4px;padding-left:10px>"
+	w "	<font size=2>"
+	w "	  <strong>Observação:</strong> as informações de estoque da unidade selecionada correspondem à somatória do estoque do(s) local(ais) "
+	
+	set strLocaisEstoque = $$GetLocaisdeEstoqueUnidade(pidUnidade)
+			
+	for cnt = 1:1:$length(strLocaisEstoque,";") {
+  		set idLocal = $piece(strLocaisEstoque,";",cnt)	   	
+  		quit:(idLocal = "")
+  			   		
+  		if (cnt > 1) w ", "
+  		w $$SQLGetLocationName^VARTRKSQL(idLocal)
+	}
+	
+	w "."
+	w "	</font>"
+	w "</div>"
+	
+	quit
+
+OnDataAccess(pYKEY,pYFORM)
+	new objWWW0121
+	set pYKEY=$$$KEY2(pYKEY)
+	set strStatus=$$$YES
+	if ((pYFORM'="WWW0121C") && (pYKEY'="")) {
+		set objWWW0121=$get(^WWW0121(YM,YM,pYKEY,1))
+		if $$$WWW0121FREE7(objWWW0121)=1 set strStatus=$$$NO
+	}
+	quit strStatus
+	
+GetEndUnitarizacao(pidLocal)
+	quit:(pidLocal = "") ""
+	quit $piece($get(^WWW0121(YM,YM,pidLocal,1)),Y,81)	
+	
+LoadINARTLOCPAR(Location)
+	if $GET(YM)="" {
+		do ^WWWVAR
+	}	
+	set data=""
+	set data=$order(^INART(YM,data))
+	while data'="" {
+		set objPar=""
+		set objPar=$get(^INARTLOCPAR(YM,data,Location,1))
+		set $piece(objPar,Y,1)=1
+		set key=data_","_Location
+		set strStatus=$$Save^COMUtils("INARTLOCPAR",key,objPar,1)
+		if strStatus'=1 {
+			//set errorstring="Erro ao salvar INARTLOCPAR "_key_" . Erro->"_strStatus
+			//$$$Alert(errorstring)
+		}
+		set data=$order(^INART(YM,data))
+	}
+	q
+	
+UnLoadINARTLOCPAR(Location)
+	if $GET(YM)="" {
+		do ^WWWVAR
+	}	
+	set data=""
+	set data=$order(^INART(YM,data))
+	while data'="" {
+		set objPar=""
+		set objPar=$get(^INARTLOCPAR(YM,data,Location,1))
+		if objPar'="" {
+			;;set $piece(objPar,Y,1)=1
+			set key=data_","_Location
+			set strStatus=$$KILL^COMUtils("INARTLOCPAR",key)
+			if strStatus'=1 {
+				//set errorstring="Erro ao apagar INARTLOCPAR "_key_" . Erro->"_strStatus
+				//$$$Alert(errorstring)
+			}
+	}
+		set data=$order(^INART(YM,data))
+	}
+	q	
+]]></Routine>
+</Export>

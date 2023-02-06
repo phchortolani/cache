@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FININTBank" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FININTBank
+	; 08-Jul-2003	SCR			Bug Fixes from Code Checking
+	#Include FIN
+	#Include FINConst
+ 
+	;-------------------------------------------------------------------
+	; 28-Feb-2006	PO		SR14225: Added Drill Down Detail to Allocate
+	; 20-Sep-2005	RPW		SR13214: Do not use the sub block number anymore, these are 1 entry now.
+	; 20-Jun-2005	PO		SR12691: Incrementing the sub block number
+	; 24-May-2005	JW		Cleaned up status usage
+	; 19-Apr-2005	SCR		SR11476 Pass YLOCATION to Allocate Block
+	; 05-Jun-2003	SCR		Changed Payment type from "BANK" to "ARBANK"
+	;
+	; Header Info
+	; Bank("Number")=""
+	; Bank("BankingDate")=""
+	; Bank("BankAccount")=""
+		
+	; Payments Info.
+	; Bank("Payments",1,"Account")=""
+	; Bank("Payments",1,"Amount")=""
+	; Bank("Payments",1,"Customer")=""
+	; 
+	; Invoice Allocation Info. (optional. if left out will auto allocate)
+	; Sale("Payments",1,"Invoice",1,"PayAmount")=""
+	; Sale("Payments",1,"Invoice",1,"Discount")=""
+	; 
+	; Expense Accounts
+	; Sale("Payments",intPayLine,"LineAccount",idGroup,idAccount) 
+	;-----------------------------------------------------------------
+Post(pBank,idBatch,intBlockNumber)
+ 
+ 
+	tstart
+	new strStatus,intPaymentLine,curBankingTotal,idFINARBank,strForm,strDetail ; SR14225
+	
+	set idBatch=""
+	set intBlockNumber=""
+	set curBankingTotal=0
+	set idFINARBank = @pBank@("Number") ; SR14225
+	set strForm = $$CheckForm^FINUtils($get(YFORM),"FINARBank")  ; Get the form using YFORM, with validation
+	set strDetail = "Fin00988,"_idFINARBank  ;Customer Banking Number %1
+	set strStatus=$$Allocate^FININTBatch(.idBatch,.intBlockNumber,"ARBANK",$Get(YLOCATION),@pBank@("BankingDate"),,,,strForm,idFINARBank,strDetail)
+	;set strStatus=$$Allocate^FININTBatch(.idBatch,.intBlockNumber,"ARBANK",$Get(YLOCATION),@pBank@("BankingDate"))
+	
+	if $$$ISOK(strStatus) {
+		set intPaymentLine=""
+		for {
+			set intPaymentLine=$order(@pBank@("Payments",intPaymentLine))
+			quit:intPaymentLine=""
+ 
+			;do SubBlockNumber^FININTBatch(.intBlockNumber) ; SR13214
+ 
+			set strStatus=$$PostPayment(pBank,intPaymentLine,idBatch,intBlockNumber)
+			quit:$$$ISERR(strStatus)
+		}
+		if $$$ISOK(strStatus) {
+			set strStatus=$$PostBlock^FININTBatch(idBatch,intBlockNumber)
+		}
+	}	
+	
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+	} elseif $$$ISERR(strStatus) {
+		trollback
+	}
+	quit strStatus
+ 
+	;-----------------------------------------------------------------------
+	; Get the Banking Line information and post to the required GL's.
+	; 
+	; Step 1.
+	; Get the Accounts Receivable Payment total for the Bank Account
+	; 
+	; Step 2.
+	; Loop through the grid lines for a Banking line and add them to the batch.
+	; 
+	; Step 3.
+	; Get the Accounts into the Batch
+	; 
+	; Step 4.
+	; Post the Taxes
+	; 
+	; Step 5.
+	; Post the prepayment information
+	;
+	; History
+	; 30-Jun-2006	RPW			SR14559: Fixed ARP and APC entries to have the banking line number.
+	; 29-Jun-2006	RPW			SR14642: Commented as to what is going on
+	; 26-Jun-2006	SC			SR14734: Pass extra params to GetUnAllocatedInvoiceNumber
+	; 15-Nov-2005	JW			SR13867: Use new interface type DISCTAX. 
+	; 15-Nov-2005	JW			SR13857: Divide by current invoice amount, not running total !!
+	; 20-Sep-2005	RPW&JW		SR13214: Use Source not Customer. Use ARP not PAYMENT.
+	; 07-Jul-2005	PO			SR12881: Include reversal capability (pblnReverse)
+	; 27-Sep-2004	shobby		idBatchLine required to create the correct value for 'Source', used to determine Cheque number when displaying payments. (SR10453)
+	; 23-May-2004	shobby		Added pintPayLine to Source parameter of AddLine.
+	; 26-Feb-2004	shobby		Initialised a couple of total variables
+	; 30-Jul-2003	shobby		Quit out of for loop if an error is found.
+	; 02-Jul-2003	Paul K		Changed InterfaceType "Cash" to "PAYMENT"
+	; 01-Jul-2003	shobby		Call to PostAccount (TrackRecord 005524)
+	; 27-Jun-2003	shobby		Change Account type for Expense Payments. (TrackRecord 005490)
+	; 19-Jun-2003	shobby		passed in pidBatch and pintBlockNumber
+	; ----------------------------------------------------------------------
+PostPayment(pBank,pintPayLine,pidBatch,pintBlockNumber,pblnReverse=$$$NO)
+	new strStatus,idCustomer,curAmount,strSource,idInvoice,dteBankDate,curBalance
+	new curInvoiceAmount,curDiscountAmount,curAccountBalance
+	new idAccount,idBankAccount,curInvoiceTotal,curTotalTax
+	new intTax,objInvoiceTax,arrTax,curDiscountTotal,curTaxTotal,strAccountType
+	new idBankLine,curTax ;SR10453
+	
+	set idAccount=@pBank@("Payments",pintPayLine,"Account")
+	set curAmount=-@pBank@("Payments",pintPayLine,"Amount") ;negative to control account
+	set idCustomer=@pBank@("Payments",pintPayLine,"Customer")
+	set strSource=@pBank@("Number")
+	set dteBankDate=@pBank@("BankingDate")
+	set idBankAccount=@pBank@("BankAccount")
+	set idBankLine=@pBank@("Payments",pintPayLine,"BankLine") ;SR10453 // SR14559
+	set curInvoiceTotal=curAmount
+		
+	// Step 1.
+	
+	;set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNumber,idBankAccount,$$$FCSign(curAmount),"PAYMENT","",strSource,idCustomer,pblnReverse)  ; SR13214
+	set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNumber,idBankAccount,$$$FCSign(curAmount),"ARP","",strSource_$$$COMMA_idBankLine,strSource,pblnReverse) // SR14559
+ 
+	set idInvoice=""
+	
+	// Step 2.
+	// Loop through the grid lines and push these onto the batch. The Source entry for these will show the Banking Number and the Bank Line Number
+	// These are the normal mode of operation
+	
+	for {
+		quit:$$$ISERR(strStatus)
+		
+		set idInvoice=$order(@pBank@("Payments",pintPayLine,"Invoice",idInvoice))
+		quit:idInvoice=""
+		
+		set curInvoiceAmount=@pBank@("Payments",pintPayLine,"Invoice",idInvoice,"PayAmount")
+		set curDiscountAmount=@pBank@("Payments",pintPayLine,"Invoice",idInvoice,"Discount") // SR14559
+		;set idBankLine=@pBank@("Payments",pintPayLine,"BankLine") ;SR10453
+		set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNumber,idAccount,$$$FCSign(curInvoiceAmount),"ACP",idCustomer_","_idInvoice,strSource_","_idBankLine,idCustomer,pblnReverse) ;SR10453
+		set curInvoiceTotal=curInvoiceTotal+curInvoiceAmount-curDiscountAmount
+		
+		if $$$ISOK(strStatus) {
+			if +curDiscountAmount'=0 {
+				set curTotalTax=0
+				set intTax=""
+				for {
+					set intTax=$order(^FINARInvoiceTax(YM,idCustomer,idInvoice,intTax))
+					quit:intTax=""
+					set objInvoiceTax=$get(^FINARInvoiceTax(YM,idCustomer,idInvoice,intTax,1))
+					set arrTax(intTax,"Account")=$$$FINARInvoiceTaxAccount(objInvoiceTax)
+					
+					//set arrTax(intTax,"Amount")=$get(arrTax(intTax,"Amount"))+($$$FINARInvoiceTaxAmount(objInvoiceTax)*curDiscountAmount/curInvoiceTotal)		SR13857
+					//set curTotalTax=curTotalTax+($$$FINARInvoiceTaxAmount(objInvoiceTax)*curDiscountAmount/curInvoiceAmount)
+					
+					set curTax = ($$$FINARInvoiceTaxAmount(objInvoiceTax)*curDiscountAmount/curInvoiceAmount)		
+					set arrTax(intTax,"Amount")=$get(arrTax(intTax,"Amount"))+curTax
+					set curTotalTax=curTotalTax+curTax
+				}
+				set strStatus=$$PostDiscount(pBank,pidBatch,pintBlockNumber,curDiscountAmount-curTotalTax,idAccount,strSource,idCustomer,pblnReverse) ; TODO: Is the amount here always to be in base?
+			}
+		}
+	}
+	
+	// Step 3.
+	// Get the Accounts
+	
+	if $$$ISOK(strStatus) set strStatus=$$PostAccount(pBank,pintPayLine,pidBatch,pintBlockNumber,strSource,idCustomer,.curInvoiceTotal,pblnReverse)
+	
+	// Step 4.
+	// Post the Taxes
+	
+	set intTax=""
+	set curDiscountTotal=0
+	set curTaxTotal=0
+	
+	for {
+		set intTax=$order(arrTax(intTax))
+		quit:intTax=""
+		//if $$$ISOK(strStatus) set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNumber,arrTax(intTax,"Account"),arrTax(intTax,"Amount"),"TAX","",strSource,intTax,pblnReverse)	SR13867
+		if $$$ISOK(strStatus) set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNumber,arrTax(intTax,"Account"),arrTax(intTax,"Amount"),"DISCTAX","",strSource,intTax,pblnReverse)
+		set curDiscountTotal=curDiscountTotal-arrTax(intTax,"Amount")
+		set curTaxTotal=curTaxTotal+arrTax(intTax,"Amount")
+	}
+	
+	// Step 5.
+	// If there is any money left over, it's a Prepayment, the Source entry for this only has the Banking Number, as there is no grid to get it from
+	// TODO: Could we put the drawer field here into the Reference field for GL Inquiry?
+	
+	if curInvoiceTotal'=0 {
+		set idInvoice=""
+		;if $$$ISOK(strStatus) set strStatus=$$GetUnAllocatedInvoiceNumber^FINARInvoice(idCustomer,.idInvoice)
+		;if $$$ISOK(strStatus) set strStatus=$$GetUnAllocatedInvoiceNumber^FINARInvoice(idCustomer,.idInvoice,pblnReverse,strSource) ;SR14734
+		if $$$ISOK(strStatus) set strStatus=$$GetUnAllocatedInvoiceNumber^FINARInvoice(idCustomer,.idInvoice,pblnReverse,strSource_$$$COMMA_idBankLine) ;SR14734 / 14559.
+		set strAccountType="ACP"		;(TrackRecord 005490)
+		if $$$ISOK(strStatus) set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNumber,idAccount,curInvoiceTotal,strAccountType,idCustomer_","_idInvoice,strSource_$$$COMMA_idBankLine,idCustomer,pblnReverse) // SR14559
+	}
+	
+	quit strStatus
+ 
+ 
+PostAccount(pBank,pintPayLine,pidBatch,pintBlockNumber,pstrSource,pidCustomer,pcurInvoiceTotal,pblnReverse=$$$NO)
+	;------------------------------------------------------------------------
+	; Post details of expense account
+	; 
+	; History
+	; 21-Jun-2006	SC			SR14734: FCSign reversal not required, as this causes negative 
+	; 							amounts (unposts) to not match.
+	; 07-Jul-2005	PO			SR12881: Include reversal capability (pblnReverse) and FC support
+	; 24-May-2005	JW			SR12417: Added idGroup subscript. Also, use pintPayLine!
+	; 01-Jul-2003	shobby		Creation (TR005524)
+	; 
+	; -----------------------------------------------------------------------
+	new strStatus,idGroup,idAccount,curAmount
+	;
+	set strStatus=$$$OK
+	
+	set idGroup="" ; SR12417
+	for {
+		quit:strStatus'=$$$OK
+		set idGroup=$order(@pBank@("Payments",pintPayLine,"LineAccount",idGroup))
+		quit:idGroup=""
+		
+		set idAccount=""
+		for {
+			quit:strStatus'=$$$OK
+			;set idAccount=$order(@pBank@("Payments",1,"LineAccount",idAccount))
+			set idAccount=$order(@pBank@("Payments",pintPayLine,"LineAccount",idGroup,idAccount))
+			quit:idAccount=""
+			
+			;set curAmount=$get(@pBank@("Payments",1,"LineAccount",idAccount))
+			set curAmount=$get(@pBank@("Payments",pintPayLine,"LineAccount",idGroup,idAccount))
+			if +curAmount'=0 {
+				;set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNumber,idAccount,-curAmount,"ACCEX","",pstrSource,pidCustomer,pblnReverse) ; SR12881 OLD
+				set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNumber,idAccount,$$$FCSign(curAmount),"ACCEX","",pstrSource,pidCustomer,pblnReverse)
+				;if pblnReverse set curAmount=$$$FCSign(curAmount) //SR14734
+				;set pcurInvoiceTotal=pcurInvoiceTotal+curAmount ; SR12881 OLD
+				set pcurInvoiceTotal=$$$FCAdd(pcurInvoiceTotal,curAmount)
+			}
+		}
+	}
+	quit strStatus
+ 
+ 
+PostDiscount(pBank,pidBatch,pintBlockNumber,pcurDiscountAmount,pidControlAccount,pstrSource,pidCustomer,pblnReverse=$$$NO)
+ 
+    ;-------------------------------------------------------------------------------
+    ; Method Usage
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 07-Jul-2005	PO		SR12881: Include reversal capability (pblnReverse)
+    ;-------------------------------------------------------------------------------
+    ;
+	new objControlAccount,idDiscountAccount,strStatus
+	set objControlAccount=$get(^FINARAccount(YM,pidControlAccount,1))
+	set idDiscountAccount=$$$FINARAccountDiscountAccount(objControlAccount)
+	if (idDiscountAccount'="") {
+		if +pcurDiscountAmount'=0 set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNumber,idDiscountAccount,pcurDiscountAmount,"SDISC","",pstrSource,pidCustomer,pblnReverse)
+		}
+	else {
+		set strStatus=$listbuild("Fin00070",pidControlAccount)  ; Discount account does not exist for customer control account %1
+		}
+	quit strStatus
+ 
+	
+]]></Routine>
+</Export>

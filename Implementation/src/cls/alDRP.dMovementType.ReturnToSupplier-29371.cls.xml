@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alDRP.dMovementType.ReturnToSupplier">
+<ClassType>serial</ClassType>
+<IncludeCode>INConst</IncludeCode>
+<Super>alDRP.dMovementType</Super>
+<UDLText name="T">
+<Content>
+/*----------------------------------------------------------------------------------
+; 30-Jun-2010	PPP	SR17297: Created
+/---------------------------------------------------------------------------------*/
+</Content>
+</UDLText>
+
+
+<Property name="MovementTypeId">
+<Type>alSYS.dt.dtInteger</Type>
+<Final>1</Final>
+<InitialExpression>"8&quot;</InitialExpression>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="AL00470"/>
+</Property>
+
+
+<Method name="Validate">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set sc = $$$OK
+	if pobjMove.Completed {
+		set strMessage = $$$Text("IN00711")      ; "This movement is already completed."
+		set sc =$$$ERROR($$$GeneralError,strMessage)
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="Confirm">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; 1)  Update V1 Average Cost (ReceiptWithOrder)
+	; 2)  Create alSOH.dStockHistory                           [Simple sequential key]
+	; 3)  Update alSOH.dPeriodBalance (creating if required)   [Locn, Item, PeriodID]
+	; 4)  Stock-Finance Interface + INStockValAdjust
+	; 5a) ReceiptWithOutOrderMovement
+	; 5b) ReceiptWithOrderMovement
+	; 
+	; History:
+	; 29-Sep-2010	GRF		SR17537: Sign Change on TxnValue; fix strings & comment
+	; 04-Aug-2010	SCR		SR17387: Pass Source Details to Auto Adjust.
+	; 04-Aug-2010	SCR		SR17387: Pass Source Details, Form & Rec to Finance
+	; 30-Jun-2010	PPP		SR17297: Created
+	;-------------------------------------------------------------------------------
+	set sc     = $$$OK
+	set idItem = pobjMove.Item.ItemId
+	
+	set idIssue   	= pobjMove.Reference 
+	set idIssLine   = pobjMove.LineNumber
+	set idOrder     = pobjMove.OrderNumber      ; FIXME : Not set => Null
+	set idOrderLine = pobjMove.OrderLine        ; FIXME : Not set => Null
+	set idLocn      = pobjMove.FromLocn.Code
+	set idStore     = pobjMove.FromStorage.Code
+	set dteRecvd    = pobjMove.ReceiptDate
+	if dteRecvd = "" set dteRecvd = +$horolog
+	
+	set idCostCentre = $$GetCostCentre^INCostCentre(idLocn)
+	
+	;+++++++++++++++++++++++++++++++++++++++ VVV SR15818
+	LOCK +^alSOHProcessing(idItem):2 ; Use a timeout of 2 to help stop dead lock
+	if '$test {
+		set strMessage = $$$Text($listbuild("IN00853",idItem))
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+		; "Can not acquire a lock for Item: (%1) please try again "
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	} else {
+		set fltUnitCost = pobjMove.UnitCost
+		set strReceiptRef = idOrder_","_idOrderLine_","_idLocn_","_idStore_","_dteRecvd_","_idIssue_","_idIssLine_",R"
+		set curNewAVG     = $$UpdateCost^INAvgCost(idItem,idLocn,-pobjMove.QtyReceived,fltUnitCost,strReceiptRef,idCostCentre)
+		
+	; Supplier Receipt : Stock History & Period Balance
+	;---------------------------------------
+		set objTransType   = ##class(alSOH.dTransactionType).%OpenId(2)
+		set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove,
+													   pobjMove.FromLocn,
+													   pobjMove.FromStorage,
+													   -pobjMove.QtyReceived,
+													   fltUnitCost,
+													   objTransType,
+													   .sc)
+		if $$$ISOK(sc) set sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist)
+	
+	;+++++++++++++++++++++++++++++++++++++++
+		LOCK -^alSOHProcessing(idItem)
+	;+++++++++++++++++++++++++++++++++++++++
+	}
+		
+	; Stock to Finance Interface
+	;---------------------------------------
+	if $$$ISOK(sc) {
+		set objIssLine = $get(^INIssueLine(0,idIssue,idIssLine,1))
+		set idSupplier = $$$INIssueSupplier($get(^INIssue(0,idIssue,1)))
+		//set idSupplier = $$$INRECLineSupplier(objIssLine)
+		
+		set objStockFin = ##class(alSFI.dStockFin).%New()
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "REC"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.ReturnToSupplier"
+		set objStockFin.TxnInformation = "Return To Supplier"
+		set objStockFin.Item           = pobjMove.Item
+		set objStockFin.Quantity       = -pobjMove.QtyReceived
+		set objStockFin.TxnValue       = -pobjMove.ExtendedCost  
+		set objStockFin.FromLocn       = pobjMove.FromLocn 
+		set objStockFin.FromStorage    = pobjMove.FromStorage
+		set objStockFin.ToLocn         = pobjMove.FromLocn
+		set objStockFin.ToStorage      = pobjMove.FromStorage
+		
+		set objStockFin.Supplier       = idSupplier 
+		
+		set objStockFin.OrderNo        = idOrder      ; FIXME : Not set => Null
+		set objStockFin.OrderLine      = idOrderLine  ; FIXME : Not set => Null
+		set objStockFin.SourceRec	   = idIssue
+		set objStockFin.SourceForm	   = "INReturnToSupplier"
+		set objStockFin.SourceDetail   = "IN01246,"_idIssue_","_idIssLine_","_idOrder_","_idOrderLine_","_idSupplier ; SR17387
+		                                 ; "Return to Supplier %1, Line %2, Order %3, Line %4, Supplier %5"
+		set sc = objStockFin.StockToFin()
+		
+	; Adjust Stock Values if cost centres differ - AFTER Post called so QOH updated in INStockVal
+	;---------------------------------------
+		if $$$ISOK(sc) {
+			set strStatus = $$AutoUpdate^INStockValCCAdj("Return To Supplier",idIssue_","_idIssLine,idItem,idCostCentre,curNewAVG,objStockFin)
+			set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"Error Updating Stock Values")
+		}
+		set YUSER =%("%KEY","YUSER") 
+		set:YUSER="" YUSER=" "
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		set:$$$ISOK(sc) ^CacheTemp(YUSER,"FIBURecord") = $$$YES
+	}
+	
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="Default">
+<Type>%Library.CacheSerialState</Type>
+</Storage>
+</Class>
+</Export>

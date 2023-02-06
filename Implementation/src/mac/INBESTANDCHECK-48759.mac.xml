@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INBESTANDCHECK" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INBESTANDCHECK(pidItem)   ; DEPRECATED - INWE no longer supported
+#include COMSYS
+#include INConst
+	/*------------------------------------------------------------------------------
+	; Description of Function :
+	;		PRUEFEN BESTAND EINES ARTIKELS UND KORREKTUR
+	;		EXAMINE EXISTENCE OF AN ARTICLE AND CORRECTION
+	; 
+	; 	Called from INTAGES (overnight processing), INWEAUF,
+	; 	            IsValidAverageCost^FINAPInvPrePostCost
+	; 
+	;   Part of processing is to consolidate negative quantities in one storage
+	;   with positive quantities in another storage at the same site.
+	; 
+	; ----- Previous code structure - retain doco in case other code needs explanation
+	; QUIT:$FIND(LAP,"*")  ;External Manufacture FREMDFERTIGUNG; *
+	;    ; Storages with "*" represent external manufacturers - probably a defunct usage
+	;    ; in future with more explicit setting <GRF>
+	; -----
+	; Inputs : 
+	;	pidItem		Item Number
+	;
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	; Updates :
+	; 				^INWE				(Modify, Kill)
+	; 				^INWES				(Kill)
+	; 				^INWEALT			(Create)
+	;
+	; History :
+	; 22-Nov-2006	GRF		SR15232: Clarify clearing SOH details when there are
+	; 							reservations; use macros; set objItem & item-based
+	; 							values outside loop; brace format with clearer variables.
+	; 21-Mar-2006	GRF		SR14203: Doco; Stop consolidating negative stock by storage
+	; 27-Jan-2006	GRF		SR14203: Doco; !=>||
+	; 02.01.2004	FIS		24852
+	; 24-Oct-2002	DT		Created
+	;-----------------------------------------------------------------------------*/
+	new blnNonStock,blnSerialNo,Count,dteRecvd,idSerialNo,idLocn,idStore
+	new INWEKey,ItemType,MENGE,NumDecPlaces,objItem,UnitCode
+	
+	new YFORM,YVOR                 ; don't appear necessary? <GRF>
+	
+	set NumDecPlaces = $$$INVORGPermittedPostDecimalLine($get(^INVORG(YM,YM,1)))  ; D77  ; NACHKOMMASTELLEN ; Number of decimals
+	if (NumDecPlaces="") || (NumDecPlaces<0) set NumDecPlaces = 4     ; Default
+	
+	set objItem     = $get(^INART(YM,pidItem,1))
+	set ItemType    = $$$INARTItemType(objItem)                       ; D26
+	set blnNonStock = $$$INARTItemWithoutInventoryMaint(objItem)      ; D29
+	set UnitCode    = $$$INARTUnitofMeasure(objItem)                  ; D40
+	set blnSerialNo = $$$INARTSerialNumber(objItem)                   ; D56
+	
+	set idLocn = ""
+	for {
+		set idLocn = $order(^INWE(YM,pidItem,idLocn))
+		quit:idLocn=""
+		
+		set idStore = ""
+		for {
+			set idStore = $order(^INWE(YM,pidItem,idLocn,idStore))
+			quit:idStore=""
+			
+			set dteRecvd = ""
+			for {
+				set dteRecvd = $order(^INWE(YM,pidItem,idLocn,idStore,dteRecvd))   ; ^INWE(YM,pidItem,BE,LA,DA)
+				quit:dteRecvd=""
+				
+				set INWEKey = pidItem_","_idLocn_","_idStore_","_dteRecvd
+				
+			;-------------------------------
+			;	Remove excess decimal places
+			;	NACHKOMMASTELLEN KORRIGIEREN
+			;-------------------------------
+				set MENGE = +$$$INWEQuantity($get(^INWE(YM,pidItem,idLocn,idStore,dteRecvd,1)))
+				if $LENGTH($PIECE(MENGE,".",2))>NumDecPlaces {
+					set $$$INWEQuantity(^INWE(YM,pidItem,idLocn,idStore,dteRecvd,1)) = $JUSTIFY(MENGE,0,NumDecPlaces)
+				}
+				
+			;-----------------------------------------------------------------------
+			;	Item Type : 5 (Phantom Article) or 6 (Overall Performances)
+			;-----------------------------------------------------------------------
+				if (ItemType=5) || (ItemType=6) {
+					do KillSOH(pidItem,idLocn,idStore,dteRecvd,INWEKey)
+					
+			;-----------------------------------------------------------------------
+			;	Item Type       : 1 (Buy)
+			;	Unit of Measure : Hours (2), Minutes (10) or Industry-Minutes (11)		
+			;-----------------------------------------------------------------------
+				} elseif (ItemType=1) && ((UnitCode=2) || (UnitCode=10) || (UnitCode=11)) {
+					do BackUpAndKill(pidItem,idLocn,idStore,dteRecvd,INWEKey)        ;FREMDLEISTUNGEN
+					
+			;-----------------------------------------------------------------------
+			;	Non Stock Item
+			;-----------------------------------------------------------------------
+				} elseif blnNonStock=$$$YES {
+					do BackUpAndKill(pidItem,idLocn,idStore,dteRecvd,INWEKey)        ;OHNE BESTANDSVERWALTUNG
+					
+			;-----------------------------------------------------------------------
+			;	Stock Items
+			;-----------------------------------------------------------------------
+				} else {
+					
+					;-----------------------
+					;	Delete if QOH is 0 - 0.000001  (small +ve values are treated as zero)
+					;	Ignores negative reservations
+					;-----------------------
+					if $$$INWEQuantity($get(^INWE(YM,pidItem,idLocn,idStore,dteRecvd,1))) < 0.000001 {
+				;		IF $$$INWETotalReservedQuantity(($GET(^INWE(YM,pidItem,idLocn,idStore,dteRecvd,1))<0.000001 {        ; D37
+						if $$^INWERMENGE(pidItem,idLocn,idStore,dteRecvd) < 0.000001 {   ;WENN MENGE+RESERVIERUNGEMENGE 0 ODER <0;FIS;02.01.04;24852
+							if $$$INWEQuantity($get(^INWE(YM,pidItem,idLocn,idStore,dteRecvd,1)))'<0 {
+								do BackUpAndKill(pidItem,idLocn,idStore,dteRecvd,INWEKey)
+							}
+						}
+					}
+					
+					;-----------------------
+					;	BERICHTIGEN SERIENNUMMERN ;regulate Serial Numbers
+					;-----------------------
+					
+	;	FIXME :  How do we have fractional items with serial numbers - If we do, why round to 4 dp rather than NumDecPlaces?
+	;	FIXME :  We are killing off excess serial numbers from the latest alphabetic entries.
+	;	         Perhaps should indicate stocktake needed instead?                           <GRF>
+					if blnSerialNo=$$$YES {
+						set MENGE = +$$$INWEQuantity($GET(^INWE(YM,pidItem,idLocn,idStore,dteRecvd,1)))
+						if $length($piece(MENGE,".",2))>4 {
+							set $$$INWEQuantity(^INWE(YM,pidItem,idLocn,idStore,dteRecvd,1)) = $justify(MENGE,0,4)
+						}
+						set idSerialNo = ""
+						for Count=1:1 {
+							set idSerialNo = $order(^INWES(YM,pidItem,idLocn,idStore,dteRecvd,idSerialNo),-1)
+							quit:idSerialNo=""
+							
+							if Count>MENGE kill ^INWES(YM,pidItem,idLocn,idStore,dteRecvd,idSerialNo)
+						}
+					}
+				}
+			}
+		}
+	}
+	quit
+	
+	
+KillSOH(pidItem,pidLocn,pidStore,pdteRecvd,pINWEKey)
+	;-------------------------------------------------------------------------------
+	; Kill Serial Number (no indices) and SOH records
+	;-------------------------------------------------------------------------------
+	;---------------------------------------
+	;
+	; *** UPDATE INWE POINT ***
+	; 
+	; This comment marks where the INWE class is being
+	; saved or killed as an indication of where a
+	; common method may need to be located.     <GRF>
+	;
+	;---------------------------------------
+	kill ^INWES(YM,pidItem,pidLocn,pidStore,pdteRecvd)
+	do ^WWWKILL("INWE",pINWEKey)
+	quit
+	
+	
+BackUpAndKill(pidItem,pidLocn,pidStore,pdteRecvd,pINWEKey)
+	; FIXME : <GRF> INWEALT has indices.  Needs to go via WWWSPEI
+	set ^INWEALT(YM,pidItem,pidLocn,pidStore,pdteRecvd,1) = $get(^INWE(YM,pidItem,pidLocn,pidStore,pdteRecvd,1))
+	do KillSOH(pidItem,pidLocn,pidStore,pdteRecvd,pINWEKey)
+	quit
+	
+]]></Routine>
+</Export>

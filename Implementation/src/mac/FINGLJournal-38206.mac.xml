@@ -1,0 +1,784 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLJournal" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLJournal
+	
+#include FINConst
+#include COMConst
+#include COMSYS
+	
+OnBeforeSave(pYKEY)
+	new strStatus
+	
+	set strStatus = $$$GRIDSave(pYKEY)
+	if $$$ISERR(strStatus) set Q = 1
+	quit
+	
+	
+OnAfterSave(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; Executed after saving a Journal.
+    ; 
+    ; If the journal type is not a Scheduled Posting, delete
+    ; schedules associated with the journal.
+    ;
+    ; Returns: nothing
+    ;
+    ; History:
+    ; 22-Nov-2005	SteveS	SR13853: Use KILL^COMSchedule
+    ; 22-Dec-2004	SteveS	Created (SR:11355)
+    ;-------------------------------------------------------------------------------
+	new idJournal,objJournal,journalType
+	
+	set idJournal=$get(pYKEY)
+	
+	if (idJournal'="") {
+		set objJournal=$get(^FINGLJournal(0,idJournal,1))
+		set journalType=$$$FINGLJournalJournalType(objJournal)
+		
+		if (journalType'=$$$EnumFINGLJOURNALTYPEScheduledPosting) {
+			do KILL^COMSchedule("FINGLJournal",idJournal)
+		}
+	}
+	quit 
+	
+	
+OnBeforeButtonLine(pidJournal="")
+    ;-------------------------------------------------------------------------------
+    ; Used to set the journal to read only is the user does not have access
+    ; to it.
+    ;
+    ; History:
+    ; SR13173
+    ; 30-Jun-2005	JW		SR10412: Set YOPTION for InterCompany
+    ; 11-Nov-2004	Paul	Only make journal read only if is is a "once off" journal and can't be accessed (SR10211)
+    ; 06-Oct-2004	Paul K	Created, test for "+"
+    ;-------------------------------------------------------------------------------
+	new objJournal,strStatus
+	
+	set pidJournal=$piece(pidJournal,",",1)
+	
+	set YOPTION=$$$NO
+	
+	if (pidJournal'="")&&(pidJournal'="+") {
+		do CheckGLEffectiveDateExpiration^FINAPUtilities()
+		set objJournal=$get(^FINGLJournal(0,pidJournal,1))
+		if $$$FINGLJournalJournalType(objJournal)=$$$EnumFINGLJOURNALTYPEOnceOff {
+			if '$$Editable^FINSYSReview("FINGLJournal",$$$FINGLJournalStatus(objJournal)) {
+				set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+			}
+		}
+		set YOPTION = +$$$FINGLJournalInterCompany(objJournal)
+	}
+	
+	quit
+	
+	
+OnBeforeDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Checks whether it is valid to allow a journal to be deleted.
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Mar-2004	shobby	Renamed from CanDelete.
+	; 25-Feb-2003	shobby	Removed parameter intCheque in error message.
+	; 03-Sep-2003	shobby	Creation (TR005696)
+	;-------------------------------------------------------------------------------
+ 	new objFINGLJournal,strStatus
+ 	
+ 	set strStatus       = $$$OK
+ 	set objFINGLJournal = $get(^FINGLJournal(0,pYKEY,1))
+ 	if objFINGLJournal'="" {
+	 	if $$$FINGLJournalLastPostedDate(objFINGLJournal)'="" {
+			set strStatus = $listbuild("Fin00201")
+	 	} ; "Can´t delete. This journal has been posted."
+	}
+	;
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtils(strStatus)
+		set Q = 1
+	}
+	quit $$$ISOK(strStatus)
+	
+	
+OnAfterDelete(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; Code to run after deleting a journal record.
+    ; 
+    ; Kills associated schedule records.
+    ;
+    ; History:
+    ; 23-Oct-2006	JW		SR15134: Look at kill status.
+    ; 22-Nov-2005	SteveS	SR13853: Use KILL^COMSchedule
+    ; 27-May-2005	SteveS	Simplified -- just use KillSchedules()
+    ; 24-May-2005	RPW		Created SR:12382.
+    ;-------------------------------------------------------------------------------
+    new strStatus
+    
+    set strStatus = $$KILL^COMSchedule("FINGLJournal",pYKEY)
+    if $$$ISERR(strStatus) {
+		set Q = $$$QDontDelete
+	}
+	quit
+	
+	
+Post(pidJournal,pblnScheduled=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Post Journal
+    ; 
+    ; Inputs:
+    ; 	pidJournal			Journal Number
+    ; 	pblnScheduled		
+    ; 
+    ; Returns:Status
+    ;
+    ; History:
+    ; 13-Jun-2006	RPW		SR14642: Call the new CreateBatch code to create a batch
+    ; 							instead of going directly to the ledger accounts.
+    ; 30-May-2005	JW		SR12427: Added reversing. Cleaned up status usage.
+    ; 05-Oct-2004	Paul K	Added code
+    ; 30-Sep-2004	SCR		Added Reason Code
+    ;-------------------------------------------------------------------------------
+	if $get(Y)="" do ^WWWVAR // TODO: MUST NOT be here, if for dev purposes put in DEV code
+	
+	new intLineNumber,idTran,idAccount,strReference,curDebit,curCredit,dteTransDate,strStatus
+	new objJournal,objJournalLine,dtePostedDate,strReason,blnPost,intStatus
+	
+	set blnPost=$$$YES
+	set intStatus=1       ; 1:Pending
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	tstart
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set strStatus=$$Postable(pidJournal,pblnScheduled)    ; [calls Editable without returning suggested status]
+	
+	if $$$ISOK(strStatus) {
+		set objJournal=$get(^FINGLJournal(0,pidJournal,1))
+		
+		; FIXME : ? Doesn't consider strStatus returned from Editable^FINSYSReview <GRF>
+		do Editable^FINSYSReview("FINGLJournal",$$$FINGLJournalStatus(objJournal),.blnPost,.intStatus)
+		set $$$FINGLJournalStatus(objJournal)=intStatus
+		
+		if (blnPost)||(pblnScheduled) {
+			set strStatus = $$CreateBatch^FINGLJournalPost(pidJournal,.idTran)
+			
+			if $$$ISOK(strStatus) {
+				set $$$FINGLJournalLastPostedDate(objJournal) = $horolog
+				if $$$FINGLJournalReverse(objJournal) {
+					set $$$FINGLJournalReversalTransaction(objJournal) = idTran
+				}
+			}
+		}
+		if $$$ISOK(strStatus) {
+			set strStatus = $$$Save("FINGLJournal",pidJournal,objJournal,$$$YES)
+		}
+	}
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+		
+		if 'pblnScheduled {
+			do ^WWWFORM
+		}
+		
+	} else {
+		trollback
+		if 'pblnScheduled {
+			do ReturnError^COMUtilError(strStatus)
+			
+		} else {
+			do RaiseError^COMUtilError(strStatus,"FINGLJournal",pidJournal)
+		}
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+	quit strStatus
+	
+PostError ; Internal Tag
+	do RaiseError^COMUtilError($listbuild($zerror),"FINGLJournal",pidJournal)
+	quit
+	
+	
+LoadGrid(pYKEY)
+	;-------------------------------------------------------------------------------
+	; History
+	; 05-Dec-2008	GRF		Clarify Enabled test
+	; 08-Nov-2006	Steve S	SR14550: New lines default to prev. ref.
+	; 30-Sep-2005	JW		SR11573: Simplified update fields
+	; 28-Jun-2005	JW		Changed field nums
+    ; 10-Dec-2004	shobby	Removed null YKEY test (SR11175)
+	;                       SR10538: Code for Grid Edit 
+	;-------------------------------------------------------------------------------
+	new YFORM,YKEY,YAUSWAHL,YFELD
+	
+	set YFORM = "FINGLJournalLine"
+	set YFELD = ""
+	set YKEY  = $get(pYKEY)
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 300
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = YFORM
+	set $$$COMGridEditParameterUpdateFields(YAUSWAHL)  = "D"_$$$FldFINGLJournalBalance_"=5-6;"
+	set $$$COMGridEditParameterClearFields(YAUSWAHL)   = "5,6;6,5"
+	set $$$COMGridEditParameterDefaultFields(YAUSWAHL) = 4
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)     = "FINGLJournal"
+	
+	do ^COMGridEdit31
+	quit
+	
+	
+OnAfterDataFields(pKey)
+    ;-------------------------------------------------------------------------------
+    ; Code to run when called by the AfterDataField event on the @netManager form.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 28-Jan-2010	shobby	SR15753: Remove redundant code (core rules)
+    ; 27-May-2005	JW		SR12427: Toggle reversal date
+    ; 18-Mar-2005	shobby	Renamed from AfterDataField.
+    ; 17-Nov-2004	SteveS	Added code for Grid Edit to see Journal Lines (SR:10538) - reverted
+    ; 12-Mar-2004	shobby	Enclosed the key in quotes when calling the AfterDataField^COMSchedule method.
+    ; 27-Feb-2004	shobby	Moved Balance calculation to AfterPrimaryKey to avoid locking issues.
+    ;-------------------------------------------------------------------------------
+	new objJournal
+	
+	do LoadGrid(pKey)
+	if pKey'="" {
+		if $data(^FINGLJournal(0,pKey,1)) {
+			set objJournal=$get(^FINGLJournal(0,pKey,1))
+			if $$$FINGLJournalJournalType(objJournal)=$$$EnumFINGLJOURNALTYPEScheduledPosting {
+				if $$Editable^FINSYSReview("FINGLJournal",$$$EnumFINSYSSTATUSPending) {
+					do AfterDataField^COMSchedule(pKey,"FINGLJournal","PostSchedule^FINGLJournal(´"_pKey_"´)")
+				} else {
+					write "<BR>"_$$$Text("Fin00376")  ; "Invalid security to setup schedule."
+				}
+			}
+			do ShowHistory(pKey)	
+		}
+	}
+	quit
+	
+	
+ShowLines(pidJournal,pidLine)
+    ;-------------------------------------------------------------------------------
+    ; Show Journal Lines
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 21-Jun-2005	SCR		Removed Reason
+    ; 30-Sep-2004	SCR		Added Reason
+    ;-------------------------------------------------------------------------------
+	new idLine,objJournalLine,lstHeader,Account
+ 
+	; not used in code exactly, just a template of a query
+	set lstHeader = ""
+	set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalLineAccount)
+	set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalLineReference)
+	set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalLineDebit)
+	set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalLineCredit)
+	
+	do Start^COMTable(lstHeader,$$$Text($listbuild("Fin00041")))  ; Lines
+ 
+	if pidJournal'="" {
+		set idLine = ""
+		for {
+			set idLine = $order(^FINGLJournalLine(0,pidJournal,idLine))
+			quit:idLine=""
+			
+			do NewLine^COMTable($select(idLine=pidLine:"lightgreen",1:""))
+			set objJournalLine = $get(^FINGLJournalLine(0,pidJournal,idLine,1))
+			set Account = $$$FINGLJournalLineAccount(objJournalLine)                                              ; Number
+			if Account'="" set Account = Account_" "_$$$FINGLAccountDescription($get(^FINGLAccount(0,Account,1))) ; Account Description
+			do InsertCell^COMTable(Account,"FINGLJournalLine",pidJournal_","_idLine)
+			do InsertCell^COMTable($$$FINGLJournalLineReference(objJournalLine),"FINGLJournalLine",pidJournal_","_idLine)
+			do InsertCurrencyCell^COMTable($$$FINGLJournalLineDebit(objJournalLine),$$$NO,"FINGLJournalLine",pidJournal_","_idLine)
+			do InsertCurrencyCell^COMTable($$$FINGLJournalLineCredit(objJournalLine),$$$NO,"FINGLJournalLine",pidJournal_","_idLine)
+			do EndLine^COMTable()
+			}
+		}
+	do Stop^COMTable()
+	
+	
+ShowHistory(pidJournal="")
+    ;-------------------------------------------------------------------------------
+    ; Show history of this journal getting posted
+    ;
+    ; History:
+    ; 30-May-2005	JW		SR12427: Added reversing.
+    ; 29-Apr-2005	Paul K	Added Inter company columns SR:10412
+    ;-------------------------------------------------------------------------------
+	new idJournalHist,objJournalHist,lstHeader,idTran,objTran,idSite,strDescription
+	new strJournals,objMIDJournalHist
+	
+	if pidJournal'="" {
+		set lstHeader = ""
+		set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalHistNumber)
+		set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalHistTransaction1)
+		set lstHeader = lstHeader_$listbuild($$$StrFINGLTranTransactionDate)
+		set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalHistPostedDate)
+		set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalHistReversal)
+		
+		if $data(^FINGLJournalHistIC(0,pidJournal)) {
+			set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalHistICSite)
+			set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalHistICTransaction1)
+		}
+		
+		do Start^COMTable(lstHeader,$$$Text($listbuild("Fin00109",pidJournal)))  ; "History For Journal %1"
+	 
+		if pidJournal'="" {
+			set idJournalHist=""
+			for {
+				set idJournalHist=$order(^FINGLJournalHist(0,pidJournal,idJournalHist),-1)
+				quit:idJournalHist=""
+				do NewLine^COMTable()
+				set objJournalHist=$get(^FINGLJournalHist(0,pidJournal,idJournalHist,1))
+				set idTran=$$$FINGLJournalHistTransaction1(objJournalHist)
+				set objTran=$get(^FINGLTran(0,idTran,1))
+				do InsertCell^COMTable(idJournalHist,"FINGLTran",idTran)
+				do InsertCell^COMTable(idTran,"FINGLTran",idTran)
+				do InsertCellDate^COMTable($$$FINGLTranTransactionDate(objTran),"FINGLTran",idTran)
+				do InsertCellDate^COMTable($$$FINGLJournalHistPostedDate(objJournalHist),"FINGLTran",idTran)
+				do InsertCellBoolean^COMTable($$$FINGLJournalHistReversal(objJournalHist),"FINGLTran",idTran)
+				if $data(^FINGLJournalHistIC(0,pidJournal)) {
+					set strDescription = ""
+					set strJournals    = ""
+					set idSite = ""
+					for {
+						set idSite = $order(^FINGLJournalHistIC(0,pidJournal,idJournalHist,idSite))
+						quit:idSite=""
+						
+						set objMIDJournalHist = $get(^FINGLJournalHistIC(0,pidJournal,idJournalHist,idSite,1))
+						if strDescription'="" set strDescription = strDescription_"<br>"
+						if strJournals'=""    set strJournals    = strJournals_"<br>"
+						set strDescription = strDescription_idSite_" - "_$$$COMDCMLocationLocName($get(^COMDCMLocation(0,idSite,1)))
+						set strJournals    = strJournals_$$$FINGLJournalHistICTransaction1(objMIDJournalHist)
+					}
+					do InsertCell^COMTable(strDescription)
+					do InsertCell^COMTable(strJournals)
+				}
+				do EndLine^COMTable()
+				}
+			}
+		do Stop^COMTable()
+	}
+	quit
+	
+	
+PostSchedule(pidJournal)
+	;-------------------------------------------------------------------------
+	;
+	; History
+	; 27-Jun-2003	shobby	Defined a variable
+	; ------------------------------------------------------------------------
+	new strMessage,strStatus
+	
+	set strStatus = $$Post(pidJournal,$$$YES)
+	if $$$ISERR(strStatus) {
+		set strMessage = $$$Text($listbuild("Fin00094",pidJournal,$$$Text(strStatus)))
+	} ; "Post of Journal %1 unsuccessful. Problem : %2"
+	
+	if $$$ISOK(strStatus) {
+		set strMessage = $$$Text($listbuild("Fin00093",pidJournal))
+	} ; "Post of Journal %1 successful"
+	
+	quit strMessage
+	
+	
+Balance(pidJournal)
+    ;-------------------------------------------------------------------------------
+    ; Sets balance of journal
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+    ; 01-Jun-2005	RPW		SR12289: If the Account Amount Type is not a currency 
+	;							amount type, then can allow a non balanced account. 
+    ; 18-Oct-2004	PaulK	Moved the non-zero status check.
+    ; 26-Feb-2004	shobby	Created
+    ;-------------------------------------------------------------------------------
+	new intLineNumber,curDebit,curCredit,curTotal,strStatus,objJournal
+	new objJournalLine
+	new blnMustBalance,idAmountType,objAmountType
+	
+	set intLineNumber=""
+	set curTotal=0
+	set strStatus=$$$OK
+	if pidJournal="+" set pidJournal=""
+	
+	if $get(pidJournal)'="" {
+		for {
+			set intLineNumber = $order(^FINGLJournalLine(0,pidJournal,intLineNumber))
+			quit:intLineNumber=""
+			
+			set objJournalLine = $get(^FINGLJournalLine(0,pidJournal,intLineNumber,1))
+			set curDebit       = $$$FINGLJournalLineDebit(objJournalLine)
+			set curCredit      = $$$FINGLJournalLineCredit(objJournalLine)
+			set curTotal       = curTotal+curDebit-curCredit
+		}
+		set objJournal = $get(^FINGLJournal(0,pidJournal,1))
+		if $$$FINGLJournalBalance(objJournal)'=curTotal {
+			set $$$FINGLJournalBalance(objJournal)=curTotal
+			; Locking in Save reviewed 27-Feb-2004
+			set strStatus = $$$Save("FINGLJournal",pidJournal,objJournal,$$$YES)
+		}
+		if curTotal'=0 {
+			; If the Account Amount Type is not a currency amount type, 
+			; then we can allow a non balanced account.
+			
+			set blnMustBalance = $$$YES
+			set idAmountType   = $$$FINGLJournalAmountType(objJournal)
+			if idAmountType'="" {
+				set objAmountType = $get(^FINGLAccountAmountType(0,idAmountType,1))
+				if objAmountType'="" {
+					if $$$FINGLAccountAmountTypeCurrencyType(objAmountType)'=1 {
+						set blnMustBalance = $$$NO
+					}
+				}
+			}
+			
+			; If we MUST balance, then do show the error
+			if blnMustBalance set strStatus = $listbuild("Fin00059",curTotal)  ; "Balance Must Be zero (%1)"
+		}
+	}
+	quit strStatus	
+	
+	
+Postable(pidJournal,pblnScheduled="")
+	;-------------------------------------------------------------------------------
+	; Returns whether or not a journal record can be posted to the GL
+	;
+	; Returns:
+	;
+	; History:
+	; SR13173
+	; 28-Jun-2006	JW		SR12775: Removed Posting security check from here. Done
+	;							in validate account.
+	; 23-Jan-2006	RPW		SR13087: Removed FINGLJournalIC calls as they are now
+	;							done in the Transaction
+	; 24-Jun-2005	JW		SR12627: Call validate account
+	; 19-Jun-2005	PO		SR12523: In case Account security changed between
+	; 							journal line creation and journal posting, prevent
+	; 							journal from posting if security enabled.
+	; 27-May-2005	JW		SR12427: Added reversing. Cleaned up status usage.
+    ; 11-Nov-2004	PaulK	Only apply $$Editable to once off Journals. (SR10211)
+	; 23-Oct-2003	shobby	Put in a check to find out if the Journal has lines. (TR006125)
+	;-------------------------------------------------------------------------------
+	new strStatus,objJournal,strJournalType,dteTransDate
+	new intJournalHist,objJournalHistory,objTran
+	new idLine,objJournalLine,idAccount
+ 
+	set strStatus=$$$OK
+ 
+	if pidJournal="" {
+		set strStatus = $listbuild("Fin00089")  ; "No Record Selected."
+		
+	} elseif '$data(^FINGLJournalLine(0,pidJournal)) {
+		set strStatus = $listbuild("Fin00204")  ; "Can´t Post.  Journal has no lines."
+		
+	} else {
+		set objJournal   = $get(^FINGLJournal(0,pidJournal,1))
+		set dteTransDate = $$$FINGLJournalTransactionDate(objJournal)
+		
+		set strStatus = $$ValidGLEffectiveDate^FINGLEffectiveDate(dteTransDate,dteTransDate,$$$FldFINGLJournalTransactionDate)
+ 
+		if $$$ISOK(strStatus) {
+			set strJournalType = $$$FINGLJournalJournalType(objJournal)
+			
+			if $$$FINGLJournalReverse(objJournal) {
+				if ($$$FINGLJournalReversalDate(objJournal)="") {
+					set strStatus = $listbuild("Fin00775")  ; "Must specify a Reversal Date"
+				} elseif ($$$FINGLJournalReversalTransaction(objJournal)'="") {
+					set strStatus = $listbuild("Fin00776")  ; "Cannot post until last transaction has been reversed."
+				}
+			}
+			if strJournalType=$$$EnumFINGLJOURNALTYPEOnceOff {
+				set strStatus=$$Editable^FINSYSReview("FINGLJournal",$$$FINGLJournalStatus(objJournal))
+				
+			} elseif strJournalType=$$$EnumFINGLJOURNALTYPEManualPosting {							;manual journal
+				; look through the journal history and see if journal has been posted for this date.
+				; 
+				set intJournalHist = ""
+				for {
+					set intJournalHist = $order(^FINGLJournalHist(0,pidJournal,intJournalHist))
+					quit:intJournalHist=""
+					
+					set objJournalHistory = $get(^FINGLJournalHist(0,pidJournal,intJournalHist,1))
+					if $data(^FINGLTran(0,$$$FINGLJournalHistTransaction1(objJournalHistory),1)) {
+						set objTran = $get(^FINGLTran(0,$$$FINGLJournalHistTransaction1(objJournalHistory),1))
+						if $$$FINGLTranTransactionDate(objTran)=dteTransDate {
+							set strStatus=$listbuild("Fin00061")
+						} ; "Cannot post Manual journal twice for the same day.  Have you forgotten to change the ´Transaction Date´?"
+					}
+					quit:$$$ISERR(strStatus)
+				}
+			} elseif strJournalType=$$$EnumFINGLJOURNALTYPEScheduledPosting {
+				if 'pblnScheduled {
+					set strStatus=$listbuild("Fin00062")  ; "Can´t manually post a Scheduled Journal"
+				}
+			}
+			if $$$ISOK(strStatus) {
+				kill ^CacheTempAccountValid(YUSER)
+				set idLine = ""
+				for {
+					set idLine = $order(^FINGLJournalLine(0,pidJournal,idLine))
+					quit:idLine=""
+					
+					set objJournalLine = $get(^FINGLJournalLine(0,pidJournal,idLine,1))
+					set idAccount = $$$FINGLJournalLineAccount(objJournalLine)
+					if $data(^CacheTempAccountValid(YUSER,idAccount)) {
+						set strStatus=^CacheTempAccountValid(YUSER,idAccount)
+					} else {
+						set strStatus = $$ValidateAccount^FINGLAccountTran(idAccount)
+						set ^CacheTempAccountValid(YUSER,idAccount)=strStatus
+					}
+					
+					if $$$ISOK(strStatus) {
+					 	if $$$FINGLJournalInterCompany(objJournal) {
+						 	set strStatus = $$PostableLine^FINGLTranIC($$$FINGLJournalLineCompany1(objJournalLine),$$$FINGLJournalLineCompanyAccount(objJournalLine))
+					 	}
+					}
+					
+					if $$$ISERR(strStatus) {
+						set strStatus=$listbuild("Fin00385",idLine,$$$Text(strStatus)) ; "Line %1 failed. Reason: %2"
+						quit  // for loop
+					}
+					;}
+				}
+				kill ^CacheTempAccountValid(YUSER)
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set strStatus=$$Balance(pidJournal)
+	}
+	
+	if $$$ISOK(strStatus) {
+		set YQ = 0 ; $$$QSave
+	} else {
+		set YQ = "1 "_$$$Text(strStatus) ; $$$QDontSave
+	}
+	quit strStatus
+	
+	
+ReverseSign(pidJournal)
+    ;-------------------------------------------------------------------------------
+    ; Reverses sign of lines.
+    ;
+    ; Params: journal key
+    ;
+    ; Returns: nil
+    ;
+    ; History:
+    ; 30-Jun-2005	JW		Added header. Set balance. Use ReloadForm.
+    ;-------------------------------------------------------------------------------
+	new intLineNumber,objJournalLine,curDebit,curCredit,strStatus
+	
+	;TODO: Probably should do this dynamically using the grid interface.
+	set intLineNumber = ""
+	for {
+		set intLineNumber = $order(^FINGLJournalLine(YM,pidJournal,intLineNumber))
+		quit:intLineNumber=""
+		
+		set objJournalLine = $get(^FINGLJournalLine(0,pidJournal,intLineNumber,1))
+		set curDebit       = $$$FINGLJournalLineDebit(objJournalLine)
+		set curCredit      = $$$FINGLJournalLineCredit(objJournalLine)
+		set $$$FINGLJournalLineDebit(objJournalLine)  = curCredit
+		set $$$FINGLJournalLineCredit(objJournalLine) = curDebit
+		set strStatus = $$$Save("FINGLJournalLine",pidJournal_","_intLineNumber,objJournalLine,$$$YES)
+		quit:$$$ISERR(strStatus)
+	}
+	do Balance(pidJournal)
+	do ReloadForm^COMUtilForm()
+	quit
+	
+ 
+CreateHistory(pidJournal,pidTran,pdteTransDate,intLineNumber="",pblnReversal=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Save a journal posting into its history 
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 30-May-2005	JW		SR12427: Added pblnReversal parameter
+    ;-------------------------------------------------------------------------------
+	set intLineNumber=$order(^FINGLJournalHist(0,pidJournal,""),-1)+1
+	quit $$$Save("FINGLJournalHist",pidJournal_","_intLineNumber,pidTran_Y_pdteTransDate_Y_pblnReversal,$$$YES)
+	
+	
+OnAfterPrimaryKey(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; Code to run when called by the AfterPrimaryKey event on the @netManager form.
+    ;
+    ; Returns:
+    ; 
+    ; Notes:
+    ; 		Balance called at this point to avoid locking issues which were occuring
+    ; 		when method was previous called in AfterDataFields.
+    ;
+    ; History:
+    ; 18-Mar-2005	shobby	Renamed from AfterPrimaryKey
+    ; 18-Oct-2004	PaulK	Populate the journal flag on the journal load.
+    ; 27-Feb-2004	shobby	Creation
+    ;-------------------------------------------------------------------------------
+	do Balance($piece(pYKEY,",",1))
+	quit
+	
+	
+Copy(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; Wrapper for CopyTxn
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 05-May-2005	shobby	Created SR11875
+    ;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$Transaction^COMTransaction("CopyTxn^FINGLJournal(.pYKEY)",1)
+	if $$$ISOK(strStatus) {
+		do RedirectForm^COMUtils(YFORM,pYKEY,YFORM_",",YPARA,YSEITE)
+	}
+	quit
+	
+	
+CopyTxn(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; Make a copy of the current Journal including lines and Scheduling. (SR7580)
+    ;
+    ; Returns:
+    ;
+    ; History:
+	; 05-May-2005	shobby	 SR11875.  Managed transactions to handle rollback after cache errors.
+    ; 10-Mar-2005	RobertW	 Fixed TCOMMIT and TROLLBACK (SR11273)
+    ; 19-Nov-2004	Paul K	 Set the record to unposted.
+    ; 28-Jun-2004   Shobby   Created
+    ;-------------------------------------------------------------------------------
+	new idJournal,idScheduleNew,idSchedule,objFINGLJournal,objFINGLJournalLine
+	new strStatus,idJournalLine,objCOMSchedule,strScheduleCode
+ 
+	set idJournal       = $$^WWWNEXT("FINGLJournal")
+	set objFINGLJournal = $get(^FINGLJournal(0,pYKEY,1))
+	set $$$FINGLJournalLastPostedDate(objFINGLJournal) = ""
+	set $$$FINGLJournalStatus(objFINGLJournal)         = $$$EnumFINSYSSTATUSUnposted
+	set strStatus = $$$Save("FINGLJournal",idJournal,objFINGLJournal,$$$YES)
+ 
+	if $$$ISOK(strStatus) {
+		set idJournalLine = ""
+		for {
+			set idJournalLine = $order(^FINGLJournalLine(0,pYKEY,idJournalLine))
+			quit:idJournalLine=""
+			
+			set objFINGLJournalLine = $get(^FINGLJournalLine(0,pYKEY,idJournalLine,1))
+			set strStatus = $$$Save("FINGLJournalLine",idJournal_YKOMMA_idJournalLine,objFINGLJournalLine,$$$YES)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+ 
+	if $$$ISOK(strStatus) {			
+		set idSchedule = ""
+		for {
+			set idSchedule = $order(^COMSchedules(0,1,"FINGLJOURNAL",pYKEY,idSchedule)) ;Using index, must be uppercase
+			quit:idSchedule=""
+			
+			set objCOMSchedule = $get(^COMSchedule(0,idSchedule,1))
+			set idScheduleNew  = $$^WWWNEXT("COMSchedule")
+			set $$$COMScheduleTypeReference(objCOMSchedule) = idJournal
+			set strScheduleCode = $$$COMScheduleCode(objCOMSchedule)
+			set $$$COMScheduleCode(objCOMSchedule) = $piece(strScheduleCode,pYKEY,1)_idJournal_$piece(strScheduleCode,pYKEY,2)
+			set strStatus = $$$Save("COMSchedule",idScheduleNew,objCOMSchedule,$$$YES)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	set pYKEY = idJournal
+	quit strStatus
+	
+	
+GetReversalDate(YFELD)
+	quit $select($$$FINGLJournalReversalDate(YFELD)="":$$GetNextPeriodStart^FINGLPeriod(),1:$$$FINGLJournalReversalDate(YFELD))
+	
+	
+PostReversals()
+    ;-------------------------------------------------------------------------------
+    ; Reverse all the transactions that are due for reversing
+    ;
+    ; Returns: status
+    ;
+    ; History:
+    ; 30-May-2005	JW		Created SR12427
+    ;-------------------------------------------------------------------------------
+	new today,idDate,idTran,strForm,strStatus,idTranRev,idJournal,objJournal,transCount
+	
+	set strStatus = $$$OK
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	tstart
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set strForm    = "FINGLJournal"
+	set today      = +$horolog
+	set transCount = 0
+	set idDate     = ""
+	for {
+		set idDate = $order(^FINGLJournals(0,2,idDate))
+		quit:(+idDate=0)||(idDate>today)
+		
+		set idJournal = ""
+		for {
+			set idJournal = $order(^FINGLJournals(0,2,idDate,idJournal))
+			quit:idJournal=""
+			
+			set objJournal = $get(^FINGLJournal(0,idJournal,1))
+			set idTran     = $$$FINGLJournalReversalTransaction(objJournal)
+			if idTran'="" { // if posted, Reverse Transaction
+				set transCount = transCount+1
+				set strStatus  = $$PostReversal^FINGLTran(idTran,idDate,.idTranRev)
+				if $$$ISOK(strStatus) {
+					set strStatus=$$CreateHistory(idJournal,idTranRev,$horolog,,$$$YES)
+					
+					; Remove id and save journal
+					if $$$ISOK(strStatus) {
+						set $$$FINGLJournalReversalTransaction(objJournal) = ""
+						set $$$FINGLJournalReversalDate(objJournal)        = $$GetNextPeriodStart^FINGLPeriod()
+						set strStatus = $$$Save(strForm,idJournal,objJournal,$$$YES)
+					}
+				}
+				quit:$$$ISERR(strStatus)
+			}
+		}
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+		set strStatus = $listbuild("Fin00778",transCount)  ; "%1 Journal transaction(s) reversed"
+	} else {
+		trollback
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+	quit $$$Text(strStatus)
+	
+	
+GetType()
+	;-------------------------------------------------------------------------------
+	; Get the Type for the Effective Date
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; The type of the effective date
+	;
+	; History:
+	; 26-Jun-2006	RPW		SR13173: Created
+	;-------------------------------------------------------------------------------
+	quit "GLJNL"
+	
+]]></Routine>
+</Export>

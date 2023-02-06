@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWWMultiLock" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWWMultiLock
+	
+#include COMSYS
+#include WWWConst
+	
+	; FIXME : DEPRECATED YM always 0 - see if can be skipped altogether
+#define AddCompany(%1,%2)		set %1 = $$$WWWYM($$$WWW120ClassUsedInForm($get(^WWW120(0,%2,1))))_$$$COMMA_%1
+	
+	;*******************************************************************************
+	; SR14508: Multi-locking
+	;
+	; Routines for multi-locking a single YUSER against multiple records (keys).
+	; Locks are automatically cleared when the YUSER closes the browser, 
+	; or navigates to another form.
+	;
+	; Mainly intended for usage in Edit Grid scenarios, where multiple records
+	; are shown per YUSER session, and you wish to have special logic for "locking"
+	; rows of the grid as the user performs an action.
+	;
+	; IMPORTANT:
+	; Do **NOT** kill locks manually in any application code. Always go through
+	; the KILL routine (this is due to an index file being present.)
+	; 
+	;*******************************************************************************
+	
+LockSet(pYFORMHeader,pYFORMLine,pstrKeys,plstInUseMessage="")
+	;-------------------------------------------------------------------------------
+	; If possible, set the multi-lock
+	; 
+	; History:
+	; 01-Dec-2009	GRF		SR17007: separate tags for different operation
+	;-------------------------------------------------------------------------------
+	quit $$ManageLock($get(pYFORMHeader),$get(pYFORMLine),$get(pstrKeys),$$$YES,plstInUseMessage)
+	
+	
+GetLock(pYFORMHeader,pYFORMLine,pstrKeys,plstInUseMessage="")
+	;-------------------------------------------------------------------------------
+	; If possible, get the multi-lock
+	; 
+	; History:
+	; 01-Dec-2009	GRF		SR17007: separate tags for different operation; strip
+	; 							argument 4
+	;-------------------------------------------------------------------------------
+	quit $$ManageLock($get(pYFORMHeader),$get(pYFORMLine),$get(pstrKeys),$$$NO,plstInUseMessage)
+	
+	
+ManageLock(pYFORMHeader,pYFORMLine,pstrKeys,pblnSet,plstInUseMessage) private
+	;-------------------------------------------------------------------------------
+	; Attempts to get/set a multi-lock
+	; 
+	; Params: pYFORMHeader		: The YFORM of the header
+	; 		  pYFORMLine		: The YFORM of the lines (grid) 
+	; 		  pstrKeys			: The keys of the locked record (K1_,_K2_ ... _ Kn)
+	;		  pblnSet			: If you can get it, set it
+	;		  plstInUseMessage	: $lb() of error to use, if record is in use.
+	;
+	; ByRefs:
+	;
+	; Returns: strStatus
+	;
+	; History:
+	; 01-Dec-2009	GRF		SR17007: renamed with separate calling tags
+	; 18-Jan-2007	SteveS	SR15355: Use namespace subscript
+	; 17-Jan-2007	SteveS	SR15392: Check for @net lock
+	; 23-Jun-2006	SteveS	SR14698: Can now display a custom message
+	; 05-May-2006	SteveS	SR14508: Created
+	;-------------------------------------------------------------------------------
+	new idUser,idYUSER,loop,strKey,strNS,strStatus,tmsLock
+ 
+	set strStatus = $$$OK
+	if (pYFORMHeader="") || (pYFORMLine="") {      ; FIXME : $$$MakeStatus for consistancy
+		set strStatus = $listbuild(35)                               ; "No Form Default"
+	
+	} else {
+		for loop=1:1:$length(pstrKeys,$$$COMMA) {
+			if $$$ISOK(strStatus) {
+				set strKey = $piece(pstrKeys,$$$COMMA,loop)
+				if $$$NoKey(strKey) set strStatus = $listbuild(278)  ; "No Primary Key"
+			}
+		}
+		
+		if $$$ISOK(strStatus) {
+			$$$AddCompany(pstrKeys,pYFORMLine)
+			set strNS = $zutil(5)
+			
+			lock +^CacheTempMultiLock(pYFORMHeader,pYFORMLine,pstrKeys,strNS):10
+			if $test {
+				set idYUSER = $order(^CacheTempMultiLock(pYFORMHeader,pYFORMLine,pstrKeys,strNS,""))
+				
+				if (idYUSER'="") && (idYUSER'=YUSER) {     ; someone else has it ...
+					if plstInUseMessage="" {
+						set idUser    = $$$WWWUSERUser1($get(^WWWUSER(0,idYUSER,1)))
+						set tmsLock   = $get(^CacheTempMultiLock(pYFORMHeader,pYFORMLine,pstrKeys,strNS,idYUSER))
+						set strStatus = $listbuild("WWW00040",idUser,$$$FormatTimeStamp(tmsLock))
+						;                 "Item locked by user `%1` at %2."
+					} else {
+						set strStatus = plstInUseMessage
+					}
+				
+				} else {                                   ; can get it
+					set strStatus = $$IsAvailable(pYFORMLine,pstrKeys)
+					if $$$ISOK(strStatus) && pblnSet {
+						set ^CacheTempMultiLock(pYFORMHeader,pYFORMLine,pstrKeys,strNS,YUSER)  = $horolog	
+						set ^CacheTempMultiLocks(strNS,YUSER,pYFORMHeader,pYFORMLine,pstrKeys) = ""
+					}
+				}
+				lock -^CacheTempMultiLock(pYFORMHeader,pYFORMLine,pstrKeys,strNS)
+			
+			} else {
+				set strStatus = $$$MakeStatus("WWW00041")  ; "Unable to obtain lock."
+			}
+		}
+	}
+	quit strStatus
+	
+	
+IsAvailable(pYFORM,pstrKeys) private
+	;-------------------------------------------------------------------------------
+	; Determines if this record is "unlocked" (ie, has no @net locks)
+	;
+	; Params:	pYFORMLine		: The form
+	; 			pstrKeys		: The full keys
+	;
+	; Returns:	strStatus
+	;
+	; History:
+	; 09-Jun-2009	PPP		SR16544: Removed Order Macros
+	; 18-Jan-2007	SS		SR15355: Use namespace subscript
+	; 17-Jan-2007	SS		SR15392: Created
+	;-------------------------------------------------------------------------------
+	new dteLock,idClass,idLock,idSession,idUserAtNetLock,objWWW006,strStatus,tmeLock
+ 
+	set strStatus = $$$OK
+	set idClass   = $$$WWW120ClassUsedInForm($get(^WWW120(0,pYFORM,1)))
+	set idLock    = "^"_idClass_"/"_$translate(pstrKeys,",",".")_".1/"
+	
+	set dteLock = "" 
+	for {                                          // This allows locks held overnight.
+		set dteLock = $order(^WWW006(0,dteLock))
+		quit:dteLock=""
+		continue:'$data(^WWW006(0,dteLock,idLock))
+		
+		set objWWW006 = $get(^WWW006(0,dteLock,idLock,1))
+		set idSession = $$$WWW006User1(objWWW006)
+		continue:(idSession=YUSER)      // This does nothing really - can't have 2 forms open with the same YUSER.
+		
+		set tmeLock	        = $$$WWW006LockedUntilTime(objWWW006)  		; locked by another user
+		set idUserAtNetLock = $$$WWWUSERUser1($get(^WWWUSER(0,idSession,1)))
+		set strStatus       = $$$MakeStatus("WWW00040",idUserAtNetLock,$$$FormatTimeStamp(dteLock_","_tmeLock))
+		quit:$$$ISERR(strStatus)     ; "Item locked by user `%1` at %2."
+	}
+	quit strStatus
+	
+ 
+HaveLock(pidFormHeader,pidFormLine,pYKEY)
+	;-------------------------------------------------------------------------------
+	; See if this record is owned (locked) by me
+	;
+	; Params:	pidFormHeader	: The form header
+	; 			pidFormLine		: The form line
+	; 			pYKEY			: The record key
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jan-2007	SS		SR15355: Use namespace subscript
+	; 16-Jan-2007	SS		SR15339: Created
+	;-------------------------------------------------------------------------------
+	new blnLockedByMe,strNS
+ 
+ 	set strNS = $zutil(5)
+	set blnLockedByMe = $$$NO
+	
+	$$$AddCompany(pYKEY,pidFormLine)
+	
+	if $data(^CacheTempMultiLocks(strNS,YUSER,pidFormHeader,pidFormLine,pYKEY)) {
+		set blnLockedByMe = $$$YES
+	}
+	quit blnLockedByMe
+	
+	
+GetLockUser(pYFORMHeader,pYFORMLine,pstrKeys)
+	;-------------------------------------------------------------------------------
+	; Which user owns this lock?
+	;
+	; Params: pYFORMHeader	: The YFORM of the header
+	; 		  pYFORMLine	: The YFORM of the lines (grid) 
+	; 		  pstrKeys		: The keys of the locked record (K1_,_K2_ ... _ Kn)
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jan-2007	SS		SR15355: Use namespace subscript
+	; 05-May-2006	SS		SR14508: Created
+	;-------------------------------------------------------------------------------
+	new idUser,idYUSER,strNS
+ 
+ 	set strNS  = $zutil(5)
+	set idUser = ""
+	
+	if ($get(pYFORMHeader)'="") && ($get(pYFORMLine)'="") && ($get(pstrKeys)'="") {
+		$$$AddCompany(pstrKeys,pYFORMLine)
+		set idYUSER = $order(^CacheTempMultiLock(pYFORMHeader,pYFORMLine,pstrKeys,strNS,""))
+		set:(idYUSER'="") idUser = $$$WWWUSERUser1($get(^WWWUSER(0,idYUSER,1)))
+	}
+	quit idUser
+	
+	
+IsFree(pYFORMHeader,pYFORMLine,pstrKeys)
+	;-------------------------------------------------------------------------------
+	; Checks if this record is free (ie, locked by no-one).
+	;
+	; Params: pYFORMHeader	: The YFORM of the header
+	; 		  pYFORMLine	: The YFORM of the lines (grid) 
+	; 		  pstrKeys		: The keys of the locked record (K1_,_K2_ ... _ Kn)
+	;
+	; Returns: boolean
+	;
+	; History:
+	; 24-Jan-2007	Steve S		Created
+	;-------------------------------------------------------------------------------
+	quit ($$GetLockUser(pYFORMHeader,pYFORMLine,pstrKeys)="")
+	
+	
+ClearOld(pYUSER,pYFORM="")
+	;-------------------------------------------------------------------------------
+	; Remove all multi-locks for a YUSER, except for those of the current form.
+	; 
+	; I'm on this form -- clear any multi-locks I no longer own.
+	; 
+	; Params: 	pYUSER	: The YUSER number
+	; 			pYFORM	: The YFORM I'm opening
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Jun-2009	PPP		SR16544: Removed Order Macros
+	; 18-Jan-2007	SS		SR15355: Use namespace subscript
+	; 11-Jan-2007	SS		SR15355: Order macros
+	; 05-May-2006	SS		SR14508: Created
+	;-------------------------------------------------------------------------------
+	new idYFORMHeader,idYFORMLine,strKeys,strNS
+	
+	quit:$get(pYUSER)=""
+	
+	set strNS = $zutil(5)
+	
+	set idYFORMHeader = ""
+	for {
+		set idYFORMHeader = $order(^CacheTempMultiLocks(strNS,pYUSER,idYFORMHeader))
+		quit:idYFORMHeader=""
+		continue:(idYFORMHeader=pYFORM)
+		
+		set idYFORMLine = ""
+		for {
+			set idYFORMLine = $order(^CacheTempMultiLocks(strNS,pYUSER,idYFORMHeader,idYFORMLine))
+			quit:idYFORMLine=""
+			
+			set strKeys = ""
+			for {
+				set strKeys = $order(^CacheTempMultiLocks(strNS,pYUSER,idYFORMHeader,idYFORMLine,strKeys))
+				quit:strKeys=""
+				
+				do KILL(idYFORMHeader,idYFORMLine,strKeys,pYUSER,,strNS)
+			}
+		}
+	}
+	quit
+	
+	
+KILL(pYFORMHeader,pYFORMLine,pstrKeys,pYUSER="",pblnPrefix=$$$NO,pstrNS="")
+	;-------------------------------------------------------------------------------
+	; Kill this one lock record
+	;
+	; Params: pYFORMHeader	: The YFORM of the header
+	; 		  pYFORMLine	: The YFORM of the lines (grid) 
+	; 		  pstrKeys		: The keys of the locked record (K1_,_K2_ ... _ Kn)
+	; 		  pYUSER		: The YUSER (defaults to current YUSER)
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 05-May-2006	SS		SR14508: Created
+	;-------------------------------------------------------------------------------
+	new strNS
+	
+	set strNS = $select(pstrNS="":$zutil(5),1:pstrNS)
+	
+	if pYUSER="" set pYUSER = $get(YUSER)
+	if pblnPrefix $$$AddCompany(pstrKeys,pYFORMLine)
+	
+	kill ^CacheTempMultiLocks(strNS,pYUSER,pYFORMHeader,pYFORMLine,pstrKeys)
+	kill ^CacheTempMultiLock(pYFORMHeader,pYFORMLine,pstrKeys,strNS,pYUSER)
+	quit
+	
+	
+GetLockIds(pidForm,pidGrid,pstrUser)
+	;-------------------------------------------------------------------------------
+	; Get all the lock ids for the current user/form/grid
+	;
+	; Inputs:
+	;
+	; ByRef:
+	;
+	; Returns:
+	;
+	; History:
+	; 13-Aug-2009	GRF		SR16544: Removed Order Macros
+	; 12-Apr-2007	RPW		SR15513: Created
+	;-------------------------------------------------------------------------------
+	new strKeys
+	
+	kill ^CacheTempMultiLockIds(pstrUser,YUCI)
+	set strKeys = ""
+	for {
+		set strKeys = $order(^CacheTempMultiLocks(YUCI,pstrUser,pidForm,pidGrid,strKeys))
+		quit:strKeys=""
+		
+		set ^CacheTempMultiLockIds(pstrUser,YUCI,strKeys)=""
+	}
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARDWProducaoMensal" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARDWProducaoMensal
+#include COMSYS
+#include VARLog
+
+GeraProducaoMensal(pCompetencia="")
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Gera a produção mensal para uma determinada competência.
+    ;		Tipo 1 = Fracionamento (ou unitarização)
+    ;		Tipo 2 = Montagem de Kits
+	;
+	; Chamado por:
+	;	Serviço diário.
+	;
+    ; Histórico:
+    ;	01-Mar-2013	 Gustavo	Atualizado para funcionar quando o serviço roda depois
+    ;							da meia-noite.
+    ;	16-Fev-2012	 Gustavo	Criado	
+    ;-------------------------------------------------------------------------------
+	$$$VAR
+	
+	/* Caso não informe a competência, gera para a competência atual (serviço diário).
+	   
+	   Como o serviço está rodando depois da meia-noite, é importante que caso o dia atual
+	   seja o primeiro dia do mês, o sistema considere como base hoje menos 1, para poder
+	   assim pegar a competência anterior, que é a correta. */
+	
+	if (pCompetencia = "") {
+		new startOfMonthHorolog, todayHorolog, baseDateFormat
+		
+		set startOfMonthHorolog = $$GetStartOfMonth^COMUtilDate($piece($horolog,",",1))
+		set todayHorolog = $piece($horolog,",",1)
+		
+		if (startOfMonthHorolog = todayHorolog) {
+			set baseDateFormat = $zdate( (todayHorolog - 1) ,4) ;fix - ontem (competência anterior)
+		} else {		
+			set baseDateFormat = $zdate(todayHorolog,4)
+		}
+		
+		set pCompetencia = $extract(baseDateFormat,7,11)_$extract(baseDateFormat,4,5)
+	}
+	
+	// 1. Gera PRIMEIRO os dados de produção diária
+	new dteInicioCompetencia, dteFinalCompetencia, dia, idLocal, quantidadeTotal, tipo, media
+	
+	set dteInicioCompetencia = $$GetDataInicialFromCompetencia(pCompetencia)
+	set dteFinalCompetencia  = $$GetDataFinalFromCompetencia(pCompetencia)
+
+	for dia = dteInicioCompetencia:1:dteFinalCompetencia {		
+		do GeraProducaoDiaria^VARDWProducaoDiaria(dia)					
+	}
+	
+	// 2. Para ENTÃO gerar os dados de produção mensal
+	&sql(DECLARE cursorProducaoLocal CURSOR FOR
+		  SELECT Local1, Tipo, SUM(QuantidadeTotalnoDia), count(Dia)
+		    INTO :idLocal, :tipo, :quantidadeTotal, :qtdeRegistros
+		    FROM VARDWProducaoDiaria
+		   WHERE Dia BETWEEN $$GetDataInicialFromCompetencia^VARDWProducaoMensal(:pCompetencia)
+		                 AND $$GetDataFinalFromCompetencia^VARDWProducaoMensal(:pCompetencia)
+			 AND QuantidadeTotalnoDia > 0
+		GROUP BY Local1, Tipo
+	)
+	
+	&sql(open cursorProducaoLocal)
+   	quit:(SQLCODE)
+   	
+	for { &sql(fetch cursorProducaoLocal)
+		quit:(SQLCODE)
+		
+		set media = ""
+		
+		;Prevenindo erro de DIVIDE
+		if (qtdeRegistros > 0) {
+			set media = (quantidadeTotal / qtdeRegistros)
+		}
+		
+		set ^VARDWProducaoMensal(YM,tipo,idLocal,pCompetencia,1) = quantidadeTotal_Y_media_Y_$horolog
+		
+	}
+	
+	&sql(close cursorProducaoLocal)
+
+	if 'SQLCODE {
+		write "Dados gerados com sucesso para a competência "_$extract(pCompetencia,5,6)_"/"_$extract(pCompetencia,1,4)_"." ,!
+		$$$VARLOGINFO("Dados gerados com sucesso para a competência "_$extract(pCompetencia,5,6)_"/"_$extract(pCompetencia,1,4)_".")
+	}
+	else {
+		$$$VARLOGERROR(SQLCODE)
+	}
+
+	quit $$$OK
+	
+GetMediaMensal(pTipo,pidLocal)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Retorna a média mensal dos últimos 12 meses de produção para um tipo e local.
+    ;		Tipo 1 = Fracionamento (ou unitarização)
+    ;		Tipo 2 = Montagem de Kits    
+	;
+    ; Histórico:
+    ;	16-Fev-2012	 Gustavo	Criado	
+    ;-------------------------------------------------------------------------------
+	quit:( (pTipo = "") || (pidLocal = "") ) ""
+
+	new qtdeRegistros, qtdeTotal, mediaMensal
+	
+	&sql(SELECT TOP 12 count(*), SUM(QuantidadeMensal)
+		   INTO :qtdeRegistros, :qtdeTotal
+		   FROM VARDWProducaoMensal
+		  WHERE Tipo = :pTipo
+            AND Local1 = :pidLocal
+		  ORDER BY ID desc
+	)
+	
+	if (SQLCODE '= 0) {
+		quit 0
+	}	
+	
+	set mediaMensal = 0
+	
+	if (qtdeRegistros > 0) {
+		set mediaMensal = $normalize( (qtdeTotal/qtdeRegistros) ,0)
+	}
+
+	quit mediaMensal
+	
+
+GetMediaDiaria(pTipo,pidLocal)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Retorna a média diária dos últimos 12 meses de produção para um tipo e local.
+    ;		Tipo 1 = Fracionamento (ou unitarização)
+    ;		Tipo 2 = Montagem de Kits    
+	;
+    ; Histórico:
+    ;	16-Fev-2012	 Gustavo	Criado	
+    ;-------------------------------------------------------------------------------
+	quit:( (pTipo = "") || (pidLocal = "") ) ""
+
+	new qtdeRegistros, qtdeTotal, mediaDiaria
+	
+	&sql(SELECT TOP 12 count(*), SUM(MediaDiaria)
+		   INTO :qtdeRegistros, :qtdeTotal
+		   FROM VARDWProducaoMensal
+		  WHERE Tipo = :pTipo
+            AND Local1 = :pidLocal
+		  ORDER BY ID desc
+	)
+	
+	if (SQLCODE '= 0) {
+		quit 0
+	}	
+	
+	set mediaDiaria = 0
+	
+	if (qtdeRegistros > 0) {
+		set mediaDiaria = $normalize( (qtdeTotal/qtdeRegistros) ,0)
+	}
+
+	quit mediaDiaria
+	
+GetQuantProducaoMensal(pTipo,pidLocal,pCompetencia)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Retorna o quantitivo acumulado de um tipo de produção em um local e competência.
+    ;		Tipo 1 = Fracionamento (ou unitarização)
+    ;		Tipo 2 = Montagem de Kits	
+	;
+    ; Histórico:
+    ;	16-Fev-2012	 Gustavo	Criado	
+    ;-------------------------------------------------------------------------------
+	quit:( (pTipo = "") || (pidLocal = "") || (pCompetencia = "") ) ""
+	
+	new fltQuantidade
+	set fltQuantidade = 0
+
+	//Busca no DataWarehouse pois os dados mensais de produção são gerados diariamente
+	if $data(^VARDWProducaoMensal(YM,pTipo,pidLocal,pCompetencia)) {
+		set fltQuantidade = +$piece($get(^VARDWProducaoMensal(YM,pTipo,pidLocal,pCompetencia,1)),Y,1)	
+	}
+
+	quit fltQuantidade
+	
+GetDataInicialFromCompetencia(pCompetencia)
+	quit:(pCompetencia = "") ""	
+	new dia, mes, ano, dteInicial, dteInicialHorolog
+	
+	set dteInicialHorolog = ""	
+	
+	set dia = "01"
+	set mes = $extract(pCompetencia,5,6)
+	set ano = $extract(pCompetencia,1,4)
+	
+	set dteInicial = dia_"/"_mes_"/"_ano
+	set dteInicialHorolog = $zdateh(dteInicial,4)
+	
+	quit dteInicialHorolog
+	
+GetDataFinalFromCompetencia(pCompetencia)
+	quit:(pCompetencia = "") ""	
+	
+	new dteInicialHorolog, dteFinalHorolog
+	
+	set dteInicialHorolog = $$GetDataInicialFromCompetencia(pCompetencia)
+	set dteFinalHorolog   = $$GetEndOfMonth^COMUtilDate(dteInicialHorolog)
+	
+	quit dteFinalHorolog	
+
+
+]]></Routine>
+</Export>

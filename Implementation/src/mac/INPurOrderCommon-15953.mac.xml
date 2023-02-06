@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INPurOrderCommon" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INPurOrderCommon
+	
+#include COMSYS
+#include COMConst
+#include WWWConst
+#include INConst
+	
+OnAfterDataFields(pidForm)
+	;-------------------------------------------------------------------------------
+	; Load the Edit Grid, followed by loading the COMView extension for the Edit Grid
+	;
+	; Params:
+	; pidForm - Form Id
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 28-Feb-2007	PO		SR15466: Created
+	;-------------------------------------------------------------------------------
+	do LoadGrid(pidForm)
+	do LoadCOMViewGrid^COMViewFilter(pidForm,pidForm_"Line",1)
+	
+	quit
+	
+	
+LoadGrid(pstrForm,pblnLocked=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Load the Edit Grid
+	;
+	; Params:
+	; pidForm - Form Id
+	; pblnLocked - Whether the Edit Grid is to be locked
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 05-Dec-2008	GRF		Clarify Enabled test
+	; 30-Mar-2007	RPW		SRBR014416: Tell the grid it's attached to a COMView
+	; 28-Feb-2007	PO		SR15466: Created
+	;-------------------------------------------------------------------------------
+	new YFORM,YKEY,YAUSWAHL,YFELD
+	
+	kill ^CacheTempLocked(YUCI,YUSER)
+	do ClearOld^WWWMultiLock(YUSER)
+		
+	set YFORM = pstrForm_"Line"
+	set YFELD = ""
+	set YKEY  = ""		// No header
+	
+	if $get(YVOR)="" {
+		set YVOR = $get(^WWW120(0,pstrForm,1))
+	}
+	
+	if pblnLocked set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)          = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL)       = 400
+	set $$$COMGridEditParameterGridName(YAUSWAHL)            = YFORM
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)             = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)           = pstrForm
+	set $$$COMGridEditParameterDontUpdateContainer(YAUSWAHL) = $$$YES
+	set $$$COMGridEditParameterCOMViewGrid(YAUSWAHL)         = $$$YES // SRBR014416
+	
+	do ^COMGridEdit31
+	quit
+	
+	
+OnBeforeSave()
+	;-------------------------------------------------------------------------------
+	; Attempt to save the Edit Grid content, if unsuccessful then report error.
+	;
+	; Params: Nothing
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 28-Feb-2007	PO		SR15466: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$GRIDSave("")
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		do ReturnError^COMUtilError(strStatus)
+	}
+	quit
+	
+	
+DisabledCheck(pidForm,pblnCheckUnlocked=$$$YES)
+	;-------------------------------------------------------------------------------
+	; Determine whether Cut / Place button is enabled.
+	;
+	; Params:
+	; pidForm - Form Id
+	; pblnCheckUnlocked - Whether check is to include orders that not not locked anyone
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 21-Jul-2009	GRF		Order Macro
+	; 02-Mar-2007	PO		SR15466: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idKey,strDecomposedStatus,idxTmp,objOrder,idOrder
+	
+	set strStatus = $$$MakeStatus("IN00667")  ;No orders are set to be cut
+	
+	; Only problem with this is that the lines may not be locked but will be locked when the form is loaded
+	
+	set idKey = ""
+	for {
+		set idKey = $order(^CacheTempMultiLocks(YUCI,YUSER,pidForm,pidForm_"Line",idKey))
+		quit:idKey=""
+		
+		set objOrder = $get(^INAUF(YM,$$$KEY2(idKey),1))
+		
+		if (pidForm = "INPurOrderCut") && $$$INAUFCut(objOrder) {
+			set strStatus = $$$OK
+			quit
+		} elseif (pidForm = "INPurOrderPlace") && $$$INAUFPlace(objOrder) {
+			set strStatus = $$$OK
+			quit
+		}
+	}
+	
+	; Subsequently need this - run through all orders that are not currently locked and check whether any of those are set to be cut
+	if pblnCheckUnlocked && $$$ISERR(strStatus) {
+		for idxTmp = " ",1 {
+			set idOrder = ""
+			for {
+				set idOrder = $order(^INAUFs(YM,30,idxTmp,2,idOrder))
+				quit:idOrder=""
+				
+				if '$data(^CacheTempMultiLock(pidForm,pidForm_"Line","0,"_idOrder)) {
+					set objOrder = $get(^INAUF(YM,idOrder,1))
+					
+					if (pidForm = "INPurOrderCut") && $$$INAUFCut(objOrder) {
+						set strStatus = $$$OK
+					} elseif (pidForm = "INPurOrderPlace") && $$$INAUFPlace(objOrder) {
+						set strStatus = $$$OK
+					}
+					quit
+				}
+			}
+		}
+	}
+	
+	if $$$ISERR(strStatus) {
+		set strDecomposedStatus = strStatus
+		$$$DecomposeStatus(strDecomposedStatus)    ; FIXME : $$$YQHandler does not want stripped strStatus <GRF> May report as okay when not. see SR16411
+		$$$YQHandler(strDecomposedStatus)
+	}
+	quit strStatus
+	
+	
+FirmingAction(pidForm)
+	;-------------------------------------------------------------------------------
+	; Performing cut and place actions
+	;
+	; Params:
+	; pidForm - Form Id
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 21-Jul-2009	GRF		Order Macro
+	; 02-Mar-2007	PO		SR15466: Created
+	;-------------------------------------------------------------------------------
+	new idOrder,idKey,YKEY,strStatus,idLastRecord,objCompanyParms,intCount,objOrder,YTEST ;,VORG
+	
+	set strStatus = $$DisabledCheck(pidForm,$$$NO)
+	
+	set objCompanyParms = $get(^INVORG(YM,YM,1))
+	set intCount = 0
+	
+	if $$$ISOK(strStatus) {
+		set idLastRecord = $order(^CacheTempMultiLocks(YUCI,YUSER,pidForm,pidForm_"Line",""),-1)
+		set idKey = ""
+		for {
+			set idKey = $order(^CacheTempMultiLocks(YUCI,YUSER,pidForm,pidForm_"Line",idKey))
+			quit:idKey=""
+			
+			set idOrder = $$$KEY2(idKey)
+			set objOrder = $get(^INAUF(YM,idOrder,1))
+			
+			if ((pidForm = "INPurOrderCut") && $$$INAUFCut(objOrder)) ||
+			   ((pidForm = "INPurOrderPlace") && $$$INAUFPlace(objOrder)) {
+				
+				if pidForm = "INPurOrderCut" {
+					set $$$INAUFCutOn(objOrder) = +$horolog
+				} elseif pidForm = "INPurOrderPlace" {
+					set $$$INAUFPlaceOn(objOrder) = +$horolog
+				}
+				
+				set strStatus = $$$Save("INAUF",idOrder,objOrder,$$$YES)
+				set YKEY = idOrder
+				
+				if ((pidForm = "INPurOrderCut") && ($$$INVORGFirmOrderAt(objCompanyParms) '= $$$EnumINFIRMORDERCut)) ||
+				   ((pidForm = "INPurOrderPlace") && $case($$$INVORGFirmOrderAt(objCompanyParms),$$$EnumINFIRMORDERPlace:0,"":0,:1)) {
+					set YTEST = 2
+					;set VORG(2) = "copy"
+				}
+				
+				do AUFTRAG^INAUFBES
+				set intCount = intCount + 1
+				if (intCount > 1) && (idKey = idLastRecord) write "<p style='page-break-after:always;'></p>"
+			}
+		}
+		
+	} else {
+		$$$DecomposeStatus(strStatus)    ; FIXME : redundant - already done in $$$Alert
+		$$$Alert(strStatus)
+		do RedirectForm^COMUtilForm(pidForm,YM,YBACK,"","")
+	}
+	quit
+	
+	
+OnDisplayRightClickMenu(pidKey="",pobjRecord="",pidForm="")
+	;-------------------------------------------------------------------------------
+	; Determine the additional menu items for the context menu
+	;
+	; Params:
+	; pidKey - Key
+	; pobjRecord - Record
+	; pidForm - Form Id
+	;
+	; Returns: List of additional menu items
+	;
+	; History:
+	; 01-Mar-2007	PO		SR15466: Created
+	;-------------------------------------------------------------------------------
+	new lstNewMenuItems
+	
+	set lstNewMenuItems = ""
+	set pidKey = $translate($get(pidKey),"""")
+	
+	quit:(pobjRecord="")||(pidKey="") lstNewMenuItems
+	
+	; "Show Purchase Order"
+	set lstNewMenuItems = lstNewMenuItems_$listbuild($listbuild("g.gif",$$$Text("IN00665")_" ["_pidKey_"]","CallBack(""GoToForm^COMUtilForm"",""INAUF"","""_pidKey_""")",,$$$YES))
+	
+	quit lstNewMenuItems
+	
+	
+NumberOfLines(pidComany,pidOrder)
+	;-------------------------------------------------------------------------------
+	; Count the number of order lines for a particular order.
+	; 
+	; This function is used by a calculated on the order header (INAUF) and by manual fields
+	; on cut and place lines (INPurOrderCutLine, INPurOrderPlaceLine)
+	;
+	; Params:
+	; pidCompany - Company Id
+	; pidOrder - Order Id
+	;
+	; Returns: number of order lines
+	;
+	; History:
+	; 21-Jul-2009	GRF		Order Macro
+	; 15-Oct-2007	GM		SRBR014739: If Order is empty, don't check.
+	; 01-Mar-2007	PO		SR15466: Created
+	;-------------------------------------------------------------------------------
+	new idLine,intNumberOrderLines
+	
+	set intNumberOrderLines = 0
+ 	
+	if (pidOrder '="") {
+		set idLine = ""
+		for {
+			set idLine = $order(^INAUFP(pidComany,pidOrder,idLine))
+			quit:idLine=""
+			
+			set intNumberOrderLines = intNumberOrderLines + 1
+		}
+	}
+	quit intNumberOrderLines
+	
+]]></Routine>
+</Export>

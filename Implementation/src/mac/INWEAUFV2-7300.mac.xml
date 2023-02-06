@@ -1,0 +1,1284 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INWEAUFV2" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+#include COMSYS
+#include INConst
+	
+#define LogR(%1,%2)	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2)	s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INWEAUFV2("_%2_")"
+#;define LogRx(%1)		s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1
+#;define LogRm(%1)		m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1
+	
+INWEAUFV2	
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		COPY VON WE ERFASSUNG IN FREIEN BESTAND
+	;		BUCHEN DER WARENEINGÄNGE AUS WE ERFASSUNG
+	;	COPY OF INCOMING GOODS COLLECTION IN FREE EXISTENCE
+	;	RECORD OF THE INCOMING GOODS FROM INCOMING GOODS COLLECTION
+	;	
+	; Called By : No direct calls found - other tabs used for entry point : Receive, Reverse
+	;
+	;
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 31-Jul-2008	HQN		SR15815: Copied from INWEAUF
+	; 14-Dec-2006	GRF		Doco; Macros
+	; 12-Oct-2006	GRF		Doco
+	; 28-Jun-2006	GRF		Doco
+	; 02-Feb-2006	GRF		SR14203: Call AutoUpdate^INStockValAdjust
+	; 24-Nov-2005	RPW		SR13884: Make the code conform to Coding Standards (SR13800)
+	; 03-Nov-2005	JW		SR13222: Added blnREVERSE for reversing receipts
+	; 05-Sep-2005	PO		SR13591: Corrected SR13517 work so that amount calculated
+	; 							from FC OR Base amounts
+	; 26-Sep-2005	PO		SR13517 : Fixed discrepency in amounts posted to G/L
+	; 06-Sep-2005	GRF		Doco; remove unnecessary DO level
+	; 16-Aug-2005	FIS		SR13253 : Use AVERAGE COST; calls $$^INARTAVG
+	; 03-Aug-2005	GRF		SR13161 : Add INFOTEXT
+	; 08-Jul-2005	shobby	SR12745 : Call to INARTHIST now does not have the service
+	; 							cost added to unitcost.  
+	; 05-Jul-2005	shobby	SR12333 : Call to INARTHIST now has DISPATCH no (delivery
+	; 							note number).
+	; 23-Jun-2005	shobby	SR12749 : Cost of item after adding service costs should
+	; 							not be rounded. 
+	; 16-Jun-2005	GRF		Clean up
+	; 14-Apr-2005	shobby	SR12101 : Included Service Cost code per Mr Fischer's email
+	; 12-Apr-2005	shobby	Moved Finance Transaction Reference from piece 17
+	; 							to piece 18 in called to INARTHIST
+	; 12-Apr-2005	GRF		SR10478 : Add Finance Transaction Reference
+	;							(INWEAUF D115 => INFIBBUCH D104)
+	; 08.Aug.2000	DT		Created
+	;-------------------------------------------------------------------------------
+	new AUF,BETR,LP,POS,WEDAT
+ 	
+	$$$LogR("INWEAUFV2",$get(YKEY))
+	
+	QUIT:YKEY=""
+	
+	; FIXME : <GRF> INWEAUFVORS doesn't encase individual keys in quotes.  If no other
+	;               calling routine does either then this can be simplified.  Can we pass
+	;               a kill flag to Receive and move the other code there so we only
+	;               decompose the key once? 
+	SET AUF   = $TRANSLATE($$$KEY1(YKEY),$$$DBLQUOTE)   QUIT:AUF=""
+	SET POS   = $TRANSLATE($$$KEY2(YKEY),$$$DBLQUOTE)   QUIT:POS=""
+	SET BETR  = $TRANSLATE($$$KEY3(YKEY),$$$DBLQUOTE)   QUIT:BETR=""
+	SET LP    = $TRANSLATE($$$KEY4(YKEY),$$$DBLQUOTE)   QUIT:LP=""
+	SET WEDAT = $TRANSLATE($$$KEY5(YKEY),$$$DBLQUOTE)   QUIT:WEDAT=""
+	
+	SET ^WWW126(YM,"INAUF",YBED,1,1)=AUF   ;BEARBEITET
+	IF $DATA(^INWEAUFVOR(YM,AUF,POS,BETR,LP,WEDAT,1)) DO ^WWWSKILL("INWEAUFVOR",AUF_","_POS_","_BETR_","_LP_","_WEDAT)  ;FIS;LÖSCHEN VORERFASSUNG;17.05.04;25661
+	
+	do Receive(YKEY,YFELD)	//SR14421
+	
+	quit
+	
+	
+Receive(YKEY,YFELD)   ; DEPRECATED SR16361 : replaced by Receive^INRECReceive
+	;-------------------------------------------------------------------------------
+	; Process INWEAUF
+	;
+	; Params:	YKEY, YFELD - of INWEAUF record
+	;
+	; ByRefs:		blnREVERSE
+	; 
+	; Called By :	SaveReceive^INRECPost
+	; 				^INWEAUFV2
+	; 
+	; Returns:
+	;
+	; Updates :
+	; 				^INDRPNETCHANGE		(Create)
+	; 				^INWEAUF			(Modify, Kill)
+	; 				^INAUFP				(Modify)
+	; 				^INWEBUCH			(Create)
+	; 				^INART				(Modify)				[INARTAVG]
+	; 				^INARTAVG			(Create)				[INARTAVG]
+	;				^INStockVal			(Create, Modify, Kill)	[INStockValAdjust]
+	; 				^INFIBBUCH			(Create)				[INStockValAdjust]
+	; 				^INWE				(Modify, Kill)			[INBESTANDCHECK]
+	; 				^INWES				(Kill)					[INBESTANDCHECK]
+	; 				^INWEALT			(Create)				[INBESTANDCHECK]
+	;
+	; History:
+	; 18-May-2009	DWR		SR16541: Removed call to update INARTAVG and return new
+	; 							value; call that uses this new value to update
+	; 							INStockVal.  INARTAVG routine updates INStockVal
+	; 							itself, and this is now done when confirm movement.
+	; 07-Aug-2008	HQN 	SR15815: Removing all reversal code, remove INWE missed updates
+	; 						^INRESERVIERT only applicable to CustomerOrders, remove
+	; 06-Aug-2008	HQN		SR15815: Removing INARTHSTL creation, let V2 backpopulate
+	; 01-Aug-2008	HQN		SR15815: Removing redundant processing for SupplierReceipt
+	; 19-Jul-2007	GRF		SR15575: errors creating INWEBUCH
+	; 13-Jul-2007	GRF		SR15558: unnecessary code commented; boolean macro
+	; 29-Jun-2006	GRF		SR14471: Var UNITCOSTWITHOUTSERVICECOSTS => UnitCostWithoutSC;
+	; 							use UnitCostWithoutSC rather than calling $piece twice
+	; 10-Apr-2006	JW		SR14421: Encapsulated code from ^INWEAUF. Cleaned up reversals.
+	;-------------------------------------------------------------------------------
+	new ART,AUF,BETR,blnDone,dteOrigRec,EKNEU,idGoodsFlags,INFOTEXT,LEOK,LOESCH,lstHist
+	new LP,POS,SATZ,strSource,UnitCostWithoutSC,UnitCostWithSC,WEDAT,WEOK
+	
+	$$$LogR("Receive",$get(YKEY))
+  		
+	set AUF   = $translate($$$KEY1(YKEY),$$$DBLQUOTE)   quit:AUF=""
+	set POS   = $translate($$$KEY2(YKEY),$$$DBLQUOTE)   quit:POS=""
+	set BETR  = $translate($$$KEY3(YKEY),$$$DBLQUOTE)   quit:BETR=""
+	set LP    = $translate($$$KEY4(YKEY),$$$DBLQUOTE)   quit:LP=""
+	set WEDAT = $translate($$$KEY5(YKEY),$$$DBLQUOTE)   quit:WEDAT=""
+	
+	$$$LogRm(^INWEAUF(0,AUF))
+	$$$LogRx("---------")
+	
+	; FIXME : <GRF> ? Why not use YFELD as object?  Is it possible INWEAUF can be
+	;                 updated between being set and used, or can YFELD be something
+	;                 different?  Are we better off just resetting YFELD?
+	; FIXME : <GRF> This is retested in LOESCH (delete if no idItem)
+	IF $$$INWEAUFQuantityInStockSet($GET(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)))'="" QUIT   ; D23  ;SCHON ÜBERTRAGEN ;already transferred 
+	;set blnREVERSE = $get(blnREVERSE)		// SR13222
+	
+	/*	TODO JW - reverted for build
+	//SR14615 - Source Details
+	set strSource = YFORM_"|"_$select($extract(YFORM,1,5)="INREC":$$$INWEAUFReceivingNumber(YFELD),1:YKEY)
+	// Use YFORM for logging for now - change to INWEAUF later - TODO JW
+	*/
+	set strSource=""
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;	NEBENWE		objINWE			Stock On Hand
+	;	SATZ		objINAUFP		OrderLine
+	;	YSATZ		objINAUFP		OrderLine
+	;	YFELD		objINWEAUF      (from parameters)
+	;	YFELD		objINAUFP       (isolated redefinition)
+	;	XPOS1		objINRESERVIERT
+	;	WER1		objINWER
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	DO
+	. SET SATZ = $GET(^INAUFP(YM,AUF,POS,1))
+	. SET ART  = $$$INAUFPItemNumber(SATZ)
+	. IF ART="" DO LOESCH QUIT   ;KEINE ARTIKELNUMMER       ;no item
+	. ;
+	. ;  D217		$$$INVORGDRPOnlyForNetChange()
+	. IF $PIECE($GET(^INVORG(YM,YM,1)),Y,217)=$$$YES SET ^INDRPNETCHANGE(YM,ART,1)=""  ;FIS;29.04.05;SR12200
+	. ;
+	. ;IF $PIECE(YFELD,Y,10)=0 SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,90)=1,$PIECE(SATZ,Y,90)=1  ;AUSLIEFERUNGSFÄHIG
+	. set WEOK = $$$OK
+	. set idGoodsFlags = $$$INWEAUFIncomingGoodsFlags(YFELD)
+	. IF idGoodsFlags'="" DO
+	. . SET WEOK = $$$NO
+	. . ;                               Receiving O.K.                               _BLANK = "Handover Can Take Place" 
+	. . IF ($PIECE($GET(^INWEMERKER(YM,idGoodsFlags,1)),Y,2)=$$$YES) || (+$PIECE($GET(^INWEMERKER(YM,idGoodsFlags,1)),Y,3)=0) DO
+	. . . SET WEOK = $$$OK  ;AUSLIEFERUNGSFÄHIG
+	. ;
+	. IF WEOK=$$$OK DO
+	. . SET $$$INAUFPReadyForDelivery(^INAUFP(YM,AUF,POS,1)) = $$$YES
+	. . SET $$$INAUFPReadyForDelivery(SATZ)                  = $$$YES
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;MENGE IST DIE MENGE, DIE EINGETRAGEN WIRD
+	. ; replace vvv 13-Jul-2007 ; SR15558
+	. ;SET MENGE     = ""
+	. ;SET MENGEREST = ""
+	. ;SET MENGEGES  = ""
+	. ;SET MENGEIST  = ""
+	. ;
+	. ;SET MENGE    = $$$INWEAUFIncomingGoodsQuantity(YFELD),MENGESOLL=MENGE,MENGEREST=MENGE,MENGEGES=MENGE
+	. ;SET LOESCH   = 0
+	. ;SET MENGEIST = $$$INAUFPIncomingGoodsQuantity(SATZ)  ;MENGE SCHON ÜBERTRAGEN ;quantity yet transport 
+	. ;if +MENGEIST=0 set (MENGESOLL,MENGE,MENGEREST,MENGEGES) = $$$INWEAUFIncomingGoodsQuantity(YFELD)
+	. ;
+	. ;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	. ;;IF +MENGEIST'=0 DO  ;19.04.04 WIEDER AKTIVIERT (WAR AUSKOMMENTIERT), DA SONST DOPPELTER WE MÖGLICH. WARUM AUSKOMMENTIERT WAR, IST UNBEKANNT.
+	. ;. SET MENGESOLL=$PIECE(YFELD,Y,4)-$PIECE(YFELD,Y,23)  ;MENGE ZU ÜBERTRAGEN-DER SCHON EINGETRAGENEN MENGE ;quantity within yet quantity 
+	. ;. IF (MENGESOLL+($PIECE(YFELD,Y,4)*10))'>0                         DO LOESCH QUIT   ;KEIN BESTANDEINGETRAGEN ;no 
+	. ;. IF (MENGEIST+MENGESOLL)>($PIECE(SATZ,Y,5)+($PIECE(SATZ,Y,4)*10)) DO LOESCH QUIT   ;SCHON GENUG ÜBERTRAGEN ;yet sufficiently transport 
+	. ;. SET MENGEGES=$PIECE(SATZ,Y,5)           ;MENGE GESAMT ;quantity total 
+	. ;. SET MENGE=MENGESOLL                     ;WAS WILL DER USER ÜBERTRAGEN ;whatsoever the transport 
+	. ;. SET MENGEREST=MENGEGES-MENGEIST         ;WAS KANN ER NOCH ÜBERTRAGEN ;whatsoever him yet transport 
+	. ;. IF MENGE>MENGEREST SET MENGE=MENGEREST  ;WAS DARF ER NOCH ÜBERTRAGEN ;whatsoever him yet transport 
+	. ;;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  DISABLED BLOCK END
+	. ;QUIT:LOESCH=1
+	. ;
+	. ;    with vvv
+	. ;
+	. set MENGE     = $$$INWEAUFIncomingGoodsQuantity(YFELD)  ; quantity received this delivery
+	. set MENGEIST  = $$$INAUFPIncomingGoodsQuantity(SATZ)    ; quantity previously received   ;MENGE SCHON ÜBERTRAGEN
+	. set MENGEREST = MENGE                      ; probably not required (MENGESOLL only used in commented lines) <GRF>
+	. set MENGEGES  = MENGE                      ; could probably just substitute with MENGE below?               <GRF>
+	. ;         ^^^ 13-Jul-2007
+	. /*IF 'blnREVERSE */IF MENGE'>0 DO LOESCH QUIT   ;Remove entries with negative quantity unless a reversal  // SR13222 ; 07-Aug-2008
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;
+	. ; *** REFERENCE POINT 1 *** <GRF>
+	. ; If the total quantity received meets the ordered quantity,
+	. ; set the order delivery [?] quantity to match this delivery quantity
+	. IF (MENGE+MENGEIST)'<$$$INAUFPQuantity(SATZ) SET $$$INWEAUFCompleteWEQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGEGES  ;MENGE GESAMT ;quantity total 
+	. ;IF MENGE'>0 DO  QUIT                                             ;KEINE MENGE MEHR OFFEN ZUM ÜBERTRAGEN
+	. ;. SET $PIECE(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1),Y,4)=MENGEGES  ;MENGE GESAMT
+	. ;
+	. SET $$$INWEAUFIncomingGoodsQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGE+$$$INWEAUFQuantityInStockSet(YFELD)  ;MENGE GESAMT ;quantity total
+	. ;  ^^^ This does nothing!!    (D4 = D4 + D23 where D23 starts off as null) <JW/GRF>  D23 is updated below
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; Update Total Cost for Stock Location
+	. ; as Qty * Unit Price
+	. ; (where Unit Price is FCPrice * Exchange Rate if appropriate)
+	. ;+++++++++++++++++++++++++++++++++++++
+	. new SuppliersFCCode ; SR13591
+	. set SuppliersFCCode = $$GetFCCode^INLIEF($$$INWEAUFSupplier(YFELD))
+	. if SuppliersFCCode '= "" do
+	. . set UnitCostWithoutSC = $$$INWEAUFPriceForeignCurrency(YFELD)*$$$INWEAUFExchangeRate(YFELD)
+	. . set $$$INWEAUFTotalCostOnLocation(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=$$Round^COMUtilNum($$$INWEAUFIncomingGoodsQuantity(YFELD)*UnitCostWithoutSC) ; SR13517
+	. if SuppliersFCCode = "" do
+	. . set UnitCostWithoutSC = $$$INWEAUFUnitPrice(YFELD)
+	. . set $$$INWEAUFTotalCostOnLocation(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=$$$INWEAUFIncomingGoodsQuantity(YFELD)*UnitCostWithoutSC  ;GESAMTPREIS BEI EINLAGERUNG;FIS;23719;07.07.03
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; UPDATE UNIT COST WITH SERVICE COSTS
+	. ; FOR INWE AND FINANCE POSTING ;FIS;13-APR-05
+	. ; 
+	. ; Finance Transaction Reference is made
+	. ; up of COSTTYPE / UnitValue pairs
+	. ;  %3B CT %7C UV %3B CT %7C UV %3B ...
+	. ;+++++++++++++++++++++++++++++++++++++
+	. set UnitCostWithSC = UnitCostWithoutSC
+	. IF $$$INWEAUFFinanceTxRef(YFELD)'="" IF $FIND(YFELD,"%3B") DO
+	. . NEW YI
+	. . FOR YI=1:1  QUIT:$PIECE($$$INWEAUFFinanceTxRef(YFELD),"%3B",YI,YI+99)=""  DO              ; D115
+	. . . SET YI(2)=$PIECE($PIECE($$$INWEAUFFinanceTxRef(YFELD),"%3B",YI),"%7C",2)
+	. . . SET $$$INWEAUFUnitPrice(YFELD) = $$$INWEAUFUnitPrice(YFELD) + YI(2)         ;SERVICE COSTS => D8
+	. . . set UnitCostWithSC             = UnitCostWithSC             + YI(2)         ; 29-Jun-2006
+	. . ;SET $PIECE(YFELD,Y,8)=$JUSTIFY($PIECE(YFELD,Y,8),0,2)  ;SR12749
+	. ;
+	. SET $$$INAUFPIncomingGoodsQuantity(^INAUFP(YM,AUF,POS,1))=MENGE+MENGEIST   ;GESAMTMENGE IN POSITION ;within 
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ; Update order line if the Delivery should be sent directly to the Customer for a Supplier Order
+	. ; (Specified at order line or at order level)
+	. IF ($$$INAUFPCustomerIsDeliveryAddress(^INAUFP(YM,AUF,POS,1))=$$$YES) || ($$$INAUFCustomerAddressinOrder($GET(^INAUF(YM,AUF,1)))=$$$YES) DO  ;FIS;08.08.03;DIREKTLIEFERUNG VOM LIEFERANT ;supplier ; 13-Jul-2007
+	. . NEW YSATZ,YFORM,YVOR,YOK
+	. . SET YSATZ = $GET(^INAUFP(YM,AUF,POS,1))
+	. . SET $PIECE(YSATZ,Y,91) = $PIECE(YFELD,Y,1)                            ;WE NUMMER ;In numeral 
+	. . IF $PIECE(YSATZ,Y,91)="" SET $PIECE(YSATZ,Y,91) = $PIECE(YFELD,Y,14)  ;LIEFERSCHEIN NR. ;packing slip 
+	. . SET $PIECE(YSATZ,Y,92) = +$HOROLOG
+	. . SET $PIECE(YSATZ,Y,93) = $PIECE($HOROLOG,",",2)
+	. . SET $PIECE(YSATZ,Y,94) = YBED
+	. . SET YOK=$$^WWWSPEI("INAUFP",AUF_","_POS,YSATZ,1)
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;VOLLSTÄNDIG? - Completely?
+	. ;
+	. ; *** REFERENCE POINT 2 *** <GRF>
+	. ; This seems to be a copy of REFERENCE POINT 1 without considering over-receipt
+	. IF $$$INAUFPQuantity(SATZ)=(MENGE+MENGEIST) SET $$$INWEAUFCompleteWEQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGEGES  ;MENGE GESAMTUND VOLLSTÄNDIG ;quantity entire and complete
+	. SET $$$INWEAUFQuantityInStockSet(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGE+$$$INWEAUFQuantityInStockSet(YFELD)  ;MENGE ÜBERTRAGEN ;quantity transport 
+	. ;
+	. ;IF $PIECE(SATZ,Y,5)=(MENGE+MENGEIST) IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=2 IF WEOK=1 DO  ;WARENEINGANG OK = AUFTRAG ABGESCHLOSSEN KANN REORGANISIERT WERDEN
+	. ;. NEW YFORM,YVOR
+	. ;. SET $PIECE(SATZ,Y,60)=$$$YES  ;AUFTRAG OK
+	. ;. SET YFORM="INAUFP"
+	. ;. SET YOK=$$^WWWSPEI("INAUFP",AUF_","_POS,SATZ,1)
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;BUCHEN WARENEINGANG ;receiving 		
+	. ; 06-Aug-2008	vvvv
+	. ;DO
+	. ;. NEW TEXT
+	. ;. if 'blnREVERSE set TEXT="+"	// SR13222
+	. ;. if blnREVERSE  set TEXT=""
+	. ;. SET TEXT=TEXT_MENGE_" "_$$^WWWTEXT(32512)_" "_$$^WWWTEXT(32279)_" "_AUF_"-"_POS  ;AUF BESTAND AUS WE ;upon out of In 
+	. ;. IF ($PIECE(YFELD,Y,2)'="") || ($PIECE(YFELD,Y,19)'="") DO
+	. ;. . SET TEXT=TEXT_" ("_$PIECE(YFELD,Y,2)      ;CHARGENNUMMER
+	. ;. . SET TEXT=TEXT_"/"_$PIECE(YFELD,Y,19)_")"  ;LOTNUMMER
+	. ;. ;
+	. ;. ;DO ^INARTHIST(ART,TEXT,BETR,MENGE,,,$PIECE(YFELD,Y,7),($PIECE(YFELD,Y,4)*UnitCostWithoutSC),BETR_"|"_LP_"|"_WEDAT_"|"_MENGE,1,LP,AUF,POS,BETR,,"REC",,$piece(YFELD,Y,115),,$$$INWEAUFVORDeliveryNoteNumber(YFELD))  ;SHOBBY SR12333 ;SR12745
+	. ;. ; SR13800: Defer ^INARTHIST
+	. ;.;set lstHist = $listbuild(ART,TEXT,BETR,MENGE,,,$PIECE(YFELD,Y,7),($PIECE(YFELD,Y,4)*UnitCostWithoutSC),BETR_"|"_LP_"|"_WEDAT_"|"_MENGE,1,LP,AUF,POS,BETR,,"REC",,$piece(YFELD,Y,115),,$$$INWEAUFVORDeliveryNoteNumber(YFELD),strSource)	//SR14615
+	. ;. set lstHist = $listbuild(ART,TEXT,BETR,MENGE,,,$PIECE(YFELD,Y,7),($PIECE(YFELD,Y,4)*UnitCostWithoutSC)_"|"_($PIECE(YFELD,Y,4)*UnitCostWithSC),BETR_"|"_LP_"|"_WEDAT_"|"_MENGE,1,LP,AUF,POS,BETR,,"REC",,$piece(YFELD,Y,115),,$$$INWEAUFVORDeliveryNoteNumber(YFELD),strSource,"INWEAUF",YKEY)	//SR14615 ;BR014754
+	. ;. ;						  1		2	3	4	56			7				8																		9							 10 11	12	13	14 15  16 17		18		   19				20							21
+	. ;
+	. ;06-Aug-2008 ^^^^
+	. ;-----------------------------------------------------------------------------
+	. ;RECHNEN DURCHSCHNITTLICHER EK ;Calculate Average Cost 
+	. 		////   VVVV  update the Average cost 
+	. ;set EKNEU = $$^INARTAVG(ART,MENGE,$PIECE(YFELD,Y,8),AUF_","_POS_","_BETR_","_LP_","_WEDAT,,$$$YES)  ; SR14203 - move NEW up higher so value is retained   ;SR16541
+	. //SET EKNEU = $$^INARTAVG(ART,MENGE,$PIECE(YFELD,Y,8),AUF_","_POS_","_BETR_","_LP_","_WEDAT)  ; SR14203 - move NEW up higher so value is retained
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. DO  ;WE BUCH  FÜR alle Positionen des Auftrags einlagern  ZEIT VERSCHIEBEN ,  FAN 15.03.02
+	. . NEW YFORM,YVOR,YOK,ZEIT,ZEIT1,YQ,SATZ0,ART0,idSupplier
+	. . SET ZEIT=$PIECE($HOROLOG,",",2)
+	. . SET YQ=0
+	. . FOR ZEIT1=ZEIT:1 QUIT:YQ=1  DO
+	. . . set idSupplier = $piece(YFELD,Y,7)                                ; SR15575  idSupplier may not be numeric
+	. . . ;QUIT:$DATA(^INWEBUCH(YM,+$HOROLOG,ZEIT1,+$PIECE(YFELD,Y,7)))     ; SR15575
+	. . . QUIT:$DATA(^INWEBUCH(YM,+$HOROLOG,ZEIT1,idSupplier))
+	. . . SET ART0  = $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4)
+	. . . ;
+	. . . ;    FIXME : <GRF> $PIECE(YFELD,Y,10) is ^INWEMERKER not ^INPARA(YM,"WE-MERKER")
+	. . . ;
+	. . . ;SET SATZ0 = $PIECE($GET(^INLIEF(YM,+$PIECE(YFELD,Y,7),1)),Y,48)_Y_$PIECE(YFELD,Y,14)_Y_WEDAT_Y_AUF_Y_POS_Y_ART0_Y_MENGE_Y_$PIECE(YFELD,Y,10)_Y_$PIECE(YFELD,Y,2)_Y_$PIECE(YFELD,Y,1)_Y_BETR ; SR15575
+	. . . SET SATZ0 = $PIECE($GET(^INLIEF(YM,idSupplier,1)),Y,48)_Y_$PIECE(YFELD,Y,14)_Y_WEDAT_Y_AUF_Y_POS_Y_ART0_Y_MENGE_Y_$PIECE(YFELD,Y,10)_Y_$PIECE(YFELD,Y,2)_Y_$PIECE(YFELD,Y,1)_Y_BETR
+	. . .;IF ART0'="" SET SATZ0=SATZ0_Y_$PIECE($GET(^INART(YM,ART0,1)),Y,30)
+	. . . if ART0'="" set $piece(SATZ0,Y,12) = $$$INARTItemGroup($GET(^INART(YM,ART0,1)))       ; D30
+	. . . ;SET YOK=$$^WWWSPEI("INWEBUCH",+$HOROLOG_","_ZEIT1_","_+$PIECE(YFELD,Y,7),SATZ0,1) ; SR15575
+	. . . SET YOK=$$^WWWSPEI("INWEBUCH",+$HOROLOG_","_ZEIT1_","_idSupplier,SATZ0,1)
+	. . . SET YQ=1
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;ENTSTEHUNGSPRODUKTE BEI WARENEINGANG NACH VEREDELUNG
+	. ;DEVELOPING PRODUCTS WITH INCOMING GOODS AFTER REFINEMENT/Production By-Products
+	. ;IF $DATA(^INARTNEBEN(YM,ART)) DO ByProducts() ; Manufacturing Receipt only ; 07-Aug-2008
+	. ; SR15815 Supplier Receipt can never be from a Customer Order
+	. ;			 Customer Order
+	. ;-----------------------------------------------------------------------------
+	. ; IF +$$$INAUFOrderType($GET(^INAUF(YM,AUF,1)))=0 DO  QUIT:MENGE'>0  ;BEI KUNDENAUFTRAG SOLL WE BLEIBEN, KEIN FREIER BESTAND (AUSSER WENN MEHRMENGE)
+	. ; . ;WENN MENGE > BESTELLMENGE FÜR DEN KUNDEN DANN MENGE = BESTELLMENGE UND REST AUF LAGER ;when quantity ordering quantity to quantity ordering quantity And residue upon stock location 
+	. ; . IF MENGE>$$$INAUFPQuantity(SATZ) SET $$$INWEAUFIncomingGoodsQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=$$$INAUFPQuantity(SATZ)  ;4.2.2003; TYBD
+	. ; . ;SET $PIECE(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1),Y,4)=$PIECE(SATZ,Y,5)  ;4.2.2003; TYBD;ALT
+	. ; . SET MENGE=MENGE-$$$INAUFPQuantity(SATZ)
+	. ; . IF MENGE>0 SET $$$INWEAUFAdditionalQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGE
+	. ; . ;HISTORY; MENGE: X VON bestand für AUFTRAG XXX (WE XXX)
+	. ; . 
+	. ; . // SR14903 - This is the line.
+	. ; . SET TEXT="-"_$$$INAUFPQuantity(SATZ)_" "_$$^WWWTEXT(32511)_" "_$$^WWWTEXT(32047)_" "_AUF_"-"_POS  ;FIS;24328;02.10.03;HISTORY
+	. ; . ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. ; . NEW KOST
+	. ; . SET KOST=$PIECE(YFELD,Y,8)
+	. ; . IF $PIECE($GET(^INVORG(YM,YM,1)),Y,15)=9 SET KOST=$$^INARTKOST(ART,,9)  ;FIS;16.08.05;SR13253;USE ALWAYS AVERAGE COST
+	. ; . DO ^INARTHIST(ART,TEXT,BETR,,$$$INAUFPQuantity(SATZ),,$PIECE(YFELD,Y,7),($$$INWEAUFIncomingGoodsQuantity(YFELD)*KOST),BETR_"|"_LP_"|"_WEDAT_"|"_$$$INWEAUFIncomingGoodsQuantity(YFELD),1,LP,AUF,POS,BETR,,"ISS",,,,,strSource)	//SR14615
+	. ; . ;             ARTIKEL,UMLAGERUNGSTEXT,+MENGE,,,LIEFERANT,GESAMTPREIS,WE-DETAILS,INVENTURSPERRE,,AUFTRAG,POSITION
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;
+	. QUIT:$GET(NOBESTAND)=1  ;VARAIBLE WIRD IN INARTMINUS GESETZT, 
+	. QUIT:(MENGE<0)&&'blnREVERSE				// SR13222     ; FIXME : see FIXME below <GRF>
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ; FREIGEBEN RESERVIERUNGEN
+	. ; RELEASE RESERVATIONS
+	. ;IF $DATA(^INRESERVIERT(YM,AUF,POS)) DO ReleaseCOReservation() ; 07-Aug-2008 Inapplicable to Supplier Order, Only for Customer Orders
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. QUIT:+MENGE=0
+	. QUIT:(MENGE<0) /*&&'blnREVERSE		// SR13222. */
+	. ; FIXME : why do we need line just above with blnREVERSE? should that have been commented with the RESERVATIONS? <GRF>
+	. ;
+	. ; FIXME - JW: If the appropriate INWE is defined, then just the qty is updated.
+	. ; 			This is fine if the order and line are the same (2nd receipt),
+	. ;				but if they are different, it is no good. Costs can't be updated etc.
+	. ;
+	. ; FIXME : These 3 lines setting YFELD were required to update INWE - save is commented below - Obsolete <GRF>
+	. SET $$$INWEAUFIncomingGoodsQuantity(YFELD) = MENGE  ;RESTMENGE AUS LAGERBESTELLUNGS RESERVIERUNG ;out of 
+	. SET $$$INWEAUFSourceOrder(YFELD)           = AUF  ;SPEICHERN WARENHERKUNFT/URSPRUNG ;Save 
+	. SET $$$INWEAUFSourceLineItem(YFELD)        = POS
+	. ;
+	. QUIT:LP=$$$INVORGDeleteStockLocation($GET(^INVORG(YM,YM,1)))
+	. QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,29)=1	;KEINE BESTANDSFÜHRUNG  TYBD 16.05.2002 ;no 
+	. QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,26)=2	;LEISTUNG  TYBD 16.05.2002 ;service item 
+	. ;
+	. ; 07-Aug-2008  vvvv Done on backpopulate now, ignore here
+	. ;IF $DATA(^INWE(YM,ART,BETR,LP,WEDAT,1)) DO  QUIT   ;LAGERPLATZ VORHANDEN ;WEM;22698;22.10.2003;ERSETZEN HARDCODED LÖSCHLAGERPLATZ
+	. ;. SET MENGEALT=$$$INWEQuantity(^INWE(YM,ART,BETR,LP,WEDAT,1))
+	. ;. SET $$$INWEQuantity(^INWE(YM,ART,BETR,LP,WEDAT,1))=MENGEALT+MENGE  ;NEUE MENGE ;quantity 
+	. ;
+	. ;if blnREVERSE if $DATA(^INWE(YM,ART,BETR,LP,(WEDAT-1),1)) DO  QUIT 	// SR13222: Reversal	
+	. ;. SET MENGEALT=$$$INWEQuantity(^INWE(YM,ART,BETR,LP,(WEDAT-1),1))
+	. ;. SET $$$INWEQuantity(^INWE(YM,ART,BETR,LP,(WEDAT-1),1))=MENGEALT+MENGE  ;NEUE MENGE ;quantity 
+	. ;
+	. ;set blnDone = $$$NO		// SR14421: Reversal - get prev date from cache temp
+	. ;if blnREVERSE do
+	. ;. set dteOrigRec = $get(^CacheTempRECReverse(YUSER,AUF,POS,BETR,LP,WEDAT))
+	. ;. if dteOrigRec'="" if $data(^INWE(YM,ART,BETR,LP,dteOrigRec,1)) do
+	. ;. . SET MENGEALT=$$$INWEQuantity(^INWE(YM,ART,BETR,LP,dteOrigRec,1))
+	. ;. . SET $$$INWEQuantity(^INWE(YM,ART,BETR,LP,dteOrigRec,1))=MENGEALT+MENGE
+	. ;. . set blnDone = $$$YES
+	. ;quit:blnDone
+	. ; 07-Aug-2008 ^^^^
+	. ; // SR15815 Removed INWE update, done in dUReceiptLine
+	. ;DO   ;WEM;22698;22.10.2003;ERSETZEN HARDCODED LÖSCHLAGERPLATZ
+	. ;. SET ^INWE(YM,ART,BETR,LP,WEDAT,1)=YFELD             ;NEUER LAGERPLATZ ;stock location 
+	. ;. DO ^WWWSSORT("INWE",ART_","_BETR_","_LP_","_WEDAT)  ;AUFBEREITEN SORTKEY
+	. ;. ; do $$$Save("INWE",ART_","_BETR_","_LP_","_WEDAT,YFELD) // SR14546
+	
+	/*
+	if $get(lstHist)'="" {		//SR13800 - Fix
+		do Deferred^INARTHIST(lstHist)
+		set strStatus = $$AutoUpdate^INStockValAdjust("INWEAUF",AUF_","_POS,ART,EKNEU)       ; SR14203
+	}*/
+	
+	 ;set strStatus = $$AutoUpdate^INStockValAdjust("INWEAUF",AUF_","_POS,ART,EKNEU)         ; SR16541 
+	
+	;-------------------------------------------------------------------------------
+	
+	; Store all order lines when "All Line Items Received" set
+	;ALLE POSITIONEN DES AUFTRAGES EINLAGERN
+	IF $$$INWEAUFAllLineItemsReceived($GET(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)))=1 DO 
+	. SET $$$INWEAUFAllLineItemsReceived(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=0  ;WIEDER AUSSCHALTEN  ;re- eliminate 
+	. SET $$$INWEAUFVersionRev(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=POS          ;SPEICHERN ERFASSTE POSITION BEI GESAMT-WE ;Save next to 
+	. IF +$$$INWEAUFCreateCustomsMessage(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=1 DO ^INWEGESAMT(0,AUF,POS,1) QUIT   ;BUCHEN WE ALLER POSITIONEN  ;WEM;24071;03.11.2003;UND ALS ZU VERZOLLEND DEKLARIEREN
+	. DO ^INWEGESAMT(0,AUF,POS,0)                                                 ;BUCHWEN WE ALLER POSITIONEN ;In everyone 
+	
+	;-------------------------------------------------------------------------------
+	SET ART=$$$INAUFPItemNumber($GET(^INAUFP(YM,AUF,POS,1)))        ; 06-Sep-2005 remove unnecessary DO level
+	IF ART'="" DO ^INBESTANDCHECK(ART)  ;BESTANDSCHECK             ; Update ^INWE
+	
+	$$$LogRx("#quit#")
+	$$$LogRm(^INWEAUF(0,AUF))
+	QUIT
+	
+ByProducts()
+	;-------------------------------------------------------------------------------
+	;ENTSTEHUNGSPRODUKTE BEI WARENEINGANG NACH VEREDELUNG
+	;DEVELOPING PRODUCTS WITH INCOMING GOODS AFTER REFINEMENT/Production By-Products
+	; 07-Aug-2008	HQN		SR15815: Moved from Receive()
+	;-------------------------------------------------------------------------------
+	DO
+	. DO
+	. . NEW NEBEN,NEBENMENGE,PRODUKTMENGE,NEBENWE,WEMENGE,HAL,YII
+	. . SET NEBEN=""
+	. . FOR  SET NEBEN=$ORDER(^INARTNEBEN(YM,ART,NEBEN)) QUIT:NEBEN=""  DO
+	. . . QUIT:+$PIECE($GET(^INARTNEBEN(YM,ART,NEBEN,1)),Y,3)'=1  ;NUR WENN DURCH WARENEINGANG ;only when trans- receiving 
+	. . . SET NEBENMENGE  =+$PIECE($GET(^INARTNEBEN(YM,ART,NEBEN,1)),Y,1)       ; Created Quantity
+	. . . SET PRODUKTMENGE=+$PIECE($GET(^INARTNEBEN(YM,ART,NEBEN,1)),Y,2)       ; Per Production Output
+	. . . QUIT:NEBENMENGE=0
+	. . . IF PRODUKTMENGE=0 SET PRODUKTMENGE=1
+	. . . SET WEMENGE=((MENGE/PRODUKTMENGE)*NEBENMENGE)
+	. . . SET HAL=""
+	. . . IF $DATA(^INARTLP(YM,NEBEN)) SET HAL=$ORDER(^INARTLP(YM,NEBEN,BETR,""))  ;FESTER LAGERPLATZ;FIS;24562;07.11.03
+	. . . IF HAL="" SET HAL=$GET(LP)
+	. . . IF HAL="" SET HAL=$PIECE($GET(^INVORGB(YM,YM,BETR,1)),Y,1)
+	. . . IF HAL="" SET HAL=$ORDER(^INLP(YM,BETR,""))
+	. . . IF HAL="" SET HAL=0
+	. . . SET NEBENWE=$GET(^INWE(YM,NEBEN,BETR,HAL,+$HOROLOG,1))
+	. . . DO  ;NEUANLAGE WE ;In 
+	. . . . IF NEBENWE="" FOR YII=1,7,11,12,13  SET $PIECE(NEBENWE,Y,YII)=$PIECE(YFELD,Y,YII)  ;DATEN ÜBERNEHMEN ;assume 
+	. . . . SET $PIECE(NEBENWE,Y,9)=$$^WWWTEXT(32560)_" "_$$^WWWTEXT(32515)_" "_ART  ;NEBENPRODUKT AUS ;by-product out of 
+	. . . . SET $PIECE(NEBENWE,Y,28)=$GET(AUF)  ;URSPRUNGSAUFTRAG
+	. . . . SET $PIECE(NEBENWE,Y,29)=$GET(POS)  ;URSPRUNGSPOSITION
+	. . . ;
+	. . . IF +$PIECE(NEBENWE,Y,8)=0 SET $PIECE(NEBENWE,Y,8)=$$^INARTKOST(NEBEN)  ;HERSTELLKOSTEN;FIS;24562;07.11.03
+	. . . SET $PIECE(NEBENWE,Y,4)=$PIECE(NEBENWE,Y,4)+WEMENGE
+	. . . ;IF $PIECE(NEBENWE,Y,4)<0 SET $PIECE(NEBENWE,Y,4)=0  ;MINUSBESTÄNDE WERDEN DURCH INTAGES KORRIGIERT
+	. . . SET ^INWE(YM,NEBEN,BETR,HAL,+$HOROLOG,1)=NEBENWE
+	. . . ; do $$$Save("INWE",NEBEN,BETR,HAL,+$HOROLOG,NEBENWE,$$$YES) // SR14546
+	. . . SET WEMENGE=$$^WWWZAHL(WEMENGE,0,$LENGTH($PIECE(WEMENGE,".",2)))  ;ANZEIGEFORMAT
+	. . . IF WEMENGE>0 SET WEMENGE="+"_WEMENGE
+	. . . ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. . . set INFOTEXT = WEMENGE_" "_$$^WWWTEXT(32560)_" "_$$^WWWTEXT(32515)_" "_$$^WWWTEXT(32278)_"("_AUF_"-"_POS_") "_$$^WWWDATE(+$HOROLOG)
+	. . . ;+ QUANTITY OF BY-PRODUCTS FROM PRODUCTION ORDER	;SR14615
+	. . . DO ^INARTHIST(NEBEN,INFOTEXT,BETR,WEMENGE,,,,$PIECE(NEBENWE,Y,8),,,HAL,AUF,POS,BETR,,"REC",,,,,strSource)
+	quit
+	
+ReleaseCOReservation()
+	;-------------------------------------------------------------------------------
+	; FREIGEBEN RESERVIERUNGEN
+	; RELEASE RESERVATIONS
+	; 07-Aug-2008	HQN		SR15815: Moved from Receive()
+	;-------------------------------------------------------------------------------
+	DO
+	. DO
+	. . NEW XAUF,XPOS,XPOS1,XMENGE
+	. . SET XAUF=""
+	. . FOR  SET XAUF=$ORDER(^INRESERVIERT(YM,AUF,POS,XAUF)) QUIT:XAUF=""  DO  QUIT:+MENGE=0
+	. . . SET XPOS=""
+	. . . FOR  SET XPOS=$ORDER(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS)) QUIT:XPOS=""  DO  QUIT:+MENGE=0
+	. . . . SET XPOS1=$GET(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS,1))
+	. . . . QUIT:($PIECE(XPOS1,Y,1)-$PIECE(XPOS1,Y,2))=0  ;KEINE MENGE MEHR ;no quantity more 
+	. . . . ;
+	. . . . IF XAUF=" " DO  QUIT  ;RESERVIERUNG OHNE KUNDENAUFTRAG;FIS;07.01.04;24891
+	. . . . . NEW RENUM,WER1,YOK,YVOR,YFORM,TEXT,WE1
+	. . . . . SET XMENGE=$PIECE(XPOS1,Y,1)-$PIECE(XPOS1,Y,2)  ;RESTMENGE DIE BENÖTIGT WIRD ;who 
+	. . . . . IF MENGE<XMENGE SET XMENGE=MENGE  ;MAX. EINLAGERUNGSMENGE;FIS:05.12.03;24633
+	. . . . . SET RENUM=$PIECE(XPOS,Y,4)        ;RES.NUMMER
+	. . . . . IF RENUM="" SET RENUM=XPOS
+	. . . . . IF RENUM="" SET RENUM=$$^WWWNEXT("INRESERVIERT")
+	. . . . . SET WER1=$GET(^INWER(YM,ART,BETR,LP,WEDAT,RENUM,1))
+	. . . . . IF $PIECE(WER1,Y,8)'="" SET WER1="" DO ^WWWSKILL("INWER",ART_","_BETR_","_LP_","_WEDAT_","_RENUM)  ;ALTEN SATZ LÖSCHEN ;typesetting Delete 
+	. . . . . SET $PIECE(WER1,Y,4)=$PIECE($GET(WER1),Y,4)+XMENGE  ;MENGE ;quantity 
+	. . . . . SET $PIECE(WER1,Y,5)=(+$HOROLOG+7)                  ;GÜLTIG BIS ;valuable until 
+	. . . . . SET $PIECE(WER1,Y,6)=RENUM                          ;GÜLTIG BIS ;valuable until 
+	. . . . . SET YOK  = $$^WWWSPEI("INWER",ART_","_BETR_","_LP_","_WEDAT_","_RENUM,WER1,1)    ;SPEICHERN ;Save 
+	. . . . . SET TEXT = $$^WWWTEXT(32480)_" "_$$^WWWTEXT(32807)_" "_$$^WWWTEXT(32347)_": "   ;RESERVIERT FÜR ;reserved to 
+	. . . . . ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. . . . . DO ^INARTHIST(ART,TEXT_" / "_BETR_" / "_LP_" / "_$$^WWWDATE(WEDAT)_" / "_RENUM,BETR,,XMENGE,,,,,,LP,,,BETR,,,,,,,strSource)  ;Reserved Quantity 	//SR14615
+	. . . . . SET $PIECE(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS,1),Y,2)=XMENGE+$PIECE(XPOS1,Y,2)
+	. . . . . SET MENGE=MENGE-XMENGE
+	. . . . . IF MENGE<0 SET MENGE=0
+	. . . . . IF +MENGE=0 IF '$DATA(^INWE(YM,ART,BETR,LP,WEDAT)) DO  ;ANLEGEN WE MIT MENGE 0 ;put onto In by means of quantity 
+	. . . . . . SET WE1=YFELD
+	. . . . . . SET $PIECE(WE1,Y,4)=0
+	. . . . . . SET $PIECE(WE1,Y,28)=AUF  ;URSPRUNGSAUFTRAG
+	. . . . . . SET $PIECE(WE1,Y,29)=POS  ;POSITION
+	. . . . . . 
+	. . . . . . SET ^INWE(YM,ART,BETR,LP,WEDAT,1)=WE1  ;NEUER LAGERPLATZ ;stock location 
+	. . . . . . DO ^WWWSSORT("INWE",ART_","_BETR_","_LP_","_WEDAT)  ;AUFBEREITEN SORTKEY
+	. . . . . . ; do $$$Save("INWE",ART_","_BETR_","_LP_","_WEDAT,WE1,$$$YES) // SR14546
+	. . . . ;
+	. . . . QUIT:$PIECE($GET(^INAUFP(YM,XAUF,XPOS,1)),Y,7)'=5  ;NICHT MEHR LAGERBESTELLUNG ; TYBD;17,09,2003
+	. . . . QUIT:$PIECE($GET(^INAUFP(YM,XAUF,XPOS,1)),Y,9)=1   ;STORNO; TYBD;17,09,2003
+	. . . . QUIT:'$DATA(^INAUFP(YM,XAUF,XPOS,1))               ;POSITION NICHT MEHR VORHANDEN;TYBD;17,09,2003
+	. . . . ;
+	. . . . ;-------------------------------
+	. . . . ;
+	. . . . SET XMENGE=$PIECE(XPOS1,Y,1)-$PIECE(XPOS1,Y,2)     ;RESTMENGE DIE BENÖTIGT WIRD ;who 
+	. . . . IF MENGE<XMENGE SET XMENGE=MENGE                   ;MAX. EINLAGERUNGSMENGE;FIS:05.12.03;24633
+	. . . . NEW YFELD1
+	. . . . SET YFELD1=YFELD
+	. . . . SET $PIECE(YFELD1,Y,4)=XMENGE
+	. . . . NEW YFORM,YVOR,YOK
+	. . . . SET YOK=$$^WWWSPEI("INWEAUF",XAUF_","_XPOS_","_BETR_","_LP_","_WEDAT,YFELD1,1)  ;;FIS;03.02.04;25041
+	. . . . ;SET ^INWEAUF(YM,XAUF,XPOS,BETR,LP,WEDAT,1)=YFELD1
+	. . . . NEW TEXT
+	. . . . ;HISTORY; MENGE: X VON bestand für AUFTRAG XXX (WE XXX)
+	. . . . SET TEXT="-"_$PIECE(YFELD1,Y,4)_" "_$$^WWWTEXT(32511)_" "_$$^WWWTEXT(32047)_" "_XAUF_"-"_XPOS_" ("_$$^WWWTEXT(32279)_" "_AUF_"-"_POS_")"  ;FIS;24210;27.08.03;HISTORY
+	. . . . ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. . . . DO ^INARTHIST(ART,TEXT,BETR,,$PIECE(YFELD1,Y,4),,$PIECE(YFELD1,Y,7),($PIECE(YFELD1,Y,4)*$PIECE(YFELD1,Y,8)),BETR_"|"_LP_"|"_WEDAT_"|"_$PIECE(YFELD1,Y,4),1,LP,XAUF,XPOS,BETR,,"ISS",,,,,strSource)	//SR14615
+	. . . . ;             ARTIKEL,UMLAGERUNGSTEXT,+MENGE,,,LIEFERANT,GESAMTPREIS,WE-DETAILS,INVENTURSPERRE,,AUFTRAG,POSITION
+	. . . . ;
+	. . . . DO
+	. . . . . IF (MENGE>XMENGE) || (MENGE=XMENGE) DO  QUIT  ;MENGE REICHT AUS ;quantity out of 
+	. . . . . . SET MENGE=MENGE-XMENGE
+	. . . . . . IF MENGE<0 SET MENGE=0
+	. . . . . . SET $PIECE(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS,1),Y,2)=XMENGE+$PIECE(XPOS1,Y,2)
+	. . . . . . IF (XMENGE+$PIECE(XPOS1,Y,2))=$PIECE(XPOS1,Y,1) DO
+	. . . . . . . SET $PIECE(^INAUFP(YM,XAUF,XPOS,1),Y,90)=1  ;AUSLIEFERUNGSFÄHIG
+	. . . . . ;
+	. . . . . IF MENGE<XMENGE DO  QUIT  ;MENGE REICHT NICHT AUS ;quantity Not out of 
+	. . . . . . SET XMENGE=MENGE
+	. . . . . . SET MENGE=0
+	. . . . . . SET $PIECE(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS,1),Y,2)=XMENGE+$PIECE(XPOS1,Y,2)
+	. . . . ;
+	. . . . ;  D154		$$$INVORGReadjustTrafficDateOnRece()
+	. . . . IF $PIECE($GET(^INVORG(YM,YM,1)),Y,154)=1 DO  ;FIS;2.9.03;24218;VERSANDTERMIN AKTUALISIEREN
+	. . . . . NEW YVOR,YOK,YFORM,YFELD
+	. . . . . SET YFELD=$GET(^INAUFP(YM,XAUF,XPOS,1))
+	. . . . . IF +$PIECE(YFELD,Y,76)=0         QUIT   ;KEIN DATUM ;no Date ]]><![CDATA[
+	. . . . . IF $PIECE(YFELD,Y,76)'<$HOROLOG  QUIT   ;NICHT ÜBERSCHRITTEN ;Not 
+	. . . . . SET $PIECE(YFELD,Y,76)=+$HOROLOG
+	. . . . . SET YOK=$$^WWWSPEI("INAUFP",XAUF_","_XPOS,YFELD,1)
+	. . . . . SET ^INTOUR(YM,+$HOROLOG,1)=""
+	quit
+	
+	
+LOESCH ;FALSCHE WERTE
+	; ByRef: YFELD,Y,YM,AUF,POS,BETR,LP,WEDAT
+	; Set ByRef: LOESCH
+	quit:$PIECE(YFELD,Y,23)'=""  ;SCHON DATEN ÜBERTRAGEN= NICHT LÖSCHEN ;yet Not Delete 
+	IF $PIECE($GET(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)),Y,23)'="" QUIT
+	
+	SET LOESCH = $$$YES  ;LOESCHMERKER
+	; <FIXME> Use WWWKILL Wrapper??
+	KILL ^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)
+	quit
+	
+	
+OnBeforeDCM(pstrKeys)
+	;-------------------------------------------------------------------------------
+    ; Only DCM if it's a purchase order receipt.
+    ;
+    ; Params:	pstrKeys	- INWEAUF keys
+    ;
+    ; Returns:	boolean - whether to DCM
+    ;
+    ; History:
+    ; 05-Oct-2006	JW		SR15079: Created
+	;-------------------------------------------------------------------------------
+    new idOrder,blnDCM
+    
+    set blnDCM = $$$NO
+    
+    set idOrder = $$$KEY1(pstrKeys)
+    if idOrder'="" {
+		set blnDCM = $$$INAUFOrderType($get(^INAUF(YM,idOrder,1)))=2
+    }
+    
+	quit blnDCM
+	
+	
+Reverse(YKEY,YFELD)   ; DEPRECATED SR16361 : replaced by RevOrderLine^INRECReverse which
+	; is called from ReverseTxn^INRECReverse, replacing SAVE^INWEAUFVORS call
+	;-------------------------------------------------------------------------------
+	; Reverses a ReceiptOrderLine generated from a prior ReceiptLine
+    ;
+    ; ByRef: blnREVERSE = $$$YES if via INWEAUFVORS
+    ; 
+    ; Called From: SAVE^INWEAUFVORS()
+    ; 
+    ; History:
+	; 14-Sep-2009	PPP		SR16888:Added Location to the INARTAVG parameter
+    ; 09-Sep-2009	GRF		SR16875: mixing qty in order units & cost in inventory
+    ; 							units
+    ; 01-Sep-2008	HQN		Documenting ByRef variables used
+	; 28-Aug-2008	HQN		SR15829: Code cleanup, removing all logic not applicable
+	; 							supplier receipts
+	; 27-Aug-2008	HQN		SR15829: Copied from INWEAUF
+	;-------------------------------------------------------------------------------
+	new ART,AUF,BETR,blnDone,dteOrigRec,EKNEU,idGoodsFlags,INFOTEXT,LEOK,LOESCH,lstHist
+	new LP,POS,SATZ,strSource,UnitCostWithoutSC,UnitCostWithSC,WEDAT,WEOK
+	new MENGE,MENGEIST,MENGEGES,MENGEREST,MENGEALT
+	
+	$$$LogR("Reverse",$get(YKEY))
+	
+	SET AUF   = $TRANSLATE($$$KEY1(YKEY),$$$DBLQUOTE)   QUIT:AUF=""
+	SET POS   = $TRANSLATE($$$KEY2(YKEY),$$$DBLQUOTE)   QUIT:POS=""
+	SET BETR  = $TRANSLATE($$$KEY3(YKEY),$$$DBLQUOTE)   QUIT:BETR=""
+	SET LP    = $TRANSLATE($$$KEY4(YKEY),$$$DBLQUOTE)   QUIT:LP=""
+	SET WEDAT = $TRANSLATE($$$KEY5(YKEY),$$$DBLQUOTE)   QUIT:WEDAT=""
+ 
+	; FIXME : <GRF> ? Why not use YFELD as object?  Is it possible INWEAUF can be
+	;                 updated between being set and used, or can YFELD be something
+	;                 different?  Are we better off just resetting YFELD?
+	; FIXME : <GRF> This is retested in LOESCH (delete if no idItem)
+	IF $$$INWEAUFQuantityInStockSet($GET(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)))'="" QUIT   ; D23  ;SCHON ÜBERTRAGEN ;already transferred 
+	
+	; set blnREVERSE = $get(blnREVERSE)		// SR13222 ;28-Aug-2008
+	
+	/*	TODO JW - reverted for build
+	//SR14615 - Source Details
+	set strSource = YFORM_"|"_$select($extract(YFORM,1,5)="INREC":$$$INWEAUFReceivingNumber(YFELD),1:YKEY)
+	// Use YFORM for logging for now - change to INWEAUF later - TODO JW
+	*/
+	set strSource=""
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;	NEBENWE		objINWE			Stock On Hand
+	;	SATZ		objINAUFP		OrderLine
+	;	YSATZ		objINAUFP		OrderLine
+	;	YFELD		objINWEAUF      (from parameters)
+	;	YFELD		objINAUFP       (isolated redefinition)
+	;	XPOS1		objINRESERVIERT
+	;	WER1		objINWER
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	DO
+	. SET SATZ = $GET(^INAUFP(YM,AUF,POS,1))
+	. SET ART  = $$$INAUFPItemNumber(SATZ)
+	. IF ART="" DO LOESCH QUIT   ;KEINE ARTIKELNUMMER       ;no item
+	. ;
+	. ;  D217		$$$INVORGDRPOnlyForNetChange()
+	. IF $PIECE($GET(^INVORG(YM,YM,1)),Y,217)=$$$YES SET ^INDRPNETCHANGE(YM,ART,1)=""  ;FIS;29.04.05;SR12200
+	. ;
+	. ;IF $PIECE(YFELD,Y,10)=0 SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,90)=1,$PIECE(SATZ,Y,90)=1  ;AUSLIEFERUNGSFÄHIG
+	. set WEOK = $$$OK
+	. set idGoodsFlags = $$$INWEAUFIncomingGoodsFlags(YFELD)
+	. IF idGoodsFlags'="" DO
+	. . SET WEOK = $$$NO
+	. . ;                               Receiving O.K.                               _BLANK = "Handover Can Take Place" 
+	. . IF ($PIECE($GET(^INWEMERKER(YM,idGoodsFlags,1)),Y,2)=$$$YES) || (+$PIECE($GET(^INWEMERKER(YM,idGoodsFlags,1)),Y,3)=0) DO
+	. . . SET WEOK = $$$OK  ;AUSLIEFERUNGSFÄHIG
+	. ;
+	. IF WEOK=$$$OK DO
+	. . SET $$$INAUFPReadyForDelivery(^INAUFP(YM,AUF,POS,1)) = $$$YES
+	. . SET $$$INAUFPReadyForDelivery(SATZ)                  = $$$YES
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;MENGE IST DIE MENGE, DIE EINGETRAGEN WIRD
+	. ; replace vvv 13-Jul-2007 ; SR15558
+	. ;SET MENGE     = ""
+	. ;SET MENGEREST = ""
+	. ;SET MENGEGES  = ""
+	. ;SET MENGEIST  = ""
+	. ;
+	. ;SET MENGE    = $$$INWEAUFIncomingGoodsQuantity(YFELD),MENGESOLL=MENGE,MENGEREST=MENGE,MENGEGES=MENGE
+	. ;SET LOESCH   = 0
+	. ;SET MENGEIST = $$$INAUFPIncomingGoodsQuantity(SATZ)  ;MENGE SCHON ÜBERTRAGEN ;quantity yet transport 
+	. ;if +MENGEIST=0 set (MENGESOLL,MENGE,MENGEREST,MENGEGES) = $$$INWEAUFIncomingGoodsQuantity(YFELD)
+	. ;
+	. ;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	. ;;IF +MENGEIST'=0 DO  ;19.04.04 WIEDER AKTIVIERT (WAR AUSKOMMENTIERT), DA SONST DOPPELTER WE MÖGLICH. WARUM AUSKOMMENTIERT WAR, IST UNBEKANNT.
+	. ;. SET MENGESOLL=$PIECE(YFELD,Y,4)-$PIECE(YFELD,Y,23)  ;MENGE ZU ÜBERTRAGEN-DER SCHON EINGETRAGENEN MENGE ;quantity within yet quantity 
+	. ;. IF (MENGESOLL+($PIECE(YFELD,Y,4)*10))'>0                         DO LOESCH QUIT   ;KEIN BESTANDEINGETRAGEN ;no 
+	. ;. IF (MENGEIST+MENGESOLL)>($PIECE(SATZ,Y,5)+($PIECE(SATZ,Y,4)*10)) DO LOESCH QUIT   ;SCHON GENUG ÜBERTRAGEN ;yet sufficiently transport 
+	. ;. SET MENGEGES=$PIECE(SATZ,Y,5)           ;MENGE GESAMT ;quantity total 
+	. ;. SET MENGE=MENGESOLL                     ;WAS WILL DER USER ÜBERTRAGEN ;whatsoever the transport 
+	. ;. SET MENGEREST=MENGEGES-MENGEIST         ;WAS KANN ER NOCH ÜBERTRAGEN ;whatsoever him yet transport 
+	. ;. IF MENGE>MENGEREST SET MENGE=MENGEREST  ;WAS DARF ER NOCH ÜBERTRAGEN ;whatsoever him yet transport 
+	. ;;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  DISABLED BLOCK END
+	. ;QUIT:LOESCH=1
+	. ;
+	. ;    with vvv
+	. ;
+	. set MENGE     = $$$INWEAUFIncomingGoodsQuantity(YFELD)  ; quantity received this delivery
+	. set MENGEIST  = $$$INAUFPIncomingGoodsQuantity(SATZ)    ; quantity previously received   ;MENGE SCHON ÜBERTRAGEN
+	. set MENGEREST = MENGE                      ; probably not required (MENGESOLL only used in commented lines) <GRF>
+	. set MENGEGES  = MENGE                      ; could probably just substitute with MENGE below?               <GRF>
+	. ;         ^^^ 13-Jul-2007
+	. ; IF 'blnREVERSE IF MENGE'>0 DO LOESCH QUIT   ;Remove entries with negative quantity unless a reversal  // SR13222 28-Aug-2008
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;
+	. ; *** REFERENCE POINT 1 *** <GRF>
+	. ; If the total quantity received meets the ordered quantity,
+	. ; set the order delivery [?] quantity to match this delivery quantity
+	. IF (MENGE+MENGEIST)'<$$$INAUFPQuantity(SATZ) SET $$$INWEAUFCompleteWEQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGEGES  ;MENGE GESAMT ;quantity total 
+	. ;IF MENGE'>0 DO  QUIT                                             ;KEINE MENGE MEHR OFFEN ZUM ÜBERTRAGEN
+	. ;. SET $PIECE(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1),Y,4)=MENGEGES  ;MENGE GESAMT
+	. ;
+	. SET $$$INWEAUFIncomingGoodsQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGE+$$$INWEAUFQuantityInStockSet(YFELD)  ;MENGE GESAMT ;quantity total
+	. ;  ^^^ This does nothing!!    (D4 = D4 + D23 where D23 starts off as null) <JW/GRF>  D23 is updated below
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; Update Total Cost for Stock Location
+	. ; as Qty * Unit Price
+	. ; (where Unit Price is FCPrice * Exchange Rate if appropriate)
+	. ;+++++++++++++++++++++++++++++++++++++
+	. new SuppliersFCCode ; SR13591
+	. new enumOrderUnit,fltOrderConv,fltQtyInventUnit,fltQtyOrderUnit   ; SR16875 vvv
+	. set enumOrderUnit    = $$$INWEAUFQuantityUnit(YFELD)
+	. set fltQtyOrderUnit  = $$$INWEAUFIncomingGoodsQuantity(YFELD)
+	. set fltOrderConv     = $$GetUOMConversion^INUOMConversion(ART,enumOrderUnit)  ; Conversion Order to Inventory
+	. set fltQtyInventUnit = fltQtyOrderUnit * fltOrderConv             ; SR16875 ^^^
+	. ;
+	. set SuppliersFCCode  = $$GetFCCode^INLIEF($$$INWEAUFSupplier(YFELD))
+	. if SuppliersFCCode '= "" do
+	. . set UnitCostWithoutSC = $$$INWEAUFPriceForeignCurrency(YFELD)*$$$INWEAUFExchangeRate(YFELD)
+	. . set $$$INWEAUFTotalCostOnLocation(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)) = $$Round^COMUtilNum($$$INWEAUFIncomingGoodsQuantity(YFELD)*UnitCostWithoutSC) ; SR13517
+	. . ; FIXME : ensure FC-based UnitCostWithoutSC here is for Order Units - probably Supplier Unit instead. <GRF>
+	. if SuppliersFCCode = "" do
+	. . set UnitCostWithoutSC = $$$INWEAUFUnitPrice(YFELD)
+	. . set $$$INWEAUFTotalCostOnLocation(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)) = fltQtyInventUnit*UnitCostWithoutSC  ; SR16875
+	. .;set $$$INWEAUFTotalCostOnLocation(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)) = $$$INWEAUFIncomingGoodsQuantity(YFELD)*UnitCostWithoutSC  ;GESAMTPREIS BEI EINLAGERUNG;FIS;23719;07.07.03
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; UPDATE UNIT COST WITH SERVICE COSTS
+	. ; FOR INWE AND FINANCE POSTING ;FIS;13-APR-05
+	. ; 
+	. ; Finance Transaction Reference is made
+	. ; up of COSTTYPE / UnitValue pairs
+	. ;  %3B CT %7C UV %3B CT %7C UV %3B ...
+	. ;+++++++++++++++++++++++++++++++++++++
+	. set UnitCostWithSC = UnitCostWithoutSC
+	. IF $$$INWEAUFFinanceTxRef(YFELD)'="" IF $FIND(YFELD,"%3B") DO
+	. . NEW YI
+	. . FOR YI=1:1  QUIT:$PIECE($$$INWEAUFFinanceTxRef(YFELD),"%3B",YI,YI+99)=""  DO              ; D115
+	. . . SET YI(2)=$PIECE($PIECE($$$INWEAUFFinanceTxRef(YFELD),"%3B",YI),"%7C",2)
+	. . . SET $$$INWEAUFUnitPrice(YFELD) = $$$INWEAUFUnitPrice(YFELD) + YI(2)         ;SERVICE COSTS => D8
+	. . . set UnitCostWithSC             = UnitCostWithSC             + YI(2)         ; 29-Jun-2006
+	. . ;SET $PIECE(YFELD,Y,8)=$JUSTIFY($PIECE(YFELD,Y,8),0,2)  ;SR12749
+	. ;
+	. SET $$$INAUFPIncomingGoodsQuantity(^INAUFP(YM,AUF,POS,1))=MENGE+MENGEIST   ;GESAMTMENGE IN POSITION ;within 
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ; Update order line if the Delivery should be sent directly to the Customer for a Supplier Order
+	. ; (Specified at order line or at order level)
+	. IF ($$$INAUFPCustomerIsDeliveryAddress(^INAUFP(YM,AUF,POS,1))=$$$YES) || ($$$INAUFCustomerAddressinOrder($GET(^INAUF(YM,AUF,1)))=$$$YES) DO  ;FIS;08.08.03;DIREKTLIEFERUNG VOM LIEFERANT ;supplier ; 13-Jul-2007
+	. . NEW YSATZ,YFORM,YVOR,YOK
+	. . SET YSATZ = $GET(^INAUFP(YM,AUF,POS,1))
+	. . SET $PIECE(YSATZ,Y,91) = $PIECE(YFELD,Y,1)                            ;WE NUMMER ;In numeral 
+	. . IF $PIECE(YSATZ,Y,91)="" SET $PIECE(YSATZ,Y,91) = $PIECE(YFELD,Y,14)  ;LIEFERSCHEIN NR. ;packing slip 
+	. . SET $PIECE(YSATZ,Y,92) = +$HOROLOG
+	. . SET $PIECE(YSATZ,Y,93) = $PIECE($HOROLOG,",",2)
+	. . SET $PIECE(YSATZ,Y,94) = YBED
+	. . SET YOK=$$^WWWSPEI("INAUFP",AUF_","_POS,YSATZ,1)
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;VOLLSTÄNDIG? - Completely?
+	. ;
+	. ; *** REFERENCE POINT 2 *** <GRF>
+	. ; This seems to be a copy of REFERENCE POINT 1 without considering over-receipt
+	. IF $$$INAUFPQuantity(SATZ)=(MENGE+MENGEIST) SET $$$INWEAUFCompleteWEQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGEGES  ;MENGE GESAMTUND VOLLSTÄNDIG ;quantity entire and complete
+	. SET $$$INWEAUFQuantityInStockSet(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGE+$$$INWEAUFQuantityInStockSet(YFELD)  ;MENGE ÜBERTRAGEN ;quantity transport 
+	. ;
+	. ;IF $PIECE(SATZ,Y,5)=(MENGE+MENGEIST) IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=2 IF WEOK=1 DO  ;WARENEINGANG OK = AUFTRAG ABGESCHLOSSEN KANN REORGANISIERT WERDEN
+	. ;. NEW YFORM,YVOR
+	. ;. SET $PIECE(SATZ,Y,60)=$$$YES  ;AUFTRAG OK
+	. ;. SET YFORM="INAUFP"
+	. ;. SET YOK=$$^WWWSPEI("INAUFP",AUF_","_POS,SATZ,1)
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;BUCHEN WARENEINGANG ;receiving 		
+	. ; 28-Aug-2008 vvvv
+	. ;DO
+	. ;. NEW TEXT
+	. ;. if 'blnREVERSE set TEXT="+"	// SR13222
+	. ;. if blnREVERSE  set TEXT=""
+	. ;. SET TEXT=TEXT_MENGE_" "_$$^WWWTEXT(32512)_" "_$$^WWWTEXT(32279)_" "_AUF_"-"_POS  ;AUF BESTAND AUS WE ;upon out of In 
+	. ;. IF ($PIECE(YFELD,Y,2)'="") || ($PIECE(YFELD,Y,19)'="") DO
+	. ;. . SET TEXT=TEXT_" ("_$PIECE(YFELD,Y,2)      ;CHARGENNUMMER
+	. ;. . SET TEXT=TEXT_"/"_$PIECE(YFELD,Y,19)_")"  ;LOTNUMMER
+	. ;. ;
+	. ;. ;DO ^INARTHIST(ART,TEXT,BETR,MENGE,,,$PIECE(YFELD,Y,7),($PIECE(YFELD,Y,4)*UnitCostWithoutSC),BETR_"|"_LP_"|"_WEDAT_"|"_MENGE,1,LP,AUF,POS,BETR,,"REC",,$piece(YFELD,Y,115),,$$$INWEAUFVORDeliveryNoteNumber(YFELD))  ;SHOBBY SR12333 ;SR12745
+	. ;. ; SR13800: Defer ^INARTHIST
+	. ;.;set lstHist = $listbuild(ART,TEXT,BETR,MENGE,,,$PIECE(YFELD,Y,7),($PIECE(YFELD,Y,4)*UnitCostWithoutSC),BETR_"|"_LP_"|"_WEDAT_"|"_MENGE,1,LP,AUF,POS,BETR,,"REC",,$piece(YFELD,Y,115),,$$$INWEAUFVORDeliveryNoteNumber(YFELD),strSource)	//SR14615
+	. ;. set lstHist = $listbuild(ART,TEXT,BETR,MENGE,,,$PIECE(YFELD,Y,7),($PIECE(YFELD,Y,4)*UnitCostWithoutSC)_"|"_($PIECE(YFELD,Y,4)*UnitCostWithSC),BETR_"|"_LP_"|"_WEDAT_"|"_MENGE,1,LP,AUF,POS,BETR,,"REC",,$piece(YFELD,Y,115),,$$$INWEAUFVORDeliveryNoteNumber(YFELD),strSource,"INWEAUF",YKEY)	//SR14615 ;BR014754
+	. ;. ;						  1		2	3	4	56			7				8																		9							 10 11	12	13	14 15  16 17		18		   19				20							21
+	. ; 28-Aug-2008 ^^^^
+	. ;-----------------------------------------------------------------------------
+	. ;RECHNEN DURCHSCHNITTLICHER EK ;Calculate Average Cost 
+	. $$$LogRx(AUF_","_POS_","_BETR_","_LP_","_WEDAT)
+	. //SR16888
+	. SET EKNEU = $$^INARTAVG(ART,MENGE,$PIECE(YFELD,Y,8),AUF_","_POS_","_BETR_","_LP_","_WEDAT,$$$NO,$$$YES,BETR)  ; SR14203 - move NEW up higher so value is retained
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. DO  ;WE BUCH  FÜR alle Positionen des Auftrags einlagern  ZEIT VERSCHIEBEN ,  FAN 15.03.02
+	. . NEW YFORM,YVOR,YOK,ZEIT,ZEIT1,YQ,SATZ0,ART0,idSupplier
+	. . SET ZEIT=$PIECE($HOROLOG,",",2)
+	. . SET YQ=0
+	. . FOR ZEIT1=ZEIT:1 QUIT:YQ=1  DO
+	. . . set idSupplier = $piece(YFELD,Y,7)                                ; SR15575  idSupplier may not be numeric
+	. . . ;QUIT:$DATA(^INWEBUCH(YM,+$HOROLOG,ZEIT1,+$PIECE(YFELD,Y,7)))     ; SR15575
+	. . . QUIT:$DATA(^INWEBUCH(YM,+$HOROLOG,ZEIT1,idSupplier))
+	. . . SET ART0  = $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4)
+	. . . ;
+	. . . ;    FIXME : <GRF> $PIECE(YFELD,Y,10) is ^INWEMERKER not ^INPARA(YM,"WE-MERKER")
+	. . . ;
+	. . . ;SET SATZ0 = $PIECE($GET(^INLIEF(YM,+$PIECE(YFELD,Y,7),1)),Y,48)_Y_$PIECE(YFELD,Y,14)_Y_WEDAT_Y_AUF_Y_POS_Y_ART0_Y_MENGE_Y_$PIECE(YFELD,Y,10)_Y_$PIECE(YFELD,Y,2)_Y_$PIECE(YFELD,Y,1)_Y_BETR ; SR15575
+	. . . SET SATZ0 = $PIECE($GET(^INLIEF(YM,idSupplier,1)),Y,48)_Y_$PIECE(YFELD,Y,14)_Y_WEDAT_Y_AUF_Y_POS_Y_ART0_Y_MENGE_Y_$PIECE(YFELD,Y,10)_Y_$PIECE(YFELD,Y,2)_Y_$PIECE(YFELD,Y,1)_Y_BETR
+	. . .;IF ART0'="" SET SATZ0=SATZ0_Y_$PIECE($GET(^INART(YM,ART0,1)),Y,30)
+	. . . if ART0'="" set $piece(SATZ0,Y,12) = $$$INARTItemGroup($GET(^INART(YM,ART0,1)))       ; D30
+	. . . ;SET YOK=$$^WWWSPEI("INWEBUCH",+$HOROLOG_","_ZEIT1_","_+$PIECE(YFELD,Y,7),SATZ0,1) ; SR15575
+	. . . SET YOK=$$^WWWSPEI("INWEBUCH",+$HOROLOG_","_ZEIT1_","_idSupplier,SATZ0,1)
+	. . . SET YQ=1
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;ENTSTEHUNGSPRODUKTE BEI WARENEINGANG NACH VEREDELUNG
+	. ;DEVELOPING PRODUCTS WITH INCOMING GOODS AFTER REFINEMENT
+	. ;28-Aug-2008 vvvv
+	. ;IF $DATA(^INARTNEBEN(YM,ART)) DO
+	. ;. NEW NEBEN,NEBENMENGE,PRODUKTMENGE,NEBENWE,WEMENGE,HAL,YII
+	. ;. SET NEBEN=""
+	. ;. FOR  SET NEBEN=$ORDER(^INARTNEBEN(YM,ART,NEBEN)) QUIT:NEBEN=""  DO
+	. ;. . QUIT:+$PIECE($GET(^INARTNEBEN(YM,ART,NEBEN,1)),Y,3)'=1  ;NUR WENN DURCH WARENEINGANG ;only when trans- receiving 
+	. ;. . SET NEBENMENGE  =+$PIECE($GET(^INARTNEBEN(YM,ART,NEBEN,1)),Y,1)       ; Created Quantity
+	. ;. . SET PRODUKTMENGE=+$PIECE($GET(^INARTNEBEN(YM,ART,NEBEN,1)),Y,2)       ; Per Production Output
+	. ;. . QUIT:NEBENMENGE=0
+	. ;. . IF PRODUKTMENGE=0 SET PRODUKTMENGE=1
+	. ;. . SET WEMENGE=((MENGE/PRODUKTMENGE)*NEBENMENGE)
+	. ;. . SET HAL=""
+	. ;. . IF $DATA(^INARTLP(YM,NEBEN)) SET HAL=$ORDER(^INARTLP(YM,NEBEN,BETR,""))  ;FESTER LAGERPLATZ;FIS;24562;07.11.03
+	. ;. . IF HAL="" SET HAL=$GET(LP)
+	. ;. . IF HAL="" SET HAL=$PIECE($GET(^INVORGB(YM,YM,BETR,1)),Y,1)
+	. ;. . IF HAL="" SET HAL=$ORDER(^INLP(YM,BETR,""))
+	. ;. . IF HAL="" SET HAL=0
+	. ;. . SET NEBENWE=$GET(^INWE(YM,NEBEN,BETR,HAL,+$HOROLOG,1))
+	. ;. . DO  ;NEUANLAGE WE ;In 
+	. ;. . . IF NEBENWE="" FOR YII=1,7,11,12,13  SET $PIECE(NEBENWE,Y,YII)=$PIECE(YFELD,Y,YII)  ;DATEN ÜBERNEHMEN ;assume 
+	. ;. . . SET $PIECE(NEBENWE,Y,9)=$$^WWWTEXT(32560)_" "_$$^WWWTEXT(32515)_" "_ART  ;NEBENPRODUKT AUS ;by-product out of 
+	. ;. . . SET $PIECE(NEBENWE,Y,28)=$GET(AUF)  ;URSPRUNGSAUFTRAG
+	. ;. . . SET $PIECE(NEBENWE,Y,29)=$GET(POS)  ;URSPRUNGSPOSITION
+	. ;. . ;
+	. ;. . IF +$PIECE(NEBENWE,Y,8)=0 SET $PIECE(NEBENWE,Y,8)=$$^INARTKOST(NEBEN)  ;HERSTELLKOSTEN;FIS;24562;07.11.03
+	. ;. . SET $PIECE(NEBENWE,Y,4)=$PIECE(NEBENWE,Y,4)+WEMENGE
+	. ;. . ;IF $PIECE(NEBENWE,Y,4)<0 SET $PIECE(NEBENWE,Y,4)=0  ;MINUSBESTÄNDE WERDEN DURCH INTAGES KORRIGIERT
+	. ;. . SET ^INWE(YM,NEBEN,BETR,HAL,+$HOROLOG,1)=NEBENWE
+	. ;. . ; do $$$Save("INWE",NEBEN,BETR,HAL,+$HOROLOG,NEBENWE,$$$YES) // SR14546
+	. ;. . SET WEMENGE=$$^WWWZAHL(WEMENGE,0,$LENGTH($PIECE(WEMENGE,".",2)))  ;ANZEIGEFORMAT
+	. ;. . IF WEMENGE>0 SET WEMENGE="+"_WEMENGE
+	. ;. . ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. ;. . set INFOTEXT = WEMENGE_" "_$$^WWWTEXT(32560)_" "_$$^WWWTEXT(32515)_" "_$$^WWWTEXT(32278)_"("_AUF_"-"_POS_") "_$$^WWWDATE(+$HOROLOG)
+	. ;. . ;+ QUANTITY OF BY-PRODUCTS FROM PRODUCTION ORDER	;SR14615
+	. ;. . DO ^INARTHIST(NEBEN,INFOTEXT,BETR,WEMENGE,,,,$PIECE(NEBENWE,Y,8),,,HAL,AUF,POS,BETR,,"REC",,,,,strSource)
+	. ;28-Aug-2008 ^^^^
+	. ;			 Customer Order
+	. ;-----------------------------------------------------------------------------
+	. ;28-Aug-2008 vvvv
+	. ;IF +$$$INAUFOrderType($GET(^INAUF(YM,AUF,1)))=0 DO  QUIT:MENGE'>0  ;BEI KUNDENAUFTRAG SOLL WE BLEIBEN, KEIN FREIER BESTAND (AUSSER WENN MEHRMENGE)
+	. ;. ;WENN MENGE > BESTELLMENGE FÜR DEN KUNDEN DANN MENGE = BESTELLMENGE UND REST AUF LAGER ;when quantity ordering quantity to quantity ordering quantity And residue upon stock location 
+	. ;. IF MENGE>$$$INAUFPQuantity(SATZ) SET $$$INWEAUFIncomingGoodsQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=$$$INAUFPQuantity(SATZ)  ;4.2.2003; TYBD
+	. ;. ;SET $PIECE(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1),Y,4)=$PIECE(SATZ,Y,5)  ;4.2.2003; TYBD;ALT
+	. ;. SET MENGE=MENGE-$$$INAUFPQuantity(SATZ)
+	. ;. IF MENGE>0 SET $$$INWEAUFAdditionalQuantity(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=MENGE
+	. ;. ;HISTORY; MENGE: X VON bestand für AUFTRAG XXX (WE XXX)
+	. ;. 
+	. ;. // SR14903 - This is the line.
+	. ;. SET TEXT="-"_$$$INAUFPQuantity(SATZ)_" "_$$^WWWTEXT(32511)_" "_$$^WWWTEXT(32047)_" "_AUF_"-"_POS  ;FIS;24328;02.10.03;HISTORY
+	. ;. ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. ;. NEW KOST
+	. ;. SET KOST=$PIECE(YFELD,Y,8)
+	. ;. IF $PIECE($GET(^INVORG(YM,YM,1)),Y,15)=9 SET KOST=$$^INARTKOST(ART,,9)  ;FIS;16.08.05;SR13253;USE ALWAYS AVERAGE COST
+	. ;. DO ^INARTHIST(ART,TEXT,BETR,,$$$INAUFPQuantity(SATZ),,$PIECE(YFELD,Y,7),($$$INWEAUFIncomingGoodsQuantity(YFELD)*KOST),BETR_"|"_LP_"|"_WEDAT_"|"_$$$INWEAUFIncomingGoodsQuantity(YFELD),1,LP,AUF,POS,BETR,,"ISS",,,,,strSource)	//SR14615
+	. ;. ;             ARTIKEL,UMLAGERUNGSTEXT,+MENGE,,,LIEFERANT,GESAMTPREIS,WE-DETAILS,INVENTURSPERRE,,AUFTRAG,POSITION
+	. ;28-Aug-2008 ^^^^
+	. ;-----------------------------------------------------------------------------
+	. ;
+	. ; QUIT:$GET(NOBESTAND)=1  ;VARAIBLE WIRD IN INARTMINUS GESETZT, ; 28-Aug-2008 NOBESTAND SET BYREF in INARTMINUS
+	. ; QUIT:(MENGE<0)&&'blnREVERSE				// SR13222 ;28-Aug-2008
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ; FREIGEBEN RESERVIERUNGEN
+	. ; RELEASE RESERVATIONS
+	. IF $DATA(^INRESERVIERT(YM,AUF,POS)) DO
+	. . NEW XAUF,XPOS,XPOS1,XMENGE
+	. . SET XAUF=""
+	. . FOR  SET XAUF=$ORDER(^INRESERVIERT(YM,AUF,POS,XAUF)) QUIT:XAUF=""  DO  QUIT:+MENGE=0
+	. . . SET XPOS=""
+	. . . FOR  SET XPOS=$ORDER(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS)) QUIT:XPOS=""  DO  QUIT:+MENGE=0
+	. . . . SET XPOS1=$GET(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS,1))
+	. . . . QUIT:($PIECE(XPOS1,Y,1)-$PIECE(XPOS1,Y,2))=0  ;KEINE MENGE MEHR ;no quantity more 
+	. . . . ;
+	. . . . IF XAUF=" " DO  QUIT  ;RESERVIERUNG OHNE KUNDENAUFTRAG;FIS;07.01.04;24891
+	. . . . . NEW RENUM,WER1,YOK,YVOR,YFORM,TEXT,WE1
+	. . . . . SET XMENGE=$PIECE(XPOS1,Y,1)-$PIECE(XPOS1,Y,2)  ;RESTMENGE DIE BENÖTIGT WIRD ;who 
+	. . . . . IF MENGE<XMENGE SET XMENGE=MENGE  ;MAX. EINLAGERUNGSMENGE;FIS:05.12.03;24633
+	. . . . . SET RENUM=$PIECE(XPOS,Y,4)        ;RES.NUMMER
+	. . . . . IF RENUM="" SET RENUM=XPOS
+	. . . . . IF RENUM="" SET RENUM=$$^WWWNEXT("INRESERVIERT")
+	. . . . . SET WER1=$GET(^INWER(YM,ART,BETR,LP,WEDAT,RENUM,1))
+	. . . . . IF $PIECE(WER1,Y,8)'="" SET WER1="" DO ^WWWSKILL("INWER",ART_","_BETR_","_LP_","_WEDAT_","_RENUM)  ;ALTEN SATZ LÖSCHEN ;typesetting Delete 
+	. . . . . SET $PIECE(WER1,Y,4)=$PIECE($GET(WER1),Y,4)+XMENGE  ;MENGE ;quantity 
+	. . . . . SET $PIECE(WER1,Y,5)=(+$HOROLOG+7)                  ;GÜLTIG BIS ;valuable until 
+	. . . . . SET $PIECE(WER1,Y,6)=RENUM                          ;GÜLTIG BIS ;valuable until 
+	. . . . . SET YOK  = $$^WWWSPEI("INWER",ART_","_BETR_","_LP_","_WEDAT_","_RENUM,WER1,1)    ;SPEICHERN ;Save 
+	. . . . . SET TEXT = $$^WWWTEXT(32480)_" "_$$^WWWTEXT(32807)_" "_$$^WWWTEXT(32347)_": "   ;RESERVIERT FÜR ;reserved to 
+	. . . . . ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. . . . . DO ^INARTHIST(ART,TEXT_" / "_BETR_" / "_LP_" / "_$$^WWWDATE(WEDAT)_" / "_RENUM,BETR,,XMENGE,,,,,,LP,,,BETR,,,,,,,strSource)  ;Reserved Quantity 	//SR14615
+	. . . . . SET $PIECE(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS,1),Y,2)=XMENGE+$PIECE(XPOS1,Y,2)
+	. . . . . SET MENGE=MENGE-XMENGE
+	. . . . . IF MENGE<0 SET MENGE=0
+	. . . . . IF +MENGE=0 IF '$DATA(^INWE(YM,ART,BETR,LP,WEDAT)) DO  ;ANLEGEN WE MIT MENGE 0 ;put onto In by means of quantity 
+	. . . . . . SET WE1=YFELD
+	. . . . . . SET $PIECE(WE1,Y,4)=0
+	. . . . . . SET $PIECE(WE1,Y,28)=AUF  ;URSPRUNGSAUFTRAG
+	. . . . . . SET $PIECE(WE1,Y,29)=POS  ;POSITION
+	. . . . . . 
+	. . . . . . SET ^INWE(YM,ART,BETR,LP,WEDAT,1)=WE1  ;NEUER LAGERPLATZ ;stock location 
+	. . . . . . DO ^WWWSSORT("INWE",ART_","_BETR_","_LP_","_WEDAT)  ;AUFBEREITEN SORTKEY
+	. . . . . . ; do $$$Save("INWE",ART_","_BETR_","_LP_","_WEDAT,WE1,$$$YES) // SR14546
+	. . . . ;
+	. . . . QUIT:$PIECE($GET(^INAUFP(YM,XAUF,XPOS,1)),Y,7)'=5  ;NICHT MEHR LAGERBESTELLUNG ; TYBD;17,09,2003
+	. . . . QUIT:$PIECE($GET(^INAUFP(YM,XAUF,XPOS,1)),Y,9)=1   ;STORNO; TYBD;17,09,2003
+	. . . . QUIT:'$DATA(^INAUFP(YM,XAUF,XPOS,1))               ;POSITION NICHT MEHR VORHANDEN;TYBD;17,09,2003
+	. . . . ;
+	. . . . ;-------------------------------
+	. . . . ;
+	. . . . SET XMENGE=$PIECE(XPOS1,Y,1)-$PIECE(XPOS1,Y,2)     ;RESTMENGE DIE BENÖTIGT WIRD ;who 
+	. . . . IF MENGE<XMENGE SET XMENGE=MENGE                   ;MAX. EINLAGERUNGSMENGE;FIS:05.12.03;24633
+	. . . . NEW YFELD1
+	. . . . SET YFELD1=YFELD
+	. . . . SET $PIECE(YFELD1,Y,4)=XMENGE
+	. . . . NEW YFORM,YVOR,YOK
+	. . . . SET YOK=$$^WWWSPEI("INWEAUF",XAUF_","_XPOS_","_BETR_","_LP_","_WEDAT,YFELD1,1)  ;;FIS;03.02.04;25041
+	. . . . ;SET ^INWEAUF(YM,XAUF,XPOS,BETR,LP,WEDAT,1)=YFELD1
+	. . . . NEW TEXT
+	. . . . ;HISTORY; MENGE: X VON bestand für AUFTRAG XXX (WE XXX)
+	. . . . SET TEXT="-"_$PIECE(YFELD1,Y,4)_" "_$$^WWWTEXT(32511)_" "_$$^WWWTEXT(32047)_" "_XAUF_"-"_XPOS_" ("_$$^WWWTEXT(32279)_" "_AUF_"-"_POS_")"  ;FIS;24210;27.08.03;HISTORY
+	. . . . ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. . . . DO ^INARTHIST(ART,TEXT,BETR,,$PIECE(YFELD1,Y,4),,$PIECE(YFELD1,Y,7),($PIECE(YFELD1,Y,4)*$PIECE(YFELD1,Y,8)),BETR_"|"_LP_"|"_WEDAT_"|"_$PIECE(YFELD1,Y,4),1,LP,XAUF,XPOS,BETR,,"ISS",,,,,strSource)	//SR14615
+	. . . . ;             ARTIKEL,UMLAGERUNGSTEXT,+MENGE,,,LIEFERANT,GESAMTPREIS,WE-DETAILS,INVENTURSPERRE,,AUFTRAG,POSITION
+	. . . . ;
+	. . . . DO
+	. . . . . IF (MENGE>XMENGE) || (MENGE=XMENGE) DO  QUIT  ;MENGE REICHT AUS ;quantity out of 
+	. . . . . . SET MENGE=MENGE-XMENGE
+	. . . . . . IF MENGE<0 SET MENGE=0
+	. . . . . . SET $PIECE(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS,1),Y,2)=XMENGE+$PIECE(XPOS1,Y,2)
+	. . . . . . IF (XMENGE+$PIECE(XPOS1,Y,2))=$PIECE(XPOS1,Y,1) DO
+	. . . . . . . SET $PIECE(^INAUFP(YM,XAUF,XPOS,1),Y,90)=1  ;AUSLIEFERUNGSFÄHIG
+	. . . . . ;
+	. . . . . IF MENGE<XMENGE DO  QUIT  ;MENGE REICHT NICHT AUS ;quantity Not out of 
+	. . . . . . SET XMENGE=MENGE
+	. . . . . . SET MENGE=0
+	. . . . . . SET $PIECE(^INRESERVIERT(YM,AUF,POS,XAUF,XPOS,1),Y,2)=XMENGE+$PIECE(XPOS1,Y,2)
+	. . . . ;
+	. . . . ;  D154		$$$INVORGReadjustTrafficDateOnRece()
+	. . . . IF $PIECE($GET(^INVORG(YM,YM,1)),Y,154)=1 DO  ;FIS;2.9.03;24218;VERSANDTERMIN AKTUALISIEREN
+	. . . . . NEW YVOR,YOK,YFORM,YFELD
+	. . . . . SET YFELD=$GET(^INAUFP(YM,XAUF,XPOS,1))
+	. . . . . IF +$PIECE(YFELD,Y,76)=0         QUIT   ;KEIN DATUM ;no Date 
+	. . . . . IF $PIECE(YFELD,Y,76)'<$HOROLOG  QUIT   ;NICHT ÜBERSCHRITTEN ;Not 
+	. . . . . SET $PIECE(YFELD,Y,76)=+$HOROLOG
+	. . . . . SET YOK=$$^WWWSPEI("INAUFP",XAUF_","_XPOS,YFELD,1)
+	. . . . . SET ^INTOUR(YM,+$HOROLOG,1)=""
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. QUIT:+MENGE=0
+	. ;
+	. ;QUIT:(MENGE<0)&&'blnREVERSE		// SR13222.;28-Aug-2008
+	. ;
+	. ; FIXME - JW: If the appropriate INWE is defined, then just the qty is updated.
+	. ; 			This is fine if the order and line are the same (2nd receipt),
+	. ;				but if they are different, it is no good. Costs can't be updated etc.
+	. ;
+	. ;28-Aug-2008 vvvv No need to set YFELD, not saving to INWE
+	. ;SET $$$INWEAUFIncomingGoodsQuantity(YFELD)=MENGE  ;RESTMENGE AUS LAGERBESTELLUNGS RESERVIERUNG ;out of 
+	. ;SET $$$INWEAUFSourceOrder(YFELD)=AUF  ;SPEICHERN WARENHERKUNFT/URSPRUNG ;Save 
+	. ;SET $$$INWEAUFSourceLineItem(YFELD)=POS
+	. ;
+	. ;QUIT:LP=$$$INVORGDeleteStockLocation($GET(^INVORG(YM,YM,1)))
+	. ;QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,29)=1	;KEINE BESTANDSFÜHRUNG  TYBD 16.05.2002 ;no 
+	. ;QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,26)=2	;LEISTUNG  TYBD 16.05.2002 ;service item 
+	. ;28-Aug-2008 ^^^^
+	. ;28-Aug-2008 vvvv
+	. IF $DATA(^INWE(YM,ART,BETR,LP,WEDAT,1)) DO  QUIT   ;LAGERPLATZ VORHANDEN ;WEM;22698;22.10.2003;ERSETZEN HARDCODED LÖSCHLAGERPLATZ
+	. . SET MENGEALT=$$$INWEQuantity(^INWE(YM,ART,BETR,LP,WEDAT,1))
+	. ;. SET $$$INWEQuantity(^INWE(YM,ART,BETR,LP,WEDAT,1))=MENGEALT+MENGE  ;NEUE MENGE ;quantity 
+	. ;28-Aug-2008 ^^^^
+	. if blnREVERSE if $DATA(^INWE(YM,ART,BETR,LP,(WEDAT-1),1)) DO  QUIT 	// SR13222: Reversal	
+	. . SET MENGEALT=$$$INWEQuantity(^INWE(YM,ART,BETR,LP,(WEDAT-1),1))
+	. ;. SET $$$INWEQuantity(^INWE(YM,ART,BETR,LP,(WEDAT-1),1))=MENGEALT+MENGE  ;NEUE MENGE ;quantity 
+	. ;28-Aug-2008 vvvv
+	. ;set blnDone = $$$NO		// SR14421: Reversal - get prev date from cache temp
+	. ;if blnREVERSE do
+	. ;. set dteOrigRec = $get(^CacheTempRECReverse(YUSER,AUF,POS,BETR,LP,WEDAT))
+	. ;. if dteOrigRec'="" if $data(^INWE(YM,ART,BETR,LP,dteOrigRec,1)) do
+	. ;. . SET MENGEALT=$$$INWEQuantity(^INWE(YM,ART,BETR,LP,dteOrigRec,1))
+	. ;. . SET $$$INWEQuantity(^INWE(YM,ART,BETR,LP,dteOrigRec,1))=MENGEALT+MENGE
+	. ;. . set blnDone = $$$YES
+	. ;quit:blnDone
+	. ;DO   ;WEM;22698;22.10.2003;ERSETZEN HARDCODED LÖSCHLAGERPLATZ
+	. ;. SET ^INWE(YM,ART,BETR,LP,WEDAT,1)=YFELD             ;NEUER LAGERPLATZ ;stock location 
+	. ;. DO ^WWWSSORT("INWE",ART_","_BETR_","_LP_","_WEDAT)  ;AUFBEREITEN SORTKEY
+	. ;. ; do $$$Save("INWE",ART_","_BETR_","_LP_","_WEDAT,YFELD) // SR14546
+	. ;28-Aug-2008 ^^^^
+	
+	
+	
+	;28-Aug-2008 vvvv
+	;if $get(lstHist)'="" {		//SR13800 - Fix
+	;	do Deferred^INARTHIST(lstHist)
+	;	set strStatus = $$AutoUpdate^INStockValAdjust("INWEAUF",AUF_","_POS,ART,EKNEU)       ; SR14203
+	;}
+	;28-Aug-2008 ^^^^
+ 
+	;-------------------------------------------------------------------------------
+	
+	; Store all order lines when "All Line Items Received" set
+	;ALLE POSITIONEN DES AUFTRAGES EINLAGERN
+	IF $$$INWEAUFAllLineItemsReceived($GET(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)))=1 DO 
+	. SET $$$INWEAUFAllLineItemsReceived(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=0  ;WIEDER AUSSCHALTEN  ;re- eliminate 
+	. SET $$$INWEAUFVersionRev(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=POS          ;SPEICHERN ERFASSTE POSITION BEI GESAMT-WE ;Save next to 
+	. IF +$$$INWEAUFCreateCustomsMessage(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1))=1 DO ^INWEGESAMT(0,AUF,POS,1) QUIT   ;BUCHEN WE ALLER POSITIONEN  ;WEM;24071;03.11.2003;UND ALS ZU VERZOLLEND DEKLARIEREN
+	. DO ^INWEGESAMT(0,AUF,POS,0)                                                 ;BUCHWEN WE ALLER POSITIONEN ;In everyone 
+	
+	;-------------------------------------------------------------------------------
+	SET ART=$$$INAUFPItemNumber($GET(^INAUFP(YM,AUF,POS,1)))        ; 06-Sep-2005 remove unnecessary DO level
+	IF ART'="" DO ^INBESTANDCHECK(ART)  ;BESTANDSCHECK
+	
+	QUIT
+	
+ReceiveV2(YKEY,YFELD)  ; NOW REVERTED - SOME FLAWS REMAIN
+	;-------------------------------------------------------------------------------
+	; Process INWEAUF
+	;
+	; Params:	YKEY, YFELD - of INWEAUF record
+	;
+	; ByRefs:		blnREVERSE
+	; 				LOESCH
+	; 
+	; Called By :	SaveReceive^INRECPost                 *** call now reverted ***
+	; 
+	; Returns:
+	;
+	; History:
+	; 14-Sep-2009	PPP		SR16888:Added Location to the INARTAVG parameter
+	; 20-Oct-2008	GRF		SR15691: overlooked error messages
+	; 27-Aug-2008	GRF		SR15691: Change from 15-Aug reverted in INRECPOST so
+	; 							this subroutine is not operational
+	; 26-Aug-2008	GRF		SR15691: Correct variable prefixes and naming; strStatus
+	; 							required on initial quits; single translate to
+	; 							produce reusable strKey
+	; 15-Aug-2008 	Luke	SR15691: Branch and refactored from V1 code. 
+	; 07-Aug-2008	HQN 	SR15815: Removing all reversal code, remove INWE missed 
+	; 							updates; ^INRESERVIERT only applicable to
+	; 							CustomerOrders, remove
+	;-------------------------------------------------------------------------------
+	new fltThisQty,fltPrevQty,idItem,idLocn,idOrder,idOrderLine,idStore,idDateRecvd,objINVORG,objOrderLine
+	new strKey,strSource,strStatus,UnitCostWithoutSC,UnitCostWithSC
+	new idGoodsFlags,WEOK
+	
+	$$$LogR("ReceiveV2",$get(YKEY))
+	
+ 	set strStatus = $$$MakeStatus("IN00754")     ; "Missing Key Value"
+	
+ 	set strKey = $translate(YKEY,$$$DBLQUOTE)    ; SR15691 26-Aug-2008
+	
+	; Test Key
+	;=======================================
+	
+	set idOrder     = $$$KEY1(strKey)   if idOrder=""     quit strStatus
+	set idOrderLine = $$$KEY2(strKey)   if idOrderLine="" quit strStatus
+	set idLocn      = $$$KEY3(strKey)   if idLocn=""      quit strStatus
+	set idStore     = $$$KEY4(strKey)   if idStore=""     quit strStatus
+	set idDateRecvd = $$$KEY5(strKey)   if idDateRecvd="" quit strStatus
+	
+ 	if $$$INWEAUFQuantityInStockSet($get(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1)))'="" { 
+ 		set strStatus = $$$MakeStatus("IN00764",idOrder,idOrderLine)      ; "The Order Quantity has already been set. (%1, %2)"
+ 		quit strStatus
+ 	}
+	
+	; Test Item in order line
+	;=======================================
+	
+	set objOrderLine = $GET(^INAUFP(YM,idOrder,idOrderLine,1))
+	set idItem  = $$$INAUFPItemNumber(objOrderLine)
+	if idItem="" {
+		do Delete(YFELD,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,.LOESCH)
+		set strStatus = $$$MakeStatus("IN00765",idOrder,idOrderLine)      ; "Item missing from order line. (%1, %2)"
+ 		quit strStatus    ; FIXME : This was a DO LOOP exit - do we want an EARLY EXIT?
+	}
+	
+ 	;***************************************
+ 	
+	set strSource=""
+ 	set strStatus = $$$OK
+ 	
+	; Flag for followup
+	set objINVORG = $GET(^INVORG(YM,YM,1))
+	if $$$INVORGDRPOnlyForNetChange(objINVORG)=$$$YES set ^INDRPNETCHANGE(YM,idItem,1)="" 
+	
+	; Product Received Status Check
+	set WEOK = $$$OK
+	set idGoodsFlags = $$$INWEAUFIncomingGoodsFlags(YFELD)
+	if idGoodsFlags'="" {
+		SET WEOK = $$$NO
+		;                               Receiving O.K.                               _BLANK = "Handover Can Take Place"
+		if ($PIECE($GET(^INWEMERKER(YM,idGoodsFlags,1)),Y,2)=$$$YES) || (+$PIECE($GET(^INWEMERKER(YM,idGoodsFlags,1)),Y,3)=0) {
+			set WEOK = $$$OK  
+		}
+	}
+	
+	if WEOK=$$$OK {
+		set $$$INAUFPReadyForDelivery(objOrderLine) = $$$YES
+	 	set ^INAUFP(YM,idOrder,idOrderLine,1)]]><![CDATA[ = objOrderLine
+	}
+	
+	set fltThisQty = $$$INWEAUFIncomingGoodsQuantity(YFELD)  ; quantity received this delivery
+	set fltPrevQty = $$$INAUFPIncomingGoodsQuantity(objOrderLine)    ; quantity previously received   ;MENGE SCHON ÜBERTRAGEN
+	
+	if fltThisQty'>0 {
+		do Delete(YFELD,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,.LOESCH)
+		set strStatus = $$$MakeStatus("DEV00000","Received Quantity is not positive - removed from processing")  ; "Code In Development - Error %1"
+ 		quit strStatus    ; FIXME : This is a DO LOOP exit  
+	}
+	
+	if (fltThisQty+fltPrevQty)'<$$$INAUFPQuantity(objOrderLine) {
+		set $$$INWEAUFCompleteWEQuantity(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))=fltThisQty  ;MENGE GESAMT ;quantity total 
+		set $$$INWEAUFIncomingGoodsQuantity(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))=fltThisQty+$$$INWEAUFQuantityInStockSet(YFELD)  ;MENGE GESAMT ;quantity total
+		new SuppliersFCCode ; SR13591               ; <<< NEW INSIDE BRACES  FIXME
+		set SuppliersFCCode = $$GetFCCode^INLIEF($$$INWEAUFSupplier(YFELD))
+		if SuppliersFCCode '= "" {
+			set UnitCostWithoutSC = $$$INWEAUFPriceForeignCurrency(YFELD)*$$$INWEAUFExchangeRate(YFELD)
+			set $$$INWEAUFTotalCostOnLocation(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))=$$Round^COMUtilNum($$$INWEAUFIncomingGoodsQuantity(YFELD)*UnitCostWithoutSC) ; SR13517
+		} else {
+			set UnitCostWithoutSC = $$$INWEAUFUnitPrice(YFELD)
+			set $$$INWEAUFTotalCostOnLocation(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))=$$$INWEAUFIncomingGoodsQuantity(YFELD)*UnitCostWithoutSC  ;GESAMTPREIS BEI EINLAGERUNG;FIS;23719;07.07.03
+		}
+		set UnitCostWithSC = UnitCostWithoutSC
+		
+		if $$$INWEAUFFinanceTxRef(YFELD)'="" {
+			if $FIND(YFELD,"%3B") {
+				NEW YI                             ; <<< NEW INSIDE BRACES  FIXME
+				FOR YI=1:1 { 
+					QUIT:$PIECE($$$INWEAUFFinanceTxRef(YFELD),"%3B",YI,YI+99)=""               ; D115
+					SET YI(2)=$PIECE($PIECE($$$INWEAUFFinanceTxRef(YFELD),"%3B",YI),"%7C",2)
+					SET $$$INWEAUFUnitPrice(YFELD) = $$$INWEAUFUnitPrice(YFELD) + YI(2)         ;SERVICE COSTS => D8
+					set UnitCostWithSC  = UnitCostWithSC + YI(2)         ; 29-Jun-2006
+				}
+			}
+		}
+		
+		SET $$$INAUFPIncomingGoodsQuantity(^INAUFP(YM,idOrder,idOrderLine,1))=fltThisQty+fltPrevQty   ;GESAMTMENGE IN POSITION ;within 
+		IF ($$$INAUFPCustomerIsDeliveryAddress(^INAUFP(YM,idOrder,idOrderLine,1))=$$$YES) || ($$$INAUFCustomerAddressinOrder($GET(^INAUF(YM,idOrder,1)))=$$$YES) {
+			NEW objTempOrderLine,YFORM,YVOR,YOK         ; <<< NEW INSIDE BRACES  FIXME
+			SET objTempOrderLine = $GET(^INAUFP(YM,idOrder,idOrderLine,1))
+			SET $PIECE(objTempOrderLine,Y,91) = $PIECE(YFELD,Y,1)                            ;WE NUMMER ;In numeral 
+			IF $PIECE(objTempOrderLine,Y,91)="" {
+				SET $PIECE(objTempOrderLine,Y,91) = $PIECE(YFELD,Y,14)  ;LIEFERSCHEIN NR. ;packing slip 
+			}
+			SET $PIECE(objTempOrderLine,Y,92) = +$HOROLOG
+			SET $PIECE(objTempOrderLine,Y,93) = $PIECE($HOROLOG,",",2)
+			SET $PIECE(objTempOrderLine,Y,94) = YBED
+			SET strStatus=$$^WWWSPEI("INAUFP",idOrder_","_idOrderLine,objTempOrderLine,1)
+		}
+		IF $$$INAUFPQuantity(objOrderLine)=(fltThisQty+fltPrevQty) {
+			SET $$$INWEAUFCompleteWEQuantity(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))=fltThisQty  ;MENGE GESAMTUND VOLLSTÄNDIG ;quantity entire and complete
+		}
+		set $$$INWEAUFQuantityInStockSet(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))=fltThisQty+$$$INWEAUFQuantityInStockSet(YFELD)  ;MENGE ÜBERTRAGEN ;quantity transport 
+		////   VVVV  update the Average cost 
+		$$$LogRx(strKey)
+		set EKNEU = $$^INARTAVG(idItem,fltThisQty,$PIECE(YFELD,Y,8),strKey,$$$NO,$$$YES,idLocn)	//SR16888
+		
+		NEW YFORM,YVOR,YOK,ZEIT,ZEIT1,YQ,SATZ0,ART0,idSupplier         ; <<< NEW INSIDE BRACES  FIXME
+		set strTime=$PIECE($HOROLOG,",",2)
+		set YQ=0
+		for strTimeTemp=strTime:1 {
+			QUIT:YQ=1  
+			set idSupplier = $piece(YFELD,Y,7)                                ; SR15575  idSupplier may not be numeric
+			; FIXME : Test for null supplier?
+			QUIT:$DATA(^INWEBUCH(YM,+$HOROLOG,strTimeTemp,idSupplier))
+			
+			set ART0  = $PIECE($GET(^INAUFP(YM,idOrder,idOrderLine,1)),Y,4)
+			set SATZ0 = $PIECE($GET(^INLIEF(YM,idSupplier,1)),Y,48)_Y_$PIECE(YFELD,Y,14)_Y_idDateRecvd_Y_idOrder_Y_idOrderLine_Y_ART0_Y_fltThisQty_Y_$PIECE(YFELD,Y,10)_Y_$PIECE(YFELD,Y,2)_Y_$PIECE(YFELD,Y,1)_Y_idLocn
+		    if ART0'="" {
+			    set $piece(SATZ0,Y,12) = $$$INARTItemGroup($GET(^INART(YM,ART0,1)))       ; D30
+		    }
+			set strStatus=$$^WWWSPEI("INWEBUCH",+$HOROLOG_","_strTimeTemp_","_idSupplier,SATZ0,1)
+			set YQ=1
+		}
+		
+		if $get(NOBESTAND)=1 || (fltThisQty<0){
+			set strStatus = 0 ; TODO ERROR 
+ 			quit strStatus    ; FIXME : This is a DO LOOP exit
+		} 
+		
+		/*
+		QUIT:$GET(NOBESTAND)=1  ;VARAIBLE WIRD IN INARTMINUS GESETZT, 
+		QUIT:(qty<0)			// SR13222
+		*/
+		
+		set $$$INWEAUFIncomingGoodsQuantity(YFELD) = fltThisQty  ;RESTMENGE AUS LAGERBESTELLUNGS RESERVIERUNG ;out of 
+		set $$$INWEAUFSourceOrder(YFELD)           = idOrder  ;SPEICHERN WARENHERKUNFT/URSPRUNG ;Save 
+		set $$$INWEAUFSourceLineItem(YFELD)        = idOrderline
+		
+ 		if idStore = $$$INVORGDeleteStockLocation(objINVORG) {
+			set strStatus = 0 ; TODO ERROR 
+ 			quit strStatus    ; FIXME : This is a DO LOOP exit
+ 			
+		} elseif $$$INARTItemWithoutInventoryMaint($get(^INART(YM,idItem,1)))=$$$YES {
+			set strStatus = 0 ; TODO ERROR 
+ 			quit strStatus    ; FIXME : This is a DO LOOP exit
+ 			
+		} elseif $$$INARTItemType($get(^INART(YM,idItem,1)))=2 {
+			set strStatus = 0 ; TODO ERROR 
+ 			quit strStatus     ; FIXME : This is a DO LOOP exit
+		}
+		
+		; ^ ^ ^ ^ End of dot levels
+		
+	 	set strStatus = $$AutoUpdate^INStockValAdjust("INWEAUF",idOrder_","_idOrderline,idItem,EKNEU)      
+		;-------------------------------------------------------------------------------
+		
+		; Toggle State, log version (already in key)
+		
+		IF $$$INWEAUFAllLineItemsReceived($get(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))) = $$$YES {
+			SET $$$INWEAUFAllLineItemsReceived(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))  = $$$NO
+			SET $$$INWEAUFVersionRev(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))            = idOrderLine
+			set blnAll = $$$NO
+			if $$$INWEAUFCreateCustomsMessage(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1))  = $$$YES {
+				set blnAll = $$$YES
+			set blnAll = ($$$INWEAUFCreateCustomsMessage(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,idDateRecvd,1)) = $$$YES)
+			}  
+			do ^INWEGESAMT(0,idOrder,idOrderLine,blnAll)     ;BUCHWEN WE ALLER POSITIONEN ;In everyone 
+		}
+		
+		set idItem=$$$INAUFPItemNumber($GET(^INAUFP(YM,idOrder,idOrderLine,1)))
+		if idItem'="" do ^INBESTANDCHECK(idItem)  ;BESTANDSCHECK
+	}
+	
+	quit strStatus 
+	
+	
+Delete(YFELD,AUF,POS,BETR,LP,WEDAT,&LOESCH)  ; NOW REVERTED
+	;-------------------------------------------------------------------------------
+	;  FALSCHE WERTE
+	;  
+	; History:
+	; 26-Aug-2008	GRF		SR15691: Created
+	;-------------------------------------------------------------------------------
+	quit:$$$INWEAUFQuantityInStockSet(YFELD)'=""  ;SCHON DATEN ÜBERTRAGEN= NICHT LÖSCHEN ;yet Not Delete 
+	quit:$$$INWEAUFQuantityInStockSet($get(^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)))'=""
+	
+	set LOESCH = $$$YES  ;LOESCHMERKER
+	; FIXME : Use WWWKILL Wrapper??
+	kill ^INWEAUF(YM,AUF,POS,BETR,LP,WEDAT,1)
+	quit
+	
+]]></Routine>
+</Export>

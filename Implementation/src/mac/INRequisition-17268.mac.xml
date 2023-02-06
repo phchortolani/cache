@@ -1,0 +1,562 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INRequisition" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INRequisition
+	
+#include COMSYS
+#include INConst
+#include COMConst
+	
+OnBeforeButtonLine(YKEY)
+	;-------------------------------------------------------------------------------
+	; Disable form if record is loaded in the firming or sourcing screens
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Dec-2009	GRF		SR17007: separate tags for multi-lock operations
+	; 12-Jan-2007	sch/SS	SR15350: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idReq
+ 
+	set strStatus = $$$OK
+	set idReq     = $$$KEY2(YKEY)
+	
+	if '$$$NoKey(idReq) {
+	;	if $$$ISOK(strStatus) set strStatus=$$GetLock^WWWMultiLock("INReqFirm",   "INReqFirmLine",   YKEY,$$$NO)  ; SR17007
+	;	if $$$ISOK(strStatus) set strStatus=$$GetLock^WWWMultiLock("INReqSource", "INReqSourceLine", YKEY,$$$NO)
+	;	if $$$ISOK(strStatus) set strStatus=$$GetLock^WWWMultiLock("INReqRelease","INReqReleaseLine",YKEY,$$$NO)
+		if $$$ISOK(strStatus) set strStatus=$$GetLock^WWWMultiLock("INReqFirm",   "INReqFirmLine",   YKEY)
+		if $$$ISOK(strStatus) set strStatus=$$GetLock^WWWMultiLock("INReqSource", "INReqSourceLine", YKEY)
+		if $$$ISOK(strStatus) set strStatus=$$GetLock^WWWMultiLock("INReqRelease","INReqReleaseLine",YKEY)
+		
+		if $$$ISERR(strStatus) set $$$WWW120AuthorizationToModifyData(YVOR)=$$$EnumReadOnly
+	}
+	quit
+	
+	
+OnBeforeSave(YFELD)
+	;-------------------------------------------------------------------------------
+	; Before saving update the field values.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Jan-2007	shobby	SR15348: Created
+	;-------------------------------------------------------------------------------
+	new idItem,idUnit
+	
+	if $$$INRequisitionStatus(YFELD)=$$$EnumINREQSTATUSNew {
+		set $$$INRequisitionStatus(YFELD)=$$$EnumINREQSTATUSUnfirmed
+		
+		set ^CacheTempRequisition(YUCI,YUSER)=""
+ 
+		set $$$INRequisitionPlanDue(YFELD)=$$$INRequisitionDueDate(YFELD)
+		set $$$INRequisitionPlanQty(YFELD)=$$$INRequisitionQuantity(YFELD)
+		
+		set idItem=$$$INRequisitionItem(YFELD)
+		if idItem'="" {
+			set idUnit=$$$INARTUnitofMeasure($get(^INART(YM,idItem,1))) // SR15350: Is shared and need ,1 at end
+			set $$$INRequisitionUnit(YFELD)=idUnit
+		}
+	}
+		
+	quit
+	
+	
+OnAfterSave(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	; After save add a change history for the status if we are firmed and not modified.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jul-2011	shobby	SR17831: Removed the hack for INReqFirm, form itself will
+	;                                save a record.
+	; 24-Jan-2007	PO		SR15340: Ensure there is a Firm and Source header record
+	; 15-Jan-2007	RPW		SR15359: Created
+	;-------------------------------------------------------------------------------
+	if $data(^CacheTempRequisition(YUCI,YUSER)) {
+		do AddEntry^COMChangeHistory(YM,YFORM,YBED,YKEY,$$$Text($listbuild("IN00624",$$$AppEnum("INREQSTATUS",$$$EnumINREQSTATUSNew),$$$AppEnum("INREQSTATUS",$$$EnumINREQSTATUSUnfirmed),YBED,$$^WWWDATE($h),$$^WWWTIME($h))))  ;Changed from %1 to %2 by %3 on %4 at %5.
+		kill ^CacheTempRequisition(YUCI,YUSER)
+	}
+ 
+	// Ensure the Firm and Source header records exist for the company
+	// WWWSPEI IS PURPOSELY NOT BEING CALLED - This is because these forms are a kludge.
+	;set ^INReqFirm(YM,YM,YLOCATION,1)   = 1  ;SR17831
+	set ^INReqSource(YM,YM,1) = Y
+ 
+ 	quit
+	
+	
+OnAfterButtonLine(YKEY)
+	;-------------------------------------------------------------------------------
+	; Lock the screen if status has passed the 'unfirmed' status.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Jan-2007	shobby		SR15348: Created
+	;-------------------------------------------------------------------------------
+	new objINRequisition,pidKey1,pidKey2
+	
+	set pidKey1 = $$$KEY1(YKEY)
+	set pidKey2 = $$$KEY2(YKEY)
+	
+	if '$$$NoKey(pidKey1) && '$$$NoKey(pidKey2) {
+		set objINRequisition=$$$DATA(YFORM,YKEY)
+		if +$$$INRequisitionStatus(objINRequisition)>$$$EnumINREQSTATUSUnfirmed {
+			set $$$WWW120AuthorizationToModifyData(YVOR)=$$$EnumReadOnly
+		}
+	}
+	quit
+	
+	
+CreateFirmed(pidItem,pidLoc)
+	;-------------------------------------------------------------------------------
+	; Code to check if Reqs need to be firmed
+	; 
+	; Parameters:	pidItem	- 
+	; 				pidLoc	- 
+	; 
+	; History
+	; 09-Jan-2007	JW		SR15347: Moved from INAUFANLAGE, cleaned up.
+	; 02-Jan-2007	RPW		SR15249: Modified to use GetFieldFromDRP
+	; 29-Nov-2006	PPP		SR15249: Creation
+	;-------------------------------------------------------------------------------
+	new blnCreate,objPlanner
+	
+	if $$$INVORGSupplierOrderAutoBarrier($get(^INVORG(YM,YM,1))) {
+		set blnCreate = $$$NO
+		
+	} elseif $get(BGJOB)=1 {	// DRP automatic. Check DRP setting.
+		set blnCreate = $find(";"_$$$INDRPSYSImmediateReleaseOfSupply($GET(^INDRPSYS(YM,YLOCATION,1)))_";",";5;")
+		
+	} else {	               // Not DRP BG job. Check current planner settings
+		set objPlanner = $GET(^INDRPPLANNER(YM,YLOCATION,YBED,1))
+		set blnCreate = $$$INDRPPLANNEREverythingAllowed(objPlanner) || $$$INDRPPLANNERReleasePurchaseOrdersAuto(objPlanner)
+	}
+	
+	if blnCreate {	; Now check DRP Item paramaters
+		set blnCreate = $$GetFieldFromDRP^INDRPITEM(pidLoc,pidItem,$$$FldINDRPITEMCreateFirmedOrders)
+	}
+	
+	quit blnCreate
+	
+	
+OnBlur(pCOL,&pYFELD)
+	;-------------------------------------------------------------------------------
+	; Handle changes when the user leaves a field.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Sep-2007   PJones  BR014707 : Added a warning pop-up if they try to use 
+	; 							the ordering locn as the default supplying locn
+	; 18-May-2007	RPW		SR15513: If the location = sourcing location, set the
+	; 							sourcing location to "".  If the type is changed,
+	; 							update the sourcing location's dropdown list.
+	; 08-May-2007	RPW		SR15513: If the field is Type then check if the Sourcing
+	; 							Locations field should be cleared
+	; 23-Jan-2007	RPW		SR15362: Don't get dates for empty or non-existent item.
+	; 09-Jan-2007	RPW		SR15249: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idItem,strUnit,fltQty
+	
+	set strStatus = $$$OK
+	
+	if (pCOL=$$$FldINRequisitionItem)      || 
+	   (pCOL=$$$FldINRequisitionDueDate)   ||
+	   (pCOL=$$$FldINRequisitionLocation)     {
+		set idItem=$$$INRequisitionItem(pYFELD)
+		if (idItem'="") && ($get(^INART(YM,idItem,1))'="") {
+			if ($$$INRequisitionLocation(pYFELD)'="") {
+				set strStatus=$$SetDates(.pYFELD,$$$INRequisitionLocation(pYFELD),$$$INRequisitionItem(pYFELD),$$$INRequisitionDueDate(pYFELD),-1) // SR15350: Pass pYFELD through
+			}
+			;do FillLocations(pYFELD)
+		}
+		
+	} elseif pCOL=$$$FldINRequisitionQuantity {
+		set fltQty = $$$INRequisitionQuantity(pYFELD)
+		if (fltQty'="") && (fltQty'>0) {
+			set strStatus="IN00632"                        ;Quantity must be greater than 0.
+			set %TXT(1)=%TXT(1)_"#Y"_YFORM_"D"_$$$FldINRequisitionQuantity_Y
+		}
+		
+	} elseif (pCOL=$$$FldINRequisitionFirmBy)       ||
+	         (pCOL=$$$FldINRequisitionSourceBy)     ||
+	         (pCOL=$$$FldINRequisitionRaiseBy)      ||
+	         (pCOL=$$$FldINRequisitionPlaceBy)      ||
+	         (pCOL=$$$FldINRequisitionConfirmBy)    ||
+	         (pCOL=$$$FldINRequisitionToSupplierBy)    {
+		if $piece(pYFELD,Y,pCOL)'=YOLDV {
+			;Only do something if value has changed
+			do AdjustDueDate(pCOL,.pYFELD,.strStatus)
+		}
+		
+	} elseif (pCOL=$$$FldINRequisitionType) { // SR15513
+		if $$$INRequisitionType(pYFELD)'=$$$EnumINREQUISITIONTYPETfr {
+			set %TXT(1)=%TXT(1)_"#Y"_YFORM_"D"_$$$FldINRequisitionSourcingLocation	
+		}
+		
+	} elseif (pCOL=$$$FldINRequisitionSourcingLocation) {
+		if $$$INRequisitionSourcingLocation(pYFELD)=YLOCATION {  ; can't source from self
+			; here if the user has entered his / her current location
+			; as the default sourcing location for this requisition. 
+			; That doesn't make sense, (can't source from self) so 
+			; we blank it and give a pop-up warning.
+			; 
+			set %TXT(1)=%TXT(1)_"#Y"_YFORM_"D"_$$$FldINRequisitionSourcingLocation
+			set strStatus = "IN00705"   
+			
+		}
+	}
+	
+	if $$$ISERR(strStatus) {
+		$$$Alert(strStatus)
+	}
+	
+	quit
+ 
+	/* Not used at the moment.
+FillLocations(pobjRequisition)
+	;-------------------------------------------------------------------------------
+	; Remove the entries in the Sourcing Location dropdown list.
+	; Replace them with entries valid for this product.  
+	;
+	; Inputs:
+	;
+	; ByRef:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-May-2007	RPW		SR15513: Created
+	;-------------------------------------------------------------------------------
+ 
+	new intPos,arrLocations,idLocation,objLocation,strLocation
+	
+	set %TXT(1)=%TXT(1)_"#Y"_YFORM_"D"_$$$FldINRequisitionSourcingLocation_Y_"REMOVE"
+			
+	do GetWarehouseLocationsWithStock^INReqCommon(.arrLocations,$$$INRequisitionItem(pobjRequisition))
+	
+	set intPos=0
+	$$$Order1(arrLocations,idLocation)
+ 
+		continue:idLocation=YLOCATION
+		set objLocation=$get(^WWW0121(0,YM,idLocation,1))
+		
+		set strLocation=idLocation_" - "_$$$WWW0121LocationName(objLocation)
+		set %TXT(1)=%TXT(1)_"#Y"_YFORM_"D"_$$$FldINRequisitionSourcingLocation_Y_idLocation_Y_strLocation_Y_$increment(intPos)
+		
+	$$$End
+	
+	quit
+	*/
+	
+AdjustDueDate(pCol,&pYFELD,&pstrStatus)
+	;-------------------------------------------------------------------------------
+	; Adjusts the Due Date if the user has changed one of the other dates to be
+	; 	a) before the preceding step.
+	; 	b) so that the due date can not be achieved.
+	; Dates are then adjusted.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Jan-2007	shobby	SR15350: Created
+	;-------------------------------------------------------------------------------
+	new dteDiff,dteLeadTimeCurrent,dteLeadTimePrior,dteDueDate,dteLeadTimeNext
+	
+	set dteLeadTimeCurrent = $$GetSpecificLeadTime^INATP1($$Map(pCol),  $$$INRequisitionLocation(pYFELD),$$$INRequisitionItem(pYFELD))
+	set dteLeadTimePrior   = $$GetSpecificLeadTime^INATP1($$Map(pCol-2),$$$INRequisitionLocation(pYFELD),$$$INRequisitionItem(pYFELD))
+	set dteLeadTimeNext    = $$GetSpecificLeadTime^INATP1($$Map(pCol+2),$$$INRequisitionLocation(pYFELD),$$$INRequisitionItem(pYFELD))
+	
+	if (pCol'<$$$FldINRequisitionSourceBy) &&
+	   ($piece(pYFELD,Y,pCol)<($piece(pYFELD,Y,pCol-2)+(dteLeadTimePrior-dteLeadTimeCurrent))) {
+		;earlier than preceeding step allowing for amount of lead time required for each stage.
+		set dteDueDate = $piece(pYFELD,Y,pCol)+dteLeadTimeCurrent
+		set pstrStatus = $$SetDates(.pYFELD,$$$INRequisitionLocation(pYFELD),$$$INRequisitionItem(pYFELD),dteDueDate,pCol,-1) // Pass pYFELD through
+	
+	} elseif (pCol'>$$$FldINRequisitionToSupplierBy)&&($piece(pYFELD,Y,pCol+2)<($piece(pYFELD,Y,pCol)+(dteLeadTimeCurrent-dteLeadTimeNext))) {
+		;later than next step allowing for amount of lead time required for each stage.
+		set dteDueDate = $piece(pYFELD,Y,pCol)+dteLeadTimeCurrent
+		if dteDueDate>$$$INRequisitionDueDate(pYFELD) {
+			set $$$INRequisitionDueDate(pYFELD) = dteDueDate
+			set %TXT(1) = %TXT(1)_"#Y"_YFORM_"D"_$$$FldINRequisitionDueDate_Y_$$$FormatDate($$$INRequisitionDueDate(pYFELD))
+		}
+		set pstrStatus = $$SetDates(.pYFELD,$$$INRequisitionLocation(pYFELD),$$$INRequisitionItem(pYFELD),dteDueDate,pCol,1) // Pass pYFELD through
+	
+	} else {
+		set dteDiff = ($$$INRequisitionDueDate(pYFELD)-$piece(pYFELD,Y,pCol))-dteLeadTimeCurrent
+		if dteDiff<0 {
+			;due date can no longer be achieved.
+			set $$$INRequisitionDueDate(pYFELD) = $$$INRequisitionDueDate(pYFELD)-dteDiff
+			set pstrStatus = $$SetDates(.pYFELD,$$$INRequisitionLocation(pYFELD),$$$INRequisitionItem(pYFELD),$$$INRequisitionDueDate(pYFELD),pCol) // Pass pYFELD through
+			set %TXT(1)    = %TXT(1)_"#Y"_YFORM_"D"_$$$FldINRequisitionDueDate_Y_$$$FormatDate($$$INRequisitionDueDate(pYFELD))
+		}
+	}
+	
+	quit
+ 
+ 
+Map(pintBy)
+	;-------------------------------------------------------------------------------
+	; Maps the INRequisition constants to their corresponding DRP constants
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Jan-2007	JW		Changed to non-Intraprend style.
+	; 12-Jan-2007	shobby	SR15350: Created
+	;-------------------------------------------------------------------------------
+	quit $case(pintBy,	$$$FldINRequisitionFirmBy		:$$$DRPFirm,
+						$$$FldINRequisitionSourceBy		:$$$DRPSource,
+						$$$FldINRequisitionRaiseBy		:$$$DRPRaise,
+						$$$FldINRequisitionPlaceBy		:$$$DRPPlace,
+						$$$FldINRequisitionConfirmBy	:$$$DRPConfirm,
+						$$$FldINRequisitionToSupplierBy	:$$$DRPSupplier,
+														:"")
+	
+	
+SetDates(&pYFELD,pidLocation,pidItem,pdteReqDate,pintStart=99999,pblnDirection=1) // Pass pYFELD through by ref
+	;-------------------------------------------------------------------------------
+	; Updates all of the dates 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Jan-2007	shobby	SR15350: With the pintStart parameter only dates that
+	; 							follow the currently edited field in the sequence
+	; 							will be updated. 
+	; 10-Jan-2007	RPW		Created
+	;-------------------------------------------------------------------------------
+	new dteMinDue,strStatus
+	
+	set strStatus=$$$OK
+	
+	if pblnDirection=1 {
+		set dteMinDue = $horolog+$$GetSpecificLeadTime^INATP1($$$DRPFirm,pidLocation,pidItem)
+		
+		if pdteReqDate<dteMinDue {
+			if pdteReqDate'="" set strStatus = $listbuild("IN00446",$$$FormatDate(dteMinDue))  ; "Due date must be %1 or greater."
+			
+			set $$$INRequisitionDueDate(pYFELD)=dteMinDue
+			set %TXT(1) = %TXT(1)_"#Y"_YFORM_"D"_$$$FldINRequisitionDueDate_Y_$$$FormatDate(dteMinDue)
+		} else {
+			set dteMinDue = pdteReqDate
+		}
+	} else {
+		set dteMinDue = pdteReqDate
+	}
+	
+	do GetSpecificationLeadTime($$$DRPSupplier ,$$$FldINRequisitionToSupplierBy,dteMinDue,pidLocation,pidItem,pintStart,pblnDirection)
+	do GetSpecificationLeadTime($$$DRPConfirm  ,$$$FldINRequisitionConfirmBy   ,dteMinDue,pidLocation,pidItem,pintStart,pblnDirection)
+	do GetSpecificationLeadTime($$$DRPPlace    ,$$$FldINRequisitionPlaceBy     ,dteMinDue,pidLocation,pidItem,pintStart,pblnDirection)
+	do GetSpecificationLeadTime($$$DRPRaise    ,$$$FldINRequisitionRaiseBy     ,dteMinDue,pidLocation,pidItem,pintStart,pblnDirection)
+	do GetSpecificationLeadTime($$$DRPSource   ,$$$FldINRequisitionSourceBy    ,dteMinDue,pidLocation,pidItem,pintStart,pblnDirection)
+	do GetSpecificationLeadTime($$$DRPFirm     ,$$$FldINRequisitionFirmBy      ,dteMinDue,pidLocation,pidItem,pintStart,pblnDirection)
+	
+	quit strStatus
+	
+	
+GetSpecificationLeadTime(penumType,pintField,pdteMinDue,pidLocation,pidItem,pintStart,pblnDirection)
+	;-------------------------------------------------------------------------------
+	; Update a value of a particular field to the latest value that will still allow achieving of the Due Date.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Jan-2007	shobby	SR15350: Created
+	;-------------------------------------------------------------------------------
+	new dteDate
+	
+	if (pintStart*pblnDirection)<(pintField*pblnDirection) {
+		set dteDate=$$GetDate(pdteMinDue,penumType,pidLocation,pidItem)
+	//	set dteDate=pdteMinDue-$$GetSpecificLeadTime^INATP1(penumType,pidLocation,pidItem)
+		set %TXT(1)=%TXT(1)_"#Y"_YFORM_"D"_pintField_Y_$$$FormatDate(dteDate)
+	;	set $piece(YFELD,Y,pintField)=dteDate
+	}
+	quit
+	
+	
+GetDate(pdteMinDue,penumType,pidLocation,pidItem)
+	;-------------------------------------------------------------------------------
+	; Get the actual date so that this can be used elsewhere, ie DRP
+	;
+	; Params:
+	; pdteMinDue : The due date
+	; penumType  : The type, Firm, Source, Raise, Place, Confirm, Supplier
+	; pidLocation: The location
+	; pidItem    : The product
+	;
+	; Returns:
+	; 0 or the $h
+	;
+	; History:
+	; 18-Jan-2007	RPW		SR15350: Created
+	;-------------------------------------------------------------------------------
+	quit:((penumType="")||(pidLocation="")||(pidItem="")) 0
+	quit pdteMinDue-$$GetSpecificLeadTime^INATP1(penumType,pidLocation,pidItem)
+	
+	
+RequisitionCount(pidSupplier,pidCompany)
+	;-------------------------------------------------------------------------------
+	; Find out how many requisitions this suppliers has that are ready to be released
+	; 
+	; Used on the Calculated field on INLIEF called RequisitionCount
+	;
+	; Params:
+	;
+	; Returns:
+	; The count on entries.
+	;
+	; History:
+	; 05-Jan-2007	RPW		SR15365: Created
+	;-------------------------------------------------------------------------------
+	new idLine,idxSupplier,intCount
+	
+	set idxSupplier = $$$Index(pidSupplier)
+	set intCount=0
+ 
+	set idLine = ""
+	for {
+		set idLine = $order(^INRequisitions(pidCompany,6,"3",idxSupplier,pidCompany,idLine))
+		quit:idLine=""
+		
+		set intCount=intCount+1
+	}
+	
+	quit intCount
+	
+	
+EarliestCutDate(pidSupplier,pidCompany)
+	;-------------------------------------------------------------------------------
+	; Find the earliest requisition that is ready to be released
+	; 
+	; Used on the Calculated field on INLIEF called RequisitionCutDate
+	;
+	; Params:
+	;
+	; Returns:
+	; The horolog date of the earliest
+	;
+	; History:
+	; 11-Jan-2007	RPW		SR15365: Created
+	;-------------------------------------------------------------------------------
+	quit $order(^INRequisitions(pidCompany,13,$$$EnumINREQSTATUSSourced,$$$YES,$$$Index(pidSupplier),""))
+	
+	
+CanDelete(YKEY)
+	;-------------------------------------------------------------------------------
+	; If the status is unfirmed or below, allow the delete.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Dec-2009	GRF		SR17007: separate tags for multi-lock operations
+	; 18-May-2007	RPW		SR15513: If can delete, & have a Demand, mark the demand
+	; 							for closure Or allow a release req to be deleted.
+	; 12-Apr-2007	RPW		SR15495: Do not allow deletion of "to be released" lines
+	; 17-Jan-2007	RPW		SR15249: Created
+	;-------------------------------------------------------------------------------
+ 	new idDemand,strStatus
+		
+	;et strStatus = $$GetLock^WWWMultiLock("INReqFirm","INReqFirmLine",YKEY,$$$NO)          ; SR17007
+	set strStatus = $$GetLock^WWWMultiLock("INReqFirm","INReqFirmLine",YKEY)
+	if $$$ISOK(strStatus) {
+	;	set strStatus = $$GetLock^WWWMultiLock("INReqSource","INReqSourceLine",YKEY,$$$NO)  ; SR17007
+		set strStatus = $$GetLock^WWWMultiLock("INReqSource","INReqSourceLine",YKEY)
+		
+		// SR15513: vvv
+		if $$$ISOK(strStatus) {
+			if $$$INRequisitionStatus(YFELD)=$$$EnumINREQSTATUSReleased {
+				set strStatus = $$$MakeStatus("IN00700")  ; "Unable to delete a released requisition."
+			}
+		}
+		// SR15513: ^^^
+	}
+	
+	// SR15513: vvv
+	if $$$ISOK(strStatus) {
+		set idDemand = $$$INRequisitionDemand(YFELD)
+		
+		if idDemand'="" {
+			set ^CacheTempDemand(YUCI,YUSER) = idDemand
+		}
+	}
+	// SR15513: ^^^
+	
+	set Q = $$$ISERR(strStatus)
+	
+	quit
+	
+	
+OnAfterDelete()
+	;-------------------------------------------------------------------------------
+	; After we have deleted the record, close the transfer
+	;
+	; Inputs:
+	;
+	; ByRef:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-May-2007	RPW		SR15513: Created
+	;-------------------------------------------------------------------------------
+	new idDemand,objDemand,strStatus
+	
+	set idDemand=$get(^CacheTempDemand(YUCI,YUSER))
+	kill ^CacheTempDemand(YUCI,YUSER)
+	
+	if idDemand'="" {
+		set objDemand=$$$DATA("INDRPDEMAND",idDemand)
+		set $$$INDRPDEMANDDemandClosed(objDemand)=$$$YES
+			
+		set strStatus=$$$Save("INDRPDEMAND",idDemand,objDemand,$$$YES)
+	}
+	
+	quit
+	
+AssociatedValidation(pstrYFELD,pstrFieldValue,pidAssociated)
+	;-------------------------------------------------------------------------------
+	; Check if the field is valid based on another field.
+	;
+	; Inputs:
+	; pstrYFELD     : The data for the form
+	; pstrFieldValue: The value of the field we are in
+	; pidAssociated : The associated field
+	;
+	; ByRef:
+	;
+	; Returns:
+	; boolean - $$$YES is valid, $$$NO invalid
+	;
+	; History:
+	; 26-Apr-2007	RPW		SRBR014310: Created
+	;-------------------------------------------------------------------------------
+ 	quit $$AssociatedValidation^INReqCommon(pstrYFELD,pstrFieldValue,pidAssociated)
+ 	
+]]></Routine>
+</Export>

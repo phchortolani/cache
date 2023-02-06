@@ -1,0 +1,887 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INMO" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INMO
+	
+#include COMSYS
+#include INConst
+#include COMConst
+#include COMSYSNum
+
+#define INMOStatusConfirmado 2
+#define INMOStatusRecebido 5
+
+	
+OnBeforeButtonLine(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; Set form to readonly if not editable
+    ;
+    ; Params:	pYKEY		- Req id
+    ;
+    ; ByRef: 
+    ; 	YVOR		WWW122 record
+    ;
+    ; History:
+	; 29-Apr-2010	PP		SR16573: Created
+    ;-------------------------------------------------------------------------------
+	if '$$Editable(pYKEY) {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+	}
+	quit
+	
+HideTab(YKEY,YFELD)	;HEVA-1172
+	quit $$$INMOType(YFELD)'=2
+		
+Editable(pidMO) 
+    ;-------------------------------------------------------------------------------
+    ; Is form editable (unprocessed) ?
+    ;
+    ; Params:	pidMO - MO id
+    ;
+    ; Returns:	status
+    ;
+    ; History:
+	; 29-Apr-2010	PP		SR16573: Created
+    ;-------------------------------------------------------------------------------
+	new objMO,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidMO) {
+		set objMO = $get(^INMO(0,pidMO,1))
+		
+	 	if $$$INMOStatus(objMO) > 1 {
+		 	set strStatus = $$$MakeStatus("IN01216")       ; "Order has been Firmed"
+	 	}
+	}
+	quit strStatus
+	
+	
+OnAfterDataFields(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Aug-2010	PPP		SR16573: Only Show Grid for TAB 1
+	; 29-Apr-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new idIssue,idREC
+	
+	quit:pYKEY=""
+	
+	if YSEITE=1 {
+		do LoadINMOLine(pYKEY)	
+		
+		if '$$$NoKey(pYKEY) {
+			// Issue
+			set idIssue = $order(^INIssues(0,6,$$$Index(pYKEY),""))
+			if idIssue = "" { ;Also check index string without formating HEVA-1658
+				set idIssue = $order(^INIssues(0,6,pYKEY,""))
+			}
+			if idIssue'="" {
+				do ShowIssue^INMOShow(idIssue)
+			}
+		
+			// Receipt
+			set idREC = $order(^INRECs(0,3,$$$Index(pYKEY),""))
+			if idREC'="" {
+				do ShowRec^INMOShow(idREC)
+			}
+
+			// Reversal
+			if $data(^INMORev(0,pYKEY)) {
+				do ShowReversal^INMOShow(pYKEY)
+			}
+
+		}
+	}
+	quit
+	
+	
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Sep-2013	SCR		CORE-266:
+	; 13-Aug-2010	PPP		SR16573: Added checks for Qty
+	; 29-Apr-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new idItem,strStatus,idSupLoc,idProdLoc,idRecLoc
+	
+	set strStatus=$$$OK
+	
+	set idItem = $$$INMOItemCode(pYFELD)
+	
+	if idItem '= "" {
+		if ($order(^INARTT(0,idItem,"")) = "") {
+	 		set strStatus = $$$MakeStatus("IN01238",idItem)     ; "Item '%1' has no Bill of Material"
+		
+		} else {
+			if ('$$$INMOMinimumQuantity(pYFELD) || ($$$INMOMinimumQuantity(pYFELD)<0)) {
+					set strStatus = $$$MakeStatus("IN00805")	; "Invalid Quantity"	
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set idSupLoc	= $$$INMOSupplyingLocation(pYFELD)
+		set idProdLoc	= $$$INMOProductionLocation(pYFELD)
+		set idRecLoc	= $$$INMOReceiptLocation(pYFELD)
+		if $$OnlyTrackPrograms^INBundleUtils(idSupLoc) {
+			if '$$OnlyTrackPrograms^INBundleUtils(idProdLoc) {
+				set strStatus = $$$MakeStatus("IN01453")  ;Cannot mix Lot Controlled and Non Lot Controlled Locations
+			} elseif  '$$OnlyTrackPrograms^INBundleUtils(idRecLoc) {
+				set strStatus = $$$MakeStatus("IN01453")  ;Cannot mix Lot Controlled and Non Lot Controlled Locations
+			}
+
+		} else {
+			if $$OnlyTrackPrograms^INBundleUtils(idProdLoc) {
+				set strStatus = $$$MakeStatus("IN01453")  ;Cannot mix Lot Controlled and Non Lot Controlled Locations
+			} elseif  $$OnlyTrackPrograms^INBundleUtils(idRecLoc) {
+				set strStatus = $$$MakeStatus("IN01453")  ;Cannot mix Lot Controlled and Non Lot Controlled Locations
+			}
+		}
+	}
+	if $$$ISOK(strStatus) {
+		set strStatus = $$$GRIDSave(pYKEY)
+	}
+
+	if $$$ISOK(strStatus) {
+		set $$$INMOStatus(pYFELD) = 1		// Open	(can be Firmed if it has lines)
+	
+	} else {
+		do ReturnError^COMUtilError(strStatus)
+		set Q = $$$QDontSave
+	}
+	quit
+	
+OnAfterSave(pYKEY,pYFELD)
+	
+	do PickBillOfMaterials(pYKEY,pYFELD)
+	
+	quit
+	
+LoadINMOLine(pYKEY)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jun-2013	SCR		HEVA-1030: Edit Qty when Type = 2
+	; 29-Apr-2010	PP		SR16573: Updated
+	;-------------------------------------------------------------------------------
+	new YFORM,YKEY,YAUSWAHL,YFELD
+	
+	set YFORM = "INMOLine"			
+	set YKEY  = $get(pYKEY)
+	set YFELD = $get(^INMO(YM,YKEY,1))
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)          = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL)       = 200
+	set $$$COMGridEditParameterGridName(YAUSWAHL)            = YFORM
+	set $$$COMGridEditParameterUpdateFields(YAUSWAHL)        = ""
+	set $$$COMGridEditParameterClearFields(YAUSWAHL)         = ""
+	set $$$COMGridEditParameterDefaultFields(YAUSWAHL)       = ""
+	set $$$COMGridEditParameterContainer(YAUSWAHL)           = "INMO"
+	; HEVA-1030 vvvv
+	;set $$$COMGridEditParameterEnabled(YAUSWAHL)             = $$$NO
+	if ($$$INMOType(YFELD)'=2) || ($$$INMOStatus(YFELD) > 1) {
+		set $$$COMGridEditParameterEnabled(YAUSWAHL)             = $$$NO
+	} else {
+		set $$$COMGridEditParameterEnabled(YAUSWAHL)             = $$$YES
+	}
+	; HEVA-1030 ^^^^
+	set $$$COMGridEditParameterDontUpdateContainer(YAUSWAHL) = $$$YES
+	
+	do ^COMGridEdit31
+	do ^WWWVAR
+	quit
+	
+	
+IsFirmable(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Called by Firm Button on INMO form
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 
+	; 13-Nov-2013	shobby	HEVA-1172.1: If there is additional VAR checks on the button call out to that test.
+	; 29-Apr-2010	PP		SR16573: Updated 
+	; 09-JUN-2009   KALYAN	SR16573: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,objINMO,strStatus
+		
+ 	set strStatus = $$$OK
+	
+	if (pYKEY'="") {
+		
+		if $$$ISOK(strStatus) if $data(^rOBJ("VARINMOExecuteToCheckForDisabled")) set strStatus=$$IsDisabled^VARINMOExecuteToCheckForDisabled(pYKEY,1) ;HEVA-1172.1
+
+		set objINMO = $get(^INMO(0,pYKEY,1))
+		quit:objINMO=""
+		
+		do GetGridContents^COMGridEdit31G(.arrGrid)
+		if '$data(^INMOLine(0,pYKEY)) && ($order(arrGrid(pYKEY,""))="") {
+		 	set strStatus = $$$MakeStatus("IN00586")       ; "No lines available for firming"
+		}
+		
+		if $$$ISOK(strStatus) {
+		 	if $$$INMOStatus(objINMO) > 1 {    //1 (Open)
+			 	set strStatus = $$$MakeStatus("IN01216")   ; "Order has already been Firmed"
+		 	}
+		}
+	}
+ 	$$$YQHandler(strStatus)
+ 	quit strStatus
+ 	
+	
+AllowToIssue(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Called by Issue Button on INMO form
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Sep-2012	PPP		SR18113:Included Supplying Location validation (C98)
+	; 02-Aug-2010	GRF		SR16573: use elseif structure
+	; 29-Apr-2010	PP		SR16573: Updated 
+	; 19-JUN-2009   SRAPOL	Created
+	;-------------------------------------------------------------------------------
+	new objINMO,strStatus
+	
+ 	set strStatus = $$$OK
+	
+	if (pYKEY'="") {
+		set objINMO = $get(^INMO(0,pYKEY,1))
+			
+		if objINMO'="" {
+			if $$$INMOStatus(objINMO) = 1 {
+			 	set strStatus = $$$MakeStatus("IN01217")       ; "Please 'Firm' the Order"
+		
+			} elseif $$$INMOStatus(objINMO) > 2 {              ; 1 (Open)
+				 set strStatus = $$$MakeStatus("IN01218")      ; "Order has already been Issued"
+
+			//SR18113
+			}  elseif ($$$INMOSupplyingLocation(objINMO) '= YLOCATION) {
+      			set strStatus = $$$MakeStatus("IN01338")		;Only the Supplying Location can perform this operation
+			}
+		}
+	}
+ 	$$$YQHandler(strStatus)
+ 	quit strStatus
+	
+	
+AllowToReceipt(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Called by Receive Button on INMO form
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 13-Sep-2012	PPP		SR18115:Included Receipt Location validation (C100)
+	; 02-Aug-2010	GRF		SR16573: use elseif structure
+	; 29-Apr-2010	PP		SR16573: Updated 
+	; 19-JUN-2009   SRAPOL	Created
+	;-------------------------------------------------------------------------------
+	new objINMO,strStatus
+	
+ 	set strStatus = $$$OK
+	
+	if (pYKEY'="") {
+		set objINMO = $get(^INMO(0,pYKEY,1))
+		
+		if objINMO'="" {
+			if $$$INMOStatus(objINMO) = 1 {
+			 	set strStatus = $$$MakeStatus("IN01217")       	; "Please 'Firm' the Order"
+		
+			} elseif $$$INMOStatus(objINMO) = 2 {
+				 set strStatus = $$$MakeStatus("IN01221")      	; "Please 'Issue' the Order"
+		
+			} elseif $$$INMOStatus(objINMO) > 4 {              	; 5 (Received)
+			 	set strStatus = $$$MakeStatus("IN01219")       	; "Order has already been Received"
+			
+			//SR18115
+			}  elseif ($$$INMOReceiptLocation(objINMO) '= YLOCATION) {
+      			set strStatus = $$$MakeStatus("IN01339")		;Only the Receiving Location can perform this operation
+    		}
+		}
+	}
+
+ 	$$$YQHandler(strStatus)
+
+	quit strStatus
+	
+	
+AllowToReverse(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Called by Dismantle Button on INMO form
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Aug-2010	GRF		SR16573: replace early exit
+	; 11-Aug-2010	PPP		SR16573/1: More Error Checks, Added IN01251
+	; 14-May-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new objINMO,strStatus
+	
+ 	set strStatus = $$$OK
+	
+	if (pYKEY'="") {
+		set objINMO = $get(^INMO(0,pYKEY,1))
+		//SR16573/1
+		if objINMO="" {
+			set strStatus = $$$MakeStatus("WWW00028",pYKEY)     ; "´%1´ is invalid"
+				
+		} elseif $$$INMOStatus(objINMO) < 5 {	                   //Received
+			set strStatus = $$$MakeStatus("IN01227")            ; "Order has not yet been 'Received'"
+		
+		} elseif $$$INMOStatus(objINMO) > 5 {              // 5 (Received)
+			 	set strStatus = $$$MakeStatus("IN01251")        ; "Order has already been Dismantled"
+		}
+		
+		if $$$ISOK(strStatus) {
+			if '$$IsReturnDefaultDefined^INMORev($$$INMOSupplyingLocation(objINMO)) {
+				 set strStatus = $$$MakeStatus("IN01255",$$$INMOSupplyingLocation(objINMO))
+			} ; "Default Manufacturing Return Storage not found for Location %1"
+		}
+	}
+ 	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	
+PickBillOfMaterials(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Create the PO Lines based on the BOM of the Item
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Jun-2013	SCR		HEVA-1030: Dont reload line if Type 2
+	; 07-Jul-2010	PPP		SR17399:Check for the existance of Manufactured Item Code
+	; 29-Apr-2010	PPP		SR16573:Updated
+	; 18-JUN-2009   VIJAY	Created
+	;-------------------------------------------------------------------------------
+	new fltMinQty,idINARTT,idINMOLine,idMakeItem,idIngredient
+	new objINARTT,objINMOLine,strStatus
+	
+	set idMakeItem = $$$INMOItemCode(pYFELD)
+	
+	; HEVA-1030 vvvv
+	if $$$INMOType(pYFELD) = 2 {
+		quit:$data(^INMOLine(YM,pYKEY))
+	}
+	; HEVA-1030 ^^^^
+	
+	if idMakeItem'="" {   //SR17399
+		set idIngredient = ""
+		for {
+			set idIngredient = $order(^INARTT(0,idMakeItem,idIngredient))
+			quit:idIngredient=""
+			
+			set objINARTT = $get(^INARTT(0,idMakeItem,idIngredient,1))
+			quit:objINARTT=""
+			
+			if ($$$INMOMinimumQuantity(pYFELD)'="") {
+				set fltMinQty = $$$INMOMinimumQuantity(pYFELD)
+			} else {
+				set fltMinQty = 1
+			}
+			
+			set objINMOLine=""
+			set $$$INMOLineItem(objINMOLine)       = $$$INARTTItemNumber1(objINARTT)
+			set $$$INMOLineUnit(objINMOLine)       = $$$INARTTUnit(objINARTT)
+			set $$$INMOLineQtyOrdered(objINMOLine) = fltMinQty*$$$INARTTQuantity(objINARTT)
+			set $$$INMOLineStatus(objINMOLine)     = 1
+		//	$$$INMOLineQtyRequired(objINMOLine) 
+		//	$$$INMOLineFromStockLocn(objINMOLine)
+		//	$$$INMOLineStatus(objINMOLine)
+		//	$$$INMOLineDueDate(objINMOLine)
+			set $$$INMOLineUnitPrice(objINMOLine)  = $$GetCost^INItemCost($$$INMOLineItem(objINMOLine),$$$INMOSupplyingLocation(objINMOLine))
+			set strStatus = $$$Save("INMOLine",pYKEY_","_idIngredient,objINMOLine,$$$YES)
+		}
+	}
+	quit
+	
+	
+Firm(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Called by the Firm Button on the INMO form
+	; This process generates the INIssue record for the Production Order
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Jan-2014	shobby	HEVA-1686.3: Include the line number of the INMOLine
+	; 16-Aug-2010	GRF		SR16573: YBED not YUDER
+	; 20-May-2010	PPP		SR16573: Pick Lines with Bundles & Storages defined (System Generated)
+	; 29-Apr-2010	PPP		SR16573: Updated Process
+	; 09-Jul-2009   VIJAY	Added updation of Reference and ToStorage fields 
+	;							and handling of StrStatus in for loop
+	; 18-Jun-2009   VIJAY	Created
+	;-------------------------------------------------------------------------------
+ 	new idINIssue,idINIssueLine,idINMOLine,idLine,idLocn,idProdLocn
+ 	new objINIssue,objINIssueLine,objINMO,objINMOLine,strStatus
+	
+ 	if (pYKEY'="") {
+	 	set objINMO = $get(^INMO(0,pYKEY,1))
+	 	quit:objINMO=""
+		
+		set idLocn     = $$$INMOSupplyingLocation(objINMO)
+		set idProdLocn = $$$INMOProductionLocation(objINMO)
+		
+	 	set idINIssue = $$^WWWNEXT("INIssue")
+	 	
+	 	set objINIssue = "" 
+	 	set $$$INIssueStatus(objINIssue)	           = 1
+		set $$$INIssueToLocn(objINIssue)	           = $$$INMOProductionLocation(objINMO)
+		set $$$INIssueFromLocn(objINIssue)	           = idLocn
+		set $$$INIssueCreatedOn(objINIssue)	           = +$horolog
+		set $$$INIssueCreatedBy(objINIssue)	           = YBED
+		set $$$INIssueChangedOn(objINIssue)            = +$horolog
+		set $$$INIssueChangedBy(objINIssue)	           = YBED
+		set $$$INIssueFinishedGoodItemCode(objINIssue) = $$$INMOItemCode(objINMO)
+		set $$$INIssueProductionOrder(objINIssue)      = YKEY
+		set $$$INIssueType(objINIssue)                 = 6		//Manufacturing Issue
+		set $$$INIssueReference(objINIssue)            = "Issue"
+		
+		set strStatus = $$$Save("INIssue",idINIssue,objINIssue,$$$YES)
+		
+		if $$$ISOK(strStatus) {
+			set idINMOLine=""
+			set idLine = 0
+			for {
+				set idINMOLine = $order(^INMOLine(0,pYKEY,idINMOLine))
+				quit:idINMOLine=""
+				
+				set objINMOLine = $get(^INMOLine(0,pYKEY,idINMOLine,1))
+				quit:objINMOLine=""
+				
+				set strStatus = $$CreateIssueLine(idINIssue,idLocn,idProdLocn,objINMOLine,$increment(idLine),idINMOLine)  ;HEVA-1686.3
+				quit:$$$ISERR(strStatus)
+			}
+			
+			if $$$ISOK(strStatus) {
+				set $$$INMOStatus(objINMO)                = 2    // Firmed
+				set $$$INMORequisitionFirmedDate(objINMO) = $horolog
+				set $$$INMORequisitionFirmedBy(objINMO)   = $get(YBED)
+				
+				set strStatus = $$$Save("INMO",pYKEY,objINMO,$$$YES)
+			}
+		}
+ 	}
+	do ReloadForm^COMUtilForm()
+	quit
+	
+	
+CreateIssueLine(pidINIssue,pidLocn,pidProdLocn,pobjINMOLine,pidLine,pidSourceLine="") ;HEVA-1686.3
+	;-------------------------------------------------------------------------------
+	; Called by the Firm process
+	; This process generates the INIssueLines for the Production Order
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 
+	; 27-Jan-2014	shobby	HEVA-1686.3: Include the line number of the INMOLine
+	; 20-May-2010	PPP		SR16573:Created (Pick Lines with Bundles & Storages 
+	;							defined (System Generated) )
+	;-------------------------------------------------------------------------------
+	new blnNotFirst,fltOutstanding,fltQty,fltQtyIssued,idItem,idLn,idToStorage
+	new loopStock,lstAvailableIssues,objBundle,objINIssueLine,objStorage,strStatus
+		
+	set strStatus = $$$OK
+	
+ 	set idItem      = $$$INMOLineItem(pobjINMOLine)
+ 	set fltQty      = $$$INMOLineQtyOrdered(pobjINMOLine)
+ 	set idToStorage = $$GetStorage^INIssueAuto(idItem,pidProdLocn)
+ 	set blnNotFirst = $$$NO
+ 	
+ 	set fltOutstanding = fltQty
+ 	
+	set lstAvailableIssues = ##class(alDRP.iDRP).SourceIssue(idItem,pidLocn,fltQty)
+ 	
+	if lstAvailableIssues.Count() > 0 {
+		for loopStock=1:1:lstAvailableIssues.Count() {
+			quit:$$$ISERR(strStatus)
+			
+		//	set objItem      = lstAvailableIssues.GetAt(loopStock).Item
+			set objStorage   = lstAvailableIssues.GetAt(loopStock).Storage
+			set objBundle    = lstAvailableIssues.GetAt(loopStock).Bundle
+			set fltQtyIssued = lstAvailableIssues.GetAt(loopStock).QtyToIssue
+			
+			set objINIssueLine = ""
+			
+			// Create a IssueLine based on this IssuedStock entry
+		//	set $$$INIssueLineToStorage(objINIssueLine)   = $$$INMOReceiptLocation(objINMO)
+		//	set $$$INIssueLineFromStorage(objINIssueLine) = $$$INMOSupplyingLocation(objINMO)
+			
+			set $$$INIssueLineStatus(objINIssueLine)      = 1				
+			set $$$INIssueLineQtyRequired(objINIssueLine) = fltQty
+			set $$$INIssueLineQtyIssued(objINIssueLine)   = fltQtyIssued
+			set $$$INIssueLineItem(objINIssueLine)        = idItem
+			set $$$INIssueLineUnit(objINIssueLine)        = $$$INMOLineUnit(pobjINMOLine)
+			set $$$INIssueLineToStorage(objINIssueLine)   = idToStorage
+			set $$$INIssueLineFromStorage(objINIssueLine) = objStorage.Code
+			set $$$INIssueLineBundle(objINIssueLine)      = objBundle.%Id()
+			set $$$INIssueLineReference(objINIssueLine)   = pidINIssue
+			set $$$INIssueLineReferenceLine(objINIssueLine)=pidSourceLine ;HEVA-1686.3
+			if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) { //HEVA-1073
+				set $$$INIssueLineFREE1(objINIssueLine)	  = ##class(alSOH.iSOH).GetQtyOnHand(idItem,pidProdLocn,pidProdLocn_"||"_objStorage.Code)
+			}
+			
+			if blnNotFirst = $$$YES {
+				set idLn    = $increment(idLn)
+				set pidLine = (pidLine\1)_"."_idLn
+			} else {
+				set blnNotFirst = $$$YES
+			}
+			
+			set strStatus = $$$Save("INIssueLine",pidINIssue_","_pidLine,objINIssueLine,$$$YES)
+			set fltOutstanding = fltOutstanding - fltQtyIssued
+		}
+	}
+	
+	//Blank Lines for remaining Qty
+	if fltOutstanding>0 {
+		quit:$$$ISERR(strStatus)			; EARLY EXIT
+		
+		set objINIssueLine = ""
+		set $$$INIssueLineStatus(objINIssueLine)      = 1				
+		set $$$INIssueLineQtyRequired(objINIssueLine) = fltQty
+		set $$$INIssueLineQtyIssued(objINIssueLine)   = fltOutstanding
+		set $$$INIssueLineItem(objINIssueLine)        = idItem
+		set $$$INIssueLineUnit(objINIssueLine)        = $$$INMOLineUnit(pobjINMOLine)
+		set $$$INIssueLineToStorage(objINIssueLine)   = idToStorage
+	//	set $$$INIssueLineFromStorage(objINIssueLine) = 
+	//	set $$$INIssueLineBundle(objINIssueLine)      = 
+		set $$$INIssueLineReference(objINIssueLine)   = pidINIssue
+		set $$$INIssueLineReferenceLine(objINIssueLine)=pidSourceLine ;HEVA-1686.3
+		if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) { //HEVA-1073
+			set $$$INIssueLineFREE1(objINIssueLine)	  = ##class(alSOH.iSOH).GetQtyOnHand(idItem,pidProdLocn,pidProdLocn_"||"_objStorage.Code)
+		}		
+		if blnNotFirst = $$$YES {
+			set idLn = $increment(idLn)
+			set pidLine = (pidLine\1)_"."_idLn
+		} else {
+			set blnNotFirst = $$$YES
+		}
+		set strStatus = $$$Save("INIssueLine",pidINIssue_","_pidLine,objINIssueLine,$$$YES)	
+	}
+	quit strStatus
+	
+	
+GoToIssue(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Called by Issue (I) Button on INMO form
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Jul-2009	VIJAY	SR16573:	Created
+	;-------------------------------------------------------------------------------
+	new idIssue
+	
+	quit:pYKEY=""
+	
+	set idIssue = $order(^INIssues(0,6,$$$Index(pYKEY),""))
+	if idIssue = "" { ;Also check index string without formating HEVA-1658
+	set idIssue = $order(^INIssues(0,6,pYKEY,""))
+	}
+	do GoToForm^COMUtilForm("INMOIssue",idIssue)
+	quit
+	
+	
+GoToReceipt(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Called by Receipt (R) Button on INMO form
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Jul-2009	VIJAY	SR16573:Created
+	;-------------------------------------------------------------------------------
+	new idREC
+		
+	quit:pYKEY=""
+	
+	set idREC = $order(^INRECs(0,3,$$$Index(pYKEY),""))
+	do GoToForm^COMUtilForm("INMOREC",idREC,,YPARA)
+	
+	quit
+	
+	
+OnBlurItem(pYFORM,&pYFELD)
+	;-------------------------------------------------------------------------------
+	; Called by OnBlur of the Item field on INMO form
+	; Restricts/Populates the UOM field on the form with the UOM of the Item
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 24-Jun-2014	shobby	RVCONTAGEM-11: INMOFREE1 is no INMOMaximumSuggestedQuantity
+	; 24-Apr-2013	SCR		HEVA-297: Move Code
+	; 02-Aug-2010	GRF		SR16573: use macros
+	; 29-Apr-2010	PP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new fltSugQty,idItem,idUnit,objItem
+	
+	set idItem = $$$INMOItemCode(pYFELD)
+	
+	if ((idItem '= "") && ($$$INMOStatus(pYFELD) < $$$INMOStatusConfirmado)) { ;RVCONTAGEM-11 
+		set objItem = $get(^INART(0,idItem,1))
+		set idUnit  = $$$INARTUnitofMeasure(objItem)
+		if $$$INMOUnitOfMeasure(pYFELD)="" set $$$INMOUnitOfMeasure(pYFELD) = idUnit
+		do UpdateUnits^INARTUNIT(idItem,"Y"_YFORM_"D8")
+		set %TXT(1) = %TXT(1)_"#"_"Y"_YFORM_"D8~"_idUnit
+		set fltSugQty = $$SuggestedQty(pYFELD)
+		;RVCONTAGEM-11 set %TXT(1) = %TXT(1)_"#Y"_pYFORM_"M"_$$$FldINMOMaximumSuggestedQuantity_"~"_fltSugQty
+		;RVCONTAGEM-11 if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) { //HEVA-1073
+		;RVCONTAGEM-11 set $$$INMOFREE1(pYFELD) = +fltSugQty
+		;RVCONTAGEM-11}
+		set $$$INMOMaximumSuggestedQuantity(pYFELD) = +fltSugQty ;RVCONTAGEM-11
+	}
+	
+	
+	quit
+	
+	
+SuggestedQty(pYFELD)
+	;-------------------------------------------------------------------------------
+	; Create the PO Lines based on the BOM of the Item
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 
+	; 15-Apr-2013	SCR		HEVA-297: Look at othe Open INMOs and subtract from availble SOH
+	; 05-Jun-2012	PPP		SR18031:Use Available Qty
+	; 05-May-2010	PPP		SR16573:Created
+	;-------------------------------------------------------------------------------
+	new arrQty,fltQOH,fltQty,idINARTT,idIngredient,idINMOLine,idItem,idMakeItem
+	new idSupLocn,intMinQty,objINARTT,strStatus,arrFirmed
+	
+	set idMakeItem = $$$INMOItemCode(pYFELD)
+	set idSupLocn  = $$$INMOSupplyingLocation(pYFELD)
+	
+	/*
+	if ($$$INMOMinimumQuantity(pYFELD)'=""){
+		set intMinQty=$$$INMOMinimumQuantity(pYFELD)
+	} else {
+		set intMinQty=1
+	}
+	*/
+	do GetFirmedQty(YKEY,idSupLocn,idMakeItem,.arrFirmed) ; HEVA-297
+	
+	if idMakeItem'="" {
+		set idIngredient = ""
+		
+		for {
+			set idIngredient = $order(^INARTT(0,idMakeItem,idIngredient))
+			quit:idIngredient=""
+			
+			set objINARTT = $get(^INARTT(0,idMakeItem,idIngredient,1))
+			quit:objINARTT=""
+		
+			set idItem 	= $$$INARTTItemNumber1(objINARTT)
+			set fltQty 	= $$$INARTTQuantity(objINARTT)
+			
+			//SR18031
+			//set fltQOH = ##class(alSOH.iSOH).GetQtyOnHand(idItem,idSupLocn)
+			set fltQOH 	= ##class(alSOH.iSOH).GetQtyAvailable(idItem,idSupLocn)
+			
+			set fltQOH	= fltQOH - $get(arrFirmed(idItem))	; HEVA-297
+			set:fltQOH<0 fltQOH=0							; HEVA-297
+			
+		
+		//	set arrIngredient(idIngredient,idItem) = fltQOH\fltQty
+			set arrQty(fltQOH\fltQty)=""
+		//	write !,idItem,":",fltQty,":",fltQOH,":",(fltQOH\fltQty)
+		}
+	}
+	quit +$order(arrQty(""))
+
+GetFirmedQty(pidCurOrd,pidCurSupLocn,pidCurItem,&parrFirmed)
+	;-------------------------------------------------------------------------------
+	; Get any other Firmed Qty
+	; 
+	; 
+	; Params:	pidCurOrd, this maybe null for new Orders
+	;			pidCurSupLocn
+	;			pidCurItem
+	;			
+	; Pass Back:	parrFirmed			
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Apr-2013	SCR		HEVA-297: Created
+	;-------------------------------------------------------------------------------
+	new idMakeItem,idSupLocn,idCurSupLocn,objOrd,idOrd,idStatus,idIngredient
+	new objINARTT,idItem,fltQty,fltQOH,fltReq,objINARTT
+	
+	kill parrFirmed
+	
+	quit:pidCurItem=""  ; fast exit for no item
+	
+	set idOrd	= ""
+	for {
+		set idOrd		= $order(^INMO(YM,idOrd))
+		quit:idOrd=""
+		set objOrd		= $get(^INMO(YM,idOrd,1))
+		set idStatus	= $$$INMOStatus(objOrd)
+		continue:(idStatus'=1)&&(idStatus'=2)&&(idStatus'=3) 
+		continue:$$$INMOSupplyingLocation(objOrd)'=pidCurSupLocn
+		continue:idOrd=pidCurOrd
+		
+		set idMakeItem	= $$$INMOItemCode(objOrd)
+		set idSupLocn	= $$$INMOSupplyingLocation(objOrd)
+		set fltReq		= $$$INMOMinimumQuantity(objOrd)
+		if idMakeItem'="" {
+			set idIngredient = ""
+			for {
+				set idIngredient = $order(^INARTT(0,idMakeItem,idIngredient))
+				quit:idIngredient=""
+			
+				set objINARTT = $get(^INARTT(0,idMakeItem,idIngredient,1))
+				quit:objINARTT=""
+		
+				set idItem	= $$$INARTTItemNumber1(objINARTT)
+
+				set fltQty	= $$$INARTTQuantity(objINARTT)
+			
+				set fltRes	= fltReq*fltQty
+				set parrFirmed(idItem)			= $get(parrFirmed(idItem))+fltRes
+				set parrFirmed(idItem,idOrd)	= fltRes
+			}
+		}
+	}
+				
+
+GetDataFrom(pidMO,pidDataField)
+	;-------------------------------------------------------------------------------
+	; Get the relevant Data Item from the Data, Used by Default values for 
+	; ItemCode, Supply Location and Receipt Location of INMORev
+	; 
+	; Called By : Form INMORev F8/9/10 Default Variable Input (returns D2/4/6)
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Aug-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new objMO 
+	
+	set objMO = $get(^INMO(0,pidMO,1))
+	quit $piece(objMO,Y,pidDataField)
+	
+	
+CheckQty(pfltQty)
+	;-------------------------------------------------------------------------------
+	; Check if the Quantity entered is valid
+	;
+	; Called By : Form INMO      Core Rules F7 (Required Quantity) Clears if invalid
+	;             Form INMORev   Core Rules F3 (Reverse Quantity)  Clears if invalid
+	; 
+	; Params: Entered qty, pfltQty
+	;
+	; Returns: Boolean ($$$YES indicates Invalid situation)
+	;
+	; History:
+	; 
+	; 13-Aug-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+
+	quit $select(pfltQty<0:1,pfltQty=0:1,1:0)
+	
+OnBlurQty(pYFELD)
+	;-------------------------------------------------------------------------------
+	; Check if the Quantity entered is valid
+	;
+	; Called By : Form INMO      
+	;            
+	; 
+	; Params: INMO Obj
+	;
+	; Returns: 
+	;
+	; History:
+	; 
+	; 16-Apr-2013	PPP		HEVA-297: Created
+	;-------------------------------------------------------------------------------
+	new fltMax,fltQty,strStatus
+	
+	set strStatus	= $$$OK
+	set fltMax	= $$SuggestedQty(pYFELD)
+	set fltQty	= $$$INMOMinimumQuantity(pYFELD)
+	
+	if fltQty>fltMax {
+		set strStatus= "IN01414"  ;Required Quantity can not be greater than Maximum Quantity
+		set %TXT(1)=%TXT(1)_"#Y"_YFORM_"D7"_Y
+	}
+	if $$$ISERR(strStatus) {
+		$$$Alert(strStatus)
+	}
+
+GetReferenceColor(YFELD="")					;HEVA-1172
+	quit $$$INARTColor($$GetItem(YFELD))
+
+GetReferenceOdour(YFELD)					;HEVA-1172
+	quit $$$INARTOdor($$GetItem(YFELD))
+	
+GetReferenceAspect(YFELD)					;HEVA-1172
+	quit $$$INARTAspect($$GetItem(YFELD))
+	
+GetReferenceVolume(YFELD)					;HEVA-1172
+	quit $$$INARTVolume1($$GetItem(YFELD))
+	
+GetReferencepH(YFELD)						;HEVA-1172
+	quit $$$INARTpH($$GetItem(YFELD))
+	
+GetItem(pobjINMO="")						;HEVA-1172
+	new objINART
+	
+	set idItem=$$$INMOItemCode(pobjINMO)
+	if idItem'="" set objINART=$get(^INART(YM,idItem,1))
+	quit $get(objINART)
+
+	
+]]></Routine>
+</Export>

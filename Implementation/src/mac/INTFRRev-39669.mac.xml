@@ -1,0 +1,753 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTFRRev" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTFRRev
+	
+#include COMSYS
+#include COMConst
+#include INConst
+	
+	;---------------------------------------
+	;    From Location / Storage
+	;         
+	;                     /\
+	; Ship     ||         ||       Reversal
+	;          \/
+	;
+	;   In Transit Location / Storage
+	;       from INDRPUMLKW D4/D5  <= INTFR D5, INTFRRev D5
+	; 
+	; Receive       ||
+	;               \/
+	;                       
+	;      To Location / Storage
+	;---------------------------------------
+	
+OpenReversal(pidTfr,&pintRevSeq)
+	;-------------------------------------------------------------------------------
+	; Whether there is an unprocessed reversal for a certain transfer
+	; 
+	; Called By: CreateReversal^INTFRButtons
+	; 
+	; Params:	pidTfr - INTFR id
+	;
+	; ByRefs:	pidRec - first unprocessed reversal (null if none)
+	;
+	; Returns:	boolean - whether unprocessed reversal exists
+	;
+	; History:
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new intSeq,objReversal
+	
+	set pintRevSeq = ""
+	
+	set intSeq = ""
+	for {
+		set intSeq = $order(^INTFRRev(0,pidTfr,intSeq))
+		quit:intSeq=""
+		
+		set objReversal = $get(^INTFRRev(0,pidTfr,intSeq,1))
+		continue:$$$INTFRRevStatus(objReversal)=$$$EnumINSTATUSProcessed
+		
+		set pintRevSeq = intSeq
+		quit
+	}
+	quit (pintRevSeq'="")
+	
+	
+OnAfterDataFields(pidForm,pidKey,pobjReversal)
+	;-------------------------------------------------------------------------------
+	; What needs running after header is drawn
+	;  Remove any old locks, Display open demands table, Load Edit.
+	;
+	; Params:
+	; pidForm		Form id that called this function
+	; pidKey		Key of the record
+	; pobjReversal	Header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	do LoadGrid(pidKey,pidForm,pobjReversal)     ; Form "INTFRRev"
+	quit
+	
+	
+LoadGrid(pidKey,pstrContainer,pobjReversal)
+	;-------------------------------------------------------------------------------
+	; Load Edit Grid, run validation for currently editable grid and cause grid to be redrawn.
+	;
+	; Params:
+	; pidKey			Key of header record
+	; pstrContainer		Form id that called this function
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new blnEnabled,idForm,YAUSWAHL,YFORM
+	
+	;set idTfr     = $$$KEY1(pidKey)
+	;set intRevSeq = $$$KEY2(pidKey)
+	
+	set idForm = pstrContainer_"Line"
+	set YFORM  = idForm
+	
+	set blnEnabled = ($$$INTFRRevStatus(pobjReversal) = $$$EnumINSTATUSUnprocessed)
+	if blnEnabled {
+		set blnEnabled = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	}
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 300
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)       = blnEnabled
+	set $$$COMGridEditParameterContainer(YAUSWAHL)     = pstrContainer
+	
+	set ^CacheTemp(YUSER,"GridLine") = YPARA
+	
+	$$$GRIDStart(idForm,pidKey)
+	quit
+	
+	
+OnBeforeSave(pidKey,&pobjReversal)
+	;-------------------------------------------------------------------------------
+	; Pre-save the Reversal Header - if okay save the lines first.
+	;
+	; Params:
+	; 	pidKey			INTFRRev key
+	; 
+	; ByRefs:
+	;	objReversal		The header record to be saved
+	;	Q				Save flag
+	;	
+	; Returns:	nothing
+	;
+	; History:
+	; 03-Mar-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new YFELD,YKEY,idTransfer,intRevSeq,objTransfer,strStatus
+	
+	set YFELD = pobjReversal
+	set YKEY  = pidKey
+	
+	set idTransfer = $$$KEY1(pidKey)
+	set intRevSeq  = $$$KEY2(pidKey)
+	set strStatus  = $$$OK
+	
+	if $$$INTFRRevStatus(pobjReversal) = $$$EnumINSTATUSProcessed {
+		set strStatus = $$$MakeStatus("IN00377")
+		set Q = $$$QDontSave
+	} ; "Record already processed"
+	
+	if $$$ISOK(strStatus) {
+		set objTransfer = $get(^INTFR(0,idTransfer,1))
+		
+		if ($$$INTFRStatus(objTransfer) '= $$$EnumINTFRSTATUSSent) &&
+		   ($$$INTFRStatus(objTransfer) '= $$$EnumINTFRSTATUSReceived)    {
+				set strStatus = $$$MakeStatus("IN00672","A")
+		} ; "Transfer Order can not be reversed"
+		
+		if $$$ISOK(strStatus) {
+			set strStatus = $$$GRIDSave(pidKey)     ; Transfer Order Reversal Lines
+		}
+		
+		if $$$ISERR(strStatus) {
+			do ReturnError^COMUtilError($$$MakeStatus("IN00737",pidKey,$$$Text(strStatus)))
+			set Q = $$$QDontSave
+		 ; "Save of Transfer Order Reversal %1 unsuccessful. Reason: %2"
+		
+	;	} else {
+	;		set Q = $$$QSave
+		}
+	}
+	quit
+	
+	
+Postable(pidKey) 
+	;-------------------------------------------------------------------------------
+	; Test whether this record is postable
+	;
+	; Params:
+	; 	pidKey		INTFRRev key
+	; 
+	; ByRefs:
+	;
+	; Returns:	postable status YQ
+	;
+	; History:
+	; 23-Jun-2011	GRF		SR17770: get receipt details - Reverted
+	; 24-Jun-2011	GRF		SR17770: correct variable name - INTFRRevLine P3 is
+	;							Pick Line No not Transfer Line No (Not an integer -
+	;							e.g. 2.01)
+	; 08-Sep-2010	GL/GRF	SR17501: Check for open Receipts before posting
+	; 07-Jan-2010	GRF		SR17080: Correct In Transit validation
+	; 07-Oct-2008	HQN		RevLine based on PickLine instead of TFRLine now
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new IndexIdTfr,arrLines,fltAvailQty,idINREC,idINRECList,idPickLine,idReceipt
+	new idRevSeq,idShipMode,idTfr,idTransitLocn,idTransitStore,idxTfrNo,intPostableLines
+	new objINREC,objReversal,objShipment,strINRECList,strStatus
+	
+	set intPostableLines = 0
+	set strStatus = $$$OK
+	
+	set idTfr    = $$$KEY1(pidKey)
+	set idRevSeq = $$$KEY2(pidKey)
+	
+	if (idTfr="") || (idRevSeq="") {
+		set strStatus = $$$MakeStatus("IN00738")    ; "Invalid transfer or reversal number"
+	}
+	
+	if $$$ISOK(strStatus) {
+		set objReversal = $get(^INTFRRev(0,idTfr,idRevSeq,1))
+		
+		if $$$ISOK(strStatus) && (objReversal="") {
+			set strStatus = $$$MakeStatus("IN00739",idTfr,idRevSeq)      ; "Reversal record not found (%1,%2)"
+		
+		} elseif $$$INTFRRevStatus(objReversal) = $$$EnumINSTATUSProcessed {
+			set strStatus = $$$MakeStatus("IN00377")                      ; "Record already processed"
+		}
+		
+		if $$$ISOK(strStatus) {
+			if $$IsLockedStockLocation^INLocking($$$INTFRRevSendingLocation(objReversal),"") {
+				set strStatus = $$ReasonLocked^INLocking($$$INTFRRevSendingLocation(objReversal),"","")
+			}
+			if $$$ISOK(strStatus) {
+				set idShipMode = $$$INTFRRevDispatch(objReversal)
+				if idShipMode'="" {
+					set objShipment    = $get(^INDRPUMLKW(0,idShipMode,1))
+					set idTransitLocn  = $$$INDRPUMLKWLocation(objShipment)
+					set idTransitStore = $$$INDRPUMLKWStockLocation(objShipment)
+					
+					if (idTransitLocn'="") && (idTransitStore'="") {
+						if $$IsLockedStockLocation^INLocking(idTransitLocn,idTransitStore) {
+							set strStatus = $$ReasonLocked^INLocking(idTransitLocn,idTransitStore,"")
+						}
+					
+					} else {
+						set strStatus = $$$MakeStatus("IN00748",idTfr,idShipMode)
+					} ; "Can't identify In Transit for transfer %1 - Dispatch %2 incomplete"
+						
+				} else {
+					set strStatus = $$$MakeStatus("IN00747",idTfr)
+				} ; "Can't identify In Transit for transfer %1 - No Dispatch"
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		do GetOpenPickLines^INTFRRevLine(idTfr,.arrLines)
+
+		set idPickLine = ""
+		for {
+			set idPickLine = $order(^INTFRRevLine(0,idTfr,idRevSeq,idPickLine))
+			quit:idPickLine=""
+			
+			set fltAvailQty = +$get(arrLines(idPickLine))
+			set strStatus   = $$PostableLine(idTfr,idRevSeq,idPickLine,fltAvailQty,$piece($get(arrLines(idPickLine)),Y,2),.intPostableLines)
+			quit:'$$$ISOK(strStatus)
+		}
+	}
+	
+	if $$$ISOK(strStatus) && (intPostableLines=0) {
+		set strStatus = $$$MakeStatus("IN00740")           ; "No postable lines"
+	}
+	
+	if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+		// SR17501 *****
+		if $$$ISOK(strStatus){
+			set idINRECList= ""
+			set IndexIdTfr = $$Index^COMUtilIndex(idTfr)
+			$$$Order4(^INRECs,YM,1,IndexIdTfr,idINREC)
+				set objINREC = $get(^INREC(YM,idINREC,1))
+				if $$$INRECStatus(objINREC)'=$$$EnumINSTATUSProcessed {
+					if ($order(^INRECs(YM,1,IndexIdTfr,""))=idINREC) {
+						set idINRECList = idINREC
+					}else{
+						set idINRECList = idINRECList_","_idINREC
+					}
+				}
+			$$$End
+			if +idINRECList'=0 {
+				set strStatus = $$$MakeStatus("Não é possível processar este estorno, pois existe um ou mais aceites em aberto para esta transferência ("_idINRECList_")."_$Char(10)_"Os aceites em aberto precisam ser excluídos para que se possa realizar o estorno de transferência.")
+				//This reversal cannot be processed, due to the following open transfer receipt(s): "_idINRECList_"."_$Char(10)_"Any open transfer receipt should be deleted before the reversal can be concluded.
+			}
+		}
+	}
+	
+	; SR17501 vvv
+	if $$$ISOK(strStatus) {
+		set strINRECList = ""
+		set idxTfrNo     = $$$Index(idTfr)
+		
+		set idReceipt = ""
+		for {
+			set idReceipt = $order(^INRECs(0,1,idxTfrNo,idReceipt))
+			quit:idReceipt=""
+			
+			set objINREC = $get(^INREC(0,idReceipt,1))
+			if $$$INRECStatus(objINREC)'=$$$EnumINSTATUSProcessed {
+				set strINRECList = strINRECList_","_idReceipt
+			}
+		}
+		set strINRECList = $extract(strINRECList,2,999)
+		if strINRECList'="" {
+			set strStatus = $$$MakeStatus("IN01261",strINRECList)
+		} ; "Must first delete the following open Transfer Receipts : %1"
+	}
+	; SR17501 ^^^
+	
+	if $$$ISOK(strStatus) {
+		set YQ = $$$QSave
+	} else {
+		set YQ = $$$QDontSave_" "_$$$Text(strStatus)
+	}
+	quit strStatus
+	
+	
+PostableLine(pidTfr,pintRevSeq,pidPickLine,pfltAvailQty,pidTFRLine,&pintPostableLines)
+	;-------------------------------------------------------------------------------
+	; Get the receipt status of the order line
+	;
+	; Params: pidTfr,pintRevSeq,pidPickLine - INTFRRevLine keys
+	;
+	; Returns: status
+	;
+	; History:
+	; 30-Jun-2011	GRF		SR17770: Revised - allow reversal after partial receipt
+	; 07-Oct-2008	HQN		RevLine now based on PickLine instead of TFRLine
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new blnPost,fltRevQty,objRevLine,objTfrLine,strStatus
+	
+	set strStatus  = $$$OK
+	set blnPost    = $$$NO
+	set objRevLine = $get(^INTFRRevLine(0,pidTfr,pintRevSeq,pidPickLine,1))
+	set fltRevQty  = $$$INTFRRevLineReversalQuantity(objRevLine)
+	
+	if objRevLine="" {
+		set strStatus = $$$MakeStatus("IN00741",pidPickLine)  ; "Reversal record not found for line %1"
+		
+	} elseif fltRevQty < 0 {
+		set strStatus = $$$MakeStatus("IN00742",pidPickLine)  ; "Reversal quantity cannot be less than zero (line %1)"
+	
+ ;	} elseif fltRevQty = 0 {                     ; do nothing - line will be ignored
+	
+	} elseif fltRevQty > 0 {                     ; Only these lines will be processed
+		set blnPost    = $$$YES 
+		set objTfrLine = $get(^INTFRLine(0,pidTfr,pidTFRLine,1))
+		
+		if objTfrLine="" {
+			set strStatus = $$$MakeStatus("IN00743",pidPickLine)  ; "No transfer record for line %1"
+			
+		} elseif fltRevQty > pfltAvailQty {
+			set strStatus = $$$MakeStatus("IN00746",pidPickLine,pfltAvailQty)
+		}  ; "Reversal Quantity too great in Pick line %1 (Maxm %2)"
+	} 
+	
+	if $$$ISERR(strStatus) set blnPost = $$$NO
+	set pintPostableLines = pintPostableLines + blnPost
+	
+	quit strStatus
+	
+	
+Post(pidKey)
+	;-------------------------------------------------------------------------------
+	; Post an INTFRRev record
+	;
+	; Params:	pidKey - INTFRRev id
+	;
+	; ByRefs:	YFORM
+	;
+	; Returns:	status
+	;
+	; History:
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	set strStatus=$$$OK
+	if $$$ISOK(strStatus) {
+		set strStatus = $$Transaction^COMTransaction("PostTxn^INTFRRev("""_pidKey_""","""_$$GetLineForm^INTFRInterface($get(YFORM),"INTFRRevLine")_""")",$$$YES)
+	}
+	if $$$ISOK(strStatus) {
+		do ReloadForm^COMUtilForm()
+	}
+	quit strStatus
+	
+	
+PostTxn(pidKey,pidForm="")
+	;-------------------------------------------------------------------------------
+	; Post an INTFRRev record                            *** TO BE DONE ***
+	;  -  Get the InTransit Storage used for the transfer
+	;  -  Get the default receipt storage for the sending location
+	;  -  Call UpdateStock to move the Reversal Quantity from InTransit to SendStorage
+	;  -  Increment the total Reversal Quantity for the Transfer Line
+	;  -  Update Reversal Header status and processed date
+	;
+	; Params:	pidKey - INTFRRev id
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 16-Feb-2011	GRF		SR17579: use idTfrLine
+	; 07-Jan-2010	GRF		SR17080: Correct In Transit validation
+	; 15-Jan-2009	GRF		SR16292: Additional parameter in IN00751
+	; 20-Oct-2008 	HQN		SR16003: Corrected key passing; $$$KEY macro (GRF)
+	; 07-Oct-2008	HQN		SR15995: Corrected global lookup, macro correct, global wrong
+	; 26-Sep-2008	HQN		SR15862: key change, now pickline not tfrline
+	; 07-Aug-2008	PP		SR15812: Rewrite of Transfers (Check strStatus)
+	; 10-Apr-2008	shobby	SRBR014754: Log tracking information into INARTHISTL
+	; 06-Mar-2008	PPP		SRBR014859: Added "IN00751"
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new fltIssued,fltTfrSumRev,idDispatch,idInTranLocn,idInTranStore,idPickLine
+	new idReq,idReqLine,idSendLocn,idSendStore,idTfr,idTfrLine,intRevSeq,objReqLine
+	new objRevLine,objReversal,objShipment,objTfrLine,objTfrPickLine,strStatus
+ 	
+	set idTfr     = $$$KEY1(pidKey)
+	set intRevSeq = $$$KEY2(pidKey)
+	
+	set strStatus = $$Postable(pidKey)
+	
+	set objReversal = $get(^INTFRRev(0,idTfr,intRevSeq,1))
+	
+	set idDispatch  = $$$INTFRRevDispatch(objReversal)
+	if idDispatch = "" {
+		set strStatus = $$$MakeStatus("IN00747",idTfr)
+	; "Can't identify In Transit for transfer %1 - No Dispatch"
+	
+	} else {
+		set objShipment   = $get(^INDRPUMLKW(0,idDispatch,1))
+		set idInTranLocn  = $$$INDRPUMLKWLocation(objShipment)
+		set idInTranStore = $$$INDRPUMLKWStockLocation(objShipment)
+		if (idInTranLocn="") || (idInTranStore="") {
+			set strStatus = $$$MakeStatus("IN00748",idTfr,idDispatch)
+		; "Can't identify In Transit for transfer %1 - Dispatch %2 incomplete"
+	
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set idSendLocn  = $$$INTFRRevSendingLocation(objReversal)
+		if idSendLocn = "" {
+			set strStatus = $$$MakeStatus("IN00749",idTfr)
+		; "Can't identify Receipt Storage for transfer %1 - No Sending Location"
+		
+		} else {
+			set idSendStore = $$$WWW0121ReceiptStorage($get(^WWW0121(0,0,idSendLocn,1)))
+			if idSendStore = "" {
+				set strStatus = $$$MakeStatus("IN00751",idTfr,idSendStore)    ; SR16292
+			; "Can't identify Receipt Storage for transfer %1 - No Receipt Storage defined for location %2"
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set idPickLine = ""
+		for {
+			quit:$$$ISERR(strStatus)
+			set idPickLine = $order(^INTFRRevLine(0,idTfr,intRevSeq,idPickLine))
+			quit:idPickLine=""
+			
+			set objTfrPickLine = $get(^INTFRPickLine(0,idTfr,idPickLine,1))
+			
+			kill ^CacheTempHistoryTracking(YUCI,YUSER)
+			set ^CacheTempHistoryTracking(YUCI,YUSER,"SourceForm") = pidForm
+			set ^CacheTempHistoryTracking(YUCI,YUSER,"SourceId")   = idTfr_","_idPickLine
+			
+			set strStatus = $$UpdatePick(idTfr,intRevSeq,idPickLine,idInTranLocn,idInTranStore,idSendLocn,idSendStore)
+			
+			kill ^CacheTempHistoryTracking(YUCI,YUSER)							   ;BR014754
+			
+		;	Update Transfer Line	
+			if $$$ISOK(strStatus) {
+				set objTfrPickLine = $get(^INTFRPickLine(0,idTfr,idPickLine,1))
+				set idTfrLine      = $$$INTFRPickLineSourceline(objTfrPickLine)
+				
+				set objTfrLine     = $get(^INTFRLine(0,idTfr,idTfrLine,1))
+				set objRevLine     = $get(^INTFRRevLine(0,idTfr,intRevSeq,idPickLine,1))
+				
+				set fltTfrSumRev = $$$INTFRLineReversalQuantity(objTfrLine) + $$$INTFRRevLineReversalQuantity(objRevLine)
+				set $$$INTFRLineReversalQuantity(objTfrLine) = fltTfrSumRev
+				set strStatus = $$$Save("INTFRLine",idTfr_$$$COMMA_idTfrLine,objTfrLine,$$$YES)
+				; If there is a Req update the line isseued qty
+				if $$$ISOK(strStatus) && ($$$INTFRLineReference(objTfrLine) '= "") {
+					set idReq		= $$$KEY1($$$INTFRLineReference(objTfrLine))
+					set idReqLine	= $$$KEY2($$$INTFRLineReference(objTfrLine))
+					set objReqLine	= $get(^INReqLine(YM,idReq,idReqLine,1))
+					set fltIssued	= $$$INReqLineQtyIssued(objReqLine) - fltTfrSumRev
+					set $$$INReqLineQtyIssued(objReqLine)	= fltIssued
+					set strStatus	= $$$Save("INReqLine",idReq_$$$COMMA_idReqLine,objReqLine,1)
+					if $$$ISOK(strStatus) {
+						set strStatus	= $$UpdateStatus^INReq(idReq)
+					}
+				}
+			}
+		}
+	}	
+	
+	;	Update Reversal Header
+	if $$$ISOK(strStatus) {
+		set objReversal = $get(^INTFRRev(0,idTfr,intRevSeq,1))
+		set $$$INTFRRevStatus(objReversal)   = $$$EnumINSTATUSProcessed
+		set $$$INTFRRevReversed(objReversal) = $horolog
+		set strStatus = $$$Save("INTFRRev",idTfr_$$$COMMA_intRevSeq,objReversal,$$$YES)
+	}
+	quit strStatus
+	
+	
+UpdatePick(pidTfr,pintRevSeq,pidPickLine,pidInTranLocn,pidInTranStore,pidSendLocn,pidSendStore)
+	;-------------------------------------------------------------------------------
+	; Reverse stock using INWE1
+	;
+	; Params:
+	; 	pidTfr			Reversal Line Key P1 Transfer ID
+	; 	pintRevSeq		Reversal Line Key P2
+	; 	pidPickLine		Reversal Line Key P3 TransferPickLine ID
+	; 	pidInTranLocn	In Transit Location
+	; 	pidInTranStore	In Transit Storage   - Deduct RevQty from here
+	; 	pidSendLocn		Sending Location
+	; 	pidSendStore	Sending Storage      - Add it to here
+	;
+	; ByRefs:
+	;
+	; Returns:	Status
+	;
+	; History:
+	; 24-Jun-2011	GRF		SR17770: correct variable name - INTFRRevLine P3 is
+	;							Pick Line No not Transfer Line No (Not an integer -
+	;							e.g. 2.01)
+	; 20-Oct-2008	HQN		SR16003: Each INTFRRevLine refers to 1 INTFRPickLine now
+	; 26-Sep-2008	HQN		SR15862: corrected key passing
+	; 19-May-2008	GRF		SR15742: Preserve both Batch and Lot No from INTFRPickLine
+	; 							passing Lot No to UpdateStock instead of Batch No
+	; 06-Mar-2008	PPP		SRBR014859: Primed strStatus
+	; 04-Mar-2008	GRF		SRBR014859: Created (adapted from INRECTFR)
+	;-------------------------------------------------------------------------------
+	new dteExpiry,fltBalanceQty,fltPickQty,fltPickRevQty,fltProcessQty,fltRevQty
+	new idBatch,idItem,idLotNo,idxTfrNo,objPickLine,objRevLine,strStatus
+	
+	set strStatus  = $$$OK
+	
+	set objRevLine = $get(^INTFRRevLine(0,pidTfr,pintRevSeq,pidPickLine,1))
+	set idxTfrNo   = $$$Index(pidTfr)
+	
+	set fltRevQty  = $$$INTFRRevLineReversalQuantity(objRevLine)
+	set idItem     = $$$INTFRRevLineItem(objRevLine)
+	
+	if fltRevQty > 0 {
+		set objPickLine = $get(^INTFRPickLine(0,pidTfr,pidPickLine,1))
+		
+		set fltPickQty    = $$$INTFRPickLinePickedQuantity(objPickLine)
+		set fltPickRevQty = $$$INTFRPickLineReversalQuantity(objPickLine)
+		
+		if (fltPickQty > fltPickRevQty) {
+			set idBatch       = $$$INTFRPickLineBatch(objPickLine)
+			set idLotNo       = $$$INTFRPickLineLotNumber(objPickLine)     ; SR15742
+			set dteExpiry     = $$$INTFRPickLineUsebyDate(objPickLine)
+			
+			set fltBalanceQty = fltPickQty-fltPickRevQty
+			set fltProcessQty = $select(fltRevQty<=fltBalanceQty:fltRevQty, 1:fltBalanceQty)
+			set fltRevQty     = fltRevQty     - fltProcessQty
+			set fltPickRevQty = fltPickRevQty + fltProcessQty
+			
+			set strStatus = $$UpdateStock(idItem,fltProcessQty,pidInTranLocn,pidInTranStore,pidSendLocn,pidSendStore,
+			                              idLotNo,dteExpiry,pidTfr,pintRevSeq,pidPickLine)
+			if $$$ISOK(strStatus) {
+				set $$$INTFRPickLineReversalQuantity(objPickLine) = fltPickRevQty
+				set strStatus = $$$Save("INTFRPickLine",pidTfr_$$$COMMA_pidPickLine,objPickLine,$$$YES)
+			}
+		}
+	}
+	quit strStatus
+	
+	
+UpdateStock(pidItem,pfltProcessQty,pidInTranLocn,pidInTranStore,pidSendLocn,pidSendStore,
+            pidLotNo,pdteExpiry,pidTfr,pintRevSeq,pidPickLine)
+	;-------------------------------------------------------------------------------
+	; Reverse stock using INWE1
+	;
+	; pintTfrRevLineKey	: Line component of a INTFRRevLine ie INTFRLine_$$$COMMA_INTFRPickLine
+	; Params:
+	; 	pidItem			
+	; 	pfltProcessQty	
+	; 	pidInTranLocn	In Transit Location
+	; 	pidInTranStore	In Transit Storage   - Deduct RevQty from here
+	; 	pidSendLocn		Sending Location
+	; 	pidSendStore	Sending Storage      - Add it to here
+	; 	pidLotNo		Lot Number where applicable
+	; 	pdteExpiry		Expiry Date where applicable
+	; 	pidTfr			Reversal Line Key P1 Transfer ID
+	; 	pintRevSeq		Reversal Line Key P2
+	; 	pidPickLine		Reversal Line Key P3
+	;
+	; ByRefs:
+	;
+	; Returns:	Status
+	;
+	; History:
+	; 07-oct-2008	Luke 	SR15862: PEER Variable News
+	; 26-Sep-2008	HQN		SR15862: Changed arguments to reflect exact usage
+	; 						Calling UpdateSOH with new type 3: reversal
+	; 07-Aug-2008	PP		SR15812: Rewrite of Transfers 
+	; 						1. Update SOH using new Routine
+	; 						2. Check strStatus and Quit Status
+	; 19-May-2008	GRF		SR15742: Process Lot No instead of Batch No
+	; 04-Mar-2008	GRF		SRBR014859: Created (adapted from INRECTFR)
+	;-------------------------------------------------------------------------------
+	new arrMove,dteSOH,fltMoveQty,fltSOHQty,intInTransitType,objSOH,strStatus,strText
+
+	
+	//PPP:FIXME - INWE References
+	set dteSOH = ""
+	for {
+		set dteSOH = $order(^INWE(0,pidItem,pidInTranLocn,pidInTranStore,dteSOH))
+		quit:dteSOH=""
+		quit:pfltProcessQty=0
+		
+		set objSOH = $get(^INWE(0,pidItem,pidInTranLocn,pidInTranStore,dteSOH,1))
+	; vvv  FIXME : <GRF> Do we need to check *BOTH* Batch and Lot? (SR15730)
+	;                    Do we need to accept any INWELotNo when pidLotNo is null?  ditto Expiry Date
+	;	continue:$$$INWELotNo(objSOH)'=pidBatch                 ; Only for same batch
+		continue:$$$INWELotNo(objSOH)'=pidLotNo                 ; Only for same Lot No    ; SR15742
+		continue:$$$INWEUseableUntilDate(objSOH)'=pdteExpiry    ; and expiry date
+		
+		set fltSOHQty = $$$INWEQuantity(objSOH)
+		if fltSOHQty > 0 {
+			set fltMoveQty     = $select(pfltProcessQty<=fltSOHQty:pfltProcessQty, 1:fltSOHQty)
+			set pfltProcessQty = pfltProcessQty - fltMoveQty
+			
+			set $$$INWETransferQuantity(objSOH) = fltMoveQty
+			set arrMove(dteSOH) = objSOH
+		}
+	}
+	
+	// If more quantity reversed than have in batches
+	if pfltProcessQty {
+		set dteSOH = $order(arrMove(""),-1)	; Take from last one
+		if dteSOH'="" {
+			set objSOH = arrMove(dteSOH)
+		} else {							; Or if none, create new INWE
+			set dteSOH = $$Increment^INWECounter(pidItem,pidInTranLocn,pidInTranStore)
+	;---------------------------------------
+	;
+	; *** UPDATE INWE POINT ***
+	; 
+	; This comment marks where the INWE class is being
+	; saved or killed as an indication of where a
+	; common method may need to be located.     <GRF>
+	;
+	;---------------------------------------
+			set ^INWE(0,pidItem,pidInTranLocn,pidInTranStore,dteSOH,1)=""   ; new record
+			set objSOH = ""
+		;	set $$$INWELotNo(objSOH)            = pidBatch	; Add batch details  ; SR15742
+			set $$$INWELotNo(objSOH)            = pidLotNo
+			set $$$INWEUseableUntilDate(objSOH) = pdteExpiry
+	; FIXME : <GRF> Do we need to save *BOTH* Batch and Lot?  (SR15730)
+		}
+		set $$$INWEQuantityDifference(objSOH) = 2  ;run negative
+		set $$$INWETransferQuantity(objSOH)   = $$$INWETransferQuantity(objSOH) + pfltProcessQty
+		set arrMove(dteSOH)=objSOH
+	}
+	
+	set strText = $$$Text($$$MakeStatus("IN00750"))   ; "Transfer Reversal"
+	set dteSOH = ""
+	for {
+		set dteSOH = $order(arrMove(dteSOH))
+		quit:dteSOH=""
+		
+		set objSOH = arrMove(dteSOH)
+		set intInTransitType = 3
+		set strStatus = $$UpdateSOH^INTRNStockUpdate(intInTransitType,pidItem,pidInTranLocn,pidInTranStore,dteSOH,pidSendLocn,pidSendStore,$$$INWETransferQuantity(objSOH),pidTfr,pintRevSeq_$$$COMMA_pidPickLine)
+		
+	}
+	quit strStatus
+	
+Update(YDATEI,YKEY,YFELD,pidRevLine)
+	;-------------------------------------------------------------------------------
+	; Common update point, insulating arguments
+	; 
+	; History:
+	; 16-May-2008	GRF		SR15717: remove ^SysSetup("V1 to V2") switch
+	; 06-May-2008	GRF		SR15717: Separate processing once processing V2 Bundles
+	; 							as well as V1
+	;-------------------------------------------------------------------------------
+	do Transfer^INWE1V2(YDATEI,YKEY,YFELD,"TfrRev",pidRevLine)
+	quit
+	
+	
+ShowReversals(pidTfr)
+	;-------------------------------------------------------------------------------
+	; Show Transfer Reversals at bottom of INTFR tab 1
+	; 
+	; Called by: INTFR
+	; 
+	; Params:	pidTfr		INTFR key
+	;
+	; Returns:	nothing
+	;
+	; History:
+	; 29-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new arrQuery
+	
+	;+++++++++++++++++++++++++++++++++++++++ TODO : Left inactive - Find out why this leaves the screen dead
+	quit
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	
+	set arrQuery("Class")	= "INTFRRev"
+	set arrQuery("Loop")	= "ReversalQuery^INTFRRev"
+	set arrQuery("Get")		= "set id=$get(^INTFRRev(0,id(1),id(2),1))"
+	set arrQuery("Link") 	= "INTFRRev~P~1-2"
+	set arrQuery("Title")	= $$^WWWFORMNAME("INTFRRev")
+	
+	set arrQuery("Col",1)	= "P~1~L"
+	set arrQuery("Col",2)	= "P~2~L"
+	set arrQuery("Col",3)	= "D~9~L"
+	set arrQuery("Col",4)	= "D~10~L"
+	set arrQuery("Col",5)	= "D~14~L"
+	
+	do Query^COMQuery(.arrQuery,pidTfr)
+	
+	quit     ; ^^^^ see above
+	
+	
+ReversalQuery(parrQuery,&parrStorage,pidTfr)
+	;-------------------------------------------------------------------------------
+	; Loop for the COMQuery above - show related receipts
+	;
+	; Params:	parrQuery	- COMQuery info
+	; 			parrStorage	- COMQuery data
+	; 			pidxTFR		- indexed INFTR id
+	;
+	; ByRefs:
+	;
+	; Returns:	int - row count
+	;
+	; History:
+	; 29-Feb-2008	GRF		SRBR014859: Copied from elsewhere for ShowReversals
+	;-------------------------------------------------------------------------------
+	new idRevSeq,intCount
+	set intCount=0
+	
+	set idRevSeq = ""
+	for {
+		set idRevSeq = $order(^INTFRRev(0,pidTfr,idRevSeq))
+		set @parrStorage@($increment(intCount),1) = idRevSeq   ; pidTfr_$$$COMMA_idRevSeq ? perhaps
+	}
+	quit intCount
+	
+
+]]></Routine>
+</Export>

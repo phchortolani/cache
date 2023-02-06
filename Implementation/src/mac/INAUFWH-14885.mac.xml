@@ -1,0 +1,1694 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INAUFWH" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INAUFWH(YKEY)
+#include COMSYS
+#include INConst
+#include %occInclude
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		BESTIMMEN DER WARENHERKUNFT
+	;		Identify source of goods
+	;		
+	;		When a radio button is selected the form is refreshed and the input value processed.
+	;		Form Layout shown under "Manual Input Form INAUFWH" below.
+	;		
+	;	YFUNCT "WARENHERKUNFT"
+	;			0 : Not Specified      3 : Production
+	;			1 : Order              4 : Service
+	;			2 : From Stock         5 : Purchase Order
+	; 
+	; Inputs : 
+	; 
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 14-Oct-2008	PPP		SR16031: 
+	; 						1. Moved Source Listing Block to ^INAUFWHSource
+	; 						2. Updated the getting of idBundleStock (issue with |
+	; 							as id contains | as well)
+	; 						3. Old Reservations Removed
+	; 						4. Remove references to INWE
+	; 10-Oct-2008	HQN		SR16013: Trust our sourcing algorithm to handle
+	; 							negative stock values.
+	; 						SR16023: Show V2 SOH Summary for this order location
+	; 17-Sep-2008	HQN		SR15808: Changed format of V2 reservations/sourcing
+	; 							Updated code to match
+	; 13-Aug-2008	HQN		SR15811: Use V2 movement/SOH processing, don't update
+	; 							INWE/INARTHISTL from here
+	; 12-Aug-2008	HQN		SR15811: V2 Movement/SOH processing
+	; 11-Aug-2008	HQN		SR15811: V2 Sourcing implemented (EXPERIMENTAL)
+	; 							Adding stylesheet usage instead of html attributes/
+	; 							inline styling
+	; 04-Apr-2008	GM		SRBR014923: Changed $$^WWWTEXT() to $$$Text() for 
+	; 							language texts (53) and (54)
+	; 08-Jul-2007	GRF		Doco; boolean macros
+	; 20-Dec-2006	Steve S	SR15244: If sourcing from stock, check that we have enough SoH
+	; 07-Dec-2006	GRF		SR15272: restrict Internal Customers to sourcing from stock
+	; 05-Dec-2006	GRF		Doco
+	; 29-Nov-2006	GRF		SR15232: Doco
+	; 21-Nov-2006	GRF		SR15226: Emphasise setting NOPOST boolean in INARTMINUS call.
+	; 05-Oct-2006	RPW		SR14746: Fixed missed direct global writes. This code now
+	; 						has multiple WWWSPEI calls for INAUFP, this routine needs
+	; 						to be rewritten.
+	; 26-Sep-2006	RPW		SR14933: If we are attempting to source from stock, check
+	; 						that we can source the item.  Fixed some language texts
+	; 21-SEP-2006 	FAN 	SR14746: Sales statistics incorrect
+	; 04-Sep-2006	GRF		SR12027: Unnecessary loop accessing same data repeatedly
+	; 28-Aug-2006	GRF		SR12027: D1=>D8; Naked References; INVORG Macros;
+	; 						replace repeated case conversion with idxVARIABLES;
+	; 						boolean macros
+	; 20-Jun-2006	JW		SR14748: Removed logging code.
+	; 08-Jun-2006	Steve S	SR14705: Logging code.
+	; 01-May-2006	RPW		SR14547: Always pass the location into INARTMENGE, we do
+	; 						not want the entire company record.
+	; 06-Mar-2006	RPW		SR14521: Do not allow manual sourcing when the location
+	; 						doesn't match the order location
+	; 31-Mar-2006	RPW		SR14379: Fixed Non-Stock Items.
+	; 20-Mar-2006	RPW		SR14379: If we have no stock, do not allow the source to be
+	; 						performed.
+	; 09-Mar-2006	Steve S	SR14311: Disallow sourcing adjustment if order is blocked
+	; 25-Aug-2005	GRF		SR12721 : Doco
+	; 14-Jul-2005	GRF		INVORG macro
+	; 30-Jun-2005	GRF		SR12834 : Incorrect text code replaced
+	; 05.07.2000	DT
+	;-------------------------------------------------------------------------------
+	new AUF,AUF1,blnInternalCust,blnNOPOST,idLocation,idxAUF,idxKUNDE,KUNDE,LIEF,MENGE
+	new objINVORG,objOrder,POS,POS1,PRICE,TEIL,TEILMAX,strStatus
+	
+	;***************************************
+	;
+	;  FIXME : Inconsistent operation when qty on hand at a site locn is negative,
+	;          or goes negative, or when a bin has both +ve & -ve entries.    <GRF>
+	;          
+	;       1. Negative bin qty (shown in red) only seems to be
+	;          displayed when site location total is negative.
+	;          Change for SR15244 now displays an error message
+	;          but omission of the negative bin qty makes it hard
+	;          to see why positive bin qty wasn't acceptable.
+	;                                       [DOESN'T MATCH INWE TABLE BELOW]
+	;          
+	;       2. If QOH for site locn is -ve but chosen bin has stock,
+	;          sourcing screen doesn't give error but instead refreshes
+	;          with no sourcing options without actually sourcing
+	;          from the selected bin.       [CAN'T GO FURTHER NEGATIVE AT SITE]
+	;          
+	;       3. If QOH for site locn is +ve but less than the
+	;          required qty, the sourcing screen allows the whole
+	;          of the quantity in the selected bin to be sourced
+	;          even though that takes the QOH at the site locn
+	;          negative.  Suggest for consistency that it should
+	;          only allow as much stock to be removed from that
+	;          bin as would take the QOH for the site locn back
+	;          to zero.                     [PERMITTED TO GO NEGATIVE AT SITE]
+	;          (May be flag based - still inconsistent between 2 & 3)
+	;
+	;***************************************
+	
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;  AUF1			objINAUF		Order
+	;  XAUF1		objINAUF		Order
+	;  POS1			objINAUFP		OrderLine
+	;  XPOS1		objINAUFP		OrderLine
+	;+++++++++++++++++++++++++++++++++++++++
+	set objINVORG = $get(^INVORG(YM,YM,1))
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;  1.  INPUT from displayed sources returns YFUNCT.
+	;      If set, perform sorcing.
+	;  2.  If still have outstanding stock, refresh form &
+	;      allow further input provided not a background
+	;      process.
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	;*******************************************************************************
+	; PART 1 : Process response from previous INPUTs
+	;          YFUNCT matches Source Entries under (*6*) in PART 2.
+	;*******************************************************************************
+	
+	
+	SET YFUNCT=$GET(%(YQUERY,"YFUNCT"))   ;AUSGEWÄHLTE FUNKTION  ; selected function
+ 
+	if (+YFUNCT=2)&&('$$CanSource($$$KEY1(YKEY),$$$KEY2(YKEY),$piece(YFUNCT,"|",2))) { // SR14933
+		;SR15244
+		$$$Alert("IN00598") ;	Insufficient stock to perform sourcing.
+		set YFUNCT="" 		; 	Repaint the form
+	}
+	
+	IF YFUNCT'="" DO  IF YQ=1 QUIT        ;WARENHERKUNFT BESTIMMEN ;ordain 
+	. SET YQ=0
+	. SET OK=0  ;WENN OK'=0 DANN WIEDER IN WH ;when re- within 
+	. SET AUF=$PIECE(YKEY,",",1)			QUIT:AUF=""
+	. SET POS=$PIECE(YKEY,",",2)			QUIT:POS=""
+	. SET POS1=$GET(^INAUFP(YM,AUF,POS,1))	QUIT:POS1=""      ; preserved copy?
+	. ;
+	. ;WARENHERKUNFT BESTIMMEN  ;BEI BESTELLUNG SIEHE UNTEN !  WENN $FIND(YFUNCT,";") BEDEUTET RESERVIEREN ZURÜCKSETZEN
+	. IF +YFUNCT'=1 IF +YFUNCT'=2 IF +YFUNCT'=7 IF +YFUNCT'=8 IF '$FIND(YFUNCT,";") SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,7)=+YFUNCT 
+	. IF +YFUNCT'=2 IF +YFUNCT'=7 IF +YFUNCT'=8 SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,6)=$PIECE(^INAUFP(YM,AUF,POS,1),Y,5)
+	. ;
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. ;		YFUNCT 3	
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. ;IF +YFUNCT=3 IF $PIECE(objINVORG,Y,70)=1 DO
+	. IF +YFUNCT=3 DO  ;FIS;25899;INAUF1SEL IMMER AUSFÜHREN;17.06.04
+	. . IF $$$INVORGDRPActivated(objINVORG)=$$$YES DO START^INDRPPRODU(AUF,POS)  ;KEIN JOB ;TYBD;22.1.03 ;no 
+	. . DO ^INAUF1SEL()  ;NEUER AUFTRAG ;order 
+	. ;
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. ;		YFUNCT 7	EINTRAGEN LIEFERANT					;FIS;23856;01.07.03
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. IF +YFUNCT=7 DO
+	. . NEW LIEF,YFORM,YVOR,AUF1,POS1,OK
+	. . SET LIEF=$PIECE(YFUNCT,"-",2,99)
+	. . IF LIEF'="" DO
+	. . . SET AUF1=$GET(^INAUF(YM,AUF,1))
+	. . . SET $PIECE(AUF1,Y,12)=LIEF
+	. . . SET $PIECE(AUF1,Y,38)=0            ;SPERRE AUFHEBEN ;suspension repeal 
+	. . .;SET $PIECE(AUF1,Y,39)=YBED         ;VON
+	. . .;SET $PIECE(AUF1,Y,40)=$HOROLOG     ;AM
+	. . . SET OK=$$^WWWSPEI("INAUF",AUF,AUF1,1)
+	. . . SET POS=""
+	. . . FOR  SET POS=$ORDER(^INAUFP(YM,AUF,POS)) QUIT:POS=""  DO
+	. . . . SET POS1=$GET(^INAUFP(YM,AUF,POS,1))
+	. . . . SET $PIECE(POS1,Y,12)=LIEF
+	. . . .;SET $PIECE(POS1,Y,205)=0         ;SPERRE AUFHEBEN
+	. . . . DO SAVE^WWWSPEI("INAUFP",AUF_","_POS,POS1,1)
+	. . . . DO ^INAUFPKNEU(AUF,POS,1)        ;ARTIKELKONDITIONEN ÜBERTRAGEN ;transport 
+	. ;
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. ;		YFUNCT 8										;FIS;26869;21.02.05
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. IF +YFUNCT=8 DO
+	. . SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,7)=2  ;LAGER (ABER OHNE RESERVIERUNG)
+	. . SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,6)=0  ;MUSS NOCH ZUGEORDNET WERDEN (BEI BEREITSTELLUNG)
+	. ;
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. ;		YFUNCT 1	BESTELLEN
+	. ;					Order
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. IF +YFUNCT=1 DO
+	. . NEW YART,YFELD,MENGE,YPOS
+	. . SET MENGE=$PIECE(^INAUFP(YM,AUF,POS,1),Y,5)
+	. . ;
+	. . SET YPOS=POS
+	. . ;
+	. . ;WENN NUR EINE POS ODER ALLE POSITIONEN DES LIEFERANTEN ;when only one Or 
+	. . DO:$PIECE(YFUNCT,"-",3)'="ALL"  IF $PIECE(YFUNCT,"-",3)="ALL" IF $PIECE(YFUNCT,"-",2)'="" SET YPOS="" FOR  SET YPOS=$ORDER(^INAUFP(YM,AUF,YPOS)) QUIT:YPOS=""  DO
+	. . . SET POS1=$GET(^INAUFP(YM,AUF,YPOS,1))
+	. . . QUIT:POS1=""
+	. . . IF $PIECE(YFUNCT,"-",3)="ALL" QUIT:$PIECE(POS1,Y,7)'=""  ;WH BEREITS FESTGELEGT ;yet 
+	. . . SET YART=$PIECE(POS1,Y,4)   ;ARTIKEL ;item 
+	. . . QUIT:YART=""
+	. . . IF $PIECE(YFUNCT,"-",3)="ALL" QUIT:'$DATA(^INARTK(YM,YART,$PIECE(YFUNCT,"-",2),1))  ;LIEFRANTENKONDITION PRÜFEN ;Check supplier condition
+	. . . SET MENGE=$PIECE(^INAUFP(YM,AUF,YPOS,1),Y,5)
+	. . . SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,7)=1  ;WARENHERKUNFT BESTIMMEN ;Identify source of goods 
+	. . . SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,6)=$PIECE(^INAUFP(YM,AUF,YPOS,1),Y,5)
+	. . . IF $$$INVORGDoNotKillComponents(objINVORG)'=$$$YES DO  ;LÖSCHEN TEILE ;Delete 
+	. . . . KILL ^INAUFPT(YM,AUF,YPOS)   ;KEINE TEILE BEI BESTELLUNG ;no next to sales order 
+	. . . . KILL ^INAUFPXL(YM,AUF,YPOS)  ;TEILESTRUKTUR
+	. . . ;
+	. . . IF $PIECE(YFUNCT,"-",2)'="" DO  ;BEI BESTIMMTEN LIEFERANTEN BESTELLEN ;next to book 
+	. . . . ;SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,12)=$PIECE(YFUNCT,"-",2) // SR14746;LIEFERANT SICHERN ;supplier safeguard 
+	. . . . DO 
+	. . . . . NEW SATZ
+	. . . . . SET SATZ=$GET(^INAUFP(YM,AUF,YPOS,1))
+	. . . . . SET $PIECE(SATZ,Y,12)=$PIECE(YFUNCT,"-",2) // SR14746;
+	. . . . . SET strStatus=$$$Save("INAUFP",AUF_","_YPOS,SATZ,$$$YES) // SR14746
+	. . . . DO   ;TYBD;ZUSCHLÄGE;ADDONS;14,12,2004
+	. . . . . NEW KUNDE,LIEF,KUNDELIEF
+	. . . . . SET KUNDE=$PIECE($GET(^INAUF(YM,AUF,1)),Y,1)
+	. . . . . QUIT:KUNDE=""
+	. . . . . SET LIEF=$PIECE(YFUNCT,"-",2)
+	. . . . . QUIT:LIEF=""
+	. . . . . SET KUNDELIEF=$GET(^INKUNDELIEF(YM,KUNDE,LIEF,1))
+	. . . . . IF $PIECE(KUNDELIEF,Y,26)'=""    SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,384)=$PIECE(KUNDELIEF,Y,26)  ;KUNDENKONTO
+	. . . . . IF $PIECE(KUNDELIEF,Y,27)'=""    SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,385)=$PIECE(KUNDELIEF,Y,27)  ;KUNDENKOSTENSTELLE
+	. . . . . IF $PIECE(KUNDELIEF,Y,31)'=""    SET $PIECE(^INAUF(YM,AUF,1),Y,210)=$PIECE(KUNDELIEF,Y,31) SET $PIECE(^INAUF(YM,AUF,1),Y,303)=1  ;SPEZIALZUSCHLAG FÜR KUNDE;TYBD;27,11,2004;26791;
+	. . . . . IF $PIECE(KUNDELIEF,Y,32)=$$$YES SET $PIECE(^INAUF(YM,AUF,1),Y,210)="" SET $PIECE(^INAUF(YM,AUF,1),Y,303)=""  ;SPEZIALZUSCHLAG FÜR KUNDE NICHT BERECHNEN;TYBD;27,11,2004;26791;
+	. . . . ;
+	. . . . IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=5 DO  ;REQUISITION UMWANDELN ;transmute 
+	. . . . . NEW YVOR,YFORM,YOK
+	. . . . . SET YFELD=$GET(^INAUF(YM,AUF,1))
+	. . . . . SET $PIECE(YFELD,Y,2)=2   ;REQUISITION IN BESTELLUNG TAUSCHEN ;within sales order barter 
+	. . . . . SET YOK=$$^WWWSPEI("INAUF",AUF,YFELD,1)
+	. . . . . DO  ;25931;TYBD;18,6,2004;BITMAP FÜR INAUF1
+	. . . . . . NEW YFORM,YVOR,YFELD
+	. . . . . . SET YFELD=$GET(^INAUF1(YM,AUF,1))
+	. . . . . . SET $PIECE(YFELD,Y,2)=2 
+	. . . . . . SET YA=$$^WWWSPEI("INAUF1",AUF,YFELD,1)   ;ZWISCHENDATEI SETZTEN
+	. . . . . . ;SET $PIECE(^INAUF1(YM,AUF,1),Y,2)=2   ;SEZTEN FELD
+	. . . . ;
+	. . . . IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=2 DO
+	. . . . . ;IF $PIECE(^INAUF(YM,AUF,1),Y,12)="" SET $PIECE(^INAUF(YM,AUF,1),Y,12)=$PIECE(YFUNCT,"-",2)  ;FIS;23865;30.06.03;BESTELLUNGEN OHNE LF
+	. . . . . IF $PIECE(^INAUF(YM,AUF,1),Y,12)="" DO
+	. . . . . . NEW SATZ
+	. . . . . . SET SATZ=$GET(^INAUF(YM,AUF,1))
+	. . . . . . SET $PIECE(SATZ,Y,12)=$PIECE(YFUNCT,"-",2)
+	. . . . . . SET strStatus=$$$Save("INAUF",AUF,SATZ,$$$YES) // SR14746
+	. . . . SET YART=$PIECE($GET(^INAUFP(YM,AUF,YPOS,1)),Y,4)  ;ARTIKEL ;item 
+	. . . . ;
+	. . . . ;ARTIKELKONDITIONEN ÜBERTRAGEN ;transport 
+	. . . . DO ^INAUFPKNEU(AUF,YPOS,1)
+	. . . . ;
+	. . . . DO
+	. . . . . NEW KUNDE,LIEF
+	. . . . . SET KUNDE=$PIECE($GET(^INAUF(YM,AUF,1)),Y,1)
+	. . . . . QUIT:KUNDE=""
+	. . . . . SET LIEF=$PIECE(YFUNCT,"-",2)
+	. . . . . QUIT:LIEF=""
+	. . . . . IF LIEF'="" IF $GET(KUNDE)'="" DO
+	. . . . . . ; VK=EK INKL. ÜBERNAHME DER RABATTE;FIS;29.02.05;27351
+	. . . . . . IF ($$$INVORGSaleCost(objINVORG)=$$$YES) && ($$$INVORGApplyInvDiscountsToOrder(objINVORG)=$$$YES) DO
+	. . . . . . . SET KOND1=$GET(^INAUFPK(YM,AUF,YPOS,1))
+	. . . . . . . QUIT:KOND1=""
+	. . . . . . . IF +$PIECE(KOND1,Y,47)'=0   SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,118)=$PIECE(KOND1,Y,47)  ;FIXER VERKAUFSPREIS
+	. . . . . . . ;FOR YI=2,3,4,5,6,51,52,53 DO   ; 04-Sep-2006 loop not required
+	. . . . . . . IF +$PIECE(KOND1,Y,2)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,122)=$PIECE(KOND1,Y,2)   ;RABATT 1
+	. . . . . . . IF +$PIECE(KOND1,Y,3)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,128)=$PIECE(KOND1,Y,3)   ;RABATT 2
+	. . . . . . . IF +$PIECE(KOND1,Y,4)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,212)=$PIECE(KOND1,Y,4)   ;RABATT 3 ;TYBD;19.2,2005;27277;GEM
+	. . . . . . . IF +$PIECE(KOND1,Y,5)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,214)=$PIECE(KOND1,Y,5)   ;AUF/ABSCHLAG % ;TYBD;19.2,2005;27277;GEM
+	. . . . . . . IF +$PIECE(KOND1,Y,6)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,211)=$PIECE(KOND1,Y,6)   ;AUF/ABSCHLAG BETRAG
+	. . . . . . . IF $PIECE(KOND1,Y,51)'="" SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,125)=$PIECE(KOND1,Y,51)  ;TEXT RABATT 1
+	. . . . . . . IF $PIECE(KOND1,Y,52)'="" SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,129)=$PIECE(KOND1,Y,52)  ;TEXT RABATT 2
+	. . . . . . . IF $PIECE(KOND1,Y,53)'="" SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,213)=$PIECE(KOND1,Y,53)  ;TEXT RABATT 3  ;FIS;28.02.05
+	. . . . . . . DO EH2^INBRUTTONETTO(AUF,YPOS)    ; Updates ^INAUFP     ;TYBD;3,1,2005
+	. . . . . . ; ^^^^^ 04-Sep-2006 end
+	. . . . . . ;
+	. . . . . . NEW KUNDELIEF,RAHMEN,RAHMEN1,WG
+	. . . . . . SET KUNDELIEF=$GET(^INKUNDELIEF(YM,KUNDE,LIEF,1))
+	. . . . . . QUIT:KUNDELIEF=""
+	. . . . . . SET RAHMEN=$PIECE(KUNDELIEF,Y,34)
+	. . . . . . QUIT:RAHMEN=""
+	. . . . . . ;
+	. . . . . . SET RAHMEN1=""
+	. . . . . . SET WG=$PIECE($GET(^INARTK(YM,YART,LIEF,1)),Y,80)
+	. . . . . . IF $DATA(^INRAHMENGROUP(YM,LIEF,RAHMEN,0,1))            SET RAHMEN1=^INRAHMENGROUP(YM,LIEF,RAHMEN,0,1)  ;28-Aug-2006
+	. . . . . . IF WG'="" IF $DATA(^INRAHMENGROUP(YM,LIEF,RAHMEN,WG,1)) SET RAHMEN1=^INRAHMENGROUP(YM,LIEF,RAHMEN,WG,1) ;28-Aug-2006
+	. . . . . . IF RAHMEN1="" DO
+	. . . . . . . SET RAHMEN(1)=$ORDER(^INRAHMENGROUP(YM,LIEF,RAHMEN,"")) 
+	. . . . . . . IF RAHMEN(1)'="" IF $DATA(^INRAHMENGROUP(YM,LIEF,RAHMEN,RAHMEN(1),1)) SET RAHMEN1=^INRAHMENGROUP(YM,LIEF,RAHMEN,RAHMEN(1),1) ;28-Aug-2006
+	. . . . . . QUIT:RAHMEN1=""
+	. . . . . . ;
+	. . . . . . FOR YI=2,3,4,5,6,51,52,53 IF $PIECE(RAHMEN1,Y,YI)'="" SET $PIECE(^INAUFPK(YM,AUF,YPOS,1),Y,YI)=$PIECE(RAHMEN1,Y,YI)   ;RABATTE
+	. . . . . . ; EK=VK;TYBD;2,1,2005
+	. . . . . . IF $$$INVORGSaleCost(objINVORG)=$$$YES DO
+	. . . . . . . IF +$PIECE(RAHMEN1,Y,2)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,122)=$PIECE(RAHMEN1,Y,2)
+	. . . . . . . IF +$PIECE(RAHMEN1,Y,3)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,128)=$PIECE(RAHMEN1,Y,3)
+	. . . . . . . IF +$PIECE(RAHMEN1,Y,4)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,212)=$PIECE(RAHMEN1,Y,4)  ;TYBD;19.2,2005;27277;GEM
+	. . . . . . . IF +$PIECE(RAHMEN1,Y,5)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,214)=$PIECE(RAHMEN1,Y,5)  ;TYBD;19.2,2005;27277;GEM
+	. . . . . . . IF +$PIECE(RAHMEN1,Y,6)'=0  SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,211)=$PIECE(RAHMEN1,Y,6)
+	. . . . . . . IF $PIECE(RAHMEN1,Y,51)'="" SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,125)=$PIECE(RAHMEN1,Y,51)  ;TEXT RABATT 1
+	. . . . . . . IF $PIECE(RAHMEN1,Y,52)'="" SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,129)=$PIECE(RAHMEN1,Y,52)  ;TEXT RABATT 2
+	. . . . . . . IF $PIECE(RAHMEN1,Y,53)'="" SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,213)=$PIECE(RAHMEN1,Y,53)  ;TEXT RABATT 3  ;FIS;28.02.05
+	. . . . . . . DO EH2^INBRUTTONETTO(AUF,YPOS)    ; Updates ^INAUFP  ;TYBD;3,1,2005
+	. . . . . . ;
+	. . . . . . SET $PIECE(^INAUFPK(YM,AUF,YPOS,1),Y,13)=$$^INNETTO(^INAUFPK(YM,AUF,YPOS,1))
+	. . . . . . SET KOND=$PIECE(RAHMEN1,Y,7)
+	. . . . . . QUIT:KOND=""
+	. . . . . . SET KOND1=$GET(^INKOND(YM,KOND,1))
+	. . . . . . SET $PIECE(^INAUFPK(YM,AUF,YPOS,1),Y,7)  = $PIECE(KOND1,Y,3)   ;SKONTO
+	. . . . . . SET $PIECE(^INAUFPK(YM,AUF,YPOS,1),Y,9)  = $PIECE(KOND1,Y,2)   ;TAGE
+	. . . . . . SET $PIECE(^INAUFPK(YM,AUF,YPOS,1),Y,10) = $PIECE(KOND1,Y,4)   ;NETTO
+	. . . . . . SET $PIECE(^INAUFPK(YM,AUF,YPOS,1),Y,13) = $$^INNETTO(^INAUFPK(YM,AUF,YPOS,1))
+	. . . . ;
+	. . . . ;IF $PIECE(POS1,Y,254)'=1 IF YART'="" SET ^INAUFPK(YM,AUF,YPOS,1)=$GET(^INARTK(YM,YART,$PIECE(YFUNCT,"-",2),1))  ;ARTIKELKONDITIONEN ÜBERTRAGEN
+	. . . . ;;MENGENRABATTE USW
+	. . . . ;IF $PIECE(YFUNCT,"-",2)'="" IF YART'="" IF $DATA(^INARTKR(YM,YART,$PIECE(YFUNCT,"-",2))) DO   ;MENGENRABATTE EINKAUF
+	. . . . ;. NEW RABATT,RABATT1
+	. . . . ;. SET RABATT1=""
+	. . . . ;. SET RABATT=$ORDER(^INARTKR(YM,YART,$PIECE(YFUNCT,"-",2),+MENGE),-1)  ;VORIGE STUFE
+	. . . . ;. IF RABATT'="" SET RABATT1=$GET(^INARTKR(YM,YART,$PIECE(YFUNCT,"-",2),RABATT,1))
+	. . . . ;. IF RABATT="" SET RABATT1=$GET(^INARTKR(YM,YART,$PIECE(YFUNCT,"-",2),+MENGE,1))  ;GENAUE MENGEN
+	. . . . ;. QUIT:RABATT1=""  ;KEIN RABATT
+	. . . . ;. IF $PIECE(RABATT1,Y,2)'="" QUIT:$PIECE(RABATT1,Y,2)>$HOROLOG   ;AB GÜLTIG
+	. . . . ;. IF $PIECE(RABATT1,Y,3)'="" QUIT:$PIECE(RABATT1,Y,3)<$HOROLOG   ;BIS GÜLTIG
+	. . . . ;. IF +$PIECE(RABATT1,Y,1)'=0 SET $PIECE(^INAUFPK(YM,AUF,YPOS,1),Y,4)=$PIECE(RABATT1,Y,1)  ;3.RABATT=MENGENRABATT
+	. . . . ;. SET $PIECE(^INAUFPK(YM,AUF,YPOS,1),Y,53)=$$^WWWTEXT(32223)  ;3.RABATT=MENGENRABATT
+	. . . . ;. I $P(POS1,Y,254)'=1 IF +$PIECE(RABATT1,Y,4)'=0 SET $PIECE(^INAUFPK(YM,AUF,YPOS,1),Y,12)=$PIECE(RABATT1,Y,4)  ;WENN BETRAG ALS RABATT
+	. . . . ;;
+	. . . . ;SET YFELD=$GET(^INAUFPK(YM,AUF,YPOS,1))
+	. . . . ;IF $PIECE(POS1,Y,254)'=1 SET $PIECE(YFELD,Y,47)=$PIECE(YFELD,Y,12)   ;EINZEL-EK IN SELBSTKOSTENFELD
+	. . . . ;SET $PIECE(YFELD,Y,16)=MENGE  ;STANDARDMENGE
+	. . . . ;IF +$PIECE(YFELD,Y,41)'=0 SET $PIECE(YFELD,Y,16)=+$J(MENGE*$PIECE(YFELD,Y,41),0,2)  ;UMRECHNUNGSFAKTOR ;TYBD;9.5.2003
+	. . . . ;SET $PIECE(YFELD,Y,12)=$PIECE(YFELD,Y,47)*$PIECE(YFELD,Y,16)  ;MENGE * PREIS
+	. . . . ;SET $PIECE(YFELD,Y,13)=$$^INNETTO(YFELD)  ;NETTOPREIS ERRECHNE
+	. . . . ;IF $PIECE(POS1,Y,254)'=1 SET ^INAUFPK(YM,AUF,YPOS,1)=YFELD  ;SPEICHERN PREISE
+	. . . . ;IF $PIECE(POS1,Y,254)'=1 SET $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,47)=$PIECE(YFELD,Y,13)  ;NEURECHNEN POSITIONS-EK
+	. ;
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. ;		YFUNCT 5	AUS LAGERBESTELLUNGEN
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. IF +YFUNCT=5 DO  ;BESTELLT
+	. . NEW YART,YFELD,MENGE,XAUF,XPOS
+	. . SET MENGE = $PIECE(^INAUFP(YM,AUF,POS,1),Y,5)
+	. . SET YART  = $PIECE(^INAUFP(YM,AUF,POS,1),Y,4)     ;ARTIKERLNUMMER
+	. . SET XAUF  = $PIECE(YFUNCT,"|",2)
+	. . SET XPOS  = $PIECE(YFUNCT,"|",3)
+	. . IF XAUF="" SET XAUF=$PIECE(YFUNCT,"-",2)
+	. . IF XPOS="" SET XPOS=$PIECE(YFUNCT,"-",3)
+	. . IF XAUF'="" IF XPOS'="" DO
+	. . . SET XPOS1=$GET(^INAUFP(YM,XAUF,XPOS,1))
+	. . . ;SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,12)  = $PIECE(XPOS1,Y,12)   // SR14746;LIEFERANT SICHERN ;supplier safeguard 
+	. . . ;SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,145) = XAUF  ;LAGERBESTELLUNG
+	. . . ;SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,146) = XPOS  ;LAGERBESTELLUNG
+	. . . ;SET ^INRESERVIERT(YM,XAUF,XPOS,AUF,POS,1)=MENGE_Y_Y_YART 
+	. . . DO 
+	. . . . NEW SATZ
+	. . . . SET SATZ=$GET(^INAUFP(YM,AUF,POS,1))
+	. . . . SET $PIECE(SATZ,Y,12)=$PIECE(XPOS1,Y,12)   // SR14746;
+	. . . . SET $PIECE(SATZ,Y,145) = XAUF  ;LAGERBESTELLUNG   // SR14746;
+	. . . . SET $PIECE(SATZ,Y,146) = XPOS  ;LAGERBESTELLUNG / SR14746;
+	. . . . SET strStatus=$$$Save("INAUFP",AUF_","_POS,SATZ,$$$YES) // SR14746
+	. . . SET ^INRESERVIERT(YM,XAUF,XPOS,AUF,POS,1)=MENGE_Y_Y_YART      ;BEC;24512;04.11.03;SPEICHERN RESERVIERUNG
+	. . . IF $$$INVORGDoNotKillComponents(objINVORG)'=$$$YES DO  
+	. . . . KILL ^INAUFPT(YM,AUF,POS)   ;KEINE TEILE BEI BESTELLUNG ;no next to sales order 
+	. . . . KILL ^INAUFPXL(YM,AUF,POS)  ;TEILESTRUKTUR
+	. ;
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. ;		YFUNCT 2	RESERVIERTUNG ZURÜCKSETZEN
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. IF +YFUNCT=2 IF $FIND(YFUNCT,";") DO  ;RESERVIERUNG NUR AUFLÖSEN
+	. . //NEW ART,BET,LAP,WAD,RENR,INWE1,INWER1                 ; vvv SR16031
+	. . //SET ART  = $PIECE(YFUNCT,";",2)  ;QUIT:ART=""
+	. . //SET BET  = $PIECE(YFUNCT,";",3)  ;QUIT:BET=""
+	. . //SET LAP  = $PIECE(YFUNCT,";",4)  ;QUIT:LAP=""
+	. . //SET WED  = $PIECE(YFUNCT,";",5)  ;QUIT:WED=""
+	. . //SET RENR = $PIECE(YFUNCT,";",6)  ;QUIT:RENR=""
+	. . //;QUIT:'$DATA(^INWE(YM,ART,BET,LAP,WED,1))  ;FIS;08.01.04;IMMER AUFLÖSEN
+	. . //DO AUS^INWER(ART,BET,LAP,WED,RENR,YBED)    ;FAN;24045;04.08.2003;RESERVIERUNG AUFLÖSEN
+	. . ;                                                       ; ^^^ SR16031
+	. . ;
+	. . IF $PIECE(YFUNCT,";",7)=1 DO  QUIT  ;RESERVIERUNG AUFLÖSEN UND WH FESTLEGEN;FIS;08.01.04
+	. . . IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,6)'<$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5) SET YFUNCT=0 QUIT
+	. . . SET YFUNCT=2_"|"_LAP_"|"_WED_"|"_BET
+	. . ;
+	. . SET OK=1     ;WIEDER IN WH ;re- within 
+	. . SET YFORM="INAUFP"
+	. ;
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. ;		YFUNCT 2	AUS LAGER
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. IF +YFUNCT=2 IF '$FIND(YFUNCT,";") DO  ;LAGERWARE
+	. . ; 28-Aug-2006
+	. . DO:$PIECE(YFUNCT,"-",3)'="ALL"  IF $PIECE(YFUNCT,"-",3)="ALL" SET YPOS="" FOR  SET YPOS=$ORDER(^INAUFP(YM,AUF,YPOS)) QUIT:YPOS=""  IF $data(^INAUFP(YM,AUF,YPOS,1)) IF $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,7)="" SET YART=$PIECE(^INAUFP(YM,AUF,YPOS,1),Y,4) IF YART'="" IF $PIECE($GET(^INART(YM,YART,1)),Y,28)=1 SET POS=YPOS DO
+	. . . NEW SERIENNUMMER,LAGERPL,FELD,MENGE,WEDATU,VBETR,MINUS,intStoragePos,idBundleStock
+	. . . SET POS1=$GET(^INAUFP(YM,AUF,POS,1))
+	. . . SET MENGE=$PIECE(POS1,Y,5)
+	. . . IF $PIECE(YFUNCT,"-",3)="ALL" SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,6)=$PIECE(^INAUFP(YM,AUF,POS,1),Y,5)
+	. . . IF $PIECE(YFUNCT,"-",3)="ALL" QUIT:$PIECE(POS1,Y,7)'=""  ;WH BEREITS FESTGELEGT ;yet 
+	. . . //SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,7)=2  ;WARENHERKUNFT BESTIMMEN ;ordain 
+	. . . SET SERIENNUMMER = ""   ;SERIE ;series 
+	. . . SET LAGERPL      = ""   ;LAGER ;storage 
+	. . . SET WEDATU       = ""   ;WEDATUM
+	. . . SET VBETR        = ""   ;BETRIEB
+	. . . QUIT:$PIECE(POS1,Y,4)=""
+	. . . ; 12-Aug-2008 HQN vvvv                                          // SR16031 vvv
+	. . .  ; Construct V2 structure for a SOH Decrement
+	. . . //SET intStoragePos = $FIND(YFUNCT,"|")
+	. . . //SET idBundleStock = $EXTRACT(YFUNCT,$FIND(YFUNCT,"|",intStoragePos),$LENGTH(YFUNCT))
+	. . . set idBundleStock = $piece($piece(YFUNCT,"]"),"[",2)            // SR16031 ^^^
+	. . . ;set OK=$$CreateMovement^INAUFWH(AUF,POS,$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5)-$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,6),idBundleStock)
+	. . . set OK=$$SourceStock^INAUFWH(AUF,POS,$piece($get(^INAUFP(YM,AUF,POS,1)),Y,5)-$piece($get(^INAUFP(YM,AUF,POS,1)),Y,6),idBundleStock) 		// 17-Sep-2008 HQN SR15808
+	. . . ; 12-Aug-2008 HQN ^^^^
+	. . . IF $PIECE(YFUNCT,"-",3)'="ALL" IF $EXTRACT($PIECE(YFUNCT,"-",3),1,5)'="MINUS" IF $EXTRACT(YFUNCT,2)="-" SET SERIENNUMMER= $PIECE(YFUNCT,"-",2,99)
+	. . . IF ($EXTRACT(YFUNCT,2)="|")||($EXTRACT($PIECE(YFUNCT,"-",3),1,5)="MINUS") IF $PIECE(YFUNCT,"|",2)'=""   SET LAGERPL     = $PIECE(YFUNCT,"|",2)
+	. . . IF ($EXTRACT(YFUNCT,2)="|")||($EXTRACT($PIECE(YFUNCT,"-",3),1,5)="MINUS") IF $PIECE(YFUNCT,"|",3)'=""   SET WEDATU      = $PIECE(YFUNCT,"|",3)
+	. . . IF ($EXTRACT(YFUNCT,2)="|")||($EXTRACT($PIECE(YFUNCT,"-",3),1,5)="MINUS") IF $PIECE(YFUNCT,"|",4)'=""   SET VBETR       = $PIECE(YFUNCT,"|",4)
+	. . . ;IF SERIENNUMMER'="" SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,56)=SERIENNUMMER  ;SERIENNUMMER SPEICHERN
+	. . . ;SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,90)=1  ;AUSLIEFERFÄHIG
+	. . . ;IF $PIECE(objINVORG,Y,41)=1 IF $$^INARTMENGE($PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4),,VBETR)'>0 SET OK=1 QUIT // SR14379
+	. . . SET MINUS=2  ;KEIN MINUSBESTAND BILDEN, WENN LAGERPLATZ AUSGEWÄHLT;FIS;24053;30.07.03
+	. . . IF $EXTRACT($PIECE(YFUNCT,"-",3),1,5)="MINUS" SET MINUS=1  ;KEIN KONKRETER LAGERPLATZ = MINUS BUCHUNG ERLAUBEN ;no stock location minus permit 
+	. . . ;if MINUS=2 && ($$^INARTMENGE($PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4),,VBETR)'>0) SET OK=1 QUIT // SR14379 ; SR16013 REMOVED
+	. . . ; 13-Aug-2008 HQN Removed vvvv
+	. . . ;.;SR15226
+	. . . ;.;SET OK=$$^INARTMINUS(AUF,POS,$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4),$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5)-$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,6),SERIENNUMMER,LAGERPL,,MINUS,,,WEDATU,,VBETR,1)  ;BESTAND
+	. . . ;. set blnNOPOST = $$$YES
+	. . . ;. SET OK=$$^INARTMINUS(AUF,POS,$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4),$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5)-$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,6),SERIENNUMMER,LAGERPL,,MINUS,,,WEDATU,,VBETR,blnNOPOST)  ;BESTAND
+	. . . ;                     1   2                  3 - Item                                                 4 - Qty                                             5          6       8       11      13     14
+	. . . ; 13-Aug-2008 HQN Removed ^^^^
+	. . . ;
+	. . . ; SR15272 TODO : May need to add Intra-Company code here <GRF>   possibly including
+	. . . ; if $$$INKUNDEInternalCustomer($get(^INKUNDE(YM,idCustomer,1))) do
+	. . . ; . set $$$INAUFPNoDeliveryNote(^INAUFP(YM,AUF,POS,1)) = $$$YES
+	. . . ;
+	. . . IF $PIECE(YFUNCT,"-",3)="ALL" SET OK=0
+	. . . //IF '$DATA(^INWE(YM,$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4))) SET OK=0  ;KEIN BESTAND ;no 
+	. . . IF '$$^INARTMENGE($PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4)) SET OK=0  ;KEIN BESTAND ;no 	//SR16031
+	. . . //IF $PIECE(objINVORG,Y,41)'=1 IF $$^INARTMENGE($PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4),,VBETR)'>0 SET OK=0  ;FIS;24053;30.07.03
+	. . . //SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,7)=2  ;WARENHERKUNFT BESTIMMEN ;ordain  // SR14379 // SR14746
+	. . . //SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,6)=$PIECE(^INAUFP(YM,AUF,POS,1),Y,5)-OK  ;RESTMENGE SPEICHERN ;Save  // SR14746
+	. . . SET YART=$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4)  ;ARTIKEL ;item 
+	. . . ;SET LIEF=$PIECE(^INAUFP(YM,AUF,POS,1),Y,12)
+	. . . ;SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,12)=""    // SR14746
+	. . . DO 
+	. . . . NEW SATZ
+	. . . . SET SATZ=$GET(^INAUFP(YM,AUF,POS,1))
+	. . . . set $PIECE(SATZ,Y,7)  = 2 // SR14746
+	. . . . set $piece(SATZ,Y,6)  = $PIECE(^INAUFP(YM,AUF,POS,1),Y,5)-OK // SR14746
+	. . . . SET $PIECE(SATZ,Y,12) = ""   // SR14746;
+	. . . . SET strStatus=$$$Save("INAUFP",AUF_","_POS,SATZ,$$$YES) // SR14746
+	. . . IF VBETR'="" IF VBETR'=$PIECE($GET(^INAUF(YM,AUF,1)),Y,6) DO
+	. . . . //SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,324)=VBETR  ;FIS;SHIP FROM LOCATION;04.05.05;SR12200 //SR14746
+	. . . . new SATZ //SR14746
+	. . . . set SATZ=$GET(^INAUFP(YM,AUF,POS,1)) //SR14746
+	. . . . set $piece(SATZ,Y,324)=VBETR //SR14746
+	. . . . SET strStatus=$$$Save("INAUFP",AUF_","_POS,SATZ,$$$YES) // SR14746 //SR14746
+	. . . . IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,403)="" QUIT  ;DELETE TRANSFER REQUEST IF SOURCED DIRECTLY;FIS;29.04.05;SR12200
+	. . . . ;SEARCH FOR DEMANDS AND SUPPLIES FROM THAT ORDER AND DELETE, IF NOT TRANSFERRED YET
+	. . . . NEW SUCH,DEM,LOC,YVOR,YFORM,YOK
+	. . . . SET SUCH=$$^WWWUMLAU(AUF_"-"_POS,1)
+	. . . . SET LOC=""
+	. . . . FOR  SET LOC=$ORDER(^INDRPDEMANDs(YM,11,SUCH,LOC)) QUIT:LOC=""  DO
+	. . . . . SET DEM=""
+	. . . . . FOR  SET DEM=$ORDER(^INDRPDEMANDs(YM,11,SUCH,LOC,DEM)) QUIT:DEM=""  DO
+	. . . . . . SET DEM1=$GET(^INDRPDEMAND(YM,LOC,DEM,1))
+	. . . . . . QUIT:($PIECE(DEM1,Y,41)'="")||($PIECE(DEM1,Y,40)'="")  ;ALREADY DISPATCHED
+	. . . . . . SET $PIECE(DEM1,Y,98)  = $$$YES  ;VORGANG GELÖSCHT
+	. . . . . . SET $PIECE(DEM1,Y,115) = $$^WWWTEXT("IN00544")  ;Reference Order has been sourced manually   ;$$^WWWTEXT(33693)  //SR14933
+	. . . . . . SET YOK=$$^WWWSPEI("INDRPDEMAND",LOC_","_DEM,DEM1,1)
+	. . . . ;
+	. . . . SET LOC=""
+	. . . . FOR  SET LOC=$ORDER(^INDRPSUPPLYs(YM,11,SUCH,LOC)) QUIT:LOC=""  DO
+	. . . . . SET DEM=""
+	. . . . . FOR  SET DEM=$ORDER(^INDRPSUPPLYs(YM,11,SUCH,LOC,DEM)) QUIT:DEM=""  DO
+	. . . . . . SET DEM1=$GET(^INDRPSUPPLY(YM,LOC,DEM,1))
+	. . . . . . QUIT:($PIECE(DEM1,Y,41)'="")||($PIECE(DEM1,Y,40)'="")  ;ALREADY DISPATCHED
+	. . . . . . SET $PIECE(DEM1,Y,98)  = $$$YES  ;VORGANG GELÖSCHT
+	. . . . . . SET $PIECE(DEM1,Y,115) = $$^WWWTEXT("IN00544")  ;Reference Order has been sourced manually   ;$$^WWWTEXT(33693)  //SR14933
+	. . . . . . SET YOK=$$^WWWSPEI("INDRPSUPPLY",LOC_","_DEM,DEM1,1)
+	. . . ;
+	. . . ;ARTIKELKONDITIONEN ÜBERTRAGEN ;transport 
+	. . . DO ^INAUFPKNEU(AUF,POS)
+	. . . ;IF $GET(LIEF)'="" IF YART'="" DO
+	. . . ;. IF $PIECE(POS1,Y,254)'=1 SET ^INAUFPK(YM,AUF,POS,1)=$GET(^INARTK(YM,YART,LIEF,1)) 
+	. . . ;. SET YFELD=$GET(^INAUFPK(YM,AUF,POS,1))
+	. . . ;. SET $PIECE(YFELD,Y,13)=$PIECE(^INAUFP(YM,AUF,POS,1),Y,47)  ;GESAMT IN AUFTRAG
+	. . . ;. SET $PIECE(YFELD,Y,12)=$JUSTIFY($$^INBRUTTO(YFELD),0,2)  ;NETTOPREIS ERRECHNE
+	. . . ;. IF $PIECE(POS1,Y,254)'=1 SET $PIECE(YFELD,Y,47)=$PIECE(YFELD,Y,12)  ;MENGE * PREIS
+	. . . ;. IF $PIECE(POS1,Y,254)'=1 IF +$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5)'=0 SET $PIECE(YFELD,Y,47)=$JUSTIFY($PIECE(YFELD,Y,12)/$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5),0,2) ;MENGE * PREIS
+	. . . ;. IF $P(POS1,Y,254)'=1 SET ^INAUFPK(YM,AUF,POS,1)=YFELD  ;SPEICHERN PREISE
+	. . . ;
+	. . . IF $PIECE(POS1,Y,254)'=$$$YES do 
+	. . . . //SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,47)=$$^INAUFKOST(AUF,POS)  ;NEURECHNEN POSITIONS-EK //SR14746
+	. . . . new SATZ //SR14746
+	. . . . set SATZ=$GET(^INAUFP(YM,AUF,POS,1)) //SR14746
+	. . . . set $piece(SATZ,Y,47)=$$^INAUFKOST(AUF,POS)  ;NEURECHNEN POSITIONS-EK
+	. . . . SET strStatus=$$$Save("INAUFP",AUF_","_POS,SATZ,$$$YES) // SR14746
+	. . . IF $$$INVORGDoNotKillComponents(objINVORG)'=$$$YES DO  
+	. . . . KILL ^INAUFPT(YM,AUF,POS)   ;KEINE TEILE BEI BESTELLUNG ;no next to sales order 
+	. . . . KILL ^INAUFPXL(YM,AUF,POS)  ;TEILESTRUKTUR
+	. . . ;
+	. . . IF $DATA(^INWEAUF(YM,AUF,POS)) DO
+	. . . . NEW BET,LAP,WE,WE1
+	. . . . SET BET=""
+	. . . . FOR  SET BET=$ORDER(^INWEAUF(YM,AUF,POS,BET)) QUIT:BET=""  DO
+	. . . . . SET LAP=""
+	. . . . . FOR  SET LAP=$ORDER(^INWEAUF(YM,AUF,POS,BET,LAP)) QUIT:LAP=""  DO
+	. . . . . . SET WE=""
+	. . . . . . FOR  SET WE=$ORDER(^INWEAUF(YM,AUF,POS,BET,LAP,WE)) QUIT:WE=""  DO
+	. . . . . . . SET WE1=$GET(^INWEAUF(YM,AUF,POS,BET,LAP,WE,1))
+	. . . . . . . ;IF $PIECE(WE1,Y,2)'=""  SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,197)=$PIECE(WE1,Y,2)   // SR14746;;CHARGENNUMMER SPEICHERN ;Save 
+	. . . . . . . ;IF $PIECE(WE1,Y,19)'="" SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,198)=$PIECE(WE1,Y,19)  ;LOTNUMMER SPEICHERN ;Save 
+	. . . . . . . DO
+	. . . . . . . . NEW SATZ
+	. . . . . . . . SET SATZ=$GET(^INAUFP(YM,AUF,POS,1))
+	. . . . . . . . IF $PIECE(WE1,Y,2)'=""  SET $PIECE(SATZ,Y,197)=$PIECE(WE1,Y,2)   // SR14746;;CHARGENNUMMER SPEICHERN ;Save 
+	. . . . . . . . IF $PIECE(WE1,Y,19)'="" SET $PIECE(SATZ,Y,198)=$PIECE(WE1,Y,19)  ;LOTNUMMER SPEICHERN ;Save 
+	. . . . . . . . SET strStatus=$$$Save("INAUFP",AUF_","_POS,SATZ,$$$YES) // SR14746
+	. . . ;
+	. . . SET YFUNCT=$EXTRACT(YFUNCT)
+	. ;
+	. ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. ;
+	. IF +OK'=0 QUIT
+	. ;
+	. ;IF +YFUNCT=2 SET $PIECE(^INAUFP(YM,AUF,POS,1),Y,90)=1  ;AUSLIEFERFÄHIG
+	. ;
+	. ;		D90		$$$INAUFPReadyForDelivery()
+	. DO
+	. . NEW SATZ
+	. . SET SATZ=$GET(^INAUFP(YM,AUF,POS,1))
+	. . IF +YFUNCT=2 SET $PIECE(SATZ,Y,90) = $$$YES  ;AUSLIEFERFÄHIG
+	. . SET strStatus=$$$Save("INAUFP",AUF_","_POS,SATZ,$$$YES)     // SR14746
+	. ;------------------------------------------------------
+	. IF $GET(BGJOB)=1 SET YQ=1 QUIT  ;HINTERGRUNDJOB AUS DRP ;out of DRP 
+	. ;------------------------------------------------------
+	. ;
+	. ;FORMULAR AUFRUFEN ;form 
+	. //
+	. //SET YFORM="INAUFBANZ"
+	. //SET %("VAR","YBACK")=""
+	. //SET %(YQUERY,"YFORM")=YFORM
+	. //SET %("VAR","YFORM")=YFORM
+	. //DO ^WWWFORMX 
+	. /]]><![CDATA[/SET $PIECE(^WWWUSER(0,YUSER,1),Y,5)=$$$YES
+	. //DO ^WWWFORM1
+	. //DO ^INAUFBANZ
+	. //SET $PIECE(^WWWUSER(0,YUSER,1),Y,5)=$$$NO
+	. //SET YQ=1
+	. 
+	. DO ^INAUFPTBINF($G(AUF),1)
+	. SET YQ=1
+	
+	;---------------------------------------------
+	IF $GET(BGJOB)=1 QUIT  ;HINTERGRUNDJOB AUS DRP ;out of DRP 
+	;---------------------------------------------
+	
+	
+	
+	
+	;*******************************************************************************
+	; PART 2 : Display Form
+	;*******************************************************************************
+	
+	;AUFLISTEN DER MÖGLICHKEITEN --------------------------------------------------------------
+	IF ($PIECE($GET(YKEY),",",1)="") || ($PIECE($GET(YKEY),",",2)="") || ($PIECE($GET(YKEY),",",2)="+") DO  QUIT
+	. SET YFORM="INAUFBANZ"  ;KEIN AUFTRAG ;no order 
+	. SET %("VAR","YBACK")=""
+	. SET %(YQUERY,"YFORM")=YFORM
+	. SET %("VAR","YFORM")=YFORM
+	. SET %("VAR","YKEY")=YKEY
+	. DO ^WWWFORM 
+	
+	IF $PIECE($GET(YKEY),",",1)'="" IF $PIECE($GET(YKEY),",",2)'="" DO  IF YQ=1 QUIT
+	. new idCustomer,idOrderType,idSource,objINAUF,objINAUFP,OrderQty,ProcQty     ; 28-Aug-2006
+	. SET YQ=0
+	. SET AUF=$PIECE(YKEY,",",1)
+	. SET POS=$PIECE(YKEY,",",2)
+	. ; vvvvv 28-Aug-2006
+	. set objINAUF  = $get(^INAUF(YM,AUF,1))
+	. set idOrderType = $$$INAUFOrderType(objINAUF)
+	. ; vvv SR15272
+	. set blnInternalCust = $$$NO
+	. if idOrderType=0 do
+	. . set idCustomer = $$$INAUFCustomerNumber(objINAUF)
+	. . if idCustomer'="" set blnInternalCust = +$$$INKUNDEInternalCustomer($get(^INKUNDE(YM,idCustomer,1)))
+	. ; ^^^ SR15272
+	. ;
+	. set objINAUFP = $get(^INAUFP(YM,AUF,POS,1))
+	. set OrderQty  = $$$INAUFPQuantity(objINAUFP)    ; D5
+	. set ProcQty   = $$$INAUFPQuantity1(objINAUFP)   ; D6
+	. set idSource  = $$$INAUFPSource(objINAUFP)      ; D7
+	. ;
+	. ; Not yet sourced
+	. ; source from order; Sales order without supplier
+	. ; Source from stock; quantity remains unsourced
+	. ; Source from stock; none sourced; no delivery note printed; Source on Picking; 
+	. ;          - continue with display
+	. if idSource="" QUIT
+	. ;BESTELLUNG OHNE LIEFERANT;FIS:01.07.03;23856
+	. if (idSource=1) && ((idOrderType=2) || (idOrderType=5)) && ($$$INAUFSupplierNumber(objINAUF)="") QUIT
+	. if (idSource=2) && (OrderQty-ProcQty'=0) QUIT  ;KEINE WARENHERKUNFT
+	. ;GENAUE WARENHERKUNFT ERST BEI PICKING;FIS;21.02.05;26869
+	. IF (idSource=2) && (ProcQty=0) && ($PIECE(objINAUFP,Y,92)="") IF $$$INVORGSourceByPickingProcess(objINVORG)=$$$YES IF '$DATA(^INWEAUF(YM,AUF,POS)) IF '$DATA(^INWEAUFALT(YM,AUF,POS)) QUIT
+	. ;IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,7)="" QUIT 
+	. ;IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,7)=1 IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=2!($PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=5) IF $PIECE(^ (1),Y,12)="" QUIT  ;BESTELLUNG OHNE LIEFERANT;FIS:01.07.03;23856 ;sales order without supplier 
+	. ;IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,7)=2&($PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5)-$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,6)'=0) QUIT  ;KEINE WARENHERKUNFT ;no 
+	. ;IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,7)=2 IF $PIECE(^ (1),Y,6)=0 IF $PIECE(^(1),Y,92)="" IF $PIECE(objINVORG,Y,211)=1 IF '$DATA(^INWEAUF(YM,AUF,POS)) IF '$DATA(^INWEAUFALT(YM,AUF,POS)) QUIT  ;GENAUE WARENHERKUNFT ERST BEI PICKING;FIS;21.02.05;26869
+	. ; ^^^^^ 28-Aug-2006
+	. SET YQ=1
+	. SET YFORM="INAUFBANZ"  ;KEIN AUFTRAG ;no order 
+	. SET %(YQUERY,"YFORM") = YFORM
+	. SET %("VAR","YFORM")  = YFORM
+	. DO ^WWWFORM
+	
+	SET YKEY=$GET(YKEY)
+	SET KOPF=$GET(YKOPF)
+	SET YVOR=$GET(^WWW012(0,YM,1))            ;MANDANTENVORGABEN
+	DO ^WWWFORMX
+	DO ^WWWUP(0)                              ;ANKER FESTLEGEN ;armature 
+	IF $GET(YFORM)="INAUFP" DO                ;WENN EINSPRUNG AUS AUFTRAGSPOSITION ;when out of 
+	. IF ($PIECE($GET(YKEY),",",1)="") || ($PIECE($GET(YKEY),",",2)="") QUIT
+	. DO ^WWWKOPF(KOPF)  ;KOPFZEILE
+	. DO ^WWWFRAME(0)
+	. WRITE YCR,"<TR><TD>"
+ 
+	; Manual Input Form INAUFWH
+	
+	;===============================================================================
+	;  Determine Goods Origin
+	;  [ ? ]  [<==]                                                                              (*1*)
+	;===============================================================================
+	; Order Number: 1234567                    Line Item :  1                                    (*2*)  (*3*)
+	; Short Name : xxxxxxxxxxxxx               Item Number : ABC12345
+	; Project:                                 Item Name : xxxxxxxxxxxxxxxxxxx 
+	; Order Date : dd/mm/yyyy                  Quantity: 123  
+	; Required Delivery Date : dd/mm/yyyy      Quantity Unit : EA 
+	;                                          Cost: 123.00
+	; 
+	; Rest No Of Items: 1                                                                        (*4*)
+	; Source Of Items---------------------------------------------------------------             (*5*)
+	; ( ) Order From XYZ Co [100.00]          ( ) From Stock
+	;    Standard Pack Quantity: 1            ( ) From Stock(SiteLocn / StkLocn / Date / Qty)    (*6*)
+	;                                         ( ) Production
+	;===============================================================================
+	
+	; vvvv SR15811 11-Aug-2008
+	&html<
+	<style>
+		.warning {color:red;}
+	</style>
+	>
+	; ^^^^
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	; (*1*)   Buttons
+	;+++++++++++++++++++++++++++++++++++++++
+	WRITE YCR,"<TABLE BORDER=0 CELLSPACING=0><TR>"
+	IF $PIECE(YVOR,Y,45)=$$$YES WRITE "<TD WIDTH=3><IMG SRC="_""""_YGIF_"delimiter1.gif"_""""_"></TD>"
+	DO HELP^WWWFORMF
+	DO BACK^WWWFORMF
+	IF $PIECE(YVOR,Y,45)=$$$YES WRITE "<TD WIDTH=3><IMG SRC="_""""_YGIF_"delimiter.gif"_""""_"></TD>"
+	WRITE YCR,"</TR></TABLE>"
+	
+	WRITE YCR,"<TABLE CELLSPACING=0 BORDER=0><TR><TD>"
+	WRITE YCR
+	WRITE YCR,"</TD></TR></TABLE>"
+	
+	IF $PIECE($GET(YKEY),",",1)'="" IF $PIECE($GET(YKEY),",",2)'="" DO  
+	. SET AUF=$PIECE(YKEY,",",1)
+	. SET ^WWW126(YM,"INAUF",YBED,1,1)=$PIECE(YKEY,",",1)
+	. SET POS=$PIECE(YKEY,",",2)
+	. SET TEILMAX=""
+	. FOR YI=3:1 QUIT:$PIECE(YKEY,",",YI)=""  DO
+	. . SET TEILMAX=TEILMAX+1
+	. . SET TEIL(YI)=$PIECE(YKEY,",",YI)
+	. ;
+	. ;ANZEIGE AUFTRAG ;Show order 
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; (*2*)   Order Number / Short Name, Project, Order Date, Required Delivery Date  
+	. ;+++++++++++++++++++++++++++++++++++++
+	. WRITE YCR,"<TABLE BORDER=0 WIDHT=100%>"
+	. WRITE "<TR>"
+	. WRITE "<TD VALIGN=TOP>"
+	. DO ^ININFOANZ("INAUF",AUF,1,"13,8,4,19")             ;AUFTRAG ;order
+	. WRITE "</TD>"
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; (*3*)   Line Item / Item Number, Item Name, Quantity, Quantity Unit, Cost 
+	. ;+++++++++++++++++++++++++++++++++++++
+	. WRITE "<TD VALIGN=TOP>"
+	. SET POS1=$GET(^INAUFP(YM,AUF,POS,1))
+	. DO ^ININFOANZ("INAUFP",AUF_","_POS,2,"4,1,5,40,47")  ;AUFTRAGSPOSITION
+	. WRITE "</TD>"
+	. WRITE "</TR>"
+	. WRITE "</TABLE>",YCR
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; Validation
+	. ;    IN00398  "Can not source blocked order `%1`."
+	. ;    IN00409  "Can not source location %1 order from location %2."
+	. ;+++++++++++++++++++++++++++++++++++++
+	. WRITE "<FONT SIZE=2>"
+	. ;
+	. set objOrder=$get(^INAUF(YM,AUF,1))
+	. ;SR14311: Disallow sourcing adjustments if order is blocked
+	. if $piece(objOrder,Y,38) write $$$Text($listbuild("IN00398",AUF))_"</B><BR>" quit
+	. // SR14521: Disallow sourcing if we can't get from other locations and the location doesn't match the order
+	. set idLocation=$piece(objOrder,Y,6)
+	. if '$piece(^INVORG(YM,YM,1),"~",67)&&(YLOCATION'=idLocation) write $$$Text($listbuild("IN00409",idLocation,YLOCATION))_"</B><BR>" quit
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; Split Line        ;AUFTRAGSPOSITION SPLITTEN
+	. ;    33081    "Please check the quantity for this line item, the remaining quantity will be split into a new line item."
+	. ;    32292    "Check Please!"
+	. ;    31407    "Quantity"
+	. ;    33105    "Split Position"
+	. ;+++++++++++++++++++++++++++++++++++++
+	. SET REST=$PIECE(POS1,Y,5)-$PIECE(POS1,Y,6)  ;RESTMENGE
+	. IF REST>0 IF REST<$PIECE(POS1,Y,5) DO
+	. . NEW YKEY,YFORM
+	. . WRITE "<A HREF="_""""_"JavaScript:",YCR
+	. . WRITE "pvalue = prompt('"_$$^WWWTEXT(33081,,1)_"','"_($PIECE(POS1,Y,5)-REST)_"'); ",YCR
+	. . WRITE "if (pvalue >= "_($PIECE(POS1,Y,5)-REST)_" && pvalue <= "_$PIECE(POS1,Y,5)_" ) {"
+	. . WRITE " window.location='"
+	. . WRITE YAKTION_"EP=WWWMANU&YEXEC=*D|SPLIT^INAUFWH(\'"_AUF_"\',"_POS_","_"' + pvalue + ')"      ;LINK SETZEN ;typeset 
+	. . DO ^WWWCGI
+	. . WRITE "';}",YCR
+	. . WRITE "else  alert('"_$$^WWWTEXT(32292)_" ("_$$^WWWTEXT(31407)_")"_"');"                      ;BITTE PRÜFEN (MENGE)
+	. . WRITE """"_">",YCR
+	. . WRITE "<img src="_YGIF_"allevertr.gif border=0 TITLE="_""""_$$^WWWTEXT(33105)_""""_"></A>"    ;position splitten
+	. . WRITE YCR
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; (*4*)   "Rest No Of Items"
+	. ;+++++++++++++++++++++++++++++++++++++
+	. WRITE "&nbsp;&nbsp;"
+	. WRITE $$^WWWTEXT(32087)_": "_REST  ;RESTMENGE
+	. WRITE "<BR>"
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; (*5*)   "Source Of Items"
+	. ;+++++++++++++++++++++++++++++++++++++
+	. WRITE "<FONT SIZE=2>"
+	. SET YAUSWAHLOK=0
+	. DO                          ;funktionsauswahl für nächste anzeige
+	. . NEW YFORM
+	. . SET YFORM="INAUFWH"
+	. . WRITE YCR,"<FIELDSET STYLE="_""""_"border-color:"_YLIGHTGREY_""""_">"
+	. . WRITE "<LEGEND><B>"_$$^WWWTEXT(32088)_"</B></LEGEND>"
+	. . WRITE "<TABLE BORDER=0 CELLSPACING=0>"
+	. . WRITE "<TR>"
+	. . NEW YI
+	. . SET YI(1)=""
+	. . IF YFUNCT="" SET YFUNCT=$PIECE(POS1,Y,7)
+	. . IF REST=$PIECE(POS1,Y,5) SET YFUNCT=""   ;ALLES NEU ;whatsoever recent 
+	. . ;
+	. . ;+++++++++++++++++++++++++++++++++++
+	. . ; (*6*)   Source Entries
+	. . ; 
+	. . ; 1 : Order, 2 : From Stock, 3 : Production, 4 : Service, 5 : Purchase Order
+	. . ;+++++++++++++++++++++++++++++++++++
+	. . ; 
+	. . FOR YI=1:1:5 SET YI(1)=YI(1)_$PIECE($GET(^WWW101(0,"WARENHERKUNFT",SPRACHE,YI,1)),Y,1)_"#"
+	. . ;
+	. . ;     1         2          3            5                7                          8
+	. . ; BESTELLEN, BESTAND,   SELBER,  LAGERBESTELLUNG,  AUSWAHL LIEFERANT,  LAGER (GENAUE BESTIMMUNG BEI PICKEN)
+	. . ; Order,     Inventory, Self     Warehouse Order,  SELECT SUPPLIER,    Location (EXACT Lot to pick)
+	. . FOR YI=1,2,3,5,7,8  DO            ;FIS:01.07.03;23856;BESTELLUNG OHNE LIEFERANT
+	. . . if blnInternalCust quit:YI'=2               ; SR15272
+	. . . IF $PIECE(POS1,Y,7)=1 IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=2 IF $PIECE(^INAUF(YM,AUF,1),Y,12)="" QUIT:YI'=7  ;NUR LIEFERANT FESTLEGEN;FIS:01.07.03;23856 ;only supplier 
+	. . . IF YI'=1 IF YI'=7     IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=5 QUIT   ;REQUISITION= NUR BESTELLLUNG ;only 
+	. . . NEW ART
+	. . . SET ART=$PIECE(POS1,Y,4)
+	. . . WRITE YCR,"<TD NOWRAP ALIGN=LEFT VALIGN=TOP>"
+	. . . WRITE "<FONT SIZE=2>"
+	. . . ;
+	. . . IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,60)=$$$YES QUIT  ;AUFTRAG ABGESCHLOSSEN ;order 
+	. . . IF $PIECE(POS1,Y,60)=$$$YES QUIT                    ;AUFTRAGSPOSITION ABGESCHLOSSEN
+	. . . ;
+	. . . IF YFUNCT'="" QUIT:YI'=YFUNCT
+	. . . IF YI=2 IF $PIECE(POS1,Y,26)=2 QUIT  ;LEISTUNG NICHT AUF LAGER,(BESTELLEN ODER EIGEN) 
+	. . . ; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	. . . ;IF YI=1 IF +$PIECE(POS1,Y,66)=1 DO  QUIT  ;AUSLAUFARTIKEL / NICHT MEHR BESTELLEN
+	. . . ;. WRITE "<FONT COLOR="_YRED_">"
+	. . . ; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DISABLED BLOCK END
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;			Source Description
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . IF YI=3 IF $PIECE(POS1,Y,26)=1 QUIT  ;KEINE EIGENFERTIGUNG ;Item Type = "Buy"
+	. . . SET YA=""
+	. . . IF YI'=7 IF YI'=8 SET YA=$PIECE(YI(1),"#",YI)    ; 
+	. . . IF YI=8           SET YA=$PIECE(YI(1),"#",2)     ; "From Stock"
+	. . . ;
+	. . . WRITE YCR
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   5    Warehouse Order               LAGERBESTELLUNG
+	. . . ;        "Purchase Order"    "Quantity" ":" "From"
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . IF YI=5 DO   ;
+	. . . . NEW idxART,YBESTELL,POK,XAUF,XPOS,XPOS1,XAUF1,RESTMENGE,XXAUF,XXPOS
+	. . . . SET YBESTELL=0
+	. . . . QUIT:ART=""
+	. . . . set idxART = $$^WWWUMLAU(ART,1)    ; 28-Aug-2006
+	. . . . FOR POK=" ",0 SET XAUF="" FOR  SET XAUF=$ORDER(^INAUFPs(YM,5,POK,idxART,XAUF)) QUIT:XAUF=""  DO   ;OFFENER AUFTRAG ;order 
+	. . . . . SET XAUF1=$GET(^INAUF(YM,XAUF,1))
+	. . . . . QUIT:'$DATA(^INAUF1(YM,XAUF))       ;KEINEN OFFEN ;vulnerable 
+	. . . . . IF +$PIECE(XAUF1,Y,2)'=2 QUIT       ;KEIN BESTELLUNG ;no sales order 
+	. . . . . IF +$PIECE(XAUF1,Y,38)=1 QUIT       ;GESPERRT ;DISABLED 
+	. . . . . IF $$$INVORGAccessOtherItemLocns(objINVORG)'=$$$YES QUIT:$PIECE(XAUF1,Y,6)'=YLOCATION  ;FIS;18.06.03;23795;ZUGRIFF AUF BESTÄNDE ANDERER BETRIEBE NICHT ERLAUBT !
+	. . . . . SET YBESTELL=1  ;ES GIBT EINE OFFENE BESTELLUNG ;it one sales order 
+	. . . . ;
+	. . . . QUIT:YBESTELL=0  ;ENDE WENN KEINE BESTELLUNG ;termination when no sales order 
+	. . . . ;
+	. . . . FOR POK=" ",0 SET XAUF="" FOR  SET XAUF=$ORDER(^INAUFPs(YM,5,POK,idxART,XAUF)) QUIT:XAUF=""  DO   ;OFFENER AUFTRAG ;order 
+	. . . . . SET XAUF1=$GET(^INAUF(YM,XAUF,1))
+	. . . . . QUIT:'$DATA(^INAUF1(YM,XAUF))  ;NICHT OFFEN ;Not vulnerable 
+	. . . . . IF +$PIECE(XAUF1,Y,2)'=2 QUIT  ;KEIN BESTELLUNG ;no sales order 
+	. . . . . IF +$PIECE(XAUF1,Y,38)=1 QUIT  ;GESPERRT ;DISABLED 
+	. . . . . SET XPOS=""
+	. . . . . FOR  SET XPOS=$ORDER(^INAUFPs(YM,5,POK,$$^WWWUMLAU(ART,1),XAUF,XPOS)) QUIT:XPOS=""  DO
+	. . . . . . ;QUIT:$DATA(^INWEAUF(YM,XAUF,XPOS))  ;SCHON WE VORHANDEN
+	. . . . . . SET XPOS1=$GET(^INAUFP(YM,XAUF,XPOS,1))
+	. . . . . . QUIT:$PIECE(XPOS1,Y,9)=$$$YES       ;STORNIERT  ;TYBD;02,04,2003;STORNOS WERDEN ANGEZEIGT;
+	. . . . . . QUIT:$PIECE(XPOS1,Y,205)=$$$YES     ;GESPERRT ;DISABLED 
+	. . . . . . QUIT:$PIECE(XPOS1,Y,83)=""          ;NOT ORDERED YET ;privation  ;FIS;31.07.03
+	. . . . . . SET RESTMENGE=$PIECE(XPOS1,Y,5)
+	. . . . . . IF $DATA(^INWEAUF(YM,XAUF,XPOS)) DO  ;SCHON WE VORHANDEN ;yet In on hand 
+	. . . . . . . NEW BET,LAP,WED
+	. . . . . . . SET BET=""
+	. . . . . . . FOR  SET BET=$ORDER(^INWEAUF(YM,XAUF,XPOS,BET)) QUIT:BET=""  DO
+	. . . . . . . . SET LAP=""
+	. . . . . . . . FOR  SET LAP=$ORDER(^INWEAUF(YM,XAUF,XPOS,BET,LAP)) QUIT:LAP=""  DO
+	. . . . . . . . . SET WED=""
+	. . . . . . . . . FOR  SET WED=$ORDER(^INWEAUF(YM,XAUF,XPOS,BET,LAP,WED)) QUIT:WED=""  DO
+	. . . . . . . . . . SET RESTMENGE=RESTMENGE-$PIECE($GET(^INWEAUF(YM,XAUF,XPOS,BET,LAP,WED,1)),Y,4)
+	. . . . . . ;
+	. . . . . . SET XXAUF=""
+	. . . . . . FOR  SET XXAUF=$ORDER(^INRESERVIERT(YM,XAUF,XPOS,XXAUF)) QUIT:XXAUF=""  DO  ;SUCHEN RESTMENGE ;seek 
+	. . . . . . . SET XXPOS=""
+	. . . . . . . FOR  SET XXPOS=$ORDER(^INRESERVIERT(YM,XAUF,XPOS,XXAUF,XXPOS)) QUIT:XXPOS=""  DO
+	. . . . . . . .;SET RESTMENGE=RESTMENGE-$PIECE($GET(^INRESERVIERT(YM,XAUF,XPOS,XXAUF,XXPOS,1)),Y,1)+$PIECE($GET(^INRESERVIERT(YM,XAUF,XPOS,XXAUF,XXPOS,1)),Y,2)
+	. . . . . . . . SET RESTMENGE=RESTMENGE-$PIECE($GET(^INRESERVIERT(YM,XAUF,XPOS,XXAUF,XXPOS,1)),Y,1)+$PIECE($GET(^INRESERVIERT(YM,XAUF,XPOS,XXAUF,XXPOS,1)),Y,2)  ;FIS;15.01.04;BEREITS GELIEFERTE SIND SCHON DURCH INWEAUF BERÜCKSICHTIGT ;yet yet trans- 
+	. . . . . . ;
+	. . . . . . QUIT:+RESTMENGE=0
+	. . . . . . QUIT:RESTMENGE<0
+	. . . . . . QUIT:RESTMENGE<REST  ;WENN NICHT GENUG BESTELLT ;when Not sufficiently 
+	. . . . . . WRITE "<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"|"_XAUF_"|"_XPOS_"""" 
+	. . . . . . WRITE " onClick="_""""_"window.location='"
+	. . . . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI_"|"_XAUF_"|"_XPOS
+	. . . . . . DO ^WWWCGI
+	. . . . . . WRITE "'"_""""
+	. . . . . . IF YI=YFUNCT WRITE " CHECKED="_""""_"CHECKED"_""""
+	. . . . . . WRITE "> "
+	. . . . . . ; "Quantity" ":" "From"
+	. . . . . . ;IF RESTMENGE'=$PIECE(XPOS1,Y,5) WRITE YA_"("_XAUF_" "_$$^WWWTEXT(32025)_": "_RESTMENGE_" "_$$^WWWTEXT(68)_" "_$PIECE(XPOS1,Y,5)_" / "_$$^WWWDATE($PIECE(XPOS1,Y,19))_")"  ;BR014923
+	. . . . . . IF RESTMENGE'=$PIECE(XPOS1,Y,5) WRITE YA_" ("_XAUF_" "_$$^WWWTEXT(32025)_": "_RESTMENGE_" "_$$$Text($listbuild("53",$PIECE(XPOS1,Y,5)))_" / "_$$^WWWDATE($PIECE(XPOS1,Y,19))_")"	;BR014923  ; From %1
+	. . . . . . IF RESTMENGE=$PIECE(XPOS1,Y,5)  WRITE YA_" ("_XAUF_" "_$$^WWWTEXT(32025)_": "_$PIECE(XPOS1,Y,5)_" / "_$$^WWWDATE($PIECE(XPOS1,Y,19))_")"
+	. . . . . . WRITE "<BR>"
+	. . . . . . WRITE "</INPUT>"
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   3    Own Manufacture               EIGENPRODUKTION
+	. . . ;        "Production"
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . IF YI=3 DO  
+	. . . . ;QUIT:$$^WWWACCESS(,"PPS")'=1         ;BERECHTIGUNG FEHLT;FIS;AUSGESCHALTET;16.07.04;26117
+	. . . . SET YAUSWAHLOK=1                      ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . . WRITE "<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"""" 
+	. . . . WRITE " onClick="_""""_"window.location='"
+	. . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI
+	. . . . DO ^WWWCGI
+	. . . . WRITE "'"_""""
+	. . . . IF YI=YFUNCT WRITE " CHECKED="_""""_"CHECKED"_""""
+	. . . . WRITE "> "
+	. . . . WRITE YA_"&nbsp;&nbsp;&nbsp;"
+	. . . . WRITE "<BR>"
+	. . . . WRITE "</INPUT>"
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   2    Stock Reserved for this Order      LAGERBESTAND RESERVIERT FÜR DIESE AUFTRAG
+	. . . ;        32807    "For" "Order" ":" "To"
+	. . . ;        33066    "Undo Layby   (locn / date / qty)"
+	. . . ;        33297    "Cons. Qty"
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . set idxAUF = $$^WWWUMLAU(AUF,1)      ; 28-Aug-2006
+	. . . ;
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ; <<<<< DISABLED BLOCK SR16031 - At the End of this SubRoutine   MOVED SECTION 1
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   2     Stock Without Serial Numbers without Inventory   lager ohne seriennummer OHNE BESTAND
+	. . . ;         "From Stock"
+	. . . ;         33221    "All Line Items From Stock"
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . //IF YI=2 IF ART'="" IF '$DATA(^INWE(YM,ART))||(+$$^INARTMENGE(ART,,YLOCATION)'>0) DO   ;IF $PIECE($GET(^INART(YM,ART,1)),Y,56)'=1 DO   ; // SR14547: All INARTMENGE should have the location in it
+	. . . IF YI=2 IF ART'="" IF (+$$^INARTMENGE(ART,,YLOCATION)'>0) DO   ;IF $PIECE($GET(^INART(YM,ART,1)),Y,56)'=1 DO   ; // SR14547: All INARTMENGE should have the location in it
+	. . . . IF $$$INVORGMinusStockAllowed(objINVORG)'=$$$YES IF $PIECE($GET(^INART(YM,ART,1)),Y,28)'=1 QUIT  ;FIS;26.03.03;23349;MINUSBESTÄNDE ERLAUBT // SR14379
+	. . . . SET YAUSWAHLOK=1  ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . . WRITE "<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"""" 
+	. . . . WRITE " onClick="_""""_"window.location='"
+	. . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI
+	. . . . ;IF $PIECE(objINVORG,Y,41)=1 IF $PIECE(objINVORG,Y,134)=1 WRITE "-"_REST_"-MINUS"  ;MINUS BESTAND ERZEUGEN;FIS;24053;30.07.03
+	. . . . IF $$$INVORGMinusStockAllowed(objINVORG)=$$$YES WRITE "-"_REST_"-MINUS"          ;MINUS BESTAND ERZEUGEN;FIS;24053;30.07.03 // SR14379
+	. . . . DO ^WWWCGI
+	. . . . WRITE "'"_""""
+	. . . . ;IF YI=YFUNCT WRITE " CHECKED="_""""_"CHECKED"_""""
+	. . . . WRITE "> "
+	. . . . WRITE YA_"&nbsp;&nbsp;&nbsp;"
+	. . . . WRITE "<BR>"
+	. . . . WRITE "</INPUT>"
+	. . . . DO
+	. . . . . NEW YPOS,YART
+	. . . . . SET YPOS(1)=0
+	. . . . . SET YPOS=""
+	. . . . . FOR  SET YPOS=$ORDER(^INAUFP(YM,AUF,YPOS)) QUIT:YPOS=""  IF POS'=YPOS IF $data(^INAUFP(YM,AUF,YPOS,1)) IF $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,7)="" SET YART=$PIECE(^INAUFP(YM,AUF,YPOS,1),Y,4) IF YART'="" IF $PIECE($GET(^INART(YM,ART,1)),Y,28)=1 SET YPOS(1)=1 QUIT
+	. . . . . QUIT:YPOS(1)=0
+	. . . . . WRITE "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"-"_"-ALL"_"""" 
+	. . . . . WRITE " onClick="_""""_"window.location='"
+	. . . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI_"-"_"-ALL"
+	. . . . . DO ^WWWCGI
+	. . . . . WRITE "'"_""""
+	. . . . . WRITE ">"
+	. . . . . WRITE "</INPUT>"
+	. . . . . WRITE ""_$$^WWWTEXT(33221)_")"   ;ALLE POSTIONEN VON Lager ;"All Line Items From Stock" 
+	. . . . . WRITE "<BR>"
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   2    Stock without serial numbers with Inventory       LAGERBESTAND OHNE SERIENnummer MIT BESTAND
+	. . . ;        "From Stock" (site locn / stock locn / date / qty)
+	. . . ;        33297    "Cons. Qty"
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . IF YI=2 IF ART'="" do ListStorages^INAUFWHSource(YI,ART,AUF,POS,objINVORG)      ; SR16031
+	. . . ;
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ; ^^^^^ DISABLED BLOCK SR16031 - At the End of this SubRoutine   MOVED SECTION 2
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   1    ORDER if several companies OR one       BESTELLEN wenn mehrere Firmen ODER eine
+	. . . ;        "Order" "From" supplier name
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . IF YI=1 IF ART'="" SET LIEFERANT="" FOR  SET LIEFERANT=$ORDER(^INARTK(YM,ART,LIEFERANT)) QUIT:LIEFERANT=""  DO
+	. . . . QUIT:'$DATA(^INLIEF(YM,LIEFERANT,1))
+	. . . . NEW MERK,COLOR
+	. . . . WRITE YCR
+	. . . . SET MERK=""
+	. . . . SET COLOR=""
+	. . . . SET MERK=$PIECE($GET(^INLIEF(YM,LIEFERANT,1)),Y,32)
+	. . . . IF MERK'="" DO
+	. . . . . SET COLOR=$PIECE($GET(^WWW101(0,"MARKIERUNG",SPRACHE,MERK,1)),Y,2)
+	. . . . . IF COLOR'="" SET COLOR=$PIECE($GET(^WWW100(0,"FARBE",SPRACHE,COLOR,1)),Y,1)
+	. . . . ;
+	. . . . IF MERK'=1 DO
+	. . . . . SET YAUSWAHLOK=1  ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . . . WRITE "<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"-"_LIEFERANT_"""" 
+	. . . . . WRITE " onClick="_""""_"window.location='"
+	. . . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI_"-"_LIEFERANT
+	. . . . . DO ^WWWCGI
+	. . . . . WRITE "'"_""""
+	. . . . . IF YI=YFUNCT WRITE " CHECKED="_""""_"CHECKED"_""""
+	. . . . . WRITE ">"
+	. . . . . WRITE "</INPUT>"
+	. . . . . DO
+	. . . . . . WRITE "<A HREF="_""""_"#"_""""_" TITLE="_""""
+	. . . . . . IF +$PIECE($GET(^INARTK(YM,ART,LIEFERANT,1)),Y,13)'=0 WRITE $$^WWWZAHL($PIECE($GET(^INARTK(YM,ART,LIEFERANT,1)),Y,13),0,2,YWHR)_" "
+	. . . . . . IF $PIECE($GET(^INARTK(YM,ART,LIEFERANT,1)),Y,15)'="" WRITE $PIECE($GET(^INPARA(YM,"FRACHT",SPRACHE,$PIECE($GET(^INARTK(YM,ART,LIEFERANT,1)),Y,15),1)),Y,1)
+	. . . . . . WRITE """"_">"
+	. . . . . ;
+	. . . . . IF $PIECE(POS1,Y,66)=1 SET COLOR=YRED   ;AUSLAUFARTIKEL
+	. . . . . IF COLOR'="" WRITE "<FONT COLOR="_""""_COLOR_""""_">"           ;MARKIERUNG FABER
+	. . . . . WRITE YA_" "_$$^WWWTEXT(33544)_" "       ;BESTELLEN BEI...
+	. . . . . WRITE $PIECE($GET(^INLIEF(YM,LIEFERANT,1)),Y,8)  
+	. . . . . WRITE "</A>"
+	. . . . . IF COLOR'="" WRITE "</FONT>"
+	. . . . . IF $PIECE($GET(^INLIEF(YM,LIEFERANT,1)),Y,121)'="" DO  ;QM-PUNKTE
+	. . . . . . WRITE "<FONT SIZE=1 COLOR=GRAY>"
+	. . . . . . WRITE " ["_$PIECE($GET(^INLIEF(YM,LIEFERANT,1)),Y,121)_"]"
+	. . . . . . WRITE "</FONT>"
+	. . . . . ;
+	. . . . . WRITE "&nbsp;&nbsp;&nbsp;"
+	. . . . ;
+	. . . . IF $PIECE($GET(^INLIEF(YM,LIEFERANT,1)),Y,32)=1 DO       ;SPERR ---------
+	. . . . . WRITE "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+	. . . . . WRITE "<STRIKE>"_YA_" "_$$^WWWTEXT(33544)_" "_$PIECE($GET(^INLIEF(YM,LIEFERANT,1)),Y,8)_"</STRIKE>"  ;BESTELLEN BEI... (SR12834)
+	. . . . ;
+	. . . . DO TRACK
+	. . . . ;
+	. . . . DO  ;MAXIMALE BESTELLMENGE ;ordering quantity 
+	. . . . . NEW MAXM
+	. . . . . SET MAXM=+$PIECE($GET(^INARTK(YM,ART,LIEFERANT,1)),Y,70)
+	. . . . . QUIT:MAXM=0
+	. . . . . QUIT:MAXM'<REST
+	. . . . . WRITE "<BR>"
+	. . . . . WRITE "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+	. . . . . WRITE "<FONT SIZE=1 COLOR="_YRED_">"
+	. . . . . WRITE $$^WWWFELDNAME("INARTK","D",70)      ;MAXIMALE BESTELLMENGE ;ordering quantity 
+	. . . . . WRITE ": "_MAXM
+	. . . . . WRITE "</FONT>"
+	. . . . ;
+	. . . . DO  ;STANDARD BESTELLMENGE   ;WEM;25094;12.02.2004;NEUES FELD STANDARDBESTELLMENGE AUS INARTK (ADRAD)
+	. . . . . NEW MAXM
+	. . . . . SET MAXM=+$PIECE($GET(^INARTK(YM,ART,LIEFERANT,1)),Y,77)
+	. . . . . ;FIS;15.07.04;standard-losgrösse aus drp ;out of 
+	. . . . . IF $DATA(^INDRPITEM(YM,YLOCATION,ART,1)) IF $PIECE(^INDRPITEM(YM,YLOCATION,ART,1),Y,19)=LIEFERANT DO
+	. . . . . . IF $PIECE($GET(^INDRPITEM(YM,YLOCATION,ART,1)),Y,24)'="" SET MAXM=$PIECE(^INDRPITEM(YM,YLOCATION,ART,1),Y,24)
+	. . . . . ;
+	. . . . . QUIT:MAXM=0
+	. . . . . WRITE "<BR>"
+	. . . . . WRITE "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+	. . . . . WRITE "<FONT SIZE=1>"
+	. . . . . WRITE $$^WWWFELDNAME("INARTK","D",77)      ;STANDARD BESTELLMENGE ;ordering quantity
+	. . . . . WRITE ": "_MAXM
+	. . . . . WRITE "</FONT>"
+	. . . . ;
+	. . . . WRITE "<BR>"
+	. . . . DO
+	. . . . . NEW YPOS,YART
+	. . . . . SET YPOS(1)=0
+	. . . . . SET YPOS=""
+	. . . . . FOR  SET YPOS=$ORDER(^INAUFP(YM,AUF,YPOS)) QUIT:YPOS=""  IF POS'=YPOS IF $data(^INAUFP(YM,AUF,YPOS,1)) IF $PIECE(^INAUFP(YM,AUF,YPOS,1),Y,7)="" SET YART=$PIECE(^INAUFP(YM,AUF,YPOS,1),Y,4) IF YART'="" IF $DATA(^INARTK(YM,YART,LIEFERANT,1)) SET YPOS(1)=1 QUIT
+	. . . . . QUIT:YPOS(1)=0
+	. . . . . IF $PIECE($GET(^INLIEF(YM,LIEFERANT,1)),Y,32)=1 QUIT  ;SPERRE ;suspension 
+	. . . . . WRITE "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"-"_LIEFERANT_"-ALL"_"""" 
+	. . . . . WRITE " onClick="_""""_"window.location='"
+	. . . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI_"-"_LIEFERANT_"-ALL"
+	. . . . . DO ^WWWCGI
+	. . . . . WRITE "'"_""""
+	. . . . . WRITE ">"
+	. . . . . WRITE "</INPUT>"
+	. . . . . WRITE ""_$$^WWWTEXT(33007)_")"   ;ALLE POSTIONEN BESTELLEN ;"Order All Line Items" 
+	. . . . . WRITE "<BR>"
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   1    Order when no supplier        BESTELLEN WENN KEIN LIEFERANT
+	. . . ;        "Order"   Attention - Which Supplier?"
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . IF YI=1 DO     ;nur bei einem bestellen ;solely next to book 
+	. . . . IF ART'="" IF $DATA(^INARTK(YM,ART))                QUIT   ;EIN LIEFERANT VORHANDEN ;uni- supplier on hand 
+	. . . . IF ART'="" IF $PIECE($GET(^INART(YM,ART,1)),Y,26)=3 QUIT   ;NUR EIGENFERTIGUNG ;only 
+	. . . . SET YAUSWAHLOK=1  ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . . WRITE "<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"""" 
+	. . . . WRITE " onClick="_""""_"window.location='"
+	. . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI
+	. . . . DO ^WWWCGI
+	. . . . WRITE "'"_""""
+	. . . . ;IF YI=YFUNCT WRITE " CHECKED="_""""_"CHECKED"_""""
+	. . . . WRITE "> "
+	. . . . WRITE "<FONT COLOR="_YRED_">"
+	. . . . WRITE YA_"&nbsp;&nbsp;&nbsp;"   ;BESTELLEN
+	. . . . WRITE "</INPUT>"
+	. . . . WRITE "["_$$^WWWTEXT(33833)_"]"      ;BEC;25235;07.04.04;Achtung - welcher Lieferant?". 
+	. . . . WRITE "</FONT>"
+	. . . . WRITE "<BR>"
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   7    SELECTION SUPPLIER WITH Supplier ORDER WITHOUT Supplier NUMBER   AUSWAHL LIEFERANT BEI LF-BESTELLUNG OHNE LF-NUMMER		          ;FIS;23856;01.07.03
+	. . . ;        "Supplier No & Short Name"
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . IF YI=7 IF ($PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=2) || ($PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=5) IF $PIECE(^INAUF(YM,AUF,1),Y,12)=""  DO  ;BESTELLUNGEN OHNE LIEFERANT ;without supplier 
+	. . . . IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,265)=1 DO
+	. . . . . WRITE "<FONT COLOR="_YRED_"><B>"
+	. . . . . WRITE $$^WWWFELDNAME("INAUF","D",265)  ;BESTELLUNG VIA MARKET PLACE ;sales order via 
+	. . . . . WRITE "</B></FONT>"
+	. . . . . IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,266)'="" WRITE " ("_$$^WWWFELDNAME("INAUF","D",266)_": "_$$^WWWDATE($PIECE($GET(^INAUF(YM,AUF,1)),Y,266))_")"
+	. . . . . WRITE "<BR>",YCR
+	. . . . ;
+	. . . . IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,2)=5 QUIT  ;KEINE REQUISITION ;no 
+	. . . . IF ART'="" IF $DATA(^INARTK(YM,ART)) DO  QUIT   ;EIN LIEFERANT VORHANDEN ;uni- supplier on hand 
+	. . . . . NEW LIEF
+	. . . . . SET LIEF=""
+	. . . . . FOR  SET LIEF=$ORDER(^INARTK(YM,ART,LIEF)) QUIT:LIEF=""  DO
+	. . . . . . SET YAUSWAHLOK=1  ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . . . . IF $PIECE($GET(^INAUF(YM,AUF,1)),Y,266)="" DO
+	. . . . . . . WRITE "<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"-"_LIEF_"""" 
+	. . . . . . . WRITE " onClick="_""""_"window.location='"
+	. . . . . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI_"-"_LIEF
+	. . . . . . . DO ^WWWCGI
+	. . . . . . . WRITE "'"_""""
+	. . . . . . . WRITE "> "
+	. . . . . . ;
+	. . . . . . WRITE "&nbsp;"_LIEF_"&nbsp;"_$PIECE($GET(^INLIEF(YM,LIEF,1)),Y,8)   ;BESTELLEN
+	. . . . . . WRITE "</INPUT>"
+	. . . . . . WRITE "<BR>"
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   8    STOCK WITHOUT EXACT DEFINING (LATE TAKES PLACE WITH PICKING)
+	. . . ;        LAGERBESTAND OHNE GENAUE DEFINIERUNG (ERFOLGT SPÄTER BEIM PICKEN) ;FIS;21.02.05;26869
+	. . . ;        "From Stock"  "[Selection Of Picking ]"
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . IF YI=8 IF ART'="" IF $$$INVORGSourceByPickingProcess(objINVORG)=$$$YES DO
+	. . . . SET YAUSWAHLOK=1  ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . . WRITE "<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"""" 
+	. . . . WRITE " onClick="_""""_"window.location='"
+	. . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI
+	. . . . DO ^WWWCGI
+	. . . . WRITE "'"_""""_">"
+	. . . . WRITE "<font color="_YRED_">"
+	. . . . WRITE YA_"&nbsp;&nbsp;["
+	. . . . WRITE $$^WWWTEXT(34144)  ;AUSWAHL BEI BEREITSTELLUNG
+	. . . . WRITE "]</font>"
+	. . . . WRITE "<BR>"
+	. . . . WRITE "</INPUT>"
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;
+	. . . WRITE "</TR>"            ; FIXME <GRF> is it valid to have two consecutive /TR?
+	. . ;
+	. . WRITE "</TR>"
+	. . WRITE "</TABLE>"
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;
+	. IF YAUSWAHLOK=0 DO                              ;es wurde nichts ausgewählt
+	. . WRITE YCR,"<B>"_$$^WWWTEXT(32210)_"</B>"      ; "No Selection Possible"  ;KEINE AUSWAHL MÖGLICH
+	. ;
+	. WRITE YCR,"</FIELDSET>"
+	. ;
+	. IF $GET(YFORM)="INAUFP" DO  ;WENN EINSPRUNG AUS AUFTRAGSPOSITION ;when out of 
+	. . WRITE YCR,"</TD></TR>"
+	. . DO ^WWWFRAME(0)
+	. ;
+	. IF $PIECE(POS1,Y,4)'="" IF $DATA(^INARTA(YM,$PIECE(POS1,Y,4))) DO    ;BEC;25255;03.03.04;anzeigen alternativartikel
+	. . NEW ART1,TXT,ART11,VALID
+	. . SET TXT=$PIECE($GET(^WWW120(0,"INARTA",1)),Y,1)
+	. . IF $PIECE($GET(^WWW1201(0,"INARTA",SPRACHE,1)),Y,1)'="" SET TXT=$PIECE(^WWW1201(0,"INARTA",SPRACHE,1),Y,1)
+	. . WRITE "<B>"_TXT_":</B><BR>"
+	. . SET ART1=""
+	. . FOR  SET ART1=$ORDER(^INARTA(YM,$PIECE(POS1,Y,4),ART1)) QUIT:ART1=""  DO
+	. . . SET ART11=$GET(^INARTA(YM,$PIECE(POS1,Y,4),ART1,1))
+	. . . SET VALID=1
+	. . . IF $PIECE(ART11,Y,2)'="" IF $PIECE(ART11,Y,2)>$HOROLOG SET VALID=0
+	. . . IF $PIECE(ART11,Y,3)'="" IF $PIECE(ART11,Y,3)<$HOROLOG SET VALID=0
+	. . . IF VALID=0 WRITE "<FONT COLOR="_YRED_">"
+	. . . WRITE ART1_" "_$$^INARTNAME(ART1)
+	. . . IF $PIECE(ART11,Y,1)'="" DO
+	. . . . WRITE " ("_$EXTRACT($PIECE(ART11,Y,1),1,35)
+	. . . . IF $EXTRACT($PIECE(ART11,Y,1),36,38)'="" WRITE "..."
+	. . . . WRITE ")"
+	. . . ;
+	. . . IF VALID=0 WRITE "</FONT>"
+	. . . IF $ORDER(^INARTA(YM,$PIECE(POS1,Y,4),ART1))'="" WRITE "<BR>"
+	. ;
+	. ;ANZEIGEN BESTAND UND AUFTRÄGE ;display And 
+	. DO ^WWWFRAME(1)
+	. WRITE YCR
+	. QUIT:$PIECE(POS1,Y,4)=""  ;KEIN ARTIKEL ;no item 
+	. ;
+	. WRITE "<BR>"
+	. IF $$^INARTMENGE($PIECE(POS1,Y,4)) DO
+	. . DO ^WWWFRAME(0)
+	. . do DisplayTable^INListBundles($$$INAUFPItemNumber(POS1)_","_$]]><![CDATA[$$INAUFLocation(objOrder),YAUSWAHL)
+	. . DO ^WWWFRAME(1)  ;ENDE ;termination 
+	. ;
+	. WRITE YCR,"<BR>"
+	. ;
+	. IF $DATA(^INAUFPs(YM,5,$$^WWWUMLAU(" ",1),$PIECE(POS1,Y,4)))!($DATA(^INAUFPs(YM,5,$$^WWWUMLAU(0,1),$PIECE(POS1,Y,4)))) DO
+	. . DO ^WWWFRAME(0)
+	. . DO AUFTRAEGE
+	. . DO ^WWWFRAME(1)  ;ENDE ;termination 
+	
+	QUIT
+	
+	
+TRACK
+	;-------------------------------------------------------------------------------
+	;	INFO ATIKEL BEI LIEFEANT ;next to
+	;	 
+	; History :
+	; 28-Aug-2006	GRF		SR12027: D1=>D8
+	;-------------------------------------------------------------------------------
+	NEW YARTIKEL,YURL
+	
+	SET YURL = $PIECE($GET(^INLIEF(YM,LIEFERANT,1)),Y,119)  ;URL DER ARTIKELBESTÄNDE ;URL the 
+	QUIT:YURL=""
+	
+	SET YARTIKEL = $TRANSLATE($PIECE($PIECE($GET(^INARTK(YM,ART,LIEFERANT,1)),Y,8),"|",1)," ")
+	SET YURL = YURL_YARTIKEL
+	
+	WRITE YCR,"<A HREF="
+	WRITE "http://"_YURL
+	WRITE " TARGET=ARTTIKELINFO"
+	WRITE ">"
+	WRITE YCR,"<IMG SRC="_""""_YGIF_"left.gif"_""""_" BORDER=0 TITLE='"_$$^WWWTEXT(32196)_"'></A>"
+	WRITE "&nbsp;&nbsp;"
+	QUIT
+	
+	
+LAGERBESTAND
+    ;-------------------------------------------------------------------------------
+	;	LAGERBESTAND ZEIGEN ;exhibit 
+    ;-------------------------------------------------------------------------------
+	DO ^INBESTANZ($PIECE(POS1,Y,4))  ;ARTIKELBESTAND
+	QUIT
+	
+	
+AUFTRAEGE       ;AUFTRAGSLISTE
+    ;-------------------------------------------------------------------------------
+    ; History:
+    ; 02-Sep-2005	JW		SR12966: INUSER is not shared 
+    ;-------------------------------------------------------------------------------
+	NEW YAUSWAHLWH
+	
+	SET YAUSWAHLWH=$PIECE($GET(^INUSER(YM,YBED,1)),Y,1)
+	SET %(YQUERY,"YAUSWAHL")="/-"_$PIECE(POS1,Y,4)  ;ARTIKEL ;item 
+	SET %(YQUERY,"YNOZAHL")=1                       ; (NUR TABELLE OHNE AVZAHL BEGRANZ) ;tabulation without 
+	DO ^INAUFBANZ                                   ;AUFTRÄGE MIT DIESEM ARTIKEL ;by means of item 
+	SET $PIECE(^INUSER(YM,YBED,1),Y,1)=YAUSWAHLWH
+	QUIT
+	
+	
+SPLIT(AUF,POS,MNG)
+    ;-------------------------------------------------------------------------------
+	;	SPLITTEN AUFTRAGSPOSITION
+    ;-------------------------------------------------------------------------------
+	SET AUF=$GET(AUF)		IF AUF="" DO ^WWWFORM QUIT
+	SET POS=$GET(POS)		IF POS="" DO ^WWWFORM QUIT
+	SET MNG=$GET(MNG)		IF +MNG=0 DO ^WWWFORM QUIT
+	DO ^INAUFWHSPLIT
+	QUIT
+	
+	
+CanSource(pidOrder,pidOrderLine,pidBin="")
+	;-------------------------------------------------------------------------------
+	; Check if the Source Location field is null, and if not, does it match the headers
+	; location AND the quantity required <= the amount on site?
+	;
+	; Params:
+	; pidOrder    	: The order to be sourced
+	; pidOrderLine	: The order line to be sourced
+	; pidBin		: (Optional) Get from this bin
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; Boolean - $$$NO No Sourcing, $$$YES Sourcing
+	;
+	; History:
+	; 19-Dec-2006	SteveS	SR15244: Check qty + location + bin properly
+	; 19-Sep-2006	RPW		SR14933: Created
+	;-------------------------------------------------------------------------------
+	new idSourceLocn,objLine,fltQuantity,idItem,idShipFromLocn
+	new blnHaveQty,blnLocnOK,strQty,arrQty
+	
+ 	set objLine        = $get(^INAUFP(YM,pidOrder,pidOrderLine,1))
+	set idSourceLocn   = $$$INAUFPSourceLocation(objLine)
+	set fltQuantity    = $$$INAUFPQuantity(objLine)
+	set idItem         = $$$INAUFPItemNumber(objLine)
+	set idShipFromLocn = $$$INAUFLocation($get(^INAUF(YM,pidOrder,1)))
+	
+	set blnHaveQty	   = $$$NO
+	set blnLocnOK 	   = (idSourceLocn="")||(idSourceLocn=idShipFromLocn)
+	
+	if pidBin="" {
+		set blnHaveQty = ($$^INARTMENGE(idItem,,idShipFromLocn,,0) >= fltQuantity)
+	
+	} else {
+		set strQty = $$^INARTMENGE(idItem,$$$YES,idShipFromLocn,,0)
+		do QtyByBin^INARTMENGE(strQty,.arrQty)
+		
+		if +$get(arrQty(pidBin))>0 {
+			set blnHaveQty=$$$YES
+		}
+	}
+	quit (blnHaveQty && blnLocnOK)
+	
+	
+CreateMovement(pidOrder,pidOrderLine,pfltOrderQty,pidBundleStock)
+	;-------------------------------------------------------------------------------
+	; Returns: Qty remaining to be sourced on orderline
+	;
+	; History:
+	; 17-Sep-2008	HQN		SR15808: Deprecated
+	; 25-Aug-2008	HQN		SR15811: Replicating soft reservation with InProgress state
+	; 18-Aug-2008	HQN		SR15811: Order Qty may be more than bundle.Qty, source
+	; 							as individual
+	; 12-Aug-2008	HQN		SR15811: Reverting quantities on failure
+	; 11-Aug-2008	HQN		SR15811: Created
+	;-------------------------------------------------------------------------------
+	new sc,objBundleStock,objMove,fltQtyRemaining,objOrderLine
+	
+	set fltQtyRemaining = pfltOrderQty
+ 
+	set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(pidBundleStock,,.sc)
+	if $$$ISOK(sc) {
+		if pfltOrderQty > objBundleStock.QtyOnHand {
+			set fltQtyRemaining = objBundleStock.QtyOnHand
+		} else {
+			set fltQtyRemaining = pfltOrderQty
+		}
+		
+		set objMove = ##class(alSAL.dMovement).%New()
+		set objMove.Item        = objBundleStock.Item
+		set objMove.Bundle      = objBundleStock.Bundle
+		set objMove.FromLocn    = objBundleStock.Storage.Location
+		set objMove.FromStorage = objBundleStock.Storage
+		set objMove.Reference   = pidOrder
+		set objMove.LineNumber  = pidOrderLine
+		set objMove.QtyRequired = fltQtyRemaining
+		set objMove.ToLocn      = ""
+		set objMove.ToStorage   = ""
+		set objMove.QtyPicked   = 0
+		set objMove.QtyReceived = 0
+		set objMove.Demand      = ""
+		set objMove.Supply      = ""
+		
+		set sc = objMove.ChangeState(3)     ; Outstanding
+		
+		set objOrderLine = objMove.GetReference()
+		set:objOrderLine'=$$$NULLOREF fltQtyRemaining = objOrderLine.Quantity - objOrderLine.Quantity1 - fltQtyRemaining
+		
+		set:$$$ISERR(sc) fltQtyRemaining = pfltOrderQty ; Error, revert quantities
+	}
+	quit fltQtyRemaining
+	
+	
+SourceStock(pidOrder,pidOrderLine,pfltOrderQty,pidBundleStock)
+	;-------------------------------------------------------------------------------
+	; Attempts to create a reservation for the supplied bundlestock.
+	; Quantities need to be taken into account via sourcing
+	;
+	; Params:
+	;
+	; Returns:
+	; 	fltQtyRemaining		Total Amount remaining after sourcing
+	;
+	; History:
+	; 10-Oct-2008	HQN		FIXME: Not utilising sourcing algorithm...not taking into
+	;							account prior Reservations
+	; 08-Oct-2008	HQN		Documented return value, corrected return value
+	; 03-Oct-2008	HQN		SR15984: Handle auto sourcing, no bundlestock specified
+	; 17-Sep-2008	HQN		SR15808: Created
+	;-------------------------------------------------------------------------------
+	new fltQtyRemaining,fltQtySourced,idItem,idLocn,loopStock,lstBundleStocks
+	new objBundleStock,objItem,objLocn,objSourceDetails
+	new sc,strOrder,strOrderLine
+	
+	set fltQtySourced   = 0
+	set fltQtyRemaining = pfltOrderQty
+ 
+	set strOrder     = $get(^INAUF(YM,pidOrder,1))
+	set strOrderLine = $get(^INAUFP(YM,pidOrder,pidOrderLine,1))
+	set idItem  = $$$INAUFPItemNumber(strOrderLine)
+	set idLocn  = $$$INAUFLocation(strOrder)
+	set objItem = ##class(alINV.iUINV).GetItem(idItem)
+	set objLocn = ##class(alLOC.iULOC).GetLocation(idLocn)
+ 
+	if ($get(pidBundleStock) '= $$$NULLOID) && (##class(alSOH.dBundleStock).%ExistsId(pidBundleStock)) {
+		set lstBundleStocks = ##class(alDRP.iDRP).SourceStock(objItem,objLocn)
+		for loopStock=1:1:lstBundleStocks.Count() {
+			if lstBundleStocks.GetAt(loopStock).%Id() = pidBundleStock {
+				set objBundleStock = lstBundleStocks.GetAt(loopStock)
+				quit ; for break
+			}
+		}
+		
+		if $get(objBundleStock) '= $$$NULLOREF {
+			if pfltOrderQty > objBundleStock.QtyOnHand {
+				set fltQtySourced = objBundleStock.QtyOnHand
+			} else {
+				set fltQtySourced = pfltOrderQty
+			}
+			set objSourceDetails = ##class(alDRP.dPlannedMovement).%New()
+			set objSourceDetails.MovementType = ##class(alDRP.dMovementType.Sale).%New() ; FIXME: Type should be based off of $$$FldINAUFOrderType
+			set objSourceDetails.Item         = objBundleStock.Item
+			set objSourceDetails.Bundle       = objBundleStock.Bundle
+			set objSourceDetails.FromLocn     = objBundleStock.Storage.Location
+			set objSourceDetails.FromStorage  = objBundleStock.Storage
+			set objSourceDetails.QtyRequired  = fltQtySourced
+			set objSourceDetails.Reference    = pidOrder
+			set objSourceDetails.LineNumber   = pidOrderLine
+			set sc = objSourceDetails.ChangeState(3)
+			if $$$ISOK(sc) {
+				set fltQtyRemaining = pfltOrderQty - fltQtySourced
+			} else {
+				set fltQtyRemaining = pfltOrderQty
+			}
+		}
+		
+	} else {   ; Auto sourcing
+		set lstBundleStocks = ##class(alDRP.iDRP).SourceStock(objItem,objLocn)
+		for loopStock=1:1:lstBundleStocks.Count() {
+			quit:fltQtyRemaining=0
+			set fltQtyRemaining = $$SourceStock(pidOrder,pidOrderLine,fltQtyRemaining,lstBundleStocks.GetAt(loopStock).%Id()) ; RECURSION
+		}
+	}
+	quit fltQtyRemaining
+	
+	
+CompleteMovement(pidOrder,pidOrderLine)
+	;-------------------------------------------------------------------------------
+	; Completes a movement that has been sourced, impact SOH
+	;
+	; Params:
+	;
+	; Called From
+	; 	INTAGES1
+	; Returns:
+	;
+	; History:
+	; 09-Mar-2011	PPP		SR17681: Add the Customer Number/Account to the Planned Movement
+	; 08-Oct-2008	HQN		SR16009: SQL Embedded type lookup change, PlannedMovements
+	; 03-Sep-2008	HQN		SR15811: Created
+	;-------------------------------------------------------------------------------
+ 	new idCustomer,idCustAcct,lstMovementTypeId
+	new objCustomer,objMove,objOrder,objResultSet,sc,strStatus
+ 	
+	set sc        = $$$OK
+	set strStatus = $$$OK
+ 
+ 	//SR17681
+ 	set objOrder   = $get(^INAUF(0,pidOrder,1))
+ 	set idCustomer = $$$INAUFCustomerNumber(objOrder) 	
+ 	if idCustomer'="" {
+ 		set objCustomer = $get(^INKUNDE(0,idCustomer,1))
+ 		set idCustAcct  = $$$INKUNDEDebtorNumber(objCustomer)
+		if idCustAcct = "" {
+			set idCustAcct = idCustomer
+		}
+ 	}
+ 	
+ 	set objResultSet = ##class(%Library.ResultSet).%New()
+	set lstMovementTypeId = $listbuild(0)
+	
+	if objResultSet.Prepare("SELECT * FROM alDRP.dPlannedMovement WHERE State->StateId = 3 AND MovementType_MovementTypeId = ? AND Reference = ? AND LineNumber = ?") {
+		if objResultSet.Execute(lstMovementTypeId,pidOrder,pidOrderLine) {
+			while objResultSet.Next() {
+				set objMove = ##class(alDRP.dPlannedMovement).%OpenId(objResultSet.Data("ID"),,.sc)
+				set objMove.CustomerAccount=$get(idCustAcct)			//SR17681
+				set:$$$ISOK(sc) sc = objMove.ChangeState(4)
+				quit:$$$ISERR(sc)
+				
+				do objMove.%DeleteId(objResultSet.Data("ID"))
+			}
+		}
+	}
+	set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	
+	quit strStatus
+	
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ; vvvvv DISABLED BLOCK SR16031    MOVED SECTION 1
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ;-----------------------------------------------------------------------------------------------
+	. . . ; vvvvv DISABLED BLOCK START SR16031  Reservations are part of new SOH - need to be redone
+	. . . ;-----------------------------------------------------------------------------------------------
+	. . . ;IF YI=2 IF ART'="" IF $DATA(^INWERs(YM,3,idxAUF,ART)) DO
+	. . . ;IF YI=2 IF ART'="" IF $DATA(^INWERs(YM,3,idxAUF,ART)) DO
+	. . . ;. NEW BET,INWER1,LAP,RENR,SN,WED
+	. . . ;. SET BET=""
+	. . . ;. IF $$$INVORGAccessOtherItemLocns(objINVORG)'=$$$YES SET BET=YLOCATION  ;FIS;18.06.03;23795;ZUGRIFF NUR AUF EIGENEN BETRIEB ERLAUBT !
+	. . . ;. DO:BET'=""  FOR  SET BET=$ORDER(^INWERs(YM,3,idxAUF,ART,BET)) QUIT:BET=""  DO     ;BETRIEB
+	. . . ;. . ;IF $PIECE(objINVORG,Y,67)'=1 QUIT:BET'=YLOCATION  ;ZUGRIFF AUF BESTÄNDE ANDERER BETRIEBE NICHT ERLAUBT !
+	. . . ;. . SET LAP=""
+	. . . ;. . FOR  SET LAP=$ORDER(^INWERs(YM,3,idxAUF,ART,BET,LAP)) QUIT:LAP=""  DO     ;LAGERPLATZ ;stock location 
+	. . . ;. . . SET WED=""
+	. . . ;. . . FOR  SET WED=$ORDER(^INWERs(YM,3,idxAUF,ART,BET,LAP,WED)) QUIT:WED=""  DO
+	. . . ;. . . . SET RENR=""
+	. . . ;. . . . FOR  SET RENR=$ORDER(^INWERs(YM,3,idxAUF,ART,BET,LAP,WED,RENR)) QUIT:RENR=""  DO 
+	. . . ;. . . . . SET INWER1=$GET(^INWER(YM,ART,BET,LAP,WED,RENR,1))
+	. . . ;. . . . . QUIT:INWER1=""
+	. . . ;. . . . . QUIT:$PIECE(INWER1,Y,8)'=""  ;BEREITS AUFGELÖST ;yet 
+	. . . ;. . . . . IF $PIECE(INWER1,Y,5)<$HOROLOG DO  QUIT
+	. . . ;. . . . . . NEW INWER1
+	. . . ;. . . . . . SET VON=$$^WWWTEXT(33557)                             ; "System"
+	. . . ;. . . . . . DO AUS^INWER(ART,BET,LAP,WED,RENR,VON)                ;FAN;24045;04.08.2003;RESERVIERUNG AUFLÖSEN
+	. . . ;. . . . . ;
+	. . . ;. . . . . SET REMENGE=$PIECE(INWER1,Y,4)
+	. . . ;. . . . . QUIT:+REMENGE=0
+	. . . ;. . . . . ;QUIT:$PIECE($GET(^INLP(YM,BET,LAP,1)),Y,8)=1  ;LAGERPLATZ GESPERRT
+	. . . ;. . . . . ;IF $PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,25)'="" QUIT:+$PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1),Y,25)<$H)  ;VERFALLSDATUM ABGELAUFEN
+	. . . ;. . . . . ;IF $PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,26)'="" QUIT:+$PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,26)>$H)  ;NOCH NICHT VERWENDBAR
+	. . . ;. . . . . WRITE YCR
+	. . . ;. . . . . SET YAUSWAHLOK=1  ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . ;. . . . . WRITE "&nbsp;&nbsp;&nbsp;"
+	. . . ;. . . . . WRITE "&nbsp;&nbsp;"
+	. . . ;. . . . . ;
+	. . . ;. . . . . ; "For" "Order" ":" "To"
+	. . . ;. . . . . WRITE "<A"
+	. . . ;. . . . . ;WRITE " TITLE="_""""_$$^WWWTEXT(32807)_" "_$$^WWWTEXT(32047)_": "_$PIECE(INWER1,Y,7)_" "_$$^WWWTEXT(69)_" "_$$^WWWDATE($PIECE(INWER1,Y,5))_""""    ;BR014923     
+	. . . ;. . . . . WRITE " TITLE="_""""_$$^WWWTEXT(32807)_" "_$$^WWWTEXT(32047)_": "_$PIECE(INWER1,Y,7)_" "_$$$Text($listbuild("54",$$^WWWDATE($PIECE(INWER1,Y,5))))_""""   ;BR014923  ; To %1      
+	. . . ;. . . . . ;FÜR AUFTRAGE 00000 BIS 00.00.0000 ;to until 
+	. . . ;. . . . . WRITE " HREF="_""""
+	. . . ;. . . . . WRITE YAKTION_"EP=WWWMANU&YFORM=INAUFWH&YEXEC=D|^INAUFWH('"_YKEY_"')"_"&YFUNCT="_YI_";"_ART_";"_BET_";"_LAP_";"_WED_";"_RENR
+	. . . ;. . . . . DO ^WWWCGI
+	. . . ;. . . . . WRITE """"
+	. . . ;. . . . . WRITE "> "
+	. . . ;. . . . . ;
+	. . . ;. . . . . ;ANZEIGEN LAGERPLATZ / WE-DATUM / MENGE ;display stock location quantity 
+	. . . ;. . . . . WRITE "<U>"
+	. . . ;. . . . . WRITE $$^WWWTEXT(33066)_"("_LAP_" / "_$$^WWWDATE(WED)_" / "_$$^WWWZAHL(REMENGE,0,$LENGTH($PIECE(REMENGE,".",2)))_")"
+	. . . ;. . . . . ;ANZEIGEN LAGERPLATZHINWEIS ;display 
+	. . . ;. . . . . IF $PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,9)'="" WRITE " ("_$PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,9)_")"
+	. . . ;. . . . . WRITE "</U>"
+	. . . ;. . . . . WRITE "</A>"
+	. . . ;. . . . . WRITE "&nbsp;&nbsp;&nbsp;"
+	. . . ;. . . . . ;ulm,26.03.03 ----- KOMMISSION
+	. . . ;. . . . . IF $PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,60)'="" WRITE "/","<FONT COLOR=RED>",$$^WWWTEXT(33297),"</FONT>"  ;KOMMISSION ;errand 
+	. . . ;. . . . . WRITE "<BR>"
+	. . . ;;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   2    Stock Reserved for this Customer   LAGERBESTAND RESERVIERT FÜR DIESEN KUNDEN
+	. . . ;        32807    "For" "Order" ":" "To"
+	. . . ;        33066    "Undo Layby   ( locn / date / qty)"
+	. . . ;        33297    "Cons. Qty"
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;SET AUF1=$GET(^INAUF(YM,AUF,1))
+	. . . ;SET KUNDE=$PIECE(AUF1,Y,1)
+	. . . ;set idxKUNDE = $$^WWWUMLAU(KUNDE,1)
+	. . . ;;
+	. . . ;IF YI=2 IF KUNDE'="" IF ART'="" IF $DATA(^INWERs(YM,2,idxKUNDE,ART)) DO  ;
+	. . . ;. NEW BET,LAP,WED,SN,RENR,INWER1
+	. . . ;. SET BET=""
+	. . . ;. IF $$$INVORGAccessOtherItemLocns(objINVORG)'=$$$YES SET BET=YLOCATION  ;FIS;18.06.03;23795;ZUGRIFF NUR AUF EIGENEN BETRIEB ERLAUBT !
+	. . . ;. DO:BET'=""  IF BET="" FOR  SET BET=$ORDER(^INWERs(YM,2,idxKUNDE,ART,BET)) QUIT:BET=""  DO     ;BETRIEB
+	. . . ;. . SET LAP=""
+	. . . ;. . FOR  SET LAP=$ORDER(^INWERs(YM,2,idxKUNDE,ART,BET,LAP)) QUIT:LAP=""  DO     ;LAGERPLATZ ;stock location 
+	. . . ;. . . SET WED=""
+	. . . ;. . . FOR  SET WED=$ORDER(^INWERs(YM,2,idxKUNDE,ART,BET,LAP,WED)) QUIT:WED=""  DO
+	. . . ;. . . . SET RENR=""
+	. . . ;. . . . FOR  SET RENR=$ORDER(^INWERs(YM,2,idxKUNDE,ART,BET,LAP,WED,RENR)) QUIT:RENR=""  DO 
+	. . . ;. . . . . SET INWER1=$GET(^INWER(YM,ART,BET,LAP,WED,RENR,1))
+	. . . ;. . . . . QUIT:INWER1=""
+	. . . ;. . . . . QUIT:$PIECE(INWER1,Y,8)'=""  ;BEREITS AUFGELÖST ;yet 
+	. . . ;. . . . . IF $PIECE(INWER1,Y,5)<$HOROLOG DO  QUIT
+	. . . ;. . . . . . NEW INWER1
+	. . . ;. . . . . . SET VON=$$^WWWTEXT(33557)                             ; "System"
+	. . . ;. . . . . . DO AUS^INWER(ART,BET,LAP,WED,RENR,VON)                ;FAN;24045;04.08.2003;RESERVIERUNG AUFLÖSEN
+	. . . ;. . . . . ;
+	. . . ;. . . . . SET REMENGE=$PIECE(INWER1,Y,4)
+	. . . ;. . . . . QUIT:+REMENGE=0
+	. . . ;. . . . . ;QUIT:$PIECE($GET(^INLP(YM,BET,LAP,1)),Y,8)=1  ;LAGERPLATZ GESPERRT
+	. . . ;. . . . . ;IF $PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,25)'="" QUIT:+$PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,25)<$H  ;VERFALLSDATUM ABGELAUFEN
+	. . . ;. . . . . ;IF $PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,26)'="" QUIT:+$PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,26)>$H  ;NOCH NICHT VERWENDBAR
+	. . . ;. . . . . WRITE YCR
+	. . . ;. . . . . SET YAUSWAHLOK=1  ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . ;. . . . . WRITE "&nbsp;&nbsp;&nbsp;"
+	. . . ;. . . . . WRITE "&nbsp;&nbsp;"
+	. . . ;. . . . . ;
+	. . . ;. . . . . ; "For" "Order" ":" "To"
+	. . . ;. . . . . WRITE "<A"
+	. . . ;. . . . . ;WRITE " TITLE="_""""_$$^WWWTEXT(32807)_" "_$$^WWWTEXT(32580)_": "_$PIECE(INWER1,Y,1)_" "_$$^WWWTEXT(69)_" "_$$^WWWDATE($PIECE(INWER1,Y,5))_""""   ;BR014923      
+	. . . ;. . . . . WRITE " TITLE="_""""_$$^WWWTEXT(32807)_" "_$$^WWWTEXT(32580)_": "_$PIECE(INWER1,Y,1)_" "_$$$Text($listbuild("54",$$^WWWDATE($PIECE(INWER1,Y,5))))_""""   ;BR014923  ; To %1      
+	. . . ;. . . . . ;FÜR KUNDENUMMER 00000 BIS 00.00.0000 ;to until 
+	. . . ;. . . . . WRITE " HREF="_""""
+	. . . ;. . . . . WRITE YAKTION_"EP=WWWMANU&YFORM=INAUFWH&YEXEC=D|^INAUFWH('"_YKEY_"')"_"&YFUNCT="_YI_";"_ART_";"_BET_";"_LAP_";"_WED_";"_RENR
+	. . . ;. . . . . DO ^WWWCGI
+	. . . ;. . . . . WRITE """"
+	. . . ;. . . . . WRITE "> "
+	. . . ;. . . . . ;
+	. . . ;. . . . . ;ANZEIGEN LAGERPLATZ / WE-DATUM / MENGE ;display stock location quantity 
+	. . . ;. . . . . WRITE "<U>"
+	. . . ;. . . . . WRITE $$^WWWTEXT(33066)_"("_LAP_" / "_$$^WWWDATE(WED)_" / "_$$^WWWZAHL(REMENGE,0,$LENGTH($PIECE(REMENGE,".",2)))_")"
+	. . . ;. . . . . ;ANZEIGEN LAGERPLATZHINWEIS ;display 
+	. . . ;. . . . . IF $PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,9)'="" WRITE " ("_$PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,9)_")"
+	. . . ;. . . . . WRITE "</U>"
+	. . . ;. . . . . WRITE "</A>"
+	. . . ;. . . . . WRITE "&nbsp;&nbsp;&nbsp;"
+	. . . ;. . . . . ;ulm,26.03.03 ----- KOMMISSION
+	. . . ;. . . . . IF $PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,60)'="" WRITE "/","<FONT COLOR=RED>",$$^WWWTEXT(33297),"</FONT>"  ;KOMMISSION ;errand 
+	. . . ;. . . . . WRITE "<BR>"
+	. . . ; ^^^^^^^ DISABLED BLOCK START SR16031
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ; ^^^^^ DISABLED BLOCK SR16031    MOVED SECTION 1
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	
+	
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ; vvvvv DISABLED BLOCK SR16031    MOVED SECTION 2
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ;IF YI=2 IF ART'="" IF $DATA(^INWE(YM,ART)) DO    
+	. . . ;. NEW BET,LAP,objINWE,SN,WED,objItem,objLocation,lstBundleStocks,loopBundleStocks,objBundleStock,strClass
+	. . . ;. SET BET=""
+	. . . ;. IF $$$INVORGAccessOtherItemLocns(objINVORG)'=$$$YES SET BET=YLOCATION        ;FIS;18.06.03;23795;ZUGRIFF NUR AUF EIGENEN BETRIEB ERLAUBT !
+	. . . ;. //DO:BET'=""  IF BET="" FOR  SET BET=$ORDER(^INWE(YM,ART,BET)) QUIT:BET=""  DO     ;BETRIEB
+	. . . ;. DO:BET'=""  IF BET="" FOR  SET BET=$ORDER(^INWE(YM,ART,BET)) QUIT:BET=""  DO     ;BETRIEB
+	. . . ;. . IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,324)'="" QUIT:BET'=$PIECE(^INAUFP(YM,AUF,POS,1),Y,324)  ;FIS;OTHER SHIP FROM LOCATION;FIS;04.05.05;SR12200
+	. . . ;. . ; vvvv SR15811
+	. . . ;. . ;      TODO: Insert V2 Sourcing and write out corresponding <input> tags
+	. . . ;. . SET objItem = ##class(alINV.iUINV).GetItem(ART)
+	. . . ;. . SET objLocation = ##class(alLOC.iULOC).GetLocation(BET)
+	. . . ;. . SET lstBundleStocks = ##class(alDRP.iDRP).SourceStock(objItem,objLocation)
+	. . . ;. . FOR loopBundleStocks=1:1:lstBundleStocks.Count() DO
+	. . . ;. . . SET objBundleStock = lstBundleStocks.GetAt(loopBundleStocks)
+	. . . ;. . . set strClass=""
+	. . . ;. . . IF objBundleStock.QtyOnHand '> 0 DO
+	. . . ;. . . . SET strClass=" CLASS=""warning"""              ; SR15811
+	. . . ;. . . WRITE "<INPUT TYPE=""CHECKBOX"" NAME=""YFUNCT"" VALUE="""_YI_"|"_objBundleStock.Storage.Code_"|"_objBundleStock.%Id()_""" onClick=""window.location='"
+	. . . ;. . . IF objBundleStock.QtyOnHand > 0 WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT='+this.value+'" DO ^WWWCGI WRITE "'"">"
+	. . . ;. . . IF objBundleStock.QtyOnHand <=0 DO ^WWWCGI WRITE "'"">"
+	. . . ;. . . WRITE "<LABEL"_strClass_">From Stock("_objBundleStock.Storage.Location.Code_" / "_objBundleStock.Storage.Code_" / "_objBundleStock.Bundle.%Id()_" / "_objBundleStock.QtyOnHand_")</LABEL></INPUT><BR/>"
+	. . . ;. . . ;
+	. . . . . . ; vvvv SR15811 13-Aug-2008 Replicate Additional display formatting
+	. . . . . . ;. IF $PIECE(objINWE,Y,4)'>0 WRITE "<FONT COLOR="_YRED_">"  ;MINUS BESTAND ERZEUGEN;FIS;24053;30.07.03
+	. . . . . . ;. ;ANZEIGEN LAGERPLATZ / WE-DATUM / MENGE ;display stock location quantity 
+	. . . . . . ;. WRITE YA_"("_BET_" / "_LAP_" / "_$$^WWWDATE(WED)_" / "_$$^WWWZAHL($PIECE(objINWE,Y,4),0,$LENGTH($PIECE($PIECE(objINWE,Y,4),".",2)))_")"  ;FIS;SHOW LOCATION, TOO;27.04.05;SR12200
+	. . . . . . ;. ;ANZEIGEN LAGERPLATZHINWEIS ;display 
+	. . . . . . ;. IF $PIECE(objINWE,Y,9)'="" WRITE " ("_$PIECE($PIECE(objINWE,Y,9),";",1)_")"
+	. . . . . . ;. ;ANZEIGEN CHARGENNUMMER ;display 
+	. . . . . . ;. IF $PIECE(objINWE,Y,2)'="" WRITE " ("_$PIECE(objINWE,Y,2)_")"
+	. . . . . . ;. WRITE "&nbsp;&nbsp;&nbsp;"
+	. . . . . . ;. ;ulm,26.03.03 ----- KOMMISSION
+	. . . . . . ;. IF $PIECE(objINWE,Y,60)'="" WRITE "/","<FONT COLOR=RED>",$$^WWWTEXT(33297),"</FONT>","&nbsp;&nbsp;"  ;KOMMISSION
+	. . . . . . ;. IF $PIECE(objINWE,Y,4)'>0 WRITE "</FONT>"
+	. . . . . . ; ^^^^ SR15811 13-Aug-2008
+	. . . . . ; ^^^^ SR15811 11-Aug-2008
+	. . . . . ;
+	. . . . . ; vvvv SR15811 13-Aug-2008 Removed
+	. . . . . ;SET LAP=""
+	. . . . . ;FOR  SET LAP=$ORDER(^INWE(YM,ART,BET,LAP)) QUIT:LAP=""  DO     ;LAGERPLATZ ;stock location 
+	. . . . . ;. QUIT:$FIND(LAP,"*")                        ;BEC/TYBD;24565;24.12.03;KEINE LAGERPLÄTZE MIT *, DA FREMDFERTIGUNG
+	. . . . . ;. SET WED=""
+	. . . . . ;. FOR  SET WED=$ORDER(^INWE(YM,ART,BET,LAP,WED)) QUIT:WED=""  DO
+	. . . . . ;. . QUIT:$DATA(^INWES(YM,ART,BET,LAP,WED))   ;MIT SERIENNUMMER (SIEHE UNTEN) ;by means of
+	. . . . . ;. . ;
+	. . . . . ;. . set objINWE = $GET(^INWE(YM,ART,BET,LAP,WED,1))          ; 28-Aug-2006
+	. . . . . ;. . IF $PIECE(objINWE,Y,4)'>0 IF ($$^INARTMENGE(ART,,YLOCATION)>0) || ($$$INVORGMinusStockAllowed(objINVORG)'=$$$YES) QUIT   // SR14547: All INARTMENGE should have the location in it
+	. . . . . ;. . QUIT:$PIECE($GET(^INLP(YM,BET,LAP,1)),Y,8)=$$$YES  ;LAGERPLATZ GESPERRT ;stock location DISABLED
+	. . . . . ;. . ;
+	. . . . . ;. . IF $PIECE(objINWE,Y,25)'="" QUIT:$PIECE(objINWE,Y,25)<$HOROLOG     ;VERFALLSDATUM ABGELAUFEN
+	. . . . . ;. . IF $PIECE(objINWE,Y,26)'="" QUIT:$PIECE(objINWE,Y,26)>$HOROLOG     ;NOCH NICHT VERWENDBAR ;yet Not 
+	. . . . . ;. . WRITE YCR
+	. . . . . ;. . SET YAUSWAHLOK=1  ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . . . ;. . WRITE "<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"|"_LAP_"|"_WED_"|"_BET_"""" 
+	. . . . . ;. . WRITE " onClick="_""""_"window.location='"
+	. . . . . ;. . DO
+	. . . . . ;. . . IF $PIECE(objINWE,Y,4)>0 WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI_"|"_LAP_"|"_WED_"|"_BET QUIT
+	. . . . . ;. . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI_"-"_REST_"-MINUS"_"|"_LAP_"|"_WED_"|"_BET  ;MINUS BESTAND ERZEUGEN;FIS;24053;30.07.03
+	. . . . . ;. . ;
+	. . . . . ;. . DO ^WWWCGI
+	. . . . . ;. . WRITE "'"_""""
+	. . . . . ;. . WRITE "> "
+	. . . . . ;. . IF $PIECE(objINWE,Y,4)'>0 WRITE "<FONT COLOR="_YRED_">"  ;MINUS BESTAND ERZEUGEN;FIS;24053;30.07.03
+	. . . . . ;. . ;ANZEIGEN LAGERPLATZ / WE-DATUM / MENGE ;display stock location quantity 
+	. . . . . ;. . WRITE YA_"("_BET_" / "_LAP_" / "_$$^WWWDATE(WED)_" / "_$$^WWWZAHL($PIECE(objINWE,Y,4),0,$LENGTH($PIECE($PIECE(objINWE,Y,4),".",2)))_")"  ;FIS;SHOW LOCATION, TOO;27.04.05;SR12200
+	. . . . . ;. . ;ANZEIGEN LAGERPLATZHINWEIS ;display 
+	. . . . . ;. . IF $PIECE(objINWE,Y,9)'="" WRITE " ("_$PIECE($PIECE(objINWE,Y,9),";",1)_")"
+	. . . . . ;. . ;ANZEIGEN CHARGENNUMMER ;display 
+	. . . . . ;. . IF $PIECE(objINWE,Y,2)'="" WRITE " ("_$PIECE(objINWE,Y,2)_")"
+	. . . . . ;. . WRITE "&nbsp;&nbsp;&nbsp;"
+	. . . . . ;. . ;ulm,26.03.03 ----- KOMMISSION
+	. . . . . ;. . IF $PIECE(objINWE,Y,60)'="" WRITE "/","<FONT COLOR=RED>",$$^WWWTEXT(33297),"</FONT>","&nbsp;&nbsp;"  ;KOMMISSION
+	. . . . . ;. . IF $PIECE(objINWE,Y,4)'>0 WRITE "</FONT>"
+	. . . . . ;. . WRITE "<BR>"
+	. . . . . ;. . WRITE "</INPUT>"
+	. . . . . ; ^^^^ SR15811 13-Aug-2008
+	. . . ;
+	. . . ;
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;   2    Stock with Serial Numbers     LAGERBESTAND mit SERIENnummer
+	. . . ;        "From Stock" (stock locn / date / serial no)
+	. . . ;@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	. . . ;IF YI=2 IF ART'="" IF $DATA(^INWES(YM,ART)) DO    ;
+	. . . ;. NEW BET,LAP,objINWE,SN,WED
+	. . . ;. SET BET=""
+	. . . ;. IF $$$INVORGAccessOtherItemLocns(objINVORG)'=$$$YES SET BET=YLOCATION  ;FIS;18.06.03;23795;ZUGRIFF NUR AUF EIGENEN BETRIEB ERLAUBT !
+	. . . ;. DO:BET'=""  IF BET="" FOR  SET BET=$ORDER(^INWE(YM,ART,BET)) QUIT:BET=""  DO     ;BETRIEB
+	. . . ;. . IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,324)'="" QUIT:BET'=$PIECE(^INAUFP(YM,AUF,POS,1),Y,324)  ;FIS;OTHER SHIP FROM LOCATION;FIS;04.05.05;SR12200
+	. . . ;. . SET LAP=""
+	. . . ;. . FOR  SET LAP=$ORDER(^INWE(YM,ART,BET,LAP)) QUIT:LAP=""  DO     ;LAGERPLATZ ;stock location 
+	. . . ;. . . QUIT:$FIND(LAP,"*")  ;BEC/TYBD;24565;24.12.03;KEINE LAGERPLÄTZE MIT *, DA FREMDFERTIGUNG
+	. . . ;. . . SET WED=""
+	. . . ;. . . FOR  SET WED=$ORDER(^INWE(YM,ART,BET,LAP,WED)) QUIT:WED=""  DO  
+	. . . ;. . . . SET SN=""
+	. . . ;. . . . FOR  SET SN=$ORDER(^INWES(YM,ART,BET,LAP,WED,SN)) QUIT:SN=""  DO
+	. . . ;. . . . . QUIT:$PIECE($GET(^INLP(YM,BET,LAP,1)),Y,8)=1  ;LAGERPLATZ GESPERRT ;stock location DISABLED 
+	. . . ;. . . . . set objINWE = $GET(^INWE(YM,ART,BET,LAP,WED,1))          ; 28-Aug-2006
+	. . . ;. . . . . QUIT:$PIECE(objINWE,Y,4)'>0
+	. . . ;. . . . . IF $PIECE(objINWE,Y,25)'="" QUIT:$PIECE(objINWE,Y,25)<$HOROLOG       ;VERFALLSDATUM ABGELAUFEN
+	. . . ;. . . . . IF $PIECE(objINWE,Y,26)'="" QUIT:$PIECE(objINWE,Y,26)>$HOROLOG       ;NOCH NICHT VERWENDBAR ;yet Not 
+	. . . ;. . . . . WRITE YCR
+	. . . ;. . . . . SET YAUSWAHLOK=1  ;es wurde etwas ausgewählt ;it were to some extend Select 
+	. . . ;. . . . . WRITE "<INPUT TYPE="_""""_"RADIO"_""""_" NAME="_""""_"YFUNCT"_""""_" VALUE="_""""_YI_"-"_SN_"""" 
+	. . . ;. . . . . WRITE " onClick="_""""_"window.location='"
+	. . . ;. . . . . WRITE YAKTION_"EP=WWWFORM&YFORM="_YFORM_"&YFUNCT="_YI_"-"_SN
+	. . . ;. . . . . DO ^WWWCGI
+	. . . ;. . . . . WRITE "'"_""""
+	. . . ;. . . . . WRITE "> "
+	. . . ;. . . . . WRITE YA_"("_LAP_"/"_$$^WWWDATE(WED)_"/ SN:"_SN_")"_"&nbsp;&nbsp;&nbsp;"
+	. . . ;. . . . . WRITE "<BR>"
+	. . . ;. . . . . WRITE "</INPUT>"
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	. . . ; ^^^^^ DISABLED BLOCK SR16031    MOVED SECTION 1
+	. . . ;/////////////////////////////////////////////////////////////////////////////////////////
+	
+]]></Routine>
+</Export>

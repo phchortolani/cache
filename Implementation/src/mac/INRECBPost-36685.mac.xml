@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INRECBPost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INRECBPost
+	
+#include INConst
+#include COMSYS
+	
+Postable(pidRec)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Mar-2007	JW		SR15459: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$Postable^INRECPost(pidRec,$$$EnumINRECSupplierReceipt)
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$CheckValues(pidRec)
+		if $$$ISOK(strStatus) {
+			set strStatus = $$CheckInvoiceNum(pidRec)
+		}
+	}
+	
+	$$$YQHandler(strStatus)
+	
+	quit strStatus
+ 
+ 
+CheckValues(pidRec)
+	;-------------------------------------------------------------------------------
+	; Compare invoice total against receipt information
+	; 	Invoice Total coming from "Amount" on INREC Invoice Tab would be the net
+	; 	figure the supplier expects to receive.
+	; 	
+	; 	Receipt Total =   sum of Receipt Lines (stock total + line packaging - line discount)
+	; 	                + Receipt Packaging
+	; 	                - Receipt Discount
+	; 	
+	; 	e.g. (just as example)
+	; - line packaging might include "individual wrapping" while receipt packaging might include
+	;   "shipping"
+	; - line discount might include a "special price" while receipt discount might
+	;   include "order total over $xxx reduction"
+	; 	The information would not be included in both places.
+	;
+	; Params:
+	;	pidRec		Receipt number
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Dec-2007	GRF		SRBR014607: Pass correct values to error message
+	; 08-Nov-2007	GM		SRBR014607: Check if the Total Line Prices in all 
+	; 							receipts is greater than Total Price in Order
+	; 07-Mar-2007	JW		SR15459: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idLine,objLine,curLineSum,objRec,curRecTotal
+	new idOrder,idInvoice,idReceipt,objOrder,intInvoice,curTotalLineRec
+	new fltTotalInvoice,fltInvoice,fltOrderPrice,fltSurcharges,fltDiscounts,fltTotalTax
+	
+	set strStatus = $$$OK	
+ 
+	// Get sum of lines
+	set curLineSum = 0
+	$$$Order3(^INRECLine,YM,pidRec,idLine)
+		set objLine = $get(^INRECLine(YM,pidRec,idLine,1))		
+		$$$FCInc(curLineSum,$$GetValue^INRECBLine(objLine,$$$YES))
+	$$$End
+				
+	// Get header total: TotalLinePrice + packaging - discount
+	set objRec = $get(^INREC(YM,pidRec,1))
+	;$$$FCADD($$$INRECAmount(objRec),$$$INRECPackagingCost(objRec),curRecTotal)
+	$$$FCADD(curLineSum,$$$INRECPackagingCost(objRec),curRecTotal)  ;BR014607
+	$$$FCDec(curRecTotal,$$$INRECDiscountAmount(objRec))
+	
+	// Check equality
+	;if '$$$FCIsEqual(curRecTotal,curLineSum) {
+		;set strStatus = $listbuild("IN00673",$$FormatCurrency^COMTable(curRecTotal),$$FormatCurrency^COMTable(curLineSum))  ;Header total (%1) does not match line total (%2)
+	;}
+	
+	// Check if Total Line Price is equals to invoice             //BR014607
+	set intInvoice = $$$INRECAmount(objRec)
+	
+	if curRecTotal '= intInvoice {
+		set strStatus = $listbuild("IN00799",curRecTotal,intInvoice) ;"The Total Line Price of (%1) is different from the invoice (%2)"
+ 
+	} else {
+ 
+		// Get Total Price in Order
+		set idOrder = $$$INRECSupplierOrder(objRec)	
+		set objOrder = $get(^INAUF(YM,idOrder,1))				
+ 
+		set idInvoice = $$$INAUFInvoiceNumber(objOrder)
+		set fltOrderPrice = $$GetOrderPrice^INAUFHTML(idOrder,,.fltSurcharges,.fltDiscounts,.fltTotalTax,idInvoice)
+		
+		// Get Invoice value of all receipts
+		set fltTotalInvoice = 0		
+		$$$Order2(^INREC,YM,idReceipt)
+			set objRec = $get(^INREC(YM,idReceipt,1))
+			if $$$INRECSupplierOrder(objRec) = idOrder {
+				set fltInvoice = $$$INRECAmount(objRec)
+				set fltTotalInvoice = fltTotalInvoice + fltInvoice
+			}
+		$$$End
+		
+		// Get Invoice value of all receipts without actually           [without actually what?]
+		set fltTotalInvoice = fltTotalInvoice - intInvoice
+	
+		// Check if Total Price of lines sum in all receipts is greater than Total Price in Order
+		; Total Receipts = This Receipt + Previously Invoiced
+		set curTotalLineRec = curRecTotal + fltTotalInvoice
+		
+		if curTotalLineRec > fltOrderPrice {
+		;	"The Total Line Prices in all receipts of (%1) is greater than Total Price in Order of (%2)"
+		;	set strStatus = $listbuild("IN00798",curRecTotal,curTotalLineRec)          ; 17-Dec-2007
+			set strStatus = $listbuild("IN00798",curTotalLineRec,fltOrderPrice)  
+		}
+	}
+	//BR014607 ^^^
+	
+	quit strStatus
+	
+	
+CheckInvoiceNum(pidRec,pobjReceipt="")
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Oct-2014	FC		HEVA-1617: Fixed UNDEFINED error when invoke $$CheckInvoiceNum^INRECBPost(pidReceipt)
+	; 10-Sep-2014	HGD		HEVA-1485: Fixed validation for duplicate invoice number with same serial number
+	; 06-Ago-2013	RGB		CORE-242: Fixed validation for fully reverted incoming goods receipts
+	; 08-Mar-2007	JW		SR15459: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,objRec,idSupplier,idInvoiceNum,idxSupplier,idxInvoiceNum,idRec,tSerialNumber,tSNum
+
+	set objRec 		 = $get(^INREC(YM,pidRec,1))
+	
+	set idSupplier 	 = $$$INRECSupplier(objRec)
+	set idInvoiceNum = $$$INRECInvoiceNumber(objRec)
+	Set tSerialNumber = "" ; HEVA-1617
+	
+	// HGD	HEVA-1485 : Fixed validation for duplicate invoice number with same serial number
+	If (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1))))
+	{
+		If (pobjReceipt'="")
+		{
+			Set tSerialNumber = $$$INRECFREE3(pobjReceipt)
+		}
+	}
+	
+	Set strStatus = $$$OK
+	
+	if (idSupplier'="") && (idInvoiceNum'="") {
+		set idxSupplier 	= $$$Index(idSupplier)
+		set idxInvoiceNum 	= $$$Index(idInvoiceNum)
+		$$$Order5(^INRECs,YM,2,idxSupplier,idxInvoiceNum,idRec)
+			continue:idRec=pidRec
+			
+			// HGD	HEVA-1485 : Fixed validation for duplicate invoice number with same serial number
+			If (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1))))
+			{
+				Set tSNum = $$$INRECFREE3($Get(^INREC(YM,idRec,1)))
+				
+				If (tSerialNumber = tSNum)
+				{			
+					//RGB - Jira CORE-242 - Check fully reverted status
+					set currentObjRec =""
+					set currentObjRec = $get(^INREC(YM,idRec,1))
+					continue:$$$INRECStatus(currentObjRec)=4 
+			
+					;Supplier Invoice Number %2 has been used with record %3 for Supplier %1. Please choose another number.
+					set strStatus = $listbuild("Fin00543",idSupplier,idInvoiceNum,idRec)
+				}
+			}
+			Else
+			{
+				//RGB - Jira CORE-242 - Check fully reverted status
+				set currentObjRec =""
+				set currentObjRec = $get(^INREC(YM,idRec,1))
+				continue:$$$INRECStatus(currentObjRec)=4 
+			
+				;Supplier Invoice Number %2 has been used with record %3 for Supplier %1. Please choose another number.
+				set strStatus = $listbuild("Fin00543",idSupplier,idInvoiceNum,idRec)
+			}
+			
+		$$$End
+	}
+	
+	quit strStatus
+ 
+]]></Routine>
+</Export>

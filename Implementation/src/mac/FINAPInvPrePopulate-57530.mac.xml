@@ -1,0 +1,724 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvPrePopulate" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvPrePopulate
+    ;-------------------------------------------------------------------------------
+    ; Populates the Pre Post Globals
+    ;-------------------------------------------------------------------------------
+#include COMSYS
+#include FINConst
+#include INConst
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^FINAPInvPrePopulate("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Populate(pidInvoice,blnResetOverride=$$$NO)
+	;------------------------------------------------------------------------------
+    ; Displays the "Balance Sheet"/"Formula" of where the money is going for this invoice.
+    ; Group by Account then line item 
+    ; 
+    ; Formula:
+    ; Goods Received Not Invoiced 
+    ; +/- [Expense Amounts] 
+    ; +/- [Inventory writeoffs/gains]
+    ; +/- [Supplier Assigned]
+    ; = Total Invoice Amount
+    ;
+    ; Where, for each line:
+    ;  Goods Received Not Invoiced = {Quantity*Price + [if closed Variance*Quantity]}
+    ;  Expense Amounts             = sum amounts destined for Expense
+    ;  Inventory writeoffs/gains   = sum amounts destined for Inventory
+    ;  Supplier Assigned           = sum amounts destined for Supplier
+    ; 
+    ; Called By:
+	;	Post^FINAPInvPost
+	;	PrePost^FINAPInvPrePost
+	;	Reset^FINAPInvPrePost
+    ; 
+    ; 
+    ; Returns:
+    ;
+    ; NOTE: 28-Jun-2005 PO: There still appears to be an issue with rounding here.
+    ;
+    ; History:
+    ; 09-Dec-2009	GRF		SR16667: no index for FINAPInvPrePost; improve doco;
+    ; 							clear old commented code
+    ; 05-Aug-2009	GRF		clarify - idStore rather than StockLocn
+    ; 19-May-2009	DWR		SR16535: strStatus was not being set correctly, needed $$$MakeStatus 
+    ; 							global instead of $$$Text($listbuild.... this does not
+    ; 							allow checking for $$$ISOK which happens following this tag
+    ; 23-Nov-2005	PO		SR13895: Include FC variance in determing rounding adjustment when FCVar posted to supplier.
+    ; 24-Oct-2005	PO		SR13613: Only include rounding adjustment if rounded amounts
+    ; 19-Oct-2005	PO		SR13613: Include Rounding adjustment.
+    ; 14-Oct-2005	RPW		SR13681: Round the Foreign Currency Variance so that can be used in Base Currency mode as well.
+    ; 11-Oct-2005	PO		SR13611: Do NOT make FC variance in FC form
+    ; 06-Oct-2005	PO		SR13609: Do NOT change receive U/P rate, instead use new FCMult2
+    ; 19-Sep-2005	PO		SR13517: Made necessary change to tax for discrepancy.
+    ; 16-Sep-2005	PO		SR13489: Take base amount discrepancy into account.
+    ; 09-Sep-2005	PO		SR13457: Retrieve status from PopulateDiscountsForLine
+    ; 08-Sep-2005	RPW		SR13461: Fix the FCVariances so that they appear. And make them FC.
+    ; 08-Sep-2005	RPW		SR13446: Update the foreign currency rate to be the same as the header.
+    ; 01-Sep-2005	shobby	SR13280: Check the 'Turn off Accrual Reversal' and don't post to GRNI it set.
+    ; 01-Sep-2005	shobby	SR13330: Call to FCUpdate after FCMult to remove rounding calculation errors.
+    ; 30-Aug-2005	RPW		SR11983: Removed calc of AdditionalCosts as this is now handled later on separately.
+    ; 19-Aug-2005	RPW		SR11983: Do not worry about OTH-$ variance post. This is no longer used.
+	; 15-Aug-2005	shobby	SR12823: Pass in a flag to AddAmount^FINAPInvPrePost to mark the item as 'non-stock'
+    ; 22-Jun-2005	PO		SR12256: Show where FC var is going including when be given back to supplier
+    ; 02-Jun-2005	Paul K	Moved to here from FINAPInvPrePost
+    ; 10-May-2005	PO		SR12256: Included support for FC Var posting
+    ; 07-Apr-2005	RobertW	SR11836: Modified OpenQuantity to UnmatchedQuantity, removed duplicate line
+    ; 31-Mar-2005	GRF		Property name macro was being passed into function to get
+    ; 						Property name - replaced with just the macro.
+    ; 10-Mar-2005	GRF		SR10478 : Pass parameters for Characteristic Matrix
+    ; 11-Feb-2005	JW		Check for data inside this routine. And add parameter
+    ; 						for Reset button.
+    ; 10-Feb-2005	RobertW	General Cleanup of undefined and subscripts
+    ; 18-Jan-2005	Paul K	Created
+    ;-----------------------------------------------------------------------------
+	new arrAmount,arrChars,arrData,curAmount,enmDestination,fltQuantity
+	new idField,idItem,idLine,idLocn,idOrder,idStore,objInvLine
+	new objInvoice,objLine,objVariance,strStatus,Supplier
+	new blnNonStock,fltAmount,fltRate,strCur,curDiscrepancy,curTax,curFCTotal //SR13517
+	new idType,objFINAPInvPrePost,curRoundedBaseTtl,curUnroundedBaseTtl
+	
+	$$$LogR("Populate",$get(pidInvoice)_"<"_blnResetOverride_"<")
+	
+	set strStatus = $$$OK
+	
+	if ($data(pidInvoice)'=0) && ($get(pidInvoice)'="") {
+		set objInvoice = $get(^FINAPInv(0,pidInvoice,1))
+		set Supplier   = $$$FINAPInvSupplier(objInvoice)
+		set fltRate    = $$$FINAPInvExchangeRate(objInvoice)
+		set strCur     = $$GetCurrencyName^FINAPInvCurrency()
+		
+		if blnResetOverride    ||
+		   '($data(^FINAPInvPrePost(0,pidInvoice)) && ($$$FINAPInvCostsPosted(objInvoice))) {
+			
+			kill ^FINAPInvPrePost(0,pidInvoice)
+		;	kill ^FINAPInvPrePosts(0,1,$$$Index(pidInvoice))   ; SR16667 
+			kill ^FINAPInvPrePostTtl(0,pidInvoice)
+			
+	;---------------------------------------
+	; 1. Convert FINAPInvLine to FINAPInvPrePost
+	;---------------------------------------
+			
+			set idLine = ""
+			for {
+				set idLine = $order(^FINAPInvLine(0,pidInvoice,idLine))
+				quit:idLine=""
+				quit:$$$ISERR(strStatus)
+				
+				set objLine=$get(^FINAPInvLine(0,pidInvoice,idLine,1))
+				if objLine'="" {
+					
+	;---------------------------------------
+	; 1a. Account Identification Matrix Requirements
+	;---------------------------------------
+				; *******************************************
+				; Build array of Characteristic Values (CV)
+				; associated with the line.
+				; 
+				; 1.  Get source values
+				; 2.  Find CV for those source values
+				; 3.  Pass to AddAmount which will use in
+				;     Account Identification Matrix
+				; 4.  Matrix Keys and Values are stored in
+				;     FINAPInvPrePost for subsequent copying
+				;     to FININTBatchLine
+				; 
+				; Normally have received goods elsewhere and
+				; processed as INREC Interface Batch.  This
+				; code performs the invoice matching.
+				; 
+				; INREC :
+				;   dr    Inventory Account (SOH)
+				;   cr    Goods Received Not Invoiced   or
+				;         Supplier Suspense
+				;       
+				; APINV :
+				;   dr    Goods Received Not Invoiced   or
+				;         Supplier Suspense
+				;   cr    Supplier
+				;   dr/cr Variance & other charges
+				; 
+				; *******************************************
+	
+					set idItem  = $$$FINAPInvLineItem(objLine)
+					set idLocn  = $$$FINAPInvLineReceiveLocation(objLine)
+					set idStore = $$$FINAPInvLineReceiveStockLocation(objLine)
+					set idOrder = $$$KEY1($$$FINAPInvLineOrderNumber(objLine))
+					if idItem'="" {
+						set blnNonStock	= $$$INARTItemWithoutInventoryMaint($get(^INART(0,idItem,1)))
+					} else {
+						set blnNonStock = $$$NO
+					}
+ 
+					kill arrChars
+					do GetItemCV^FINCharValue(idItem,.arrChars)
+					do GetLocnCV^FINCharValue(idLocn,idStore,.arrChars)
+					do GetSupCV^FINCharValue(Supplier,.arrChars)
+					do GetOrderCV^FINCharValue(idOrder,.arrChars)
+					
+	;---------------------------------------
+	; 1b. Goods Received Not Invoiced  [NOTE : INFIBPAR field has a bad property name : "Purchases"]
+	;---------------------------------------
+					set fltAmount      = $$$FCMult2($$$FINAPInvLineOrderEach(objLine),$$$FINAPInvLineInvoiceQuantity(objLine))
+					set curDiscrepancy = $$OrderToInvoiceDiscrepancy(objInvoice,objLine)
+					
+		; SEE FIXME in FINGeneralSetup about different interpretation of Accrual switch <GRF>
+					if '$$UseAccrualReversal^FINGeneralSetup() {
+						if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,fltAmount,$$$FldINFIBPARPurchases,.arrChars,blnNonStock)
+						if (curDiscrepancy '= 0) && $$$ISOK(strStatus) {
+							set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,curDiscrepancy,$$$FldINFIBPARPurchases,.arrChars,blnNonStock)
+						}
+						
+					} else {
+						if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,fltAmount,$$$EnumFINAPVARIANCEPOSTInventory,.arrChars,blnNonStock)
+						if (curDiscrepancy '= 0) && $$$ISOK(strStatus) {
+							set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,curDiscrepancy,$$$EnumFINAPVARIANCEPOSTInventory,.arrChars,blnNonStock)
+						}
+					}
+				;	if $$$ISOK(strStatus) set strStatus=$$AddAmount^FINAPInvPrePost(pidInvoice,idLine,$$$FCMult($$$FINAPInvLineOrderEach(objLine),$$$FINAPInvLineInvoiceQuantity(objLine)),$$$FldINFIBPARPurchases,.arrChars,blnNonStock)
+
+	;---------------------------------------
+	; 1c. Tax
+	;---------------------------------------
+				    ; NOTE: Assuming Total Tax can be determined from total values as opposed to (UnitPrice * Qty).
+					set curTax = $$$FCSub($$$FINAPInvLineInvoiceTotalIncludingTax(objLine),$$$FINAPInvLineInvoiceTotal(objLine)) //SR13517
+				;	set curTaxUnchanged = curTax
+					set curTax = $$$FCUpdate(curTax,fltRate,1)
+					if $$$ISOK(strStatus) set strStatus = $$AddTaxAmount^FINAPInvPrePost(pidInvoice,idLine,curTax) // SR13489
+				;	if (curTaxUnchanged - curTax) {
+				;		if $$$ISOK(strStatus) set strStatus=$$AddAmount^FINAPInvPrePost(pidInvoice,idLine,curTaxUnchanged - curTax,$$$EnumFINAPVARIANCEPOSTFCExpense,.arrChars,blnNonStock)
+				;	}
+					
+					if (curDiscrepancy'=0) && $$$AmountIsFC(curTax) { // SR13517
+						set curFCTotal = $$$FCAmount($$$FINAPInvLineInvoiceTotal(objLine))
+						if curFCTotal'=0 {
+							if $$$ISOK(strStatus) set strStatus = $$AddTaxAmount^FINAPInvPrePost(pidInvoice,idLine,$$$FCAmount(curTax) / curFCTotal * curDiscrepancy)
+						}
+					}
+					
+	;---------------------------------------
+	; 1d. Goods Received Not Invoiced - Quantity variation
+	;---------------------------------------
+					
+					if $$$FINAPInvLineClosed(objLine) {
+						set fltQuantity = $$$FINAPInvLineUnmatchedQuantity(objLine)
+						set fltQuantity = fltQuantity-$$$FINAPInvLineInvoiceQuantity(objLine)
+						if fltQuantity'=0 {
+							set fltAmount = $$$FCMult($$$FINAPInvLineOrderEach(objLine),fltQuantity)
+							set fltAmount = $$$FCUpdate(fltAmount,$$$FINAPInvExchangeRate(objInvoice),1)
+							if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,fltAmount,$$$FldINFIBPARPurchases,.arrChars,blnNonStock)
+						}
+					}
+ 
+	;---------------------------------------
+	; 1e. Variance Posting - could be to Inventory, Expense or Supplier
+	;---------------------------------------
+					
+					if $$$FINAPInvShowTotalVariance(objInvoice) {    ; *** TOTAL VARIANCE ***
+						set enmDestination = $$$FINAPInvLineVariancePosting(objLine)
+ 
+						if enmDestination=$$$EnumFINAPVARIANCEPOSTSplit {
+							set objVariance = $get(^FINAPInvLineVariance(0,pidInvoice,idLine,$$$EnumFINAPINVVARTYPETotalVariance,1))
+							if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,$$$FINAPInvLineVarianceExpenseTotal(objVariance),  $$$EnumFINAPVARIANCEPOSTExpense  ,.arrChars,blnNonStock)
+							if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,$$$FINAPInvLineVarianceInventoryTotal(objVariance),$$$EnumFINAPVARIANCEPOSTInventory,.arrChars,blnNonStock)
+							if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,$$$FINAPInvLineVarianceSupplierTotal(objVariance), $$$EnumFINAPVARIANCEPOSTSupplier, .arrChars,blnNonStock)
+						
+						} else {
+							set curAmount=0
+ 
+							if $$$FINAPInvLineClosed(objLine) set curAmount=$$$FCAdd(curAmount,$$GetINVQ^FINAPInvLine(objLine))
+ 
+							set curAmount = $$$FCAdd(curAmount,$$GetINVPrice^FINAPInvLine(objLine))
+							set curAmount = $$$FCUpdate(curAmount,$$$FINAPInvExchangeRate(objInvoice),1)
+ 
+							if $$$ISOK(strStatus) && (+curAmount'=0) && (enmDestination="") {
+							;	set strStatus = $$$Text($listbuild("Fin00628",idLine,$$$StrFINAPInvLineVariancePosting))   ; SR16535
+								set strStatus = $$$MakeStatus("Fin00628",idLine,$$$StrFINAPInvLineVariancePosting)
+							}  ; "Line Number %1 requires a value in field '%2'.
+						
+							if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,curAmount,enmDestination,.arrChars,blnNonStock)
+						}
+ 
+						if $$$ISOK(strStatus) { ;  Round the FC Variance
+							set curAmount = $$Round^COMUtilNum($$GetVARFC^FINAPInvLineGet(objLine))
+							set enmDestination = $$$FINAPInvLineVarianceFCDPost(objLine)
+ 
+							if (+curAmount'=0) && (enmDestination="") {
+							;	set strStatus = $$$Text($listbuild("Fin00628",idLine,$$$StrFINAPInvLineVarianceFCDPost))   ; SR16535
+								set strStatus = $$$MakeStatus("Fin00628",idLine,$$$StrFINAPInvLineVarianceFCDPost)
+							}  ; "Line Number %1 requires a value in field '%2'.
+ 
+							if $$$ISOK(strStatus) && (+curAmount'=0) {
+								set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,curAmount,enmDestination,.arrChars,blnNonStock)
+							}
+						}
+ 						
+					} else {                                         ; *** LINE VARIANCES ***
+						kill arrAmount
+						
+						if $$$FINAPInvLineClosed(objLine) set arrAmount($$$FldFINAPInvLineVarianceINVQPost) = $$GetINVQ^FINAPInvLine(objLine)_Y_$$$EnumFINAPINVVARTYPEInventoryQuantity
+						set arrAmount($$$FldFINAPInvLineVarianceINVDPost) = $$GetINVPrice^FINAPInvLine(objLine)_Y_$$$EnumFINAPINVVARTYPEInventoryDollar
+ 
+						set idField = ""
+						for {
+							set idField = $order(arrAmount(idField))
+							quit:idField=""
+							quit:$$$ISERR(strStatus)
+							
+							set enmDestination = $piece(objLine,Y,idField)
+							if enmDestination=$$$EnumFINAPVARIANCEPOSTSplit {
+								set objVariance = $get(^FINAPInvLineVariance(0,pidInvoice,idLine,$piece(arrAmount(idField),Y,2),1))
+								if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,$$$FINAPInvLineVarianceExpenseTotal(objVariance),  $$$EnumFINAPVARIANCEPOSTExpense  ,.arrChars,blnNonStock)
+								if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,$$$FINAPInvLineVarianceInventoryTotal(objVariance),$$$EnumFINAPVARIANCEPOSTInventory,.arrChars,blnNonStock)
+								if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,$$$FINAPInvLineVarianceSupplierTotal(objVariance), $$$EnumFINAPVARIANCEPOSTSupplier ,.arrChars,blnNonStock)
+							
+							} else {
+								if $$$ISOK(strStatus) && (+$piece(arrAmount(idField),Y,1)'=0) && (enmDestination="") {
+								;	set strStatus = $$$Text($listbuild("Fin00628",idLine,$$GetPropertyName^COMConst("FINAPInvLine",idField)))  ; SR16535
+									set strStatus = $$$MakeStatus("Fin00628",idLine,$$GetPropertyName^COMConst("FINAPInvLine",idField))
+								}  ; "Line Number %1 requires a value in field '%2'."
+								
+								if $$$ISOK(strStatus) if +$piece(arrAmount(idField),Y,1)'=0 if enmDestination="" 
+								if $$$ISOK(strStatus) set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,$piece(arrAmount(idField),Y,1),enmDestination,.arrChars,blnNonStock)
+							}
+						}
+ 
+						if $$$ISOK(strStatus) { ;  Round the FC Variance
+							set curAmount = $$Round^COMUtilNum($$GetVARFC^FINAPInvLineGet(objLine))
+							set enmDestination = $$$FINAPInvLineVarianceFCDPost(objLine)
+ 
+							if (+curAmount'=0) && (enmDestination="") {
+							;	set strStatus = $$$Text($listbuild("Fin00628",idLine,$$$StrFINAPInvLineVarianceFCDPost))  ; SR16535
+								set strStatus = $$$MakeStatus("Fin00628",idLine,$$$StrFINAPInvLineVarianceFCDPost)
+							}  ; "Line Number %1 requires a value in field '%2'."
+ 
+							if $$$ISOK(strStatus) && (+curAmount'=0) {
+								set strStatus = $$AddAmount^FINAPInvPrePost(pidInvoice,idLine,curAmount,enmDestination,.arrChars,blnNonStock)
+							}
+						}
+					}
+					
+	;---------------------------------------
+	; 1f. Calculate the Discounts
+	;---------------------------------------
+					 
+					if $$$ISOK(strStatus) {
+						set strStatus = $$PopulateDiscountsForLine(pidInvoice,idLine,Supplier,.arrChars)
+					}
+				}
+			}  ; end FOR loop
+			
+	;---------------------------------------
+	; 2. Calculate any discrepancy
+	;---------------------------------------
+			
+			if $$$ISOK(strStatus) {
+				set curRoundedBaseTtl   = 0
+				set curUnroundedBaseTtl = 0
+				
+				set idType = ""
+				for {
+					set idType = $order(^FINAPInvPrePost(0,pidInvoice,idType))
+					quit:idType=""
+ 
+					set idLine = ""
+					for {
+						set idLine = $order(^FINAPInvPrePost(0,pidInvoice,idType,idLine))
+						quit:idLine=""
+ 
+						set objFINAPInvPrePost = $get(^FINAPInvPrePost(0,pidInvoice,idType,idLine,1))
+						set curAmount          = $$$FINAPInvPrePostAmount(objFINAPInvPrePost)
+ 
+						; Producing rounded base amount as stored base amount may contain discrepancy.
+						; ! However, this relies on the base amounts being rounded !
+						
+						if $$$AmountIsFC(curAmount) {
+							set curAmount         = $$$FCAmount(curAmount) * $$$FCRate(curAmount)
+							set curRoundedBaseTtl = curRoundedBaseTtl      + $$$FCRound(curAmount)
+						} else {
+							set curRoundedBaseTtl = curRoundedBaseTtl + curAmount
+						}
+					}
+				}
+				
+				set idLine = ""
+				for {
+					set idLine = $order(^FINAPInvLine(0,pidInvoice,idLine))
+					quit:idLine=""
+					set objInvLine = $get(^FINAPInvLine(0,pidInvoice,idLine,1))
+					
+					if ($$$FINAPInvLineVariancePosting(objInvLine) = $$$EnumFINAPVARIANCEPOSTSupplier) &&
+					   ($$$FINAPInvLineVarianceFCDPost(objInvLine) = $$$EnumFINAPVARIANCEPOSTSupplier)    {
+						
+						set curRoundedBaseTtl = curRoundedBaseTtl + $$GetVARFC^FINAPInvLineGet(objInvLine)
+					}
+				}
+ 
+				set curUnroundedBaseTtl = $$$FCBase($$$FINAPInvActualTotal(objInvoice)) + $$TotalInvoiceDiscrepancy(pidInvoice)
+				if $$$FCRound(curUnroundedBaseTtl) '= $$$FCRound(curRoundedBaseTtl) {
+					set strStatus = $$AddAmount^FINAPInvPrePostTtl(pidInvoice,
+					                                               $$$EnumFINAPVARIANCEPOSTFCRound,
+					                                               $$$FCRound(curUnroundedBaseTtl - curRoundedBaseTtl) )
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+PopulateDiscountsForLine(pidInvoice,pidLine,pidSupplier,&parrChars) 
+    ;-------------------------------------------------------------------------------
+    ; Find charge lines where FINAPInvCharge D12 = FINAPInvLine P2
+    ; 
+    ; If line-based,  add charge amount and tax on charge to FINAPInvPrePost as "LINESURC"/"LINEDISC"
+    ; if total-based, determine distribution of charge amount and tax on charge to FINAPInvPrePost as "TOTALSURC"/"TOTALDISC"
+    ; 
+    ; Get the discounts and taxes for lines and totals and put them against the correct
+    ; accounts.
+    ;
+    ; Called By: Populate
+    ; 
+    ; Params:
+    ;		pidInvoice : The Suppliers Invoice id
+    ;		pidLine    : The Suppliers Invoice Lines id
+    ;		pidSupplier: The Suppliers Invoice Suppliers id
+    ;		parrChars  : The array of costing matrix data.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 09-Dec-2009	GRF		SR16667: clarify idxLine
+    ; 05-Aug-2009	GRF		clarify - idStore rather than StockLocn
+    ; 09-Sep-2005	PO		SR13457: Return status and check that Cost Allocation provided
+    ; 07-Sep-2005	RPW		SRxxxxx: Fixed an issue with tax amounts (SR13446?)
+    ; 29-Aug-2005	RPW		SR11983: Created
+    ;-------------------------------------------------------------------------------
+	new arrChars,arrDiscounts,arrDist,arrTaxDist,blnNonStock,enumCostAlloc,fltDiscount,fltTax
+	new idAccount,idCharge,idDiscount,idDist,idItem,idLocn,idOrder,idParent,idStore
+	new idxDiscount,idxLine,intDist
+	new objCharge,objDiscount,objFINAPInvLine,objLine,strStatus
+	
+	$$$LogR("PopulateDiscountsForLine",$get(pidInvoice)_"<"_$get(pidLine)_"<")
+	
+	set strStatus = $$$OK
+	
+	set idxLine   = pidLine
+	if pidLine="Total" set idxLine = "TOTAL"
+		
+	do GetChargesForLine^FINAPInvDiscount(pidInvoice,idxLine,.arrDiscounts)
+	
+	quit:'$data(arrDiscounts) strStatus
+	
+	set idCharge = ""
+	for {
+		set idCharge = $order(arrDiscounts(idCharge))
+		quit:idCharge=""
+		
+		set objCharge = arrDiscounts(idCharge)
+		
+		set fltTax    = $$$FINAPInvChargeTax(objCharge)
+		if $$$FCZero(fltTax) {
+			set fltDiscount = $$$FINAPInvChargeAmountTaxEx(objCharge)
+		} else {
+			set fltDiscount = $$$FINAPInvChargeAmount(objCharge)
+		}
+		set intDist       = $$$FINAPInvChargeCostDistribution(objCharge)
+		set enumCostAlloc = $$$FINAPInvChargeCostAllocation(objCharge)
+		
+		set objFINAPInvLine = $get(^FINAPInvLine(0,pidInvoice,pidLine,1))
+		
+		if enumCostAlloc=$$$EnumINSUPBUYINGDISCOUNTCOSTALLOCATIONByGLAccount {
+			set idAccount = $$$FINAPInvChargeAccount(objCharge)
+			
+		} elseif enumCostAlloc=$$$EnumINSUPBUYINGDISCOUNTCOSTALLOCATIONBySOH {
+			set idAccount = $$$EnumFINAPVARIANCEPOSTInventory         ; 2    ; FIXME : What if we have acct 2 or 3 in GL?
+			
+		} elseif enumCostAlloc=$$$EnumINSUPBUYINGDISCOUNTCOSTALLOCATIONBySupplier {
+			set idAccount = $$$EnumFINAPVARIANCEPOSTSupplier          ; 3
+		}
+		
+		if enumCostAlloc="" {
+			set strStatus = $listbuild("Fin00886",pidLine)
+		}  ; "Cost Allocation for Additional Charge '%1' must be provided."
+		
+		if $$$ISOK(strStatus) {
+			if pidLine'="Total" {                ; Line-based Charges
+				if $$$ISOK(strStatus) {
+					set strStatus = $$AddDiscountAmount(pidInvoice,pidLine,idCharge,$$$FCSub(fltDiscount,fltTax),idAccount,.parrChars)
+				}
+				if $$$ISOK(strStatus) {
+					set strStatus = $$AddTaxAmount^FINAPInvPrePost(pidInvoice,idxLine,fltTax)
+				}
+			
+			} else {                             ; Invoice-based Charges
+				do GetLineDistribution^FINAPInvDiscount(pidInvoice,fltDiscount,intDist,.arrDist)
+				do GetLineDistribution^FINAPInvDiscount(pidInvoice,fltTax,intDist,.arrTaxDist)
+				
+				set idDist=""
+				for {
+					set idDist = $order(arrDist(idDist))
+					quit:idDist=""
+					
+					set idParent = idDist
+					set objLine  = $get(^FINAPInvLine(0,pidInvoice,idParent,1))
+					
+					set idItem   = $$$FINAPInvLineItem(objLine)
+					set idLocn   = $$$FINAPInvLineReceiveLocation(objLine)
+					set idStore  = $$$FINAPInvLineReceiveStockLocation(objLine)
+					set idOrder  = $piece($$$FINAPInvLineOrderNumber(objLine),$$$COMMA,1)
+					if idItem'="" {
+						set blnNonStock	= $$$INARTItemWithoutInventoryMaint($get(^INART(0,idItem,1)))
+					} else {
+						set blnNonStock = $$$NO
+					}
+ 
+					kill arrChars
+					do GetItemCV^FINCharValue(idItem,.arrChars)
+					do GetLocnCV^FINCharValue(idLocn,idStore,.arrChars)
+					do GetSupCV^FINCharValue(pidSupplier,.arrChars)
+					do GetOrderCV^FINCharValue(idOrder,.arrChars)
+					
+					set fltTax      = arrTaxDist(idDist)
+					set fltDiscount = arrDist(idDist)
+					
+					if $$$ISOK(strStatus) {
+						set strStatus = $$AddDiscountAmount(pidInvoice,-idParent,idCharge,$$$FCSub(fltDiscount,fltTax),idAccount,.arrChars)
+					}
+					if $$$ISOK(strStatus) {
+						set strStatus = $$AddTaxAmount^FINAPInvPrePost(pidInvoice,idParent,fltTax)
+					}
+					quit:$$$ISERR(strStatus)
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+AddDiscountAmount(pidInvoice,pidLine,pidCharge,pcurAmount,penumType,&parrChars)
+    ;-------------------------------------------------------------------------------
+    ; Adds the discount amount to the line and if the same details are passed in,
+    ; finds the existing details and adds to it.
+    ;
+    ; Called By: PopulateDiscountsForLine
+    ; 
+    ; Params:	pidLine 	- ^FINAPInvCharge P2 (set to -ve if Total rather than Line charge)
+    ; 
+    ; Returns:Status
+    ;
+    ; History:
+    ; 09-Dec-2009	GRF		SR16667: idAccount test should be for null; penumType
+    ; 							could contain a valid account number which may start
+    ; 							with letters; if/else for strDiscount definition
+    ; 07-Sep-2005	RPW		SR11983: Fixed an extra C.
+    ; 23-Aug-2005	RPW		SR11983: Created.
+    ;-------------------------------------------------------------------------------
+	new arrCSTKey,arrLine,blnNegative,curAmount
+	new idAccount,idDiscount,idLine,idNext,idParent,idTax,intLen
+	new objCSTVals,objInvoice,objLine,objPrePost,strDiscount,strStatus
+	
+	
+	$$$LogR("AddDiscountAmount",$get(pidInvoice)_"<"_$get(pidLine)_"<"_$get(pidCharge)_"<"_$get(pcurAmount)_"<"_$get(penumType)_"<")
+	
+	set blnNegative = ($$$FCBase(pcurAmount)<0)
+	
+	if pidLine'<0 {   ; SR16667
+		set strDiscount = "LINESURC"
+		if blnNegative {
+			set strDiscount = "LINEDISC"
+		}
+			
+	} else {
+		set pidLine     = -pidLine
+		set strDiscount = "TOTALSURC"
+		if blnNegative {
+			set strDiscount = "TOTALDISC"
+		}
+	}
+	
+	set strStatus = $$$OK
+	
+	;if (pidInvoice'="") && (pidLine'="") && (pidCharge'="") && (+pcurAmount'=0) && (+penumType'=0) {  ; SR16667
+	if (pidInvoice'="") && (pidLine'="") && (pidCharge'="") && (+pcurAmount'=0) && (penumType'="") {
+		if (penumType=$$$EnumFINAPVARIANCEPOSTInventory) {
+			set strStatus = 1 ;$$GetAccount^FINAPInvPrePost(.idAccount,$$$FldINFIBPARInventoryAccount,pidInvoice,pidLine,.parrChars,.arrCSTKey,.objCSTVals)
+			
+		} elseif (penumType=$$$EnumFINAPVARIANCEPOSTSupplier) {
+			set strStatus = 1 ;$$GetSupplierAccount^FINAPInvPrePost(.idAccount,pidInvoice)
+			
+		} else {
+			set idAccount = penumType
+		}
+		
+		if $get(idAccount)'="" {  ; SR16667
+			set idNext     = 0 
+			set intLen     = $length(strDiscount)
+			set idDiscount = strDiscount
+			for {
+				set idDiscount = $order(^FINAPInvPrePost(0,pidInvoice,idDiscount))
+				quit:idDiscount=""
+				quit:$extract(idDiscount,1,intLen)'=strDiscount
+				
+				set idNext   = $extract(idDiscount,9,999)
+				set idParent = $order(^FINAPInvPrePost(0,pidInvoice,idDiscount,""))
+				
+				if idParent=pidLine {     ; Check if they are the same.
+					set objPrePost = $get(^FINAPInvPrePost(0,pidInvoice,idDiscount,idParent,1))
+					
+					if objPrePost'="" {
+						if $$$FINAPInvPrePostAccount(objPrePost)=idAccount {
+							set idNext = idNext-1
+						}
+					}
+				}
+			}
+			set strStatus = $$SaveLine^FINAPInvPrePost(pidInvoice,strDiscount_(idNext+1),pidLine,idAccount,pcurAmount)
+		}
+	}
+	
+	quit strStatus
+	
+	
+TotalInvoiceDiscrepancy(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Sum up total discrepancy for invoice
+	;
+	; Params: Invoice number - pidInvoice
+	;
+	; Returns: Invoice discrepancy
+	;
+	; History:
+	; 24-Oct-2005	PO		SR13613: Created
+	;-------------------------------------------------------------------------------
+	new idLine,curDiscrepancy,objInvoice
+ 
+	set objInvoice = $get(^FINAPInv(0,pidInvoice,1))
+ 
+	set curDiscrepancy = 0
+	set idLine = ""
+	for {
+		set idLine = $order(^FINAPInvLine(0,pidInvoice,idLine))
+		quit:idLine=""
+		
+		set curDiscrepancy = curDiscrepancy + $$OrderToInvoiceDiscrepancy(objInvoice,$get(^FINAPInvLine(0,pidInvoice,idLine,1)))
+	}
+ 
+	quit curDiscrepancy
+	
+	
+OrderToInvoiceDiscrepancy(pobjInvoice,pobjLine) 
+	;-------------------------------------------------------------------------------
+	; Calculate the discrepancy between the receipt and invoice
+	;
+	; Params:
+	; 	pobjInvoice	- not used
+	; 	pobjLine	- FINAPInvLine record
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Oct-2009	GRF		SR16361: Implement changed code
+	; 10-Sep-2009	GRF		SR16361: Base on INRECLine rather than INWEAUF
+	; 24-Nov-2005	RPW		SR13895: Added comment line for SR number
+	; 23-Nov-2005	PO		SR13895: Use received quantity, not order quantity.
+	; 21-Oct-2005	PO		SR13613: Round base amount of order total to same accuracy as receipt.
+	; 19-Oct-2005	PO		SR13613: Round returned result.
+	; 28-Sep-2005	PO		SR13575: Was incorrectly adjusting OrderTotal to 3WM exchange rate.
+	; 20-Sep-2005	GRF		Build 1.11.6 : new variables
+	; 16-Sep-2005	PO		SR13489: Created
+	;-------------------------------------------------------------------------------
+	new curBase,curCost,curDiscrepancy,curForeign,curOrderEach,curOrderTotal
+	new fltQuantity,fltRate,idCacheLink,idReceipt,idRecLine
+	new objMatchCache,objReceipt,strCode
+	
+	set curOrderEach = $$$FINAPInvLineOrderEach(pobjLine)
+	set fltQuantity  = $$$FINAPInvLineReceivedQuantity(pobjLine)
+ 
+	set curOrderTotal = $$$FCMult2(curOrderEach,fltQuantity)          ; e.g. 87.5  or  "87.5@USD70@1.25"
+ 
+ 	if $$$AmountIsFC(curOrderTotal) {
+		set idCacheLink   = $$$FINAPInvLineCacheLink(pobjLine)
+		set objMatchCache = $get(^FINAPInvMatchCache(0,idCacheLink,1))
+		set idReceipt     = $$$FINAPInvMatchCacheReceiptNumber(objMatchCache)
+		set idRecLine     = $$$FINAPInvMatchCacheReceiptLine(objMatchCache)
+		
+		set curCost = 0
+		if (idReceipt'="") && (idRecLine'="") {
+			set objReceipt = $get(^INRECLine(0,idReceipt,idRecLine,1))
+			set curCost    = $$$INRECLineEach(objReceipt) * $$$INRECLineQuantity(objReceipt)  ; both for Inventory Unit
+			
+		} else {
+			set curOrderTotal = $$$FCMake(0,$$$FCur(curOrderTotal),$$$FCRate(curOrderTotal))   ; e.g. "0@USD0@1.25"
+		}
+		$$$FCSplit(curOrderTotal,.curBase,.curForeign,.strCode,.fltRate)
+		set curDiscrepancy = curCost - $justify(curBase,0,$$$NumberOfDP(curCost))
+		
+	} else {
+		set curDiscrepancy = 0
+	}
+	quit $$$FCRound(curDiscrepancy)
+	
+	
+OldOrderToInvoiceDiscrepancy(pobjInvoice,pobjLine) ; DEPRECATED with change to INWEAUF SR16361
+	;-------------------------------------------------------------------------------
+	; Calculate the discrepancy between the receipt and invoice
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 24-Nov-2005	RPW		SR13895: Added comment line for SR number
+	; 23-Nov-2005	PO		SR13895: Use received quantity, not order quantity.
+	; 21-Oct-2005	PO		SR13613: Round base amount of order total to same accuracy as receipt.
+	; 19-Oct-2005	PO		SR13613: Round returned result.
+	; 28-Sep-2005	PO		SR13575: Was incorrectly adjusting OrderTotal to 3WM exchange rate.
+	; 20-Sep-2005	GRF		Build 1.11.6 : new variables
+	; 16-Sep-2005	PO		SR13489: Created
+	;-------------------------------------------------------------------------------
+	new curBase,curCost,curDiscrepancy,curForeign,curOrderEach,curOrderTotal
+	new dteReceipt,fltQuantity,fltRate,idCacheLink,idLocn,idSrcOrder,idSrcOrdLine,idStore
+	new objMatchCache,objReceipt,strCode
+ 
+	set curOrderEach  = $$$FINAPInvLineOrderEach(pobjLine)
+	set fltQuantity   = $$$FINAPInvLineReceivedQuantity(pobjLine) ; SR13895
+	set curOrderTotal = $$$FCMult2(curOrderEach,fltQuantity)
+ 
+ 	if $$$AmountIsFC(curOrderTotal) {
+		set idCacheLink   = $$$FINAPInvLineCacheLink(pobjLine)
+		set objMatchCache = $get(^FINAPInvMatchCache(0,idCacheLink,1))
+		set idSrcOrder    = $$$FINAPInvMatchCacheSourceOrder(objMatchCache)
+		set idSrcOrdLine  = $$$FINAPInvMatchCacheOrderLine(objMatchCache)
+		
+		set curCost = 0
+		if (idSrcOrder'="") && (idSrcOrdLine'="") {
+			set idLocn     = $$$FINAPInvMatchCacheLocation(objMatchCache)
+			set idStore    = $$$FINAPInvMatchCacheStockLocation(objMatchCache)
+			set dteReceipt = $$$FINAPInvMatchCacheReceiptDate(objMatchCache)
+			
+			if (idLocn'="") && (idStore'="") && (dteReceipt'="") {
+				set objReceipt = $get(^INWEAUF(0,idSrcOrder,idSrcOrdLine,idLocn,idStore,dteReceipt,1))
+				set curCost    = $$$INWEAUFTotalCostOnLocation(objReceipt)
+			}
+		} else {
+			set curOrderTotal = $$$FCMake(0,$$$FCur(curOrderTotal),$$$FCRate(curOrderTotal))
+			// Further functionality - For receive without order (CURRENTLY DISABLED)
+			
+		}
+		$$$FCSplit(curOrderTotal,.curBase,.curForeign,.strCode,.fltRate)
+		set curDiscrepancy = curCost - $justify(curBase,0,$$$NumberOfDP(curCost))
+		
+	} else {
+		set curDiscrepancy = 0
+	}
+	quit $$$FCRound(curDiscrepancy) ; SR13613	
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,1052 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INItemPrice" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INItemPrice
+	
+#include COMSYS
+#include INConst
+	
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_":"_%2 $$$JournalOn
+#define LogR(%1,%2) 	;
+	
+#define Where(%1) $select($increment(%1)=1:"where ",1:"and ")
+#define DELIM	$char(31)
+	
+SetPrice(pidItem,pidUnit,pidLocn,pidPC,pdteStart,pdteEnd,pfltValue,pstrPPLine,&pidSequence)
+	;-------------------------------------------------------------------------------
+	; Given relevant parameters set the Price Record INItemPrice
+	;
+	;       ********************************************************
+	; 		************** MAIN SET PRICE METHOD *******************
+	;       ********************************************************
+	;
+	;
+	; Inputs:
+	; Params:	pidItem			- item number (INART)
+	; 		2	pidUnit			- unit of measure
+	; 		3	pidLocn			- location
+	; 		4	pidPC			- Price identifier/Code
+	; 		5	pdtePrice		- date, defaults to today
+	;		6	pfltValue		- Value
+	;		7	pstrPRLine		- Price Review Line (Primary Keys) which resulted in this
+	;							  record being created.
+	;
+	; Returns:  Status Code
+	;			By Ref - pidSequence = Price Record ID
+	;
+	; History:
+	; 28-Oct-2009	GRF		SR16842: parentheses missing from clauses of IF test;
+	; 							remove unnecessary $get from defaulted parameters
+	; 03-Sep-2009	PPP		SR16842: If the Price Record already exists (based on 
+	; 							PPlan Review Line identifier use that ID to update
+	; 							the Record.
+	; 02-Sep-2009	shobby	SR16842: Put some brackets if the dteStart/dteEnd test
+	; 							to return the correct result.
+	; 02-Sep-2009	PPP		SR16842: Added pfltValue as parameter; Added Status Code
+	; 							'IN01124', 'IN01125'
+	; 01-Sep-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new idPrice,objPrice,strStatus
+	
+	set strStatus = $$$OK
+
+	if ($get(pidItem)="") || ($get(pidUnit)="")  || ($get(pidLocn)="") || ($get(pidPC)="")  {
+		set strStatus = $$$MakeStatus("IN01124")
+	}  ; "Insufficient Data to create a Price Record"
+	
+	if $get(pdteStart) = "" set pdteStart = +$horolog
+
+	if $$$ISOK(strStatus) {
+		if ($get(pdteEnd)'="") && ($get(pdteEnd)<pdteStart) {
+			set strStatus = $$$MakeStatus("IN01125")
+		}  ; "End Date cannot be before Start Date"
+	}
+	
+	if $$$ISOK(strStatus) {
+	
+	;+++++++++++++++++++++++++++++++++++++++
+		LOCK +^INItemPrice(pidItem):1
+	;+++++++++++++++++++++++++++++++++++++++
+	
+		if $get(pstrPPLine)'="" {
+			set pidSequence = $$GetPPLineRecord^INItemPriceUtils($get(pstrPPLine))
+		}
+		
+		if $get(pidSequence) = "" {
+			set pidSequence = $$^WWWNEXT("INItemPrice")
+		}
+
+		set objPrice = ""	
+		set $$$INItemPriceItemNo(objPrice)           = pidItem
+		set $$$INItemPriceUnit(objPrice)             = pidUnit
+		set $$$INItemPriceLocation(objPrice)         = pidLocn
+		set $$$INItemPricePriceIdentifier(objPrice)  = pidPC
+		set $$$INItemPriceStartDate(objPrice)        = pdteStart
+		set $$$INItemPriceEndDate(objPrice)          = $get(pdteEnd)
+		set $$$INItemPricePrice(objPrice)            = $get(pfltValue)
+		set $$$INItemPricePricePreviewLine(objPrice) = $get(pstrPPLine)
+		
+		set strStatus=$$$Save("INItemPrice",pidSequence,objPrice,$$$YES)
+		
+	;+++++++++++++++++++++++++++++++++++++++
+		LOCK -^INItemPrice(pidItem)#"I"
+	;+++++++++++++++++++++++++++++++++++++++
+	}
+
+	quit strStatus
+	
+	
+GetPrice(pidItem,pidUnit,pfltQty,pidLocn,pidPC,pdtePrice,pidCustomer="",pidCustGroup="",pblnIncTax=$$$NO,pblnVerbose=$$$NO,pblnShowSQL=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Get the Price for an Item, based on Pricing Location & Hierarchy
+	;
+	;       ********************************************************
+	; 		************** MAIN GET PRICE METHOD *******************
+	;       ********************************************************
+	;
+	;
+	; Inputs:
+	; Params:	pidItem			- item number (INART)
+	; 		2	pidUnit			- unit of measure
+	; 		3	pfltQty			- qty, defaults to 1
+	; 		4	pidLocn			- location
+	; 		5	pidPC			- Price identifier/Code
+	; 		6	pdtePrice		- date, defaults to today
+	; 		7	pidCustomer		- Customer number (INKUNDE)
+	; 		8	pidCustGroup	- Customer Group
+	;		9	pblnIncTax		- Return Tax inc price
+	;		10	pblVerbose		- If the Log for Price Calculation is to be displayed
+	;		11	pblnShowSQL		- Show the SQL used in Price Calculations
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Oct-2009	GRF		SR16842: parentheses missing from clauses of IF test
+	; 28-Aug-2009	DWR		SR16842: Create and include language texts for log labels
+	; 27-Aug-2009	PPP		SR16842: Concept of Pricing Location
+	; 27-Aug-2009	PPP		SR16842: Added pblnIncTax parameter
+	; 27-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new fltPrice,fltTax,idParentLocn,idPriceLocn 
+
+	if $get(Y)="" do ^WWWVAR
+	if $get(SPRACHE)="" set SPRACHE = "EN"
+	
+	//Logging of Data for Viewing
+	if pblnVerbose {
+		do Start^INItemPriceLog()   ; "Input Data Values"
+		do Message^INItemPriceLog($$$Text("IN01093"),"Item:"_pidItem_", UOM:"_pidUnit_"( "_$$GetEnumDescription^COMUtils("EINHEIT",pidUnit)_")"_", Qty:"_pfltQty_", Loc:"_pidLocn_", Price Code:"_pidPC_", Eff Date:"_$zdt(pdtePrice,3)_", Customer:"_$select(pidCustomer'="":pidCustomer,1:"None")_", Customer Group:"_$select(pidCustGroup'="":pidCustGroup,1:"None"))
+	}
+
+	set fltPrice = ""
+	if $get(pidLocn)="" set pidLocn = $get(YLOCATION)
+	
+	if ($get(pidItem)="") || ($get(pidUnit)="")  || (pidLocn="") || ($get(pidPC)="") {
+	//	set strStatus = $$$MakeStatus("IN01124")	; "Insufficient Data to create a Price Record"
+		quit fltPrice
+	}
+	
+	set idPriceLocn = $$GetPriceLocation^INItemPriceUtils(pidLocn)
+	do:pblnVerbose Message^INItemPriceLog($$$Text("IN01094"),pidLocn_" = "_$select(idPriceLocn'="":idPriceLocn,1:"None"))   ; "Price Location for"
+	
+	if idPriceLocn '= "" {
+		//Get Price for Pricing Location
+		set fltPrice = $$GetPriceForLocation(pidItem,pidUnit,pfltQty,idPriceLocn,pidPC,pdtePrice,pidCustomer,pidCustGroup,pblnVerbose,pblnShowSQL)	
+		if fltPrice {
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01095"),idPriceLocn_" = "_$justify(+fltPrice,0,2))
+		}  ;"Price calculated for pricing location"
+	}
+	
+	if $piece(fltPrice,Y,2)'=$$$OK {
+		//Get Price for Current Location
+		set fltPrice = $$GetPriceForLocation(pidItem,pidUnit,pfltQty,pidLocn,pidPC,pdtePrice,pidCustomer,pidCustGroup,pblnVerbose,pblnShowSQL)	
+		if fltPrice {
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01096"),pidLocn_" = "_$justify(+fltPrice,0,2))
+		}  ; "Price calculated for current location"
+	}
+	
+	if +$piece(fltPrice,Y,2)'=$$$OK {
+		//Recursive for Parent till we reach the Top Location
+		
+		set idParentLocn = $$GetParentLocation^INItemPriceUtils(pidLocn)
+		do:pblnVerbose Message^INItemPriceLog($$$Text("IN01097"),pidLocn_" = "_idParentLocn)   ; "Parent Location for "
+
+		if idParentLocn'="" {
+			set fltPrice = $$GetPriceForLocation(pidItem,pidUnit,pfltQty,idParentLocn,pidPC,pdtePrice,pidCustomer,pidCustGroup,pblnVerbose,pblnShowSQL)	
+			if fltPrice {
+				do:pblnVerbose Message^INItemPriceLog($$$Text("IN01098"),idParentLocn_" = "_$justify(+fltPrice,0,2))
+			}  ; "Price calculated for parent Location"
+		}
+	}
+
+	//Taxes
+	if pblnIncTax {
+		set fltTax = $$GetTax(pidItem,pidCustomer,pidLocn,pdtePrice,fltPrice)
+		do:pblnVerbose Message^INItemPriceLog($$$Text("IN01099"),$justify(fltTax,0,2))   ;"Tax calculated"
+		set fltPrice = fltPrice + fltTax
+	}
+	
+	if pblnVerbose {
+		do Message^INItemPriceLog($$$Text("IN01100"),$justify(+fltPrice,0,2))    ;"Price returned"
+		do ShowLog^INItemPriceLog($$$EnumWWWDYNTABLEAfterDataFields,"INItemPrice"_$$$DELIM_"INItemPrice"_$$$DELIM_"ItemPrice"_$$$DELIM)
+	}
+		
+	quit +fltPrice
+
+
+GetPriceForLocation(pidItem,pidUnit,pfltQty,pidLocn="",pidPC="",pdtePrice,pidCustomer="",pidCustGroup="",pblnVerbose=$$$NO,pblnShowSQL=$$$NO) private
+	;-------------------------------------------------------------------------------
+	; Calculate the sales price for a Given Location
+	;
+	; Inputs:
+	; Params:	pidItem			- item number (INART)
+	; 		2	pidUnit			- unit of measure
+	; 		3	pfltQty			- qty, defaults to 1
+	; 		4	pidLocn			- location
+	; 		5	pidPrice		- Price identifier
+	; 		6	pidCustomer		- Customer number (INKUNDE)
+	; 		7	pdte			- date, defaults to today
+	;
+	; Returns: fltPrice - Calculated Price
+	;
+	; History:
+	; 29-Aug-2009	DWR		SR16842: Create and include language texts for log labels
+	; 25-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new arrSequence,fltPrice,fltTax,idGroup,idPriceLocn
+	new objCustomer,objGroup,objItem,strGroup
+	
+	quit:$get(pidItem)="" ""
+	
+	if +$get(pfltQty)=0 set pfltQty=1
+	if $get(pdtePrice)="" set pdtePrice=+$HOROLOG
+	
+	//Set Price Identifier & Customer Group
+	if (pidCustomer'="") {
+		set objCustomer = $get(^INKUNDE(YM,pidCustomer,1))
+		if (pidPC="")      set pidPC        = $$$INKUNDEPriceIdentifier(objCustomer)
+		if pidCustGroup="" set pidCustGroup	= $$$INKUNDECustomerGroup(objCustomer)
+		do:pblnVerbose Message^INItemPriceLog($$$Text(32374),pidCustomer_","_pidPC_","_pidCustGroup)   ;"Customer Data"
+	}
+
+	//Item Group
+	set objItem = $get(^INART(0,pidItem,1))
+	set idGroup = $$$INARTItemGroup(objItem)
+	if pblnVerbose {
+		if idGroup'="" {
+			set objGroup = $get(^INItemGroup(0,idGroup,1))
+			set strGroup = $$$INItemGroupDescription(objGroup)
+		}
+		do Message^INItemPriceLog($$$Text(32082),idGroup_" - "_$get(strGroup))  ;"Item Group"
+	}
+	
+	kill arrSequence
+	set fltPrice = $$PriceCalc(pidItem,pidUnit,pfltQty,pidLocn,pidPC,pdtePrice,pidCustomer,pidCustGroup,idGroup,pblnVerbose,pblnShowSQL,.arrSequence)
+
+	//Prices on the Item Master
+	if 'fltPrice {
+		set fltPrice = $$ItemMasterPrice(objItem,pidPC)_Y_$$$YES
+		do:pblnVerbose Message^INItemPriceLog($$$Text("IN01101"),$justify(fltPrice,0,2))
+	}  ; "Item Master Price"
+
+	quit fltPrice
+	
+	
+ItemMasterPrice(pobjItem,pidPC)
+	;-------------------------------------------------------------------------------
+	; Get the Price on the Item Master
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns: fltPrice
+	;
+	; History:
+	; 26-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new fltPrice
+	
+	set fltPrice = 0
+	
+	if $$$INARTPriceIdentifier(pobjItem) = pidPC {
+		set fltPrice = $$$INARTSalesPrice(pobjItem)
+		
+	} elseif $$$INARTPriceIdentifier1(pobjItem) = pidPC {
+		set fltPrice = $$$INARTSalesPrice1(pobjItem)
+		
+	} elseif $$$INARTPriceIdentifier2(pobjItem) = pidPC {
+		set fltPrice = $$$INARTSalesPrice2(pobjItem)
+		
+	} elseif $$$INARTPriceIdentifier3(pobjItem) = pidPC {
+		set fltPrice = $$$INARTSalesPrice3(pobjItem)
+	}
+	
+	quit fltPrice
+
+
+PriceCalc(pidItem,pidUnit,pfltQty,pidLocn,pidPC,pdtePrice,pidCustomer,pidCustGroup,pidGroup,pblnVerbose=$$$NO,pblnShowSQL=$$$NO,&parrSequence) private
+	;-------------------------------------------------------------------------------
+	; Price Calulation Routine
+	; 1. Itentify the Record
+	; 2. Get Price
+	; 3. If no price and Based On, Get the Price (recursive call to this subroutine)
+	; 4. Apply Calculation Methods
+	; 5. Apply Rounding
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Oct-2009	GRF		SR16871: pass idLocn through to GetPriceCalculated
+	; 20-Oct-2009	PPP		SR16961: Updated Manual Pack Cost calculations
+	; 01-Oct-2009	PPP		SR16842: added parrSequence (By Ref)
+	; 29-Sep-2009	SCR		SR16842: added pblnVerbose & pblnShowSQL
+	; 10-Sep-2009	PPP		SR16842: Check if the Rounding Value exist
+	; 31-Aug-2009	DWR		SR16842: Create and include language texts for log labels
+	; 20-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new fltCalcAmt,fltPrice,fltQty,fltRound,idBasedOnPC,idCalc,idPCBasedOn
+	new idRound,idSeq,objPC,objPrice,strCalc,strPrice
+	//new blnGetOneRecord
+	
+	set fltPrice = 0
+	set strPrice = ""
+	
+	;Price Record
+	$$$LogR("Find",pidItem_","_pidUnit_","_pfltQty_","_pidLocn_","_pidPC_","_pdtePrice_","_pidCustomer_","_pidCustGroup_","_pidGroup)
+	set idSeq = $$IdentifyPriceRecord(pidItem,pidUnit,pfltQty,pidLocn,pidPC,pdtePrice,pidCustomer,pidCustGroup,pidGroup,pblnVerbose,pblnShowSQL,.parrSequence)	
+	
+	$$$LogR("Price Record Selected",idSeq_"           <<<<<<<")
+	do:pblnVerbose Message^INItemPriceLog($$$Text("IN01102"),$select(idSeq'="":idSeq_"           <<<<<<<",1:"None"))  ; "Price Record Selected"
+	
+	if idSeq = "" quit 0														//	EARLY EXIT
+	
+	set objPrice = $get(^INItemPrice(0,idSeq,1))
+	$$$LogR("Price Record",objPrice)
+	
+	set $piece(strPrice,Y,1) = $$$INItemPricePromotionCode(objPrice)
+	set $piece(strPrice,Y,2) = $$$INItemPricePricePreviewLine(objPrice)
+	
+	if objPrice '= "" {
+		set fltPrice = $$$INItemPricePrice(objPrice)
+
+		if fltPrice {
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01103"),idSeq_" : "_fltPrice) ;"Manually Set Price"
+		}
+		
+		if 'fltPrice {
+			set idBasedOnPC = $$$INItemPriceBasedOn(objPrice)
+			
+			if idBasedOnPC'="" {
+	$$$LogR("PC Based On",idBasedOnPC)
+				set $piece(strPrice,Y,1)=$piece(strPrice,Y,1)_","_idBasedOnPC
+				
+				//Already found record with Entered Qty, Change Qty = 1 to avoid Circular Reference
+				set fltQty = pfltQty
+				if idBasedOnPC = pidPC {
+					do:pblnVerbose Message^INItemPriceLog($$$Text("IN01104"),idSeq_" : "_pfltQty_" to 1") ;"Set Qty"
+					set fltQty =1
+				}
+				
+				do:pblnVerbose Message^INItemPriceLog($$$Text("IN01105"),idBasedOnPC)  ;"Based On Price Code"
+				set fltPrice = $$PriceCalc(pidItem,pidUnit,fltQty,pidLocn,idBasedOnPC,pdtePrice,pidCustomer,pidCustGroup,pidGroup,pblnVerbose,pblnShowSQL,.parrSequence)
+				do:pblnVerbose Message^INItemPriceLog($$$Text("IN01106"),idSeq_" : Price Code "_idBasedOnPC_" = "_fltPrice)   ; "Calculated Value Based"
+	$$$LogR("Price Based On",fltPrice)
+				
+				//No Price Definition in INItemPrice, Check the definition of the Price Code itself
+				if 'fltPrice {
+					set objPC       = $get(^INPriceCode(0,idBasedOnPC,1))
+					set idPCBasedOn = $$$INPriceCodeBasedOn(objPC)
+					
+					if idPCBasedOn'="" {
+						set strCalc  = $$$WWW101Text($get(^WWW101(0,"PRICEBASIS",SPRACHE,idPCBasedOn,1)))
+						set fltPrice = $$GetPriceCodeBase(pidItem,pidLocn,idPCBasedOn)	//SR16961
+	$$$LogR("Value Based On",idPCBasedOn)
+						do:pblnVerbose Message^INItemPriceLog($$$Text("IN01106"),idSeq_" : "_idPCBasedOn_" ("_strCalc_") = "_fltPrice)   ;"Calculated Value Based On"
+						set $piece(strPrice,Y,1)=$piece(strPrice,Y,1)_","_idBasedOnPC
+					}
+				}
+			}
+			
+			//Calculations Defined
+			set idCalc 		= $$$INItemPriceCalculation(objPrice)
+			set fltCalcAmt 	= $$$INItemPriceCalculationAmount(objPrice)
+			
+			if (idCalc && fltCalcAmt && fltPrice) {
+				set strCalc  = $$$WWW101Text($get(^WWW101(0,"PRICECALCBASIS",SPRACHE,idCalc,1)))
+			;	set fltPrice = $$GetPriceCalculated(pidItem,pidUnit,idCalc,fltCalcAmt,fltPrice,pblnVerbose)  ; SR16871
+				set fltPrice = $$GetPriceCalculated(pidItem,pidUnit,idCalc,fltCalcAmt,fltPrice,pblnVerbose,pidLocn)
+	$$$LogR("Based On Calcs",idCalc_":"_fltCalcAmt_":"_fltPrice)
+				do:pblnVerbose Message^INItemPriceLog($$$Text("IN01106"),idSeq_" : "_idCalc_" ("_strCalc_") : "_fltCalcAmt_" = "_fltPrice)  ;"Calculate Value Based On "
+			}
+		}
+
+		//Rounding
+		set idRound  = $$$INItemPriceRoundingMethod(objPrice)
+		set fltRound = $$$INItemPriceRoundingValue(objPrice)
+		if (idRound>1) && fltRound {	//SRxxxxx
+			set strCalc  =$$$WWW101Text($get(^WWW101(0,"INFORERND",SPRACHE,idRound,1)))
+			set fltPrice = $$Round(fltPrice,idRound,fltRound,pblnVerbose)
+	$$$LogR("Based On Rounding",idRound_":"_fltRound_":"_fltPrice)
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01106"),idSeq_" : "_idRound_" ("_strCalc_") : "_fltRound_" = "_fltPrice)   ;"Calculate Value Based On "
+		}
+	}
+	quit fltPrice_Y_$$$YES_Y_strPrice
+	
+	
+IdentifyPriceRecord(pidItem,pidUnit,pfltQty,pidLocn,pidPC,pdtePrice,pidCustomer,pidCustGroup,pidGroup,pblnVerbose=$$$NO,pblnShowSQL=$$$NO,&parrSequence)
+	;-------------------------------------------------------------------------------
+	; Based on Rules in the following seq get the price record
+	;		1. Customer & Customer Group Prices
+	;		2. Customer & Item Group Prices
+	;		3. Customer Group & Item Group Prices
+	;		4. Item Group Prices
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Oct-2009	PPP		SR16842: added parrSequence (By Ref)
+	; 29-Sep-2009	SCR		SR16842: Added pblnVerbose & pblnShowSQL
+	; 31-Aug-2009	DWR		SR16842: Create and include language texts for log labels
+	; 25-Aug-2009	PPP		SR16842: For the following Groups of Prices only consider
+	;						top 1 valid price (arrSequence..)
+	;						1. Customer & Customer Group Prices
+	;						2. Customer & Item Group Prices
+	;						3. Customer Group & Item Group Prices
+	;						4. Item Group Prices
+	;						If an Item is not included, the User cannot set a Manual Price
+	;						and hence only 1 calculated price needs to be checked for.
+	;						Do not want the calculation to be done multiple times only the 
+	;						first one.
+	;
+	; 21-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new idSeq	//,arrSequence
+	
+	set idSeq = ""
+
+	//Item Records
+	//Customer Prices
+	if pidCustomer'="" {
+		//Customer & Item
+		set idSeq = $$GetPriceRecordID(pidItem,pidUnit,pfltQty,pidLocn,pidPC,pdtePrice,pidCustomer,,,,pblnVerbose,pblnShowSQL,.parrSequence)	
+	$$$LogR("pidCustomer & pidItem <>",idSeq)
+		do:pblnVerbose Message^INItemPriceLog($$$Text("IN01107"),pidCustomer_"/"_pidItem_" = "_idSeq)  ;"Customer & Item Record"
+
+		//Customer & Group
+		if '$data(parrSequence("CIG")) {
+			if (idSeq = "") && (pidGroup'="") {
+				set idSeq = $$GetPriceRecordID("","",pfltQty,pidLocn,pidPC,pdtePrice,pidCustomer,,pidGroup,,pblnVerbose,pblnShowSQL,.parrSequence)	
+				if idSeq'="" set parrSequence("CIG") = idSeq
+	$$$LogR("pidCustomer & pidGroup <>",idSeq)
+				do:pblnVerbose Message^INItemPriceLog($$$Text("IN01108"),pidCustomer_"/"_pidGroup_" = "_idSeq) ;"Customer & Item Group Record"
+			}
+		
+		} else {
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01109"),pidGroup_" = "_idSeq) ;"Excluding All Customer & Group Records"
+		}
+	}
+
+	//Customer Group
+	if (idSeq = "") && (pidCustGroup'="") {
+		//Customer Group & Item
+		set idSeq = $$GetPriceRecordID(pidItem,pidUnit,pfltQty,pidLocn,pidPC,pdtePrice,,pidCustGroup,,,pblnVerbose,pblnShowSQL,.parrSequence)	
+	$$$LogR("pidCustGroup, & pidItem <>",idSeq)
+		do:pblnVerbose Message^INItemPriceLog($$$Text("IN01110"),pidCustGroup_"/"_pidItem_" = "_idSeq)  ;"Customer Group & Item Record"
+
+		//Customer Group & Item Group
+		if '$data(parrSequence("CGIG")) {
+			if (idSeq = "") && (pidGroup'="") {
+				set idSeq = $$GetPriceRecordID("","",pfltQty,pidLocn,pidPC,pdtePrice,,pidCustGroup,pidGroup,,pblnVerbose,pblnShowSQL,.parrSequence)	
+				if idSeq'="" set parrSequence("CGIG") = idSeq
+	$$$LogR("pidCustGroup & pidGroup <>",idSeq)
+				do:pblnVerbose Message^INItemPriceLog($$$Text("IN01111"),pidCustGroup_"/"_pidGroup_" = "_idSeq)   ;"Customer Group & Item Group Record"
+			}
+		
+		} else {
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01112"),pidGroup_" = "_idSeq)   ;"Excluding All Customer Group & Item Group Records"
+		}
+	}
+
+	//Item Group No Set Price
+	if (idSeq = "") && (pidGroup'="") {
+		if '$data(parrSequence("IGNP")) {
+			set idSeq = $$GetPriceRecordID("","",pfltQty,pidLocn,pidPC,pdtePrice,,,pidGroup,$$$YES,pblnVerbose,pblnShowSQL,.parrSequence)	
+			if idSeq'="" set parrSequence("IGNP") = idSeq
+	$$$LogR("pidGroup <> & NoPrice",idSeq)
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01113"),pidGroup_" = "_idSeq)   ;"Item Group Record, No Price"
+		} else {
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01114"),pidGroup_" = "_idSeq)   ;"Excluding All Group Records"
+		}
+	}
+
+	//Item
+	if (idSeq = "")	&& (pidItem'="") {
+		set idSeq = $$GetPriceRecordID(pidItem,pidUnit,pfltQty,pidLocn,pidPC,pdtePrice,,,,,pblnVerbose,pblnShowSQL,.parrSequence)	
+	$$$LogR("pidItem <>",idSeq)
+		do:pblnVerbose Message^INItemPriceLog($$$Text("IN01115"),pidItem_" = "_idSeq)        ;"Item Record"
+
+	}
+
+	//Item Group
+	if (idSeq = "") && (pidGroup'="") {
+		if '$data(parrSequence("IG")) {
+			set idSeq = $$GetPriceRecordID("","",pfltQty,pidLocn,pidPC,pdtePrice,,,pidGroup,,pblnVerbose,pblnShowSQL,.parrSequence)
+			set:idSeq'="" parrSequence("IG")=idSeq
+			$$$LogR("pidGroup <>",idSeq)
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01116"),pidGroup_" = "_idSeq)   ;"Item Group Record"
+		} else {
+			do:pblnVerbose Message^INItemPriceLog($$$Text("IN01117"),pidGroup_" = "_idSeq)   ;"Excluding Group Records"
+		}
+	}
+	
+	if idSeq'="" {
+		set parrSequence(idSeq)=pfltQty
+	}
+	quit idSeq
+	
+	
+GetPriceRecordID(pidItem="",pidUnit="",pfltQty,pidLocn,pidPC,pdtePrice,pidCustomer="",pidCustGroup="",pidGroup="",pblnNoPrice=$$$NO,pblnVerbose=$$$NO,pblnShowSQL=$$$NO,&parrSequence)
+	;-------------------------------------------------------------------------------
+	; Get the Price Record based on Inputs
+	;
+	; Inputs:
+	;
+	; Returns: Price Record ID
+	;
+	; History:
+	; 01-Oct-2009	PPP		SR16842: added parrSequence (By Ref)
+	; 29-Sep-2009	SCR		SR16842: Added pblnVerbose & pblnShowSQL
+	; 31-Aug-2009	DWR		SR16842: Create and include language texts for log labels
+	; 20-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	//Item - Customer Pricing
+	//Item - Customer Group Pricing
+	//Item/Unit/Loc/Start Date/End Date/Price/Qty Break
+	//Item/Unit/Loc/Start Date/Price/Qty Break
+	//Item/Unit/Loc/Start Date/End Date/Price
+	//Item/Unit/Loc/Start Date/Price
+	//Group - Customer Pricing
+	//Group - Customer Group Pricing
+	//Group
+
+	new blnContinue,blnWhereUsed,dteEndDate,dteStartDate,fltQB,idPrice,idSeq
+	new objPrice,objResultSet,sc,SQLCODE,strData,strSQL
+	
+	set sc    = $$$OK
+	set idSeq = ""
+	
+	set objResultSet = ##class(%Library.ResultSet).%New()
+ 	/*
+ 	set strSQL = "SELECT ID FROM INItemPrice"	//WHERE Customer = ? AND CustomerGroup = ? ItemNo = ? AND Location = ? AND Unit = ? AND PriceIdentifier = ? AND Quantity <= ? ORDER BY StartDate DESC"
+ 	set strSQL = strSQL_" WHERE Customer"_$select(pidCustomer'="":" = ?",1:" is null")
+ 	set strSQL = strSQL_" AND CustomerGroup"_$select(pidCustGroup'="":" = ?",1:" is null")
+ 	set strSQL = strSQL_" AND ItemNo"_$select(pidItem'="":" = ?",1:" is null")
+ 	set strSQL = strSQL_" AND Location"_$select(pidLocn'="":" = ?",1:" is null")
+ 	set strSQL = strSQL_" AND Unit"_$select(pidUnit'="":" = ?",1:" is null")
+  	set strSQL = strSQL_" AND PriceIdentifier"_$select(pidPC'="":" = ?",1:" is null")
+  	set strSQL = strSQL_" AND Quantity"_$select(pidPC'="":" <= ?",1:" is null")
+	set strSQL = strSQL_" ORDER BY StartDate DESC"
+	*/
+	
+	set blnWhereUsed = 0
+ 	set strSQL = "SELECT Sequence FROM INItemPrice "	//WHERE Customer = ? AND CustomerGroup = ? ItemNo = ? AND Location = ? AND Unit = ? AND PriceIdentifier = ? AND Quantity <= ? ORDER BY StartDate DESC"
+ 	set strSQL = strSQL_$$AddSQL(pidCustomer,"Customer",,.blnWhereUsed)
+ 	set strSQL = strSQL_$$AddSQL(pidCustGroup,"CustomerGroup",,.blnWhereUsed)
+ 	set strSQL = strSQL_$$AddSQL(pidGroup,"ItemGroup",,.blnWhereUsed)
+ 	set strSQL = strSQL_$$AddSQL(pidItem,"ItemNo",,.blnWhereUsed)
+ 	set strSQL = strSQL_$$AddSQL(pidLocn,"Location",,.blnWhereUsed)
+ 	set strSQL = strSQL_$$AddSQL(pidUnit,"Unit",,.blnWhereUsed)
+ 	set strSQL = strSQL_$$AddSQL(pidPC,"PriceIdentifier",,.blnWhereUsed)
+ 	//set strSQL = strSQL_"((Quantity is null) or (Quantity <= ))"
+ 	//set strSQL = strSQL_$$AddSQL(pfltQty,"Quantity"," <= ")
+ 	set:pblnNoPrice strSQL = strSQL_$$AddSQL("","Price",,.blnWhereUsed)
+	set strSQL = strSQL_"ORDER BY StartDate DESC, Quantity DESC, Price DESC"
+ 	
+	
+	$$$LogR("strSQL",strSQL)
+	do:pblnShowSQL Message^INItemPriceLog("SQL",strSQL)
+	
+ 	set sc = objResultSet.Prepare(strSQL)
+	
+	if $$$ISOK(sc) {
+		set sc = objResultSet.Execute()		//pidCustomer,pidCustGroup,pidItem,pidLocn,pidUnit,pidPC,pfltQty)
+		
+		if $$$ISOK(sc) {
+			while objResultSet.Next(.sc) {
+				quit:idSeq'=""
+			
+				set idPrice  = objResultSet.Data("Sequence")
+				set objPrice = $get(^INItemPrice(0,idPrice,1))
+				do:pblnVerbose Message^INItemPriceLog($$$Text("IN01118"),idPrice)   ;"Found Record"
+
+				if $data(parrSequence(idPrice)) {
+					do:pblnVerbose Message^INItemPriceLog($$$Text("IN01119"),idPrice_" = "_"Yes")  ;"Exclude Record already used in Calculation"
+					continue
+				}
+					
+				//Start Date
+				set dteStartDate = $$$INItemPriceStartDate(objPrice)
+	$$$LogR("dteStartDate",dteStartDate)
+				set blnContinue = ( (dteStartDate'="") && (dteStartDate>pdtePrice) )
+	$$$LogR("(dteStartDate>pdtePrice)",blnContinue)
+				if pblnVerbose {
+					set strData = $$^WWWDATE(dteStartDate)_" > "_$$^WWWDATE(pdtePrice) 				
+					do Message^INItemPriceLog($$$Text("IN01120"),idPrice_" ("_strData_") = "_$select(blnContinue:"Yes",1:"No"))   ;"Exclude Record based on Start Date"
+				}
+				continue:blnContinue
+
+				//End Date
+				set dteEndDate	= $$$INItemPriceEndDate(objPrice)				
+	$$$LogR("dteEndDate",dteEndDate)
+				set blnContinue = ( (dteEndDate'="") && (dteEndDate<pdtePrice) )
+	$$$LogR("(dteEndDate<pdtePrice)",blnContinue)
+				if pblnVerbose {
+					set strData = $select(dteEndDate'="":$$^WWWDATE(dteEndDate),1:"Blank")_" < "_$$^WWWDATE(pdtePrice) 				
+					do Message^INItemPriceLog($$$Text("IN01121"),idPrice_" ("_strData_") = "_$select(blnContinue:"Yes",1:"No"))   ;"Exclude Record based on End Date"
+				}
+				continue:blnContinue
+				
+				//Quantity Break
+				set fltQB = $$$INItemPriceQuantity(objPrice)
+				set blnContinue = ( (fltQB'="") && (fltQB>pfltQty) )
+				if pblnVerbose {
+					set strData = +fltQB_" > "_pfltQty 				
+					do Message^INItemPriceLog($$$Text("IN01129"),idPrice_" ("_strData_") = "_$select(blnContinue:"Yes",1:"No"))    ;"Exclude Record based on Quantity"
+				}
+				continue:blnContinue
+				
+				set idSeq = idPrice
+			}
+		}
+	}
+	quit idSeq
+	
+	
+AddSQL(strRefValue,strProperty,pstrCompare=" = ",&pblnWhereUsed)
+	;-------------------------------------------------------------------------------
+	; Add an SQL where/and clause
+	;
+	; Inputs:
+	;  strRefValue
+	;  strProperty
+	;  pstrCompare
+	;
+	; Returns: stSQL - SQL string
+	;
+	; History:
+	; 20-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new strSQL
+	
+	if strRefValue="" {
+		set strSQL = $$$Where(pblnWhereUsed)_"("_strProperty_" in ("""","" "") or "_strProperty_" is null) "
+	} else {
+		set strSQL = $$$Where(pblnWhereUsed)_"("_strProperty_pstrCompare_$$$Add(strRefValue)_") "
+	}
+	quit strSQL
+
+
+GetPriceCodeBase(pidItem,pidLocn,pidPCBasedOn)
+	;-------------------------------------------------------------------------------
+	; Get the Price based on the Cost Calulation Code defined
+	;
+	; Inputs:pidItem,pidLocn,pidPCBasedOn
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Oct-2009	GRF		SR16871: INItemCost with location replaces INARTKOST
+	; 20-Oct-2009	PPP		SR16961: Updated Manual Pack Cost calculations
+	; 20-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new fltPrice,objItem
+
+	set objItem = $get(^INART(YM,pidItem,1))  // Item Masterdata
+
+	;set fltPrice = $case(pidPCBasedOn,
+	;                       1:$$GetCost^INARTKOST(pidItem),                             // Average Cost   ; SR16871
+	set fltPrice = $case(pidPCBasedOn,
+	                        1:$$GetCost^INItemCost(pidItem,pidLocn),                    // Average Cost
+	                        2:$$GetManualPackCost^INItemPriceUtils(pidItem,pidLocn),    // Manual Pack Cost
+	                         :0)
+	quit fltPrice
+	
+	
+	;GetPriceCalculated(pidItem,pidUnit,pidCalc,pfltCalcAmt,pfltPrice,pblnVerbose=0) ; SR16871
+GetPriceCalculated(pidItem,pidUnit,pidCalc,pfltCalcAmt,pfltPrice,pblnVerbose=$$$NO,pidLocn)
+	;-------------------------------------------------------------------------------
+	; Get the Calculated Price based on Calculation Types
+	;
+	; Called By: PriceCalc^INItemPrice
+	; 
+	; Inputs:pidItem,pidUnit,pidCalc,pfltCalcAmt,pfltPrice
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Oct-2009	GRF		SR16871: INItemCost with location replaces INARTKOST
+	; 29-Spe-2009	SCR		SR16842: Added pblnVerbose
+	; 02-Sep-2009	DWR		SR16842: Create and include language texts for log labels
+	; 20-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new fltCost,fltDisc,fltGP,fltPrice,fltUnitConv,idInvUnit,objItem
+	
+	set fltDisc = 0
+	 			
+	if pidCalc = 1 {                   // Gross Profit	
+		set pfltCalcAmt = $select(pfltCalcAmt>99.99:99.99,pfltCalcAmt<0:0,pfltCalcAmt:pfltCalcAmt,1:0)
+		set pfltPrice   = pfltPrice*100/(100-pfltCalcAmt)
+		
+	} elseif pidCalc = 2 {            // Gross Profit Margin
+		set objItem		= $get(^INART(0,pidItem,1))
+		set idInvUnit 	= $$$INARTUnitofMeasure(objItem)
+		set fltUnitConv	= $$GetUOMConversion^INUOMConversion(pidItem,pidUnit)
+		
+       	set pfltCalcAmt = $select(pfltCalcAmt'<100:0,1:pfltCalcAmt)
+	;	set fltCost = $$GetCost^INARTKOST(pidItem)*fltUnitConv        ; SR16871
+		set fltCost = $$GetCost^INItemCost(pidItem,pidLocn) * fltUnitConv
+        
+        do:pblnVerbose Message^INItemPriceLog($$$Text(32980),fltCost)  ;"Cost"
+        
+        //set fltGP=1-(fltCost/pfltPrice)*100
+        //if fltGP<pfltCalcAmt {
+	        set pfltPrice=fltCost/(100-pfltCalcAmt)*100
+        //}
+        
+	} elseif pidCalc = 3 {             // Discount Amount
+		set fltDisc = pfltCalcAmt
+
+	} elseif pidCalc = 4 {             // Discount Percentage
+		set fltDisc = pfltPrice*pfltCalcAmt/100
+	
+	} elseif pidCalc = 5 {             // Surcharge Amount
+		set fltDisc = -pfltCalcAmt
+
+	} elseif pidCalc = 6 {             // Surcharge Percentage
+		set fltDisc = -pfltPrice*pfltCalcAmt/100
+
+	} elseif pidCalc = 7 {             // Gross Profit Mark Up
+		set objItem		= $get(^INART(0,pidItem,1))
+		set idInvUnit 	= $$$INARTUnitofMeasure(objItem)
+		set fltUnitConv	= $$GetUOMConversion^INUOMConversion(pidItem,pidUnit)
+		
+	;	set fltCost = $$GetCost^INARTKOST(pidItem)*fltUnitConv        ; SR16871
+		set fltCost = $$GetCost^INItemCost(pidItem,pidLocn) * fltUnitConv
+        do:pblnVerbose Message^INItemPriceLog($$$Text(32980),fltCost)  ;"Cost"
+        set pfltPrice=(100+pfltCalcAmt/100*fltCost)
+ 	
+	} elseif pidCalc = 8 {             // Cost Multiplier
+		set objItem		= $get(^INART(0,pidItem,1))
+		set idInvUnit 	= $$$INARTUnitofMeasure(objItem)
+		set fltUnitConv	= $$GetUOMConversion^INUOMConversion(pidItem,pidUnit)
+		
+	;	set fltCost = $$GetCost^INARTKOST(pidItem)*fltUnitConv        ; SR16871
+		set fltCost = $$GetCost^INItemCost(pidItem,pidLocn) * fltUnitConv
+        do:pblnVerbose Message^INItemPriceLog($$$Text(32980),fltCost)  ;"Cost"
+        set pfltPrice=fltCost + (pfltCalcAmt*fltCost)
+	}
+
+	set fltDisc  = $justify(fltDisc,0,4)
+	set fltPrice = pfltPrice-fltDisc
+
+	if fltDisc {
+		do:pblnVerbose Message^INItemPriceLog($$$Text("IN01122"),fltDisc)   ;"Discount Amount"
+	}
+	
+	quit fltPrice
+
+
+Round(pfltValue,Method,RoundBy,pblnVerbose=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Round the Value based on the Rouding Method
+	;
+	; Inputs:Value,Method,RoundBy
+	;
+	; Returns:Rounded Value, float
+	;
+	; History:
+	; 29-Sep-2009	SCR		SR16842: Added pblnVerbose
+	; 31-Aug-2009	DWR		SR16842: Create and include language texts for log labels
+	; 20-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	if pfltValue#RoundBy'=0 {
+		if Method=2 set pfltValue = pfltValue+RoundBy    \RoundBy*RoundBy   ; Round Up
+		if Method=3 set pfltValue = pfltValue            \RoundBy*RoundBy   ; Round Down
+		if Method=4 set pfltValue = pfltValue+(RoundBy/2)\RoundBy*RoundBy   ; Round Nearest
+	}
+	do:pblnVerbose Message^INItemPriceLog($$$Text("IN01123"),Method_":"_pfltValue)   ;"Price Rounding"
+
+	quit pfltValue
+
+
+GetTax(pidItem,pidCustomer,pidLocn,pdteTransDate,pcurPrice,pblnIncludesTax=$$$YES,
+		 &pidRates="",pstrReason="",pblnRound=$$$YES)
+    ;-------------------------------------------------------------------------------
+    ; This routine returns the amount of tax for a product/customer etc.
+    ; Also returns an array for taxes in the rates parameter.
+    ;
+    ; Returns:Currency
+    ;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Jul-2014	shobby	CORE-385.22: Broke link to SAL Module
+	; 20-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new curAmount,customerCode,idTaxLocn,idxTax,TotalTax,objCustomer
+	new objItem,idItemTaxCode
+	
+	kill pidRates
+	
+	set curAmount    = 0
+	set customerCode = ""
+	set idTaxLocn    = ""
+
+	set objItem = $get(^INART(0,pidItem,1))
+	set idItemTaxCode = $$$INARTVATTax(objItem)
+ 	
+ 	if $get(pdteTransDate)="" set pdteTransDate = +$horolog
+ 
+	if pidCustomer'="" {
+		set objCustomer  = $get(^INKUNDE(0,pidCustomer,1))
+		set customerCode = $$$INKUNDEDefaultTaxCode(objCustomer)
+		set idTaxLocn    = $$$INKUNDETaxLocation(o]]><![CDATA[bjCustomer)
+	}
+	
+	if (idTaxLocn="") && (pidLocn'="") {
+		set idTaxLocn = $$$WWW0121TaxLocation($get(^WWW0121(0,YM,pidLocn,1)))  ;Tax Location
+	}
+	
+	set idItemTaxCode = $$IsTaxable^COMTAX(idItemTaxCode,customerCode,.pstrReason,idTaxLocn)
+	if idItemTaxCode'="" {
+		set pstrReason=""  ;we are taxing...
+ 
+		do TaxRates^COMTAX(idItemTaxCode,idTaxLocn,pdteTransDate,.pidRates)
+		
+		set TotalTax = 0
+		set idxTax   = ""
+		for {
+			set idxTax = $order(pidRates(idxTax))
+			quit:idxTax=""
+			
+			set TotalTax = TotalTax+($piece($get(pidRates(idxTax)),Y,2)/100)
+		}
+		
+		if pblnIncludesTax {
+			set curAmount = (pcurPrice*TotalTax)/(1+TotalTax)
+		} else {
+			set curAmount = pcurPrice*(TotalTax)
+		}
+		if pblnRound {
+			set curAmount = $$Round^COMUtilCurrency(curAmount) ;CORE-385.22
+		}
+	}
+	quit curAmount
+	
+	
+	//*************************** Button Call for INItemPrice FORM *************************
+	
+ShowPriceForm(YKEY,YFORM)
+	;-------------------------------------------------------------------------------
+	; Show the Price Form  
+	; 1. (Called by INART, Button- Location Prices)
+	; 2. (Called by INKUNDE, Button - Customer Special Prices)
+	; 3. (Called by INItemGroup, Button - Item Group Prices)
+	;
+	; Inputs:YKEY - Item
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	do GoToForm^COMUtilForm("INItemPrice","",,$get(YKEY)_$$$COMMA_$get(YFORM))
+	quit
+
+
+	//*****************************************INItemPrice FORM *************************
+
+OnBlurItem(pidItem,&YFELD)
+	;-------------------------------------------------------------------------------
+	; Item OnBlur
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	do UpdateUnits^INARTUNIT(pidItem,"Y"_YFORM_"D2")
+	quit
+	
+	
+OnBeforeButtonLine(YPARA,YKEY,&YFELD)
+	;-------------------------------------------------------------------------------
+	; Called by the INItemPrice form (Execute Before Button Line)
+	; This setsup default data
+	;
+	; Inputs: YPARA - Contains the default Data
+	;	By Ref - YFELD - Returns the default Data
+	;
+	; YPARA 
+	;  - is set in ShowPriceForm^INItemPrice (Button Calls) #2 is the Form
+	;  - This data is used to set the Default YFELD parameters
+	;  - The default YFELD parameters are then used to set the Index Key details
+	;    in SetParameters & SetIndexKey to define the Grid to be shown at the 
+	;    at the bottom of the INItemPrice form
+	;
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new idCustGroup,idCustomer,idForm,idItem,idKey,idLocn,idUnit,objItem
+		
+	//Only set default details if YPARA has the FORM NAME;
+	//ie coming from another FORM
+	if $get(YPARA)'="" {
+		set idKey  = $$$KEY1(YPARA)
+		set idForm = $$$KEY2(YPARA)
+	}
+	
+	if ($get(idForm)'="") && (YKEY="") {
+		if idForm = "INART" {
+			set idItem = idKey
+			set $$$INItemPriceItemNo(YFELD)    = idItem
+		
+		} elseif idForm = "INKUNDE" {
+			set idCustomer = idKey		
+			set $$$INItemPriceCustomer(YFELD)  = idCustomer
+		
+		} elseif idForm = "INItemGroup" {
+			set $$$INItemPriceItemGroup(YFELD) = $get(idKey)
+		}
+	
+		set idLocn = $get(YLOCATION)
+		set $$$INItemPriceLocation(YFELD)      = idLocn
+
+		if $get(idItem)'="" {
+			set objItem = $get(^INART(0,idItem,1))	
+			set idUnit	= $$$INARTUnitofMeasure(objItem)
+			set $$$INItemPriceUnit(YFELD)      = idUnit
+		}
+	
+		set $$$INItemPriceStartDate(YFELD)     = +$horolog
+	}
+	quit
+	
+	
+OnBeforeSave(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	; Called by Execute Before Save for form INItemPrice
+	;
+	; Inputs:YKEY,YFELD
+	;
+	; Returns: YRETVAL
+	;
+	; History:
+	; 26-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	set Q = $$$QSave
+	
+	if ($$$INItemPriceItemNo(YFELD)="") && ($$$INItemPriceItemGroup(YFELD)="") {
+		set strStatus = $$$MakeStatus("IN01090")	//Please enter either the Item No or the Item Group for this Price Record 
+	}
+	
+	if $$$ISOK(strStatus) {
+		if ($$$INItemPricePrice(YFELD)="") && ($$$INItemPriceBasedOn(YFELD)="") {
+			set strStatus = $$$MakeStatus("IN01091")	//Please enter either a Price or the Based On Price Identifier for this Price Record
+		}
+	}
+
+	if $$$ISOK(strStatus) {
+		if $$$INItemPricePriceIdentifier(YFELD) = $$$INItemPriceBasedOn(YFELD) {
+			set strStatus = $$$MakeStatus("IN01130")	//'Price Identfier' and 'Based On Price Identifier' cannot be identical
+		}
+	}
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		do ^WWWINFO(strStatus)
+	}
+	quit
+	
+	//**************** THE 2 ROUTINES BELOW ARE REQUIRED TO DISPLAY    *********************
+	//**************** THE LIST AT THE BOTTOM OF THE INItemPrice FORM  *********************
+	//**************** BASED ON THE ORIGINATING FORMS - INART, INKUNDE *********************
+	//**************** SetParameters, SetIndexKey					   *********************
+	
+SetParameters()
+	;-------------------------------------------------------------------------------
+	; Set parameters required for Display of Prices at the bottom of the INItemPrice 
+	; Form (Called by WWW124(0,INtemPrice,1) #17) used in ^WWWSUCH1
+	;
+	; Inputs:
+	; 
+	; Assumed - YFELD
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new idForm,idKey
+	
+	set YHEADONLY = $$$NO     ; see WWWSEAR3, WWWSUCH1, WWWFORM
+	set idKey     = ""
+	
+	if $get(YPARA)'="" {
+		set idKey  = $$$KEY1(YPARA)
+		set idForm = $$$KEY2(YPARA)
+	}
+	
+	quit idKey
+	
+	
+SetIndexKey()
+	;-------------------------------------------------------------------------------
+	; Set Index Key for Display of Prices at the bottom of the INItemPrice 
+	; Form - (Called by WWW124(0,INtemPrice,1) #3) used in ^WWWSUCH1
+	;
+	; Inputs:YKEY - YFELD
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Aug-2009	PPP		SR16842: Created
+	;-------------------------------------------------------------------------------
+	new idForm,intIndex
+	
+	set intIndex = 1
+	
+	if $get(YPARA)'="" {
+		set idForm 	= $$$KEY2(YPARA)
+
+		if idForm = "INART" {               ; Item, Locn
+			set intIndex = 1
+			
+		} elseif idForm = "INKUNDE" {       ; Cust, Locn
+			set intIndex = 2		
+			
+		} elseif idForm = "INItemGroup" {   ; Group, Locn
+			set intIndex = 3
+		}
+	}
+	quit intIndex
+		
+	//************************************** END INItemPrice FORM *************************
+
+]]></Routine>
+</Export>

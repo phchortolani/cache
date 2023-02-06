@@ -1,0 +1,291 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRNPick" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRNPick
+	
+#include INConst
+#include COMSYS
+	
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+	
+CanPrintPick(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Determine whether Transfer Order Pick List can be printed.
+	; Reasons for preventing firming from being allowed
+	;  - No key / record
+	;  - Due date is invalid
+	;  - There are no Transfer Order lines
+	;  - Transfer Order status is not created
+	;  - There is an error with Transfer Order line(s) 
+	;    - There is no item detailed on a Transfer Order line
+	;    - There is no quantity detailed on a Transfer Order line
+	;    - Negative quantity detailed on Transfer Order line
+	;    - Non stock item selected for transfer
+	;
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus, error message if unable to print
+	;  DEPRECATED: Nothing (changes @NM variable YQ)
+	;
+	; History:
+	; 07-Jan-2010	GRF		SR17080: Correct In Transit validation
+	; 06-Jan-2010	GRF		SR17080: Check stocktake locking of In Transit as well
+	; 22-Oct-2008	HQN		SR15862: Corrected usage of strStatus
+	; 07-Oct-2008	Luke	SR15862: PEER fix new variables
+	; 24-Sep-2008	HQN		SR15862: Change return type
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new idLine,idShipMode,idTransitLocn,idTransitStore
+	new objItem,objLine,objShipMode,objTFR,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidTFR) {
+		set objTFR = $get(^INTFR(0,pidTFR,1))
+
+		if ((+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) ||
+		     (+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+		     (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+			if ($$$INTFRFREE6(objTFR) '= ""){
+				set strStatus = $$$MakeStatus("3435") ; "Separação somente habilitada para o Mobile"
+			}
+		
+			if $$$ISOK(strStatus) {
+				set strStatus = $$IsDueDateValid^INTRNValidation(objTFR)
+			}
+		}
+		else {
+			set strStatus = $$IsDueDateValid^INTRNValidation(objTFR)
+		}
+		
+		if $$$ISOK(strStatus) {
+			if '$data(^INTFRLine(0,pidTFR)) {
+				set strStatus = $$$MakeStatus("IN00427")
+			}  ; "No stock has been selected to be transferred."
+		}
+		
+		if $$$ISOK(strStatus) {
+			if $$IsLockedSiteLocation^INLocking($$$INTFRSendingLocation(objTFR)) {
+				set strStatus = $$ReasonLocked^INLocking($$$INTFRSendingLocation(objTFR))
+			}			
+		}
+		if $$$ISOK(strStatus) {        ; SR17080 vvv
+			set idShipMode = $$$INTFRDispatch(objTFR)
+			if idShipMode'="" {
+				set objShipMode    = $get(^INDRPUMLKW(0,idShipMode,1))
+				set idTransitLocn  = $$$INDRPUMLKWLocation(objShipMode)
+				set idTransitStore = $$$INDRPUMLKWStockLocation(objShipMode)
+				
+				if (idTransitLocn'="") && (idTransitStore'="") {
+					if $$IsLockedStockLocation^INLocking(idTransitLocn,idTransitStore) {
+						set strStatus = $$ReasonLocked^INLocking(idTransitLocn,idTransitStore,"")
+					}
+				} else {
+					set strStatus = $$$MakeStatus("IN00748",pidTFR,idShipMode)
+				} ; "Can't identify In Transit for transfer %1 - Dispatch %2 incomplete"
+					
+			} else {
+				set strStatus = $$$MakeStatus("IN00747",pidTFR)
+			} ; "Can't identify In Transit for transfer %1 - No Dispatch"
+		}                              ; SR17080 ^^^
+		
+		if $$$ISOK(strStatus) {
+			if $$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSFirmed {
+				set strStatus = $$ProductError^INTRNValidation("IN00432")  ; "Please fix all errors before firming."
+				
+				set idLine = ""
+				for {
+					quit:$$$ISERR(strStatus)
+					set idLine = $order(^INTFRLine(0,pidTFR,idLine))
+					quit:idLine=""
+					
+					set objLine = $get(^INTFRLine(0,pidTFR,idLine,1))
+					if $$$INTFRLineItem(objLine) = "" {
+						set strStatus = $$$MakeStatus("IN00433")        ; "All lines require an item."
+					
+					} elseif +$$$INTFRLineQuantity(objLine) = 0 {
+						set strStatus = $$$MakeStatus("IN00434")        ; "All lines require a quantity."
+					
+					} elseif +$$$INTFRLineQuantity(objLine) < 0 {
+						set strStatus = $$$MakeStatus("IN00456",idLine) ; "Negative quantity on line %1"
+					
+					} elseif $$$INTFRLineUnit(objLine) = "" {
+						set strStatus = $$$MakeStatus("IN00508")        ; "All lines require a unit."
+					
+					} elseif $$$INTFRLineBaseQuantity(objLine) = "" {
+						set strStatus = $$$MakeStatus("IN00509",idLine) ; "Line ´%1´ is assigned a unit that is not defined in terms of base unit."
+					}
+				}
+				
+			} else {  ; FIXME : Better message if already sent
+				set strStatus = $$$MakeStatus("IN00423")  ; "Transfer not Firmed."
+			}
+		}
+	} else {
+		set strStatus = $$$MakeStatus(32072)              ; "Please select a data record first."
+	}
+		
+	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	
+PrintPick(pidTFR,pblnReloadForm=$$$YES)
+  	;-------------------------------------------------------------------------------
+	; Determine whether the pick list can be printed, if yes, Print the Pick List
+	; Pick List can be printed multiple times, however the generation of the pick lines
+	; is done only once.
+	; 
+	; 1. Creation of Pick Lines
+	; 2. Reserves stock
+	; 3. Updated/Reduces SOH
+	; 4. Print the Pick List
+	;
+	; Params:
+	; pidTFR         - Key of header record
+	; pblnReloadForm - $$$YES then reload form else do not
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message or $$$NO
+	;
+	; History:
+    ; 25-May-2009	PPP		SR16565: Scanning Prompt for Grid,If a Scanning Form
+    ; 							then clearout IssueQty
+	; 29-Oct-2008	HQN		SR16088: COMTransaction has new environment, YBACK not
+	; 							passed
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set YBACK = ""
+	set strStatus = $$$NO
+	
+	; Print the PickList Report (HTML)
+	; If Pick Lines exist only print the Pick List Report
+	if '$data(^INTFRPickLine(YM,pidTFR)) {
+		do CanPrintPick(pidTFR)
+		
+		if YQ = $$$YQEnable {
+			set strStatus = $$Transaction^COMTransaction("CreatePickTxn^INTRNPick("""_pidTFR_""")",1)
+			
+			if $$$ISOK(strStatus) {  //If a Scanning Form then clearout IssueQty  //SR16565
+				if $$IsScanReq^WWW120Scan("INTFRPickLine") {
+					set strStatus = $$Transaction^COMTransaction("ClearIssueQty^INTRNPick("""_pidTFR_""")",1)
+				}
+	 			
+				if $$$ISOK(strStatus) {  ; Print the PickList Report (HTML)	
+					if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+						if ($$GetPreferencia^VARPreferenciasUsuario(1) = 1){
+							do GotoFiltrosRelatorio^VARFiltrosRelatorio("RunReportListaSeparacaoTFR",0,1,,pidTFR)
+						} else {
+							do RunReportListaSeparacaoTFR^VARJasperRunReport(pidTFR)
+						}
+						set strStatus = $$$OK
+					} else {
+						set strStatus = $$PrintPickList^INTRNPickList(pidTFR)
+					}
+				}
+			}
+	 		
+		} else {
+			do ReturnError^COMUtils($$$YQMessage)
+		}
+		
+	} else {     ; Print the PickList Report (HTML)	
+		if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+			if ($$GetPreferencia^VARPreferenciasUsuario(1) = 1){
+				do GotoFiltrosRelatorio^VARFiltrosRelatorio("RunReportListaSeparacaoTFR",0,1,,pidTFR)
+			} else {
+				do RunReportListaSeparacaoTFR^VARJasperRunReport(pidTFR)
+			}
+			set strStatus = $$$OK
+		} else {
+			set strStatus = $$PrintPickList^INTRNPickList(pidTFR)
+		}
+	}
+	quit strStatus
+	
+	
+CreatePickTxn(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Creates:
+	; 	PickLines Via Issuing of the line
+	; 	Creates Reservations(dPlannedMovement) Via Issuing of the line
+	; 	Removes Demands
+	;
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message
+	;
+	; History:
+	; 01-Oct-2008	HQN		SR15862: V2 only processing
+	;-------------------------------------------------------------------------------
+	new idLine,objTFR,strStatus
+	
+	set strStatus = $$$OK
+
+	set idLine = ""
+	for {
+		set idLine = $order(^INTFRLine(0,pidTFR,idLine))
+		quit:idLine=""
+		
+		set strStatus = $$Issue^INTFRLine(pidTFR_","_idLine)
+		quit:$$$ISERR(strStatus)
+
+	}
+
+	if $$$ISERR(strStatus) {
+		DO ^WWWINFO($$DecodeError^COMUtilError(strStatus))
+	}
+	if $$$ISOK(strStatus) set strStatus = $$RemoveDemandForTrn^INTRNDemand(pidTFR)
+	
+	if $$$ISOK(strStatus) {
+		; Update Header status
+		set objTFR = $get(^INTFR(0,pidTFR,1))
+		set $$$INTFRPickListPrinted(objTFR) = $horolog
+		set strStatus = $$$Save("INTFR",pidTFR,objTFR,$$$YES)
+	}
+	quit strStatus
+	
+	
+ClearIssueQty(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Sets the Issue Qty of the Pick Lines to 0, ready for scanning
+	; 
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message
+	;
+	; History:
+    ; 25-May-2009	PPP		SR16565: Scanning Prompt for Grid
+	;-------------------------------------------------------------------------------
+	new idLine,objLine,strStatus
+	
+	set strStatus = $$$OK
+	set idLine = ""
+	
+	for {
+		set idLine = $order(^INTFRPickLine(0,pidTFR,idLine))
+		quit:idLine=""
+		
+		set objLine = $get(^INTFRPickLine(0,pidTFR,idLine,1))
+		
+		set $$$INTFRPickLinePickedQuantity(objLine)		= 0
+		set $$$INTFRPickLinePriorPickedQuantity(objLine)= 0
+		
+		set strStatus = $$$Save("INTFRPickLine",pidTFR_","_idLine,objLine,$$$YES)	
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+]]></Routine>
+</Export>

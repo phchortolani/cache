@@ -1,0 +1,379 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTFR" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTFR
+	
+#include COMSYS
+#include INConst
+#include COMGridEdit31
+	
+IsProgramOutOfDateRange(YFELD)    ; SR17034
+	quit $$IsProgramOutOfDateRange^INPROJECT($$$INTFRProgram1(YFELD),$$$INTFRTransferDate(YFELD))
+	
+OnBlur(YLFN,YKEY,YFELD)           ; SR17034
+	if YLFN=$$$FldINTFRProgram1 do Update^COMGridEdit31Interface("INTFRLine",YKEY,YFELD)
+	quit $$$OK
+	
+OnBeforeFormConstruction()        ; SR17034
+	;-------------------------------------------------------------------------------
+	; 28-Oct-2013	SCR		SESDF-669: Change to Pick Tab if the pick is done
+	;-------------------------------------------------------------------------------
+	new objTFR
+	set YOPTION1	= '$$DisableProgramFunctionality^INVORG()
+	if $get(YKEY)'="" {
+		set objTFR	= $get(^INTFR(YM,YKEY,1))
+		if $$$INTFRPickListPrinted(objTFR)'="" {
+			set YSEITE = 2 
+		}
+	}
+	quit
+	
+	
+DefaultDispatch(pidSendingLocn,pidReceivingLocn)
+	;-------------------------------------------------------------------------------
+	; Determines the default dispatch based on the sending and receiving locations
+	;
+	; Params:
+	; pidSendingLocn   - Location providing the stock
+	; pidReceivingLocn - Location receiving the stock
+	;
+	; ByRefs: None
+	;
+	; Returns: lstResult - list containing dispatch id and lead time
+	;
+	; History:
+	; 25-Apr-2006	PO		SR14427: Created
+	;-------------------------------------------------------------------------------
+	new lstResult
+	
+	set lstResult	= $$DefaultDispatch^INTRNValidation(pidSendingLocn,pidReceivingLocn)
+	quit lstResult
+	
+	
+NumOpenDemands(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Sum up the number of open (outstanding) demands
+	;
+	; Params:
+	; pidTFR - Record of header
+	;
+	; ByRefs: None
+	;
+	; Returns:
+	; 	intOpenDemands	Number of 'open' demands
+	; 					** open is not the opposite of a closed demand **
+	;					Instead of refering to demand as open should instead use
+	;						the word 'outstanding'
+	;
+	; History:
+	; 22-May-2006	PO		SR?????: Created
+	;-------------------------------------------------------------------------------
+	new idSendingLocn,idReceivingLocn,objTFR,idDemand,objDemand,intOpenDemands
+	new idxReady,idxDispatchNo,idxClosed
+	
+	quit:$$$NoKey(pidTFR) ""
+	
+	set objTFR = $get(^INTFR(YM,pidTFR,1))
+	quit:$$$INTFRStatus(objTFR)'=$$$EnumINTFRSTATUSCreated ""
+	
+	set idSendingLocn   = $$$INTFRSendingLocation(objTFR)
+	set idReceivingLocn = $$$INTFRReceivingLocation(objTFR)
+	
+	set intOpenDemands = 0
+	
+	// FILTER FOR OPEN DEMANDS
+	
+	set idxReady = $$$YES
+	set idxDispatchNo = " "
+	for idxClosed = " ", $$$NO {
+		set idDemand = ""
+		for {
+			set idDemand = $order(^INDRPDEMANDs(YM,5,idxClosed,idxReady,idxDispatchNo,idSendingLocn,idDemand))
+			quit:idDemand=""
+
+			set objDemand = $get(^INDRPDEMAND(YM,idSendingLocn,idDemand,1))
+			if ($$$INDRPDEMANDRequestingLocation(objDemand) '= idReceivingLocn) ||
+			   '$$IsDemandOpen^INTFROpenDemands(objDemand)                      ||
+			    $$IsExternallyLocked^COMLock("INDRPDEMAND",idSendingLocn_$$$COMMA_idDemand) {
+				
+				continue
+			}
+			set intOpenDemands = intOpenDemands + 1
+		}
+	}
+	quit intOpenDemands
+	
+	
+GetQtyPlanned(pidTFR,pidItem,pidLocn="",pidStore="",pidBundle="")
+	;-------------------------------------------------------------------------------
+	; Parameters:
+	; 	pidTFR		Transfer ID
+	; 	pidItem		Item ID
+	; 	pidLocn		Location ID (Optional)
+	; 	pidStore 	Storage ID  (Optional + pidLocn Required)
+	; 	pidBundle	Bundle ID (Optional + pidStore Required + pidLocn Required)
+	; 	
+	; Returns: 
+	; 	Planned Quantity for this Transfer
+	; 
+	; Called From:
+	; 	OnBeforeFormat^INTFRPickLine()
+	; 
+	; History:
+	; 03-Nov-2008	HQN	SR16077: Added optional pidBundle
+	; 29-Oct-2008	HQN	Added Called From doco
+	; 28-Oct-2008	HQN	SR16077: Added optional pidStore
+	; 20-Oct-2008	HQN	SR16000: Created
+	;-------------------------------------------------------------------------------
+	new fltQtyPlanned,SQLCODE
+	
+	set fltQtyPlanned = 0
+	set SQLCODE = 0
+	if (pidStore'="") && (pidStore'["||") set pidStore = pidLocn_"||"_pidStore
+	if pidLocn = "" {
+		&sql(SELECT SUM(IFNULL(QtyRequired,0,QtyRequired)) INTO :fltQtyPlanned
+			FROM alDRP.dPlannedMovement
+			WHERE
+				Reference=:pidTFR AND
+				Item=:pidItem
+		)
+	} else {
+		if pidStore = "" {
+			&sql(SELECT SUM(IFNULL(QtyRequired,0,QtyRequired)) INTO :fltQtyPlanned
+				FROM alDRP.dPlannedMovement
+				WHERE
+					Reference=:pidTFR AND
+					Item=:pidItem     AND
+					FromStorage->Location=:pidLocn
+			)
+		} else {
+			if pidBundle = "" {
+				&sql(SELECT SUM(IFNULL(QtyRequired,0,QtyRequired)) INTO :fltQtyPlanned
+					FROM alDRP.dPlannedMovement
+					WHERE
+						Reference=:pidTFR AND
+						Item=:pidItem     AND
+						FromStorage->Location=:pidLocn AND
+						FromStorage=:pidStore
+				)
+			} else {
+				&sql(SELECT SUM(IFNULL(QtyRequired,0,QtyRequired)) INTO :fltQtyPlanned
+					FROM alDRP.dPlannedMovement
+					WHERE
+						Reference=:pidTFR AND
+						Item=:pidItem     AND
+						FromStorage->Location=:pidLocn AND
+						FromStorage=:pidStore AND
+						Bundle=:pidBundle
+				)
+			}
+		}
+	}
+	if SQLCODE'=0 set fltQtyPlanned = 0
+	quit fltQtyPlanned
+	
+		
+	//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	// START: FOLLOWING CODE IS PROPOSED, NOT IN USE !
+	//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+		
+CanUnFirm(pidTFR)
+	new objTFR,idItem,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidTFR) {
+		set objTFR = $get(^INTFR(YM,pidTFR,1))
+		if ($$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSFirmed) && ($$$INTFRLoadListPrinted(objTFR) = "") {
+			
+			// Can be unfirmed
+			
+		} elseif $$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSCreated {
+			set strStatus = "Transfer has not been firmed."
+		} elseif ($$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSFirmed) && ($$$INTFRLoadListPrinted(objTFR) '= "") {
+			set strStatus = "Transfer has already been loaded, need to unload before unfirming." // OR should system simply automatically perform unload?
+		} else {
+			set strStatus = "Transfer has already been sent."
+		}
+	} else {
+		set strStatus = 32072  ; "Please select a data record first."    ; $$^WWWTEXT(32072) ?
+	}
+	
+	$$$YQHandler(strStatus)
+	
+	quit
+	
+	/*
+UnFirm(pidTFR)  ; NOT CALLED
+	do UnFirm^INTFRInterface(pidTFR)  ; DOES NOT EXIST - see source logs
+	quit
+	*/
+	
+CanUnLoad(pidTFR)
+	new objTFR,idItem,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidTFR) {
+		set objTFR = $get(^INTFR(YM,pidTFR,1))
+		if ($$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSFirmed) && ($$$INTFRLoadListPrinted(objTFR) '= "") {
+			
+			// Can be unloaded
+			
+		} elseif $$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSCreated {
+			set strStatus = "Transfer has not been firmed."
+		} else {
+			set strStatus = "Transfer has already been sent."
+		}
+	} else {
+		set strStatus = 32072  ; "Please select a data record first."    ; $$^WWWTEXT(32072) ?
+	}
+	
+	$$$YQHandler(strStatus)
+	
+	quit
+	
+	/*
+UnLoad(pidTFR)  ; NOT CALLED
+	do UnLoad^INTFRInterface(pidTFR)  ; DOES NOT EXIST - see source logs
+	quit
+	*/
+	
+	//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	// END: PRECEDING CODE IS PROPOSED, NOT IN USE !
+	//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+OngoingTransfers(pYKEY="",pYFELD="",pYLFN="")
+	;-------------------------------------------------------------------------------
+	; Verify if the current location has any ongoing tranfers before enabling the automatic transfer receipt
+	;
+	; Inputs: 	YKEY
+	;			YFELD
+	;			YLFN
+	;
+	; History:
+	; 04-Jun-2014	shobby	CORE-385.12: Moved from WWW0121C
+	; 26-Set-2013	Thiago	SESPE-549 Created
+	;-------------------------------------------------------------------------------
+	new idIdx, idTransfer, transfersList
+	
+	set idLocn			= $$$KEY2(pYKEY)
+	set idIdx 			= ""
+	set transfersList 	= ""
+	
+	quit:(idLocn="")
+
+	for{ 
+		set idIdx = $order(^INTFRs(YM,2,idLocn,idIdx))
+		quit:idIdx=""
+
+		set idTransfer = ""
+		
+		for{
+			set idTransfer = $order(^INTFRs(YM,2,idLocn,idIdx,idTransfer))
+			quit:idTransfer=""
+
+			continue:($$isFullyAccepted(idTransfer)=$$$YES)
+			continue:($$isFullyReversed(idTransfer)=$$$YES)
+			
+			if (transfersList = ""){
+				set transfersList = idTransfer
+			} else {
+				if ('$find(transfersList,idTransfer)){
+					set transfersList = transfersList_"\n"_idTransfer
+				}
+			}
+		}
+	}
+
+	if ((transfersList '= "") && ($piece(pYFELD,Y,pYLFN) = $$$YES)){
+		$$$StartScript()
+		w "alert('"_$$DecodeError^COMUtilError("WWW00190")_"\n\n"_transfersList_"');"
+		$$$EndScript()
+		
+		set $piece(YFELD,Y,pYLFN) = ""
+	}
+	
+	quit
+	
+isFullyAccepted(pidINFTR)
+	;-------------------------------------------------------------------------------
+	; Checks if the transfer is fully accepted
+	;
+	; Inputs: pidINFTR - Transfer ID
+	;
+	; Returns: blnFullyAccepted
+	;
+	; History:
+	; 04-Jun-2014	shobby	CORE-385.12: Moved from WWW0121C
+	; 26-Set-2013	Thiago	SESPE-549 Created
+	;-------------------------------------------------------------------------------
+	quit:(pidINFTR = "") $$$NO
+	
+	new objINTFR, idINTFRLine, objINTFRLine, qtyReceived, qtyTransferred, qtyReversed, strStatus
+	
+	set idINTFRLine		 = ""
+	set objINTFR		 = $get(^INTFR(YM,pidINFTR,1))
+	set blnFullyAccepted = $$$YES
+	
+	quit:(($$$INTFRStatus(objINTFR) '= 2)&&($$$INTFRStatus(objINTFR) '= 3)) $$$YES
+	
+	for { 
+		set idINTFRLine = $order(^INTFRLine(YM,pidINFTR,idINTFRLine))
+		quit:idINTFRLine=""
+		
+		set objINTFRLine = ^INTFRLine(YM,pidINFTR,idINTFRLine,1)
+		
+		set qtyReceived = +$$$INTFRLineReceivedQuantity(objINTFRLine)
+		set qtyReversed = +$$$INTFRLineReversalQuantity(objINTFRLine)
+		
+		set qtyTransferred = $$PickedQuantity^INRPTransfer(YM,pidINFTR,idINTFRLine)
+		
+		if (qtyReceived + qtyReversed < qtyTransferred){
+			set blnFullyAccepted = $$$NO
+			quit
+		}
+	}
+	
+	quit blnFullyAccepted
+	
+isFullyReversed(pidTransfer)
+	;-------------------------------------------------------------------------------
+	; Checks if the tranfers is fully reversed
+	;
+	; Inputs: pidTransfer - Transfer ID
+	;
+	; Returns: blnFullyReversed
+	;
+	; History:
+	; 04-Jun-2014	shobby	CORE-385.12: Moved from WWW0121C
+	; 26-Set-2013	Thiago	SESPE-549 Created
+	;-------------------------------------------------------------------------------
+	quit:(pidTransfer = "") $$$NO
+	
+	new objTransfer, idTransferLine, baseQuantity, revQuantity, blnFullyReversed
+	
+	set objTransfer 		= $get(^INTFR(YM,pidTransfer,1))
+	set blnFullyReversed 	= $$$YES
+	set idTransferLine 		= "" 
+	
+	quit:($$$INTFRStatus(objTransfer) '= 2) $$$NO
+	
+	for { 
+		set idTransferLine = $order(^INTFRPickLine(YM,pidTransfer,idTransferLine)) 
+		quit:idTransferLine=""
+		
+		set objTransferPickLine	= $get(^INTFRPickLine(YM,pidTransfer,idTransferLine,1))
+		
+		set baseQuantity 		= +$$$INTFRPickLinePickedQuantity(objTransferPickLine)
+		set revQuantity  		= +$$$INTFRPickLineReversalQuantity(objTransferPickLine)
+		
+		if '((revQuantity = baseQuantity)&(revQuantity'=0)) {
+			set blnFullyReversed = $$$NO
+			quit
+		}
+	}
+
+	quit blnFullyReversed
+]]></Routine>
+</Export>

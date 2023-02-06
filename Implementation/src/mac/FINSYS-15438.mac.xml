@@ -1,0 +1,387 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINSYS" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINSYS
+#include COMSYS
+	;-------------------------------------------------------------------------------
+	;	Finance System Utilities
+	; 
+	; History:
+	; 19-Sep-2005	GRF		SR13481 : include - FIN changed to COMSYS
+	;-------------------------------------------------------------------------------
+	
+Save(Class,Key,Data,Lock)
+	;-------------------------------------------------------------------------------
+	; WWWSPEI Wrapper
+	;
+	; History:
+	; 19-Oct-2006	JW		SR15134: Redirect to COMUtils
+	; 12-Jan-2006	Steve S	SR14114: Compare Status with $$$OK, don't use $$$ISOK
+	; 04-Jul-2005	RobertW	SR12527: Fixed Status usage for ReturnError
+	; 27-Feb-2004	shobby	Set default locking to 0 but not allow locking of 1 when
+	; 						Class=YFORM
+	; 26-Feb-2004	shobby	Returned default locking to 1 but override with 0 when
+	; 						Class=YFORM (Awaiting SR discussion with Germany before
+	; 						finalising this)
+	; 09-Jan-2004   lwaugh	Ensured Lock flag is passed to WWWSPEI
+	; 07-Jul-2003	SCR		Added Lock Option, New YVOR
+	;-------------------------------------------------------------------------------
+	new strStatus
+	set strStatus = $$$Save($get(Class),$get(Key),$get(Data),$get(Lock))		//SR15134
+	quit strStatus
+	
+	/*	SR15134
+	
+	new Status,YVOR
+	if $get(Lock)'=$$$YES {
+		set Lock=$$$NO
+	} else {
+		if Key=YKEY {
+			if ($get(YFORM)'="")&&($piece($get(^WWW120(0,Class,1)),Y,11)=$get(YFORM)) {
+				set Lock=$$$NO
+			}
+		}
+	}
+	
+	new YFORM  ;*** Must be after the test that not saving to the currently displayed record 
+	
+	set YFORM=Class
+	set Status=$$^WWWSPEI(Class,Key,Data,Lock)
+	
+	if (Status'=$$$OK) { ;SR14114
+		set Status=$listbuild("Fin00212",Class,Key,Status)  ; System save failed, Class:%1 Key:2 Error%3
+	}
+	
+	quit Status
+	*/
+	
+KILL(pstrClass,pid)
+	;-------------------------------------------------------------------------------
+	; Wrapper for WWWKILL, calling WWWKILL within an WWWKILL will fail because YFORM
+	; is not scoped
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Oct-2006	JW		SR15134: Redirect to COMUtils
+	; 02-Dec-2003	shobby	Creation (TR006513)
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$Kill(pstrClass,pid)		//SR15134
+	quit strStatus
+	
+	/* SR15134
+	new strYFORM
+	
+	set strYFORM = $get(YFORM)
+	set YFORM    = pstrClass
+	do ^WWWKILL(pstrClass,pid)
+	set YFORM    = strYFORM
+	quit
+	*/
+	
+LastData(Form="",Piece="",Type="M")
+	;-------------------------------------------------------------------------------
+	; Last Data from ^WWWDATEN
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Mar-2004	SCR		Created
+	;-------------------------------------------------------------------------------
+	new Data,Date,User
+	
+	set Data=""
+	set Date=+$horolog
+	set User=$get(YUSER)
+	
+	if Form="" set Form=" "
+	if User="" set User=" "
+	if Type="" set Type="M"
+	set Data=$piece($get(^WWWDATEN(0,Date,User,Form,Type,1)),"~",Piece)
+	if Data="" {
+		set Data=$piece($get(^WWWDATEN(0,Date,User,Form,Type,2)),"~",Piece)
+	}
+	quit Data
+	
+Error(Process)
+	;-------------------------------------------------------------------------------
+	; Cache Error Trapping
+	;-------------------------------------------------------------------------------
+	new Status,Tag,Code,Type
+	
+	set Type=$piece($piece($ze,"<",2),">")
+	set Tag=$piece($ze,">",2)
+	set Code=""
+	if Tag["^" set Code=$text(@Tag)
+	set Status=$listbuild("Fin00175",Process,Type,Tag,Code)  ; Post Error During ´%1´ Process, Type %2, Routine %3, Code: %4
+	quit Status
+	
+CodeCheck
+	;-------------------------------------------------------------------------------
+	; Check Code
+	;-------------------------------------------------------------------------------
+	new RtnName
+	
+	set RtnName="FIN"
+	kill ^mtemp("cc",$job)
+	for {
+		set RtnName=$order(^rMAC(RtnName))
+		quit:RtnName'["FIN"
+		write RtnName," "
+		set ^mtemp("cc",$job,RtnName)=$$Show^COMCodeCheck(RtnName_".MAC")
+		
+	}
+	set RtnName=""
+	write !!!,"Finance Code Error Check",!
+	for {
+		set RtnName=$order(^mtemp("cc",$job,RtnName))
+		quit:RtnName=""
+		write RtnName,",",$get(^mtemp("cc",$job,RtnName)),!
+	}
+	
+Index(Val="") 
+	;-------------------------------------------------------------------------------
+	; Convert Value to @NM Index
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Feb-2004   SCR  	 Created
+	;-------------------------------------------------------------------------------
+	new Index
+	
+	if Val="" set Val=" "
+	if $data(^CacheTempIndex(Val)) {
+		set Index=$get(^CacheTempIndex(Val))
+	} else {
+		set Index=$$^WWWUMLAU(Val,1)
+		set ^CacheTempIndex(Val)=Index
+	}
+ 
+	quit Index
+	
+IsLinked(pYKEY,pstrClassChild,pintIndex,pidError,pstrClassParent=" ")
+	;-------------------------------------------------------------------------------
+	; Checks whether the specified object has dependencies to it.
+	;
+	; Returns:
+	; 
+	; Notes:
+	; 		1. Assumes one parameter in the error message
+	; 		2. Assumes one key index.
+	;
+	; History:
+	; 08-Apr-2005	shobby/PO	SR11814 - Return an error if ((id'=pYKEYold)||(pstrClassChild'=pstrClassParent)) - Different classes may have the same ID.  Touch up to SR11942
+	; 01-Apr-2005	Steve S	SR11942: Fixed linking check
+	; 15-Jun-2004	shobby	Avoid self references.
+	; 03-May-2004   shobby  Replaced YKOMMA with ","
+	; 09-Mar-2004	shobby	Make an educated guess on which is the most relevant
+	; 						class to report ($$GetDescription)
+	; 09-Mar-2004	shobby	Can support multiple fields of the same data type.
+	; 08-Mar-2004	shobby	Modified to determine the parent & child descriptions
+	; 08-Mar-2004	shobby	Created
+	;-------------------------------------------------------------------------------
+	new i,id,intIndex,objWWW001,strClassChildDescription
+	new strClassParentDescription,strStatus,pYKEYold
+	
+	set id=""
+	set strStatus=$$$OK
+	set pYKEYold=pYKEY ;SR11942
+	set pYKEY=$$Index^FINSYS(pYKEY)
+ 
+	for i=1:1:$length(pintIndex,",") {
+		quit:'$$$ISOK(strStatus)
+		
+		set intIndex=$piece($piece(pintIndex,",",i),".",1)
+		xecute "set id=$order(^"_pstrClassChild_"s(0,"_intIndex_","""_pYKEY_""",""""))"
+		if (id'="")&&((id'=pYKEYold)||(pstrClassChild'=pstrClassParent)) { ;SR11942
+			set objWWW001=$get(^WWW001(0,pstrClassChild,1))
+			set strClassChildDescription=$$GetDescription(pstrClassChild,pintIndex)
+			set objWWW001=$get(^WWW001(0,pstrClassParent,1))
+			set strClassParentDescription=$piece(objWWW001,Y,1)
+			set strStatus=$lb(pidError,id,strClassChildDescription,strClassParentDescription,pYKEY)
+		}
+	}
+ 
+	quit strStatus
+	
+GetDescription(pstrClass,pintIndex)
+	;-------------------------------------------------------------------------------
+	; Gets the description of the class or the description of the first index on
+	; the parent class
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Apr-2005	Steve S SR11942: Commented parent checking
+	; 09-Mar-2004	shobby	Report on the 2nd part if two part primary key index
+	; 09-Mar-2004	shobby	Created
+	;-------------------------------------------------------------------------------
+	new intIndex,objWWW001,objWWW002,strDescription,strParent,strParentClass
+ 
+	set intIndex=$piece(pintIndex,".",2)
+	if intIndex="" {
+		set objWWW002=$get(^WWW002(0,pstrClass,1,1))
+	} else {
+		; Report on the 2nd part if two part primary key index if exists else report on first part.
+		set objWWW002=$get(^WWW002(0,pstrClass,2,1))
+		if $find($piece(objWWW002,Y,6),$piece(pintIndex,".",1)_".2")=0 {
+			set objWWW002=$get(^WWW002(0,pstrClass,1,1))
+		}
+	}
+	
+	
+	;SR11942 -- Commented parent checking
+	;set strParentClass=$piece(objWWW002,Y,8)
+	
+	;if (strParentClass'="")&&(strParentClass'=pstrClass) {
+	;	set strDescription=$$GetDescription(strParentClass,pintIndex)
+	;} else {
+	set objWWW001=$get(^WWW001(0,pstrClass,1))
+	set strDescription=$piece(objWWW001,Y,1)
+	;}
+	
+	quit strDescription 
+ 
+ 
+CheckLinks(pYKEY,plstDependencies,pstrParent)
+	;-------------------------------------------------------------------------------
+	; Checks whether the Bank Account can be deleted.
+	; 
+	; History
+	; 04-Jul-2005	RobertW	SR12527: Fixed Status usage for ReturnError
+	; 03-Mar-2005	PO		SR11814 Use CheckRecordsLinks.
+	; 06-Jul-2003	shobby	Creation (TR005551)
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus=$$CheckRecordsLinks(pYKEY,plstDependencies,pstrParent)
+	if $$$ISERR(strStatus) {
+		set Q=1
+		do ReturnError^COMUtils((strStatus))
+	}
+	quit strStatus
+ 
+CheckRecordsLinks(pYKEY,plstDependencies,pstrParent)
+	;-------------------------------------------------------------------------------
+	; Checks whether the record can be deleted.
+	; 
+	; Return: status
+	; 
+	; History:
+	; 03-Mar-2005	PO	Creation SR11814
+	;-------------------------------------------------------------------------------
+	new i,strClass,strStatus
+	
+	set strStatus=$$$OK
+	if $get(pYKEY)'="" {
+		for i=1:1:$listlength(plstDependencies) {
+			quit:$$$ISERR(strStatus)
+			set strClass=$listget(plstDependencies,i)
+			set strStatus=$$IsLinked(pYKEY,strClass,$$IndexNo(strClass,pstrParent),"Fin00281",pstrParent)	;%3 ´%4´ can not be deleted! It is used by %2 ´%1´.
+		}
+	}
+	quit strStatus
+	
+IndexNo(pstrChild,pstrParent)
+	;-------------------------------------------------------------------------------
+	; Determines the index on the pstrChild class that indexes pstrParent.
+	;
+	; Returns:
+	;
+	; History:
+	; 03-May-2004   shobby  Replaced YKOMMA with ","
+	; 09-Mar-2004	shobby	Can now have multiple fields of the same type as
+	; 						properties of a class.
+	; 08-Mar-2004	shobby	Created
+	;-------------------------------------------------------------------------------
+	new intIndex,idx,objWWW002,strIndex,i,objWWW003
+	
+	set idx=""
+	set intIndex=""
+	for {
+		set idx=$order(^WWW002(0,pstrChild,idx))
+		quit:idx=""
+		;quit:intIndex>0
+		
+		set objWWW002=$get(^WWW002(0,pstrChild,idx,1))
+		if $piece(objWWW002,Y,8)=pstrParent {
+			set strIndex=$piece(objWWW002,Y,6)
+			if strIndex'="" {
+				for i=1:1:$length(strIndex,",") {
+					;quit:intIndex>0
+					
+					if $piece(strIndex,",",i)'<50 {
+						if intIndex'="" set intIndex=intIndex_","
+						set intIndex=intIndex_$piece(strIndex,",",i)
+					}
+				}
+			}
+		}
+	}
+	
+	set idx=""
+	for {
+		set idx=$order(^WWW003(0,pstrChild,idx))
+		quit:idx=""
+		;quit:intIndex>0
+		
+		set objWWW003=$get(^WWW003(0,pstrChild,idx,1))
+		if $piece(objWWW003,Y,8)=pstrParent {
+			set strIndex=$piece(objWWW003,Y,6)
+			if strIndex'="" {
+				for i=1:1:$length(strIndex,",") {
+					;quit:intIndex>0
+					
+					if $piece(strIndex,",",i)'<50 {
+						if intIndex'="" set intIndex=intIndex_","
+						set intIndex=intIndex_$piece(strIndex,",",i)
+					}
+				}
+			}
+		}
+	}
+	
+	;set intIndex=$piece(intIndex,".",1)
+	if intIndex="" set intIndex=0
+	
+	quit intIndex
+ 
+TransactionComplete(pstrStatus,pidKey,pobjRecord,pblnInHyperEvent=$$$NO,pblnSave=$$$YES)
+	;-------------------------------------------------------------------------------
+	; commits or rolls back the transaction
+	;
+	; Returns:
+	;
+	; NOTE: Procedure to be made OBS as Transaction^COMTransaction is taking over
+	;
+	; History:
+	; 12-Jan-2006	Steve S	SR14114: Added pblnSave
+	; 12-Oct-2005	Frank	SR13523: No error on UnPost Supplier Invoice
+	; 12-Jul-2005	shobby	SR12678: Don't redraw the form if inside a HyperEvent
+	; 06-Jul-2005	PO		SR12881: Moved from FINAPPayment
+	; 27-Jan-2005	RobertW	Fixed TCOMMIT and TROLLBACK (SR11273)
+	; 25-Feb-2004	shobby	Created
+	;-------------------------------------------------------------------------------
+	; if all is OK, Update Header & Commit Data
+	
+	if $$$ISOK(pstrStatus) {
+		if pblnSave set pstrStatus = $$$Save(YFORM,pidKey,pobjRecord,$$$YES)
+	}
+	
+	if $$$ISOK(pstrStatus) {
+		if $tlevel>0 tcommit
+		do:'pblnInHyperEvent ^WWWFORM
+	} else {
+		trollback
+		if pblnInHyperEvent { ; SR13523		
+			write "alert('"_$$$Text(pstrStatus)_"');"
+		} else {			
+			do ^WWWINFO($$$Text(pstrStatus))
+		}
+	}
+	quit
+]]></Routine>
+</Export>

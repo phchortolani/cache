@@ -1,0 +1,493 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INUOMConversion" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INUOMConversion
+	
+#include COMSYS
+#include INConst
+	
+	;-------------------------------------------------------------------------------
+	; Note: That the definition of 'Base Unit' has changed.
+	;       It is now the smallest unit.  (External webservice unit?)
+	;       'Inventory' Unit was previously described as the 'Base Unit' and some
+	;       tags reflect that.
+	; 
+	; 02-Feb-2011	GRF		Documentation in this routine has been modified to show
+	;							the current usage.
+	;-------------------------------------------------------------------------------
+	
+BuildUOMLookup(pidItem,&parrPackingUnits)
+	;-------------------------------------------------------------------------------
+	; Construct Unit of Measure lookup - Conversion factors in terms of INVENTORY unit
+	;
+	; Params:
+	; pidItem - Item Id
+	; parrPackingUnits - Array of conversions between Default Unit and all other provided units.
+	;
+	; ByRefs: parrPackingUnits
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 12-Nov-2010	GRF		SR17243: change implied self-referencing to explict so
+	;							unit is not omitted from array
+    ; 03-Jun-2008	shobby	SRBR014951: macro changed from $$$INARTPACKConsistOf to
+    ; 							$$$INARTPACKQuantity to reflect earlier property
+    ; 							name change.
+	; 17-Jul-2006	PO		SR14847: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,idItemUOM,idTempUnit,idUnit,idUOM,objItem,objPackingUnits
+	
+	set objItem   = $get(^INART(0,pidItem,1))
+	set idItemUOM = $$$INARTUnitofMeasure(objItem)     ; Inventory Unit
+	
+	set idUOM=""
+	for {
+		set idUOM=$order(^INARTPACK(0,pidItem,idUOM))
+		quit:idUOM=""
+		
+		set objPackingUnits = $get(^INARTPACK(0,pidItem,idUOM,1))
+		set idUnit = $$$INARTPACKUnit(objPackingUnits)
+		
+	;	continue:idUnit=""   ; SR17243
+		if idUnit="" set idUnit=idUOM
+		
+		if idItemUOM = idUnit {
+			if '$data(parrPackingUnits(idUOM)) {
+				set parrPackingUnits(idUOM) = $$$INARTPACKQuantity(objPackingUnits)
+			}
+			
+		} else {
+			if $data(parrPackingUnits(idUnit)) {
+				if '$data(parrPackingUnits(idUOM)) {
+					set parrPackingUnits(idUOM) = parrPackingUnits(idUnit) * $$$INARTPACKQuantity(objPackingUnits)
+				}
+			} else {
+				set fltConv = $$GetUOMConversion(pidItem,idUOM)
+				if fltConv '= 0 {
+					set parrPackingUnits(idUOM) = fltConv
+				}
+			}
+		}
+	}
+	quit
+	
+	
+	;***************************************
+	;  FUNCTIONS RETURNING QUANTITIES
+	;***************************************
+	
+Convert(pidItem="",pfltQtyFrom="",pidUnitFrom="",pidUnitTo="",pblnRoundUp=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Convert a quantity from one UOM to another and optionally rounds up to integer
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Feb-2011	GRF		SR17579: Clarify variable contents
+	; 02-Mar-2010	GRF		-: Greater distinction between variables
+	; 24-Mar-2009	shobby	SR16432: Reversed the multiply and divide operations to
+	; 							correct a rounding error.
+	; 12-Feb-2009	shobby	SR16348: Flag to specify whether to round up or not.
+	; 11-Feb-2009	shobby	SR16348: Created
+	;-------------------------------------------------------------------------------
+	new fltQty
+	
+	set fltQty = pfltQtyFrom * $$ConvertUOMConversionToSmallest(pidItem,pidUnitFrom)
+	set fltQty = fltQty      / $$ConvertUOMConversionToSmallest(pidItem,pidUnitTo)
+	if pblnRoundUp set fltQty = $$Ceiling^COMUtilNum(fltQty)
+	quit fltQty
+	
+	
+CalculateBaseQuantity(pidItem,pidUnitFrom,pfltQtyFrom)  ; Terminology changed making this tag ambiguous *** DO NOT USE IN FUTURE ***
+	quit $$CalcInventoryQty($get(pidItem),$get(pidUnitFrom),$get(pfltQtyFrom))
+	
+	
+CalcInventoryQty(pidItem,pidUnitFrom,pfltQtyFrom)  ; Calc Qty in INVENTORY Units
+	;-------------------------------------------------------------------------------
+	; Converts pfltQtyFrom in pidUnitFrom into the equivalent quantity in INVENTORY Units.
+	; It appears the definition of BASE unit was altered AFTER this code was written.
+	;
+	; Params:
+	; pidItem     - Item Id
+	; pidUnitFrom - Unit Id (not default unit of measure)
+	; pfltQtyFrom - Quantity in terms of pidUnitFrom
+	;
+	; ByRefs: None
+	;
+	; Returns: fltQtyInIU - Quantity in terms of INVENTORY unit,
+	;          if no conversion provided then blank
+	;
+	; History:
+	; 02-Feb-2011	GRF		SR17579: Clarify variable contents; Rename tag
+	; 17-Jul-2006	PO		SR14847: Created
+	;-------------------------------------------------------------------------------
+	new fltConvToIU,fltQtyInIU,fltQuantity
+	
+	quit:pidUnitFrom="" ""
+	
+	set fltConvToIU = $$GetUOMConversion(pidItem,pidUnitFrom)
+	if fltConvToIU = "" {
+		set fltQtyInIU = ""
+	} else {
+		set fltQtyInIU = pfltQtyFrom * fltConvToIU
+	}
+	quit fltQtyInIU
+	
+	
+CalculateQuantity(pidItem,pidUnitTo,pfltQtyInIU)
+	;-------------------------------------------------------------------------------
+	; Convert Quantity in Inventory Units to string containing quantity in pidUnitTo
+	; units as whole value and remainder.
+	; 
+	; WARNING: in some cases (such as where pidUnitTo is smaller than the Inventory
+	;          Unit), the remainder can be a very small fraction rather than zero.
+	;
+	; Params:
+	; pidItem     - Item Id
+	; pidUnitTo   - Unit Id
+	; pfltQtyInIU - Quantity in terms of Inventory unit
+	;
+	; ByRefs: None
+	;
+	; Returns: strQuantities - Quantity in terms of pidUnitTo, if no conversion provided then blank
+	;
+	; History:
+	; 02-Feb-2011	GRF		SR17579: Clarify variable contents
+	; 17-Jul-2006	PO		SR14847: Created
+	;-------------------------------------------------------------------------------
+	new fltConvToIU,strQuantities
+	
+	set fltConvToIU = $$GetUOMConversion(pidItem,pidUnitTo)
+	if fltConvToIU = "" {
+		set strQuantities = ""
+	} else {
+		set strQuantities = $$Floor^COMUtilNum(pfltQtyInIU / fltConvToIU)
+		set strQuantities = strQuantities_Y_(pfltQtyInIU # fltConvToIU)
+	}
+	quit strQuantities
+	
+	
+RoundUp(pidItem,pfltBaseQty=0)
+	;-------------------------------------------------------------------------------
+	; Returns the inventory quantity of the supplied unit for the specified quantity of
+	; the Base Unit.
+	; 
+	; e.g. If the inventory unit BOX contains 12 of the base unit EACH, then will
+	; require 1 BOX from the store if asking for up to 12 EACH but will require
+	; 2 BOXes if 13 EACH are requested.
+	;
+	; Params:
+	;
+	; Returns: fltQtyInIU, In Inventory Unit (rounded up) for pfltBaseQty in Base Unit
+	;
+	; History:
+	; 10-Feb-2009	shobby	SR16348: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,fltQtyInIU,idInventoryUOM
+	
+	set fltQtyInIU = 0
+	if (pidItem'="") {
+		set idInventoryUOM = $$GetInventoryUOM(pidItem)
+		set fltConv        = $$GetUOMConversionToExternal(pidItem,idInventoryUOM)
+		set fltQtyInIU     = $$Ceiling^COMUtilNum(pfltBaseQty/fltConv)
+	}
+	quit fltQtyInIU
+	
+	
+	;***************************************
+	;  FUNCTIONS RETURNING UNIT CODES
+	;***************************************
+	
+	
+GetInventoryUOM(pidItem="",&pstrStatus=$$$OK)
+	;-------------------------------------------------------------------------------
+	; Gets the Inventory UOM
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Feb-2009	shobby	SR16348: return an error if Dispense unit not found.
+	; 10-Feb-2009	shobby	SR16348: Created
+	;-------------------------------------------------------------------------------
+	new idUOM
+	
+	set idUOM = ""
+	if (pidItem'="") {
+		set idUOM = $$$INARTUnitofMeasure($get(^INART(0,pidItem,1)))
+		if idUOM="" set pstrStatus = $$$MakeStatus("#IN00892: "_$$$Text($listbuild("IN00892",pidItem)))
+	} ; "No Inventory Unit Of Measure defined for item '%1'."
+	quit idUOM
+	
+	
+GetIssueUOM(pidItem="",&pstrStatus=$$$OK)
+	quit $$GetInventoryUOM(pidItem,.pstrStatus)
+	
+	
+GetPickUOM(pidItem="",pidIssueType="",&pstrStatus=$$$OK, pblnDefaultInv=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Gets the Pick UOM
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Oct-2012	SCR		SR18156: Return Inv UOM if no Issue type is found
+	; 26-Feb-2010	GRF		SR16348: use $$$Index
+	; 18-Feb-2009	shobby	SR16348: 'Dispense' changed to 'Pick'.
+	; 17-Feb-2009	shobby	SR16348: return an error if Dispense unit not found.
+	; 10-Feb-2009	shobby	SR16348: Created
+	;-------------------------------------------------------------------------------
+	new idUOM,idxIssType,objItem
+	
+	set idxIssType = $$$Index(pidIssueType)
+	
+	set idUOM = ""
+	if (pidItem'="") && (pidIssueType'="") {
+		set idUOM = $order(^INARTPACKs(0,3,idxIssType,pidItem,""))
+		;if idUOM="" set pstrStatus = $$$MakeStatus("#IN00891: "_$$$Text($listbuild("IN00891",pidIssueType,pidItem)))                               ;SR18157
+		if ((idUOM="")  && (pblnDefaultInv=$$$NO)) set pstrStatus = $$$MakeStatus("#IN00891: "_$$$Text($listbuild("IN00891",pidIssueType,pidItem))) ;SR18157
+	} ; "No Dispense Unit Of Measure defined for IssueType '%1' of item '%2'."         ; FIXME : "Dispense" rather than "Pick" in WWW009?
+	; SR18156 vvvv
+	if (idUOM="") && ( pblnDefaultInv=$$$YES ) {
+		set objItem=$get(^INART(YM,pidItem,1))
+		set idUOM = $$$INARTUnitofMeasure(objItem)
+	}
+	; SR18156 ^^^^
+	quit idUOM
+	
+	
+	
+GetExternalUOM(pidItem="",&pstrStatus)
+	;-------------------------------------------------------------------------------
+	; Gets the External UOM ("Base Unit")
+	; 
+	; ***TODO Finish this off.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Feb-2009	shobby	SR16348: return an error if External(Base) unit not found.
+	; 10-Feb-2009	shobby	SR16348: Created
+	;-------------------------------------------------------------------------------
+	new idUOM
+	
+	set idUOM = ""
+	if (pidItem'="") {
+		set idUOM = $$$INARTBaseUnit($get(^INART(0,pidItem,1)))
+		if idUOM="" set pstrStatus = $$$MakeStatus("#IN00884: "_$$$Text("IN00884"))
+	} ; "No Unit Of Measure is defined as the 'Base Unit' for this Item."
+	quit idUOM
+	
+	
+	;***************************************
+	;  FUNCTIONS RETURNING CONVERSION FACTORS
+	;***************************************
+	
+ConvertUOMConversionToSmallest(pidItem,pidUnitFrom)
+	;-------------------------------------------------------------------------------
+	; Works out the multiplier against the smallest UOM - this may not necessarily
+	; be the base unit.
+	;
+	; Params:
+	;
+	; Returns: Conversion Factor
+	;
+	; History:
+	; 02-Feb-2011	GRF		SR17579: Clarify variable contents
+	; 11-Feb-2009	shobby	SR16348: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,idInnerUnit,idUnit,objINARTPACK
+	
+	set fltConv = 1
+	if (pidItem'="") && (pidUnitFrom'="") {
+		set idUnit = pidUnitFrom
+		for {
+			set objINARTPACK = $get(^INARTPACK(0,pidItem,idUnit,1))
+			set idInnerUnit  = $$$INARTPACKUnit(objINARTPACK)
+			quit:(idInnerUnit="")
+			quit:(idInnerUnit=idUnit)
+			
+			set fltConv = fltConv * $$$INARTPACKQuantity(objINARTPACK)
+			set idUnit  = idInnerUnit
+		}
+	}
+	quit fltConv
+	
+	
+GetUOMConvBetweenUnits(pidItem,pidCurUnit,pidNewUnit)
+	;-------------------------------------------------------------------------------
+	; Determine the conversion between one unit and another for an Item
+	; 
+	; Params:
+	;	pidItem    - Item Id
+	;	pidCurUnit - Intital Unit
+	;	pidNewUnit - the Final Unit
+	;
+	; ByRefs: None
+	;
+	; Returns:
+	; 	Conversion Factor (fltConv), where 1 New Unit = fltConv Current Units
+	;
+	; History:
+	; 02-Feb-2011	GRF		SR17579: Clarify variable contents
+	; 24-Aug-2009	PPP		SR16837/1: If not conversion return 1
+	; 13-Aug-2009	PPP		SR16837: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,fltCurUnitToIU,fltNewUnitToIU
+ 	
+	set fltConv = 1
+	
+	set fltCurUnitToIU = $$GetUOMConversion(pidItem,pidCurUnit)
+	set fltNewUnitToIU = $$GetUOMConversion(pidItem,pidNewUnit)
+	
+	if +fltCurUnitToIU'=0 {
+		set fltConv = fltNewUnitToIU / fltCurUnitToIU
+	}
+	
+	if 'fltConv	set fltConv = 1
+	quit fltConv
+	
+	
+GetUOMConversion(pidItem,pidRequiredUnit,&pidInventoryUnit="")
+	;-------------------------------------------------------------------------------
+	; Determine the conversion between Required Unit and *** Inventory Unit ***
+	; by calculating the conversion of each into the Base Unit.
+	;
+	; Params:
+	; pidItem          - Item Id
+	; pidRequiredUnit  - Unit to get in terms of Default Unit
+	; pidInventoryUnit - (ByRef return) Inventory Unit
+	;
+	; ByRefs: None
+	;
+	; Returns:
+	; 	Conversion Factor (fltConv), where 1 of Required Unit = fltConv of Inventory Unit
+	; 	(default conversion factor = 1)
+	;---------------------------------------
+	;	if 1 CTN    =   4 PACK                     and
+	;	   1 PACK   =  12 Bottles (Inventory Unit) and
+	;	   1 Bottle = 100 tablets (Base Unit)
+	;	then 1 CTN = 48 Bottles  by calculating fltInventoryConv = 100
+	;	                         and fltRequiredConv = 4800 (not saved)
+	;	                         with fltConv = 4800/100 = 48
+	;---------------------------------------
+	; History:
+	; 20-Feb-2012	GRF		SR17980: If ReqdUnit isn't recognised for item, return 1
+	; 02-Feb-2011	GRF		SR17579: Clarify variable contents
+	; 25-Jan-2011	GRF		SR17579: return the Inventory Unit as a ByRef param.
+	; 02-Aug-2010	PPP		SR17482: Ensured pidItem exists before Conversion
+	; 28-Aug-2009	GRF		SR16815: doco, clear old commented code
+	; 10-Feb-2009	shobby	SR16348: Rewrote because the smallest unit is no longer 
+	; 							the Inventory unit defined on the item master.
+    ; 03-Jun-2008	shobby	SRBR014951: macro changed from $$$INARTPACKConsistOf to
+    ; 							$$$INARTPACKQuantity to reflect earlier property
+    ; 							name change.
+	; 17-Jul-2006	PO		SR14847: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,fltConvIUinBU,objItem
+	
+	set fltConv = 1
+	
+	//SR17482
+	;if $get(pidItem)'="" {  //SR17482   ; SR17980
+	if ($get(pidItem)'="") && ($get(pidRequiredUnit)'="") && $data(^INARTPACK(0,pidItem,pidRequiredUnit,1)) {
+		set objItem          = $get(^INART(0,pidItem,1))
+		set pidInventoryUnit = $$$INARTUnitofMeasure(objItem)
+		set fltConvIUinBU    = $$GetUOMConversionToExternal(pidItem,pidInventoryUnit)
+		if fltConvIUinBU {
+			set fltConv = $$GetUOMConversionToExternal(pidItem,pidRequiredUnit)/fltConvIUinBU
+		}
+	}
+	quit fltConv
+	
+	
+GetUOMConversionToExternal(pidItem,pidUnitFrom) 
+	;-------------------------------------------------------------------------------
+	; Calculates the number of 'Base' units in the specified unit.
+	;
+	; Params:
+	;
+	; Returns: Conversion Factor (fltConv), where 1 of pidUnitFrom = fltConv of base unit
+	;
+	; History:
+	; 01-Oct-2009	shobby	SR16877: Redirect to Convert routine.  It's a bit more reliable.
+	; 28-Aug-2009	GRF		SR16815: doco, fix 04-Aug-2009 change
+	; 04-Aug-2009	PPP		SR16815: Consider the conv. to be 1 if No Inner Unit and
+	; 							is Base Unit
+	; 11-Feb-2009	GRF		SR16348: Unit X can be defined as 1 of unit X - infinite loop
+	; 10-Feb-2009	shobby	SR16348: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,objItem
+	
+	set fltConv = 1
+	
+	if (pidItem'="") {
+		set objItem = $get(^INART(0,pidItem,1))
+		set fltConv = $$Convert(pidItem,1,pidUnitFrom,$$$INARTBaseUnit(objItem),$$$NO)
+	}
+	quit fltConv
+
+GetDecimalsForItemUnit(pidItem,pidUnit="")
+	;-------------------------------------------------------------------------------
+	; Get the number of decimal places given the product and the unit.
+	; 
+	; If the unit is blank then get the unit from the product. If this is blank just crash.
+	; 
+	; Called By : IsValidQtyUnit^COMUnit, SetCancelVal^INReqCancel,
+	;             QtyCancelled^INReqLineCancel, QtyRejected^INReqLineReject,
+	;             SetRejectVal^INReqReject, FirmTxn^INTRNFirm
+	;
+	; Inputs:	pidItem : Item - used for Inventory Unit
+	; 			pidUnit : Unit from associate field - Null if need to get item's inventory unit
+	;
+	; ByRef:
+	;
+	; Returns:
+	; >=0 valid number of decimal places
+	; -1  this is an error and MUST be treated as such.
+	; 
+	; TODO: Make each error type return different negative numbers
+	;
+	; History:
+	; 10-Jun-2014	shobby	CORE-385.15: Moved from COMUnit
+	; 15-May-2007	RPW/GRF	SRBR014469: Fixed extra checks for missing types
+	; 11-May-2007	RPW		SRBR014310: Created
+	;-------------------------------------------------------------------------------
+	#define ERROR		-1
+	#define NOCOMUNIT 	-2
+	#define NOUNIT		-3
+	#include COMConst
+
+	new intDecimalPlaces
+	
+	set intDecimalPlaces = $$$ERROR              // ERROR
+ 
+	quit:(pidItem="")||'$data(^INART(0,pidItem)) intDecimalPlaces
+	; FIXME : should we only exit early if both params are null, or if unit is null and INART doesn't exist?
+	
+	set intDecimalPlaces = $$$NOCOMUNIT          // No COMUnit found
+	
+	if pidUnit="" {
+		set pidUnit = $$$INARTUnitofMeasure($get(^INART(0,pidItem,1)))
+	}
+	
+	if pidUnit'="" {
+		if $data(^COMUnit(0,pidUnit)) {
+			set intDecimalPlaces = $$$COMUnitDecimalPlaces($get(^COMUnit(0,pidUnit,1)))
+		}
+	} else {
+		set intDecimalPlaces = $$$NOUNIT         // No Unit found
+	}
+	quit intDecimalPlaces
+	
+	
+]]></Routine>
+</Export>

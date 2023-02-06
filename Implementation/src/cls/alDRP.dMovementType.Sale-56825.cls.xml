@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alDRP.dMovementType.Sale">
+<ClassType>serial</ClassType>
+<IncludeCode>INConst</IncludeCode>
+<Super>alDRP.dMovementType</Super>
+
+<Property name="MovementTypeId">
+<Description><![CDATA[
+11-Aug-2008	HQN	SR15811: Created
+Source of transaction
+Initially based on : ^WWW101(0,"UMSATZART1",SPRACHE,Class,1)   [later extended]]]></Description>
+<Type>alSYS.dt.dtInteger</Type>
+<InitialExpression>"0&quot;</InitialExpression>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="AL00476"/>
+</Property>
+
+
+<Method name="Validate">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; History
+	; 11-Aug-2008   HQN	SR15811: Copied from alDRP.dMovementType.Receipt
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+	if pobjMove.Completed {
+		set strMessage = $$$Text("IN00711")      ; "This movement is already completed."
+		set sc =$$$ERROR($$$GeneralError,strMessage)
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="Confirm">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+#define enumAverageCost		9
+	;-------------------------------------------------------------------------------
+	; Update the BundleStock and StockHistory plus incidentals and then back
+	; populate the V1 data.
+	;
+	; 
+	; History
+	; 09-Mar-2011	PPP		SR17681: Added CustomerAccount
+	; 19-Nov-2009	GRF		SR16471: Change scope of lock by making it a global
+	; 11-Nov-2009	GRF		SR16871: relocate unlock to cover data being updated
+	; 02-Nov-2009	GRF		SR16871: INItemCost with location replaces INARTKOST;
+	; 							Remove ConfirmMovement
+	; 21-Sep-2009	DWR		SR16880: Call to new class alSFI.dStockFin
+	; 29-Sep-2008	Luke	SR15818: Added Lock Checks 
+	; 27-Aug-2008	Luke	SR15691: Corrected the calculation of fltCost
+	; 18-Aug-2008	HQN		SR15801: Update PeriodBalance from Stock History
+	; 12-Aug-2008	Luke    SR15691: Added external calls for costings 
+	; 12-Aug-2008	Luke	SR15813: added transaction types to processing 
+	; 11-Aug-2008   HQN		SR15811: Copied from alDRP.dMovementType.Adjustment
+	;-------------------------------------------------------------------------------
+	set sc     = $$$OK
+	set idItem = pobjMove.Item.ItemId
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	LOCK +^alSOHProcessing(idItem):2
+	
+	if '$test {
+		set strMessage = $$$Text($listbuild("IN00853",idItem))
+		set sc = $$$ERROR($$$GeneralError,strMessage)  
+	;	"Can not acquire a lock for Item: (%1) please try again"
+	;+++++++++++++++++++++++++++++++++++++++
+
+	} else {
+	; SR16871 vvv
+	;	LOCK -^alSOHProcessing(idItem)
+	;;	set fltCost = $$GetCostV2^INARTKOST(idItem) ; SR16871
+	;	set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+	;}
+	
+	;if $$$ISOK(sc) {
+		set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+	; SR16871 ^^^
+		
+	; Sale : Stock History & Period Balance
+	;---------------------------------------
+		set objTransType   = ##class(alSOH.dTransactionType).%OpenId(3)
+		set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove, 
+													   pobjMove.FromLocn,
+													   pobjMove.FromStorage,
+													  -pobjMove.QtyRequired,
+													   fltCost,
+													   objTransType,
+													   .sc)
+		
+		set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist)
+	;+++++++++++++++++++++++++++++++++++++++ ; SR16871
+		LOCK -^alSOHProcessing(idItem)
+	;+++++++++++++++++++++++++++++++++++++++
+	}
+	
+	; FIXME : Post uses FromLocn - why does SFI set FromLocn to ToLocn?
+	;         This is a Sale - do we *HAVE* a ToLocn?  Should this be to delete storage @ FromLocn?
+		
+	; Stock to Finance Interface            ; SR16880
+	;---------------------------------------
+	if $$$ISOK(sc) {
+		set objStockFin = ##class(alSFI.dStockFin).%New()
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "ISS"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.Sale"
+		set objStockFin.TxnInformation = "Sale Transaction"
+		
+		set objStockFin.Item           = pobjMove.Item
+		set objStockFin.Quantity       = pobjMove.QtyPicked
+		set objStockFin.TxnValue       = fltCost * pobjMove.QtyPicked
+		
+		//PP set objStockFin.FromLocn       = pobjMove.ToLocn  ; currently use to create "To Storage" string
+		//PP set objStockFin.ToLocn         = pobjMove.ToLocn
+		set objStockFin.FromLocn       = pobjMove.FromLocn
+		set objStockFin.ToLocn         = pobjMove.FromLocn
+
+		set objStockFin.ToStorage      = pobjMove.FromStorage
+		
+		set objStockFin.OrderNo        = pobjMove.Reference
+		set objStockFin.OrderLine      = pobjMove.LineNumber
+		
+	// TO DO	
+	//	set objStockFin.SourceRec	   = pobjMove.Reference     ; SR17387
+	//	set objStockFin.SourceForm	   = "???"                  ; SR17387
+	//	set objStockFin.SourceDetail   = 34350_","_pobjMove.Reference_","_pobjMove.LineNumber ; SR17387
+	//	                                 ; "Issue %1, Line %2"
+
+		set objStockFin.CustomerAccount = pobjMove.CustomerAccount		//SR17681
+		
+		set sc = objStockFin.StockToFin()
+		
+		set YUSER =%("%KEY","YUSER") 
+		set:YUSER="" YUSER=" "
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		set:$$$ISOK(sc) ^CacheTemp(YUSER,"FIBURecord") = $$$YES
+	}
+	
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="Default">
+<Type>%Library.CacheSerialState</Type>
+</Storage>
+</Class>
+</Export>

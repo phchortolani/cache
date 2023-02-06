@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INRECSummaryScan" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INRECSummaryScan
+	
+#include COMGridEdit31
+#include INConst
+#include %occInclude
+#include COMSYS
+	
+AddScanLine(pidScan)
+    ;-------------------------------------------------------------------------------
+    ; Routine to Add a new line to a Grid after a Scan is validated
+    ;
+    ; Assumptions :
+    ;  YFORM	-	 Form Name
+    ; 
+    ; Returns: Status
+    ;
+    ; History:
+	; 20-Apr-2010	GRF		SR17177: Call UpdateThisTotal not UpdateRunningTotals
+	; 12-Apr-2010	GRF		SR17177: pass revised objSummary to UpdateRunningTotals
+    ; 07-Apr-2010	GRF		SR17177: call UpdateRunningTotals; use idDataLine rather
+    ;							than idRowAdded so it is available for determining
+    ;							idGridRow
+    ; 21-Sep-2009	PPP		SRxxxxx: Multiple Scan need to update Unit Qty field
+    ; 17-Aug-2009	GRF		SR16815: fix undeclared pidSupplier => idSupplier
+    ; 04-Aug-2009	PPP		SR16815: Update the Qty based on Units
+    ; 22-Jul-2009	GRF		SR16669: check operation matches - use consistent
+    ; 							variable names; remove "p" prefix for array
+    ; 20-Jul-2009	PPP		SR16773: ScanDelimiter is a function now
+    ; 10-Jul-2009	PPP 	SR16726: Update the Cost on the Line and on the Invoice
+    ;							 Tab when scanning is used
+    ; 25-May-2009	PPP		SR16565: Scanning Prompt for Grid
+    ;-------------------------------------------------------------------------------
+	new arrFields,idClass,idDataLine,idGridRow,idItem,idRecNo,idSupplier
+ 	new objHeader,objLine,objOldData
+ 	
+	set objHeader  = $$$GRIDYFELDContainer
+	set idRecNo    = $$$KEY1($$$GRIDYKEYContainer)
+	set idSupplier = $$$INRECSupplier(objHeader)
+	
+	set idItem = ""	
+	
+	if $get(YFORM)'="" {
+		set idClass = $$$GetClass(YFORM)
+		set objLine = ""
+		set idItem  = $piece(pidScan,$$$ScanDelim,1)
+		
+	//	Get the data for the Item if it already exists
+	//	set idDataLine = $$GetExistingItemRowData(idItem)
+	//	set idDataLine = $$GetRowLineWithCheck^COMGridEdit31Scan(idItem,$$$FldINRECSummaryItem,$$$FldINRECSummaryPurchaseOrder)
+		set idDataLine = $$GetRowLineREC(idItem)
+		
+		if idDataLine {
+			set (objLine,objOldData) = $$$GRIDGetYFELD(idDataLine)
+		//	set $$$INRECSummaryQuantityReceived(objLine) = $$$INRECSummaryQuantityReceived(objLine)+ 1
+		   ; ^^^ FIXME : if restored, set $$$INRECSummaryInventoryUnit as well
+		//	set arrFields($$$FldINRECSummaryQuantityReceived) = $$$INRECSummaryQuantityReceived(objLine)
+			set $$$INRECSummaryUnitQtyReceived(objLine)      = $$$INRECSummaryUnitQtyReceived(objLine)+ 1
+			set arrFields($$$FldINRECSummaryUnitQtyReceived) = $$$INRECSummaryUnitQtyReceived(objLine)
+			
+		//	Updates the Row and Displays it (for existing lines)
+		//	If the row is on another page displays the lines at the top of the grid
+			do UpdateRow^COMGridEdit31Scan(YFORM,idDataLine,.arrFields,objOldData)
+			
+		} else {  //New Line
+			set $$$INRECSummaryPurchaseOrder(objLine)     = ""
+			set $$$INRECSummaryPurchaseOrderLine(objLine) = ""
+			set $$$INRECSummaryItem(objLine)              = idItem
+			set $$$INRECSummaryUnitQtyReceived(objLine)   = 1
+		//	set $$$INRECSummaryReceivedUnit(objLine)      = $$LoadUnitOfMeasureList^INARTUtilities(idItem)
+			set $$$INRECSummaryReceivedUnit(objLine)      = $$GetSupplierUOM^INARTUtilities(idItem,idSupplier)
+			set $$$INRECSummaryUnitCost(objLine)          = $$CheckItemPrice^INRECSummary(objLine,idRecNo,"")  //(Current Line Object, Receipt ID, Current Line)
+			set $$$INRECSummaryExtendedCost(objLine)      = $$$INRECSummaryUnitCost(objLine)
+			set $$$INRECSummaryLineType(objLine)          = 0 		// "Standard"
+			
+	 		do CalcCostAdj^INReceiptInvoice(idRecNo_$$$COMMA_idDataLine,.objLine)
+
+	; SR17177 vvv
+	;		$$$GRIDAddLine(objLine,,idClass,,,,,,.idRowAdded)
+	;		do SimulateBlurOnAdd^COMGridEdit31Scan(idRowAdded,objLine,"",YFORM,$$$FldINRECSummaryUnitQtyReceived)
+			$$$GRIDAddLine(objLine,,idClass,,,,,,.idDataLine)
+			do SimulateBlurOnAdd^COMGridEdit31Scan(idDataLine,objLine,"",YFORM,$$$FldINRECSummaryUnitQtyReceived)
+		}
+		
+		do CalculateSummTotal^INRECSummary(idRecNo,"",objLine)
+		set idGridRow = $get($$$WWWDATEN("REFERENCEROW",idDataLine,1))    ; SR17177
+	;	do UpdateRunningTotals^INRECSummaryC(idGridRow,objLine)           ; SR17177
+		do UpdateThisTotal^INRECSummaryC(idGridRow,objLine)               ; SR17177
+		
+		//Need to Update Extended Costs & Taxes FIXME:		
+		//do OnBlur^INRECSummary(pstrKeys,objLine,idDataLine,pintCol)		
+	}
+	quit $$$OK
+	
+	
+GetRowLineREC(pidItem)
+    ;-------------------------------------------------------------------------------
+    ; Get the Row & Details for a given Item if it exists
+    ; This is not generic but specific for a Receipt (because of Order/Lines)
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 22-Jul-2009	GRF		SR16669: check operation matches - use consistent
+    ; 							variable names
+    ; 26-May-2009	PPP		SR16565: Scanning Prompt for Grid
+    ;-------------------------------------------------------------------------------
+	new idDataLine,idLine,objGridLine
+		
+	set idLine     = ""         ; FIXME : Why not just return idDataLine
+	set idDataLine = "" 
+	for {
+		set idDataLine = $order($$$WWWDATEN("REFERENCEROW",idDataLine))
+		quit:idDataLine=""
+		
+		continue:($get($$$WWWDATEN("KILLEDRECORD",$get($$$WWWDATEN("REFERENCEROW",idDataLine,1))))=$$$YES)
+		
+		set objGridLine = $$$GRIDGetYFELD(idDataLine)        ; = $$$WWWDATEN("YFELD",idGridRow,1)
+		continue:($$$INRECSummaryItem(objGridLine)'=pidItem)
+		
+		if ($$$INRECSummaryPurchaseOrder(objGridLine)'="") && 
+		  (($$$INRECSummaryQuantityReceived(objGridLine)+1) > $$$INRECSummaryQuantityOrdered(objGridLine)) {
+			
+			continue
+		}
+		set idLine = idDataLine
+		quit
+	}
+	
+	quit idLine
+	
+]]></Routine>
+</Export>

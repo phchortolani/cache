@@ -1,0 +1,415 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INAUFHTML" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INAUFHTML
+	;-------------------------------------------------------------------------------
+	; These routines are used as "callbacks" for HTML Print Forms (INDRPARAHTML).
+	; 
+	; For this reason, they really should not be called outside of this scope (mainly
+	; because these routines format the data specifically for the forms.) 
+	;-------------------------------------------------------------------------------
+#include COMSYS
+#include COMConst
+#include INConst
+#include WWWConst
+	
+#define Break	"<br />"	
+	
+GetStockLocations(pidOrder,pidLine)
+    ;-------------------------------------------------------------------------------
+    ; For an order and order line, return a string of locations/storages where
+    ; that order line was sourced.
+    ; 
+    ; Called By : INDRUCKXML6P
+    ; 
+    ; Returns: strStorageList (a string of locations/storages)
+    ;
+    ; History:
+    ; 19-May-2005	SS		SR11963: Just output storage, not physical location
+    ; 19-Apr-2005	SS		SR12042: Created
+    ;-------------------------------------------------------------------------------
+	new idLocn,idSource,idStore,objOrderLine,strStorageList
+ 
+	set strStorageList = ""
+	
+	if ($get(pidOrder)'="") && ($get(pidLine)'="") {
+		set objOrderLine = $get(^INAUFP(YM,pidOrder,pidLine,1))
+		set idSource = $$$INAUFPSource(objOrderLine)
+		
+		if idSource=2 { ; From Stock    ; SR16361 DEPRECATED but looking at source of (customer?) order rather than purch order
+			set idLocn = ""
+			for {
+				set idLocn = $order(^INWEAUF(YM,pidOrder,pidLine,idLocn))
+				quit:idLocn=""
+				
+				set idStore = ""
+				for {
+					set idStore = $order(^INWEAUF(YM,pidOrder,pidLine,idLocn,idStore))
+					quit:idStore=""
+					
+					set strStorageList = strStorageList_idStore_$$$Break
+				}
+			}
+			
+		} 
+	}
+ 
+	if strStorageList="" set strStorageList=$$$Text(86) ;Not Available
+	
+	quit strStorageList
+	
+	/*  SR16361 - possible alternative 
+			set idxOrderNo = $$$Index(pidOrder)
+			set idxOrdLine = $$$Index(pidLine)
+			
+			set idReceipt = ""
+			for {
+				set idReceipt = $order(^INRECLines(0,4,idxOrderNo,idxOrdLine,idReceipt))
+				quit:idReceipt=""
+				
+				set idRecLine = ""
+				for {
+					set idRecLine = $order(^INRECLines(0,4,idxOrderNo,idxOrdLine,idReceipt,idRecLine))
+					quit:idRecLine=""
+					
+					set objRecLine = $get(INRECLine(0,idReceipt,idRecLine,1))
+					set idLocn  = $$$INRECLineLocation(objRecLine)
+					set idStore = $$$INRECLineStockLocation(objRecLine)
+					
+					set strStorageList = strStorageList_idStore_$$$Break
+				}
+			}
+			
+	*/
+	
+GetLineTotal(pidOrder,pidLine,pblnFormat=$$$NO,pDocumentType,pidCompany)
+    /*-------------------------------------------------------------------------------
+    ; Return the total sales amount of an order line, if the order line has been invoiced
+    ; then the amount returned is zero
+    ;
+    ; Params: pidOrder      - Order number
+    ; 		  pidLine       - Line number
+    ; 		  pblnFormat    - Format as currency string
+    ; 		  pDocumentType - NOT USED ???
+    ; 		  pidCompany    - The company identifier
+    ;
+    ; ByRefs: None
+    ;
+    ; Returns: curTotal - Total of order line
+    ;
+    ; History:
+    ; 10-Mar-2010	GRF		-: cleanup old comments
+    ; 17-Aug-2006	RPW		SR14921: Added pidCompany and replaced YM with Company
+    ; 17-Jan-2006	PO		SR14152: Reverted changes in SR14142 & SR14152
+    ; 07-Jan-2006	PO		SR14152: If line not part of the current invoice then do
+    ; 							not include amount on invoice.
+    ; 06-Jan-2006	PO		SR14142: Include handling of non stock items
+    ; 21-Dec-2005	PO		SR14052: Created
+    ;-------------------------------------------------------------------------------*/
+	new objINAUF,objINAUFP,curTotal,strCurrency
+ 
+	set curTotal    = 0
+	set strCurrency = ""
+	
+	set pidCompany=$get(pidCompany,+$get(YM))
+ 
+	if ($get(pidOrder)'="") && ($get(pidLine)'="") {
+		set objINAUF  = $get(^INAUF(pidCompany,pidOrder,1))
+		set objINAUFP = $get(^INAUFP(pidCompany,pidOrder,pidLine,1))
+ 
+		set curTotal    = $$$INAUFPNetSalesPrice(objINAUFP)
+		set strCurrency = $$$INAUFOrderCurrency(objINAUF)
+	}
+ 
+	if pblnFormat set curTotal = $$FormatCurrency^COMTable(curTotal,$$$NO,strCurrency)
+ 
+	quit curTotal
+	
+	
+GetOrderTaxRate(pidOrder)
+    ;-------------------------------------------------------------------------------
+    ; Given an order ID, find the overall tax rate for the order (eg, GST=10% for AUS)
+    ; 
+    ; Note: This is the default tax code - used for Adrad to return GST
+    ; 
+    ; This will NOT work for multiple tax rates and will need to get fixed.
+    ; 
+    ; Returns: float
+    ;
+    ; History:
+    ; 21-Jun-2005	JW		SR12707: Get default combined rate. Do not hard code 1.
+    ; 03-May-2005	SteveS	Created SR:11963
+    ;-------------------------------------------------------------------------------
+	new fltRate,objOrder,idOrderLocn,objLocation,idTaxLocn,idType,dteEffective
+	new objTaxTable,dteOrder,idLine
+	
+	set fltRate = 0
+	
+	if $get(pidOrder)'="" {
+		set objOrder    = $get(^INAUF(YM,pidOrder,1))
+		set idOrderLocn = $$$INAUFLocation(objOrder)
+		if idOrderLocn="" set idOrderLocn = YLOCATION
+		
+		if idOrderLocn'="" {
+			set objLocation = $get(^WWW0121(0,YM,idOrderLocn,1))
+			set idTaxLocn   = $$$WWW0121TaxLocation(objLocation)
+			set dteOrder    = $$$INAUFOrderDate(objOrder)
+			
+			; SR12707
+			set fltRate = $$CombinedTaxRate^COMTAX("",idTaxLocn,dteOrder)  
+		}
+	}
+	quit fltRate
+	
+	
+GetTaxFlag(pidOrder,pidOrderLine,pstrFlag="*")
+    ;-------------------------------------------------------------------------------
+    ; If an order line has GST on it, return a tax flag (*).
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 30-Sep-2005	RPW		SR13593: Get the tax information correctly using the new
+    ; 							correct routines
+    ; 03-May-2005	SS		SR11963: Created
+    ;-------------------------------------------------------------------------------
+	new strTaxFlag,objOrderLine,fltRate
+ 
+	set strTaxFlag = ""
+ 
+	if ($get(pidOrder)'="") && ($get(pidOrderLine)'="") {
+		set objOrderLine = $get(^INAUFP(YM,pidOrder,pidOrderLine,1))
+		set fltRate      = $$OrderLineTaxRate^INTAX(pidOrder,pidOrderLine)
+		
+		if +fltRate'=0 set strTaxFlag = pstrFlag
+	}
+	quit strTaxFlag
+	
+	
+GetOrderPrice(pidOrder,pblnFormat=$$$NO,pfltSurcharges,pfltDiscounts,pfltTotalTax,pDocumentType,pidInvoice)
+    ;-------------------------------------------------------------------------------
+    ; Gets the total price of an order. This for a CUSTOMER ORDER!
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 24-Feb-2006	PO		SR14293: Enable calculated amount to be for any invoice
+    ; 							of order, not just most recent invoice.
+    ; 07-Jan-2006	PO		SR14152: If line not part of the current invoice then do
+    ; 							not include amount on invoice.
+    ; 06-Jan-2006	PO		SR14142: Include handling of non stock items
+    ; 21-Dec-2005	PO		SR14052: Skip lines that have already been invoiced
+    ; 							(only if doc type is 7 - Invoice)
+    ; 10-Oct-2005	RPW		SR13593: Correction to added line, we already have the
+    ; 							correct tax rate, no more work to be done
+    ; 30-Sep-2005	RPW		SR13593: Get the tax information correctly using the new
+    ; 							correct routines
+    ; 13-Sep-2005	JW		SR13434: Get discount/surcharges the same as INFIBBUCH
+    ;  6-Sep-2005	JW		SR13419: Revertpart SR13107. Don't need to deliver to invoice.
+    ; 29-Aug-2005	SS/JW	SR13311: Allow for single line print. Calculate from Tax Ex.
+    ; 22-Aug-2005	SteveS	SR13107: Skip line if not a confirmation and not delivered
+    ; 16-Jul-2005	SteveS	SR12924: Use Sourced Tax Inc, not Lines Tax Inc 
+    ; 14-Jul-2005	PO		SR12949: Removed test for equality between pblnFormat and $$$YES
+    ; 12-Jul-2005	PO		SR12923: Unsourced stock on order confirmations has tax
+    ; 							handled same as source stock on all document types
+    ; 23-Jun-2005	JW		SR12707: Return more details. Fix calculations.
+    ; 17-Jun-2005	RPW/SS	SR12607: Skip line if not sourced
+    ; 05-May-2005	SteveS	Created SR:11963
+    ;-------------------------------------------------------------------------------
+	new fltPortionPrice,idOrderCurrency,objOrder,idTaxLocn,dteOrderDate
+	new lstInclLines,singleLine,idLine,arrResults
+	new idx,objOrderLine,fltPriceTaxEx,fltTaxRate,objINAUFP
+	
+	set fltPortionPrice = 0
+	set pfltSurcharges  = 0
+	set pfltDiscounts   = 0
+	set pfltTotalTax    = 0
+	set idOrderCurrency = ""
+	
+	if ($get(pidOrder)'="") {
+		set objOrder = $get(^INAUF(YM,pidOrder,1))
+		if '($data(pidInvoice)#10) set pidInvoice = $$$INAUFInvoiceNumber(objOrder)
+		set idOrderCurrency = $$$INAUFOrderCurrency(objOrder)
+		set dteOrderDate    = $$$INAUFOrderDate(objOrder)
+		set idTaxLocn       = $$CurrentTaxLocation^COMTAXLocation($$$INAUFLocation(objOrder))
+		
+		set lstInclLines = ""
+		set singleLine   = $order(^CacheTempSingleLine(YUSER,pidOrder,""))
+		if singleLine'="" {
+			set lstInclLines = $lb(singleLine)		// SR13311: Single line needed
+			
+		} else {
+			set idLine = ""
+			for {
+				set idLine = $order(^INAUFP(YM,pidOrder,idLine))
+				quit:idLine=""
+				
+				set objINAUFP = $get(^INAUFP(YM,pidOrder,idLine,1))
+ 
+				;set blnSkip = $$$NO ; SR14142
+				;if ($$$INAUFPInvoiceNumber(objINAUFP)'=$$$INAUFInvoiceNumber(objOrder)) && (pDocumentType=7) { ; SR14152
+				;	set blnSkip = $$$YES
+				;}
+				
+				continue:(($$$INAUFPInvoiceNumber(objINAUFP)'=pidInvoice) && (pDocumentType=7))
+				;continue:'$data(^INWEAUF(YM,pidOrder,idLine))&&(pDocumentType=7) ; SR14052 order line already invoiced
+				
+				if (pDocumentType=2) || ($$$INAUFPSource(objINAUFP)'="") {		// Order confirmation or Sourced (SR12923)
+					set lstInclLines = lstInclLines_$lb(idLine)
+				}
+			}
+		}
+		if lstInclLines'="" {
+			do OrderDiscountPortion^INAUFCalc(pidOrder,lstInclLines,.pfltDiscounts,.pfltSurcharges,.arrResults)
+			
+			for idx=1:1:$listlength(lstInclLines) {
+				set idLine = $list(lstInclLines,idx)
+				
+				set objOrderLine    = $get(^INAUFP(YM,pidOrder,idLine,1)) ; objOrderLine nolonger in use
+				set fltPriceTaxEx   = $get(arrResults(idLine))
+				set fltPortionPrice = fltPortionPrice + fltPriceTaxEx
+				set fltTaxRate      = $$OrderLineTaxRate^INTAX(pidOrder,idLine)
+				
+				if +fltTaxRate {
+					set pfltTotalTax = pfltTotalTax + $justify(fltPriceTaxEx/100*fltTaxRate,0,2)
+				}
+			}
+			set fltPortionPrice = fltPortionPrice + pfltTotalTax
+		}
+	}
+	
+	if pblnFormat {
+		set fltPortionPrice	= $$FormatCurrency^COMTable(fltPortionPrice,$$$NO,idOrderCurrency)
+		set pfltSurcharges	= $$FormatCurrency^COMTable(pfltSurcharges, $$$NO,idOrderCurrency)
+		set pfltDiscounts	= $$FormatCurrency^COMTable(pfltDiscounts,  $$$NO,idOrderCurrency)
+		set pfltTotalTax	= $$FormatCurrency^COMTable(pfltTotalTax,   $$$NO,idOrderCurrency)
+	}
+	quit fltPortionPrice
+	
+	
+GetOrderLocationDetail(pidOrder,pidClassField)
+    ;-------------------------------------------------------------------------------
+    ; For an order, get its location and return a certain field number for 
+    ; that location record. 
+    ;
+    ; Returns:
+    ;
+    ; History:
+	; 24-Feb-2009	GRF		SR16394: Clarify pidClassField rather than pidField
+    ; 05-May-2005	SteveS	Created SR:12345
+    ;-------------------------------------------------------------------------------
+	new idOrderLocn,objLocn,objOrder,strText
+	
+	set strText = ""
+ 
+	if ($get(pidOrder)'="") && ($get(pidClassField)'="") {
+		set objOrder    = $get(^INAUF(YM,pidOrder,1))
+		set idOrderLocn = $$$INAUFLocation(objOrder)
+		if idOrderLocn="" set idOrderLocn = YLOCATION
+		
+		set objLocn = $get(^WWW0121(0,YM,idOrderLocn,1))
+		set strText = $piece(objLocn,Y,pidClassField)
+	}
+	quit strText
+	
+	
+GetLineDiscounts(pidOrder,pidLine)
+    ;-------------------------------------------------------------------------------
+    ; Gets the discounts/surcharges for a customer order line
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 31-May-2005	SteveS	SR11963: Created
+    ;-------------------------------------------------------------------------------
+	new fltDiscPercent1,fltDiscPercent2,fltDiscPercent3,fltSurchargeAmt,fltSurchargePercent
+	new idCurrency,objOrder,objOrderLine,strDiscounts
+ 
+	set strDiscounts=""
+	
+	if ($get(pidOrder)'="") && ($get(pidLine)'="") {
+		set objOrder     = $get(^INAUF(YM,pidOrder,1))
+		set objOrderLine = $get(^INAUFP(YM,pidOrder,pidLine,1))
+		
+		set fltDiscPercent1 = $$$INAUFPLineItemDiscount(objOrderLine)
+		set fltDiscPercent2 = $$$INAUFPAdditionDiscount(objOrderLine)
+		set fltDiscPercent3 = $$$INAUFPAdditionalDiscount(objOrderLine)
+		
+		if (+fltDiscPercent1)'=0 {
+			set strDiscounts = strDiscounts_$$$MINUS_fltDiscPercent1_" %"_$$$SPACE
+			set strDiscounts = strDiscounts_$$$INAUFPDiscountName(objOrderLine)_$$$Break		
+		}
+		
+		if (+fltDiscPercent2)'=0 {
+			set strDiscounts = strDiscounts_$$$MINUS_fltDiscPercent2_" %"_$$$SPACE
+			set strDiscounts = strDiscounts_$$$INAUFPDiscountName1(objOrderLine)_$$$Break
+		}
+		
+		if (+fltDiscPercent3)'=0 {
+			set strDiscounts = strDiscounts_$$$MINUS_fltDiscPercent3_" %"_$$$SPACE
+			set strDiscounts = strDiscounts_$$$INAUFPDiscountName(objOrderLine)_$$$Break
+		}
+		
+		set fltSurchargePercent = $$$INAUFPPercentSurchargeDiscount(objOrderLine)
+		set fltSurchargeAmt     = $$$INAUFPSpecialSurcharge(objOrderLine)
+		
+		if (+fltSurchargePercent)'=0 {
+			set strDiscounts = strDiscounts_$$$PLUS_fltSurchargePercent_" %"_$$$Break
+		}
+		
+		if (+fltSurchargeAmt)'=0 {
+			set idCurrency   = $$$INAUFOrderCurrency(objOrder)
+			set strDiscounts = strDiscounts_$$$PLUS_$$FormatCurrency^COMTable(fltSurchargeAmt,$$$NO,idCurrency)_$$$SPACE
+			set strDiscounts = strDiscounts_$$$INAUFPDescription(objOrderLine)_$$$Break	
+		}
+	}
+	quit strDiscounts
+	
+	
+GetLineQty(pidOrder,pidLine)
+    ;-------------------------------------------------------------------------------
+    ; Gets a customer order line's qty string
+    ;
+    ; Returns: String
+    ;
+    ; History:
+    ; 29-Aug-2005	SteveS	SR13107: Created
+    ;-------------------------------------------------------------------------------
+	new fltQty,objINAUFP,strLineUnit,strUnit
+	
+	set strLineUnit = ""
+	
+	if ($get(pidOrder)'="") && ($get(pidLine)'="") {
+		set objINAUFP   = $get(^INAUFP(YM,pidOrder,pidLine,1))
+		set fltQty      = $$$INAUFPQuantity(objINAUFP)               ; in Inventory Units
+		set strUnit     = $$$INAUFPQuantityUnit(objINAUFP)           ; Inventory Unit
+		set strLineUnit = fltQty_" "_$$$AppEnum("EINHEIT",strUnit)
+	}
+	quit strLineUnit
+	
+	
+GetDueDate(pidOrder,pblnFormat=$$$NO)
+    /*-------------------------------------------------------------------------------
+    ; Get the due date for a customer order
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 02-Dec-2005	SteveS	SR13873: Created
+    ;-------------------------------------------------------------------------------*/
+	new dteDueDate,objINAUF
+	
+	set dteDueDate = ""
+	
+	if $get(pidOrder)'="" {
+		set objINAUF   = $get(^INAUF(YM,pidOrder,1))
+		set dteDueDate = $$$INAUFRequiredDeliveryDate(objINAUF)
+		if dteDueDate="" set dteDueDate = $$$INAUFDeliveryDate(objINAUF)
+	}
+	
+	if pblnFormat set dteDueDate = $$^WWWDATE(dteDueDate)
+	
+	quit dteDueDate
+	
+]]></Routine>
+</Export>

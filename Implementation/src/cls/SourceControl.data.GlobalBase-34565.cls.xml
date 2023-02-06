@@ -1,0 +1,764 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="SourceControl.data.GlobalBase">
+<ClassType/>
+<Import>SourceControl.control,SourceControl.xml,VAR.infra.xml,VAR.infra.util</Import>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%RegisteredObject</Super>
+
+<Method name="ExportGlobalNode">
+<Description><![CDATA[
+This method exports one or more complete node subtrees as a file that can be
+imported back. Each piece will be in a different line, preceded by its index.
+
+The systems writes to the file according to the following algorithm
+
+1) For each global name in the list fetch all subscritps in the list and
+   write the complete global(subscript) to a file. 
+   
+The typical usage, however, is to supply just one subscript and one or more globals.
+
+
+Parameters:
+  fileName - the complete external file name, including path. 
+              The path will be created if it doesn't exist. The
+              file will be overwritten.
+              Example: "e:\projects\AplhalincA\globals\nm\userParameters\VARSESTest.parameters"
+              
+  artifactname - the name of the current artifact. For example: "WWWXYZ" or "DICTIONARY"
+              
+  lstGlobalName - a list of complete global names to be exported.
+               Examples: $listbuild("^WWWDIC"), $listbuild("^WWWDIC","^WWW100",...)
+               
+  lstGlobalSubscripts - a list of the desired subscripts in executable form, without parentesis.
+                  Example: $listbuild("0,1", "0,100", "0,""xyz""")
+                  To save the whole global to disk use: $listbuild("""""")
+                  
+  lstIgnored - a list of the dired locations and pieces to be ignored.
+               Example:
+               set ignoredLocation1="^WWW120(0,""WWWLNG"",1)"
+               set ignoredPieces1="50~52~60~200"
+               set ignoredItem1=$listbuild(ignoredLocation1,ignoredPieces1)
+               ...
+               set lstIgnored=$listbuild(ignoredItem1,ignoredItem2...,ignoredItemN)
+                  
+  printMessage - allow the system to print success and error messages to the console
+ 
+Example: export all subnodes with occurences of 0,"WWW",... and 0,"ZZZ",... from globals ^XXX and ^YYY
+ set a="0,"_..QuoteString("WWW")  //Automatic quotes
+ set b="0,""ZZZ"""                //Manual quotes
+ ExportGlobalNode(file, "EXAMPLE", $listbuild("^XXX","^YYY"), $listbuild(a,b),1)
+]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>fileName:%String,artifactName:%String="&quot;,lstGlobalName:%String,lstGlobalSubscripts:%String="&quot;,lstIgnored:%String="&quot;,printMessage:%Boolean=0,&amp;ignored:%Boolean=0,custom:%Boolean=0</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set wholeGlobal = $$$NO
+
+	set ignored = $$$NO
+	if ((##class(Config).IsBuildOnlyNonVAR() &&
+	    	(($extract(artifactName, 1, $length("VAR")) = "VAR") ||
+	    	 ($piece(fileName, ".", $length(fileName, ".")) =
+	    	 	##class(FileType).%GetParameter("TXTCUSTOMNMCLASS")) ||
+	    	 ($piece(fileName, ".", $length(fileName, ".")) =
+	    	 	##class(FileType).%GetParameter("TXTCUSTOMFORM")) ||
+	    	 ($piece(fileName, ".", $length(fileName, ".")) =
+	    	 	##class(FileType).%GetParameter("TXTCUSTOMFAVORITES")) ||
+	    	 ($piece(fileName, ".", $length(fileName, ".")) =
+	    	 	##class(FileType).%GetParameter("TXTCUSTOMPARAMETERS")))) ||
+		(##class(Config).IsBuildOnlyVAR() &&
+			(($extract(artifactName, 1, $length("VAR")) '= "VAR") &&
+			 ($piece(fileName, ".", $length(fileName, ".")) '=
+	    	 	##class(FileType).%GetParameter("TXTCUSTOMNMCLASS")) &&
+	    	 ($piece(fileName, ".", $length(fileName, ".")) '=
+	    	 	##class(FileType).%GetParameter("TXTCUSTOMFORM")) &&
+	    	 ($piece(fileName, ".", $length(fileName, ".")) '=
+	    	 	##class(FileType).%GetParameter("TXTCUSTOMFAVORITES")) &&
+	    	 ($piece(fileName, ".", $length(fileName, ".")) '=
+	    	 	##class(FileType).%GetParameter("TXTCUSTOMPARAMETERS"))))) {
+		set ignored = $$$YES
+		quit $$$OK
+	}
+
+	// Verify fileName
+	if ($get(fileName) = "") {
+		quit ##class(Errors).MakeAndPrintErrorStatus("ExportGlobalNode needs "_
+			"a file name to export to!", printMessage)
+	}
+
+	// Global
+	if ('$data(lstGlobalName)) {
+		quit ##class(Errors).MakeAndPrintErrorStatus("ExportGlobalNode needs "_
+			"a global name definition to export!", printMessage)
+	}
+
+	// Global
+	if ('##class(Lists).IsList(lstGlobalName)) {
+		quit ##class(Errors).MakeAndPrintErrorStatus("ExportGlobalNode needs "_
+			"a global name definided as of $listbuild() type!", printMessage)
+	}
+	
+	//Subscripts
+	if ('$data(lstGlobalSubscripts)) {
+		quit ##class(Errors).MakeAndPrintErrorStatus("ExportGlobalNode needs "_
+			"a list of subscripts to export!", printMessage)
+	}
+
+	// Subscripts
+	if ('##class(Lists).IsList(lstGlobalSubscripts)) {
+		quit ##class(Errors).MakeAndPrintErrorStatus("ExportGlobalNode needs "_
+			"a list of subscripts definided as of $listbuild() type!",
+			printMessage)
+	}
+
+	// Prepare a hashtable for fast lookup for things to be ignored
+	set ignoredMap = ##class(Hashtable).GetIgnoredMap(.sc, lstIgnored,
+		printMessage)
+	if (##class(Errors).IsError(sc, 0)) {
+		quit sc
+	}
+
+	// Create directories
+	set sc = ##class(DirectoryFile).CreateDirectoryChainFromFile(fileName)
+	if (##class(Errors).IsError(sc, printMessage)) {
+		quit sc
+	}
+
+	set hdlFile = ##class(%File).%New(fileName)
+	if (hdlFile = "") {
+		quit ##class(Errors).MakeAndPrintErrorStatus("The system could "_
+			"not open file '"_fileName_"'.", printMessage)
+	}
+
+	// Open for rewrite
+	if ('##class(FileFormat).IsFileNameInUTF8List(fileName)) {
+		set sc = hdlFile.Open("WSN::$Char(10)")
+	}
+	else {
+		set sc = hdlFile.Open("WSNK\UTF8\::$Char(10)")
+	}
+	if (##class(Errors).IsError(sc, printMessage)) {
+		quit sc
+	}
+
+	// Write a simple header
+	set sc = ..WriteLine(hdlFile, "; SourceControl.Exporter format version 1.1") 
+	if (##class(Errors).IsError(sc, printMessage)) {
+		quit sc
+	}
+
+	set sc = ..WriteLine(hdlFile, "Name="_artifactName) 
+	if (##class(Errors).IsError(sc, printMessage)) {
+		quit sc
+	}
+
+	set subsLength = $listlength(lstGlobalSubscripts)
+
+	// Iterate through all globals	
+	set length = $listlength(lstGlobalName)
+	for i = 1:1:length {
+		set globalName = $list(lstGlobalName, i)
+		
+		// Iterate through all subscripts
+		for j = 1:1:subsLength {
+			// subscripts
+			set globalSubscripts = $list(lstGlobalSubscripts,j)
+
+			if (globalSubscripts = "") {
+				// $query must have a pair of double quotes as a parameter
+				set globalSubscripts = """"""
+			}
+
+			if (globalSubscripts = """""") {
+				set wholeGlobal = $$$YES
+			}
+
+			// This code has changed a lot, but came originally from
+			// WWWCOFAExportAndImport
+			set strBase = globalName_"("_globalSubscripts
+			set intBaseLength = $length(strBase)
+			set strQuery = strBase_")"
+
+			// Used to make the file easier to read
+			set sc = ..WriteLine(hdlFile)
+			if (##class(Errors).IsError(sc, printMessage)) {
+				quit
+			}
+
+			// Name of the global node
+			//set sc = hdlFile.WriteLine($zconvert(strQuery, "o", "JS"))
+			set sc = ..WriteLine(hdlFile, "Node:"_strQuery)
+			if (##class(Errors).IsError(sc, printMessage)) {
+				quit
+			}
+
+			// Description of this node
+			set description = ..GetGlobalNodeDescription(globalName)
+			if (description '= "") {
+				set sc = ..WriteLine(hdlFile, "; "_description)
+				if (##class(Errors).IsError(sc,printMessage)) {
+					quit
+				}
+			}
+
+			// All new values for that global node
+			for {
+				set strQuery = $query(@strQuery)
+				// Quit when we reach the end or (reach another node if
+				// we don't want all of it)
+				if ((strQuery = "") ||
+					(($extract(strQuery, 1, intBaseLength) '= strBase) &&
+					 ('wholeGlobal))) {
+					quit
+				}
+				if (..IsToIgnore(globalName, strQuery, custom)) continue
+
+				// Used to make the file easier to read
+				set sc = ..WriteLine(hdlFile)
+				if (##class(Errors).IsError(sc, printMessage)) {
+					quit
+				}
+
+				// Write the complete index to what we are exporting
+				set sc = ..WriteLine(hdlFile, "Location:"_strQuery)
+				if (##class(Errors).IsError(sc, printMessage)) {
+					quit
+				}
+
+				// Prepare the record				
+				set record = $get(@strQuery)
+				if (record '= ""){
+					// Get the ignored pieces for the current location
+					set ignoredPieces = ignoredMap.Get(strQuery)
+
+					// Save it in a more structured way
+					set sc = ..WriteRecord(hdlFile, record, ignoredPieces)
+					if (##class(Errors).IsError(sc, printMessage)) {
+						quit
+					}
+				}
+			}
+
+			// Don't keep looping if we have an error
+			if (##class(Errors).IsErrorQuiet(sc)) {
+				quit
+			}
+		}
+	}
+
+	// Always close 
+	do hdlFile.Close()
+
+	do ##class(FileControl).CorrectNIXExecuteFlag(fileName)
+
+	if (('##class(Errors).IsErrorQuiet(sc)) && printMessage) {
+		write !, "Sucessfully exported as "_fileName_":"
+		write !, "Global node(s) "_##class(Lists).GetListAsString(lstGlobalName)
+		write !, "Subscritp(s) "_##class(Lists).GetListAsString(lstGlobalSubscripts, "][")
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="GetGlobalNodeDescription">
+<Description><![CDATA[
+This method tries to identify the description of this global.
+It searchs first in WWW001 and then in WWW120. It returns the first find, if any.
+]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>globalName:%String="&quot;</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[
+	set result = ""
+
+	set length = $length(globalName)
+	if (length > 1) {
+		set name = $extract(globalName, 2, length)
+
+		// Search in WWW001
+		set result = $piece($get(^WWW001(0, name, 1)), "~", 1)
+		if (result = ""){
+			set result = $piece($get(^WWW120(0, name, 1)), "~", 1)
+		}
+	}
+
+	quit result
+]]></Implementation>
+</Method>
+
+<Method name="WriteRecord">
+<Description><![CDATA[
+This method writes a record, each piece on a line, all lines have a trailing index
+
+Example:
+^foo(x,y,z)="bar1~~bar3~~bar5"
+001:bar1
+003:
+005:bar5
+
+Only lines that have a value are printed.
+Pieces that are in the ignored map are skipped.
+]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>file:%File="&quot;,record:%String="&quot;,ignoredMap:Hashtable="&quot;</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set status = $$$OK
+	set line = ""
+
+	// Checks
+	if (file = "") {
+		quit ##class(Errors).MakeErrorStatus("File cannot be empty!")
+	}
+
+	if (record = "") {
+		quit ##class(Errors).MakeErrorStatus("Record to be written cannot "_
+			"be empty!")
+	}
+
+	// Number of pieces
+	set n = $length(record, "~")
+
+	// Write all pieces, one for each line
+	for i = 1:1:n {
+		set piece = $piece(record, "~", i)
+
+		// Skip empty ones
+		if (piece '= "") {
+			// Verify that it is not in the ignored pieces number map
+			if ((ignoredMap = "") || ('ignoredMap.Exists(i))) {
+				// Format leading number (piece identification) plus the record
+				set line = ##class(Strings).FormatNumber(i, 3)_":"_piece
+
+				// Write to disk			
+				set status = ..WriteLine(file, line)
+				if (##class(Errors).IsErrorQuiet(status)) {
+					quit
+				}
+			}
+		}
+	}
+
+	quit status
+]]></Implementation>
+</Method>
+
+<Method name="IsToIgnore">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>globalName:%String,node:%String,custom:%Boolean</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[	quit 0
+]]></Implementation>
+</Method>
+
+<Method name="WriteLine">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>file:%File="&quot;,data:%CacheString="&quot;</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit file.Write(data_$char(10))
+]]></Implementation>
+</Method>
+
+<Method name="ImportNMMetadataHelper">
+<Description><![CDATA[
+Imports @NM metadata. This is a wrapper that traps runtime errors.
+
+This method returns 3 possible codes: 0: runtime error, 1: good, -1: processing error]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>externalFileName:%String,eraseBeforeLoading:%Boolean=0,custom:%Boolean=0</FormalSpec>
+<ReturnType>%Integer</ReturnType>
+<Implementation><![CDATA[
+	// Turn on error traping: this method will return 0 if a runtime
+	// error happens
+	new $etrap
+
+	// The following code will force Cache to keep searching for a
+	// previous etrap error handling
+	set $etrap = "quit:$quit 0 quit"
+
+	// Name of the @NM artifact (ex. WWW001 (form))
+	set name = ""
+
+	// The new node, which may or may not be deleted prior to seting
+	// additional values
+	set node = ""
+
+	// The complete global location to insert a record
+	set location = ""
+
+	// The record that will be inserted in the current global location
+	set record = ""
+
+	// Indicates that a record must be set
+	set recordPending = 0
+
+ 	// Test the file allocation
+	set file = ##class(%File).%New(externalFileName)
+ 	if (file = "") {
+ 		// Error
+		write !, "Unable to access the file '"_externalFileName_"' for "_
+			"importing."
+		quit -1
+ 	}
+
+ 	// Test if the file was opened correctly
+	if ('##class(FileFormat).IsFileNameInUTF8List(externalFileName)) {
+		set sc = file.Open("RS::$Char(10)")
+	}
+	else {
+		set sc = file.Open("RSK\UTF8\::$Char(10)")
+	}
+	if ('sc) {
+ 		//Error
+		write !,"Unable to open the file '"_externalFileName_"' for "_
+			"importing. Is it locked?"
+		quit -1
+	}
+
+	for {
+		set lineLength = 32000
+		set line = file.Read(.lineLength)
+
+		if ($extract(line, $length(line), $length(line)) = $char(13)) {
+			set line = $extract(line, 1, $length(line) - 1)
+		}
+
+		if (lineLength = -1) {
+			// Look for pending values to be processed
+			if (recordPending) {
+				// Process current value
+				do ..SetRecord(location, .record)
+			}
+
+			set recordPending = 0			
+			quit
+		}
+
+		// Skip over comments ;
+		if ((line '= "") && ($extract(line, 1, 1) = ";")) {
+			continue
+		}
+
+		// Name of the artifact
+		if ((line '= "") && (##class(Strings).StartsWith(line, "Name="))) {
+			// Get the name 
+			set name = $extract(line, 6, $length(line))
+			continue
+		}
+
+		// Skip over empty lines
+		if (line = "") { 
+			continue
+		}
+
+		// Look for new node
+		if (##class(Strings).StartsWith(line, "Node:")) {
+			// Look for pending values to be processed
+			if (recordPending) {
+				// Process current value
+				do ..SetRecord(location, record)
+				set recordPending = 0
+			}
+
+			// Get the new node
+			set node = $extract(line, 6, $length(line))
+			set location = ""
+			set value = ""
+
+			if (eraseBeforeLoading) {
+				// Call with all global variables that are needed
+				//write !, "KillNode(", node, ", ", custom, ")"
+				do ..KillNode(node, custom)
+			}
+
+			continue
+		}
+
+		// New location
+		if (##class(Strings).StartsWith(line, "Location:")) {
+			// Look for pending values to be processed
+			if (recordPending) {
+				// Process current value
+				do ..SetRecord(location, record)
+				set recordPending = 0
+			}
+			
+			// Get the new location
+			set location = $extract(line, 10, $length(line))
+			set record = ""
+
+			continue
+		}
+
+		// The only other type of block expected is (NNN:xyz)
+		// New value for the record
+		if (..CollectValue(line, .record)) {
+			set recordPending = 1
+		}
+		else {
+			write !, "Warning: File "_externalFileName_", "_
+				"Name "_name_", Node "_node_", Location "_location_" "_
+				"had invalid data."
+			write !, "Invalid data:"_line
+		}
+	}
+
+	do file.Close()
+
+	quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="SetRecord">
+<Description><![CDATA[
+Inserts a value into a global location. Both parameters must 
+contain normal (unescaped) strings.
+ Example: location="^WWW(1,2,3,4,5,6)" value="qwerty~asdfg~zxcv"
+ ]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>location:%String="&quot;,record:%String="&quot;</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[
+	if (location = "") {
+		quit $$$NO
+	}
+
+	// Set the global
+	//write !, "SetRecord: location='"_location_"', record='"_record_"'"
+	set @location = record
+
+	// 28-Mar-2006 PO: The following will generate indexes,
+	// NOT creating all the indexes that WWWSPEI does though.
+	// However to use SPEI need to change code just above
+	set carretClass = $qsubscript(location,0)
+	set className = $extract(carretClass, 2, $length(carretClass))
+	do ..FillBlankFields(location, className)
+	set key = ""
+	for i = 2:1:$qlength(location) - 1 {
+		set $piece(key, ",", i - 1) = $qsubscript(location, i)
+	}
+
+	if (className '= "COMViewColumn") { // This class isn't used the normal way
+		//write !, "^WWWSSORT(", className, ",", key, ")"
+		do ^WWWSSORT(className, key)
+	}
+
+	quit $$$YES
+]]></Implementation>
+</Method>
+
+<Method name="FillBlankFields">
+<Description><![CDATA[
+preenche variavel "target" ate ficar com "fields" tils
+ ]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>target:%String,className:%String</FormalSpec>
+<Implementation><![CDATA[
+	set fields = ..CountFieldsOnClass(className)
+	if ($length(@target, "~") < fields) {
+	 	set $piece(@target, "~", fields) = ""
+	}
+]]></Implementation>
+</Method>
+
+<Method name="CountFieldsOnClass">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>target</FormalSpec>
+<ReturnType>%Integer</ReturnType>
+<Implementation><![CDATA[
+	set output = 0
+	set next = ""
+	for {
+		set next = $order(^WWW003(0, target, next))
+		quit:(next = "")
+		set output = output + 1
+	}
+	quit output
+]]></Implementation>
+</Method>
+
+<Method name="KillNode">
+<Description><![CDATA[
+This method just calls KILL^COMUtils(), but first it defines the needed
+variables that are read globally by the routines that get called.
+]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>node,custom:%Boolean</FormalSpec>
+<ProcedureBlock>0</ProcedureBlock>
+<Implementation><![CDATA[
+	set YBED = "UNKNOWN"
+	set YUSER = "UNKNOWN"
+
+	set query = node
+	for {
+		set query = $query(@query)
+		quit:(($length(query) = 0) ||
+		      ($extract(query, 1, $length(node) - 1) '=
+		       $extract(node, 1, $length(node) - 1)))
+
+		set carretClass = $qsubscript(query, 0)
+		set className = $extract(carretClass, 2, $length(carretClass))
+		set key = ""
+		for i = 2:1:$qlength(query)-1 {
+			set $piece(key, ",", i-1) = $qsubscript(query, i)
+		}
+
+		if (..IsToIgnore("^"_className, query, custom)) {
+			// Ignore
+		}
+		elseif ((className '= "WWW001") &&
+		    	(className '= "WWW120")) {
+			do KILL^COMUtils(className, key)
+			//write !, "KILL^COMUtils(""", className, """,""", key, """)"
+		}
+		else {
+			kill @("^"_className)@(0, key)
+		}
+	}
+]]></Implementation>
+</Method>
+
+<Method name="CollectValue">
+<Description><![CDATA[
+Sets a piece in record based on what is found in line
+A line must be in the form:
+
+NNN:value
+
+Examples:
+001:blablabla
+125:dbdjabdjbasjdbaj
+]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>line:%String,&amp;record:%String="&quot;</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[
+	// Identify the piece number
+	if ($extract(line, 4, 4) = ":") {
+		set numlen = 3
+	}
+	elseif ($extract(line, 5, 5) = ":") {
+		set numlen = 4
+	}
+	elseif ($extract(line, 6, 6) = ":") {
+		set numlen = 5
+	}
+	else {
+		write !, "Wrong line format!"
+		quit $$$NO
+	}
+	set position = $extract(line, 1, numlen)
+
+	// Validate it
+	if ('$isvalidnum(position)) {
+		write !, "Wrong piece number found!"
+		quit $$$NO
+	}
+
+	// Update the record
+	set $piece(record, "~", position) = $extract(line, numlen + 2, $length(line))
+	quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="ExportAll">
+<Description><![CDATA[
+Exports all Net Manager data]]></Description>
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Integer</ReturnType>
+<Implementation><![CDATA[	quit 0
+]]></Implementation>
+</Method>
+
+<Method name="Export">
+<Description><![CDATA[
+Export @Net Manager data for a specific id
+This routine will either overwrite an existing file or remove it, if
+the id can't be found
+
+Parameters:
+  prefix - the code that is to be exported
+  printMessage - controls whether a message is output to the console
+                 for each]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>id:%String,printMessage:%Boolean=1</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit $$$NO
+]]></Implementation>
+</Method>
+
+<Method name="IsAffected">
+<Description><![CDATA[
+This method tests if a @NM data should be saved (with all its
+dependencies) when some @NM artifact gets changed.
+
+Parameters
+  globalName - example "^WWW123" (the artifact that was changed)
+  
+Example:
+   Suppose somewhere in netmanager there is a routine that changes
+   ^WWW123. We can then use .IsAffected("^WWW123") to figure out if
+   we need to call .Export
+   ]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>globalName:%String</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[
+	if ($get(globalName) = "") {
+		quit 0
+	}
+
+	quit ($listfind(..GetGlobals(), globalName) || $listfind(..GetCustomGlobals(), globalName))
+]]></Implementation>
+</Method>
+
+<Method name="GetGlobals">
+<Description><![CDATA[
+Returns a $listbuild() of the globals]]></Description>
+<ClassMethod>1</ClassMethod>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[	quit ""
+]]></Implementation>
+</Method>
+
+<Method name="GetCustomGlobals">
+<Description><![CDATA[
+Returns a $listbuild() of the globals]]></Description>
+<ClassMethod>1</ClassMethod>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[	quit ""
+]]></Implementation>
+</Method>
+
+<Method name="SaveAuditInfo">
+<Description><![CDATA[
+Log save auditing information]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>fileType:%String,key:%String,userName:%String,sessionId:%String</FormalSpec>
+<Implementation><![CDATA[
+	if (($length(fileType) = 0) || ($length(key) = 0)) quit
+
+	set date = +$horolog
+	set time = $piece($horolog, ",", 2)
+	set ^SourceControlGlobalAudit("SAVE", fileType, key, date, time) =
+		userName_"|"_sessionId
+]]></Implementation>
+</Method>
+
+<Method name="KillAuditInfo">
+<Description><![CDATA[
+Log kill auditing information]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>fileType:%String,key:%String,userName:%String,sessionId:%String</FormalSpec>
+<Implementation><![CDATA[
+	if (($length(fileType) = 0) || ($length(key) = 0)) quit
+
+	set date = +$horolog
+	set time = $piece($horolog, ",", 2)
+	set ^SourceControlGlobalAudit("KILL", fileType, key, date, time) =
+		userName_"|"_sessionId
+]]></Implementation>
+</Method>
+</Class>
+</Export>

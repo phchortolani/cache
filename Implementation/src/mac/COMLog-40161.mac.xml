@@ -1,0 +1,394 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMLog" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMLog
+    ;-------------------------------------------------------------------------------
+	; History:
+	; 02-Oct-2008	GRF		Add & for identified ByRef arguments; removed obsolete
+	; 							surbroutines that should have been cleared before.
+	; 15-Dec-2005	GRF		Boolean Macros
+    ;-------------------------------------------------------------------------------
+#include COMConst
+#include COMSYS
+	
+StartLog(pstrLogDescription,&pidLog,pstrUser="")
+    ;-------------------------------------------------------------------------------
+	;Creates a new log entry.
+    ;-------------------------------------------------------------------------------
+	new objCOMMsg
+	
+	if pstrUser="" set pstrUser = YUSER
+	
+	set objCOMMsg = ""
+	set $$$COMMsgDateTime(objCOMMsg)  = $horolog
+	set $$$COMMsgUser1(objCOMMsg)     = YBED
+	set $$$COMMsgFunction1(objCOMMsg) = pstrLogDescription
+	set $$$COMMsgUser1(objCOMMsg)     = YBED
+	set $$$COMMsgSession(objCOMMsg)   = pstrUser
+	
+	set pidLog=$$^WWWNEXT("COMMsg")
+	
+	; FIXME: Use a WWWSPEI wrapper here, in case status 9 is returned.
+	
+	quit $$^WWWSPEI("COMMsg",pidLog,objCOMMsg)
+	
+	
+AddMessage(pidLog="",pstrMessage,&idEntryNumber,pstrForm="",pidKey="")
+    ;-------------------------------------------------------------------------------
+	;Adds a message to a log.
+	;The Entry Number can be preset
+    ;
+    ; History:
+    ; 06-Jun-2011	shobby	SR17787: Ensure pidLog is defined.
+    ; 18-Jul-2005	RPW		SR12994: Make sure the message is for HTML, including Cache error messages.
+    ; 20-Jun-2005	SCR		SR12696 Added Force save to WWWSPEI (for updating the same message line)
+    ; 09-Feb-2005	Paul K	Added Form to Jump to and Key to Jump To.
+	; 17-Nov-2004	GRF		Replace YKOMMA with $$$COMMA
+	; 25-Feb-2004	SCR		Added Option to Set & Return Entry Number
+    ;-------------------------------------------------------------------------------
+	new objCOMMsgLog,strStatus
+	
+	set strStatus = $$$YES
+	
+	if pidLog'="" {
+		if '$get(idEntryNumber) {
+			set idEntryNumber = $order(^COMMsgLog(0,pidLog,""),-1)+1
+		}
+		
+		set objCOMMsgLog = ""
+		set $$$COMMsgLogDateTime(objCOMMsgLog)	   = $horolog
+		set $$$COMMsgLogMessage1(objCOMMsgLog)	   = $zcvt(pstrMessage,"o","HTML")
+		set $$$COMMsgLogFormtoJumpTo(objCOMMsgLog) = pstrForm
+		set $$$COMMsgLogKeytoJumpTo(objCOMMsgLog)  = pidKey
+ 
+ 		; FIXME: Use a WWWSPEI wrapper here, in case 9 is returned.
+ 		
+		set strStatus = $$^WWWSPEI("COMMsgLog",pidLog_$$$COMMA_idEntryNumber,objCOMMsgLog,$$$YES)
+	
+	} else {
+		set strStatus = $listbuild("Com00059")  ; "Could not find Log Id"
+	}
+	quit strStatus
+	
+	
+PurgeMessageLog(pintDays=0)
+    ;-------------------------------------------------------------------------------
+	; Purge all messages older than the specified number of days
+	; 
+	; History:
+	; 13-Jun-2008	shobby	BR014948: Reverted previous logic, keeping only the Removal
+	; 							of COMMsgLog processing.
+	; 30-May-2008	shobby	BR014948: Rewrite to improve removing of COMMsgLog which
+	; 							may have been orphaned.  Changed the logic of
+	; 							'intDays' from 'Only keep data from the last 'x' days'
+	; 							to 'Keep data from the last 'x' days where there is
+	; 							data. (Avoids confusion when the list is empty
+	; 							because nothing has happened in the last few days)
+	; 15-Mar-2005	Paul K	Added macro usage
+    ;-------------------------------------------------------------------------------
+	new idCOMMsg,dteDate,idCOMMsgLog,intCount
+	
+	set intCount = 0
+	set idCOMMsg = ""
+	for {
+		set idCOMMsg = $order(^COMMsg(0,idCOMMsg))
+		quit:idCOMMsg=""
+		
+		set dteDate = +$$$COMMsgDateTime($get(^COMMsg(0,idCOMMsg,1)))
+		if ($horolog-dteDate)>pintDays {
+			set intCount = intCount+1
+			do KILL^COMUtils("COMMsg",idCOMMsg) ;Doesn't really matter if it fails here.  It will get picked up next time.
+		}
+	}
+	
+	set idCOMMsg = ""
+	for {
+		set idCOMMsg = $order(^COMMsgLog(0,idCOMMsg))
+		quit:idCOMMsg=""
+		
+		set idCOMMsgLog = ""
+		for {
+			set idCOMMsgLog = $order(^COMMsgLog(0,idCOMMsg,idCOMMsgLog))
+			quit:idCOMMsgLog=""
+			
+			set dteDate = +$$$COMMsgLogDateTime($get(^COMMsgLog(0,idCOMMsg,idCOMMsgLog,1)))
+			if ($horolog-dteDate) > pintDays {
+				set intCount = intCount+1
+				do KILL^COMUtils("COMMsgLog",idCOMMsg_","_idCOMMsgLog) ;Doesn't really matter if it fails here.  It will get picked up next time.
+			}
+		}
+	}
+	quit intCount_" items purged"
+	
+	
+GetErrors(Number,pdteStartDate,pdteEndDate)
+    ;-------------------------------------------------------------------------------
+    ; Get All errors from the start date to the end date.
+    ; Don't show errors more than 4 hours later than start date if no end date.
+    ;
+    ; History:
+    ; 04-Apr-2005	SCR/PK	SR12015 Show '<' & '>' in Message
+    ; 03-Feb-2005	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new lngTotalSeconds,intDay,intTime,idUser,intCount
+	
+	set intDay   = $piece(pdteStartDate,",",1)-1
+	set intTime  = $piece(pdteStartDate,",",2)-1
+	set intCount = 0
+	if pdteEndDate="" {  ;4 hours into future.
+		set lngTotalSeconds = $piece(pdteStartDate,",",1)*86400 + $piece(pdteStartDate,",",2) + (3600*4)
+		set pdteEndDate     = (lngTotalSeconds\86400)_","_(lngTotalSeconds#86400)
+	}
+	
+	for {
+		set intDay = $order(^WWWERROR(0,intDay))
+		quit:intDay=""
+		quit:$$DateDiff^COMUtilDate((intDay_","_intTime),pdteEndDate)<=0
+		
+		for {
+			set intTime = $order(^WWWERROR(0,intDay,intTime))
+			quit:intTime=""
+			quit:$$DateDiff^COMUtilDate((intDay_","_intTime),pdteEndDate)<=0
+			
+			set idUser = ""
+			for {
+				set idUser = $order(^WWWERROR(0,intDay,intTime,idUser))
+				quit:idUser=""
+				
+				set intCount = intCount+1
+				do NewLine^COMTable()
+				do InsertCell^COMTable(Number_"."_intCount)
+				do InsertCellDate^COMTable(intDay_","_intTime)
+				do InsertCell^COMTable($zcvt($piece($get(^WWWERROR(0,intDay,intTime,idUser,1)),"/",1),"o","HTML"))
+				do EndLine^COMTable()
+			}
+		}
+	}
+	quit
+	
+	
+ShowMessages(pidLog="")
+    ;-------------------------------------------------------------------------------
+    ; New Hyper event way to display message logs. No More screen refresh!!
+    ;
+    ; History:
+    ; 15-Jun-2011	shobby	SR17720: Don't try and refresh if code database is not connected.
+	; 21-May-2010	shobby	SR17315: Replaced x-small with 10pt.
+    ; 23-May-2005	Paul K	Created SR:12178
+    ;-------------------------------------------------------------------------------
+	if pidLog'="" {
+	&html<
+ 
+<TABLE style="font-size:10pt" BORDER=1 WIDTH=100% CELLSPACING=0 BGCOLOR=lightgrey BORDERCOLORDARK=white BORDERCOLORLIGHT=dimgray>
+<THEAD>
+<TH NOWRAP BGCOLOR=darkgray>#($$$StrCOMMsgLogEntryNo)#</TH>
+<TH NOWRAP BGCOLOR=darkgray>#($$$StrCOMMsgLogDateTime)#</TH>
+<TH NOWRAP BGCOLOR=darkgray>#($$$StrCOMMsgLogMessage1)#</TH>
+</THEAD>
+<TBODY id="MessageLogBody">
+</TBODY>
+</TABLE>
+</font>
+<script language=javascript type='text/javascript'>
+var LastMessageUpdate='';
+var LastRow='#(YWHITE)#';
+ 
+function AddMessage(pidMessage,pstrDate,pstrMessage) {
+	if (document.getElementById('Message'+pidMessage)==null) {
+		var objRow = document.createElement('tr');
+		objRow.id='Message'+pidMessage;
+		if (LastRow=='#(YWHITE)#') {
+			LastRow='#(YGRAY)#';
+		} else {
+			LastRow='#(YWHITE)#';
+		}
+		objRow.style.backgroundColor=LastRow;
+		var objCell = document.createElement('td');
+		objCell.innerHTML=pidMessage;
+		objRow.appendChild(objCell);
+		var objCell = document.createElement('td');
+		objCell.id='Message'+pidMessage+'_Date';
+		objRow.appendChild(objCell);
+		var objCell = document.createElement('td');
+		objCell.id='Message'+pidMessage+'_Message';
+		objRow.appendChild(objCell);
+		MessageLogBody.appendChild(objRow);
+	}
+	document.getElementById('Message'+pidMessage+'_Date').innerHTML=pstrDate;
+	document.getElementById('Message'+pidMessage+'_Message').innerHTML=pstrMessage;
+}
+function CheckMessages() {
+	if (document.getElementById('DATABASEDISCONNECTED')==null) {
+		CallBack('CheckMessages^COMLog','#(pidLog)#',LastMessageUpdate);  //SR17720
+	}
+	window.setTimeout('CheckMessages()',1000);
+}
+CheckMessages();
+</script>
+>
+	}
+	quit
+	
+	
+CheckMessages(pidLog="",pdteLastUpdate="")
+    ;-------------------------------------------------------------------------------
+    ; Called via a hyper event.
+    ; See if there are any new messages not yet shown on the screen put there now.
+    ;
+    ; History:
+    ; 29-Apr-2009	PPP		SR16494: Removed any null characters (ascii 0) only from the Message Entry
+    ; 24-Apr-2009	shobby	SR16494: Removed any null characters (ascii 0) from error messages displayed in COMLog
+    ; 21-Dec-2006	PO		SR14039: Escape strMessage
+    ; 15-Nov-2005	GRF		Add "quit"
+    ; 23-May-2005	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new idEntry,objEntry,strMessage,strDateTime,dteEnd
+	
+	write !,"LastMessageUpdate='"_$horolog_"';"
+	
+	if pidLog'="" {
+		set idEntry = ""
+		for {
+			set idEntry = $order(^COMMsgLog(0,pidLog,idEntry))
+			quit:idEntry=""
+			
+			set objEntry = $get(^COMMsgLog(0,pidLog,idEntry,1))
+			set $$$COMMsgLogMessage1(objEntry)=$$FullReplace^COMUtilStr($extract($$$COMMsgLogMessage1(objEntry),1,1000),$char(0),"")
+			if $$DateDiff^COMUtilDate(pdteLastUpdate,$$$COMMsgLogDateTime(objEntry))>=0 {
+				set strMessage = $zcvt($$$COMMsgLogMessage1(objEntry),"o","JS")
+				if ($$$COMMsgLogFormtoJumpTo(objEntry)'="") && ($$$COMMsgLogKeytoJumpTo(objEntry)'="") {
+					set strMessage = $$InsertLink^COMTable($$$COMMsgLogFormtoJumpTo(objEntry),$$$COMMsgLogKeytoJumpTo(objEntry),strMessage,,,1)
+				}
+				set strDateTime = $$^WWWDATE($$$COMMsgLogDateTime(objEntry))
+				if $piece($$$COMMsgLogDateTime(objEntry),",",2)'="" set strDateTime=strDateTime_" "_$$^WWWTIME($$$COMMsgLogDateTime(objEntry))
+				write !,"AddMessage("_idEntry_",'"_strDateTime_"','"_$$$JSText(strMessage)_"');"
+			}
+			set dteEnd = ""
+			if $order(^COMMsgLog(0,pidLog,idEntry))'="" {
+				set dteEnd = $$$COMMsgLogDateTime($get(^COMMsgLog(0,pidLog,$order(^COMMsgLog(0,pidLog,idEntry)),1)))
+			}
+			do GetErrorsNew(idEntry,$$$COMMsgLogDateTime(objEntry),pdteLastUpdate,dteEnd,$$$COMMsgSession($get(^COMMsg(0,pidLog,1))))	
+		}
+	}
+	quit
+	
+	
+GetErrorsNew(pidEntry,pdteStartDate,pdteWriteFrom,pdteEndDate,pidSession="")
+    ;-------------------------------------------------------------------------------
+    ; Get All errors from the start date to the end date.
+    ; Don't show errors more then 4 hours later than start date if no end date.
+    ;
+    ; History:
+    ; 15-Nov-2005	GRF		Add "quit"
+    ; 23-May-2004			Adapted to return hyperevent rows
+    ; 04-Apr-2005	SCR/PK	SR12015 Show '<' & '>' in Message
+    ; 03-Feb-2005	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new lngTotalSeconds,intDay,intTime,idUser,intCount,strMessage
+	
+	set intDay   = $piece(pdteStartDate,",",1)-1
+	set intTime  = $piece(pdteStartDate,",",2)-1
+	set intCount = 0
+	
+	if pdteEndDate="" {  ;4 hours into future.
+		set lngTotalSeconds = $piece(pdteStartDate,",",1)*86400 + $piece(pdteStartDate,",",2) + (3600*4)
+		set pdteEndDate     = (lngTotalSeconds\86400)_","_(lngTotalSeconds#86400)
+	}
+	
+	for {
+		set intDay=$order(^WWWERROR(0,intDay))
+		quit:intDay=""
+		
+		quit:$$DateDiff^COMUtilDate((intDay_","_intTime),pdteEndDate)<=0
+		
+		for {
+			set intTime=$order(^WWWERROR(0,intDay,intTime))
+			quit:intTime=""
+			quit:$$DateDiff^COMUtilDate((intDay_","_intTime),pdteEndDate)<=0
+			
+			set idUser=""
+			for {
+				set idUser=$order(^WWWERROR(0,intDay,intTime,idUser))
+				quit:idUser=""
+				
+				if (idUser=0) || (idUser=pidSession) {
+					set intCount = intCount+1
+					if $$DateDiff^COMUtilDate(pdteWriteFrom,intDay_","_intTime)>=0 {
+						set strMessage = $zcvt($zcvt($piece($get(^WWWERROR(0,intDay,intTime,idUser,1)),"/",1),"o","HTML"),"o","JS")
+						write !,"AddMessage('"_pidEntry_"."_intCount_"','"_$$^WWWDATE(intDay)_" "_$$^WWWTIME(intTime)_"','"_strMessage_"');"
+					}
+				}
+			}
+		}
+	}
+	quit
+	
+		
+PurgeWSLog(pintDays=0)
+    ;-------------------------------------------------------------------------------
+	; Purge all messages older than the specified number of days
+	; 
+	; History:
+	; 09-Nov-2010	shobby	SR17610: Corrected spelling of ^WWWWSLog, which was causing
+	;							all ^WWWWSLogParamO to be removed prematurely.
+	; 05-Mar-2009	shobby	SR16385: Resolved some code check issues.
+	; 03-Mar-2009	DavidR	SR16385: copied and modified to put loop through all 
+	; 							ParamI and ParamO as separate loop outside original
+	; 							WWWWSLog Loop. Used to Be OldPurgeWSLog.
+	; 							History suggests that the older way could leave orphaned
+	; 							classes
+	; 02-Mar-2009	GRF		SR16385: separate Input and Output processing; >= not =
+	; 27-Feb-2009	DavidR	SR16385: Created
+    ;-------------------------------------------------------------------------------
+	new dteDate,idParamI,idParamO,idWSLog,intCount
+	
+	set intCount = 0
+	set idWSLog  = ""
+	for {
+		set idWSLog = $order(^WWWWSLog(YM,idWSLog))
+		quit:idWSLog=""
+		
+		set dteDate = +$$$WWWWSLogMsgReceived($get(^WWWWSLog(YM,idWSLog,1)))
+		
+		if ($horolog-dteDate) >= pintDays {
+			do KILL^COMUtils("WWWWSLog",idWSLog) ;kills header
+			set intCount = intCount+1
+		}
+	}
+			
+	set idWSLog = ""
+	for {
+		set idWSLog = $order(^WWWWSLogParamI(YM,idWSLog))
+		quit:idWSLog=""
+		
+		if '$data(^WWWWSLog(YM,idWSLog)) {
+			set idParamI = ""
+			for {
+				set idParamI = $order(^WWWWSLogParamI(YM,idWSLog,idParamI))
+				quit:idParamI="" 
+								
+				do KILL^COMUtils("WWWWSLogParamI",idWSLog_$$$COMMA_idParamI) 
+			}
+		}
+	}
+			
+	set idWSLog = ""
+	for {
+		set idWSLog = $order(^WWWWSLogParamO(YM,idWSLog))
+		quit:idWSLog=""
+		
+		;SR17610 if '$data(^WWWSLog(YM,idWSLog)) {
+		if '$data(^WWWWSLog(YM,idWSLog)) {
+			set idParamO = ""
+			for {
+				set idParamO = $order(^WWWWSLogParamO(YM,idWSLog,idParamO))
+				quit:idParamO="" 
+								
+				do KILL^COMUtils("WWWWSLogParamO",idWSLog_$$$COMMA_idParamO) 
+			}
+		}
+	}
+	quit intCount_" items purged"
+	
+]]></Routine>
+</Export>

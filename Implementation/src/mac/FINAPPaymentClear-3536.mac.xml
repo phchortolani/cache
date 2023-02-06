@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPPaymentClear" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPPaymentClear
+	#include FINConst
+	#include COMSYS
+	#include WWWConst
+ 
+CanClear(pidPayment)
+    ;-------------------------------------------------------------------------------
+    ; Determines whether a record can be auto-cleared for bank recon
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 06-Jan-2006	SC			SR13798: Decode wrapper removed. Decode in COMSYS.INC
+    ; 18-Oct-2005	Steve S		SR13216: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,objPay,idBankAcc
+ 
+	set strStatus=$$$OK
+ 
+	if $$$NoKey(pidPayment) {
+		set strStatus=$listbuild("Fin00089")  ;No Record Selected.	
+	} else {
+		set objPay=$get(^FINAPPayment(YM,pidPayment,1))
+		if $$$FINAPPaymentStatus(objPay)'=$$$EnumFINSYSSTATUSCancelled {
+			set strStatus=$listbuild("Fin00920")  ;Can only auto clear cancelled payments	
+		} elseif $$$FINAPPaymentAutoCleared(objPay) {
+			set strStatus=$listbuild("Fin00921",pidPayment)  ;Supplier payment `%1` has already been auto cleared.	
+		} elseif $$$FINAPPaymentBankAccount(objPay)="" {
+			set strStatus=$listbuild("Fin00392")  ;No Bank Account	
+		} 
+	}
+ 
+	if $$$ISOK(strStatus) {
+		set YQ=$$$YQEnable	
+	} else {
+		set YQ=$$$YQDisable(strStatus) ;SR13798
+	}
+ 
+	quit strStatus
+	
+	
+ClearPayments(pidPayment)
+	;-------------------------------------------------------------------------------
+	; Wrapper for ClearPaymentsTxn code.
+	;
+	; Params: pidPayment		: Payment number
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Oct-2006	Steve S		Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+ 
+	set strStatus = $$Transaction^COMTransaction("ClearPaymentsTxn^FINAPPaymentClear("""_pidPayment_""")",$$$YES)
+	if $$$ISOK(strStatus) do ReloadForm^COMUtilForm()
+	
+	quit
+	
+	 
+ClearPaymentsTxn(pidPayment)
+    ;-------------------------------------------------------------------------------
+    ; When a payment run is being posted that has been created from a cancelled
+    ; payment run, this routine will attempt to clear all the cancelled transactions
+    ; from the original payment run in bank rec.
+    ;
+    ; Returns: strStatus
+    ;
+    ; History:
+    ; 18-Oct-2005	Steve S		SR13216: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,idBankAcc,idLine,idBankRec,objPay
+ 
+	set strStatus=$$CanClear(pidPayment)
+	
+	if $$$ISOK(strStatus) && ('$$$NoKey(pidPayment)) {
+		set idBankAcc=$$$FINAPPaymentBankAccount($get(^FINAPPayment(YM,pidPayment,1)))
+		set strStatus = $$AnyUnposted^FINGLBankRecon("",idBankAcc)
+		
+		if $$$ISOK(strStatus) {
+			set strStatus=$$MakeBankRec(idBankAcc,.idBankRec,pidPayment)
+			
+			if $$$ISOK(strStatus) {
+				set idLine=""
+					
+				for {
+					set idLine=$order(^FINAPPaymentLine(YM,pidPayment,idLine))
+					quit:(idLine="")||($$$ISERR(strStatus))
+					set strStatus=$$ClearLine(pidPayment,idLine,idBankRec)
+				}
+				
+				if $$$ISOK(strStatus) set strStatus=$$Post^FINGLBankRecon(idBankRec,$$$YES)
+						
+				if $$$ISOK(strStatus) {
+					set objPay=$get(^FINAPPayment(YM,pidPayment,1))
+					set $$$FINAPPaymentAutoCleared(objPay)=$$$YES
+					set $$$FINAPPaymentBankReconciliation(objPay)=idBankRec
+					set strStatus=$$$Save("FINAPPayment",pidPayment,objPay,1)
+				}
+			}
+		}
+	} 
+	 
+	quit strStatus
+	
+	
+MakeBankRec(idAcc,pidBankRec,pidPay) private
+    ;-------------------------------------------------------------------------------
+    ; Make a bank recon record
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 18-Oct-2005	Steve S		SR13216: Created
+    ;-------------------------------------------------------------------------------
+	new objBankRec,strStatus
+	
+	set pidBankRec=$$$NextKey("FINGLBankRecon")
+	
+	set objBankRec=""
+	set $$$FINGLBankReconBankAccount(objBankRec)	=idAcc
+	set $$$FINGLBankReconNotes(objBankRec)			=$$$Text($lb("Fin00919",pidPay))  ;Auto generated from payment run `%1`.
+	set $$$FINGLBankReconEntered(objBankRec)		=+$h
+	set $$$FINGLBankReconOpeningDate(objBankRec)	=$$GetOpenDate^FINGLBankReconGet(objBankRec)
+	if $$$FINGLBankReconOpeningDate(objBankRec)="" set $$$FINGLBankReconOpeningDate(objBankRec) = +$h
+	
+	set $$$FINGLBankReconClosingDate(objBankRec)	=$$$FINGLBankReconOpeningDate(objBankRec)
+	set $$$FINGLBankReconStatus(objBankRec)			=$$$EnumFINSYSSTATUSUnposted
+	set $$$FINGLBankReconOpeningBalance(objBankRec)	=$$GetOpeningBalance^FINGLBankReconGet(,objBankRec)
+	set $$$FINGLBankReconClosingBalance(objBankRec) =$$$FINGLBankReconOpeningBalance(objBankRec)
+	
+	set strStatus=$$$Save("FINGLBankRecon",pidBankRec,objBankRec,1)
+	
+	quit strStatus
+	
+	
+ClearLine(pidPay,pidPayLine,pidBankRec) private
+    ;-------------------------------------------------------------------------------
+    ; Clear the tran lines in bank rec from the payment line
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 16-Feb-2006	RPW			SR13675: Create a new FINGLBankReconMatched instead
+    ; 									 of a FINGLBankReconCleared
+    ; 18-Oct-2005	Steve S		SR13216: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,objPayLine,strType,idBatch,idBlock,idTran,idBatchBlock,idBatchBlockIdx
+	new idBatchLine,objBatchLine,idTranLine,objTranLine,objBankReconMatched,idAccount
+		
+	set strStatus=$$$OK
+ 
+	set objPayLine=$get(^FINAPPaymentLine(YM,pidPay,pidPayLine,1))
+				
+	for strType="Post","UnPost" {
+		if strType="Post" {
+			set idBatch=$$$FINAPPaymentLinePostingBatchNumber(objPayLine)
+			set idBatchBlock=$$$FINAPPaymentLinePostingBlock(objPayLine)
+		} elseif strType="UnPost" {
+			set idBatch=$$$FINAPPaymentLineReverseInterfaceBatch(objPayLine)
+			set idBatchBlock=$$$FINAPPaymentLineReverseInterfaceBlock(objPayLine)	
+		}
+								
+		if (idBatch="")||(idBatchBlock="") {
+			set strStatus=$listbuild("Fin00265",pidPay) ;Interface Batch and Block information not found for payment ´%1´.	
+		} else {	
+			set idTran=$$$FININTBatchLedgerTransaction($get(^FININTBatch(YM,idBatch,1)))					
+			if (idTran="") {
+				set strStatus=$listbuild("Fin00918",idBatch)  ;Batch line `%1` has no transaction data. Ensure batch has been posted.
+			} else {
+				// Create a new FINGLBankReconMatched entry
+				set idBatchBlockIdx=$$$Index(idBatchBlock)
+				set idBatchLine=""
+				for {
+					set idBatchLine=$order(^FININTBatchLines(YM,30,idBatchBlockIdx,idBatch,idBatchLine))
+					quit:(idBatchLine="")||($$$ISERR(strStatus))
+					
+					set objBatchLine=$get(^FININTBatchLine(YM,idBatch,idBatchLine,1))
+					set idTranLine=$$$FININTBatchLineTranLine(objBatchLine)
+					
+					if (idTranLine'="") {
+						set objTranLine=$get(^FINGLTranLine(YM,idTran,idTranLine,1))
+						if $$$FINGLTranLineCleared(objTranLine)="" {
+							set objBankReconMatched=""
+							set $$$FINGLBankReconMatchedTransaction1(objBankReconMatched)	=idTran
+							set $$$FINGLBankReconMatchedTransactionLine(objBankReconMatched)=idTranLine
+							set $$$FINGLBankReconMatchedAccount(objBankReconMatched)		=$$$FINGLTranLineAccount(objTranLine)
+							set $$$FINGLBankReconMatchedTransactionType(objBankReconMatched)=strType				
+							set $$$FINGLBankReconMatchedDeposit(objBankReconMatched)		=+$$$FINGLTranLineDebit(objTranLine)
+							set $$$FINGLBankReconMatchedWithdrawal(objBankReconMatched)		=+$$$FINGLTranLineCredit(objTranLine)
+							set $$$FINGLBankReconMatchedTransactionDate(objBankReconMatched)=$$$FINGLTranLineTransactionDate(objTranLine)
+							set $$$FINGLBankReconMatchedReference(objBankReconMatched)		=$$$FINGLTranLineReference(objTranLine)
+							set $$$FINGLBankReconMatchedCleared(objBankReconMatched)		=$$$YES
+							set $$$FINGLBankReconMatchedManuallyCleared(objBankReconMatched)=$$$NO
+							
+							set strStatus=$$$Save("FINGLBankReconMatched",pidBankRec_","_($order(^FINGLBankReconMatched(YM,pidBankRec,""),-1)+1),objBankReconMatched)
+							//do UpdateCleared^FINGLBankRecon(pidBankRec,pidBankRec,idTran,idTranLine,$$$NO)
+							;do Save^COMUtils("FINGLBankReconCleared",pidBankRec_","_idTran_","_idTranLine,objBankReconCleared,1)
+							
+						} else {
+							set strStatus=$listbuild("Fin00925",idTran,idTranLine,$$$FINGLTranLineCleared(objTranLine))  ;Auto clear failed. Transaction %1, Line %2, has already been cleared in Bank Reconciliation `%3`.
+						}
+					} else {
+						set strStatus=$listbuild("Fin00918",idBatchLine)  ;Batch line `%1` has no transaction data. Ensure batch has been posted.
+					}
+				}
+			}
+		}
+	}
+							
+	quit strStatus
+]]></Routine>
+</Export>

@@ -1,0 +1,330 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alSOH.piSOH">
+<Abstract>1</Abstract>
+<ClassType/>
+<IncludeCode>INConst,COMSYS</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%RegisteredObject</Super>
+
+<Method name="Post">
+<Description><![CDATA[
+	Post a Stock Transaction<br>
+	Returns a SOH Transaction ID.<p>
+	creates and saves the Transaction details of the Stock on Hand 
+	This must be created before any new changes to the SOH module take place
+
+ Params:<br>
+ pobjMove					The movement object
+ pidLocn					Site Location<br>
+ pidStorage					Storage<br>
+ pfltQty					Quantity to update by (+ve = increase, -ve = reduce)<br>
+ pcurCost					Currenct Unit Cost<br>
+ pidTxType					The transaction type <br>
+ sc							(Output) Status Code<br>
+ Returns: <br>
+ transaction ID]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pobjMove:alDRP.dMovement,pidLocn:alLOC.dLocation,pidStorage:alLOC.dStorage,pfltQty:%Float,pcurCost:%Currency,pTxType:alSOH.dTransactionType,*sc:%Status,pobjNewPhysical:alLOC.dStorage="&quot;</FormalSpec>
+<ReturnType>alSOH.dStockHistory</ReturnType>
+<Implementation><![CDATA[
+#define enumAverageCost		9
+	;-------------------------------------------------------------------------------
+	; Updates : Stock History                           (alSOH.dStockHistory)
+	;           Stock On Hand by Location               (alSOH.dStockBalance)
+	;           Stock On Hand by Storage                (alSOH.dSOH)
+	;           Stock On Hand by Storage and Bundle     (alSOH.dBundleStock)
+	;
+	; Called By:
+	;	alDRP.dMovementType.*  (after recalc of avg cost in Receipt/ReceiptReverse)
+	; 
+	; History:
+	; 26-Feb-2014	SCR		HEVA-1343: Check for 'In Transaction'
+	; 03-Jan-2014	SCR		SESDF-655: Check Delete Storage usage
+	; 27-Sep-2013	SCR		CORE-266: Last Check of Attributes, Double check for 'Non Lot Controlled' Location moving to 'Lot Controlled'
+	; 18-Apr-2013	SCR		CORE-83: Check Locking
+	; 28-Apr-2011	GRF		SR17715: override PhysicalStorage with parameter for
+	;							RelocateByPallet
+	; 21-Apr-2011	GRF		SR17715: populate PhysicalStorage for TSU-based txs
+	; 09-Dec-2010	GRF		SR17509: Need to pass transaction date/time to get
+	;							opening Avg Cost since this transaction may have
+	;							already updated it
+	; 16-Feb-2010	PPP		SR17183: If the Storage is not defined, display an error
+	; 18-Jan-2010	shobby	SR17129: If Transaction Types haven't been configured yet. Display a warning when
+	; 							trying to Post.
+	; 10-Nov-2009	PPP		SR17023: Added SubType value to SOH,dStockHistory
+	; 02-Nov-2009	GRF		SR16871: INItemCost with location replaces INARTKOST;
+	; 10-Sep-2009	PPP		SR16884: If Item is a Consumable - define Trn as NonStock
+	; 12-Jun-2009	DWR		SR16473: get average cost and use this to populate ValueOnHandLocn 
+	; 04-Feb-2009	HQN		SR16341: Store MovementType
+	; 20-Oct-2008	GRF		SR15873: Variable cleanup
+	; 10-Oct-2008 	Luke	SR16025: Removed reference to Default Policy 
+	; 27-Aug-2008	Luke	SR15691: Correct TxValue being set to the passed in pcurCost
+	; 								
+	; 27-Aug-2008	GRF		SR15691: Peer - Added missing parentheses around third
+	; 							clause in test; added message text
+	; 19-Aug-2008	HQN		Default bundle merge
+	; 15-Aug-2008	Luke	SR15691: Added parameter pcurCost and addionation logic 
+	; 19-Feb-2008   Luke	SR15625: rewrote logic to actually work using objects 
+	; 24-Jan-2008 	HQN		SR15625 Changed class signature dStorage to dUStorage
+	;							and dLocation to dULocation
+	; 23-Nov-2007	GRF		SR15558: Replace non-existent pblnNonStock
+	; 14-Nov-2007	SCR		SR15558: Change Interface and Processing
+	; 03-Aug-2007	SCR		SR15558: Changed to a Single Post Method
+	; 20-Aug-2007	Luke	SR15558: created all internal logic and code 
+	; 08-Aug-2008	SCR		SR15558: Created
+	;-------------------------------------------------------------------------------	
+	set sc = $$$OK
+
+	set objStkHist=""
+
+	if pTxType=$$$NULLOREF { ;SR17129	
+		set message = $$$Text("alSOH0008") ;"System not Configured correctly: Missing Data 'alSOH.dTransactionType'.  Contact System Administrator."
+		set sc = $system.Status.AppendStatus(($$$ERROR($$$GeneralError,message)),sc)
+		
+	} elseif pidStorage=$$$NULLOREF {	//SR17183	
+		set message = $$$Text($lb("alSOH0010",pidLocn.%Id())) ;"Cannot process Transaction.  Storage has not been defined for Location %1"
+		set sc = $system.Status.AppendStatus(($$$ERROR($$$GeneralError,message)),sc)
+
+	} elseif '$tlevel {
+		set sc = $$$ERROR($$$GeneralError,$$$Text($listbuild("IN01810",pobjMove.Item.ItemId)))  ;Unable to Post Item %1 , Not in a Transaction
+	} else {	
+		set objStkHist = ##class(alSOH.dStockHistory).%New()
+		if objStkHist'=$$$NULLOREF {
+			if pidStorage.IsATempSU {     ; SR17715
+				if pobjNewPhysical'=$$$NULLOREF {
+					set objPhysical = pobjNewPhysical
+				} else {
+					set objPhysical = pidStorage.Physical
+				}
+			} else {
+				set objPhysical = $$$NULLOREF
+			}
+			
+			set objStkHist.Item       	= pobjMove.Item
+			set objStkHist.Location   	= pidLocn		
+			set objStkHist.Storage    	= pidStorage
+			set objStkHist.TxType     	= pTxType
+			set objStkHist.SubType    	= pobjMove.SubType
+			set objStkHist.Reference 	 = pobjMove.Reference
+			set objStkHist.LineNumber 	= pobjMove.LineNumber
+			set objStkHist.TxValue    	= pcurCost*pfltQty
+			set objStkHist.QtyMoved   	= pfltQty
+			set objStkHist.Bundle     	= pobjMove.Bundle
+			set objStkHist.PhysicalStorage = objPhysical   ; SR17715
+			
+			//SR16884
+			set blnNonStock 		  	= ##class(alINV.dUItemLocation).IsConsumable(objStkHist.Storage.Location.%Id(),objStkHist.Item.%Id())
+			set objStkHist.NonStock	  	= blnNonStock
+			
+			set idDeleteStorage			= $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+
+			if objStkHist.NonStock {
+				if objStkHist.Storage.Code '= idDeleteStorage {
+					set message = $$$Text($listbuild("IN01806",objStkHist.Location.Code,objStkHist.Item.ItemId,objStkHist.Storage.Code,idDeleteStorage))  ;Non Stock Transaction Location for %1 for Item %2 is using Storage '%3' , Should be using Delete Storage '%4'
+					set sc = $system.Status.AppendStatus(($$$ERROR($$$GeneralError,message)),sc)
+				}
+			} else {
+				if objStkHist.Storage.Code = idDeleteStorage {
+					set message = $$$Text($listbuild("IN01807",objStkHist.Location.Code,objStkHist.Item.ItemId,idDeleteStorage))  ;Stock Transaction for Location %1 for Item %2 can not use Delete Storage '%3'
+					set sc = $system.Status.AppendStatus(($$$ERROR($$$GeneralError,message)),sc)
+				}
+			}
+		
+
+			set objSOH = ##class(alSOH.dSOH).GetSOH(pobjMove.Item,pidStorage)
+			set objStkHist.QOHStorage = objSOH.QtyOnHand
+			set objStkHist.StdPrice   = pcurCost
+		
+			set objStockBal = ##class(alSOH.dStockBalance).GetStkBalance(pobjMove.Item,pidLocn)
+			; FIXME : Where is this updated? [Updated in step following this one in alDRP.dMovementType.*]
+			; FIXME : Situation when first transaction? - do we need to test for NULLOREF? <GRF>
+		
+		; SR17509 vvv
+		;	set fltCost = $$GetCost^INItemCost(pobjMove.Item.ItemId,pidLocn.Code,$$$enumAverageCost)
+			set strCreated   = pobjMove.DateTimeCreated
+			set dteCreatedOn = $$^WWWDATE1($piece(strCreated," ",1),"YYYY-MM-DD")
+			set tmeCreatedAt = $$^WWWTIME1($piece(strCreated," ",2))
+			set fltCost      = $$GetCost^INItemCost(pobjMove.Item.ItemId,pidLocn.Code,$$$enumAverageCost,dteCreatedOn,tmeCreatedAt)
+		; SR17509 ^^^
+		;-----	
+			set objStkHist.QOHLocn         = objStockBal.QtyOnHand         ; Get from dStockBalance
+			set objStkHist.ValueOnHandLocn = fltCost * objStkHist.QOHLocn  ; SR16473
+		
+			//	set objStkHist.StdPrice As %Float;
+			set objStkHist.DateConfirmed = +$horolog
+			set objStkHist.TimeConfirmed = $piece($horolog,",",2)
+	
+			set objStkHist.MovementType  = pobjMove.MovementType
+			set:$$$ISOK(sc) sc = $$SOHPostCheck^INLocking(objStkHist.Item.ItemId,
+												objStkHist.Location.Code,
+												objStkHist.Storage.Code,
+												objStkHist.MovementType.MovementTypeId,
+												objStkHist.TxType.TxnID,
+												objStkHist.Reference,
+												objStkHist.LineNumber
+												) ; CORE-83	
+			; Post Bundle Check - CORE-266 vvvvv
+			if $$$ISOK(sc) {
+				set sc = objStkHist.Bundle.GetAttributes( .arrBundleAttributes ) 
+			}
+			if $$$ISOK(sc) {
+				set sc = ##class(alSOH.iBundle).GetAttributesForPolicy(objStkHist.Item.ItemPolicy.%Id(), .arrReqAttributes, objStkHist.Location.Code)
+			}
+			if $$$ISOK(sc) {
+				if '##class(alSOH.iBundle).VerifyAttributes( .arrBundleAttributes, .arrReqAttributes, .lstMissing ) {
+					set sc = $$$ERROR(5001,$$$Text($listbuild("IN01452",objStkHist.Item.ItemId,objStkHist.LineNumber,lstMissing)))  ;Item %1 on line %2 has missing attributes %3
+				}			
+			}
+			; Post Bundle Check - CORE-266 ^^^^^
+
+
+		;+++++++++++++++++++++++++++++++++++++++
+			;set sc = objStkHist.%Save()	
+			if $$$ISOK(sc) {
+				set sc = objStkHist.%Save()
+			}
+		;+++++++++++++++++++++++++++++++++++++++
+			if $$$ISERR(sc) {
+				set message = $$$Text("alSOH0002")        ; "Error Processing Movement"
+				set sc =$system.Status.AppendStatus(($$$ERROR($$$GeneralError,message)),sc)
+			}
+		} else {                            ; "Can not post new transaction for Item %1"
+			set message = $$$Text($listbuild("alSOH0001",pobjMove.Item))
+			set sc = $system.Status.AppendStatus($$$ERROR($$$GeneralError,message))
+		}
+	}
+
+	quit objStkHist
+]]></Implementation>
+</Method>
+
+<Method name="GetStock">
+<Description><![CDATA[
+Returns a list of dStockBundles for this dItem at this location]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pobjItem:alINV.dItem,pobjLocn:alLOC.dLocation,pobjStore:alLOC.dStorage</FormalSpec>
+<ReturnType>%Library.ListOfObjects</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; History:
+	; 06-May-2008 	Luke	SR15704: reversed calls for lifo and fifo
+	; 05-May-2008 	Luke	SR15704: calls for acs and desc for LIFO and FIFO queries 
+	; 29-Apr-2008	GRF		SR15694: Include optional Storage through to limit
+	; 							returned BundleStorages to those in that storage
+	; 							Put Item first to keep Locn with Storage
+	; 22-Apr-2008 	Luke	SR15684 Checked the policy type for "Blank Policy", called a 
+	; 						different SQL for this type
+	; 25-Mar-2008	HQN		Changed parameters to be true objects
+	; 13-Mar-2008	HQN		Added Ordering processing in place for FEFO/FIFO
+	; 28-Feb-2008	HQN		Moved to query V2 datastore
+	; 						moved old code to GetStockV1
+	; 24-Jan-2008	HQN		SR15625 Changed class signature dStorage to dUStorage
+	; 16-Nov-2007	LB		SR15598: Created 
+	;-------------------------------------------------------------------------------
+	set lstStock = ##class(%Library.ListOfObjects).%New()	
+
+	if pobjStore '= $$$NULLOREF {
+		set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetBundles")
+		set sc = objResultSet.Execute(pobjItem.%Id(),pobjStore.%Id())
+	} else {
+		if pobjItem.ItemPolicy.SourceType = "Storage" {
+			set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetViaLocationOrderByStore")
+		
+		} else {
+			set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetViaLocation")
+		}
+		set sc = objResultSet.Execute(pobjItem.%Id(), pobjLocn.%Id())
+	}
+	
+	if sc {
+		while objResultSet.Next(.sc) {
+			set objStock = ##class(alSOH.dBundleStock).%OpenId(objResultSet.Data("ID"))
+			do lstStock.Insert(objStock)
+		}
+	}
+	/*
+	//if pobjItem.ItemPolicy.Description = "Blank Policy" {
+	if pobjItem.ItemPolicy.SourceType = "Storage" {
+		set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetViaLocationOrderByStore")
+
+	} else {
+		set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetViaLocation")
+	}
+	
+	if objResultSet.Execute(pobjItem.%Id(), pobjLocn.%Id()) {
+		while objResultSet.Next(.sc) {
+			set objStock = ##class(alSOH.dBundleStock).%OpenId(objResultSet.Data("ID"))
+			if (pobjStore = $$$NULLOREF) || (objStock.Storage = pobjStore) {
+				do lstStock.Insert(objStock)
+			}
+		}
+	}
+	
+	*/
+	quit lstStock
+]]></Implementation>
+</Method>
+
+<Method name="GetStockV1">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pobjLocn:alLOC.dULocation,pidItem:%String</FormalSpec>
+<ReturnType>%Library.ListOfObjects</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; History:
+	; 22-Apr-2008	HQN		SR15673: Corrected reference to iUINV
+	; 16-Nov-2007	LB		SR15598: Created 
+	;-------------------------------------------------------------------------------
+	;set idItem      = $piece(pidINWEKey,"||",2)
+	;set dteReceived = $piece(pidINWEKey,"||",5)
+	
+	set lstStock = ##class(%Library.ListOfObjects).%New()	
+ 	set idLocn   = pobjLocn.Location
+ 	set YM       = 0
+ 	//--------------------------------------
+ 	//	TotalQty#SLQty*Storage;SLQty*Storage;... split into
+ 	//		TotalQty
+ 	//		SLQty*StockLocn;SLQty*StockLocn
+ 	//--------------------------------------
+ 	set strValue = $$AvailQtyByLocn^INARTMENGE(pidItem,idLocn)
+	set numTotal = $piece(strValue,"#",1)
+	set strValue = $piece(strValue,"#",2)
+	
+	if numTotal'=0 {
+		set loopLength = $length(strValue,";") 
+		
+		for loopi = 1:1:loopLength {
+			set strTemp    = $piece(strValue,";",loopi) 
+			set strQty     = $piece(strTemp,"*",1) 
+			set strStorage = $piece(strTemp,"*",2)
+			set dteReceived = ""
+			set tempVal = ""
+			for {
+				set dteReceived = $order(^INWE(YM,pidItem,idLocn,strStorage,dteReceived))
+				quit:dteReceived=""
+				
+				set objStock = ##class(alSOH.dBundleStock).%New()
+				set objStock.Item        = ##class(alINV.iUINV).GetItem(pidItem)   ; FIXME ,.sc // SR15673
+		;		set idINWEKey            = Item _"||"_idLocn_"||"_strStorage_"||"_dteReceived
+				set objStock.Bundle      = pidItem _"||"_dteReceived
+		;		set objStock.Location    = pobjLocn
+				set objStock.Storage     = ##class(alLOC.dUStorage).%OpenId(0_"||"_idLocn_"||"_strStorage)
+				//$piece(pidItem,"||",5) // CHECK THIS should be the date thingo on inwe
+				
+		;		set objStock.PickSequenc = $piece(pidItem,"||",5) // CHECK THIS should be the date thingo on inwe
+				set objStock.QtyOnHand   = $$$INWEQuantity($get(^INWE(YM,pidItem,idLocn,strStorage,dteReceived,1))) ; strQty
+				
+				do lstStock.Insert(objStock)
+				//set objINWE = $get(^INWE(YM,pidItem,idLocn,strStorage,dteReceived,1))
+			
+			;	Is this record blocked for some reason?  e.g. Expired stock/Reserved
+			;	Is the quantity here less than or equal to zero?
+			}
+		}
+	}
+	quit lstStock
+]]></Implementation>
+</Method>
+</Class>
+</Export>

@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLProfileBuild" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLProfileBuild
+    ;-------------------------------------------------------------------------------
+    ; Builds GL Accounts from Profiles
+    ;-------------------------------------------------------------------------------
+	
+#include COMSYS
+#include FINConst
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^FINGLProfileBuild("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Build(Process,Log)
+	;-------------------------------------------------------------------------------
+	; Build actual account from the ^mtemp
+	; 
+    ; History:
+    ; 07-Jun-2005	PO		SR:12523 Include new fields Enable posting security & Permitted
+	; 15-Mar-2005	GRF		SR11273 : Apply TLEVEL test to TCOMMIT instead of
+	; 						TROLLBACK; Done is boolean, NextError is status - use
+	; 						$$$NO instead of '$$$OK for 'Done'
+	; 01-Dec-2004	shobby	SR11080 : Use COMLog messaging system rather than
+	; 						FINSysStatus
+    ;  1-Oct-2004	JW		SR10409 : Added RollUpTo field
+	; 16-Mar-2004	SCR		Update Free Fields & Modifier
+	; 27-Feb-2004	SCR		Added Code List
+	; 20-Jan-2004	LW		Corrected Error handling
+	; 20-Jan-2004	LW		Moved NEW statements to avoid STACK errors
+	;-------------------------------------------------------------------------------
+	new Status,Tmp,Number,Done,NextError,Acc,Data,NoChange,Field,Parent
+	new YFORM,ok,ProfileRec,AccField,Profile,intJob,intCount,intCurrent
+	new intPercentage0,intPercentage1,LogEntry
+ 
+	set $ztrap="BuildError"
+	
+	$$$LogR("Build",$get(Process))
+	
+	set Status = $$$OK
+	set intJob = $job
+	set Tmp    = "^mtemp(intJob)"
+	
+	set intPercentage0 = 0
+	set intPercentage1 = 0
+ 
+	set Number=""
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	tstart
+	;+++++++++++++++++++++++++++++++++++++++
+ 
+	; Start making the accounts
+	set intCount = 0
+	set Number   = ""
+	for {
+		set Number = $order(@Tmp@("new",Number))
+		quit:Number=""
+		
+		set intCount=intCount+1
+	}
+	
+	
+	set intCurrent=0
+	do AddMessage^COMLog(Log,$$$Text($listbuild("Fin00422",intPercentage0)),.LogEntry)  ; "Build - %1% Complete."
+	set Done = $$$NO
+	for {
+		quit:Done=$$$YES
+		quit:Status'=$$$OK
+		
+		set Done      = $$$YES
+		set NextError = $$$OK
+		
+		set Number    = ""
+		for {
+			quit:Status'=$$$OK
+			set Number = $order(@Tmp@("new",Number))
+			quit:Number=""
+			
+			set intCurrent     = intCurrent+1
+			set intPercentage0 = $justify(intCurrent/intCount*10,0,0)*10
+			if intPercentage1'=intPercentage0 {
+				do AddMessage^COMLog(Log,$$$Text($listbuild("Fin00422",intPercentage0)),.LogEntry)  ; "Build - %1% Complete."
+				set intPercentage1 = intPercentage0
+			}
+			
+			
+			set NoChange = $$$OK
+			set Acc      = $get(@Tmp@("new",Number))
+			set Data     = $get(^FINGLAccount(YM,Number,1))
+			set Parent   = $piece(Data,Y,4)
+			set $piece(Acc,Y,9)  = @Tmp@("new",Number,1)  ; Profile Indicator
+			set $piece(Acc,Y,20) = @Tmp@("new",Number,2)  ; Profile Codes
+			; Merge New Account fields into Current Data
+			;  and update the NoChange flag
+			for Field=1,2,3,4,9,20,31,32,33 {                           ; SR10409, SR12523
+				if $piece(Data,Y,Field)'=$piece(Acc,Y,Field) {
+					set NoChange = $$$NO
+					set $piece(Data,Y,Field) = $piece(Acc,Y,Field)   ; Update Field
+				}
+			}
+			
+			set Profile = $get(@Tmp@("new",Number,1))
+			if Profile="" set Profile = " "
+			set ProfileRec = $get(^FINGLProfile(YM,Profile,1))
+			for Field=11:1:22 {                                      ; Update Free Fields & Modifier
+				set AccField = Field+10                              ; Offset for Free Fields
+				if Field=21 set AccField = 19                        ; Modifier Field
+				if $piece(Data,Y,AccField)'=$piece(ProfileRec,Y,Field) {
+					set NoChange = $$$NO
+					set $piece(Data,Y,AccField) = $piece(ProfileRec,Y,Field)  ; Update Field
+				}
+			}
+			set Status = $$AccountValid^FINGLAccountProcess(Number,Data)
+			if Status=$$$OK {
+				set Done = $$$NO
+				if NoChange'=$$$OK {
+					set YFORM = "FINGLAccount"
+					set ok    = $$$Save("FINGLAccount",Number,Data,1)
+					if $io["|TNT|" write !,"Saving ",Number," ",NoChange," ",ok
+				}
+				set @Tmp@("done",Number) = 1 ; Done flag - used by the remove code
+				kill @Tmp@("new",Number)
+				
+			} else {
+				set NextError = $$Decode(Status)_"("_Number_")||"_$get(@Tmp@("new",Number,1))
+				set Status    = $$$OK
+			}
+		}
+		
+		if Done=$$$OK {
+			if NextError'=$$$OK {
+				set Status = NextError
+			}
+		}
+	}
+	if Status=$$$OK {
+		set Status = $$Remove(Tmp)
+	}
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	if Status=$$$OK {
+		if $tlevel>0 tcommit  if $io["|TNT|" write !,"Commit"
+ 
+	} else {
+		trollback
+		if $io["|TNT|" write !,"RollBack"
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+	quit Status	
+	
+BuildError
+	set $ztrap=""
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	TROLLBACK
+	;+++++++++++++++++++++++++++++++++++++++
+	quit "Error "_$zerror
+	
+ 
+Remove(Tmp) ; Any Account that are profile account but not created in this run.
+	;-------------------------------------------------------------------------------
+	; History
+	; 19-Oct-2006	JW		SR15134: Look at kill status
+	; 22-Jun-2004	shobby	KILL^FINSYS 
+	;------------------------------------------------------------------------------
+	new Account,Data,blnDone,strStatus
+	
+	set strStatus = $$$OK
+	for {
+		set blnDone = $$$YES
+		set Account = ""
+		for {
+			set Account = $order(^FINGLAccount(YM,Account))
+			quit:Account=""
+			
+			set Data = $Get(^FINGLAccount(YM,Account,1))
+			if $$$FINGLAccountProfileIndicator(Data)'="" {                  ; Only check profile accounts
+				if '$data(@Tmp@("done",Account)) {                          ; If it has not been done in this run
+					if $$CanDeleteAccount^FINGLAccountProcess(Account) {    ; If it ok to remove
+						if $io["|TNT|" write !,"Removing ",Account," "
+						set strStatus             = $$$Kill("FINGLAccount",Account)
+						set @Tmp@("done",Account) = 1  ;Remove from the list of things to kill ??? <TODO shobby>
+						set blnDone               = $$$NO
+					}
+				}
+			}
+			quit:$$$ISERR(strStatus)
+		}
+		quit:blnDone
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+Decode(Text)
+	if Text'=$$$OK {
+		set Text = $$DecodeError^COMUtils(Text)
+	}
+	quit Text
+	
+]]></Routine>
+</Export>

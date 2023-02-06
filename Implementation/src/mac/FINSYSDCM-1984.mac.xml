@@ -1,0 +1,436 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINSYSDCM" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINSYSDCM
+	
+#include FINConst
+#include COMSYS
+	
+GetValue(Node,&Value,Prefix,pblnRequired=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Get Value for A Node - Used for Complex message usage
+	; 
+	; ByRef : Value
+	; 
+	; History
+	; 17-Apr-2005	GRF		SR12146 : boolean default for Required
+	; 17-Jul-2003	SCR		Increased Checking
+	;-------------------------------------------------------------------------------
+	new Ref,Status
+	
+	set $ztrap="GetValueError"
+	
+	set Value  = ""
+	set Status = $$$OK
+	set Ref    = Prefix_""""_Node_""")"
+	set Value  = $get(@Ref)
+	if (Value="") && pblnRequired set Status = $listbuild("Fin00184",Node)  ; "Interface requires a Value for %1"
+	quit Status
+	
+GetValueError ; Internal Tag
+	quit $listbuild("Get Value Error "_Ref)	
+	
+	
+Event(Class,Type,Key,YM,SendAll)
+	;-------------------------------------------------------------------------------
+	; Log Change, Put on Deferred Queue or Event Queue
+	; 
+	; History
+	; 16-Aug-2005	RPW		SRxxxx: Fixed locking issues and rollback by adding an error handler
+	; 02-Mar-2004	SCR		Auto Create Data Control Record & default to
+	; 						"Send Each Change"
+	;-------------------------------------------------------------------------------
+	new Mode,Rec,Status
+	
+	set Status = $$$OK
+	if YM="" set Status = "0~No Company"
+	if $$$ISOK(Status) && (Class="") set Status = "0~No Class"
+	
+	set $ztrap="EventError"
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	lock +^FINSYSDCM(YM,Class):10
+	else  set Status="0~Lock time out"
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set Rec = ""
+	if $$$ISOK(Status) {
+		set Rec = $get(^FINSYSDCM(YM,Class,1))
+		if (Rec="") {
+			set $$$FINSYSDCMSendMode(Rec) = $$$EnumFINSYSDCMDELTASendEachChange
+		}
+		
+		;set Status = "0~No Data Control Record for '"_Class_"'"
+		
+		set Mode = $piece(Rec,Y,1)
+		if '$data(^FINSYSDCMQueue(YM,Class,Key)) {
+			set $piece(Rec,Y,2) = $piece(Rec,Y,2)+1
+		}
+		set ^FINSYSDCMQueue(YM,Class,Key) = Type_"~"_$horolog
+		set $piece(Rec,Y,3) = $horolog
+		
+		new YFORM
+		
+		set YFORM = "FINSYSDCM"
+		do Save^FINSYS(YFORM,Class,Rec,$$$YES)   ; FIXME : Use $$$Save
+		if Mode=1 { ; Do it now
+			if '$get(SendAll) { ; And not Send All
+				do SendQueue(YM,Class)
+			}
+		}
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+	if (YM'="") && (Class'="") Lock -^FINSYSDCM(YM,Class)
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	quit Status
+	
+EventError ; Internal Tag
+	set $ztrap=""
+	lock -^FINSYSDCM(YM,Class)
+	
+	quit Status
+	
+	
+ShowSchedule(Class="")
+	;-------------------------------------------------------------------------------
+    ; Show Schedule for Sending
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 11-Feb-2011	GRF		SR17659: COMSchedule replaces Double quote (char 34)
+    ;							with special single quote (char 180) so do that now
+    ;							to avoid problems where HTML code generated with
+    ;							sub-string inside string finds wrong end of string.
+    ; 18-Feb-2004	SCR		Created
+	;-------------------------------------------------------------------------------
+	if Class'="" {
+	;	do AfterDataField^COMSchedule(Class,"FINSYSDCM","SendQueue^FINSYSDCM("_YM_","""_Class_""")",$$$Text($listbuild("Fin00524",Class),0)) ;SR17659
+		do AfterDataField^COMSchedule(Class,"FINSYSDCM","SendQueue^FINSYSDCM("_YM_",´"_Class_"´)",$$$Text($listbuild("Fin00524",Class),0))
+	}  ; "Finance Data Control for (%1)"
+	if (YM'="") && (Class'="") lock -^FINSYSDCM(YM,Class)
+	quit
+	
+	
+SendQueue(YM=0,Class="",SendAll)
+	;-------------------------------------------------------------------------------
+	; Send Queued message to DCM
+	; 
+	; History
+	; 15-Feb-2010	GRF		Add return value to SendQueueError to avoid command error
+	; 17-Mar-2006	GRF		Turn off unneeded logging - per SR
+	; 16-Aug-2005	RPW		SRxxxx: Fixed locking issues and rollback by adding an
+	; 							error handler
+	; 10-Mar-2005	RobertW		Fixed TCOMMIT and TROLLBACK (SR11273)
+	; 15-May-2003	SCR		Added FINARInvoice,FINGLProfile,FINGLProfileCode &
+	; 						Code restructure
+	;-------------------------------------------------------------------------------
+	new Status,Rec,Key,Count,Mode,Glo,DTD,Type
+	
+	set Status = $$$OK
+	if YM="" set Status = "0~No Company"
+	if Status && (Class="") set Status = "0~No Class"
+	
+	set $ztrap="SendQueueError"
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	lock +^FINSYSDCM(YM,Class):10
+	tstart
+	else  set Status = "0~Lock time out"
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set Rec = ""
+	if Status {
+		set Rec = $get(^FINSYSDCM(YM,Class,1))
+		set Glo = "^mtemp(""findcm"","_$job_")"
+		kill @Glo
+		set @Glo@("Company") = YM
+		set Mode = $piece(Rec,Y,1)
+		if $get(SendAll) set Mode = 3  			; Send All
+		set @Glo@("Mode") = $piece(Rec,Y,1)
+		
+		; Scan the Queue and Build the DTD
+		set Count = 0
+		set Key   = ""
+		for {
+			set Key = $order(^FINSYSDCMQueue(YM,Class,Key))
+			quit:Key=""
+			
+			set Type = $piece($get(^FINSYSDCMQueue(YM,Class,Key)),Y,1)
+			set DTD  = $$GetDTD(Class)
+			if DTD'="" {
+				set Status = $$ConvertClass(YM,Class,Key,Type,"o",Glo,DTD)
+			}
+			set Count = Count+1
+			quit:'Status
+		}
+	}
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	if 'Status trollback
+	if Status {
+		new YFORM
+		
+		set $piece(Rec,Y,4) = $horolog
+		set $piece(Rec,Y,5) = Count
+		set $piece(Rec,Y,2) = 0
+		set YFORM = "FINSYSDCM"
+		do Save^FINSYS(YFORM,Class,Rec,$$$YES)   ; FIXME : Use $$$Save
+		set Status = $$RaiseEvent("DISCLINC",Class_"Send","other","","^mtemp(""findcm"","_$job_")")
+		if Status {
+			if $tlevel>0 tcommit
+			kill ^FINSYSDCMQueue(YM,Class)
+		}
+		if 'Status trollback
+	}
+	if (YM'="") && (Class'="") lock -^FINSYSDCM(YM,Class)
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	quit Status
+	
+SendQueueError ; Internal Tag
+	set $ztrap=""
+	trollback
+	Lock -^FINSYSDCM(YM,Class)
+	quit Status    ; FIXME : $zerror ???
+	
+	
+GetDTD(Class="")
+	;-------------------------------------------------------------------------------
+	; Set the DTD for a Class
+	; 
+	; History
+	; 12-Jul-2004	shobby	Profile Codes.
+	; 07-Jul-2004	shobby	FINGLProfileCodeType
+	; 07-Jul-2004	shobby	Parentx fields on FINGLProfileCode
+	; 19-Feb-2004	SCR		Added FINGLPeriodTotal
+	; 11-Jul-2003	SCR		Added Profile Code Description
+	;-------------------------------------------------------------------------------
+	new DTD
+	
+	set DTD = ""
+	if Class="FINGLAccount" {
+		set DTD = "Number,K1~Description,D2~Usage,D3~Parent,D4~Type,D5~Sign,D8~Profile,D9~Currency,D14~Currency Account,D15~On Hold,D16~User Access,D17~Profile Description,F1~Profile Codes,D20"
+	}
+	if Class="FINGLProfile" {
+		set DTD = "Number,K1~Description,D2~Usage,D3~Parent,D4~Type,n,D8~Profile,D9~Currency,D14~Currency Account,D15~On Hold,D16~User Access,D17~Include Locations,D9~Exculde Locations,D10"
+	}
+	if Class="FINGLProfileCode"     set DTD = "Code Type,K1~Code,K2~Description,D1~Parent1,D5~Parent2,D6~Parent3,D7"
+	if Class="FINGLProfileCodeType" set DTD = "Id,K1~Description,D1~Unique Parent To,D2~Index,D3"
+	if Class="FINAPBalance"         set DTD = "Number,K1~Balance,D1"
+	if Class="FINARBalance"         set DTD = "Number,K1~Balance,D1"
+	if Class="FINARInvoice" {
+		set DTD = "Customer Number,K1~Invoice Number,K2~Invoice Balance,D1~Invoice Total,D5~Invoice Settlement Discount,D4~Invoice Due Date,D3~Invoice Date,D2~Invoice Hold,D7~Invoice On Hold Reason,D8"
+	}
+	if Class="FINGLPeriodTotal" {
+		set DTD = "Account,K1~Amount,D1~Period,K2~Type,K3"
+	}
+	
+	quit DTD
+	
+	
+RaiseEvent(systemType,dataSourceName,eventType,recordKeys,recordData)
+    ;-------------------------------------------------------------------------------
+    ; Returns:
+    ;
+    ; History:
+    ; 10-Mar-2004	sh/pk/scr	Test for missing YKEY
+    ;-------------------------------------------------------------------------------
+	new Status
+	
+	set Status = $$setRelevantEvents^COMDCMControlModule(systemType,dataSourceName,eventType,recordKeys,recordData)
+	if $get(YKEY)="" set YKEY=" "
+	
+	if '$piece(Status,Y,1) && ($get(YBED)'="") && ($get(YFORM)'="") {
+		set ^WWWWV(YM,YBED,$piece($horolog,",",1),YFORM,YKEY,1) = $piece($horolog,",",1)_Y_$piece($horolog,",",2)_Y_YBED_Y_$piece(Status,Y,2)
+	}
+	quit Status
+	
+	
+ConvertClass(YM,Class,Key,Type,Dir,Glo,DTD)
+	;-------------------------------------------------------------------------------
+	; Convert Class to DTD
+	; 
+	; History
+	; 23-Dec-2004	SCR		Use Number of Keys to Build Rec (SR11394) , Prevents
+	; 							error when there is extra commas on a Key
+	; 19-Feb-2004	SCR		Bug Fix for Multiple Keys coming in
+	; 11-Jul-2003	SCR		Added Extra Fields Option & Send Profile Description
+	; 							as an Extra Field on GLAccount
+	; 15-May-2003	SCR		Handle Multiple keys
+	;-------------------------------------------------------------------------------
+	new Status,Count,Rec,GloRec,YFORM,Ref,KeyCount,Extra,Profile,Keys
+	
+	set Status = $$$OK
+	set YFORM  = Class
+	; FIXME : Use "pidClass" in parameters and in place of "YFORM then" "strGlobal instead of "Class" once "^" suffix added
+	set Keys   = $$Keys(Class)
+	set Class  = "^"_Class
+	set Extra  = ""
+	
+	if (Dir="o") && (Type="Delete") {
+		set Count = $order(^mtemp("findcm",$job,"Del",""),-1)+1
+		set ^mtemp("findcm",$job,"Del",Count,"Delete Key") = Key
+	}
+	if (Dir="o") && (Type="Save") {
+		set Count = $order(^mtemp("findcm",$job,"Save",""),-1)+1
+		set Ref   = Class_"(YM"
+		for KeyCount=1:1:Keys {
+			;if $piece(Key,",",KeyCount)="" {
+			;	set Ref = Ref_","" """
+			;} else {
+				set Ref = Ref_","""_$piece(Key,",",KeyCount)_""""
+			;}
+		}
+		set Ref = Ref_",1)"
+		set Rec = $get(@Ref)
+		if Class="^FINGLAccount" {
+			set Profile = $piece(Rec,Y,9)
+			if Profile'="" {
+				set $piece(Extra,Y,1) = $piece($get(^FINGLProfile(YM,Profile,1)),Y,2)
+			}
+		}
+		set Glo = "^mtemp(""findcm"",$j,""Save"","_Count_")"
+		do Convert(Key,.Rec,.Glo,"o",DTD,Extra)		
+	}
+	
+	if Dir="i" {
+		set Count = ""
+		for {
+			set Count  = $order(@Glo@("Save",Count))
+			set GloRec = $zreference
+			quit:Count=""
+			
+			set Key = $get(@Glo@("Save",Count,"Number"))
+			if Key'="" {
+				set Ref = Class_"(YM"
+				for KeyCount=1:1:Keys {
+					set Ref = Ref_","""_$piece(Key,",",KeyCount)_""""
+				}
+				set Ref = Ref_",1)"
+				set Rec = $get(@Ref)
+				do Convert(Key,.Rec,.GloRec,"i",DTD,Extra)
+				do Save^FINSYS(YFORM,Key,Rec,$$$YES)   ; FIXME : Use $$$Save
+			}
+		}
+	}
+	
+	quit Status
+	
+	
+Load(YM,Class,Data)
+	new Keys,YFORM,Status,DTD
+	
+	set Status = $$$OK
+	set Keys   = 1  ; Default Keys
+	if Class="FINGLAccount" {
+		set DTD    = $$GetDTD(Class)
+		set Status = $$ConvertClass(YM,Class,,,"i",Data,DTD)
+	}
+	
+	quit Status
+	
+	
+Convert(Key,&Rec,&Glo,Dir,DTD,Extra)
+	;-------------------------------------------------------------------------------
+	; DTD to Class & Class to DTD
+	; 
+	; History
+	; 08-Feb-2011	GRF		Add "&"
+	; 06-Apr-2003	shobby	Properly aligned quit.
+	; 11-Jul-2003	SCR		Added Extra fields Option
+	; 15-May-2003	SCR		Bug Fix
+	;-------------------------------------------------------------------------------
+	new Delim,DTDRec,Fld,Locn,Name,Piece,Var
+	
+	for Fld=1:1:$length(DTD,Y) {
+		set DTDRec = $piece(DTD,Y,Fld)
+		set Name   = $piece(DTDRec,",",1)
+		set Locn   = $piece(DTDRec,",",2)
+		set Delim  = Y
+		set Piece  = $extract(Locn,2,99)
+		
+		if $extract(Locn)="F" set Var = "Extra"
+		if $extract(Locn)="D" set Var = "Rec"
+		if $extract(Locn)="K" set Var = "Key",Delim=","
+		if Dir="o" set @Glo@(Name) = $piece(@Var,Delim,Piece)
+		if Dir="i" set $piece(@Var,Delim,Piece) = $get(@Glo@(Name))
+	}
+	quit
+	
+	
+QueueAll(Class,YM)  ; Queue All Records
+	;-------------------------------------------------------------------------------
+	; 
+	; History
+	; 14-May-2003	SCR		AR & AP Invoices
+	;-------------------------------------------------------------------------------
+	new Glo,intKeys,intSubs,Key,Sub
+	
+	set intKeys = 1 ; Default Number of Keys
+	
+	if Class="FINARInvoice"     set intKeys = 2
+	if Class="FINAPInvoice"     set intKeys = 2
+	if Class="FINGLProfileCode" set intKeys = 2
+	if Class="FINGLPeriodTotal" set intKeys = 3
+	
+	set intSubs = intKeys+2 ; = Company + Keys +'1'
+	set Glo="^"_Class_"(YM)"
+	for  {
+		set Glo=$query(@Glo)
+		quit:Glo=""
+		
+		if $qsubscript(Glo,1)'=YM  quit  ; Finished with the Company
+		if $qlength(Glo)=intSubs {
+			if $qsubscript(Glo,intSubs)=1 {
+				set Key = ""
+				for Sub=2:1:intSubs-1 set $piece(Key,",",Sub-1) = $qsubscript(Glo,Sub)
+				do Event(Class,"Save",Key,YM,1)
+			}
+		}
+	}
+	do ^WWWFORM
+	quit
+	
+	
+Log(YM,Accounts)
+	quit $$LoadDiscLedger(YM,Accounts)
+	
+	
+LoadDiscLedger(YM,Accounts)
+	new Acc,Count
+	
+	if $get(@Accounts@("Mode"))=3 {
+		kill ^INFIBSA(YM)
+	}
+	set Count = ""
+	for {
+		set Count = $order(@Accounts@("Save",Count))
+		quit:Count=""
+		
+		set Acc = $get(@Accounts@("Save",Count,"Number"))
+		if Acc'="" {
+	 		set ^INFIBSA(YM,Acc,1) = $get(@Accounts@("Save",Count,"Description"))_Y_$get(@Accounts@("Save",Count,"Type"))_Y_Y_Y_$get(@Accounts@("Save",Count,"Parent"))
+		}
+	}
+	quit $$$OK
+	
+	
+Keys(pidClass="") 	
+    ;-------------------------------------------------------------------------------
+    ; Get the number of Keys for a Class
+    ;
+    ; Returns: The Count of Keys
+    ;
+    ; History:
+    ; 24-Dec-2004	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new intKeys
+	
+	if pidClass="" set pidClass = " "
+	set intKeys = $order(^WWW002(0,pidClass,""),-1)
+	quit intKeys
+	
+]]></Routine>
+</Export>

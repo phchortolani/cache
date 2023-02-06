@@ -1,0 +1,307 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Routine name="VARImportarTratamento" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[VARImportarTratamento
+
+    #include COMSYS
+    #include VARConst
+    
+    
+TratarRegistro(pidImportar,pRegistro,pLinha)
+	;-----------------------------------------------------------------------------------------------------
+	;Faz o tratamento do registro de entrada de acordo com a configuração para importação definida
+	;
+	;Para cada campo configurado trata o dado de origem:
+	; 1º Formatando de acordo com a rotina definida.
+	; 2º Validando o dado no destino de acordo com a rotina definida.
+	;Em qualquer um dos casos, se tiver algum problema gera uma crítica.
+	;
+	;-----------------------------------------------------------------------------------------------------
+	
+	quit:(pidImportar = "") ""
+	quit:(pRegistro   = "") ""
+	quit:(pLinha      = "") ""
+	
+	//for i=1:1:100 { hang 1 }
+	
+	new RegistroDestino,idConfig,objConfig,idCampo,objCampos,RotinaFormatarEntrada,RotinaValidarEntrada,ValorDestino
+	
+	set objImportarArquivo = $G(^VARImportarArquivo(YM,pidImportar,1))
+    set idConfig           = $$$VARImportarArquivoCodConfiguracao(objImportarArquivo) 
+	
+	set RegistroDestino = ""
+	
+	set objConfig = $G(^VARImportarConfig(YM,idConfig,1))
+	
+	set PosicaoCampoOrigem  = $$GetListaPosicaoOrigem^VARImportarConfigCampos(idConfig)
+	set PosicaoCampoDestino = $$GetListaPosicaoDestino^VARImportarConfigCampos(idConfig)
+	
+    set idCampo = ""
+    for {
+    	set idCampo=$order(^VARImportarConfigCampos(YM,idConfig,idCampo))
+    	quit:idCampo=""
+    	set objCampos = $G(^VARImportarConfigCampos(YM,idConfig,idCampo,1))
+    	
+    	set RotinaFormatarEntrada = $$$VARImportarConfigCamposRotinaFormatarEntrada(objCampos)
+		set RotinaValidarEntrada  = $$$VARImportarConfigCamposRotinaValidarEntrada(objCampos)
+		set RotinaObterValorCampo = $$$VARImportarConfigCamposRotinaObterValorCampo(objCampos) 
+		set idCampoDestino        = $piece(PosicaoCampoDestino,Y,idCampo)
+		
+		;Verifica se o campo de Origem é calculado e se foi definido uma rotina ou valor fixo para o campo
+		if (RotinaObterValorCampo '= "") {
+
+			;Se o primeiro caracter for @ chama o método com xecute
+			;senão usa o valor que estiver no campo
+			if ($extract(RotinaObterValorCampo,1,1)="@"){
+				;Monta a rotina de acordo com o que foi definido no campo sem o primeiro caracter
+				set RotinaStr = "set ValorOrigem = "_$extract(RotinaObterValorCampo,2,$length(RotinaObterValorCampo))
+				xecute RotinaStr
+			}
+			else{
+				set ValorOrigem = RotinaObterValorCampo
+			}
+
+		}
+		else{
+			set idCampoOrigem  = $piece(PosicaoCampoOrigem,Y,idCampo)
+			set ValorOrigem    = $piece(pRegistro,Y,idCampoOrigem)
+		}
+		
+		if (RotinaFormatarEntrada = "") {
+			set ValorDestino = ValorOrigem
+		}
+		else{
+			set ValorDestino = $$FormatarEntrada(ValorOrigem,RotinaFormatarEntrada)
+		
+			;Se a rotina retornou "Erro" grava uma crítica e não formata o valor
+			if $piece(ValorDestino,";",1) = "Erro" { 
+				set objCritica = ""
+				;Verifica se já existe alguma crítica para essa linha
+				if $D(^VARImportarArquivoCritica(YM,pidImportar,pLinha)) {
+					set objCritica = $G(^VARImportarArquivoCritica(YM,pidImportar,pLinha,1))
+					set objCritica = objCritica_"|"_$piece(ValorDestino,";",2)
+				}
+				else{
+					set objCritica = $piece(ValorDestino,";",2)
+				}
+				set ^VARImportarArquivoCritica(YM,pidImportar,pLinha,1) = objCritica
+				set $piece(RegistroDestino,Y,idCampoDestino) = ValorOrigem
+				;Se deu erro, vai para o próximo campo
+				continue
+			
+			}
+		
+		}
+
+		;Se não deu erro, grava o valor formatado e faz a validação de acordo com a rotina definida.
+		set $piece(RegistroDestino,Y,idCampoDestino) = ValorDestino
+		
+		if (RotinaValidarEntrada '= ""){
+			SET ^zzsilmar($now()) = RotinaValidarEntrada
+			set ValorValido = $$ValidarEntrada(ValorDestino,RotinaValidarEntrada)
+			SET ^zzsilmar($now()) = ValorValido
+
+			;Se a validação retornou "Erro" grava uma crítica
+			if $piece(ValorValido,";",1) = "Erro" { 
+				set objCritica = ""
+				;Verifica se já existe alguma crítica para essa linha
+				if $D(^VARImportarArquivoCritica(YM,pidImportar,pLinha)) {
+					set objCritica = $G(^VARImportarArquivoCritica(YM,pidImportar,pLinha,1))
+					set objCritica = objCritica_"|"_$piece(ValorValido,";",2)
+				}
+				else{
+					set objCritica = $piece(ValorValido,";",2)
+				}
+				set ^VARImportarArquivoCritica(YM,pidImportar,pLinha,1) = objCritica
+
+			}
+			
+		}
+		
+	}
+	do VerificaChavePrimaria(pidImportar,RegistroDestino,pLinha)
+
+	quit RegistroDestino
+
+
+VerificaChavePrimaria(pidImportar,pDadosDestino,pLinha)
+	;Rotina para verificar se a Chave Primária não está sendo duplicada em algum registro
+	;Se estiver gera uma crítica
+
+			
+	quit:(pidImportar   = "") ""
+	quit:(pDadosDestino = "") ""
+	quit:(pLinha        = "") ""
+	
+	new objImportarArquivo, idConfig, objConfig, ClasseDestino, Chave, ChaveStr,
+	Sep, SobrescreverDadosDestino, ExisteRegistro, RotinaStr, LinhasDuplicadas,
+	objCritica, idCampo, blnChaveEmBranco
+	
+	set objImportarArquivo = $G(^VARImportarArquivo(YM,pidImportar,1))
+	set idConfig           = $$$VARImportarArquivoCodConfiguracao(objImportarArquivo) 
+	
+	set objConfig = $G(^VARImportarConfig(YM,idConfig,1))
+	
+	set ClasseDestino = $$$VARImportarConfigClasseDestino(objConfig)
+
+	set Chave = ""
+	set Sep   = ""
+	set blnChaveEmBranco = $$$NO
+	;Monta a chave primária de acordo com a classe de destino
+	set idChavePrimaria = ""
+	for {
+		set idChavePrimaria=$order(^WWW002(YM,ClasseDestino,idChavePrimaria))
+		quit:idChavePrimaria=""
+		set idCampo = $piece(pDadosDestino,Y,idChavePrimaria)
+		if (idCampo = "") {
+			set blnChaveEmBranco = $$$YES
+		}
+		set Chave = Chave_Sep_idCampo
+		set Sep   = ","
+	}
+	
+	quit:blnChaveEmBranco
+
+	;Verifica se a opção Sobrescrever Dados no Destino está igual a 0-Não
+	;Se estiver não pode existir um registro com mesma chave primária na classe de destino
+	set SobrescreverDadosDestino = +$$$VARImportarConfigSobrescreverDadosDestino(objConfig)
+	
+	if (SobrescreverDadosDestino = $$$NO){
+
+		set ChaveStr = $$MontaChaveComAspas(Chave)
+		
+		;Monta a rotina para verificar se já existe um registro com a mesma Chave Primária
+		set RotinaStr = "set ExisteRegistro = $D(^"_ClasseDestino_"(0,"_ChaveStr_",1) )"		
+		
+		;Executa a rotina
+		xecute RotinaStr
+		
+		;Se já existir um registro, gera uma crítica
+		if (ExisteRegistro = $$$YES){
+			
+			set objCritica = ""
+			;Verifica se já existe alguma crítica para essa linha
+			if $D(^VARImportarArquivoCritica(YM,pidImportar,pLinha)) {
+				set objCritica = $G(^VARImportarArquivoCritica(YM,pidImportar,pLinha,1))
+				set objCritica = objCritica_"|"_"-Já existe um registro com essa Chave Primária na Tabela de Destino ("_Chave_")."
+			}
+			else{
+				set objCritica = "-Já existe um registro com essa Chave Primária na Tabela de Destino ("_Chave_")."
+			}
+			set ^VARImportarArquivoCritica(YM,pidImportar,pLinha,1) = objCritica
+
+		}
+
+	}
+	
+	;Verifica se já existe um registro com mesma chave primária
+	if $D(^VARTempImportarArquivoPK(YM,pYKEY,Chave)){
+		
+		set LinhasDuplicadas = $G(^VARTempImportarArquivoPK(YM,pYKEY,Chave))
+		if (LinhasDuplicadas '= ""){
+			set LinhasDuplicadas = LinhasDuplicadas_", "_pLinha
+		}
+		else{
+			set LinhasDuplicadas = pLinha
+		}
+		
+		set objCritica = ""
+		;Verifica se já existe alguma crítica para essa linha
+		if $D(^VARImportarArquivoCritica(YM,pidImportar,pLinha)) {
+			set objCritica = $G(^VARImportarArquivoCritica(YM,pidImportar,pLinha,1))
+			set objCritica = objCritica_"|"_"-Chave Primária Duplicada ("_Chave_"). Nas Linhas: "_LinhasDuplicadas
+		}
+		else{
+			set objCritica = "-Chave Primária Duplicada ("_Chave_"). Nas Linhas: "_LinhasDuplicadas
+		}
+		set ^VARImportarArquivoCritica(YM,pidImportar,pLinha,1) = objCritica
+		
+		;Grava o número das linhas em que a chave foi duplicada
+		set ^VARTempImportarArquivoPK(YM,pYKEY,Chave) = LinhasDuplicadas
+		
+	}
+	else{
+		;Se ainda não existir a Chave Primária grava ela na global de verificação
+		set ^VARTempImportarArquivoPK(YM,pYKEY,Chave) = pLinha
+	}
+
+	quit
+
+	
+FormatarEntrada(pValorOrigem="",pRotinaFormatar="")
+	;Chama a rotina de formatação configurada se existir, retornando:
+	; - Em caso de Sucesso: o valor formatado.
+	; - Em caso de Falha  : retorna o texto "Erro;mensagem" onde mensagem é diferente para cada rotina de formatação.
+	;Caso a rotina de formatação não esteja definida, devolve o valor de origem.
+
+	;Comentada essa linha porque na Importação de Alterações de Cota
+	;é necessário importar valores nulos e transformá-los
+	;quit:(pValorOrigem = "") ""
+	
+	new Retorno,RotinaStr
+	
+	set Retorno   = ""
+	set RotinaStr = ""
+	
+	;Se não tiver uma rotina definida retorna o próprio Valor de Origem
+	if (pRotinaFormatar = "") {
+		quit pValorOrigem
+	}
+	
+	;Monta a rotina de acordo com a configuração, sempre passando como parâmetro o Valor de Origem
+	set RotinaStr = "set Retorno = "_pRotinaFormatar_"("_""""_pValorOrigem_""""_")"
+	
+	;Executa a rotina
+	xecute RotinaStr
+	
+	quit Retorno
+	
+
+ValidarEntrada(pValorDestino="",pRotinaValidar="")
+	;Chama a rotina de validação configurada se existir, retornando:
+	; - Em caso de Sucesso: 1
+	; - Em caso de Falha  : retorna o texto "Erro;mensagem" onde mensagem é diferente para cada rotina de validação.
+	;Caso a rotina de validação não esteja definida, devolve sempre 1 (sucesso).
+
+	;Continua mesmo que o pValorDestino esteja vazio, principalmente para validar se o campo é obrigatório
+	;quit:(pValorDestino = "") ""
+	
+	new Retorno,RotinaStr
+	
+	set Retorno   = ""
+	set RotinaStr = ""
+	
+	;Se não tiver uma rotina definida retorna sucesso (1)
+	if (pRotinaValidar = "") {
+		quit 1
+	}
+	
+	;Monta a rotina de acordo com a configuração, sempre passando como parâmetro o Valor de Destino já formatado
+	set RotinaStr = "set Retorno = "_pRotinaValidar_"("""_pValorDestino_""")"
+	SET ^zzsilmar($now()) = RotinaStr
+	;Executa a rotina
+	xecute RotinaStr
+	
+	quit Retorno
+
+
+MontaChaveComAspas(pChave="")
+	;Rotina para montar a chave primária com aspas duplas em cada valor
+
+	quit:(pChave="") ""
+	
+	new ChaveStr, cnt, idx
+	
+	set ChaveStr = ""
+	set cnt = $length(pChave,",")
+	for idx=1:1:cnt {
+		if (idx=1) {
+			set ChaveStr = $$$DBLQUOTE_$piece(pChave,",",idx)_$$$DBLQUOTE
+		}
+		else{
+			set ChaveStr = ChaveStr_","_$$$DBLQUOTE_$piece(pChave,",",idx)_$$$DBLQUOTE
+		}
+	}
+	
+	
+	quit ChaveStr]]></Routine>
+</Export>

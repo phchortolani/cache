@@ -1,0 +1,970 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvPrePostCost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvPrePostCost
+	;-------------------------------------------------------------------------------
+	; Routines to SHOW how costings are going to be affected by posting this invoice
+	;-------------------------------------------------------------------------------
+#include COMSYS
+#include INConst
+#include FINConst
+	
+OnAfterDataFields(pidInvoice="")
+	;-------------------------------------------------------------------------------
+	; History:
+	; 19-Apr-2005	JW		SR12173: Use session global. Copied from Pre Post form.
+	; 10-Feb-2005	RPW		added this comment
+	;------------------------------------------------------------------------------- 
+	new strStatus
+	
+	; The following allows the screen to refresh, as the invoice
+	; variable will not exist and YPARA will be blank.
+	if pidInvoice="" {
+		if $IsObject($get(%session)) {
+			set pidInvoice = $get(%session.Data("IMID"))
+		}
+	}
+	set pidInvoice = $$$KEY1(pidInvoice)
+	do Display(pidInvoice)
+	quit
+	
+	
+Display(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 02-Nov-2009	GRF		SR16871: INAvgCost replaces INARTAVG; ^CacheTempAvgCost
+	; 							replaces ^CacheTempINARTAVG; Add Cost Centre
+	; 							parameter
+	; 22-Oct-2009	GRF		SR16971: reverted to simple test (INWE now deprecated)
+	; 19-Aug-2005	RPW		SR11983: Get the discount description for each line.
+	; 28-Jun-2005	shobby	SR12752: Call to IsValidAverageCost
+	; 14-Jun-2005	JW/RW	SR12484: Items without avge costing
+	; 18-Apr-2005	JW		SR12173: Store prev line for each item 
+	; 14-Feb-2005	RPW		Added old and new quantity to the screen.
+	; 10-Feb-2005	RPW		pidInvoice can not be "" so do not allow that as a
+	;							default. Added check for "" as well.
+	; 06-Feb-2005	shobby	Sorted out incorrect variables.
+	;-------------------------------------------------------------------------------
+	new arrItemLink,curTotalNew,curTotalOld,curCostNew,curCostOld,fltQty
+	new idCostCentre,idItem,idLine,idLocn,idPrevLineLink,lstHeader,objInvLine,strSeeAlso
+	
+	kill ^CacheTempAvgCost(YUSER)    ; refresh temporary storage of Average Cost info
+	
+	if $get(pidInvoice)'="" {
+		write !,$$$Text($listbuild("Fin00620",pidInvoice))  ; "Cost variances for Invoice Number : %1"
+		
+		set lstHeader = ""
+		set lstHeader = lstHeader_$listbuild($$$StrFINAPInvLineLine,
+									$$$Text("Fin00611"),  ; "Total Quantity"
+									$$$Text("Fin00612"),  ; "Total Value (Old)"
+									$$$Text("Fin00613"),  ; "Total Value (New)"
+									$$$Text("Fin00614"),  ; "Average Cost (Old)"
+									$$$Text("Fin00615"),  ; "Average Cost (New)"
+									$$$Text("Fin00618"),  ; "Cause"
+									$$$Text("Discount"))  ; "Discount"
+		
+		do Start^COMTable(lstHeader)
+		
+		set idLine = ""
+		for {
+			set idLine = $order(^FINAPInvLine(0,pidInvoice,idLine))
+			quit:idLine=""
+			
+			set objInvLine   = $get(^FINAPInvLine(0,pidInvoice,idLine,1))
+			set idItem       = $$$FINAPInvLineItem(objInvLine)
+			set idLocn       = $$$FINAPInvLineReceiveLocation(objInvLine) ; SR16871
+			set idCostCentre = $$GetCostCentre^INCostCentre(idLocn)       ; SR16871
+			
+		;	do GetHeaderDiscounts(pidInvoice,.arrDiscounts)   ; FIXME : currently 'do nothing' code - commented until required
+			
+			if idItem'="" {
+				do NewLine^COMTable()
+				set idPrevLineLink = $get(arrItemLink(idItem))
+				set arrItemLink(idItem) = idLine
+				
+				do GetPrePostInformation(pidInvoice,idLine,.fltQty,.curTotalOld,.curCostOld,.curTotalNew,.curCostNew,idCostCentre)  ; SR16871
+				
+				set strSeeAlso = ""
+				if idPrevLineLink'="" {
+					set strSeeAlso = "<br><i>"_$$$Text($listbuild("Fin00740",idPrevLineLink))
+				}  ; "See also line %1"
+				
+				do InsertCell^COMTable($$$Text($listbuild("Fin00590",idLine,idItem_" - "_$$$FINAPInvLineItemDescription(objInvLine)))_strSeeAlso)
+				; "Line: %1. Product: %2"
+				
+			;	if $$IsValidAverageCost(idItem,objInvLine) { ;SR12484   ;SR12752  ;SR16971 reverted to simple test
+			;	if $data(^INARTAVG(0,idItem)) {	                          ; SR16871
+				if $data(^INAvgCost(0,idItem,idCostCentre)) {	
+					do InsertCell^COMTable(fltQty)
+					do InsertCurrencyCell^COMTable(curTotalOld)
+					do InsertCurrencyCell^COMTable(curTotalNew)
+					do InsertCurrencyCell^COMTable(curCostOld)
+					do InsertCurrencyCell^COMTable(curCostNew)
+					do InsertCell^COMTable($$GetDescription(pidInvoice,idLine))
+					
+				} else {
+					do InsertCell^COMTable($$$Text($listbuild("Fin00800",idItem)),,,,,,6) ; (6=COLSPAN)
+				}    ; "Item %1 has no average cost data"
+				
+				do InsertCell^COMTable($$GetDiscountDescription(pidInvoice,idLine))
+				do EndLine^COMTable()
+			}
+		}
+		do Stop^COMTable()
+	}
+	 
+	kill ^CacheTempAvgCost(YUSER)     ; clear temporary storage of Average Cost info
+	
+	quit
+	
+	
+GetPrePostInformation(pidInvoice,pidLine,pfltQty=0,pcurTotalValue=0,pcurAvgCost=0,pcurTotalValueNew=0,pcurAvgCostNew=0,pidCostCentre="")
+	;-------------------------------------------------------------------------------
+	; Gets the pre post information from the time the Costs were updated or recalculates
+	; if costs have not been posted. 
+	; 
+	; Called By: Display^FINAPInvPrePostCost, UpdateAverageCosts^FINAPInvPostCost
+	; 
+	; Returns:
+	;
+	; History:
+	; 02-Nov-2009	GRF		SR16871: Add Cost Centre parameter
+	; 14-Jun-2005	JW/RW	SR12484: Reversed SR12173, as new functionality
+	; 19-Apr-2005	JW		SR12173: Pass in prev line id with same item
+	; 16-Feb-2005	Shobby	Created
+	;-------------------------------------------------------------------------------
+	new objFINAPInv,objInvLine,strStatus
+	
+	if ($get(pidInvoice)'="") && ($get(pidLine)'="") {
+		set objFINAPInv = $get(^FINAPInv(0,pidInvoice,1))
+		set objInvLine  = $get(^FINAPInvLine(0,pidInvoice,pidLine,1))
+		
+		if $$$FINAPInvCostsPosted(objFINAPInv) && ($$$FINAPInvLinePrePostingTotalQuantity(objInvLine)'="") {
+			set pfltQty           = $$$FINAPInvLinePrePostingTotalQuantity(objInvLine)
+			set pcurTotalValue    = $$$FINAPInvLinePrePostingTotalValueOld(objInvLine)
+			set pcurAvgCost       = $$$FINAPInvLinePrePostingAverageCostOld(objInvLine)
+			set pcurTotalValueNew = $$$FINAPInvLinePrePostingTotalValueNew(objInvLine)
+			set pcurAvgCostNew    = $$$FINAPInvLinePrePostingAverageCostNew(objInvLine)
+		
+		} else {
+			do GetPrePostInformationNew(pidInvoice,pidLine,.pfltQty,.pcurTotalValue,.pcurAvgCost,.pcurTotalValueNew,.pcurAvgCostNew,pidCostCentre)
+			set $$$FINAPInvLinePrePostingTotalQuantity(objInvLine)  = +pfltQty
+			set $$$FINAPInvLinePrePostingTotalValueOld(objInvLine)  = pcurTotalValue
+			set $$$FINAPInvLinePrePostingAverageCostOld(objInvLine) = pcurAvgCost
+			set $$$FINAPInvLinePrePostingTotalValueNew(objInvLine)  = pcurTotalValueNew
+			set $$$FINAPInvLinePrePostingAverageCostNew(objInvLine) = pcurAvgCostNew
+			
+			set strStatus = $$$Save("FINAPInvLine",pidInvoice_","_pidLine,objInvLine,$$$YES)
+		}
+	}
+	quit
+	
+	
+GetPrePostInformationNew(pidInvoice,pidLine,&pfltQty,&pcurTotalValue,&pcurAvgCost,&pcurTotalValueNew,&pcurAvgCostNew,pidCostCentre="")
+	;-------------------------------------------------------------------------------
+	; Another rewrite of the GetAverageCost method
+	; 
+	; Called By: GetPrePostInformation
+	;
+	; Inputs:
+	;	pidInvoice
+	;	pidLine
+	; 
+	; ByRef:
+	;	pfltQty
+	;	pcurTotalValue
+	;	pcurAvgCost
+	;	pcurTotalValueNew
+	;	pcurAvgCostNew
+	; 
+	; Returns: nothing
+	;
+	; History:
+	; 16-Feb-2010	GRF		SR15421: Ensure $query returns match (may not be an
+	; 							average cost record in existence yet)
+	; 02-Nov-2009	GRF		SR16871: Add pidCostCentre; use with ^CacheTempAvgCost
+	; 02-Nov-2009	GRF		SR16871: INAvgCost replaces INARTAVG; ^CacheTempAvgCost
+	; 							replaces ^CacheTempINARTAVG
+	; 01-Jun-2009	GRF		SR16590: If the Invoice cost = Receipt Cost then the
+	;							value returned in pcurAvgCostNew will match
+	;							pcurAvgCost, otherwise recalculate based on the
+	;							new Invoice cost.
+	; 06-Jul-2006	GRF		SR14471: Replace with meaningful subroutine name
+	; 03-Jul-2006	PO		SR14716: Use same average cost calculation as INARTAVG and
+	;								 prevent divide by zero errors.
+	; 27-Jan-2006	GRF		SR14203: Doco
+	; 05-Jan-2006	RPW		SR14091: If this is a non stock item, bug out, there is no average.
+	; 22-Aug-2005	RPW		SR11983: Added Discount Handling
+	; 10-Jun-2005	JW/RW	SR12484: Use receipt average cost
+	; 19-Apr-2005	JW		SR12173: Use stored totals for same line item
+	; 30-Mar-2005	PO		SR11349:
+	; 14-Mar-2005	PO		SR11349: FC support
+	; 15-Feb-2005	Shobby	Created
+	;-------------------------------------------------------------------------------
+	new curCalcAvg,curCostNew,curOldAvgCost,curDiscount,curRecPrevAvgCost,dteMatch,dtePosted,dteRecvd
+	new idItem,fltNewQty,fltQtyIn,fltQtyOH,objAverage,objFINAPInv,objInvLine
+	new strQuery,tmeMatch,tmeRecvd
+	
+	set pfltQty           = 0
+	set pcurTotalValue    = 0
+	set pcurAvgCost       = 0
+	set pcurTotalValueNew = 0
+	set pcurAvgCostNew    = 0
+	
+	;if ($get(pidInvoice)'="") && ($get(pidLine)'="") {
+	if ($get(pidInvoice)'="") && ($get(pidLine)'="") && ($get(pidCostCentre)'="") {
+		set objInvLine = $get(^FINAPInvLine(0,pidInvoice,pidLine,1))
+		if objInvLine'="" {
+			set idItem = $$$FINAPInvLineItem(objInvLine)
+		;;	set idLocn = $$$FINAPInvLineReceiveLocation(objInvLine)    ; SR16871
+			
+			
+			if idItem'="" {
+				if '$$$INARTItemWithoutInventoryMaint($get(^INART(0,idItem,1))) {
+					set objFINAPInv = $get(^FINAPInv(0,pidInvoice,1))
+					if objFINAPInv'="" {
+						set curDiscount = $$GetDiscountForParentLine^FINAPInvDiscount(pidInvoice,pidLine)
+						set dtePosted   = $$$FINAPInvPostedDate(objFINAPInv)
+						
+						if dtePosted="" {
+					;		if '$data(^CacheTempAvgCost(YUSER,idItem)) {
+					;			merge ^CacheTempAvgCost(YUSER,idItem) = ^INARTAVG(0,idItem)
+							if '$data(^CacheTempAvgCost(YUSER,idItem,pidCostCentre)) {
+								merge ^CacheTempAvgCost(YUSER,idItem,pidCostCentre) = ^INAvgCost(0,idItem,pidCostCentre)
+							}
+							 
+							set curCostNew        = $$GetAllocatedVarianceCost(pidInvoice,pidLine)
+						;	set curRecPrevAvgCost = $$GetReceiptPrevUnitCost(objInvLine)          ; SR16871
+							set curRecPrevAvgCost = $$GetReceiptPrevUnitCost(objInvLine,pidCostCentre)
+							
+						;	set strQuery   = "^CacheTempAvgCost(YUSER,idItem,"_($horolog+1)_")"   ; SR16871
+							set strQuery   = "^CacheTempAvgCost(YUSER,idItem,pidCostCentre,"_($horolog+1)_")"
+							
+					;		set objAverage = @($query(@strQuery,-1))   ; SR15421 vvv
+							set strQuery = $query(@strQuery,-1)
+							if (strQuery'="") && ($qsubscript(strQuery,1)=YUSER) && ($qsubscript(strQuery,2)=idItem) {
+								set objAverage = @strQuery
+							} else {
+								set objAverage = ""
+							}   ; SR15421 ^^^
+							
+					;		set pfltQty = $$$INARTAVGQuantityOnHand(objAverage)+$$$INARTAVGIncomingGoodsQuantity(objAverage) ; SR16871
+							set pfltQty = $$$INAvgCostQtyOnHand(objAverage)+$$$INAvgCostIncomingGoodsQty(objAverage)
+							if pfltQty = 0 {
+								set curDiscount = 0
+							} else {
+								set curDiscount = $$$FCDivd(curDiscount,pfltQty)
+							}
+							set curCostNew  = $$$FCSub(curCostNew,curDiscount)
+							
+					;		set pcurAvgCost = $$$INARTAVGNewAverageCost(objAverage)  ; SR16871
+							set pcurAvgCost = $$$INAvgCostNewAvgCost(objAverage)
+							/* SR16590
+							if pfltQty = 0 {
+								set pcurAvgCostNew = pcurAvgCost
+							} else {
+								set pcurAvgCostNew = pcurAvgCost-(curDiscount/pfltQty)
+							}
+							*/
+							
+							// If receipt price is staying the same, don't need to re-calculate
+						;	if (curCostNew'=curRecPrevAvgCost) {
+						; ^^^ SR16590 vvv	
+							if (curCostNew=curRecPrevAvgCost) {
+								set pcurAvgCostNew = pcurAvgCost
+								
+							} else { ; ^^^ SR16590
+							;	do GetDateTime(objInvLine,.dteMatch,.tmeMatch)   ; SR16871
+								do GetDateTimeForCC(pidCostCentre,objInvLine,.dteMatch,.tmeMatch)
+								
+								// Copied from INERECH1
+								
+								set curCalcAvg  = 0
+								set dteRecvd = ""
+								for {
+									set dteRecvd = $order(^CacheTempAvgCost(YUSER,idItem,pidCostCentre,dteRecvd),-1)
+									quit:dteRecvd=""
+									
+									set tmeRecvd = ""
+									for {
+										set tmeRecvd = $order(^CacheTempAvgCost(YUSER,idItem,pidCostCentre,dteRecvd,tmeRecvd),-1)
+										quit:tmeRecvd=""
+										quit:(dteRecvd=dteMatch)&&(tmeRecvd=tmeMatch)
+									;	quit:+$$$INARTAVGQuantityOnHand($get(^CacheTempAvgCost(YUSER,idItem,dteRecvd,tmeRecvd,1)))=0
+										quit:+$$$INAvgCostQtyOnHand($get(^CacheTempAvgCost(YUSER,idItem,pidCostCentre,dteRecvd,tmeRecvd,1)))=0
+									}
+									quit:tmeRecvd'=""
+								}
+								
+								// Check whether current SOH is zero
+								
+								// If quantity became zero, average cost doesn't change
+								if (dteRecvd=dteMatch) && (tmeRecvd=tmeMatch) && (pfltQty'=0) {
+									// Update CacheTemp with new receipt value
+									// FIXME may change call later as already have most of the data
+	 
+									// THIS WILL FAIL IN THE CASE OF RECEIPT WITHOUT ORDERS
+									// GetReceiptUnitCost is the Unit cost for the invoice line calculated as total/qty
+									//  - *NOT* Weighted Average Cost for the item.
+							;		set $$$INARTAVGIncomingGoodsCost(^CacheTempAvgCost(YUSER,idItem,dteRecvd,tmeRecvd,1)) = $$GetReceiptUnitCost(pidInvoice,pidLine)  ; SR16871
+									set $$$INAvgCostIncomingGoodsCost(^CacheTempAvgCost(YUSER,idItem,pidCostCentre,dteRecvd,tmeRecvd,1)) = $$GetReceiptUnitCost(pidInvoice,pidLine)
+									
+									// Initialise - get prev date/time
+									if (dteRecvd'="") && (tmeRecvd'="") {
+										set dteRecvd = dteRecvd-1
+										set tmeRecvd = tmeRecvd-1
+									}
+									
+									// Loop through
+									; SR16871 vvv
+									for {
+										set dteRecvd = $order(^CacheTempAvgCost(YUSER,idItem,pidCostCentre,dteRecvd))
+										quit:dteRecvd=""
+										
+										for {
+											set tmeRecvd = $order(^CacheTempAvgCost(YUSER,idItem,pidCostCentre,dteRecvd,tmeRecvd))
+											quit:tmeRecvd=""
+											
+											set objAverage = $get(^CacheTempAvgCost(YUSER,idItem,pidCostCentre,dteRecvd,tmeRecvd,1))
+											if +curCalcAvg'=0 {
+												set $$$INAvgCostCurrentAvgCost(objAverage) = curCalcAvg   ; Copy from previous "line"
+											}
+											set fltQtyOH  = $$$INAvgCostQtyOnHand(objAverage)
+											set fltQtyIn  = $$$INAvgCostIncomingGoodsQty(objAverage)
+											set fltNewQty = fltQtyOH + fltQtyIn
+											
+											set curOldAvgCost = $$$INAvgCostCurrentAvgCost(objAverage)
+											
+											if fltNewQty = 0 {
+												set curCalcAvg = curOldAvgCost
+											} else {
+												if fltQtyOH < 0 {
+													if fltNewQty > 0 {
+														set curCalcAvg = $$$INAvgCostIncomingGoodsCost(objAverage)
+													} else {
+														set curCalcAvg = curOldAvgCost
+													}
+												} else {
+													set curCalcAvg = (fltQtyOH * curOldAvgCost) + (fltQtyIn * $$$INAvgCostIncomingGoodsCost(objAverage)) / fltNewQty
+												}
+											}
+											
+											set $$$INAvgCostNewAvgCost(objAverage)                = curCalcAvg
+											set ^CacheTempAvgCost(YUSER,idItem,pidCostCentre,dteRecvd,tmeRecvd,1) = objAverage
+										}
+									}
+									/*
+									for {
+										set dteRecvd = $order(^CacheTempAvgCost(YUSER,idItem,dteRecvd))
+										quit:dteRecvd=""
+										
+										for {
+											set tmeRecvd = $order(^CacheTempAvgCost(YUSER,idItem,dteRecvd,tmeRecvd))
+											quit:tmeRecvd=""
+											
+											set objAverage = $get(^CacheTempAvgCost(YUSER,idItem,dteRecvd,tmeRecvd,1))
+											if +curCalcAvg'=0 {
+												set $$$INARTAVGCurrentAverageCost(objAverage) = curCalcAvg   ; Copy from previous "line"
+											}
+											set fltQtyOH  = $$$INARTAVGQuantityOnHand(objAverage)
+											set fltQtyIn  = $$$INARTAVGIncomingGoodsQuantity(objAverage)
+											set fltNewQty = fltQtyOH + fltQtyIn
+											
+											set curOldAvgCost = $$$INARTAVGCurrentAverageCost(objAverage)
+											
+											if fltNewQty = 0 {
+												set curCalcAvg = curOldAvgCost
+											} else {
+												if fltQtyOH < 0 {
+													if fltNewQty > 0 {
+														set curCalcAvg = $$$INARTAVGIncomingGoodsCost(objAverage)
+													} else {
+														set curCalcAvg = curOldAvgCost
+													}
+												} else {
+													set curCalcAvg = (fltQtyOH * curOldAvgCost) + (fltQtyIn * $$$INARTAVGIncomingGoodsCost(objAverage)) / fltNewQty
+												}
+											}
+											
+											set $$$INARTAVGNewAverageCost(objAverage)                = curCalcAvg
+											set ^CacheTempAvgCost(YUSER,idItem,dteRecvd,tmeRecvd,1) = objAverage
+										}
+									}
+									*/  ; SR16871 ^^^
+									set pcurAvgCostNew = $$$FCSub(curCalcAvg,curDiscount)
+								}
+							}
+							set pcurTotalValue    = pfltQty * pcurAvgCost
+							set pcurTotalValueNew = pfltQty * pcurAvgCostNew
+						}
+					}
+				}
+			}	
+		}
+	}
+	set pcurAvgCostNew    = $$$FCRound(pcurAvgCostNew)
+	set pcurTotalValue    = $$$FCRound(pcurTotalValue)
+	set pcurTotalValueNew = $$$FCRound(pcurTotalValueNew)
+	quit
+	
+	
+GetDescription(pidInvoice,pidLine)
+	;-------------------------------------------------------------------------------
+	; Gets a description of the costs of the quantities of a receipt
+	;
+	; Returns: description
+	;
+	; History:
+	; 11-Jan-2006	RPW		SR14166: If we are a dataload invoice, then just use
+	;							the description of dataload
+	; 22-Jul-2005	RPW		SR11983: Added Discount Handling
+	; 16-Jun-2005	JW		Created SR12484 (Replaces GetCost)
+	;-------------------------------------------------------------------------------
+	new curCost,curDiscount,curUnitCost,fltInvQty,fltNewQty,fltQtyRecvd,idInvMatch
+	new objInvLine,objInvMatch,strText,strInvoice
+	
+	set strText = ""
+	
+	if ($get(pidInvoice)'="") && ($get(pidLine)'="") {
+		set objInvLine = $get(^FINAPInvLine(0,pidInvoice,pidLine,1))
+		
+		set fltQtyRecvd = $$$FINAPInvLineReceivedQuantity(objInvLine)
+		set curUnitCost = $$$FINAPInvLineOrderEach(objInvLine)
+		
+		set strText = $$$Text($listbuild("Fin00799",$$$FINAPInvLineReceiveLocation(objInvLine),$$$FINAPInvLineReceiveStockLocation(objInvLine)))
+		;  "At location %1, storage %2:"
+		
+		set fltNewQty   = 0
+		set idInvMatch  = $$$FINAPInvLineCacheLink(objInvLine)
+		set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+		
+		for {
+			if pidInvoice="DataLoad" {
+				set strText = strText_"<br>"_pidInvoice_"<br>"
+				quit  // Have to quit here as we can not go any further down.
+				
+			} else {
+				set curCost   = $$GetAllocatedVarianceCost(pidInvoice,pidLine)
+				set fltInvQty = +$$$FINAPInvLineInvoiceQuantity(objInvLine)
+				set fltNewQty = fltNewQty + fltInvQty
+		
+				set curDiscount = $$GetDiscountForParentLine^FINAPInvDiscount(pidInvoice,pidLine)
+				if fltInvQty'=0 {
+					set curDiscount = $$$FCDivd(curDiscount,fltInvQty)
+				} else {
+					set curDiscount = 0
+				}
+	 
+				set curCost = $$$FCSub(curCost,curDiscount)
+				
+				set strText = strText_"<br>"_$$$Text($listbuild("Fin00650",pidInvoice,fltInvQty,$$FormatCurrency^COMTable(curCost)))
+				; "Due to Invoice %1:  %2 are worth %3"
+				
+				// Get link to previous match in cache
+				set idInvMatch = $$$FINAPInvMatchCacheLink(objInvMatch)
+				quit:idInvMatch=""
+				
+				set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+				set strInvoice  = $$$FINAPInvMatchCacheInvoiceNumber(objInvMatch)
+				set pidInvoice  = $$$KEY1(strInvoice)
+				set pidLine     = $$$KEY2(strInvoice)
+				quit:(pidInvoice="")||(pidLine="")
+				
+				set objInvLine = $get(^FINAPInvLine(0,pidInvoice,pidLine,1))
+			}
+		}
+		if fltQtyRecvd'=fltNewQty {
+			set strText = strText_"<br>"_$$$Text($listbuild("Fin00651",fltQtyRecvd-fltNewQty,$$FormatCurrency^COMTable(curUnitCost)))
+		}  ; "Remaining %1 are each worth %2"
+	}
+	quit strText
+	
+	
+GetDateTimeForCC(pidCostCentre,pobjInvLine,&pdteKey3,&ptmeKey4)
+	;-------------------------------------------------------------------------------
+	; Get Date and Time from relevant INAvgCost
+	; 
+	; Called By :	GetPrePostInformationNew, GetReceiptPrevUnitCost
+	; 
+	; ByRef :		date and time for INAvgCost key
+	; 
+	; Returns:		nothing
+	;
+	; History:
+	; 05-Nov-2009	GRF		SR16871: add "R" to strRecptKeys so only checking
+	; 							Sup Receipts; call GetCostForReference^INAvgCost
+	; 							instead of duplicating code
+	; 02-Nov-2009	GRF		SR16871: Modified from GetDateTime - INAvgCost replaces
+	; 							INARTAVG; ^CacheTempINARTAVG => ^CacheTempAvgCost
+	;-------------------------------------------------------------------------------
+	new curCost,idCacheLink,idItem,idOrder,idxRecptKeys,objFAIMC
+	new strAvgCostKeys,strRecptKeys,strShortKeys
+	
+	set idItem  = $$$FINAPInvLineItem(pobjInvLine)
+	set idOrder = $$$FINAPInvLineOrderNumber(pobjInvLine)
+	
+	if idOrder'="" {
+		set strShortKeys = $translate(idOrder,",","-")
+	} else {
+		set strShortKeys = "0-0"
+	}
+	set strShortKeys = strShortKeys _"-"_$$$FINAPInvLineReceiveLocation(pobjInvLine)
+	                                _"-"_$$$FINAPInvLineReceiveStockLocation(pobjInvLine)
+	                                _"-"_$$$FINAPInvLineReceiveDate(pobjInvLine)
+	
+	set idCacheLink = $$$FINAPInvLineCacheLink(pobjInvLine)
+	if idCacheLink'="" {
+		set objFAIMC     = $get(^FINAPInvMatchCache(0,idCacheLink,1))
+		set strRecptKeys = strShortKeys _"-"_$$$FINAPInvMatchCacheReceiptNumber(objFAIMC)
+		                                _"-"_$$$FINAPInvMatchCacheReceiptLine(objFAIMC)
+		                                _"-R"
+	} else {
+		set strRecptKeys = strShortKeys
+	}
+	
+	; 1. Check for 8 arg key
+	; 2. If not found, check for 5 arg key
+	set strAvgCostKeys = ""
+	set curCost = $$GetCostForReference^INAvgCost(idItem,pidCostCentre,strRecptKeys,.strAvgCostKeys)
+	if strAvgCostKeys="" set curCost = $$GetCostForReference^INAvgCost(idItem,pidCostCentre,strShortKeys,.strAvgCostKeys)
+	set pdteKey3 = $$$KEY3(strAvgCostKeys)
+	set ptmeKey4 = $$$KEY4(strAvgCostKeys) 
+	
+	quit
+	
+	
+GetDateTime(pobjInvLine,&pdteKey1,&ptmeKey2)  ; DEPRECATED - see GetDateTimeForCC for INAvgCost processing
+	;-------------------------------------------------------------------------------
+	; Get Date and Time from relevant INARTAVG
+	; 
+	; Called By :	GetPrePostInformationNew, GetReceiptPrevUnitCost
+	; 
+	; ByRef :		date and time for INARTAVG key
+	; 
+	; Returns:		nothing
+	;
+	; History:
+	; 28-Sep-2009	GRF		SR16361: add ReceiptNo/Line to Receipt Key string; add &
+	; 14-Jun-2005	JW/RW	SR12484: Created
+	;-------------------------------------------------------------------------------
+	new idCacheLink,idItem,idOrder,idxRecptKeys,objFAIMC,strRecptKeys,strShortKeys
+	
+	set idOrder = $$$FINAPInvLineOrderNumber(pobjInvLine)
+	
+	; SR16361 vvv
+	if idOrder'="" {
+		set strShortKeys = $translate(idOrder,",","-")
+	} else {
+		set strShortKeys = "0-0"
+	}
+	set strShortKeys = strShortKeys _"-"_$$$FINAPInvLineReceiveLocation(pobjInvLine)
+	                                _"-"_$$$FINAPInvLineReceiveStockLocation(pobjInvLine)
+	                                _"-"_$$$FINAPInvLineReceiveDate(pobjInvLine)
+	
+	set idCacheLink = $$$FINAPInvLineCacheLink(pobjInvLine)
+	if idCacheLink'="" {
+		set objFAIMC     = $get(^FINAPInvMatchCache(0,idCacheLink,1))
+		set strRecptKeys = strShortKeys _"-"_$$$FINAPInvMatchCacheReceiptNumber(objFAIMC)
+		                                _"-"_$$$FINAPInvMatchCacheReceiptLine(objFAIMC)
+	} else {
+		set strRecptKeys = strShortKeys
+	}
+	
+	; 1. Check for 7 arg key
+	; 2. If not found, check for 5 arg key
+	
+	for idxRecptKeys = $$$Index(strRecptKeys),$$$Index(strShortKeys) {
+		set pdteKey1 = ""
+		set ptmeKey2 = ""
+		if $data(^INARTAVGs(0,1,idxRecptKeys)) {
+			set idItem = $$$FINAPInvLineItem(pobjInvLine)
+			set pdteKey1 = $order(^INARTAVGs(0,1,idxRecptKeys,idItem,""))
+		
+			if pdteKey1'="" {
+				set ptmeKey2 = $order(^INARTAVGs(0,1,idxRecptKeys,idItem,pdteKey1,""))
+			}
+		}
+		quit:ptmeKey2'=""
+	}
+	quit
+	/*
+	if idOrder'="" {
+		set strRecptKeys = $translate(idOrder,",","-")
+	} else {
+		set strRecptKeys = "0-0"
+	}
+	set strRecptKeys = strRecptKeys _"-"_$$$FINAPInvLineReceiveLocation(pobjInvLine)
+	                                _"-"_$$$FINAPInvLineReceiveStockLocation(pobjInvLine)
+	                                _"-"_$$$FINAPInvLineReceiveDate(pobjInvLine)
+	                                
+	set idxRecptKeys = $$$Index(strRecptKeys)
+	
+	set pdteKey1=""
+	set ptime=""
+	if $data(^INARTAVGs(0,1,idxRecptKeys)) {
+		set idItem = $$$FINAPInvLineItem(pobjInvLine)
+		set pdteKey1 = $order(^INARTAVGs(0,1,idxRecptKeys,idItem,""))
+		
+		if pdteKey1'="" {
+			set ptime = $order(^INARTAVGs(0,1,idxRecptKeys,idItem,pdteKey1,""))
+		}
+	}
+	
+	quit	*/
+	; SR16361 ^^^
+	
+		
+GetReceiptUnitCost(pidInvoice,pidLine)
+	;-------------------------------------------------------------------------------
+	; Get the receipt unit cost as the average of total over quantity (both invoiced
+	; and uninvoiced quantities)
+	; 
+	; NOTE : This has *NOTHING* to do with the Weighted Average Cost for an item.
+	;        It is the Weighted Average Cost for an order line.
+	;
+	; Example :  Goods ordered & Received   30 @ $US10 (Exch 0.8 ) = $12.50 = $375
+	;            Invoiced                   28 @ $US11 (Exch 0.75) = $14.67 = $410.76
+	;                                               ($410.67 if $14.666666...)
+	; Unit cost is     28 @ $14.67 = $410.76
+	;               +   2 @ $12.50 = $ 25.00
+	;                 ----          ---------
+	;                  30             435.76
+	;                                  14.525333...  or  $14.53  <<< Value returned
+	; Returns: Unit Cost
+	; 
+	; History:
+	; 03-Nov-2009	GRF		SR16871: only simple variables in FC macro
+	; 06-Jul-2006	GRF		SR14471: Doco
+	; 14-Jun-2006	GRF		SR14471/14694: Doco
+	; 10-Jun-2005	JW/RW	Created SR12484
+	;-------------------------------------------------------------------------------
+	new curCost,curEach,curPrevInvoiced,curRemainder,curTotal
+	new factor,fltInvQty,fltQtyUnit
+	new idInvMatch,idItem,idOrder,objInvLine,objInvMatch,receiptQty,uninvoicedQty
+	
+	set curCost = 0
+	
+	if ($get(pidInvoice)'="") && ($get(pidLine)'="") {
+		set objInvLine = $get(^FINAPInvLine(0,pidInvoice,pidLine,1))
+		set curCost    = $$GetAllocatedVarianceCost(pidInvoice,pidLine)
+		
+		set fltInvQty  = $$$FINAPInvLineInvoiceQuantity(objInvLine)
+		set receiptQty = $$$FINAPInvLineReceivedQuantity(objInvLine)
+		
+		if fltInvQty '= receiptQty { // Partial invoice
+			set idInvMatch  = $$$FINAPInvLineCacheLink(objInvLine)
+			set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+			
+			// Get this invoice amount
+			set curTotal = $$$FCMult(curCost,fltInvQty)
+			// Add previously invoiced amount
+			set curPrevInvoiced = $$$FINAPInvMatchCachePreviouslyInvoicedValue(objInvMatch)
+			set curTotal = $$$FCAdd(curTotal,curPrevInvoiced)        ; SR16871
+			
+			// Add uninvoiced amount (uninvoiced qty * receipt unit price)
+			set uninvoicedQty = $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) - fltInvQty
+			
+			if uninvoicedQty {
+				set curEach      = $$$FINAPInvLineOrderEach(objInvLine)
+				set curRemainder = $$$FCMult(curEach,uninvoicedQty)        ; SR16871
+				set curTotal     = $$$FCAdd(curTotal,curRemainder)
+			}
+			// SR14716: There is no check for receiptQty being zero, however it never appears to be able to be zero.
+			
+			// Calculate new receipt average cost
+			set curCost = $$$FCDivd(curTotal,receiptQty)
+		}
+		
+		set idOrder = $$$FINAPInvLineOrderNumber(objInvLine)
+		if idOrder'="" {
+			set factor=$$$INAUFPKConversionFactorQuantity($get(^INAUFPK(0,$$$KEY1(idOrder),$$$KEY2(idOrder),1)))
+			if +factor'=0 {
+				set curCost = $$$FCMult(curCost,factor)
+			}
+		}
+		
+		set idItem = $$$FINAPInvLineItem(objInvLine)
+		if idItem'="" {
+			if $$$INARTPriceUnit($get(^INART(0,idItem,1)))>1 {     ; If not sold in sales unit (eg 1/10/100/1000)
+				set fltQtyUnit = $$^INQTYUNIT(idItem)
+				set curCost    = $$$FCMult(curCost,fltQtyUnit) ; then multiply   ; SR16871
+			}
+		}
+	}
+	
+	quit +$justify(curCost,0,2)
+	;quit $$$FCRound(curCost)
+	
+	
+	;GetReceiptPrevUnitCost(pobjInvLine)  ; SR16871
+GetReceiptPrevUnitCost(pobjInvLine,pidCostCentre="")
+	;-------------------------------------------------------------------------------
+	; Get the receipt's previous unit cost.
+	;
+	; Returns: Unit cost
+	;
+	; History:
+	; 02-Nov-2009	GRF		SR16871: INAvgCost replaces INARTAVG; GetDateTimeForCC
+	; 							replaces GetDateTime
+	; 10-Jun-2005	JW/RW	Created SR12484
+	;-------------------------------------------------------------------------------
+	new curPrevCost,idItem,dteRecvd,tmeRecvd
+	
+	set curPrevCost = $$$FINAPInvLineOrderEach(pobjInvLine)
+				
+	if $$$FINAPInvLineUnmatchedQuantity(pobjInvLine) '= $$$FINAPInvLineReceivedQuantity(pobjInvLine) {
+		// Some have been previously invoiced
+		
+		set idItem = $$$FINAPInvLineItem(pobjInvLine)
+	;	do GetDateTime(pobjInvLine,.dteRecvd,.tmeRecvd)    ; SR16871
+		do GetDateTimeForCC(pidCostCentre,pobjInvLine,.dteRecvd,.tmeRecvd)
+		
+		if (dteRecvd'="") && (tmeRecvd'="") {
+	;		set curPrevCost = $$$INARTAVGIncomingGoodsCost($get(^INARTAVG(0,idItem,dteRecvd,tmeRecvd,1)))
+			set curPrevCost = $$$INAvgCostIncomingGoodsCost($get(^INAvgCost(0,idItem,pidCostCentre,dteRecvd,tmeRecvd,1)))
+		}
+	}
+	
+	quit curPrevCost
+	
+	
+GetAllocatedVarianceCost(pidInvoice,pidLine)
+	;-------------------------------------------------------------------------------
+	; Determine the value of the varied cost that is to posted.
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Nov-2009	GRF		SR16871: only simple variables in FC macros
+	; 15-Jul-2006	GRF		SR14471: Use invoice if FOREX Variance => Inventory
+	; 16-Feb-2005	Shobby	Created
+	;-------------------------------------------------------------------------------
+	new curCost,curEach,fltQty,objInvLine
+	
+	set curCost=0
+	if ($get(pidInvoice)'="") && ($get(pidLine)'="") {
+		set objInvLine = $get(^FINAPInvLine(0,pidInvoice,pidLine,1))
+		set curCost = $$$FINAPInvLineOrderEach(objInvLine)
+		set fltQty  = $$$FINAPInvLineInvoiceQuantity(objInvLine)
+		
+	;	FIXME : Populates INERECH1 in UpdateLine^FINAPInvPostCost - then used for Avg Cost update in PRUEF^INERECH1
+	;	        Perhaps need to use some other value than curCost for Avg Cost calculation since should calculate
+	;	        when applied to Expense as well.  <GRF>
+		if $$$FINAPInvLineVariancePosting(objInvLine)=$$$EnumFINAPVARIANCEPOSTInventory {
+			set curCost = $$$FINAPInvLineInvoiceEach(objInvLine)
+			
+		} elseif $$$FINAPInvLineVarianceINVDPost(objInvLine)=$$$EnumFINAPVARIANCEPOSTInventory {
+			set curCost = $$$FINAPInvLineInvoiceEach(objInvLine)
+			
+		} elseif $$$FINAPInvLineVarianceFCDPost(objInvLine)=$$$EnumFINAPVARIANCEPOSTFCInventory {
+			set curCost = $$$FINAPInvLineInvoiceEach(objInvLine)
+			
+		} elseif $$$FINAPInvLineVariancePosting(objInvLine)=$$$EnumFINAPVARIANCEPOSTSplit {
+			set curEach = $$GetAllocatedVarianceCostSplit(pidInvoice,pidLine,"TV",fltQty)
+			set curCost = $$$FCAdd(curCost,curEach)     ; SR16871
+			
+		} elseif $$$FINAPInvLineVarianceINVDPost(objInvLine)=$$$EnumFINAPVARIANCEPOSTSplit {
+			set curEach = $$GetAllocatedVarianceCostSplit(pidInvoice,pidLine,"ID",fltQty)
+			set curCost = $$$FCAdd(curCost,curEach)     ; SR16871
+		}
+	}
+	quit curCost
+	
+	
+GetAllocatedVarianceCostSplit(pidInvoice,pidLine,pstrType,pfltQty=0) private
+	;-------------------------------------------------------------------------------
+	; Determine the value of the varied cost due to a split that is to posted.
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Nov-2009	GRF		SR16871: only simple variables in FC macros
+	; 23-Mar-2005	PO		SR11349: FC support
+	; 16-Feb-2005	Shobby	Created
+	;-------------------------------------------------------------------------------
+	new curEach,curTotal,objVariance
+	
+	set curEach = 0
+	if ($get(pidInvoice)'="") && ($get(pidLine)'="") && ($get(pstrType)'="") {
+		set objVariance = $get(^FINAPInvLineVariance(0,pidInvoice,pidLine,pstrType,1))
+		if pfltQty'=0 {
+			set curTotal = $$$FINAPInvLineVarianceInventoryTotal(objVariance)
+			set curEach  = $$$FCDivd(curTotal,pfltQty)     ; SR16871
+		}
+	}
+	quit curEach
+	
+	
+GetDiscountDescription(pidInvoice,pidLine) 
+	;-------------------------------------------------------------------------------
+	; Get the description of the discounts and the amount for display
+	;
+	; Params:
+	; pidInvoice: The id of the Invoice Matching Record
+	; pidLine   : The id of the Invoice Matching Line
+	;
+	; Returns:
+	; The Description string
+	;
+	; History:
+	; 29-Aug-2005	RPW		SR11983: TODO: Fix off Invoice to be applied Method.
+	; 15-Aug-2005	RPW		SR11983: Created
+	;-------------------------------------------------------------------------------
+	new arrDiscounts,intDisc,strDiscount,strOffInvoice,strText
+	
+	do GetListOfDiscounts^FINAPInvDiscount(pidInvoice,pidLine,.arrDiscounts)
+	set strText = ""
+	
+	set intDisc = ""
+	for {
+		set intDisc = $order(arrDiscounts(intDisc))
+		quit:intDisc=""
+		
+		set strDiscount = arrDiscounts(intDisc)
+		continue:strDiscount=""
+		
+		set strOffInvoice=""
+		if +$piece(strDiscount,Y,2) {
+			set strOffInvoice="("_$$$Text("Fin00872")_")" ; "Off Invoice"
+		}
+	]]><![CDATA[	set strText = strText_$piece(strDiscount,Y,4)_" "_$$FormatCurrency^COMTable($piece(strDiscount,Y,1))_" "_strOffInvoice_"<BR>"
+	}
+	
+	quit strText
+	
+	
+	
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++
+	;   * * *   D E P R E C A T E D   C O D E   * * *
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+BaseQuantity(pintUnit,pidProduct,pidSupplier) // 14-Jun-2005 JW - NOT CURRENTLY IN USE
+	;-------------------------------------------------------------------------------
+	; 
+	; Called By: no calls found Oct-2009
+	; 
+	; History:
+	; 03-Jun-2008	shobby	SRBR014951: macro changed from $$$INARTPACKConsistOf to
+	;							$$$INARTPACKQuantity to reflect earlier property
+	;							name change.
+	; 10-Feb-2005	RPW		added this comment
+	;-------------------------------------------------------------------------------
+	new fltConversion,objTerms,objUPC,strUPC
+	
+	set fltConversion = ""
+	
+	if (pidProduct'="") && (pintUnit'="") {
+		if $$$INARTUnitofMeasure($get(^INART(0,pidProduct,1)))=pintUnit {
+			set fltConversion = 1
+		
+		} else {
+			if pidSupplier'="" {
+				set strUPC = ""
+				for {
+					set strUPC = $order(^INARTUPC(0,pidProduct,pidSupplier,strUPC))
+					quit:strUPC=""
+					
+					set objUPC = $get(^INARTUPC(0,pidProduct,pidSupplier,strUPC,1))
+					if pintUnit=$$$INARTUPCPackingUnit(objUPC) {
+						set fltConversion = $$$INARTUPCContainsQuantity(objUPC)
+					}
+				}
+				set objTerms=$get(^INARTK(0,pidProduct,pidSupplier,1))
+				if (fltConversion="") && (pintUnit=$$$INARTKDeliveryQuantityUnit(objTerms)) {
+					set fltConversion = $$$INARTKConversionFactor(objTerms)
+				}
+			}
+			if fltConversion="" {
+				set fltConversion = $$$INARTPACKQuantity($get(^INARTPACK(0,pidProduct,pintUnit,1)))
+			}
+		}
+	}
+	if fltConversion="" set fltConversion = 1
+	quit fltConversion
+	
+	
+	/*
+IsValidAverageCost(pidItem,pobjInvLine) ; INWE is deprecated - this test is no longer applicable in its current form <GRF>
+	;-------------------------------------------------------------------------------
+	; Determines (indirectly through use of INBESTANDCHECK) whether average costs are
+	; valid for this particular item.
+	; 
+	; Called By: Display^FINAPInvPrePostCost
+	; 
+	; History:
+	; 30-Jun-2005	shobby	Code Check
+	; 28-Jun-2005	shobby	SR12752
+	;-------------------------------------------------------------------------------
+	new blnValid,idDate,idLocn,idStore,objINWE
+	
+	set blnValid = $$$NO
+	
+	if (pidItem'="") {
+		set blnValid = $$$YES
+		if '$data(^INARTAVG(0,pidItem)) {
+			set blnValid = $$$NO
+			
+		} else {
+			set idLocn  = $$$FINAPInvLineReceiveLocation(pobjInvLine)
+			set idStore = $$$FINAPInvLineReceiveStockLocation(pobjInvLine)
+			set idDate  = $$$FINAPInvLineReceiveDate(pobjInvLine)
+			
+			if (idLocn'="") && (idStore'="") && (idDate'="") {
+				do ^INBESTANDCHECK(pidItem)
+				set objINWE = $get(^INWE(0,pidItem,idLocn,idStore,idDate,1))    ; DEPRECATED
+				if objINWE="" {
+					set blnValid = $$$NO
+				}
+			} else {
+				set blnValid = $$$NO
+			}
+		}
+	}
+	quit blnValid
+	
+GetReceiptAverageCost(pidInvoice,pidLine)                  ; DEPRECATED - not in use
+	;-------------------------------------------------------------------------------
+	; Misleading subroutine name (This has *NOTHING* to do with the Weighted Average
+	; Cost for an item.) - replace with GetReceiptUnitCost instead.
+	; 
+	; Temporarly retained until all instances cleared.  *** DO NOT USE ***
+	; 
+	; History:
+	; 06-Jul-2006	GRF		SR14471: Replace with meaningful subroutine name
+	;						 - eventually eliminate this call
+	;-------------------------------------------------------------------------------
+	quit $$GetReceiptUnitCost($get(pidInvoice),$get(pidLine))
+	
+GetReceiptPrevAvgeCost(pobjInvLine)                        ; DEPRECATED - NOT IN USE
+	;-------------------------------------------------------------------------------
+	; Misleading subroutine name (This has *NOTHING* to do with the Weighted Average
+	; Cost for an item.) - replace with GetReceiptPrevUnitCost instead.
+	; 
+	; Temporarly retained until all instances cleared.  *** DO NOT USE ***
+	; 
+	; History:
+	; 02-Nov-2009	GRF		SR16871: Commented rather than updated
+	; 06-Jul-2006	GRF		SR14471: Replace with meaningful subroutine name
+	;						 - eventually eliminate this call
+	;-------------------------------------------------------------------------------
+	quit $$GetReceiptPrevUnitCost($get(pobjInvLine))
+	
+GetHeaderDiscounts(pidInvoice,parrDiscounts)                            ; NOT IN USE
+	;-------------------------------------------------------------------------------
+	; Called By: Display
+	; 
+	; Params:
+	; pidInvoice   : The id of the Invoice Matching Record
+	; parrDiscounts: The header discounts
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Aug-2005	RPW		SR11983: Created
+	;-------------------------------------------------------------------------------
+	quit
+	
+	*/
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,704 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Routine name="VARPedidoCompraEntrega" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[VARPedidoCompraEntrega
+#include COMSYS
+
+OnBeforeFormConstruction
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Verifica se a entrega pode ser editada, dependendo do status do pedido de compra.
+    ;
+    ; Chamado por:
+    ;	Campo OnBeforeFormConstruction do form VARPedidoCompraEntrega
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new statusPedido, EntregaModelo
+	
+	// Se nenhum pedido foi escolhido escolhido, torna tela não editável
+	if ($get(YKEY) = "") || ($piece($get(YKEY),YKOMMA,1) = "") {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = 5
+		set $$$WWW120DoNOTDisplayStandardButto(YVOR) = "1;"_$$$WWW120DoNOTDisplayStandardButto(YVOR)
+		quit
+	}
+	
+	// Se o pedido estiver processado, não é possível editar as entregas
+	set statusPedidoCompra = $$getStatusPedidoCompra^VARPedidoCompra($$$KEY1(YKEY))
+	if (statusPedidoCompra '= 0) {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = 5
+		set $$$WWW120DoNOTDisplayStandardButto(YVOR) = "1;"_$$$WWW120DoNOTDisplayStandardButto(YVOR)
+		quit
+	}	
+	
+	// Se um modelo de entrega foi definido no pedido de compra, não é possível editar as entregas
+	set EntregaModelo = $piece($get(^VARPedidoCompra(YM,$piece(YKEY,YKOMMA,1),1)),Y,12)
+	if (EntregaModelo '= "") {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = 5
+		set $$$WWW120DoNOTDisplayStandardButto(YVOR) = "1;"_$$$WWW120DoNOTDisplayStandardButto(YVOR)
+		do AlertInScript^COMConst(	"Não é possível editar entregas, pois foi definida um modelo de entrega no pedido de compra. "_YCR_
+									"Para editar entregas, deixe o campo 'Modelo de Entrega' em branco, no pedido de compra.")
+	}
+	
+	quit
+	
+OnBeforeButtonLine
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnBeforeButtonLine do form VARPedidoCompraEntrega
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	do CriaListaDeLinhas(YKEY)
+	quit
+	
+OnAfterDataFields
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnAfterDataFields do form VARPedidoCompraEntrega
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	do LoadGrid^VARPedidoCompraEntregaLinha(YKEY,YFELD)
+	do ListarEntregas($$$KEY1(YKEY))	
+	quit
+	
+OnBeforeSave
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnAfterDataFields do form VARPedidoCompraEntrega
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new strStatus
+	set strStatus = $$$GRIDSave(YKEY)
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		do ReturnError^COMUtilError(strStatus)		
+	}
+
+	quit
+	
+OnAfterSave
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnAfterSave do form VARPedidoCompraEntrega
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new entregaUniforme
+	set entregaUniforme = $piece(YFELD,Y,3)
+	set listaVazia = 0
+	if (entregaUniforme = 1) {
+		do CriaEntregaUniforme(YKEY,YFELD, .listaVazia)
+	}
+	quit
+
+EntregasValidas(pidPedidoCompra,&listaStatus)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Realiza as seguintes validações nas entregas do pedido de compra:
+    ;		1. Verifica se há ao menos uma entrega definida
+    ;		2. Para cada linha do pedido, verifica se a quantidade no pedido é igual à
+    ;		   soma das quantidades das entregas
+    ;		3. Verifica se não há nenhuma entrega sem linhas ou sem prazo de entrega
+    ;		4. Verifica se não há nenhuma linha de entrega com quantidade vazia
+    ;
+    ; Chamado por:
+    ;	Process^VARPedidoCompra.mac
+    ;	ListarEntregas^VARPedidoCompraEntrega.mac
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new strStatus, objPedidoCompra, modeloEntrega, idPedidoCompraLinha,
+		objPedidoCompraLinha, qtyPedido, qtdEntregas, idEntrega, objEntrega, 
+		seqLinhaEntrega, objLinhaEntrega
+	
+	set strStatus = $$$OK
+	
+	if ($get(pidPedidoCompra) = "") {
+		set strStatus = "0~Número do pedido de compra não informado."
+		quit strStatus
+	}
+	
+	; Obter registro do Pedido
+	set objPedidoCompra = $get(^VARPedidoCompra(YM,pidPedidoCompra,1))
+		
+	if ( $get(objPedidoCompra) = "" ) {
+		set strStatus = "0~Erro ao ler pedido de compra número '"_pidPedidoCompra_"'."
+		quit strStatus
+	}
+		
+	; Se a entrega é 0-Conforme Solicitação, não deve ter definição de entregas	
+	set modeloEntrega = $piece(objPedidoCompra,Y,12)
+	if (modeloEntrega = 0) {
+		quit $$$OK
+	}
+	
+	; 1) Verifica se há ao menos uma entrega definida.
+	if ('$data(^VARPedidoCompraEntrega(YM,pidPedidoCompra)) ) {
+		set strStatus = "0~Nenhuma entrega definida para o Pedido de Compra """_pidPedidoCompra_"""."
+		quit strStatus
+	}
+ 
+	; 2) Para cada linha do Pedido, verifica se a quantidade no Pedido é igual à soma das 
+	;	quantidades das entregas.
+ 	$$$Order3(^VARPedidoCompraLinha,YM,pidPedidoCompra,idPedidoCompraLinha)
+ 		
+		set objPedidoCompraLinha = $get(^VARPedidoCompraLinha(YM,pidPedidoCompra,idPedidoCompraLinha,1))
+		
+		if ($get(objPedidoCompraLinha) = "") {
+			set strStatus = "0~Erro ao ler linha """_idPedidoCompraLinha_""" do Pedido de Compra """_pidPedidoCompra_"""."
+			quit strStatus
+		}
+		
+		set qtyPedido = $piece(objPedidoCompraLinha,Y,4)		
+		set qtdEntregas = $$GetQuantEntr^VARPedidoCompraEntregaLinha(pidPedidoCompra,idPedidoCompraLinha)
+		
+		if (qtyPedido = qtdEntregas) {
+			set listaStatus(idPedidoCompraLinha) = 1
+		}
+		else {
+			set listaStatus(idPedidoCompraLinha) = 0_Y_"Qtd. no Pedido de Compra ("_qtyPedido_") diferente da qtd. nas entregas ("_qtdEntregas_")."
+			set strStatus = 0
+		}
+	
+	$$$End
+	
+	if (strStatus '= $$$OK) {
+		quit strStatus
+	}
+	
+	; 3) Verifica se não há nenhuma entrega sem linhas ou sem prazo de entrega: 	
+ 	$$$Order3(^VARPedidoCompraEntrega,YM,pidPedidoCompra,idEntrega)
+		
+		set objEntrega = $get(^VARPedidoCompraEntrega(YM,pidPedidoCompra,idEntrega,1))
+		
+		if ($get(objEntrega) = "") {
+			set strStatus = "0~Erro ao ler entrega """_idEntrega_""" do pedido de compra."
+			quit
+		}
+		
+		// Verifica se há linhas para a entrega:
+		if ( '$data(^VARPedidoCompraEntregaLinha(YM,pidPedidoCompra,idEntrega)) ) {
+			set strStatus = "0~Não há linhas para a entrega """_idEntrega_""" do pedido de compra."
+			quit
+		}
+		
+		// Verifica se há prazo de entrega:
+		set prazoDeEntrega = $piece(objEntrega,Y,1)
+		if ( +prazoDeEntrega <= 0 ) {
+			set strStatus = "0~Prazo de entrega inválido ("_+prazoDeEntrega_" dias) para a entrega """_idEntrega_""" do pedido de compra."
+			quit
+		}
+		
+		; 4) Verifica se não há nenhuma linha de entrega com quantidade vazia.
+		
+		$$$Order4(^VARPedidoCompraEntregaLinha,YM,pidPedidoCompra,idEntrega,seqLinhaEntrega)
+			
+			set objLinhaEntrega = $get(^VARPedidoCompraEntregaLinha(YM,pidPedidoCompra,idEntrega,seqLinhaEntrega,1))
+			
+			if ($get(objLinhaEntrega) = "") {
+				set strStatus = "0~Erro ao ler linha """_seqLinhaEntrega_""" da entrega """_idEntrega_""" do pedido de compra."
+				quit
+			}
+			
+			set qtdEntrega = $piece(objLinhaEntrega,Y,2)
+			if (+qtdEntrega <= 0) {
+				set strStatus = "0~Quantidade inválida ("_+qtdEntrega_") da linha """_seqLinhaEntrega_""" da entrega """_idEntrega_""" do pedido de compra."
+				quit
+			}
+			
+		$$$End
+		 	
+ 		quit:($$$ISERR(strStatus))
+ 
+	$$$End
+	
+	quit strStatus
+
+ListarEntregas(pidPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Lista todas as entregas de um Pedido de Compra.
+    ;
+    ; Chamado por:
+    ;	Campo OnAfterDataFields do form VARPedidoCompraEntrega.
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new strStatus, listaStatusEntregas, linhaPedidoCompra, cabecalhoJaImpresso, lstHeader,
+		objPedidoCompra, numEntrega, objEntrega, PrazoDeEntrega, listaEntregas,
+		i, linhaDoPedido, objlinhaDoPedido, idProduto, qtyPedido, nomeProduto, objLinhaEntrega,
+		qtdEntrega, somaQtdEntregas, idPedidoCompraEntrega
+		
+	quit:($get(pidPedidoCompra) = "")
+	
+	write "<br /><strong>Situação das entregas: </strong>"
+ 	
+	set strStatus = $$EntregasValidas^VARPedidoCompraEntrega(pidPedidoCompra,.listaStatusEntregas)
+ 
+	if $$$ISERR(strStatus) {
+		write $piece(strStatus,Y,2) // Mostra mensagem de erro
+		
+		if ($data(listaStatusEntregas)) {
+			
+			set linhaPedidoCompra   = ""
+			set cabecalhoJaImpresso = $$$NO
+			
+			for {
+				set linhaPedidoCompra = $order(listaStatusEntregas(linhaPedidoCompra))
+				quit:(linhaPedidoCompra = "")
+				if ( listaStatusEntregas(linhaPedidoCompra) '= $$$YES ) {
+					
+					write:(cabecalhoJaImpresso '= $$$YES) "<br />Entregas inválidas para as seguintes linhas do Pedido de Compra:"
+					set cabecalhoJaImpresso = $$$YES
+					write "<br />"_linhaPedidoCompra_": "_$piece(listaStatusEntregas(linhaPedidoCompra),Y,2)
+				}
+			}
+		}
+	}
+	else {
+		write "Entregas válidas."
+	}
+	
+	set lstHeader = ""
+	set lstHeader = lstHeader_$listbuild("Seq.","Produto","Quant.&nbsp;<br />&nbsp;&nbsp;Pedido")
+	
+	$$$Order3(^VARPedidoCompraEntrega,YM,pidPedidoCompra,idPedidoCompraEntrega)
+	
+		set objEntrega = $get(^VARPedidoCompraEntrega(YM,pidPedidoCompra,idPedidoCompraEntrega,1))
+		quit:($get(objEntrega) = "")
+		
+		set listaEntregas(idPedidoCompraEntrega) = objEntrega
+		set PrazoDeEntrega = $piece(objEntrega,Y,1)
+		set lstHeader = lstHeader_$listbuild("Entrega "_idPedidoCompraEntrega_"&nbsp;<br />&nbsp;"_PrazoDeEntrega_" dias")
+		
+	$$$End
+	
+	set lstHeader = lstHeader_$listbuild("Quant.&nbsp;<br />&nbsp;&nbsp;Entregas") 
+	
+	if $$Start^COMTable(lstHeader,"Entregas por linha do pedido de compra:") {
+		
+		set linhaDoPedido = ""
+		for i=1:1 {
+			set linhaDoPedido = $order(^VARPedidoCompraLinha(YM,pidPedidoCompra,linhaDoPedido))
+			quit:(linhaDoPedido = "")
+			
+			set objlinhaDoPedido = $get(^VARPedidoCompraLinha(YM,pidPedidoCompra,linhaDoPedido,1))
+			continue:(objlinhaDoPedido = "")
+			
+			set idProduto = $piece(objlinhaDoPedido,Y,1)
+			set qtyPedido = +$piece(objlinhaDoPedido,Y,4)
+			
+			set nomeProduto = $$SQLGetDescricaoProduto^VARSQL(idProduto)
+			;set nomeProduto = $zconvert(nomeProduto,"O","HTML")			
+			
+			do NewLine^COMTable()
+			do InsertCell^COMTable(linhaDoPedido)
+			do InsertCell^COMTable("("_idProduto_") "_nomeProduto)
+			do InsertCell^COMTable($$^WWWTR(0,12,qtyPedido))
+			
+			set numEntrega = "",somaQtdEntregas = 0
+			
+			for {
+				set numEntrega = $order(listaEntregas(numEntrega))
+				quit:(numEntrega = "")
+ 
+				set linhaEntrega = $order(^VARPedidoCompraEntregaLinhas(YM,1,$$^WWWUMLAU(pidPedidoCompra,1),linhaDoPedido,numEntrega,""))
+				if ( $get(linhaEntrega) '= "" ) {
+					set objLinhaEntrega = $get(^VARPedidoCompraEntregaLinha(YM,pidPedidoCompra,numEntrega,linhaEntrega,1))
+					set qtdEntrega = $piece(objLinhaEntrega,Y,2)
+					
+					//Evitando erro de DIVIDE
+					if (qtyPedido = 0) {
+						do InsertCell^COMTable(qtyPedido)
+					} else {
+						do InsertCell^COMTable(qtdEntrega_" ("_$normalize(qtdEntrega/qtyPedido*100,1)_"%)")
+					}
+					set somaQtdEntregas = somaQtdEntregas + qtdEntrega
+				}
+				else {
+					do InsertCell^COMTable("")
+				}
+			}
+			
+			if (qtyPedido = 0) {
+				do InsertCell^COMTable(qtyPedido)
+			} else {
+				do InsertCell^COMTable(somaQtdEntregas_" ("_$normalize(somaQtdEntregas/qtyPedido*100,1)_"%)")
+			}
+			
+			do EndLine^COMTable()	 
+		}
+ 
+		do Stop^COMTable()
+	}
+	
+	quit
+
+CriaEntregasPadrao(pidPedidoCompra,pobjPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Se foi definido um modelo de entrega no pedido, cria as diversas entregas
+    ;	uniformes correspondentes.
+    ;
+    ; Chamado por:
+    ;	OnAfterSave^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new strStatus, idEntrega, idModeloEntrega, objModeloEntrega, listaDePrazos, listaDePorcentagens,
+		numEntregas, idPedidoCompraLinha, objPedidoCompraLinha, idProduto, qtyPedido, somatorioLinha,
+		entrega, percentual, porcentagem, prazo, objEntrega
+	
+	quit:($get(pidPedidoCompra) = "") "Pedido de compra não definido."
+	quit:($get(pobjPedidoCompra) = "") "Dados do pedido de compra não definidos."
+ 	
+ 	set strStatus = $$$OK
+ 	
+	; Se já existem entregas para o pedido, as exclui:
+	$$$Order3(^VARPedidoCompraEntrega,YM,pidPedidoCompra,idEntrega)		
+		set strStatus = $$KILL^COMUtils("VARPedidoCompraEntrega",pidPedidoCompra_","_idEntrega)	
+	$$$End
+ 	;
+ 
+	set idModeloEntrega   = $piece(pobjPedidoCompra,Y,12)
+	set objModeloEntrega = $get(^VARCompraEntregaModelo(YM,idModeloEntrega,1)) 
+	
+	quit:($get(idModeloEntrega) = "") "Modelo de entrega não definido."
+	quit:($get(objModeloEntrega) = "") "Dados de modelo de entrega não definidos."
+	
+	// Caso especial: Entrega Padrão do tipo 0-Conforme Solicitação
+	quit:(idModeloEntrega = 0) $$$OK
+	
+	set listaDePrazos 		= $piece(objModeloEntrega,Y,1)
+	set listaDePorcentagens = $piece(objModeloEntrega,Y,2)
+	
+	set numEntregas = $length(listaDePrazos,";")
+	
+	$$$Order3(^VARPedidoCompraLinha,YM,pidPedidoCompra,idPedidoCompraLinha)
+	
+		set objPedidoCompraLinha = $get(^VARPedidoCompraLinha(YM,pidPedidoCompra,idPedidoCompraLinha,1))
+		
+		set idProduto = $piece(objPedidoCompraLinha,Y,1)
+		set qtyPedido = $piece(objPedidoCompraLinha,Y,4)
+		
+		set somatorioLinha = 0
+		
+		for entrega=1:1:numEntregas {
+			
+			set percentual = $piece(listaDePorcentagens,";",entrega)
+			
+			if (somatorioLinha >= qtyPedido){
+				set qtdLinha(idPedidoCompraLinha, entrega) = 0
+			}
+			else
+				{
+				set qtdLinha(idPedidoCompraLinha, entrega) = $NORMALIZE(qtyPedido * (percentual/100),0) // Arredondando
+				if ( qtdLinha(idPedidoCompraLinha, entrega) = 0 ) {
+			 		set qtdLinha(idPedidoCompraLinha, entrega) = 1 
+				}
+				set somatorioLinha = somatorioLinha + qtdLinha(idPedidoCompraLinha, entrega)
+			}
+		}
+
+		// reajuste de erros causados por arredondamento
+		if (somatorioLinha '= qtyPedido) {
+			set som = 0
+			for i = 2:1:numEntregas {
+				set som = qtdLinha(idPedidoCompraLinha,i) + som
+			}
+			set qtdLinha(idPedidoCompraLinha, 1) = qtyPedido - som
+				
+		}
+	 
+	$$$End
+
+	// Código de gravação
+	for entrega=1:1:numEntregas {
+		set porcentagem = $piece(listaDePorcentagens,";",entrega)
+		set prazo = $piece(listaDePrazos,";",entrega)
+		
+		set objEntrega = ""
+		set $piece(objEntrega,Y,1) = prazo
+		set $piece(objEntrega,Y,2) = $$$YES
+		set $piece(objEntrega,Y,3) = porcentagem
+		
+		set strStatus = $$$Save("VARPedidoCompraEntrega",pidPedidoCompra_","_entrega,objEntrega,1)
+		
+		if (strStatus = $$$YES) {
+			set qtdLinha = 1
+			do CriaEntregaUniforme(pidPedidoCompra_","_entrega,objEntrega, .qtdLinha)
+			
+			if ( '$data(^VARPedidoCompraEntregaLinha(YM,pidPedidoCompra,entrega)) ) {
+				set strStatus = $$KILL^COMUtils("VARPedidoCompraEntrega",pidPedidoCompra_","_entrega)
+				if ('strStatus ) {
+					set strStatus = "0~Erro ao excluir entrega '"_entrega_"' que não possui linhas. Mensagem: "_strStatus
+					quit
+				}
+			}
+			
+		}
+	}
+	
+	quit strStatus
+	
+CriaEntregaUniforme(pKeyEntrega,pObjEntrega, listaQtds)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Ao salvar o registro pela tela VARPedidoCompra, na criação automática das
+    ;	entregas padrão, se o campo "Entrega Uniforme" estiver selecionado, cria as
+    ;	linhas de entrega, baseado no percentual informado. Caso a inserção seja manual,
+    ;	os valores serão calculados de acordo com os parâmetros informados.
+    ;
+    ; Chamado por:
+    ;	OnAfterSave^VARPedidoCompraEntrega.mac
+    ;	CriaEntregasPadrao^VARPedidoCompraEntrega.mac
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new strStatus, idPedidoCompra, numEntrega, entregaUniforme, percentual, idEntregaLinha, 
+		idPedidoCompraLinha, objPedidoCompraLinha,]]><![CDATA[ idProduto, qtyPedido, numSeq, qtyEntregaLinha,
+		qtyOutrasEntregas, percCalcLinha, objEntregaLinha, listaLinhas
+	
+	set strStatus = $$$OK
+	//--------------------------
+	// dados preliminares
+	set idPedidoCompra 	= $piece(pKeyEntrega,YKOMMA,1)
+	set numEntrega 		= $piece(pKeyEntrega,YKOMMA,2)
+	set entregaUniforme = $piece(pObjEntrega,Y,2)
+	set percentual		= $piece(pObjEntrega,Y,3)	
+	//----------------------------
+	// **** Se campo "Entrega uniforme" NÃO selecionado, sai da rotina:
+	quit:(entregaUniforme '= $$$YES)
+	
+	if ((percentual <= 0) || (percentual > 100)) {
+		do AlertInScript^COMConst($piece(pObjEntrega,Y,17)_"Campo de Percentual com valor inválido. Valor deve ser entre 1 e 100.")
+		quit
+	}
+	
+	;Limpando possíveis linhas existentes para a entrega
+	$$$Order4(^VARPedidoCompraEntregaLinha,YM,idPedidoCompra,numEntrega,idEntregaLinha)		
+		set strStatus = $$KILL^COMUtils("VARPedidoCompraEntregaLinha", idPedidoCompra_YKOMMA_numEntrega_YKOMMA_idEntregaLinha)	
+	$$$End
+	
+	quit:($$$ISERR(strStatus))
+	
+	; Verifica se há uma tabela de quantidades  já preenchido.
+	; Se tiver, executa pela tabela, se não, executa o modo manual.	
+	set numSeq = 0
+	
+	if (listaQtds = 0) {
+		// modo manual de inserção de dado
+		$$$Order3(^VARPedidoCompraLinha,YM,idPedidoCompra,idPedidoCompraLinha)
+		
+			set objPedidoCompraLinha = $get(^VARPedidoCompraLinha(YM,idPedidoCompra,idPedidoCompraLinha,1))
+			set idProduto = $piece(objPedidoCompraLinha,Y,1)
+			set qtyPedido = $piece(objPedidoCompraLinha,Y,4)
+			
+			continue:(qtyPedido <= 0)
+			
+			set numSeq = $i(numSeq)
+			
+			set qtyEntregaLinha = $NORMALIZE(qtyPedido * (percentual/100),0) // Arredondando
+			
+			if (qtyEntregaLinha = 0) {
+				set qtyEntregaLinha = 1
+			}
+			
+			set qtyOutrasEntregas = $$GetQuantEntr^VARPedidoCompraEntregaLinha(idPedidoCompra, idPedidoCompraLinha)
+			
+			if ((qtyPedido - qtyOutrasEntregas) < qtyEntregaLinha) {
+				set qtyEntregaLinha = (qtyPedido - qtyOutrasEntregas)
+			}
+			
+			if (qtyEntregaLinha < 0 ) {
+				set qtyEntregaLinha = 0
+			}
+
+			; Percentual calculado da linha, que pode ser diferente do percentual uniforme,
+			; devido aos arredondamentos feitos acima:
+			set percCalcLinha = qtyEntregaLinha / qtyPedido * 100
+		
+			set objEntregaLinha = ""
+			set $piece(objEntregaLinha,Y,1) = idPedidoCompraLinha
+			set $piece(objEntregaLinha,Y,2) = qtyEntregaLinha
+			set $piece(objEntregaLinha,Y,7)	= idProduto
+			//set $piece(objEntregaLinha,Y,8)	= percCalcLinha
+		
+			set strStatus = $$ChecarQuant^VARPedidoCompraEntregaLinha(idPedidoCompra_YKOMMA_numEntrega_YKOMMA_numSeq,objEntregaLinha)
+			if ( strStatus '= $$$YES) {
+				do AlertInScript^COMConst("Ocorreu um erro ao tentar definir entrega de "_percentual_"% para o produto "_idProduto_"."_$char(10)_$piece(strStatus,Y,2)) 
+				quit 
+			}
+	 
+			set listaLinhas(numSeq) = objEntregaLinha
+			
+		$$$End
+		
+	} else {
+		; Novo tratamento para quantidades caso exista a tabela de quantidades preenchida
+		; no modo automatico
+		
+		$$$Order3(^VARPedidoCompraLinha,YM,idPedidoCompra,idPedidoCompraLinha)
+
+			set objPedidoCompraLinha = $get(^VARPedidoCompraLinha(YM,idPedidoCompra,idPedidoCompraLinha,1))
+			set idProduto = $piece(objPedidoCompraLinha,Y,1)
+			set qtyPedido = $piece(objPedidoCompraLinha,Y,4)
+			
+			continue:(qtyPedido <= 0)
+			
+			set numSeq = $i(numSeq)
+			
+			; Percentual calculado da linha, que pode ser diferente do percentual uniforme,
+			; devido aos arredondamentos feitos acima:			
+			set percCalcLinha = listaQtds(idPedidoCompraLinha, numEntrega) / qtyPedido * 100
+			
+			set objEntregaLinha = ""
+			set $piece(objEntregaLinha,Y,1) = idPedidoCompraLinha
+			set $piece(objEntregaLinha,Y,2) = listaQtds(idPedidoCompraLinha, numEntrega)
+			set $piece(objEntregaLinha,Y,7)	= idProduto
+			//set $piece(objEntregaLinha,Y,8)	= percCalcLinha
+			
+			set strStatus = $$ChecarQuant^VARPedidoCompraEntregaLinha(idPedidoCompra_YKOMMA_numEntrega_YKOMMA_numSeq,objEntregaLinha)
+			
+			if (strStatus '= $$$YES) {
+				do AlertInScript^COMConst("Ocorreu um erro ao tentar definir entrega de "_percentual_"% para o produto "_idProduto_"."_$char(10)_$piece(strStatus,Y,2)) 
+				quit 
+			}
+	 		set listaLinhas(numSeq) = objEntregaLinha
+			
+		$$$End
+	}
+
+	if (strStatus) {
+		// Gera novas linhas:
+		set numSeq = ""
+		for {
+			set numSeq = $order(listaLinhas(numSeq))
+			quit:(numSeq = "")
+			
+			set objEntregaLinha = $get(listaLinhas(numSeq))
+			set qtyEntregaLinha = $piece(objEntregaLinha,Y,2)
+			
+			if (qtyEntregaLinha > 0 ) {
+				set strStatus = $$$Save("VARPedidoCompraEntregaLinha",idPedidoCompra_YKOMMA_numEntrega_YKOMMA_numSeq,objEntregaLinha,1)
+			}
+		}
+	}
+	
+	quit	
+	
+CriaListaDeLinhas(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Cria temporária "VARTempPedidoCompraLinha" que é uma lista temp de linhas do
+    ;	pedido de compra relacionado à entrega corrente.
+    ;
+    ; Chamado por:
+    ;	OnBeforeButtonLine^VARPedidoCompraEntrega.mac
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new idPedidoCompra, objPedidoCompraLinha, idPedidoCompraLinha, idProduto, nomeProduto
+	
+	kill ^COMTempList(YM,YBED,"VARTempPedidoCompraLinha")
+	
+	quit:($get(pYKEY) = "")
+	
+	set idPedidoCompra = $piece(pYKEY,YKOMMA,1)
+	quit:(idPedidoCompra = "")
+	
+	$$$Order3(^VARPedidoCompraLinha,YM,idPedidoCompra,idPedidoCompraLinha)
+		
+		set objPedidoCompraLinha = $get(^VARPedidoCompraLinha(YM,idPedidoCompra,idPedidoCompraLinha,1))
+		continue:(objPedidoCompraLinha = "")
+		
+		set idProduto   = $piece(objPedidoCompraLinha,Y,1)
+		set nomeProduto = $$SQLGetDescricaoProduto^VARSQL(idProduto)
+		
+		set ^COMTempList(YM,YBED,"VARTempPedidoCompraLinha",idProduto,1) = nomeProduto_Y_idPedidoCompraLinha
+	
+	$$$End
+	
+	quit
+
+
+OnExecutePrazoDeEntrega(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Valida o campo prazo de entrega: não permite mais de uma entrega com o mesmo
+    ;	prazo de entrega.
+    ;
+    ; Chamado por:
+    ;	Core rule do campo (1)-Prazo de Entrega no form VARPedidoCompraEntrega.
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new strStatus, idPedidoCompra, numEntregaCorrente, prazoDeEntregaCorrente, numEntrega, 
+		objEntrega, prazoDeEntrega
+	
+	set strStatus = $$$OK
+	
+	set idPedidoCompra = $piece(pYKEY,YKOMMA,1)
+	set numEntregaCorrente = $piece(pYKEY,YKOMMA,2)
+	set prazoDeEntregaCorrente = $piece(pYFELD,Y,1)
+	
+	if (idPedidoCompra = "") || (numEntregaCorrente = "") || (prazoDeEntregaCorrente = "") {
+		set strStatus = $$$OK
+		quit strStatus
+	}
+	
+	set objEntrega = ""
+	
+	$$$Order3(^VARPedidoCompraEntrega,YM,idPedidoCompra,numEntrega)				
+		quit:($$$ISERR(strStatus))		
+		continue:(numEntrega = numEntregaCorrente)
+		set objEntrega = $get(^VARPedidoCompraEntrega(YM,idPedidoCompra,numEntrega,1))
+		continue:(objEntrega = "")
+		set prazoDeEntrega = $piece(objEntrega,Y,1)
+		if (prazoDeEntrega = prazoDeEntregaCorrente) {
+			set strStatus = $$$NO
+			do AlertInScript^COMConst("Já existe outra entrega (Num. "_numEntrega_") no mesmo prazo de "_prazoDeEntregaCorrente_" dias.")
+			quit 
+		}
+	$$$End
+	
+	quit strStatus
+	
+ChecarPercentualEhValido()
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Verifica se o percentual é válido.
+    ;
+    ; Chamado por:
+    ;	Core rule do campo (3)-Percentual no form VARPedidoCompraEntrega.
+    ; 
+    ; Histórico:
+    ; 	28-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new percentual, entregaUniforme
+	
+	set percentual = +$piece(YFELD,Y,4)
+	set entregaUniforme = $piece(YFELD,Y,3)
+	
+	if (entregaUniforme = 1) {
+		if ( ((percentual <= 0) || (percentual > 100)) && ($piece(YFELD,Y,4) '= "") ) {
+			do AlertInScript^COMConst("Percentual com valor inválido. Valor deve ser entre 1 e 100.")
+			quit $$$NO
+		}
+	}	
+	quit $$$YES]]></Routine>
+</Export>

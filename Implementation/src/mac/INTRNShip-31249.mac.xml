@@ -1,0 +1,514 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRNShip" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRNShip
+	
+#include INConst
+#include COMSYS
+	
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+	
+CanShip(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Determines whether shipping the Transfer Order can be performed.
+	; Reasons for preventing shipping from being allowed
+	;  - Printing must be able to be performed
+	;  - Pick list must have been displayed
+	;  - Pick Grid must contain no errors
+	;    - All pick lines must have valid stock locations
+	;  - Picked quantities must match reserved quantities
+	;
+	; Params: pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: YQ implicitly
+	;
+	; History:
+	; 05-Sep-2013	shobby	HEVA-893: Replaced CheckPickIntegrity
+	; 18-Apr-2013	SCR		CORE-84: Check Intransit Location
+	; 07-Jan-2010	GRF		SR17080: Correct In Transit validation
+	; 06-Jan-2010	GRF		SR17080: Check stocktake locking; check in transit as
+	; 							well as sending locn; INDRPUMLKW validation; check
+	; 							auto-receipts
+	; 04-Nov-2008	HQN		SR16088: Check for record existence, key may be entered
+	; 							but record not saved yet, fired from tab change
+	; 07-Oct-2008	HQN		$$ProductError now returns a strStatus, use directly
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new blnEntry,idLine,idRecvLocn,idSendLocn,idShipMode,idTFRPickLine
+	new idTransitLocn,idTransitStore,objLocn,objShipMode,objTFR,objTFRPickLine,strStatus
+	new objTransitLocn
+	
+	if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+		new idItem,arrItemsQty,idTFRLine,intTotalPicked
+		kill arrItemsQty
+	}
+	
+	if '$$$NoKey(pidTFR) {
+		set strStatus  = $$$OK
+		set objTFR     = $get(^INTFR(0,pidTFR,1))
+		
+		if objTFR = "" {
+			set strStatus = $$$NO
+		
+		} else {
+			set strStatus = $$CheckPickIntegrity^INTRN(pidTFR)
+
+			if $$$ISOK(strStatus) {
+				set idSendLocn = $$$INTFRSendingLocation(objTFR)
+				set idShipMode = $$$INTFRDispatch(objTFR)                          ; SR17080 vvv extend original
+				set idRecvLocn = $$$INTFRReceivingLocation(objTFR)
+			
+				if idShipMode'="" {
+					set objShipMode    = $get(^INDRPUMLKW(0,idShipMode,1))
+					set idTransitLocn  = $$$INDRPUMLKWLocation(objShipMode)
+					set idTransitStore = $$$INDRPUMLKWStockLocation(objShipMode)
+					if (idTransitLocn'="") && (idTransitStore'="") {
+						if $$IsLockedStockLocation^INLocking(idTransitLocn,idTransitStore) {
+							set strStatus = $$ReasonLocked^INLocking(idTransitLocn,idTransitStore,"")
+						}
+						; CORE-84 vvvv
+						if $$$ISOK(strStatus) {
+							set objTransitLocn = $get(^WWW0121(YM,0,idTransitLocn,1))
+							if '$$$WWW0121StorageLocn(objTransitLocn) {
+								set strStatus = $$$MakeStatus("IN01415",idTransitLocn)  ;Can not transfer, Intransit location %1 is not a Inventory location
+							}
+						}
+						; CORE-84 ^^^^
+
+					} else {
+						set strStatus = $$$MakeStatus("IN00748",pidTFR,idShipMode)
+					} ; "Can't identify In Transit for transfer %1 - Dispatch %2 incomplete"
+				
+				} else {
+					set strStatus = $$$MakeStatus("IN00747",pidTFR)
+				} ; "Can't identify In Transit for transfer %1 - No Dispatch"      ; SR17080 ^^^
+			}			
+			if $$$ISOK(strStatus) {   ; SR17080 add wrapper
+				if ($$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSSent)     ||
+				   ($$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSReceived)    {
+					set strStatus = $$$MakeStatus("IN00424")        ; "Can not perform action as Transfer has been sent."
+			
+				} else {
+					if $$$INTFRPickListPrinted(objTFR) = "" {
+						set strStatus = $$$MakeStatus("IN00422")    ; "Pick list needs to be printed."
+				
+					} else {
+						set strStatus = $$ProductError^INTRNValidation("IN00439")  ; "Please fix all errors before shipping."
+						if $$$ISOK(strStatus) {
+							if $$IsLockedSiteLocation^INLocking(idSendLocn) {
+								set strStatus = $$ReasonLocked^INLocking(idSendLocn)
+							}			
+						}				
+					}
+				}
+			}
+			
+			if $$$ISOK(strStatus) {    ; SR17080 auto receipt
+				set objLocn = $get(^WWW0121(0,0,idRecvLocn,1))
+			
+				if $$$WWW0121AutoReceiptTransferOrders(objLocn) {
+					if $$IsLockedSiteLocation^INLocking(idRecvLocn) {
+						set strStatus = $$ReasonLocked^INLocking(idRecvLocn)
+					}
+				}
+			}                          ; SR17080 ^^^
+		}
+		
+		set blnEntry = $$$NO
+		if $$$ISOK(strStatus) {
+			set idTFRPickLine = ""
+			for {
+				quit:blnEntry
+				
+				set idTFRPickLine = $order(^INTFRPickLine(0,pidTFR,idTFRPickLine))
+				quit:idTFRPickLine=""
+				
+				set objTFRPickLine = $get(^INTFRPickLine(0,pidTFR,idTFRPickLine,1))
+				if $$$INTFRPickLinePickedQuantity(objTFRPickLine) {
+					set blnEntry = $$$YES
+				}
+			}
+		
+			if blnEntry = $$$NO {
+				set strStatus = $$$MakeStatus("IN01081")   ; "No Pick Quantities Entered on Lines"
+			}			
+		}
+		$$$YQHandler(strStatus)
+	}
+	
+	quit
+	
+	
+Ship(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Determine whether shipping can be performed, if so perform ship.
+	;
+	; Params: pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 20-Aug-2014	Henrique Dias	MARKANTI-26		Call for Changing Attributes 
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+ 
+	set strStatus = $$$NO
+	do CanShip(pidTFR)
+	
+	if YQ = $$$YQEnable {
+		set strStatus = $$Transaction^COMTransaction("ShipTxn^INTRNShip("""_pidTFR_""")",$$$YES)
+		
+		if $$$ISOK(strStatus) {
+			set YSEITE = 1 // FIXME: This does not even fix all cases where page two is displayed.
+			do ReloadForm^COMUtilForm()
+		}
+	
+	} else {
+		do ReturnError^COMUtils($$$YQMessage)
+	}
+	
+	
+	if (+$$$WWWClientParamCoreChangesMARKANTI($get(^WWWClientParam(YM,YM,1)))) 
+	{
+		// 20-Aug-2014	Henrique Dias	MARKANTI-26	
+		// Begin
+	 
+		If (pidTFR '= "")
+		{
+			&SQL(Select ReceivingLocation into :tReceivingLocation From INTFR Where TransferNumber = :pidTFR)
+		}
+	
+		Set tStatusProprietario = $$ChangeStockAttribute^VARINADJATT(pidTFR,tReceivingLocation,YBED,YUSER)
+	
+		// End
+	}
+	
+	Quit strStatus
+	
+	
+ShipTxn(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Update the status of the Transfer Order
+	;
+	; Params: pidTFR - Transfer Order Id
+	;
+	; ByRefs: None
+	;
+	; Returns: $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new idForm,idREC,objLocation,objTFR,strStatus
+ 
+	set objTFR = $get(^INTFR(0,pidTFR,1))
+	set $$$INTFRShipped(objTFR) = $horolog
+	set $$$INTFRStatus(objTFR)  = $$$EnumINTFRSTATUSSent
+	set strStatus = $$$Save("INTFR",pidTFR,objTFR,$$$YES)
+
+	if $$$ISOK(strStatus) {
+		set strStatus = $$CreateShipment(pidTFR)
+		
+		if $$$ISOK(strStatus) {
+			set objLocation = $get(^WWW0121(0,0,$$$INTFRReceivingLocation(objTFR),1))
+			
+			if $$$WWW0121AutoReceiptTransferOrders(objLocation) {
+				set strStatus = $$CreateReceiptTxn^INTRNRec(pidTFR)
+				
+				if $$$ISOK(strStatus) {
+					set idREC =	$$$TempStore("idREC")
+					set strStatus = $$PostTxn^INRECTFR(idREC,"INRECLine")
+				}
+			}
+		}
+	}
+
+	if ($$$ISOK(strStatus)) {
+		if (+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) {
+			set strStatus = $$ShipTxn^VARINTRNShip(pidTFR)
+		}
+	}
+
+	quit strStatus
+	
+	
+CreateShipment(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Create and Update the relevant records as a result
+	; of Shipping the Transfer
+	;
+	; Params:
+	; pidTFR - Transfer Order Id
+	;
+	; ByRefs: None
+	;
+	; Returns: $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 07-Jan-2010	GRF		SR17080: Correct In Transit validation
+	; 12-Jan-2009	HQN		Moved *OLD* block after quit
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new idRecvLocn,idSendLocn,idShipMode,idTransitLocn,idTransitStore
+	new objShipMode,objTFR,strStatus
+	
+	set strStatus = $$$OK
+	
+	set objTFR = $get(^INTFR(0,pidTFR,1))
+	//set idSendLocn  = $$$INTFRSendingLocation(objTFR)
+	set idRecvLocn  = $$$INTFRReceivingLocation(objTFR)
+	//set idReserveNo = "TFR_"_$$Replace^COMUtilStr($$$Escape(pidTFR),"-","%2d")
+	
+	set idShipMode = $$$INTFRDispatch(objTFR)
+	if idShipMode '="" {
+		set objShipMode    = $get(^INDRPUMLKW(0,idShipMode,1))
+		set idTransitLocn  = $$$INDRPUMLKWLocation(objShipMode)
+		set idTransitStore = $$$INDRPUMLKWStockLocation(objShipMode)
+	}
+	
+	if idShipMode'="" {
+		set objShipMode    = $get(^INDRPUMLKW(0,idShipMode,1))
+		set idTransitLocn  = $$$INDRPUMLKWLocation(objShipMode)
+		set idTransitStore = $$$INDRPUMLKWStockLocation(objShipMode)
+		if (idTransitLocn'="") && (idTransitStore'="") {
+			if $$IsLockedStockLocation^INLocking(idTransitLocn,idTransitStore) {
+				set strStatus = $$ReasonLocked^INLocking(idTransitLocn,idTransitStore,"")
+			}
+		} else {
+			set strStatus = $$$MakeStatus("IN00748",pidTFR,idShipMode)
+		} ; "Can't identify In Transit for transfer %1 - Dispatch %2 incomplete"
+		
+	} else {
+		set strStatus = $$$MakeStatus("IN00747",pidTFR)
+	} ; "Can't identify In Transit for transfer %1 - No Dispatch"      ; SR17080
+	
+	//No longer required as Planned Movemnts are not a physical Stock Holding in new SOH Model PP Adhoc 20/08
+	//if $$$ISOK(strStatus) {
+	//	set strStatus = $$AllowTransfer(pidTFR)
+	//}
+	
+	; FIXME : idTransitLocn is not defined, idSendLocn is not used.
+	;         Since this is a shipment should it be idSendLocn => idTransitLocn?  No (needs inTransitLocn)
+	
+	if $$$ISOK(strStatus) {                      // Update the Supply with the correct quantity when Shipped
+		set strStatus = $$UpdateShipmentSupply^INTRNDemand(pidTFR,idTransitLocn,idRecvLocn)
+		
+		//ClearPickStock Removed - No Reservations to clear and update stock with new SOH
+		//DropReservations Removed - Again no reservations to remove
+		//The Create Movement will update the reservation ie alDRP.dPlannedMovement to alDRP.dMovement
+		//
+		if $$$ISOK(strStatus) {          // Create the Movement -LOC to +INTRANSIT
+			set strStatus = $$CreateMovement(pidTFR)
+		}
+	}
+	quit strStatus
+	
+	
+CreateMovement(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Create the Movement Record for Update
+	; 
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if all saves are successful, otherwise error list is returned.
+	;
+	; History:
+	; 28-Jan-2009	HQN		SR16296: Reverted, per pickline and issuedqty now
+	; 							is based on actual picked qty
+	; 27-Jan-2009	HQN		SR16296: Only update once instead of per PickLine
+	; 12-Jan-2009	HQN		SR16296: Update Req if needed
+	; 16-Oct-2008	HQN		SR15874: Don't bother to ship zero quantity picklines
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new blnFromLocnConsumable,dtePick,dteUseBy,fltShipQty
+	new idBatch,idItem,idLine,idLot,idReserve
+	new idSendLocn,idShipMode,idStore,idTransitLocn,idTransitStore
+	new intInTransitType,objShipMode,objTFR,objTFRLine,objUReqLine,objUTFRLine
+	new sc,strStatus
+	
+	set sc         = $$$OK
+	set strStatus  = $$$OK
+ 
+	set objTFR     = $get(^INTFR(0,pidTFR,1))
+	set idSendLocn = $$$INTFRSendingLocation(objTFR)
+	
+	set idShipMode = $$$INTFRDispatch(objTFR)
+	set objShipMode    = $get(^INDRPUMLKW(0,idShipMode,1))
+	set idTransitLocn  = $$$INDRPUMLKWLocation(objShipMode)         ; D4  In-Transit Site Location
+	set idTransitStore = $$$INDRPUMLKWStockLocation(objShipMode)    ; D5  In-Transit Storage
+	
+	; FIXME : There is no else situation where idTransitLocn/idTransitStore are set.
+	; idShipMode is Mandatory
+	
+	set idLine=""
+	for {
+		set idLine=$order(^INTFRPickLine(0,pidTFR,idLine))
+		quit:idLine=""
+		
+		set objTFRLine =  $get(^INTFRPickLine(0,pidTFR,idLine,1))
+		
+		set idBatch    =  $$$INTFRPickLineBatch(objTFRLine)
+		set idLot      =  ""			//$$$INTFRPickLineLotNumber(objTFRLine)
+		set dteUseBy   =  $$$INTFRPickLineUsebyDate(objTFRLine)
+			
+		set idItem     =  $$$INTFRPickLineItem(objTFRLine)
+		set idStore    =  $$$INTFRPickLineSendingStockLocation(objTFRLine)
+		set fltShipQty = +$$$INTFRPickLinePickedQuantity(objTFRLine)             ; FIXME : Pick or Ship?  - Actual Shipped Qty during Shipping
+		set dtePick    =  $$$INTFRPickLineINWEDate(objTFRLine)
+		
+		set blnFromLocnConsumable = $$$NO	// $$IsConsumable^INARTLOCPAR(idItem,idSendLocn)
+		// I don't need the QOH updated but need the Transaction Updated
+		
+		if 'blnFromLocnConsumable {
+			if fltShipQty < 0 {
+				set strStatus = $$$AppError("P0060000001") ; Quantity to reserve must be positive.   ; FIXME : inappropriate idError <GRF>
+			; FIXME: Do we really want to generate a Dump File? Shouldn't the negative quantity be picked up on saving the pick line? <GRF>
+			// should not reach this point in the first place
+			}
+			;continue:fltShipQty=0 ; SR15874 16-Oct-2008
+			
+			// Create the Movement -LOC to +INTRASIT
+			if $$$ISOK(strStatus) {
+				if (fltShipQty > 0){
+					set intInTransitType = 1         ; 1:"ISS", 2:"REC"
+					set strStatus = $$UpdateSOH^INTRNStockUpdate(intInTransitType,idItem,idSendLocn,idStore,dtePick,
+				                                             idTransitLocn,idTransitStore,fltShipQty,pidTFR,idLine)
+				}
+				                    
+				//  Remove the Planned Movements                      
+				if $$$ISOK(strStatus) {
+					set strStatus = $$OnDelete^INTRNPickLine(pidTFR_$$$COMMA_idLine)
+				}
+			}
+			continue:fltShipQty=0
+		}
+		
+		;SR16296 vvvv
+		if $$$ISOK(strStatus) {
+			; Update Req if needed
+			set objUTFRLine = $get(^INTFRLine(0,pidTFR,$$$INTFRPickLineSourceline(objTFRLine),1))
+			if ($$$INTFRLineReference(objUTFRLine) '= "") {
+				; TODO: Detect type of reference, right now assume its a Req if Reference exists
+				set objUReqLine = ##class(alREQ.dUReqLine).%OpenId("0||"_$$$KEY1($$$INTFRLineReference(objUTFRLine))_"||"_$$$KEY2($$$INTFRLineReference(objUTFRLine)),,.sc)
+				if $$$ISOK(sc) {
+					set objUReqLine.QtyIssued = objUReqLine.QtyIssued + $$$INTFRPickLinePickedQuantity(objTFRLine)
+					; 27-Jan-2009 vvvv
+					if $$$INTFRLineRejectRemainder(objTFRLine) = 1 {
+						set objUReqLine.Rejected = $$$YES
+						set objUReqLine.ReasonRejection = "Rejected at Transfer"
+					}
+					; 27-Jan-2009 ^^^^
+					set sc = objUReqLine.%Save()
+					set:$$$ISOK(sc) sc = objUReqLine.AutoClose()
+				}
+				set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+				if $$$ISOK(strStatus) {
+					set strStatus	= $$UpdateStatus^INReq($$$KEY1($$$INTFRLineReference(objUTFRLine)))
+				}
+
+			}
+		}
+		;SR16296 ^^^^
+ 
+		quit:$$$ISERR(strStatus)
+ 	}
+ 
+	quit strStatus
+	
+	
+AllowTransfer(pidTFR) 
+	;-------------------------------------------------------------------------------
+	; Determine whether storages can fulfil all of the demands
+	; 
+	; Params: pidTFR
+	;
+	; Returns: Status: $$$OK to allow transfer otherwise a listbuild is returned.
+	;
+	; History:
+	; 17-Oct-2008	GRF		SR16053: Remove $listbuild from inside $MakeStatus();
+	; 							text code.
+	; 01-Oct-2008	HQN		Semi redundant, PickLines should have reserved quantites
+	; 						valid before this step. Check again...
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new idPickLine,idItem,idSendLocn,fltQtyPicked,objPickLine,objTFR,SQLCODE,strStatus
+	
+	set strStatus    = $$$OK
+	set SQLCODE      = 0
+	set fltQtyPicked = 0
+	
+	set objTFR     = $get(^INTFR(0,pidTFR,1))
+	set idSendLocn = $$$INTFRSendingLocation(objTFR)
+	
+	set idPickLine = ""
+	for {
+		set idPickLine = $order(^INTFRPickLine(0,pidTFR,idPickLine))
+		quit:idPickLine=""
+		quit:$$$ISERR(strStatus)
+		
+		&sql(SELECT SUM(QtyRequired) INTO :fltQtyPicked FROM alDRP.dPlannedMovement
+		     WHERE reference=:pidTFR      AND
+		           linenumber=:idPickLine AND
+		           State->StateId=3          )
+ 
+		if SQLCODE=0 {
+			set objPickLine = $get(^INTFRPickLine(0,pidTFR,idPickLine,1))
+			set idItem      = $$$INTFRPickLineItem(objPickLine)
+ 
+			continue:$$IsConsumable^INARTLOCPAR(idItem,idSendLocn)
+ 
+			if fltQtyPicked < $$$INTFRPickLinePickedQuantity(objPickLine) {
+				set strStatus = $$$MakeStatus("IN00382",idItem)
+			}
+ 
+		} else {
+			set strStatus = $$$MakeStatus("IN00763",pidTFR,idPickLine)   ; "Error querying Planned Movement (%1, %2)"
+			quit
+		}
+	}
+	quit strStatus
+	
+	
+ValidStockLocation(pidLocn,pidStore)
+	;-------------------------------------------------------------------------------
+	; Determine whether a storage is valid
+	;
+	; Params:
+	; pidLocn  - Sending Site Location
+	; pidStore - Storage
+	;
+	; ByRefs: None
+	;
+	; Returns: blnValid - $$$YES if valid storage, otherwise $$$NO
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new blnValid,objINVORG
+	
+	set blnValid = $$$NO
+	
+	if (pidLocn '= "") && (pidStore '= "") {
+		if $data(^INLP(0,pidLocn,pidStore)) {
+			set blnValid = $$$YES
+			
+		} else {
+			set objINVORG = $get(^INVORG(0,0,1))
+			if pidStore = $$$INVORGDeleteStockLocation(objINVORG) {
+				set blnValid = $$$YES
+			}
+		}
+	}
+	
+	quit blnValid
+	
+]]></Routine>
+</Export>

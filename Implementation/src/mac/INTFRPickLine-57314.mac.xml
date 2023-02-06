@@ -1,0 +1,350 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTFRPickLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTFRPickLine
+	
+#include INConst
+#include COMSYS
+#include %occInclude
+#include COMGridEdit31	
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+
+#define FORMFldINTFRPickLineUnit	4
+	
+OnBeforeDisplayCombo(pidYKEY,pobjTFRLine,pintCol,pSUCH)
+	;-------------------------------------------------------------------------------
+	; Generate data for Unit of Measure drop down before displaying drop down in the Edit Grid
+	;
+	; Params:
+	; pidYKEY     - Pick Line Id
+	; pobjTFRLine - Pick Line record
+	; pintCol     - Edit Grid Column Id
+	; pSUCH       - Not used
+	;
+	; ByRefs: None
+	;
+	; Returns: blnOverride
+	;
+	; History:
+	; 15-Jul-2011	GRF		SR17669: Call common code
+	; 04-Nov-2009	DWR		SR16983: Rewritten to be the same as all other unit combos
+	; 18-Apr-2006	PO/RPW	SR14427: Created
+	;-------------------------------------------------------------------------------
+	new blnOverride,enumLineType,enumUnit,idClassField,idItem
+
+	set blnOverride = $$$NO
+	
+	; Unit
+	;---------------------------------------
+	if pintCol = $$$FORMFldINTFRPickLineUnit {      ; SR17669 vvv
+		set blnOverride = $$LoadCombo^INARTPACK($$$INTFRPickLineItem(pobjTFRLine),blnOverride,.pSUCH)
+	}
+	quit blnOverride
+	/*
+	if pintCol = $$$FORMFldINTFRPickLineUnit  {
+		kill pSUCH
+		set pSUCH  = "SUCH"
+		set idItem = $$$INTFRPickLineItem(pobjTFRLine)
+		if idItem '= "" {
+			set enumUnit = ""
+			for {
+				set enumUnit = $order(^INARTPACK(0,idItem,enumUnit))
+				quit:enumUnit=""
+				
+				set pSUCH(enumUnit) = enumUnit
+			}
+			set blnOverride = $$$YES
+		}
+	}
+	quit blnOverride
+	*/                                           ; SR17669 ^^^
+	
+	
+OnBeforeFormat(pstrYFIELDNAME,pstrText,pobjLine)
+	;-------------------------------------------------------------------------------
+	; Determine how particular fields on the Pick Line are to be displayed.
+	;
+	; Params:
+	; pstrYFIELDNAME - Edit Grid field name
+	; pstrText - Not used
+	; pobjLine - Pick Line record
+	;
+	; ByRefs: YTEXT
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 11-Oct-2013	SCR		CORE-299: Make Storage always read only
+	; 21-Apr-2011	shobby	SR17729: Optionally allow posting with pick qty greater than
+	;							transfer qty.
+	; 08-Jan-2010	shobby	SR15753: Let @netManager do the hard work.
+	; 09-Nov-2009	PPP		SR17017:Pick Qty need to be matched against BaseQty on the Order
+	; 24-Mar-2009	GRF		SR16428: Call common code for CellColours; idClassFld
+	; 							instead of idField; replace early quit; standardise
+	; 							tag name
+	; 09-Feb-2009	GRF		SR16328: EnumReadOnly Macro; use $$Get^WWW122 to include
+	; 							customisations
+	; 11-Nov-2008	HQN		SR16077: Now validate coloring as a set, based on
+	; 							dBundleStock instead of Storage.
+	; 29-Oct-2008	HQN		FIXME: Quite slow for PickedQty checks, lots of SOH hits
+	; 28-Oct-2008	HQN		SR16077: fltTotPickQty misleading, fltTotPickStorageQty
+	; 							preferable; check against Planned for storage
+	; 21-Oct-2008	GRF		SR15812: unused variables removed from new command;
+	; 							move new commands to top; variable prefixes
+	; 20-Oct-2008	HQN		SR16000: Now taking PlannedQty only for this Transfer
+	; 15-Oct-2008	HQN		SR16033: Include blocked storages for this query since
+	; 							INTRANSIT is a blocked location.
+	; 23-Sep-2008	HQN		SR15862: Override default color handling
+	; 							Manually set LotNumber/Batch/UseByDate from bundle
+	; 							replacing old color handling; Changed to V2 GetQty
+	; 07-Aug-2008	PP		SR15812: Modified from earlier version
+	;-------------------------------------------------------------------------------
+ 	new dteExpiry,dteReceiptNo,fltBundlePickQty,fltBundlePlannedQty
+	new fltMax,fltQuantity,fltSourceQty,fltSourcedQty,fltTotPickQty,fltTFRQty
+ 	new idBundle,idClassFld,idItem,idKey,idLine,idLocn,idPlannedMovement,idStore,idTFR,idTFRLine
+	new idxAttribute,intCol,intRow,intRowLoop,lstSources
+ 	new objBundle,objBundleStock,objGrid,objPlannedMovement,objTFR,objTFRLine,SQLCODE
+	new strBundleValues,strLotNo,strDefaultColor,strDisabledColor,strRequiredColor,strWarningColor
+	
+	quit:$translate(pobjLine,Y)=""
+	
+	set objTFR = $$$GRIDYFELDContainer	
+	set idItem = $$$INTFRPickLineItem(pobjLine)
+    
+	quit:($$$INTFRStatus(objTFR)=$$$EnumINTFRSTATUSSent)||($$$INTFRStatus(objTFR)=$$$EnumINTFRSTATUSReceived)||(idItem="")
+	
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pstrYFIELDNAME,intRow,intCol)
+	
+ 	set idClassFld = $$$GetClassField(YFORM,intCol)
+	set idLocn     = $$$INTFRSendingLocation(objTFR)
+	
+	set idKey  = $$ReferenceKey^COMGridEdit31Interface(YFORM,intRow)
+	set idTFR  = $$$KEY1(idKey)
+	set idLine = $$$KEY2(idKey)
+	
+	kill $$$TempStore("TRNLineErrors",idLine,idClassFld) ; CAUTION : change if adding manual fields to form - idClassFld will be null <GRF>
+	
+	; Picked Quantity
+	;---------------------------------------
+	if idClassFld = $$$FldINTFRPickLinePickedQuantity {
+		set idStore     = $$$INTFRPickLineSendingStockLocation(pobjLine)
+		set fltQuantity = $$$INTFRPickLinePickedQuantity(pobjLine)
+		
+		if fltQuantity < 0 {
+			set YTOOLTIP = $$$Text("IN00490")    ; "Quantity can not be negative."
+			set YWARNING = $$$YES
+			set $$$TempStore("TRNLineErrors",idLine,idClassFld) = ""
+			
+		} elseif (idItem'="") && (fltQuantity'="") {
+			set idBundle = $$$INTFRPickLineBundle(pobjLine)
+			
+			//	Total Pick Qty > Transfer Line Qty
+			set idTFRLine  = +$$$INTFRPickLineSourceline(pobjLine)
+			set objTFRLine = $get(^INTFRLine(0,idTFR,idTFRLine,1))
+			
+			// Pick Qty need to be matched against BaseQty on the Order
+			set fltTFRQty     = +$$$INTFRLineBaseQuantity(objTFRLine)
+			set fltTotPickQty = $$GetQtyPickedViaTFRLine(idTFR_","_idTFRLine)
+			
+			if (fltTotPickQty > fltTFRQty)&&'$$PickMoreThanTransfer^INVORG() {		;SR17729
+				set YTOOLTIP = $$$Text($listbuild("IN00850",fltTotPickQty,fltTFRQty))
+				set YWARNING = $$$YES
+				set $$$TempStore("TRNLineErrors",idLine,idClassFld) = ""
+			 ; "Total Picked Qty '%1' is greater that Order Line Qty '%2'."
+				
+			} else {
+				set fltBundlePickQty  = $$GetQtyPickedViaBundleStock^INTRNPickTable(idItem,idLocn_"||"_idStore,idBundle)
+				//	Entered Qty > Bundle Qty for Storage 
+				set fltBundlePlannedQty = 0
+				
+				&sql(
+					SELECT IFNULL(SUM(QtyRequired),0,SUM(QtyRequired)) INTO :fltBundlePlannedQty
+					FROM alDRP.dPlannedMovement
+					WHERE Item=:idItem                  AND
+					      FromStorage->Location=:idLocn AND
+					      FromStorage->Code=:idStore    AND
+					      Bundle=:idBundle
+				)
+				set:SQLCODE'=0 fltBundlePlannedQty = 0
+				
+				set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idItem_"||"_idLocn_"||"_idStore_"||"_idBundle)
+				if objBundleStock'=$$$NULLOREF {
+					set fltMax = objBundleStock.QtyOnHand
+					set fltMax = fltMax - fltBundlePlannedQty + $$GetQtyPlanned^INTFR(idTFR,idItem,idLocn,idStore,idBundle)
+					
+					if fltBundlePickQty > fltMax {  //	Total Pick Qty > Available Qty
+						set YTOOLTIP = $$$Text($listbuild("IN00852",fltBundlePickQty,idStore,fltMax))
+						set YWARNING = $$$YES
+						set $$$TempStore("TRNLineErrors",idLine,idClassFld) = ""
+					} ; "Total Picked Qty '%1' at Storage '%2' is greater than Available Qty '%3'."
+					
+				} else {
+					set YTOOLTIP = $$$Text($listbuild("IN00852",fltBundlePickQty,idStore,0))
+					set YWARNING = $$$YES
+					set $$$TempStore("TRNLineErrors",idLine,idClassFld) = ""
+				} ; "Total Picked Qty '%1' at Storage '%2' is greater than Available Qty '%3'."
+			}
+		}
+	
+	; Bundle
+	;---------------------------------------
+	} elseif idClassFld = $$$FldINTFRPickLineBundle {
+		set idStore     = $$$INTFRPickLineSendingStockLocation(pobjLine)
+		set fltQuantity = $$$INTFRPickLinePickedQuantity(pobjLine)
+		set idBundle    = $$$INTFRPickLineBundle(pobjLine)
+		
+		set objBundle = ##class(alSOH.dBundle).%OpenId(idBundle)
+		if objBundle '= $$$NULLOREF {
+			set YTOOLTIP  = idBundle
+			set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundle,SPRACHE)
+			set YTEXT = strBundleValues
+		}
+	}
+	quit
+	
+	
+ValidStockLocation(pidLocn,pidStore) ; DEPRECATED - use ValidStorage
+	; keep entry point for VAR code - should probably be INLP or V2 utility
+	quit $$ValidStorage($get(pidLocn),$get(pidStore))
+	
+	
+ValidStorage(pidLocn,pidStore)
+	;-------------------------------------------------------------------------------
+	; Determine whether a storage is valid
+	;
+	; Params:
+	; pidLocn  - Sending Site Location
+	; pidStore - Storage
+	;
+	; ByRefs: None
+	;
+	; Returns: blnValid - $$$YES if valid storage, otherwise $$$NO
+	;
+	; History:
+	; 10-Nov-2011	PPP		SR17929: User new method to check for Blocked
+	; 24-Mar-2009	GRF		SR16428: standardise naming
+	; 15-Aug-2008	PP		SR15812: Added the blocked location check
+	; 29-Apr-2006	PO		SR14427: Created
+	;-------------------------------------------------------------------------------
+	new blnValid,objINVORG
+	
+	set blnValid = $$$NO
+	
+	if (pidLocn '= "") && (pidStore '= "") {
+		if $data(^INLP(0,pidLocn,pidStore)) {
+			//SR17929
+			//if '$$$INLPStockLocationIsLocked($get(^INLP(0,pidLocn,pidStore,1))) {
+			if '$$IsStorageBlocked^INLP(pidLocn,pidStore) {
+				set blnValid = $$$YES		
+			}
+		} else {
+			set objINVORG = $get(^INVORG(0,0,1))
+			if pidStore = $$$INVORGDeleteStockLocation(objINVORG) {
+				set blnValid = $$$YES
+			}
+		}
+	}
+	quit blnValid
+	
+	
+OnBeforeCopy(pidTFRPickLine,&pobjPickLine)
+	;-------------------------------------------------------------------------------
+	; Run validation to update current errors.
+	;
+	; Params:
+	; pidTFRPickLine - Pick Line Id
+	; pobjPickLine - Pick Line record
+	;
+	; ByRefs: pobjPickLine
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 11-Nov-2008	HQN		SR16077: Recalc max issuable based on the copied line,
+	; 							use same algorithm as SelectBundle^INTFRPickLine()
+	; 08-Feb-2007	PO		SR15217: Clear prior picked quantity
+	; 26-Apr-2006	RPW/PO	SR14427: Created
+	;-------------------------------------------------------------------------------
+	new idBundleStock,fltQtyRequired
+	
+	set idBundleStock = $$$INTFRPickLineItem(pobjPickLine)_"||"_$$$INTFRSendingLocation($$$GRIDYFELDContainer)_"||"_$$$INTFRPickLineSendingStockLocation(pobjPickLine)_"||"_$$$INTFRPickLineBundle(pobjPickLine)
+	set $$$INTFRPickLinePriorPickedQuantity(pobjPickLine) = ""
+	
+	set fltQtyRequired = $$$INTFRLineQuantity(pobjPickLine) - $$GetQtyPickedViaTFRLine^INTFRPickLine($$$GRIDYFELDContainer_","_$$$INTFRPickLineSourceline(pobjPickLine)) -  $$$INTFRPickLinePickedQuantity(pobjPickLine)
+ 
+	set $$$INTFRPickLinePickedQuantity(pobjPickLine) = $$GetQtyAvailableViaBundleStock^INTRNPickTable(idBundleStock)
+	set:$$$INTFRPickLinePickedQuantity(pobjPickLine)>fltQtyRequired $$$INTFRPickLinePickedQuantity(pobjPickLine) = fltQtyRequired 
+	quit
+	
+	
+AssociatedValidation(pstrYFELD,pstrFieldValue,pidAssociated)
+	;-------------------------------------------------------------------------------
+	; Check if the field is valid based on another field.
+	;	COMUnit uses (idItem,idUnit,numQty,idLocn)
+	;
+	; Inputs:
+	; pstrYFELD     : The data for the form
+	; pstrFieldValue: The value of the field we are in
+	; pidAssociated : The associated field
+	;
+	; ByRef:
+	;
+	; Returns:
+	; boolean - $$$YES is valid, $$$NO invalid
+	;
+	; History:
+	; 26-Apr-2007	RPW		SRBR014310: Created
+	;-------------------------------------------------------------------------------
+ 	new blnValid
+ 	
+ 	set blnValid = $$$YES
+ 	if pidAssociated=$$$FldINTFRPickLineUnit {
+	 	set blnValid = $$IsValidQtyUnit^COMUnit($$$INTFRPickLineItem(pstrYFELD),$piece(pstrYFELD,Y,pidAssociated),pstrFieldValue,YLOCATION)
+	}
+	quit blnValid
+	
+	
+GetQtyPickedViaTFRLine(pidTFRKey)
+	;-------------------------------------------------------------------------------
+	; Returns the SUM(PickedQty) for a TFRLine, either onscreen if set or on disk
+	; 
+	; History
+	; 24-Mar-2009	GRF		SR16428: Procedure block zero format
+	; 11-Nov-2008	HQN		SR16077: Created
+	;-------------------------------------------------------------------------------
+	new fltQtyPicked,idLine,idTFR,idTFRLine,objLine
+	
+	set fltQtyPicked = 0
+	set idTFR     = $$$KEY1(pidTFRKey)
+	set idTFRLine = $$$KEY2(pidTFRKey)
+	
+	if YFORM = "INTFRPickLine" {
+		; IN GRID, get via screen
+		set idLine = ""
+		for {
+			set idLine = $order($$$WWWDATEN("REFERENCEROW",idLine))
+	 		quit:(idLine = "")
+	 		continue:($get($$$WWWDATEN("KILLEDRECORD",$get($$$WWWDATEN("REFERENCEROW",idLine,1))))=1)
+	 		set objLine = $$$GRIDGetYFELD(idLine)
+	 		continue:idTFRLine'=$$$INTFRPickLineSourceline(objLine)
+	 		
+	 		set fltQtyPicked = fltQtyPicked + $$$INTFRPickLinePickedQuantity(objLine)
+		}
+	
+	} else {
+		set idLine = ""
+		for {
+			set idLine = $order(^INTFRPickLine(0,idTFR,idLine))
+			quit:idLine=""
+			set objLine = $get(^INTFRPickLine(0,idTFR,idLine,1))
+	 		continue:idTFRLine'=$$$INTFRPickLineSourceline(objLine)
+	 		
+	 		set fltQtyPicked = fltQtyPicked + $$$INTFRPickLinePickedQuantity(objLine)
+		}
+	}
+	quit fltQtyPicked
+	
+]]></Routine>
+</Export>

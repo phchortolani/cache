@@ -1,0 +1,1326 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INWEINVELINE" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INWEINVELINE
+	
+	; 08-Aug-2011	shobby	SR17850 Class/Form changed (Do Not remove comment)
+
+#include INConst
+#include WWWConst
+	
+#; Manual Fields on form WWWINVELINE (based on class INWEINV)
+#define countStart 27
+#define countEnd   36
+	
+#define FORMFldINWEINVLineLotNo			43
+#define FORMFldINWEINVLineExpiryDate	44
+#define FORMFldINWEINVLineBrand			46
+#define FORMFldINWEINVLineOwner			47
+#define FORMFldINWEINVLineProgram		48
+#define FORMFldINWEINVLineCount2		21
+#define FORMFldINWEINVLineCount3		25
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INWEINVELINE("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+OnBlur(pYBBN="",pYKEY="",pYFELD="")
+	;-------------------------------------------------------------------------------
+	; Actual quantity and the difference columns are linked together in this routine
+	; so that changing one will affect the other.
+	;
+	; Called By : COMGridEdit31Events due to setting on form (passes in GROW)
+	; 
+	; Params:
+	; 	YBBN	FormField ID
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Mar-2010	shobby	SR15753: Remove redundant code. 
+	; 17-Jun-2009 	PPP 	SR16510: 	1. Updated routine to use INItemPolicy class
+	; 24-Mar-2009	GRF		SR16428: Add variables to new list
+	; 10-Oct-2008	GRF		SR15810: Update access to bundle attributes on change to
+	; 							idItem.
+	; 03-Oct-2008	GRF		SR15810: Remove calls that would access VAR routines &
+	; 							implement functionality in CORE.
+	; 							Do not include test to reject items that were in the
+	; 							snapshot since this stops us adding them in another
+	; 							storage ($$ItemInSnapshot^INStocktaking called via
+	; 							$$CanAddToGrid); remove unnecessary tag
+	; 							UndoItemSelection.
+	; 18-Mar-2008	PJones	???: Move OnBlur code from form's D1 to this tag
+	; 02-Jan-2008	shobby	SRBR014798: Don't update quantity or difference if
+	; 							manager overwrites the Difference Adjustment column.
+	; 30-Nov-2007	shobby	SRBR014798: Created
+	;-------------------------------------------------------------------------------
+	new dteExpiry,fltDifference,idGroup,idItem,idLine,idStocktake,intRow,loopAttr
+	new objBundle,objLine,objResultSet,objUItem,sc,strStatus
+	
+	set idStocktake =  $$$KEY1(pYKEY)
+	set intRow      = +$$$KEY2(pYKEY)
+	
+	if pYBBN=1 {                                                ; * * * Item Number
+		set $$$INWEINVCountPrinted(YFELD) = $$$YES
+		;       ^^^ was the onBlur event for field 1 of the form
+		set idLine      = $$GetLineId^COMGridEdit31Interface(pYKEY,YFORM)
+		
+		set idItem    = $$$INWEINVItemNumber(pYFELD)
+		set idGroup   = $$ItemGroup(idItem)
+		set strStatus = $$ApplyGroupFilter(idStocktake,idGroup)
+		
+		if $$$ISERR(strStatus)  {
+			$$$Alert(strStatus)
+			; shouldn't really accept anything, so wipe the selected item
+			set YFELD = ""     ; shouldn't really accept anything, so wipe the selected item
+			
+		} else {
+			do AddingNewStocktakeLine(idStocktake,idLine)
+		}
+		
+	} elseif pYBBN=2 {                                          ; * * * Location
+		set strStatus = $$ApplyLocnFilter(idStocktake,$$$INWEINVLocation(pYFELD))
+		if $$$ISERR(strStatus) $$$Alert(strStatus)
+		
+	} elseif pYBBN=3 {                                          ; * * * Storage
+		set strStatus = $$ApplyStoreFilter(idStocktake,$$$INWEINVStockLocation(pYFELD))
+		if $$$ISERR(strStatus) $$$Alert(strStatus)
+			
+	} elseif pYBBN=4 {                                          ; * * * Count Quantity
+		set fltDifference = $$GetDifference(pYKEY,pYFELD)
+		set $$$INWEINVDifference(pYFELD)           = fltDifference
+		set $$$INWEINVDifferenceAdjustment(pYFELD) = fltDifference
+ 
+	} elseif $$$GetClassField("INWEINVELINE", pYBBN) = $$$FldINWEINVLotNo {
+		; TODO: Suggest Expiry Date if Use By Date Policy with Unique Lot Number
+
+		if ($$$INWEINVItemNumber(pYFELD) '= "") && ($$$INWEINVLotNo(pYFELD) '= "") {
+			set dteExpiry = ##class(alSOH.iUItemPolicy).GetExpiryForLot($$$INWEINVItemNumber(pYFELD),$$$INWEINVLotNo(pYFELD))
+			if dteExpiry'="" {
+				set objLine = $$$GRIDGetYFELD($$GetYKEY^COMGridEdit31Interface(intRow))
+				set $$$INWEINVExpiryDate(pYFELD) = dteExpiry
+			}
+		}
+	}
+	quit
+	
+	
+ApplyGroupFilter(pidStocktake,pidGroup)		
+	;-------------------------------------------------------------------------------
+	; Called on entry of an item to see if it is within the groups selected for
+	; the stocktake.
+	; 
+	; History:
+	; 03-Oct-2008	GRF		SR15810: Created
+	;-------------------------------------------------------------------------------
+	new idGroup,idItem,objStocktake,strFilterGroup,strStatus
+	
+	set strStatus = $$$YES
+	
+	set objStocktake   = $get(^INWEINVP(0,pidStocktake,1))
+	set strFilterGroup = $$$INWEINVPItemGroup(objStocktake)
+		
+	if strFilterGroup'="" {
+		if pidGroup="" {
+			set pidGroup  = $$$INVORGDefaultItemGroup($get(^INVORG(0,0,1)))
+		}
+		if '$find(";"_strFilterGroup_";",";"_pidGroup_";") {
+		; "The group (%1) for this item does not match the stocktake requirements."
+			set strStatus = $$$MakeStatus("IN00761",pidGroup)  ; IN00812?
+		}
+	}
+	quit strStatus
+	
+	
+ApplyLocnFilter(pidStocktake,pidLocn)
+	;-------------------------------------------------------------------------------
+	; Called on entry of an location to see if it is within the list selected for
+	; the stocktake.
+	; 
+	; History:
+	; 10-Oct-2008	GRF		SR15810: Created
+	;-------------------------------------------------------------------------------
+	new objStocktake,strFilterLocn,strStatus
+	
+	set strStatus = $$$YES
+	
+	set objStocktake   = $get(^INWEINVP(0,pidStocktake,1))
+	set strFilterLocn  = $$$INWEINVPSiteLocation(objStocktake)
+		
+	; "The location for this line (%1) does not match the stocktake requirements."
+	if strFilterLocn'="" {
+		if '$find(";"_strFilterLocn_";",";"_pidLocn_";") {
+			set strStatus = $$$MakeStatus("IN00847",pidLocn)
+		}
+	}
+	quit strStatus
+	
+	
+ApplyStoreFilter(pidStocktake,pidStore)
+	;-------------------------------------------------------------------------------
+	; Called on entry of a storage to see if it is within the list selected for
+	; the stocktake.
+	; 
+	; History:
+	; 10-Oct-2008	GRF		SR15810: Created
+	;-------------------------------------------------------------------------------
+	new objStocktake,strFromStore,strToStore,strStatus
+	
+	set strStatus = $$$YES
+	set objStocktake = $get(^INWEINVP(0,pidStocktake,1))
+	set strFromStore = $$$INWEINVPFromStockLocation(objStocktake)
+	set strToStore   = $$$INWEINVPToStockLocation(objStocktake)
+	
+	; "The storage for this line (%1) does not match the stocktake requirements."
+	if (strFromStore'="") && (strFromStore]]pidStore) {
+			set strStatus = $$$MakeStatus("IN00809",pidStore)
+	}	
+	if (strToStore'="")   && (pidStore]]strToStore) {
+			set strStatus = $$$MakeStatus("IN00809",pidStore)
+	}	
+	quit strStatus
+	
+	
+AddingNewStocktakeLine(pidStocktake,pidLine)
+	;-------------------------------------------------------------------------------
+	; presets for the new line
+	; 
+	; Called By : OnBlur
+	; 
+	; History:
+	; 28-May-2010	PPP		SR17296: 1. Passed $$$YES to $$$GRIDSetContents
+	;							2. Quit if objLine is null 
+	; 10-Apr-2010	GRF		SR17177: arrGrid rather than arrGridContents
+	; 10-Oct-2008	GRF		SR15810: Reuse idItemGroup
+	; 03-Oct-2008	GRF		SR15810: Remove call to VAR routine - revision to OnBlur
+	; 							makes this redundant; variable names.
+	; ??-???-???? Existing
+	;-------------------------------------------------------------------------------
+	new arrGrid,idItem,idItemGroup,objLine
+	
+	$$$GRIDGetContents(.arrGrid)
+	
+	set objLine = $get(arrGrid(pidStocktake,pidLine))
+	if objLine'="" {
+		set idItem  = $$$INWEINVItemNumber(objLine)
+		set $$$INWEINVLocation(objLine) = $$$INWEINVPSiteLocation($$GetStocktake^INStocktaking(pidStocktake))
+	//	set $$$INWEINVStockLocation(objLine) = "A"     ; FIXME : Hardcoded to SES Storage "A" ???
+		
+		set arrGrid(pidStocktake,pidLine) = objLine
+		$$$GRIDSetContents(.arrGrid,$$$YES)
+	}
+	quit
+		
+	
+DefaultVariableInput(pYBBN,pintCountField="")
+	;-------------------------------------------------------------------------------
+	; Determine the count quantity for the calculated field
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Nov-2007	shobby	SRBR014798: Timestamp of last entered count. (21)
+	; 22-Nov-2007	shobby	SRBR014798: Support 'Difference' column.
+	; 31-Oct-2007	shobby	SRBR014557: Created
+	;-------------------------------------------------------------------------------
+	new strResult
+
+	set strResult=""
+	if pintCountField'="" {  ;This variable is used for the 'Count *' fields as pYBBN ay change.
+		set strResult = $$GetQty^INWEINVCount($$$KEY1(YKEY),$$$KEY2(YKEY),pintCountField)
+	
+	} elseif (pYBBN=4) {		;Count Quantity
+		set strResult = $$GetDefaultFromTarget(YKEY,YFELD)
+	
+	} elseif (pYBBN=23) {		;Difference Adjustment
+		set strResult = $$GetDifference(YKEY,YFELD)
+	
+	} elseif (pYBBN=24) {		;Difference
+		set strResult = $$GetDifference(YKEY,YFELD)
+	
+	} elseif (pYBBN=5) {		;Count timestamp
+		set strResult = $$GetLastTimestampFormatted^INWEINVCount($$$KEY1(YKEY),$$$KEY2(YKEY),$$Count())
+	
+	} elseif (pYBBN=7) {		;Movement since generation
+		set strResult = $$GetQty^INWEINVUtils(YKEY,YFELD)
+	
+	} elseif (pYBBN=26) {
+		set strResult = $$GetItemGroup(YKEY,YFELD)
+	
+	} elseif $$IsNewCountField(pYBBN) {
+		set strResult = $$GetPrefilledCount(YKEY,YFELD,pYBBN)
+	}
+	quit strResult
+	
+	
+GetDifference(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	;	Last Count Quantity + Movement Since Generation - Target Quantity. 
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Aug-2009	PPP		SR16816:If the line has not been counted there is no difference
+	; 03-Nov-2008	PPP		SR16117:Get the trn qty for an item at a Location  for a date/time range
+	; 						CorrectByHistoryV2
+	; 10-Oct-2008	GRF		SR15810: variable prefixes
+	; 18-Dec-2007   PJones	Added reference to GetINWEINVwithLatestCount when 
+	; 							the value ActualQuantity in YFELD is nothing
+	; 22-Nov-2007	shobby	SRBR014798: Created
+	;-------------------------------------------------------------------------------
+	new fltCounted,fltDifference,idLineNo,idStocktake,objSTLine
+	
+	set idStocktake = $$$KEY1(pYKEY)
+	set idLineNo    = $$$KEY2(pYKEY)
+	
+	set fltDifference=""
+	if ($$$INWEINVStockType(pYFELD)'="R") && ($$$INWEINVStockType(pYFELD)'="S") {
+		if $$$INWEINVActualQuantity(pYFELD) '= "" {
+			; we have the last valid counted quantity in pYFELD because this count 
+			set fltCounted = $$$INWEINVActualQuantity(pYFELD)
+			
+		} else {
+			; this count we didn't count this line, because we are already satisfied 
+			; with this item. So we need to go back and get a line with the most recent 
+			; count that was done.
+			set objSTLine  = $$GetINWEINVwithLatestCount^INWEINVCount(idStocktake,idLineNo)
+			set fltCounted = $$$INWEINVActualQuantity(objSTLine)
+		}
+		//set fltDifference = fltCounted - $$$INWEINVTargetQuantity(pYFELD) + $$GetQty^INWEINVUtils(pYKEY,pYFELD)   ; FIXME : May be flawed (or fixed?)
+		
+		//if not counted yet there is no difference
+		if fltCounted'="" {
+			set fltDifference = fltCounted - $$$INWEINVTargetQuantity(pYFELD) - $$GetQty^INWEINVUtils(pYKEY,pYFELD)   ; FIXME : May be flawed (or fixed?)
+		} else {
+			set fltDifference = 0	
+		}
+	}	
+	quit fltDifference
+	
+	
+DynamicallyAddCount(pYFELD)
+	;-------------------------------------------------------------------------------
+	; Called By:  Manual call (?)
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Nov-2007	shobby	SRBR014798: Call to DynamicallyAddCountCust
+	; 13-Nov-2007	shobby	SRBR014769: Created
+	;-------------------------------------------------------------------------------
+	new idLanguage,intCounts,intCounter,intField,objWWW122,objWWW122Old,objWWW1221,strKey,strStatus
+	
+	set intCounts  = $$$INWEINVPNumberofCounts(pYFELD)
+	set intCounter = 1
+	
+	set intField   = 10
+	for {
+		set intField = $order(^WWW122(0,"INWEINVELINE",intField))
+		quit:intField=""
+		
+		set objWWW122    = $get(^WWW122(0,"INWEINVELINE",intField,1))
+		set objWWW122Old = objWWW122
+		if $extract($$$WWW122ManualCaption(objWWW122),1,6)="Count " {
+			if $piece($$$WWW122ManualCaption(objWWW122),"Count ",2)>0 {
+				set intCounter = intCounter+1
+				set $$$WWW122ManualCaption(objWWW122)          = "Count "_intCounter
+				set $$$WWW122DefaultVariableInput(objWWW122)   = "@$$DefaultVariableInput^INWEINVELINE(YBBN,"_intCounter_")"
+				set $$$WWW122ExecuteBeforeDataField(objWWW122) = "do OnBeforeFormConstruction^INWEINVELINE(YKEY,YBBN,"_intCounter_")"
+				set strKey = "INWEINVELINE"_$$$COMMA_intField
+				if objWWW122'=objWWW122Old {
+					set strStatus = $$$Save("WWW122",$$^WWWKEYBUILD(strKey),objWWW122,$$$YES)
+				}
+				set strStatus = $$DynamicallyAddCountLang(strKey,intField,intCounter)
+				set strStatus = $$DynamicallyAddCountCust(strKey,intField,intCounter)
+			}
+		}
+	}
+	set objWWW122 = $get(^WWW122(0,"INWEINVELINE",10,1))
+	set intField  = $order(^WWW122(0,"INWEINVELINE",""),-1)
+	
+	for intCounter=(intCounter+1):1:intCounts {
+		set intField = intField+1
+		set $$$WWW122ManualCaption(objWWW122)          = "Count "_intCounter
+		set $$$WWW122DefaultVariableInput(objWWW122)   = "@$$DefaultVariableInput^INWEINVELINE(YBBN,"_intCounter_")"
+		set $$$WWW122ExecuteBeforeDataField(objWWW122) = "do OnBeforeFormConstruction^INWEINVELINE(YKEY,YBBN,"_intCounter_")"
+		
+		set strKey    = "INWEINVELINE"_$$$COMMA_intField
+		set strStatus = $$$Save("WWW122",$$^WWWKEYBUILD(strKey),objWWW122,$$$YES)
+		
+		set strStatus = $$DynamicallyAddCountLang(strKey,intField,intCounter)
+		set strStatus = $$DynamicallyAddCountCust(strKey,intField,intCounter)
+	}
+	quit
+	
+	
+DynamicallyAddCountCust(pstrKey,pintField,pintCounter)
+	;-------------------------------------------------------------------------------
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Nov-2007	shobby	SRBR014798: Created
+	;-------------------------------------------------------------------------------
+	new idCompany,objWWW122D,strKey,strStatus
+	
+	set strStatus = $$$OK
+	set idCompany = ""
+	for {
+		set idCompany = $order(^WWW122D(0,"INWEINVELINE",10,idCompany))
+		quit:idCompany=""
+		
+		set objWWW122D = $get(^WWW122D(0,"INWEINVELINE",10,idCompany,1))
+		set strKey     = pstrKey_$$$COMMA_idCompany
+		set $$$WWW122DFieldDescription(objWWW122D) = $translate($$$WWW122DFieldDescription(objWWW122D),"1",pintCounter)
+		set strStatus = $$$Save("WWW122D",strKey,objWWW122D,$$$YES)
+	}
+	quit strStatus
+	
+	
+DynamicallyAddCountLang(pstrKey,pintField,pintCounter)
+	;-------------------------------------------------------------------------------
+	; Creates the language text for the dynamically added field.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Nov-2007	shobby	SRBR014769: Created
+	;-------------------------------------------------------------------------------
+	new idLanguage,objWWW1221,strCaption,strKey,strStatus
+	
+	set strStatus = $$$OK
+	
+	set idLanguage = ""
+	for {
+		set idLanguage = $order(^WWW1221(0,"INWEINVELINE",10,idLanguage))
+		quit:idLanguage=""
+		
+		set objWWW1221 = $get(^WWW1221(0,"INWEINVELINE",10,idLanguage,1))
+		set strCaption = $$$WWW1221Text(objWWW1221)
+		set strCaption = $piece(strCaption," ",1,$length(strCaption," ")-1)_" "
+		set strKey     = pstrKey_$$$COMMA_idLanguage
+		set $$$WWW1221Text(objWWW1221) = strCaption_pintCounter
+		set strStatus = $$$Save("WWW1221",strKey,objWWW1221,$$$YES)
+	}
+	quit strStatus
+	
+	
+GetDefaultFromTarget(pidINWEINV,pobjINWEINV)
+	;-------------------------------------------------------------------------------
+	; Called By: DefaultVariableInput^INWEINVELINE
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Aug-2011	shobby	SR17850: Set to 0 if blank.
+	; 09-Nov-2007	shobby	SRBR014783: Use the ActualQuantity as the default for
+	; 							the entered values.
+	;-------------------------------------------------------------------------------
+	new fltQuantity,objINWEINVP
+	
+	set fltQuantity = $$$INWEINVActualQuantity(pobjINWEINV)
+	set objINWEINVP = $$$GRIDYFELDContainer
+	
+	if $$$INWEINVPDisplayStockOnHandQuantit(objINWEINVP) {
+		if fltQuantity="" {                                   ; **** Note : not zero! ****
+			if ($$$INWEINVStockType(pobjINWEINV)'="R") && ($$$INWEINVStockType(pobjINWEINV)'="S") {
+				set fltQuantity = +$$$INWEINVTargetQuantity(pobjINWEINV)	;SR17850
+	;SR17850	set fltQuantity = $$$INWEINVTargetQuantity(pobjINWEINV)
+			}
+		}
+	}
+	quit fltQuantity
+	
+	
+ValidateAttributes(pidItem,&pYFELD,blnClear=$$$NO,pidKey)
+	;-------------------------------------------------------------------------------
+	; Validate the Attributes for an Item based on the Item Policy
+	;
+	; History:
+	; 07-Oct-2013	SCR		CORE-266: Non Lot Controlled Locations
+	; 16-Sep-2011	SCR		SR17895: Dont validae Attributes when the Difference is 0
+	; 17-Jun-2009 	PPP 	SR16510: 1. Updated routine to use INItemPolicy class
+	; 04-Mar-2009	HQN		SR16363: Copied from IsPostableLine^INRECPost()
+	;-------------------------------------------------------------------------------
+	new arrErr,blnBrand,blnLotNo,blnLotUnique,blnOK,blnOwner,blnProgram,blnUseByDate
+	new strStatus
+	
+	set strStatus = $$$OK	
+
+	if pidItem = $$$NULLOREF {
+		set strStatus = $$$MakeStatus("IN00801")  ; "Invalid Item"
+	}
+
+	;if $$$ISOK(strStatus) {
+	set blnOK=$$$YES ; SR17895
+	if $$$ISOK(strStatus) && ($$$INWEINVDifference(pYFELD)) { ; SR17895
+		set blnOK = $$CheckItemAttributes^INItemPolicyUtils(pidItem,
+		                                                    $$$INWEINVCalculatedDifferenceQty(pYFELD),
+		                                                    $$$INWEINVLotNo(pYFELD),
+		                                                    $$$INWEINVExpiryDate(pYFELD),
+		                                                    $$$INWEINVBrand(pYFELD),
+		                                                    $$$INWEINVOwner(pYFELD),
+		                                                    $$$INWEINVProgram1(pYFELD),
+		                                                    .arrErr,
+		                                                    $$$INWEINVLocation(pYFELD))
+	}
+
+	if '$$$ISOK(blnOK) {
+		set strStatus = $$$MakeStatus($order(arrErr("")),$$$KEY2(pidKey))
+	}
+	quit strStatus
+	
+	
+ValidateAttributesOld(pobjItem,&pYFELD,blnClear=$$$NO)  //SR16510:DEPRECATED
+	;-------------------------------------------------------------------------------
+	; If no attribute and policy    - report error
+	; If attribute    and no policy - clear attribute
+	; 
+	; History:
+	; 17-Jun-2009 	PPP 	SR16510: DEPRECATED
+	; 15-Oct-2008	GRF		SR15810: clear as well
+	; 10-Oct-2008	GRF		SR15810: Created
+	;-------------------------------------------------------------------------------
+	new loopAttr,objBundle,objResultSet,sc,strStatus
+	
+	set strStatus = $$$OK
+	
+	if pobjItem = $$$NULLOREF {
+		set strStatus = $$$MakeStatus("IN00801")  ; "Invalid Item"
+	}
+	
+	if $$$ISOK(strStatus) {
+		set loopAttr = pobjItem.ItemPolicy.Attributes.FindObjectId(pobjItem.ItemPolicy.%Id()_"||Lot Number")
+		;if pobjItem.ItemPolicy.Attributes.FindObjectId(pobjItem.ItemPolicy.%Id()_"||Lot Number") = "" {
+		if loopAttr = "" {
+			if blnClear set $$$INWEINVLotNo(pYFELD) = ""
+			
+		} else {
+			if $$$INWEINVLotNo(pYFELD) = "" {
+				set strStatus = $$$MakeStatus("alADJ0014",$$$KEY1(YKEY))
+			;	"Stocktake (%1) Lot Number not set"
+			
+			; SR16258 vvvv
+			} else {
+				if pobjItem.ItemPolicy.Attributes.GetAt(loopAttr).IsUnique {
+					set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleAttribute:GetValueForItemAttribute")
+					set sc = objResultSet.Execute(pobjItem.ItemId,"Lot Number")
+					if $$$ISOK(sc) {
+						while objResultSet.Next(.sc) {
+							if pobjItem.ItemPolicy.Description '= "Use By Date Policy" {
+								set strStatus = $$$MakeStatus("IN00880") ;Lot Number must be unique
+								quit   ; while break
+							
+							} else {
+								if objResultSet.Data("AttributeValue") = $$$INWEINVLotNo(pYFELD) {
+									set strStatus = $$$MakeStatus("IN00880") ;Lot Number must be unique
+									set objBundle = ##class(alSOH.dBundle).%OpenId(objResultSet.Data("Bundle"),,.sc)
+									if $$$INWEINVExpiryDate(pYFELD) = objBundle.Attributes.GetAt(objBundle.Attributes.FindObjectId(objBundle.%Id()_"||Use By Date")).AttributeValue {
+										set strStatus = $$$OK
+										quit   ; while break
+									}
+								}
+							}
+						}
+					}
+				}
+			} ; SR16258 ^^^^
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		if pobjItem.ItemPolicy.Attributes.FindObjectId(pobjItem.ItemPolicy.%Id()_"||Use By Date") = "" {
+			if blnClear set $$$INWEINVExpiryDate(pYFELD) = "" 
+			
+		} else {
+			if $$$INWEINVExpiryDate(pYFELD) = "" {
+				set strStatus = $$$MakeStatus("IN00670",$$$INWEINVItemNumber(pYFELD))
+			}             ; "An expiration date must be entered for item %1"
+		}
+	}
+	quit strStatus
+	
+	
+OnBeforeSave(pYKEY,&pYFELD)
+	;-------------------------------------------------------------------------------
+	; Updates the INWEINVCount from the INWEINV.
+	; ****  Warning this routine runs twice before saving an INWEINV, once in OnValidate and again
+	; 		in OnBeforeSave
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Feb-2011	PPP		SRAdhoc: If No Item Group, do not check
+	; 28-May-2010	PPP		SR17286: Do not Create Bundle ID on Save, will be created
+	;						if required on POST
+	; 19-Mar-2010	GRF		SR17230: $$IsManagersView is ineffective since YPARA
+	; 							appears to have been cleared; Test for empty
+	; 							record before saving INWEINVCount.
+	; 14-Dec-2009	PPP		SR17082: Cannot enter -ve values in the Qty Field
+	; 02-Dec-2009	DWR		SR17060-1: add check to location too
+	; 27-Nov-2009	DWR		SR17060: check the store Store is valid before saving.
+	; 13-Oct-2008	GRF		SR15810: Save Bundle ID
+	; 10-Oct-2008	GRF		SR15810: validate group and bundle attributes
+	; 04-Jan-2008	shobby	SRBR014815: If changing the 'Count Number' selection 
+	;							 control make sure to use the 'Count Number' as it
+	;							 was at the time of loading the record.
+	; 15-Nov-2007	shobby	SRBR014784: Only set timestamp if a quantity was changed
+	; 08-Nov-2007	shobby	SRBR014784: Set the timestamp 
+	;-------------------------------------------------------------------------------
+	new idKey,idStocktake,objBundle,objINWEINVCount,objINWEINVCountOLD,objItem
+	new sc,strStatus
+	
+	$$$LogR("OnBeforeSave",pYKEY)
+	
+	set strStatus = $$$OK
+	set idKey = pYKEY_$$$COMMA_$$Count($$$YES)  ; If changing the 'Count Number' selection control make sure to use
+	
+	set idStocktake = $$$KEY1(pYKEY)
+
+	; If new lines have been added added, check required bundle attributes have been provided
+	set objItem = ##class(alINV.iUINV).GetItem($$$INWEINVItemNumber(pYFELD))
+	
+	if objItem '= $$$NULLOREF {
+		//SRAdhoc 08-Feb-2011
+		if objItem.ItemGroup'="" {
+			set strStatus = $$ApplyGroupFilter(idStocktake,objItem.ItemGroup.%Id())
+			if $$$ISERR(strStatus) set YRETVAL = strStatus
+		}
+				
+		; SR17060 vvvvv
+		if $$$ISOK(strStatus) {
+			set strStatus = $$ApplyStoreFilter(idStocktake,$$$INWEINVStockLocation(pYFELD))
+			if $$$ISERR(strStatus) set YRETVAL = strStatus
+		}
+		
+		if $$$ISOK(strStatus) {
+			set strStatus = $$ApplyLocnFilter(idStocktake,$$$INWEINVLocation(pYFELD))
+			if $$$ISERR(strStatus) set YRETVAL = strStatus
+		} ; SR17060-2 ^^^^
+		
+		if $$$ISOK(strStatus) {
+		//	set strStatus = $$ValidateAttributes(objItem,pYFELD,$$$YES)
+			set strStatus = $$ValidateAttributes($$$INWEINVItemNumber(pYFELD),pYFELD,$$$YES,pYKEY)
+			if $$$ISERR(strStatus) set YRETVAL = strStatus
+		}
+		
+		//SR17082
+		if $$$ISOK(strStatus) {
+			if $$$INWEINVActualQuantity(pYFELD) < 0 {
+				set (strStatus,YRETVAL) = $$$MakeStatus("IN00490")    ; "Qty can not be negative."
+			}
+		}
+
+		/* SR17286 - Do not Create Bundle ID yet
+		if $$$ISOK(strStatus) {
+			if $$$INWEINVBundleID(pYFELD)="" {       ; This should never happen.
+				set objBundle  = ##class(alADJ.dUStocktakeLine).GetBundleV1(pYFELD,pYKEY,.sc)
+				if $$$ISERR(sc) {
+					set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+					set YRETVAL   = strStatus
+				} else {
+					set $$$INWEINVBundleID(pYFELD) = objBundle.%Id()
+				}
+			}
+		}
+		*/
+		
+	}
+	
+	; the 'Count Number' as it was at the time of loading the record. 
+	if $$$ISOK(strStatus) {
+		set objINWEINVCount    = $get(^INWEINVCount(0,$$$KEY1(idKey),$$$KEY2(idKey),$$$KEY3(idKey),1))
+		set objINWEINVCountOLD = objINWEINVCount
+		set objINWEINVCount    = $$CopyObjCountFromObjLine^INWEINVCount(objINWEINVCount,pYFELD)
+
+		if $$$INWEINVCountQuantity(objINWEINVCount)'=$$$INWEINVCountQuantity(objINWEINVCountOLD) {
+			set $$$INWEINVCountTimestamp(pYFELD)           = $horolog
+			set $$$INWEINVCountTimestamp1(objINWEINVCount) = $horolog
+		}
+		
+	;	if '$$IsManagersView^INWEINVEHeader() { ; SR17230 : YPARA is no longer set so this test fails
+		if $translate(objINWEINVCount,Y)'="" {  ; SR17230 : don't allow manager's view to fill "complete" entries by default
+			set strStatus = $$$Save("INWEINVCount",idKey,objINWEINVCount,$$$YES)
+		}
+	}
+	quit strStatus
+	
+	
+OnAfterPrimaryKey(pYKEY,&pYFELD)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Nov-2007	shobby	SRBR014798: Don't reuse the existing field for the
+	; 							formatted timestamp.
+	; 26-Nov-2007	shobby	SRBR014798: Display the difference column value
+	;-------------------------------------------------------------------------------
+	new intCount,intLoop,objINWEINVP,VORG
+	
+	merge VORG = ^CacheTempStocktakePara(YUSER)
+	kill ^COMTempList(YUCI,YUSER,"StockTakeCount")
+	
+	set objINWEINVP = $$$GRIDYFELDContainer
+	for intLoop=1:1:$$$INWEINVPNumberofCounts(objINWEINVP) {
+		set ^COMTempList(0,YUSER,"StockTakeCount",intLoop,1) = ""
+	}
+
+	set pYFELD = $$CopyObjLineFromCount^INWEINVCount($$$KEY1(pYKEY),$$$KEY2(pYKEY),$$Count())
+	set $$$INWEINVDifference(pYFELD) = $$GetDifference(pYKEY,pYFELD)  ;BR014798
+	
+	quit 1
+	
+	
+Count(pblnOld=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Determine what the currently displayed Count is on the header.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Jan-2008	shobby	SRBR014815: Might want to know what the 'old' value is.
+	;-------------------------------------------------------------------------------
+	new objData
+	
+	set objData = $$GetFormData^COMUtilForm("INWEINVEHeader","M",pblnOld)
+	quit $piece(objData,Y,6)
+	
+	
+OnBeforeDisplayLine(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Before displaying lines in the grid
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Dec-2009	GRF		SR17007: separate tags for multi-lock operations
+	; 03-May-2006	PP&JW	SR14508: Created (copied from INWEINVD)
+	;-------------------------------------------------------------------------------
+	new LFN1,VORG,BET,ART,WG,LAP,intCnt,ART1,strStatus,i
+ 
+	merge VORG = ^CacheTempStocktakePara(YUSER)  ;Necessary or lines don't display in grid.
+	
+	set LFN1 = pYFELD
+	
+	if $translate(LFN1,Y)'="" {			// new record
+	
+	; FIXME : Early Exit
+	;	if '$$Exists^INWEINVCount(VORG(1),$$$KEY2(pYKEY),VORG(15)) quit $$$NO
+		if ('$$IsManagersView^INWEINVEHeader())&&('$$Exists^INWEINVCount(VORG(1),$$$KEY2(pYKEY),$$GetCount^INWEINVEHeader())) quit $$$NO
+		
+		
+		IF VORG(4)=1 IF $PIECE(LFN1,Y,32)'="" quit $$$NO ;NUR FREIE WARE ;only wares 
+		IF VORG(4)=2 IF $PIECE(LFN1,Y,32)=""  quit $$$NO ;NUR AUFTRÇE ;only 
+		
+		SET BET     = $PIECE(LFN1,Y,2)  ;BETRIEB
+		SET VORG(2) = $TRANSLATE($GET(VORG(2)),",",";")  ;VORGABE BETRIEB
+		IF VORG(2)'="" QUIT:'$FIND(";"_VORG(2)_";",";"_BET_";") $$$NO  ;NICHT F? DIESEN BETRIEB
+		
+		SET ART = $PIECE(LFN1,Y,1)  ;ARTIKEL ;item 
+		QUIT:ART="" $$$NO
+		
+		SET ART1    = $GET(^INART(0,ART,1))
+		SET WG      = $PIECE(ART1,Y,30) ;WARENGRUPPE
+		SET VORG(3) = $TRANSLATE($GET(VORG(3)),",",";")  ;VORGABE WARENGRUPPE
+		
+		; replace
+		;IF $GET(VORG(3))'="" QUIT:WG=""||'$FIND(";"_VORG(3)_";",";"_WG_";") $$$NO  ;FALSCHE WARENGRUPPE
+		; with
+		set strStatus = $$ItemGroupCheck^INStocktaking(ART1,VORG(3),ART)
+	; FIXME : Early Exit
+		quit:'$$$ISOK(strStatus) $$$NO
+		; replace ends	
+		
+		SET LAP = $PIECE(LFN1,Y,3)
+	; FIXME : Early Exit
+		if VORG(7)'="" if VORG(7)]LAP quit $$$NO		; PPP bins     ; FIXME : ]] ?
+		if VORG(8)'="" if LAP]VORG(8) quit $$$NO		; PPP
+	}
+	
+	;et strStatus = $$GetLock^WWWMultiLock("INWEINVEHeader","INWEINVELINE",pYKEY)  ; SR17007
+	set strStatus = $$LockSet^WWWMultiLock("INWEINVEHeader","INWEINVELINE",pYKEY)
+	if $$$ISERR(strStatus) {
+		set ^CacheTempLocked(YUSER,pYKEY)=strStatus
+	}
+	quit $$$OK
+	
+	
+OnBeforeDelete(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Check for deletion
+	;
+	; Params:
+	;
+	; ByRefs: Q
+	;
+	; Returns:
+	;
+	; History:
+	; 28-May-2010	PPP		SR17296: Added check for Stock Type
+	; 05-May-2006	JW		SR14508: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	
+	//SR17296
+	if ($$$INWEINVTargetQuantity(YFELD)'="") || ($$$INWEINVStockType(YFELD)'="") {
+		set strStatus = $listbuild("IN00464")  ; "Cannot delete a system generated line"
+		
+	} elseif $$$INWEINVPosted(YFELD)'="" {
+		set strStatus = $listbuild("IN00463")  ; "Cannot delete: line has been posted"
+		
+	} elseif $data(^CacheTempLocked(YUSER,pYKEY)) {
+		set strStatus = $listbuild("IN00475",$$$Text($get(^CacheTempLocked(YUSER,pYKEY))))  ; "Cannot delete: %1"
+	}
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$YQDisable(strStatus)
+	}
+	quit
+	
+	
+OnBeforeFormat(pYFIELDNAME="",pYTEXT="",pYFELD="")
+	;-------------------------------------------------------------------------------
+	; OnBeforeFormat for the grid
+	;
+	; Called By :
+	; 	Form - GridEdit:INWEINVELINE
+	; 	
+	; Params: 	 pYFIELDNAME : The grid cell id
+	; 			 pYTEXT		 : The text of the grid
+	;			 pYFELD 	 : The data for the grid row.
+	; 
+	; ByRef:	GROW, YBACKGROUNDCOLOR, YENABLED, YTOOLTIP, YWARNING
+	; 
+	; Returns:
+	; 	YTOOLTIP			(ByRef)
+	; 	YBACKGROUNDCOLOR	(ByRef)
+	;
+	; History:
+	; 05-Aug-2010	GRF		SR17286: Macro correction
+	; 28-May-2010	PPP		SR17286: 1. The R/O when a Bundle exists check is redundant
+	;							2. Quit of objLine is null
+	;							3. The check is based on the Line Type 
+	; 17-Mar-2010	shobby	SR15753: Clean up some problems with strRequiredColor
+	; 08-Jan-2010	shobby	SR15753: Get @netManager do the formatting work.
+	; 14-Dec-2009	PPP		SR17082: Cannot enter -ve values in the Qty Field
+	; 02-Dec-2009	DWR		SR17060-1: Add Location cell to format cell color and tooltip
+	; 27-Nov-2009	DWR		SR17060: Format cell color and ytooltip based on same check
+	; 							as the rest of the processing.
+	; 09-Jul-2009	PPP		SR16721: Optional policy definitions
+	; 							(can be 1-Yes, 2-No, 3-Optional)
+	; 17-Jun-2009 	PPP 	SR16510: Updated routine to use INItemPolicy class
+	; 24-Mar-2009	GRF		SR16428: Call common code for CellColours; idClassFld
+	; 							instead of idField
+	; 09-Feb-2009	GRF		SR16328: EnumReadOnly Macro; use $$Get^WWW122 to include
+	; 							customisations
+	; 07-Jan-2009	HQN		SR16268: Check if LotNumber required IsUnique validation
+	; 							Corrected macros, was refering to INWADJ but are
+	; 							actually INWEINV
+	; 10-Oct-2008	GRF		SR15810: Mandatory Bundle Attributes if policy requires
+	; 05-May-2006	SS		SR14508: Created
+	;-------------------------------------------------------------------------------
+	new blnLotNo,blnUseByDate,blnLotUnique
+ 	new idBundle,idClassField,idItem,idStocktake,idUser
+ 	new intBrand,intCol,intOwner,intProgram,intRow
+ 	new loopAttr,objBundle,objItem,objResultSet
+	new sc,strADJLine,strDefaultColor,strDisabledColor,strINWEINV,strMessage,strName
+	new strRequiredColor,strStatus,strWarningColor
+	
+	//Stocktake Closed
+	if $$$INWEINVPStatus($$$GRIDYFELDContainer) = 5 quit $$$OK
+	
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pYFIELDNAME,intRow,intCol)
+	set idClassField = $$$GetClassField(YFORM,intCol)
+	
+	set strINWEINV = $$$GRIDGetYFELD($$GetYKEY^COMGridEdit31Interface(intRow))
+	set idItem     = $$$INWEINVItemNumber(strINWEINV)
+	set idBundle   = $$$INWEINVBundleID(strINWEINV)
+
+	//R/O for some columns if the Line has a Bundle
+	if idBundle'="" {
+		if (idClassField = $$$FldINWEINVExpiryDate)    ||
+		   (idClassField = $$$FldINWEINVLotNo)	       ||
+		   (idClassField = $$$FldINWEINVBrand)         ||
+		   (idClassField = $$$FldINWEINVOwner)         ||
+		   (idClassField = $$$FldINWEINVProgram1)      ||
+		   (idClassField = $$$FldINWEINVItemNumber)    ||
+		   (idClassField = $$$FldINWEINVLocation)      ||
+		   (idClassField = $$$FldINWEINVStockLocation)    {
+			
+			set YENABLED = $$$NO
+			quit $$$OK
+		}
+	}
+	
+	if idItem'="" {
+		do GetAttributes^INItemPolicyUtils(idItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram)
+
+		; Use By Date
+		;-----------------------------------
+			if (idClassField = $$$FldINWEIN]]><![CDATA[VExpiryDate) {
+				if blnUseByDate {
+					if $$$INWEINVExpiryDate(strINWEINV)'="" {
+						if ($$$INWEINVStockType(strINWEINV)'="A")      &&
+						   ($$$INWEINVExpiryDate(strINWEINV)<$horolog)   { 
+
+							if '(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+								set YTOOLTIP = $$$Text($listbuild("33989")) ; "Attention! Valid Until Date Exceeded "
+								set YWARNING = $$$YES
+							}
+						}
+					}
+					if ($$$INWEINVStockType(strINWEINV)'="A") {
+						set YREQUIRED = $$$YES
+					}
+				} else {
+					set YENABLED = $$$NO
+				}
+
+
+		; Lot Number
+		;-----------------------------------
+			} elseif (idClassField = $$$FldINWEINVLotNo) {
+				if blnLotNo {
+					if ($$$INWEINVStockType(strINWEINV)'="A") {
+						set YREQUIRED = $$$YES
+
+						if ($$$INWEINVLotNo(strINWEINV)'="") && blnUseByDate {
+							if '(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+								//FIXME : Not Sure it this check is required for a Stocktake.
+								if '##class(alSOH.iUItemPolicy).IsLotUnique(idItem, $$$INWEINVLotNo(strINWEINV), $$$INWEINVExpiryDate(strINWEINV)) {
+									set YTOOLTIP = $$$Text("IN00880") ; "Lot Number must be unique"						
+									set YWARNING = $$$YES
+								}
+							}
+						}
+					}
+
+				} else {
+					set YENABLED = $$$NO 
+				}
+
+		; Location
+		;-----------------------------------
+			} elseif (idClassField = $$$FldINWEINVLocation){
+				if $get(YKEY)'=""{
+					set idStocktake = $$$KEY1(YKEY)
+					
+					set strStatus = $$ApplyLocnFilter(idStocktake,$$$INWEINVLocation(pYFELD))
+					if $$$ISERR(strStatus){
+						set YTOOLTIP = $$DecodeError^COMUtils(strStatus)
+						set YWARNING = $$$YES
+					}
+				}
+				
+		; Storage
+		;-----------------------------------
+			} elseif (idClassField = $$$FldINWEINVStockLocation){
+				
+				if $get(YKEY)'=""{
+					set idStocktake = $$$KEY1(YKEY)
+					
+					set strStatus = $$ApplyStoreFilter(idStocktake,$$$INWEINVStockLocation(pYFELD))
+					if $$$ISERR(strStatus){
+						set YTOOLTIP = $$DecodeError^COMUtils(strStatus)
+						set YWARNING = $$$YES 
+					}
+				}
+
+
+		; Actual Qty
+		;-----------------------------------
+			} elseif (idClassField = $$$FldINWEINVActualQuantity){
+				if $$$INWEINVActualQuantity(strINWEINV) < 0 {
+					set YWARNING = $$$YES
+					set YTOOLTIP = $$$Text("IN00490")    ; "Qty can not be negative."
+				}
+
+		; Brand
+		;-----------------------------------
+			} elseif (idClassField = $$$FldINWEINVBrand) {
+				if (intBrand=1) || (intBrand=3) {
+					if ($$$INWEINVStockType(strINWEINV)'="A") {
+						if intBrand=1 set YREQUIRED = $$$YES
+						
+					} else {
+						set YENABLED = $$$NO
+					}
+				} else {
+					set YENABLED     = $$$NO 
+				}
+				
+		; Owner
+		;-----------------------------------
+			} elseif (idClassField = $$$FldINWEINVOwner) {
+				if (intOwner=1) || (intOwner=3) {
+					if ($$$INWEINVStockType(strINWEINV)'="A") {
+						set:intOwner=1 YREQUIRED = $$$YES
+					} else {
+						set YENABLED = $$$NO
+					}
+				} else {
+					set YENABLED     = $$$NO 
+				}
+			
+		; Program
+		;-----------------------------------
+			} elseif (idClassField = $$$FldINWEINVProgram1) {
+				if (intProgram=1) || (intProgram=3) {
+					if ($$$INWEINVStockType(strINWEINV)'="A") {
+						set:intProgram=1 YREQUIRED = $$$YES
+					} else {
+						set YENABLED = $$$NO
+					}
+				
+				} else {
+					set YENABLED     = $$$NO 
+				}					
+
+			} //End Elseif (idClassfield)
+	}  //idItem'=""
+
+	if ($get(YHID)=2) && ($$$INWEINVPosted(pYFELD)="") {
+		set strMessage=""
+
+		if $data(^CacheTempLocked(YUSER,YKEY)) {
+			set strStatus = $get(^CacheTempLocked(YUSER,YKEY))
+			if $$$ISERR(strStatus) {
+				set YTOOLTIP  = $$$Text(strStatus)
+				set YREQUIRED = $$$YES
+			}
+		}
+	}
+	quit $$$OK
+	
+	
+OnBeforeFormConstruction(pYKEY,pYBBN="",pintCountField="")
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Dez-2016	FC		CHSP - Sem Demanda: Correção do bug ao gerar o arquivo excel. Nas últimas linhas são passadas o YKEY sem valor, e gera o erro UNDEFINED. CHSP
+	; 03-Oct-2008	GRF		SR15810: idStocktake rather than pidStocktake; macro;
+	; 							simplify test for field 24 to match field 9
+	; 19-Dec-2007	Frank	SRBR014798: Made 'Notes' field always be visible.
+	; 13-Dec-2007	shobby	SRBR014798: Show 'Difference' column if 'Display Quantity
+	; 							On Hand' checkbox is checked in INWEINVP
+	; 30-Nov-2007	shobby	SRBR014798: Adjustment difference column.
+	; 29-Nov-2007	shobby	SRBR014798: Only show difference column in Manager's view.
+	; 19-Nov-2007	shobby	BR014769: Undesired 'if' removed.
+	; 16-Nov-2007	shobby	BR014769: Made 'notes' field visible after a stocktake
+	; 							is complete.
+	; 14-Nov-2007	Karine	BR014784: Peer Review: spelling check
+	; 13-Nov-2007	shobby	SRBR014769: Only show 'Target Quantity' column if flag
+	; 							set or manager view.
+	; 12-Nov-2007	shobby	SRBR014769: Created
+	;-------------------------------------------------------------------------------
+	
+	; 19-Dez-2016	FC		CHSP - Sem Demanda: Correção do bug ao gerar o arquivo excel. Nas últimas linhas são passadas o YKEY sem valor, e gera o erro UNDEFINED. CHSP
+	if $get(pYKEY) = "" {
+		quit
+	}
+	new enumStockType,idStocktake,objINWEINV,objINWEINVP,YAUSWAHL,YPARA
+	
+	set idStocktake = $$$KEY1(pYKEY)
+	set YPARA       = $get(^CacheTempStocktakePara(YUSER,"YPARA"))
+	set YAUSWAHL    = $get(^CacheTempStocktakePara(YUSER,"YAUSWAHL"))
+	set objINWEINVP = $$$GRIDYFELDContainer
+		
+	set enumStockType = $$$INWEINVStockType(YFELD)
+	
+	if (pYBBN=4) {  ;Count Quantity
+		if $data(^CacheTempLocked(YUSER,idStocktake)) || (enumStockType="R") || (enumStockType="S") {
+			set YHID = 2
+		} else {
+			if '$$IsCountOpen^INWEINVPStatus(idStocktake) set YHID = 2
+		}
+		
+	} elseif (pYBBN=9) {	;Target quantity
+		if '$$$INWEINVPDisplayStockOnHandQuantit(objINWEINVP) && '$$IsManagersView^INWEINVEHeader() {
+			set YHID = 2
+		}
+		
+	} elseif (pYBBN=23) {	;Adjustment Difference
+		if $data(^CacheTempLocked(YUSER,idStocktake)) || (enumStockType="R") || (enumStockType="S") {
+			set YHID = 2
+		} elseif '$$IsManagersView^INWEINVEHeader() {
+			set YHID = 2
+		}
+		
+	} elseif (pYBBN=24) {	;Difference
+		if '$$$INWEINVPDisplayStockOnHandQuantit(objINWEINVP) && '$$IsManagersView^INWEINVEHeader() {
+			set YHID = 2
+		}
+		
+	} elseif $$IsNewCountField(pYBBN) {  
+	    if '$$ShowCountFieldTest(pYBBN,$$Count()) {
+	  		set YHID = 2
+	   	}
+	   	
+	} elseif (pYBBN=10) || (pYBBN=21) || (pYBBN=25) {      ; Qty Contada / Count2 / Count3
+			set YHID = 2
+	}
+	quit
+	
+	
+UpdateContainer(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Checks whole grid
+	;   if a single record requires lot number or expiry, show that column
+	;		hide=$$YES or show=$$$NO
+	; 
+	; Called By : OnAfterDataField on INWEINVELINE
+	;	used this as the call because the Grid is set to $$$COMGridEditParameterDontUpdateContainer
+	;	in OnAfterDataFields^INWEINVEHeader as a result of slow refreshes (SR14659)
+	;
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 07-Oct-2013	SCR		CORE-266: Check for Not Lot Controlled
+	; 08-Apr-2010	GRF		SR17177: objGrid should be arrGrid
+	; 09-Jul-2009	PPP		SR16721: Optional policy definitions
+	; 							(can be 1-Yes, 2-No, 3-Optional)
+	; 23-Jun-2009 	PPP 	SR16510: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,blnHideBrand,blnHideExpiry,blnHideLotNo,blnHideOwner,blnHideProgram
+	new blnLotNo,blnLotUnique,blnUseByDate,idItem,intBrand,intOwner,intProgram
+	new objItem,strLineYKEY,strStkLine,idLoc,objHeader
+
+	set blnHideLotNo   = $$$YES
+	set blnHideExpiry  = $$$YES
+	set blnHideBrand   = $$$YES
+	set blnHideOwner   = $$$YES
+	set blnHideProgram = $$$YES
+	
+	set objHeader	= $$$GRIDYFELDContainer
+	set idLoc		= $piece($$$INWEINVPSiteLocation(objHeader),";",1)
+
+
+	$$$GRIDGetContents(.arrGrid)
+
+	set strLineYKEY = ""
+	for {
+		set strLineYKEY = $order(arrGrid($$$GRIDYKEYContainer,strLineYKEY))
+		quit:(strLineYKEY = "")
+		continue:$data(^WWWDATEN(0,$horolog,YUSER,"INWEINVELine","V","KILLEDRECORD",strLineYKEY))
+		
+		set strStkLine = $$$GRIDGetYFELD(strLineYKEY)
+		set idItem     = $$$INWEINVItemNumber(strStkLine)
+		
+		if idItem'="" {
+			do GetAttributes^INItemPolicyUtils(idItem, .blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,idLoc)
+			if blnLotNo                           set blnHideLotNo   = $$$NO
+			if blnUseByDate                       set blnHideExpiry  = $$$NO
+			if (intBrand=1)   || (intBrand=3)     set blnHideBrand   = $$$NO
+			if (intOwner=1)   || (intOwner=3)     set blnHideOwner   = $$$NO
+			if (intProgram=1) || (intProgram=3)   set blnHideProgram = $$$NO
+		}
+	}
+
+	$$$StartScript()
+	
+	$$$GRIDHideShowColumns($$$FORMFldINWEINVLineLotNo,blnHideLotNo,"INWEINVELine")
+	$$$GRIDHideShowColumns($$$FORMFldINWEINVLineExpiryDate,blnHideExpiry,"INWEINVELine")
+	$$$GRIDHideShowColumns($$$FORMFldINWEINVLineBrand,blnHideBrand,"INWEINVELine")
+	$$$GRIDHideShowColumns($$$FORMFldINWEINVLineOwner,blnHideOwner,"INWEINVELine")
+	$$$GRIDHideShowColumns($$$FORMFldINWEINVLineProgram,blnHideProgram,"INWEINVELine")
+	
+	if '$$IsManagersView^INWEINVEHeader() {
+		$$$GRIDHideShowColumns($$$FORMFldINWEINVLineCount2,$$$YES,"INWEINVELine")
+		$$$GRIDHideShowColumns($$$FORMFldINWEINVLineCount3,$$$YES,"INWEINVELine")	
+	}
+	$$$EndScript()
+
+	quit
+	
+	
+GetItem(pidStocktake,pidLine)
+	;-------------------------------------------------------------------------------
+	; Extract the item identifier from the grid version of the stocktake line.
+	; If the item is not present on the grid line, or if the stocktake line has
+	; never been added to the grid or has been deleted from it -
+	;    get the item from the
+	; 
+	; History:
+	; 10-Apr-2010	GRF		SR17177: arrGrid rather than arrGridContents
+	; 03-Oct-2008	GRF		SR15810: Remove superfluous tests; put access to
+	; 							array AFTER testing arguments are not null;
+	; 							get from YFELD in all not found situations;
+	; 							Calling routines generally have to combine key only
+	; 							to be split again - move split to single instance of
+	; 							joint key and pass 2 args; variable names.
+	; ??-???-????	Existing
+	;-------------------------------------------------------------------------------
+	new arrGrid,objLine,idItem
+	
+	set idItem = ""
+	$$$GRIDGetContents(.arrGrid)
+ 	
+	if (pidStocktake'="") && (pidLine'="") {
+		set objLine = arrGrid(pidStocktake,pidLine)
+		set idItem = $$$INWEINVItemNumber(objLine)
+		if idItem = "" {
+			set idItem = $$$INWEINVItemNumber(YFELD)
+		}
+	}
+	quit idItem
+	
+	
+GetItemGroup(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 03-Oct-2008	GRF		SR15810: ItemGroup already validates idItem so no need
+	; 							to retest; pass split args to GetItem.
+	; ??-???-???? Existing
+	;-------------------------------------------------------------------------------
+	new idItem,idGroup,idLine,idStocktake
+	
+	set idStocktake = $$$KEY1(pYKEY)
+	set idLine      = $$$KEY2(pYKEY)
+ 
+	set idItem  = $$GetItem(idStocktake,idLine)
+	set idGroup = $$ItemGroup(idItem)
+	quit idGroup
+	
+	
+ItemGroup(idItem)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 10-Oct-2008	GRF		Don't show "undefined group" message if line has no item
+	; 							yet
+	; ??-???-???? Existing
+	;-------------------------------------------------------------------------------
+	new idGroup
+	
+	if $$ValidItem^INART(idItem) {
+		set idGroup = $$GetGroup^INART(idItem)
+		
+	} elseif idItem = "" {
+		set idGroup = ""
+		
+	} else {
+		set idGroup = "undefined group" ; FIXME
+	}
+	quit idGroup
+	
+	
+OnLineAdded(pintRow,pYKEY)
+	new idLine
+
+	set idLine = $$$KEY2(pYKEY)
+	set ^CacheTempStocktakePara(YUSER,"idLine") = idLine
+
+	quit
+	
+	;---------------------------------------
+	; 10 separate counts are stored in manual fields on form INWEINVELINE
+	;---------------------------------------
+	
+IsNewCountField(pYBBN)
+	;-------------------------------------------------------------------------------
+	; is this a "New Count" field?
+	; 27-36 are the fields
+	;-------------------------------------------------------------------------------
+	if (pYBBN >= $$$countStart) && (pYBBN <= $$$countEnd) { 
+		quit $$$YES
+	}
+	quit $$$NO
+	
+	
+FieldNumberToCountNumber(pYBBN)
+	quit (pYBBN-($$$countStart-1))
+	
+	
+ShowCountFieldTest(pYBBN,pintCount)
+	;-------------------------------------------------------------------------------
+	; should this field be shown?
+	; 
+	; History :
+	; 03-Oct-2008	GRF		SR15810: variable name changes; var & countNumber =>
+	; 							blnShowCount & pintCount
+	; ??-???-???? Existing
+	;-------------------------------------------------------------------------------
+	new blnShowCount
+	
+	set blnShowCount = $$$NO
+	; beginning and end of "New Count" range of fields in INWEINVELINE
+	if $$IsNewCountField(pYBBN) {
+		if $$IsManagersView^INWEINVEHeader() { 
+			if (pintCount >= $$FieldNumberToCountNumber(pYBBN)) { ; we show this because count number includes it
+				set blnShowCount = $$$YES
+			}
+		}
+	}
+	quit blnShowCount
+	
+GetPrefilledCount(pYKEY,pYFELD,pidField)
+	new idStocktake, idLine,idCount
+	
+	set idCount = $$FieldNumberToCountNumber(pidField)
+	
+	set idStocktake = $$$KEY1(pYKEY)
+	set idLine = $$GetLineId^COMGridEdit31Interface(pYKEY,YFORM)
+	
+	quit $$$INWEINVCountQuantity($$GetCountObjNearestTo^INWEINVCount(idStocktake,idLine,idCount))
+	
+		
+AlreadyInGrid(pidStocktake,pidLine)
+	;-------------------------------------------------------------------------------
+	;   * * *   D E P R E C A T E D   * * *
+	; 
+	; Validation is performed *** ON CLOSING A COUNT *** since there is the
+	; possibility that an item may have several bundles in the one storage or a
+	; bundle across several storages and don't identify the bundle number until all
+	; attributes have been entered.
+	; 
+	; History:
+	; 10-Apr-2010	GRF		SR17177: arrGrid rather than arrGridContents
+	; 03-Oct-2008	GRF		SR15810: variable names
+	;-------------------------------------------------------------------------------
+	new arrGrid,idItem,objLine
+	
+	$$$GRIDGetContents(.arrGrid)
+	set objLine = arrGrid(pidStocktake,pidLine)
+	set idItem  = $$$INWEINVItemNumber(objLine)
+	quit $$ItemInGrid^INStocktaking(idItem,pidStocktake,.arrGrid,pidLine)
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,544 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INStocktakePost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INStocktakePost
+	
+#include COMSYS
+#include INConst
+#include %occInclude
+	
+	;-------------------------------------------------------------------------------
+	; Example : Could pass long strings via inter-process message global.
+	; 
+	; Setting
+	; -------
+	; set ^CacheTempInterProcess(idProcessNo,"pidStocktake") = pidStocktake
+	; job XXX^YYY(idProcessNo)
+	; 
+	; Using
+	; -----
+	; new pidStocktake  ; InterProcess variable - bypassing arg list so needs newing
+	; 
+	; for {
+	;	set strVariable = $order(^CacheTempInterProcess(pidProcessNo,strVariable))
+	;	...
+	;	set @strVariable = ^CacheTempInterProcess(pidProcessNo,strVariable)
+	;	}
+	; kill ^CacheTempInterProcess(idProcessNo)
+	; 
+	;-------------------------------------------------------------------------------
+	
+Post(pidStocktake,pstrFilterLocn,pstrFilterGroup,pstrFilterFrom,pstrFilterTo,pstrReasonCode)	
+	;-------------------------------------------------------------------------------
+	; Post differences between stocktake snapshot and count to update
+	; the stock on hand details.
+	; 
+	; Called By : "Update Stock from Stocktake" button on form INWEINVD => YPARA "P" through GoTo^INWEINVD
+	;
+	; Inputs : 
+	;	pidStocktake
+	;	pstrFilterLocn		Semicolon delimited list of locations
+	;	pstrFilterGroup		Semicolon delimited list of item groups
+	;	pstrFilterFrom		Range of
+	;	pstrFilterTo			Storages
+	;	pstrReasonCode		Reason code - passed through for account identification
+	;
+	; Implicit ByRef :
+	;	YUSER			Session ID
+	;	SPRACHE			User language
+	;	YLOCATION		Session Location
+	;	YBED			User name
+	;	YQ				Returned as $$$YES or unchanged
+	;
+	; Returns : Nothing
+	;
+	; History :
+	; 23-Oct-2008	GRF		SR15810: use $$$MakeStatus
+	; 30-Sep-2008	GRF		SR15810: created from INWEINRUECK for Bundle processing
+	;-------------------------------------------------------------------------------
+	new arrMatches,idBundle,idItem,idLocn,idLog,idStore
+	new objStocktake,strLines,strPara,strStatus
+	
+	if $$$NoKey(pidStocktake) do ^WWWINFO($$^WWWTEXT(32029)) quit  ; "Job Not Started"
+	
+	set strStatus = $$$OK
+	
+	; TODO : If new lines have been added added check required bundle attributes have been provided
+	;        Warn if another line with matching item/bundle
+	;        May remove need for ^CacheTempStocktakePost?
+	        
+	set objStocktake = $get(^INWEINVP(0,pidStocktake,1))
+	
+	if $$$INWEINVPStatus(objStocktake) = $$$EnumINSTOCKTAKESTATUSStocktakeComplete {
+		set strStatus = $$$MakeStatus("IN00486")  ; "Cannot update stock, as stocktake has already been completed."
+	
+	} elseif pstrReasonCode="" {
+		set strStatus = $$$MakeStatus("IN00489")  ; "A reason code is required to adjust stock"
+	
+	;} elseif '$$HasBeenPrinted^INWEINRUECK(pidStocktake) {	; BR014827 Removed this condition
+		;set strStatus = $$$MakeStatus("IN00796")  ; "The 'Stocktake Count Report' has not been printed."
+	}
+	
+	if $$$ISOK(strStatus) {     ; "Posting Stocktake"
+		do StartLog^COMLog($$$Text("IN00440")_" "_pidStocktake_" ("_$$$INWEINVPRemark(objStocktake)_")",.idLog)
+		
+		; WARNING : <GRF>
+		; There is a potential for the individual components of this string to be
+		; large (especially pstrFilterLocn and pstrFilterGroup) and this may cause a
+		; MAXSTRING error.
+		; Could pass via ^CacheTemp instead or special inter-process message global.
+		; See Example at top of routine
+		 
+		set strPara = """"_pidStocktake_""","""_pstrFilterGroup_""","""_pstrFilterLocn
+		set strPara = strPara_""","""_pstrFilterFrom_""","""_pstrFilterTo_""","""
+		set strPara = strPara_pstrReasonCode_""","""_idLog_""""
+		
+		job Background^INStocktakePost(strPara,YUSER,SPRACHE,YLOCATION,YBED,idLog)::2
+	    do GoToForm^COMUtilForm("COMMsg",idLog)   ; Ready to goto the Detail form
+	    
+	} else {
+		do ReturnError^COMUtilError(strStatus)
+	}
+	quit
+	
+	
+Background(pstrPara,pYUSER,pSPRACHE,pYLOCATION,pYBED,pidLog="")
+	;-------------------------------------------------------------------------------
+	; Wrapper to initiate background job
+	; 
+	; History
+	; 30-Sep-2008	GRF		SR15810: simplified from INWEINRUECK; Build parameter
+	; 							string before calling Start rather than passing all
+	; 							and having to build here
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set $ztrap = "^WWWERROR"
+	
+	do ^WWWVAR  ; New environment for background job
+	
+	; Preserve calling user details
+	if $get(pSPRACHE)'=""   set SPRACHE   = pSPRACHE
+	if $get(pYLOCATION)'="" set YLOCATION = pYLOCATION
+	if $get(pYUSER)'=""     set YUSER     = pYUSER
+	if $get(pYBED)'=""      set YBED      = pYBED
+	
+	set strStatus = $$Transaction^COMTransaction("PostTxn^INStocktakePost("_pstrPara_")")
+	
+	if $$$ISERR(strStatus) {
+		do AddMessage^COMLog(pidLog,$$$Text("IN00465")_": "_$$$Text(strStatus))  ; "Stocktake Post Failed"
+	}
+	quit
+	
+	
+PostTxn(pidStocktake,pstrFilterGroup,pstrFilterLocn,pstrFilterFrom,pstrFilterTo,pstrReasonCode,pidLog)
+	;--------------------------------------------------------------------------------------
+	; 29-Oct-2010 
+	; SR17586 - Does not directly use Stocktake Lines to generate Movements
+	; Adjustment batches are created with links to the Stocktake which are then posted.
+	; The PostTxnOld has been Deprecated with this new SubRoutine.
+	;
+	; Params:
+	;	pidStocktake		stocktake id
+	;	pstrFilterGroup		Stocktake selection - Item Group
+	;	pstrFilterLocn		location
+	;	pstrFilterFrom		Storage Range
+	;	pstrFilterTo
+	;	pstrReasonCode		for INARTHIST & Finance Processing
+	;	pidLog				msg log id
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 06-Apr-2011	GRF		SR17586: conflict between id and idx forms of variables; get
+	;							Locn to create adjustment header; remove enumCostType
+	; 29-Oct-2010	PPP		SR17586: Created - Create an Adjustment Batch for the Stocktake
+	;--------------------------------------------------------------------------------------
+	new arrAdjustment,dteCounted,dteLast,dtePosted,dteSnapped,fltDiffQty
+	new idAdj,idAdjLine,idDefGroup,idGroup,idItem,idLineNo,idLocn,idLogEntry,idStore
+	new idxStktake,idxSTLocn,objINART,objSTLine,objStocktake,objSystem
+	new strMessage,strStatus
+	
+	set pstrFilterGroup = ";"_pstrFilterGroup_";"
+	set pstrFilterLocn  = ";"_pstrFilterLocn_";"
+	
+	set objStocktake = $get(^INWEINVP(0,pidStocktake,1))
+	set dteSnapped   = $$$INWEINVPSystemDate(objStocktake)
+	
+	set objSystem    = $get(^INVORG(0,0,1))
+	;set enumCostType = $$$INVORGDefaultCostType(objSystem)      ; 06-Apr-2011 not used
+	set idDefGroup   = $$$INVORGDefaultItemGroup(objSystem)
+	
+	set dteLast   = ""
+	set dtePosted = $horolog
+	
+	;--------------------------------------- 
+	; Copy Final Counts to INWEINV before
+	; reconciling INWEINV with Stock on Hand
+	;--------------------------------------- 
+	; TODO : Allow replacement of GetCount with VAR call somehow
+	set strStatus = $$GetCount(pidStocktake,dteSnapped)
+	
+	;--------------------------------------- 
+	; Update filtered changed records to Stock On Hand
+	;--------------------------------------- 
+	
+	if $$$ISOK(strStatus) {
+	
+		; For every unposted line in the snapshot with a difference
+		; validate item, group, location and storage details match stocktake selection
+		; before processing
+		
+		; Users can add new lines.  If the details do not match the stocktake selection
+		; those new lines are currently excluded from the update.
+		; FIXME : Do we need to handle differently?
+		
+		set idxStktake = $$$Index(pidStocktake)
+		set idxSTLocn  = ""
+		for {
+			quit:$$$ISERR(strStatus)
+			
+			set idxSTLocn = $order(^INWEINVs(0,6,idxStktake,idxSTLocn))
+			quit:idxSTLocn=""
+			
+			; Get Locn to create adjustment header - reuse inside loop  ; 06-Apr-2011
+			set idLineNo  = $order(^INWEINVs(0,6,idxStktake,idxSTLocn,pidStocktake,"")) ; replaced below
+			set objSTLine = $get(^INWEINV(0,pidStocktake,idLineNo,1))          ; replaced below
+			set idLocn    = $$$INWEINVLocation(objSTLine)
+			
+		;	set idAdj = $$CreateAdjustmentHeader^INADJUtils(idxSTLocn,pstrReasonCode,pidStocktake,.strStatus)  ; 06-Apr-2011
+			set idAdj = $$CreateAdjustmentHeader^INADJUtils(idLocn,pstrReasonCode,pidStocktake,.strStatus)
+			do AddMessage^COMLog(pidLog,$$$Text($listbuild("IN01272",idAdj)))		; "Created Adjustment %1"
+			
+			if (idAdj'="") && $$$ISOK(strStatus) {
+				//Adjustment Array
+				set arrAdjustment(idAdj) = ""
+				
+				set idLineNo = ""
+				for {
+			;		set idLineNo = $order(^INWEINVs(0,6,idxStktake,idxSTLocn,idxStktake,idLineNo))  ; 06-Apr-2011
+					set idLineNo = $order(^INWEINVs(0,6,idxStktake,idxSTLocn,pidStocktake,idLineNo))
+					quit:idLineNo=""
+					
+					set objSTLine = $get(^INWEINV(0,pidStocktake,idLineNo,1))
+					continue:$$$INWEINVPosted(objSTLine)'=""			       ; Already Posted
+					
+					if +$$$INWEINVCalculatedDifferenceQty(objSTLine)=0 {       ; No change
+				 		set $$$INWEINVPosted(objSTLine) = dtePosted	
+			 			set strStatus = $$$Save("INWEINV",pidStocktake_","_idLineNo,objSTLine,$$$YES)
+						quit:$$$ISERR(strStatus)
+						continue
+					}
+					
+					set idItem = $$$INWEINVItemNumber(objSTLine)
+					continue:'$$ValidItem^INART(idItem)
+					
+					set objINART = $get(^INART(0,idItem,1))
+					set idGroup = $$$INARTItemGroup(objINART)
+					if idGroup="" set idGroup = idDefGroup
+					continue:((pstrFilterGroup'=";;") && '$find(pstrFilterGroup,";"_idGroup_";"))
+	 				
+				//	set idLocn = $$$INWEINVLocation(objSTLine)
+				;	continue:((pstrFilterLocn'=";;") && '$find(pstrFilterLocn,";"_idxSTLocn_";"))  ; 06-Apr-2011
+					continue:((pstrFilterLocn'=";;") && '$find(pstrFilterLocn,";"_idLocn_";"))
+	 				
+					set idStore = $$$INWEINVStockLocation(objSTLine)
+					continue:idStore=""                                        ; FIXME : Is this possible?
+					continue:((pstrFilterFrom'="") && (pstrFilterFrom]]idStore))
+					continue:((pstrFilterTo'="")   && (idStore]]pstrFilterTo))
+					
+					set idAdjLine = $$CreateAdjustmentLine^INADJUtils(idAdj,
+														idItem,
+														+$$$INWEINVCalculatedDifferenceQty(objSTLine),
+														$$$INWEINVLotNo(objSTLine),
+														$$$INWEINVExpiryDate(objSTLine),
+														$$$INWEINVBrand(objSTLine),
+														$$$INWEINVOwner(objSTLine),
+														$$$INWEINVProgram1(objSTLine),
+														idStore,
+														.strStatus)
+	 				
+			 		if $$$ISOK(strStatus) {
+				 		set $$$INWEINVPosted(objSTLine) = dtePosted	
+			 			set strStatus = $$$Save("INWEINV",pidStocktake_","_idLineNo,objSTLine,$$$YES)
+					}		 		
+	 				
+			 		quit:$$$ISERR(strStatus)
+					
+				;-----------------------------------
+				; This Line processed - no more than once a second
+				;-----------------------------------
+					
+					if (pidLog'="") && (dteLast'=$horolog) {
+						set dteCounted = $$$INWEINVCountTimestamp(objSTLine)
+						if dteCounted="" set dteCounted = dtePosted
+						
+						set fltDiffQty = $$$INWEINVCalculatedDifferenceQty(objSTLine)
+						
+						; "Processing, Item %1"  _  "Stocktake count on %1 of %2. From %3"
+			;			set strMessage = $$$Text($listbuild("IN00480",$$^WWWDATE(dteCounted),fltDiffQty,idStktakeLocn_"/"_idStore)) ; 06-Apr-2011
+						set strMessage = $$$Text($listbuild("IN00480",$$^WWWDATE(dteCounted),fltDiffQty,idLocn_"/"_idStore)) 
+						do AddMessage^COMLog(pidLog,$$$Text($listbuild("IN00448",idItem))_" ("_strMessage_")",.idLogEntry)
+						set dteLast = $horolog
+					}
+				}
+			}
+		}
+	}
+	
+	;-----------------------------------
+	; All Lines processed
+	;-----------------------------------
+	set YQ = 1           ; new generation (?)  NEUGENERIEREN
+	
+	;-----------------------------------
+	; Post All Adjustments
+	;-----------------------------------
+	
+	set idAdj = ""
+	for {
+		quit:$$$ISERR(strStatus)
+		
+		set idAdj = $order(arrAdjustment(idAdj))
+		quit:idAdj=""
+		
+		kill idLogEntry
+		
+		do AddMessage^COMLog(pidLog,$$$Text($listbuild("IN01273",idAdj)),.idLogEntry)  ; "Posting Adjustment %1"
+		set strStatus = $$PostAdjustment^INADJUtils(idAdj)
+		do AddMessage^COMLog(pidLog,$$$Text($listbuild("IN01273",idAdj))_" "_$select($$$ISOK(strStatus):$$$Text(97),1:$$$Text("IN01126")),idLogEntry)
+	}	;	97 = "Ok"         IN0O1126 = "Post Failed."
+	
+	;--------------------------------------- 
+	; Mark Stocktake as complete
+	;--------------------------------------- 
+	if $$$ISOK(strStatus) {
+		set $$$INWEINVPStatus(objStocktake) = $$$EnumINSTOCKTAKESTATUSStocktakeComplete
+		set strStatus = $$$Save("INWEINVP",pidStocktake,objStocktake,$$$YES)
+	}
+	
+	if $$$ISOK(strStatus) {
+		do AddMessage^COMLog(pidLog,$$$Text("IN00441"))  ; "Stocktake Posted Successfully"
+	} else {
+		do AddMessage^COMLog(pidLog,$$$Text(strStatus))  ; Unsuccessful - show status error
+	}
+	quit strStatus
+	
+	
+GetCount(pidStocktake,pdteSnapped) private
+	;-------------------------------------------------------------------------------
+	; Default operation
+	; Copy count information into stocktake lines
+	; 
+	; Adjust for transactions between the snap time and the count time.
+	; If there are multiple entries in INWEINV for the same item / site / storage we
+	; should only apply the adjustment once.
+	; 
+	; History:
+	; 04-Jan-2010	PPP		SR17645: Added new parameter, idBundle for $$CorrectByHistoryV2
+	; 03-Nov-2008	PP		SR16117: Corrected Call
+	; 09-Oct-2008	GRF		SR15810: preserve BundleID in record.
+	; 01-Oct-2008	GRF		Created from excessively split subroutines; apply
+	; 							adjustments here.
+	; 							(was $$CopyCountsToINWEINV^INWEINVCount)
+	;-------------------------------------------------------------------------------
+	new dteCounted,fltAdjustment,fltCountQty,fltRevisedSnap,idBundle
+	new idCount,idItem,idLineNo,idLocn,idStore,objCount,objSTLine,strMatch,strStatus
+	
+	kill ^CacheTempStocktakePost(YUCI,pidStocktake)
+	
+	set strStatus = $$$OK
+	set idLineNo=""
+	for {
+		set idLineNo=$order(^INWEINVCount(0,pidStocktake,idLineNo))
+		quit:idLineNo=""
+		
+		set objSTLine = $get(^INWEINV(0,pidStocktake,idLineNo,1))
+		set idItem    = $$$INWEINVItemNumber(objSTLine)
+		set idLocn    = $$$INWEINVLocation(objSTLine)
+		set idStore   = $$$INWEINVStockLocation(objSTLine)
+		set idBundle  = $$$INWEINVBundleID(objSTLine)
+		set strMatch  = idItem_$$$COMMA_idLocn_$$$COMMA_idStore_$$$COMMA_idBundle
+		
+		set idCount   = $order(^INWEINVCount(0,pidStocktake,idLineNo,""),-1)
+		set objCount  = $get(^INWEINVCount(0,pidStocktake,idLineNo,idCount,1))
+		set fltCountQty = $$$INWEINVCountQuantity(objCount)
+		set dteCounted  = $$$INWEINVCountTimestamp1(objCount)
+		
+		set fltAdjustment = 0
+		if '$data(^CacheTempStocktakePost(YUCI,pidStocktake,strMatch)) {
+			set ^CacheTempStocktakePost(YUCI,pidStocktake,strMatch) = ""
+	//		set fltAdjustment = $$GetSnapAdjustment^INStocktakeUtil(idItem,idLocn_"||"_idStore,idBundle,pdteSnapped,dteCounted) //SR16117
+			//set fltAdjustment = $$CorrectByHistoryV2^INWEINVUtils(idItem,pdteSnapped,dteCounted,idLocn,idStore)
+			//SR17645:New parameter - idBundle
+			set fltAdjustment = $$CorrectByHistoryV2^INWEINVUtils(idItem,pdteSnapped,dteCounted,idLocn,idStore,idBundle)
+		}
+		set fltRevisedSnap = $$$INWEINVTargetQuantity(objSTLine) + fltAdjustment
+		
+		set $$$INWEINVActualQuantity(objSTLine)          = fltCountQty
+		set $$$INWEINVCountTimestamp(objSTLine)          = dteCounted
+		set $$$INWEINVLastCount(objSTLine)               = idCount
+		set $$$INWEINVCalculatedDifferenceQty(objSTLine) = fltCountQty - fltRevisedSnap
+		
+		set strStatus = $$$Save("INWEINV",pidStocktake_","_idLineNo,objSTLine,$$$YES)
+		quit:$$$ISERR(strStatus)
+	}
+	
+	kill ^CacheTempStocktakePost(YUCI,pidStocktake)
+	quit strStatus
+	
+	; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv  DEPRECATED CODE  vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
+PostTxnOld(pidStocktake,pstrFilterGroup,pstrFilterLocn,pstrFilterFrom,pstrFilterTo,pstrReasonCode,pidLog)
+	;-------------------------------------------------------------------------------
+	; DEPRECATED - please use new PostTxn - 29-Oct-2010
+	;      SR17586 - Does not directly use Stocktake Lines to generate Movements
+	;      Adjustment batches are created with links to the Stocktake which are then posted.
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;	pidStocktake		stocktake id
+	;	pstrFilterGroup		Stocktake selection - Item Group
+	;	pstrFilterLocn		location
+	;	pstrFilterFrom		Storage Range
+	;	pstrFilterTo
+	;	pstrReasonCode		for INARTHIST & Finance Processing
+	;	pidLog				msg log id
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 29-Oct-2010	PPP		SR17586: Deprecated this routine
+	;								 - created a new routine for posting
+	; 30-Sep-2008	GRF		SR15810: created from INWEINRUECK for Bundle processing
+	; 13-May-2008	GRF		SR15660: V2 processing (Replaced 20-Sep-2008
+	;-------------------------------------------------------------------------------
+	new dteCounted,dteLast,dtePosted,dteSnapped,enumCostType,fltDiffQty
+	new idDefGroup,idGroup,idItem,idLineNo,idLocn,idLogEntry,idStore
+	new objINART,objSTLine,objStocktake,objStocktakeLine,objSystem
+	new sc,strMessage,strStatus
+	
+	set pstrFilterGroup = ";"_pstrFilterGroup_";"
+	set pstrFilterLocn  = ";"_pstrFilterLocn_";"
+	
+	set objStocktake = $get(^INWEINVP(0,pidStocktake,1))
+	set dteSnapped   = $$$INWEINVPSystemDate(objStocktake)
+	
+	set objSystem    = $get(^INVORG(0,0,1))
+	set enumCostType = $$$INVORGDefaultCostType(objSystem)
+	set idDefGroup   = $$$INVORGDefaultItemGroup(objSystem)
+	
+	set dteLast   = ""
+	set dtePosted = $horolog
+ 
+	;--------------------------------------- 
+	; Copy Final Counts to INWEINV before
+	; reconciling INWEINV with Stock on Hand
+	;--------------------------------------- 
+	; TODO : Allow replacement of GetCount with VAR call somehow
+	set strStatus = $$GetCount(pidStocktake,dteSnapped)
+	;--------------------------------------- 
+	; Update filtered changed records to Stock On Hand
+	;--------------------------------------- 
+	
+	if $$$ISOK(strStatus) {
+	
+	; For every unposted line in the snapshot with a difference
+	; validate item, group, location and storage details match stocktake selection
+	; before processing
+	
+	; Users can add new lines.  If the details do not match the stocktake selection
+	; those new lines are currently excluded from the update.
+	; FIXME : Do we need to handle differently?
+		set idLineNo = ""
+		for {
+			set idLineNo = $order(^INWEINV(0,pidStocktake,idLineNo))
+			quit:idLineNo=""
+			
+			set objSTLine = $get(^INWEINV(0,pidStocktake,idLineNo,1))
+			continue:$$$INWEINVPosted(objSTLine)'=""			       ; Already Posted
+			
+			if +$$$INWEINVCalculatedDifferenceQty(objSTLine)=0 {       ; No change
+		 		set $$$INWEINVPosted(objSTLine) = dtePosted	
+	 			set strStatus = $$$Save("INWEINV",pidStocktake_","_idLineNo,objSTLine,$$$YES)
+				quit:$$$ISERR(strStatus)
+				continue
+			}
+			
+			set idItem = $$$INWEINVItemNumber(objSTLine)
+			continue:'$$ValidItem^INART(idItem)
+			
+			set objINART = $get(^INART(0,idItem,1))
+			set idGroup= $$$INARTItemGroup(objINART)
+			if idGroup = "" set idGroup = idDefGroup
+			continue:((pstrFilterGroup'=";;") && '$find(pstrFilterGroup,";"_idGroup_";"))
+	 		
+			set idLocn = $$$INWEINVLocation(objSTLine)
+			continue:((pstrFilterLocn'=";;") && '$find(pstrFilterLocn,";"_idLocn_";"))
+	 		
+			set idStore = $$$INWEINVStockLocation(objSTLine)
+			continue:idStore=""                                        ; FIXME : Is this possible?
+			continue:((pstrFilterFrom'="") && (pstrFilterFrom]]idStore))
+			continue:((pstrFilterTo'="")   && (idStore]]pstrFilterTo))
+			
+			;-------------------------------
+			set objStocktakeLine = ##class(alADJ.dUStocktakeLine).%OpenId("0||"_pidStocktake_"||"_idLineNo)
+			set sc = objStocktakeLine.PostTxn(pstrReasonCode)
+	 		set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+			;-------------------------------
+	; was being processed as
+	;		set objTransaction = ##class(alADJ.dUStocktakeLine).%OpenId("0||"_pidStocktake_"||"_idLineNo)
+	;		set strStatus      = objTransaction.UpdateObject(idSOH,objINWE,fltDiffQty,pstrReasonCode)	 		
+	 		
+	 		if $$$ISOK(strStatus) {
+		 		set $$$INWEINVPosted(objSTLine) = dtePosted	
+	 			set strStatus = $$$Save("INWEINV",pidStocktake_","_idLineNo,objSTLine,$$$YES)
+			}		 		
+	 		
+	 		quit:$$$ISERR(strStatus)
+			
+		;-----------------------------------
+		; This Line processed
+		;-----------------------------------
+			
+			if (pidLog'="") && (dteLast'=$horolog) {
+				set dteCounted = $$$INWEINVCountTimestamp(objSTLine)
+				if dteCounted="" set dteCounted = dtePosted
+			
+				set fltDiffQty = $$$INWEINVCalculatedDifferenceQty(objSTLine)
+			
+			; "Processing, Item %1"  _  "Stocktake count on %1 of %2. From %3"
+				set strMessage = $$$Text($listbuild("IN00480",$$^WWWDATE(dteCounted),fltDiffQty,idLocn_"/"_idStore)) 
+				do AddMessage^COMLog(pidLog,$$$Text($listbuild("IN00448",idItem))_" ("_strMessage_")",.idLogEntry)
+				set dteLast=$horolog
+			}
+		}
+	}
+	
+	;-----------------------------------
+	; All Lines processed
+	;-----------------------------------
+	SET YQ=1           ; new generation (?)  NEUGENERIEREN
+	
+	;--------------------------------------- 
+	; Mark Stocktake as complete
+	;--------------------------------------- 
+	if $$$ISOK(strStatus) {
+		set $$$INWEINVPStatus(objStocktake) = $$$EnumINSTOCKTAKESTATUSStocktakeComplete
+		set strStatus = $$$Save("INWEINVP",pidStocktake,objStocktake,$$$YES)
+	}
+	
+	if $$$ISOK(strStatus) {
+		do AddMessage^COMLog(pidLog,$$$Text("IN00441"))  ; "Stocktake Posted Successfully"
+	} else {
+		do AddMessage^COMLog(pidLog,$$$Text(strStatus))  ; Unsuccessful - show status error
+	}
+	quit strStatus
+	
+	; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  DEPRECATED CODE  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+]]></Routine>
+</Export>

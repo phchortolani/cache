@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARCompareBarCodes" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+#include COMSYS
+#include VARConst
+#include VARLog
+
+#define IntEAN13Code 2
+#define IntItemWithLotNumber 57
+#define IntItemWithoutLotNumber 76
+
+VARCompareBarCodes
+
+	quit
+
+ConvertScan(pidtext)
+	
+	new idtext, idBarCode, objTranslatedBarCode, t9xtConverted, idItem, idLotNumer, dtUsebyDate, 
+		blnIsValidEAN13BarCode, objQrCode
+	
+	set txtConverted = pidtext
+	
+	;if ((pidtext'="") && ('$find(pidtext,$$$ScanDelim))) {
+	if (pidtext'="") {
+		set blnIsValidEAN13BarCode = $$IsValidEAN13(pidtext)
+		if ((blnIsValidEAN13BarCode) || ($find(pidtext,$$$ScanDelim))) {
+			set objTranslatedBarCode = $get(^VARCompareBarCodes(YM,pidtext,1))
+			if (objTranslatedBarCode '= "") {
+				set txtConverted = $$$VARCompareBarCodesAlphalincTranslated(objTranslatedBarCode)
+																	   
+				set idItem 		 = $piece(txtConverted,$$$ScanDelim,1) //Deletar estas linhas
+				set idLotNumer   = $piece(txtConverted,$$$ScanDelim,2) //após o upgrade 1.74 
+				set dtUsebyDate	 = $piece(txtConverted,$$$ScanDelim,3) //(Validade será tratada)
+																	
+				set txtConverted = idItem_$$$ScanDelim_idLotNumer	//Deixando somente o Item e o Lote para leitura.
+			} 														
+			else {
+				if ('$find(pidtext,$$$ScanDelim)) { 
+					$$$Alert("Produto/Lote/Validade não cadastrados.")
+				}
+			}
+		}		
+		else {
+			// Testa se é um código de barras 2D
+			set objQrCode = $get(^VARCompareQrCodes(0,pidtext,1))
+			if (objQrCode '= "") {
+				set idItem 		= $$$VARCompareQrCodesProduto(objQrCode)
+				set idLotNumer 	= $$$VARCompareQrCodesLote(objQrCode)
+				set dtUsebyDate = $$$VARCompareQrCodesValidade(objQrCode)
+				
+				set txtConverted = idItem_$$$ScanDelim_idLotNumer
+			}
+			;else {
+			;	$$$Alert("Código de barras inválido")
+			;}
+		}
+	}
+		
+	quit txtConverted
+
+GenerateVerifyCode(pstrEAN)
+
+	if (($length(pstrEAN)) < 12) quit
+	
+	new intTotal, intNextMult, codVerify, i
+	
+	set intTotal 		= 0
+	
+	for i=1:1:12 {
+		if (i#2 = 0) {
+			set intTotal = intTotal + ($extract(pstrEAN,i) * 3)
+		} 
+		else {
+			set intTotal = intTotal + ($extract(pstrEAN,i) * 1)
+		}
+	}
+	
+	set intNextMult = ((intTotal \ 10) +1 ) * 10	
+	set codVerify 	= intNextMult - intTotal
+	if (codVerify = 10) {
+		set codVerify = 0
+	}
+	
+	quit codVerify
+
+IsValidEAN13(pstrEAN)	
+	
+	if (($length(pstrEAN)) '= 13) quit $$$NO
+	
+	new blnIsValid, OrigVerifyCode, idCorrectCode
+
+	set blnIsValid		= $$$YES
+	set OrigVerifyCode 	= $extract(pstrEAN,13)
+	set idCorrectCode	= $$GenerateVerifyCode($extract(pstrEAN,1,12))
+	
+	if (OrigVerifyCode '= idCorrectCode) {
+		set blnIsValid = $$$NO
+	}
+	
+	quit blnIsValid
+	
+ConvertInvalidCode()
+	
+	new SQLCODE,idProduto,idLoteErrado,idValidade,idLoteCorreto, count
+	
+	$$$VAR
+	set strStatus = $$$OK
+	set count = 0
+	
+	&sql(DECLARE BARCODE CURSOR FOR
+		 SELECT DISTINCT 
+         stck.Item, 
+         stck.Lote, 
+         $$converteTabelaC^VARZebraRun(stck.Lote) LoteErrado, Bundle->UseByDate as Validade
+         INTO :idProduto,:idLoteCorreto,:idLoteErrado,:Validade
+	     FROM (select stk4.*, stk4.Bundle->LotNumber Lote from alSOH.dBundleStock stk4) As stck
+		 LEFT JOIN (SELECT DISTINCT Item, Bundle->LotNumber Lote, ID
+		       FROM     alSOH.dBundleStock stck2
+		       WHERE    ($$converteTabelaC^VARZebraRun(Bundle->LotNumber) <> Bundle->LotNumber)
+		       AND      ((SELECT COUNT(*)
+		                  FROM   alSOH.dBundleStock stck3
+		                  WHERE  ($$converteTabelaC^VARZebraRun(stck3.Bundle->LotNumber) <> stck3.Bundle->LotNumber)
+		                  AND    stck3.Item = stck2.Item
+		                  AND    ($$converteTabelaC^VARZebraRun(stck3.Bundle->LotNumber) = $$converteTabelaC^VARZebraRun(stck2.Bundle->LotNumber))
+		                  AND    (stck3.Bundle->LotNumber <> stck2.Bundle->LotNumber)) > 0)
+		GROUP BY Item, Bundle->LotNumber) stck1 ON stck1.Item = stck.Item AND stck.Lote = stck1.Lote
+
+		WHERE $$converteTabelaC^VARZebraRun(stck.Bundle->LotNumber) <> stck.Bundle->LotNumber
+		AND stck1.id IS NULL
+		and (stck.Item != 912)
+        and (stck.Item != 626)
+        and (stck.Item != 917)
+		order by stck.Item
+	)
+	&sql(OPEN BARCODE)
+	&sql(FETCH BARCODE)
+	
+	While (SQLCODE = 0) {
+		set keyInvalido = $get(idProduto)_$$$ScanDelim_$get(idLoteErrado)_$$$ScanDelim_$get(idValidade)
+		set objValido 	= $get(idProduto)_$$$ScanDelim_$get(idLoteCorreto)_$$$ScanDelim_$get(idValidade)
+		
+		set strStatus = $$Save^COMUtils("VARCompareBarCodes",keyInvalido,objValido,$$$YES)
+		if $$$ISOK(strStatus) {
+			set count = count + 1
+    		&sql(FETCH BARCODE)	
+		}
+		else {
+			$$$VARLOGERROR(strStatus)
+			quit
+		}
+ 	}
+	
+	&sql(CLOSE BARCODE)
+	
+	Write !, "Foram processados "_count_" registros"
+	
+	quit strStatus
+]]></Routine>
+</Export>

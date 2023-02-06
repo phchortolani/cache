@@ -1,0 +1,347 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARSESINReqSource" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+#include INConst
+#include VARConst
+#include WWWConst
+#include COMSYS
+#include INReq
+#include VARSESConst 
+ 
+VARSESINReqSource
+	quit
+ 
+Source()
+	;-------------------------------------------------------------------------------
+	; Perform the sourcing
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 22-Mar-2007	HeberB	BR014406: Created(copied from  INReqSource)
+	;-------------------------------------------------------------------------------
+	new strStatus,ListOfDocs
+ 
+	set strStatus=$$CanSource^INReqSource($$$YES)
+ 
+	if $$$ISOK(strStatus) {
+		set strStatus=$$Transaction^COMTransaction("SourceTxn^VARSESINReqSource(.ListOfDocs)",$$$YES)
+		if $$$ISOK(strStatus) {
+			// A rotina SourceTxn^INReqSource já emitia um alerta. Mas, comentei para evitar duas msgs. Veja SR BR014697
+			$$$StartScript()
+			write "alert('"_$$PrepareMsg(.ListOfDocs)_"');"
+			$$$EndScript()
+			// Andre, 16/01/2008:
+			// Dependendo do documento criado, abre tela de PAM ou de Solicitação de Transferência.
+			// TODO: Quando múltiplos documentos criados abrir uma tela intermediário para usuário
+			// selecionar entre últimos documentos criados.
+			if ( $data(ListOfDocs("Purchase") ) ) {
+				do GoToForm^COMUtilForm("VARTRKPAM", $order(ListOfDocs("Purchase","")), 1, "")
+			}
+			elseif ( $data(ListOfDocs("Transfer") ) ) {
+					do GoToForm^COMUtilForm("VARSESSolicTransf", $order(ListOfDocs("Transfer","")), 1, "")
+			}
+			else {
+				do ReloadForm^COMUtilForm()
+			}
+		}
+	}
+	quit strStatus
+ 
+PrepareMsg(&pListOfDocs)
+	set msg = "Os seguintes documentos foram criados:\n"
+	set i = "pListOfDocs("""")"
+	for {
+		set i = $query(@i)
+		quit:(i = "")
+		set typeOfDoc = $zstrip($piece($piece(i,YKOMMA,1),"(",2),"<>","""") // $zstrip removes leading and trailing quote marks
+		if (typeOfDoc = "Purchase") {
+			set msg = msg_"PAM"
+		}
+		elseif (typeOfDoc = "Transfer") {
+			set msg = msg_"Solic"
+		}
+		else {
+			set msg = msg_"Documento"
+		}
+		set docNumber = $piece($piece(i,YKOMMA,2),")",1)
+		set msg = msg_": "_docNumber_"\n"
+	}
+	quit msg
+ 
+SourceTxn(&pListOfDocs)
+	// Andre, 18/08/2007:
+	// 
+	// This function:
+	// 
+	// 1)Retrieves the list of supplies (records of INRequisition) selected 
+	// 	 by the user in the INReqSource screen, and save them to two lists: 
+	// 	 one of the transfer-type supplies, another of the purchase-type
+	// 	 supplies;
+	// 	 
+	// 2)Performs the core operations for Sourcing;
+	// 
+	// 3)Creates the PAM and its lines for the list of purchase-type supplies. 
+	//   Note that, it creates only a single PAM, even if different supplies 
+	//   have different Atas or Suppliers. (THIS MIGHT REQUIRE FIXING!)
+	//   
+	// 4)Creates the multiple Transfer Requests (VARSESSolicTransf) for the
+	//   list of transfer-type supplies. A different Transfer Request is 
+	//   created for each different sourcing location.
+	// 
+	// Note: this function does not rely any more on a VARHook on save of the 
+	// INRequisition class (routine OnBeforeSave^VARTRKINReqSource), to be
+	// able to save the PAM number in the INRequisition record, as Heber did.
+	// Therefore, it's no longer necessary to use global ^CacheTempRequisition.
+ 
+	new strKeys,idReqLine,idNewPAM,blnPAMCriada,ListOfReqs
+	
+	;for i=1:1:1000 { h 1 }
+ 
+ 	do GetLockIds^WWWMultiLock(YFORM,YFORM_"Line",YUSER)
+ 
+	$$$Order3(^CacheTempMultiLockIds,YUSER,YUCI,strKeys)
+ 
+		set idReqLine=$$$KEYMAX(strKeys)
+ 
+ 		set objReqLine = $get(^INRequisition(YM,YM,idReqLine,1))
+ 		
+		if (($$$INRequisitionStatus(objReqLine) = $$$EnumINREQSTATUSFirmed) && 
+			($$$INRequisitionSource(objReqLine) = $$$YES) ) {
+			if ($$$INRequisitionType(objReqLine) = $$$EnumINREQUISITIONTYPEBuy) {
+				set ListOfReqs("Purchase",YM,idReqLine)=""
+			}
+			if ($$$INRequisitionType(objReqLine) = $$$EnumINREQUISITIONTYPETfr) {
+				set ListOfReqs("Transfer",YM,idReqLine)=""
+			}
+		}
+	$$$End
+	
+	// Andre, 18/08/2007: este kill é feito sempre ao final da rotina que 
+	// usa o CacheTempMultiLockIds, pois na próxima rotina que ele for usado 
+	// será obtido novamente da rotina do GetLockIds^WWWMultiLock():
+	kill ^CacheTempMultiLockIds(YUSER,YUCI) 
+ 
+	set strStatus = $$SourceTxn^INReqSource() // Andre, 26/06/2007
+ 	if (strStatus '= $$$OK) {
+	 	quit strStatus // if error, quit.
+ 	}
+ 
+	// Andre, 18/08/2007:
+	// Cria a PAM e também suas linhas. Assim, a tela de PAM não precisa 
+	// mais pesquisar em INRequisition para saber quais são as linhas da PAM:
+	set strStatus = $$CriaPAM(.ListOfReqs,.pListOfDocs) // Andre, 26/06/2007
+ 	if (strStatus '= $$$OK) {
+	 	quit strStatus // if error, quit.
+ 	}
+ 	
+	// Andre, 18/08/2007:
+	// Cria a Solicitação de Transferência, usando como seu ID o group number das demandas
+	// associadas a cada INRequisition, e ainda associa estas à recém-criada solicitação:
+	set strStatus = $$CriaSolicTransf(.ListOfReqs,.pListOfDocs) // Andre, 26/06/2007
+ 	if (strStatus '= $$$OK) {
+	 	quit strStatus // if error, quit.
+ 	}
+ 	
+	quit strStatus
+	
+CriaPAM(&pListOfReqs,&pListOfDocs)
+	new objVARTRKPAM, idVARTRKPAM, strStatus
+	
+	set strStatus=$$$OK
+ 
+	// Se não há nenhuma PAM a criar, sai da rotina sem erro:
+	if ($data(pListOfReqs("Purchase",YM)) '= 10) {
+		quit strStatus
+	}
+	
+	set objVARTRKPAM = ""
+	
+	set $$$VARTRKPAMNaturezadaEntrada(objVARTRKPAM) = ""
+	set $$$VARTRKPAMDatadeEmisso(objVARTRKPAM) = +$H
+	set $$$VARTRKPAMSetorSolicitante(objVARTRKPAM) = YLOCATION
+	set $$$VARTRKPAMCentrodeCusto(objVARTRKPAM) = $$$WWW0121FREE1($get(^WWW0121(0,YM,YLOCATION,1))) // CENTRO DE CUSTO
+	set $$$VARTRKPAMObservaes(objVARTRKPAM) = ""
+	set $$$VARTRKPAMDataDesejada(objVARTRKPAM) = ""
+	set $$$VARTRKPAMNumerodoProcesso(objVARTRKPAM) = ""
+	set $$$VARTRKPAMNumerodaATA(objVARTRKPAM) = ""
+	
+	set idVARTRKPAM = $$^WWWNEXT("VARTRKPAM")
+	if (idVARTRKPAM = "") {
+		quit "0~Erro ao criar PAM."
+	}
+	set pListOfDocs("Purchase",idVARTRKPAM)=""
+ 	set strStatus = $$$Save("VARTRKPAM",idVARTRKPAM,objVARTRKPAM,1)
+  	if (strStatus '= $$$OK) {
+	 	quit strStatus // if error, quit.
+ 	}
+	 	
+	// Agora, cria as linhas da PAM:
+	// Andre, 27/06/2007:
+	
+	//for i=1:1:1000 h 1
+	set intCounter = 1
+	$$$Order3(pListOfReqs,"Purchase",YM,idReqLine)
+		set objReqLine = $get(^INRequisition(YM,YM,idReqLine,1))
+		set objVARTRKPAMLineFake = objReqLine
+		if $piece(objVARTRKPAMLineFake,Y,1)'="" {
+			set $piece(objVARTRKPAMLineFake,Y,54)=$piece(^INART(YM,$piece(objVARTRKPAMLineFake,Y,1),1),Y,1) //descricao
+		}
+		if $piece(objVARTRKPAMLineFake,Y,2)'="" {
+			set $piece(objVARTRKPAMLineFake,Y,55)=$piece(^WWW101(YM,"EINHEIT","PT",$piece(objVARTRKPAMLineFake,Y,2),1),Y,1) //unidade 2
+		}
+		if $piece(objVARTRKPAMLineFake,Y,4)'="" {
+			if ( $get( ^INLIEF(YM,$piece(objVARTRKPAMLineFake,Y,4),1) ) = "" ) {
+				quit "0~Fornecedor não cadastrado."
+			}
+			set $piece(objVARTRKPAMLineFake,Y,56)=$piece(^INLIEF(YM,$piece(objVARTRKPAMLineFake,Y,4),1),Y,4) //fornecedor 4 
+		}
+		if $piece(objVARTRKPAMLineFake,Y,16)'="" {
+			set $piece(objVARTRKPAMLineFake,Y,57)=$piece(^WWW0121(YM,YM,$piece(objVARTRKPAMLineFake,Y,16),1),Y,1) //local 16
+		}
+		set $$$VARTRKPAMLineFakeRequisitionProcessNumber(objVARTRKPAMLineFake)=idReqLine
+		set strStatus = $$$Save("VARTRKPAMLineFake",idVARTRKPAM_$$$COMMA_intCounter,objVARTRKPAMLineFake,1)
+		if (strStatus '= $$$OK) {
+		 	quit strStatus // if error, quit.
+		}
+		set intCounter = intCounter + 1
+		// Atualiza a requisition com o número da PAM:
+		set $$$INRequisitionRequisitionProcessNumber(objReqLine) = idVARTRKPAM
+		set strStatus = $$$Save("INRequisition",YM_YKOMMA_idReqLine,objReqLine,1)
+		if (strStatus '= $$$OK) {
+		 	quit strStatus // if error, quit.
+		}
+	$$$End
+ 
+	quit strStatus
+ 
+CriaSolicTransf(&pListOfReqs,&pListOfDocs)
+	// Andre, 18/08/2007:
+	// Cria a Solicitação de Transferência, usando como seu ID o group number das demandas
+	// associadas a cada INRequisition, e ainda associa estas à recém-criada solicitação:
+	new strStatus, arrSolic, idSolic
+	
+	set strStatus=$$$OK
+	
+	// Se não há nenhuma Solicitação de Transferência a criar, sai da rotina sem erro:
+	if ($data(pListOfReqs("Transfer",YM)) '= 10) {
+		quit strStatus
+	}
+	
+	$$$Order3(pListOfReqs,"Transfer",YM,idReqLine)
+ 
+		;set idReqLine=$$$KEYMAX(strKeys) ; $$$KEYMAX é uma função que retorna a última chave (último piece da string strkeys, tendo a vírgula - "," - como separador. 
+ 
+ 		set objReqLine = $get(^INRequisition(YM,YM,idReqLine,1))
+ 		
+ 		// Verifica se a requisition está Sourced, selecionada para fazer sourcing e
+ 		// se a requisition é do tipo 1 - Transfer:
+		// if (($data(^INRequisitions(YM,1,$$$EnumINREQSTATUSSourced,$$$YES,YM,idReqLine))) && 
+		//	($$$INRequisitionType(objReqLine) = $$$EnumINREQUISITIONTYPETfr)) {
+		if (($$$INRequisitionStatus(objReqLine) = $$$EnumINREQSTATUSSourced) && 
+			($$$INRequisitionType(objReqLine) = $$$EnumINREQUISITIONTYPETfr)) {
+			set idDemand = $$$INRequisitionDemand(objReqLine)
+			set demandLocation = $piece(idDemand,YKOMMA,1)
+			set demandNumber = $piece(idDemand,YKOMMA,2)
+			if (demandNumber '= +demandNumber) { set demandNumber = """"_demandNumber_"""" }
+			set refDemand = "^INDRPDEMAND("_YM_YKOMMA_demandLocation_YKOMMA_demandNumber_YKOMMA_"1)"
+			set objDemand = $get(@refDemand)
+			set idGroupNumber = $$$INDRPDEMANDGroupNumber(objDemand)
+			
+			if (idGroupNumber '= "") {
+				
+				;set idSolicTransf = idGroupNumber
+				;set objSolicTransf = $get(^VARSESSolicTransf(YM,idGroupNumber,1))
+				;set pListOfDocs("Transfer",idSolicTransf)=""
+ 
+ 				set idSolicTransf = $$GetIdSolicTransf^VARSESSolicTransf(idGroupNumber)
+ 				if idSolicTransf = "" set idSolicTransf = $$$NextKey("VARSESSolicTransf")
+ 				set objSolicTransf = $get(^VARSESSolicTransf(YM, idSolicTransf, 1))
+ 				set pListOfDocs("Transfer", idSolicTransf) = ""
+ 
+				// Se cabeçalho da Solicitação de Transferência ainda não existe, cria-o:
+				if (objSolicTransf = "") {
+					set objSolicTransf = ""
+					;idReqLine
+					;set $$$VARSESSolicTransfNumerodaTRnoTRAK(objSolicTransf) = ""
+					set $$$VARSESSolicTransfLocalRecebedor(objSolicTransf) = $$$INRequisitionLocation(objReqLine)
+					set $$$VARSESSolicTransfLocalAbastecedor(objSolicTransf) = $$$INRequisitionSourcingLocation(objReqLine)
+					;set $$$VARSESSolicTransfData(objSolicTransf) = $h
+					;set $$$VARSESSolicTransfStockLocation(objSolicTransf) = ""
+					set $$$VARSESSolicTransfTipoSolicitacao(objSolicTransf) = "MENSAL"
+					set $$$VARSESSolicTransfDatadaSolicitacao(objSolicTransf) = $h
+ 
+					set $$$VARSESSolicTransfParcialmenteAtendido(objSolicTransf) = $$$SolicAguardandoAtendimento
+ 
+					set $$$VARSESSolicTransfNoDocumento(objSolicTransf) = idGroupNumber
+					set $$$VARSESSolicTransfTransferenciaouConsumo(objSolicTransf) = "TRANSFERENCIA"
+					
+					set strStatus = $$$Save("VARSESSolicTransf",idSolicTransf,objSolicTransf,1)
+					if (strStatus '= $$$OK) {
+						quit strStatus // if error, quit.
+					}
+					set arrSolic(idSolicTransf) = ""
+				}
+				
+				// Cria a linha da Solicitação de Transferência:
+				
+				;set idLinhaSolicTrf = $$GetNextNumber^COMUtils("VARSESSolicTransf")
+				set idLinhaSolicTrf = $order(^VARSESSolicTransfLinha(0,idSolicTransf,""),-1)+1
+				set objLinhaSolicTrf = ""
+				set $$$VARSESSolicTransfLinhaCodigodoProduto(objLinhaSolicTrf) = $$$INRequisitionItem(objReqLine)
+				set $$$VARSESSolicTransfLinhaQuantidade(objLinhaSolicTrf) = $$$INRequisitionQuantity(objReqLine)
+				set $$$VARSESSolicTransfLinhaUnidadedeEstoque(objLinhaSolicTrf) = $$$INRequisitionUnit(objReqLine)
+				;$$$INRequisitionDemand(objReqLine)
+				set strStatus = $$$Save("VARSESSolicTransfLinha",idSolicTransf_YKOMMA_idLinhaSolicTrf,objLinhaSolicTrf,1)
+				if (strStatus '= $$$OK) {
+				 	quit strStatus // if error, quit.
+				}
+				
+				// Atualiza a requisition com o número da solicitação de transferência:
+				set $$$INRequisitionRequisitionProcessNumber(objReqLine) = idGroupNumber
+				set strStatus = $$$Save("INRequisition",YM_YKOMMA_idReqLine,objReqLine,1)
+				if (strStatus '= $$$OK) {
+				 	quit strStatus // if error, quit.
+				}
+			
+			}
+			else {
+			 	quit "0~Número de Solicitação de Transferência não encontrado!" // if error, quit.
+			}
+			
+		}
+ 
+	$$$End
+	
+	// Enviando as solicitações para o TrakCare WS.
+	$$$Order1(arrSolic,idSolic) 
+	
+		;do SolicitarTransferencia^VARSESIntegration(idSolic)
+	
+	$$$End
+	
+	quit strStatus
+ 
+Teste
+	do ^WWWVAR
+	set YBED="ANDRE"
+	new strStatus,ListOfReqs,ListOfDocs
+	set strStatus = $$$OK
+ 
+	;for i=1:1:1000 { h 1 }
+	
+	for i=13:1:28 {
+		set ListOfReqs("Transfer",YM,$e(1000000+i,2,7))=""
+	}
+	
+	set strStatus = $$CriaSolicTransf(.ListOfReqs,.ListOfDocs) // Andre, 26/06/2007
+ 	if (strStatus '= $$$OK) {
+	 	w !,"Erro!" // if error, quit.
+ 	}
+ 
+	quit
+ 
+]]></Routine>
+</Export>

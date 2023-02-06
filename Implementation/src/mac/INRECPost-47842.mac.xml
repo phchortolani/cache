@@ -1,0 +1,696 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INRECPost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INRECPost
+	
+#include COMSYS
+#include INConst
+#include FINConst
+#include %occInclude
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INRECPost("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Postable(pidReceipt,penumType="") 
+	;-------------------------------------------------------------------------------
+	; Test whether this record is postable
+	; 
+	; Called By: Postable^INRECBPost, Postable^INRECTFR, Form INREC Button 1 "Post"
+	; 
+	; Params:	pidReceipt - INREC id
+	;
+	; ByRefs:
+	;
+	; Returns:	postable status
+	;
+	; History:
+	; 07-Apr-2009	GRF		SR16363: Replace order macro
+	; 25-Aug-2008	HQN		SR15815: Removed V2 validity check, no longer applicable
+	; 06-Jun-2008	GRF		SR15785: missed variables in new list
+	; 08-May-2008	GRF		SR15717: $$$MakeStatus replaces $listbuild; separate
+	;							Enum check from status check so we can add other
+	;							types; cleanup old change comments
+	; 03-Apr-2008	PPP		SR15640: Only do V2 processing for Supplier Receipts
+	;							 (ie type = 2)
+	; 25-Mar-2008	HQN		SR15640: Checking V2 to stop garbage getting in
+	; 20-Nov-2007	GRF		BR014730: Corrected object used (objRec not objAdj)
+	; 31-Oct-2007	PJones	BR014730, added check to see if site-location is locked 
+	;							(eg. by stocktaking)
+	; 28-Oct-2007	???		SRBR014730: TODO (TidyUp)
+	; 31-Jan-2007	PO		SR15318: Check whether transfer receipt line can be posted
+	; 11-Sep-2006	JW		SR14979: Make sure we have lines
+	; 03-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	quit:$$$NoKey(pidReceipt) $$$NO
+	
+	new blnLines,err,idRecLine,loopErrors,objRec,objReceipt,strErrorLines,strStatus
+	
+	set objRec = $get(^INREC(0,pidReceipt,1))
+	
+	set strStatus = $$$OK
+	if objRec '="" {
+		if $$IsLockedStockLocation^INLocking($$$INRECLocation(objRec),$$$INRECStockLocation(objRec)) {
+			set strStatus = $$ReasonLocked^INLocking($$$INRECLocation(objRec),$$$INRECStockLocation(objRec),"")
+		}
+	}
+	; Change ends
+	if $$$ISOK(strStatus) {
+		set strStatus = $$Editable^INREC(objRec,penumType)
+		
+		if $$$ISOK(strStatus) {
+			if '$data(^INRECLine(0,pidReceipt)) {
+				set strStatus = $$$MakeStatus("IN00403")
+			 ; "No goods have been selected for receipt"
+			
+			} elseif penumType=$$$EnumINRECSupplierReceipt {
+				set blnLines = $$$NO
+				set idRecLine = ""
+				for {
+					set idRecLine = $order(^INRECLine(0,pidReceipt,idRecLine))
+					quit:idRecLine=""
+					
+					if $$$INRECLineInclude($get(^INRECLine(0,pidReceipt,idRecLine,1))) {
+						set blnLines  = $$$YES
+						set strStatus = $$PostableLine(pidReceipt,idRecLine)
+						quit:$$$ISERR(strStatus)
+					}
+				}
+				if 'blnLines {
+					set strStatus = $$$MakeStatus("IN00403")
+				} ; "No goods have been selected for receipt"
+			
+			} elseif penumType = $$$EnumINRECTransferReceipt {
+				set idRecLine=""
+				for {
+					set idRecLine=$order(^INRECLine(0,pidReceipt,idRecLine))
+					quit:idRecLine=""
+					
+					set strStatus = $$PostableTFRLine(pidReceipt,idRecLine)
+					quit:$$$ISERR(strStatus)
+				}
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set YQ = $$$QSave
+	} else {
+		set YQ = $$$QDontSave_" "_$$$Text(strStatus)
+	}
+	quit strStatus
+	
+	
+PostableLine(pidReceipt,pidRecLine)
+	;-------------------------------------------------------------------------------
+	; Get the receipt status of the order line
+	;
+	; Called By: Postable^INRECPost
+	; 
+	; Params: pidReceipt,pidRecLine - INRECLine keys
+	;
+	; Returns: status
+	;
+	; History:
+	; 27-Aug-2009	GRF		SR16857: standardise conversion
+	; 25-Aug-2009	DWR		SR16857: calculate the ordered qty as inventory Unit
+	; 03-Aug-2009	PPP		SR16815: Changed $$$INRECLineBaseQuantity to $$$INRECLineOrderQuantity
+	; 23-Feb-2009	HQN		SR16352: Incorrectly placed error message, only check
+	; 							if a match is actually found
+	; 						Newed variables used in Uniqueness check
+	; 22-Jan-2009	HQN		SR16268: Only error if a bundle match found for that
+	; 							lot number
+	; 06-Jan-2008	HQN		SR16268: Added Lot Number uniqueness check
+	; 15-Sep-2008	HQN		SR15913: Added zero quantity/negative check
+	; 15-Sep-2008	HQN		SR15871: Added ItemPolicy check which was removed when
+	; 							V2 was removed.
+	; 06-Jun-2008	GRF		SR15785: Check if INWEMERKER flag is blank - report error
+	; 08-May-2008	GRF		SR15717: $$$MakeStatus replaces $listbuild
+	; 03-Sep-2007	GM		BR014609: Included line in language text IN00514
+	; 27-Feb-2007	JW		SR15453: Encapsualated CanSave 
+	; 31-Jan-2007	PO		SR15318: Prevent post if data processing and data entry
+	; 							records don't match
+	;  5-Sep-2006	JW		SR14979: Fixed policy check. Added delete loc check.
+	; 03-Aug-2006	PO		SR14854: Prevent over receiving based on policies
+	; 17-May-2006	JW		SR14646: Added qty check
+	; 03-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new fltOrderQty,fltOtherQty,fltReceiveQty,idFlag,objInvMatch
+	new objIncomingGoodsFlag,objLine,strStatus,objUItem
+	new objBundle,sc,objResultSet,loopAttribute,loopPolicyAttribute
+	
+	set objLine     = $get(^INRECLine(0,pidReceipt,pidRecLine,1))
+	set objInvMatch = ""
+	set:$$$INRECLineCacheLink(objLine)'="" objInvMatch = $get(^FINAPInvMatchCache(0,$$$INRECLineCacheLink(objLine),1))
+	
+	set strStatus = $$$OK	
+	
+	if $$$FINAPInvMatchCacheReceipted(objInvMatch) {
+		set strStatus = $$$MakeStatus("IN00406",pidRecLine)  ; "Line %1 already received"
+		
+	} else {
+		set strStatus = $$CanSave^INDRECLine(pidReceipt_","_pidRecLine,objLine)
+		if $$$ISOK(strStatus) {
+			if '$$IsConsumable^INARTLOCPAR($$$INRECLineItem(objLine),$$$INRECLineLocation(objLine)) {
+				if $$$INRECLineStockLocation(objLine) = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1))) {
+					set strStatus = $$$MakeStatus("IN00533",pidRecLine)
+				} ; "Cannot receive into the 'Delete Stock Location' on line %1"
+			}
+		}
+			
+		if $$$ISOK(strStatus) {
+			set idFlag = $$$INRECLineFlag(objLine)
+			if idFlag = "" set strStatus = $$$MakeStatus("IN00752",pidRecLine)
+		} ; "Line %1 is missing a required status flag."
+		
+		if $$$ISOK(strStatus) {
+			set objIncomingGoodsFlag = $get(^INWEMERKER(0,idFlag,1))
+			if $$$INWEMERKERReceiptExceedsOrder(objIncomingGoodsFlag) = $$$EnumWWWTRISTATE1Disallow {
+				set fltOrderQty = $$ConvOtherQtyToInvQty^INRECLineUtil($$$INRECLineItem(objLine),$$$INRECLineUnit(objLine),$$$INRECLineOrderQuantity(objLine))
+				set fltOtherQty = $$ReceiptQuantities^INRECLine(objLine,pidReceipt,.fltReceiveQty)
+				
+				if fltReceiveQty > (fltOrderQty - fltOtherQty) {
+					set strStatus = $$$MakeStatus("IN00514",fltOtherQty,pidRecLine)
+				} ; "Receipt has exceeded ordered quantity in line ´%2´, other existing receipts account for ´%1´."
+			}
+		}
+		
+		; only check expiry if item policy requires
+		set objUItem = ##class(alINV.dUItem).%OpenId("0||"_$$$INRECLineItem(objLine))
+		if (objUItem '= $$$NULLOREF) && (objUItem.ItemPolicy '= $$$NULLOREF) {
+			if (objUItem.ItemPolicy.Description = "Use By Date Policy") {
+				if ($$$INRECLineExpirationDate(objLine) = "") {
+					set strStatus = $$$MakeStatus("alREC0003",pidRecLine)
+				} ;	"Receipt Line (%1) Expiration Date note set"
+				
+				if $$$ISOK(strStatus) && ($$$INRECLineLotNumber(objLine) = "") {
+					set strStatus = $$$MakeStatus("alREC0002",pidRecLine)
+				} ; Receipt Line (%1) Lot Number not set"
+				
+				if $$$ISOK(strStatus) {
+					set loopPolicyAttribute = objUItem.ItemPolicy.Attributes.FindObjectId(objUItem.ItemPolicy.%Id()_"||Lot Number")
+					if objUItem.ItemPolicy.Attributes.GetAt(loopPolicyAttribute).IsUnique {
+						; Check uniqueness
+						set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleAttribute:GetValueForItemAttribute")
+						set sc = objResultSet.Execute($$$INRECLineItem(objLine),"Lot Number")
+						if $$$ISOK(sc) {
+							while objResultSet.Next(.sc) {
+								if $$$INRECLineLotNumber(objLine) = objResultSet.Data("AttributeValue") {
+									set objBundle = ##class(alSOH.dBundle).%OpenId(objResultSet.Data("Bundle"),,.sc)
+									if $$$ISOK(sc) {
+										set strStatus = $$$MakeStatus("IN00880") ; "Lot Number must be unique"
+										set loopAttribute = objBundle.Attributes.FindObjectId(objBundle.%Id()_"||Use By Date")
+										if $$$INRECLineExpirationDate(objLine) = objBundle.Attributes.GetAt(loopAttribute).AttributeValue {
+											set strStatus = $$$OK
+											quit
+										}
+									} ; FIXME : else Decompose <GRF> see SR16390
+								}
+							}
+						} ; FIXME : else Decompose <GRF>
+					} else {
+						set strStatus = $$$NO  ; FIXME : message?
+					}
+				}
+				
+			} elseif (objUItem.ItemPolicy.Description = "Lot Num Policy") {
+				if ($$$INRECLineLotNumber(objLine) = "") {
+					set strStatus = $$$MakeStatus("alREC0002",pidRecLine) ; "Receipt Line (%1) Lot Number not set"
+					
+				} else {
+					if $$$ISOK(strStatus) {   ; FIXME : Why not wrapper at higher level? <GRF> see SR16390
+						set loopPolicyAttribute = objUItem.ItemPolicy.Attributes.FindObjectId(objUItem.ItemPolicy.%Id()_"||Lot Number")
+						if objUItem.ItemPolicy.Attributes.GetAt(loopPolicyAttribute).IsUnique {
+							; Check uniqueness
+							if $$LotNumberExists^INRECLine($$$INRECLineItem(objLine),$$$INRECLineLotNumber(objLine)) {
+								set strStatus = $$$MakeStatus("IN00880")
+							} ; "Lot Number must be unique"
+						}
+					}
+				}
+			}
+		}
+		
+		if $$$ISOK(strStatus) {
+			if $$$INRECLineQuantity(objLine) = 0 {
+				set strStatus = $$$MakeStatus("alREC0005")
+			 ; "Unable to receive zero quantities"
+			
+			} elseif $$$INRECLineQuantity(objLine) < 0 {
+				set strStatus = $$$MakeStatus("alREC0007",pidRecLine)
+			} ; "Errors exist on lines: %1"
+		}
+	}
+	quit strStatus
+	
+	
+PostableTFRLine(pidReceipt,pidRecLine)
+	;-------------------------------------------------------------------------------
+	; When ordered goods are picked they can be obtained from a number of storages.
+	;		If the item policy indicates a lot no, expiry date, etc. applies then
+	;		there may be multiple bundles involved.   A storage could hold multiple
+	;		bundles of an item & a particular bundle may reside in multiple storages.
+	; 
+	; A shipment may be received in several stages.
+	;		The total received in any delivery cannot exceed the shipped quantity,
+	;		taking into account those goods already received.
+	; 
+	; When receiving the goods we don't care which storage the goods were picked
+	; from but ...
+	;		the total qty received for each bundle cannot exceed the qty sent for
+	;		that bundle.  If this applies to all bundles the total received will
+	;		not exceed the total shipped independent of bundle id.
+	; 
+	; Receipts can be divided in multiple lines as the items are placed in different
+	; storages.
+	;		The total of these divided lines must be considered for each bundle when
+	;		calculating whether too many goods have been recorded as being received.
+	;		If this is the case ALL lines for that item/bundle are in an error state.
+	; 
+	; If two lines on an order are for the same item, their quantities are
+	; considered separately - based on pstrSource.
+	; 
+	; D20 "Flag" on the Receipt Line (INRECLine) can contain an Incoming Goods Flag
+	; that controls how the stock is to be treated after a Quality Assurance Check.
+	;		This flag can permit the record to be processed even if the Receipt
+	;		Quantity exceeds the Order Quantity.
+	;		Separate settings apply to Supplier Receipts and Transfer Receipts.
+	; 
+	; Called By: Postable^INRECPost
+	; 
+	; Params:
+	;	pidReceipt - Receipt id
+	;	pidRecLine - Line id
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 10-Sep-2010	GRF		SR17534: revised validation taking bundles into account
+	; 31-Jan-2007	PO		SR15318: Original version created
+	;-------------------------------------------------------------------------------
+	new fltOtherQty,fltPickedQty,fltThisOrderQty,idBundle,idFlag,objLine,strStatus
+	
+	$$$LogR("PostableTFRLine",pidReceipt_","_pidRecLine)
+	
+	set strStatus = $$$OK
+	
+	;---------------------------------------
+	; For this receipt line,
+	;   - Get CacheLink (TransferID and TransferLine)
+	;   - Get Bundle ID
+	;   - Consider matching entries on this and other (processed) orders.  Any
+	;     unprocessed orders will be reviewed when it is their turn for processing.
+	; 
+	; fltThisOrderQty : Sum of same bundle for same source line on this order
+	; fltOtherQty     : Sum of same bundle for same source line on all other PROCESSED orders
+	; fltPickedQty    : Original Picked Quantity (matches CacheLink and BundleId [and Storage?])
+	;---------------------------------------
+	
+	set objLine = $get(^INRECLine(0,pidReceipt,pidRecLine,1))
+	set idFlag  = $$$INRECLineFlag(objLine)
+	if idFlag="" set strStatus = $$$MakeStatus("IN00752",pidRecLine) ; "Line %1 is missing a required status flag."
+	
+	if $$$ISOK(strStatus) {
+		set objIncomingGoodsFlag = $get(^INWEMERKER(0,idFlag,1))
+		if $$$INWEMERKERTransferReceiptExceedsOrder(objIncomingGoodsFlag)=$$$EnumWWWTRISTATE1Disallow {
+			set strSource    = $$$INRECLineCacheLink(objLine)
+			set idBundle     = $$$INRECLineBundle(objLine)
+			set fltPickedQty = $$$INRECLineOrderQuantity(objLine)
+			
+			set fltThisOrderQty = 0
+			set fltOtherQty = $$BundleReceiptQty^INRECTFRLine(pidReceipt,strSource,idBundle,.fltThisOrderQty)
+	
+	$$$LogRx(fltOtherQty_":"_fltThisOrderQty_":"_(fltOtherQty + fltThisOrderQty)_":"_fltPickedQty)
+			
+			if (fltOtherQty + fltThisOrderQty) > fltPickedQty {
+				if fltOtherQty {
+					set strStatus = $$$MakeStatus("IN01263",pidRecLine,fltThisOrderQty,fltOtherQty)
+				; "Total receipt of the item in line %1 exceeds shipment for the corresponding bundle. (%2 on this order, %3 already processed)"
+				
+				} else {
+					set strStatus = $$$MakeStatus("IN01264",pidRecLine,fltThisOrderQty)
+				} ; "Total receipt of the item in line %1 exceeds shipment for the corresponding bundle. (%2)"
+			}
+		}
+	}
+	quit strStatus
+	
+	
+	/*
+PostableTFRLine(pidReceipt,pidRecLine)
+	;-------------------------------------------------------------------------------
+	; Determine whether receipt line can be posted
+	;
+	; Params:
+	; pidReceipt - Receipt id
+	; pidRecLine - Line id
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 07-Sep-2010	GRF		SR17534: Add fltReportedRecQty to qty reported in error
+	;							message; comment obsolete strTFRLine lines
+	; 03-Aug-2009	PPP		SR16815: Changed $$$INRECLineBaseQuantity to $$$INRECLineOrderQuantity
+	; 03-Dec-2008	GRF		SR16172: comment; change GetTotalQty call to 2 args
+	; 27-Nov-2080	HQN		SR16172: Corrected algorithm to take into account total
+	; 							quantity to be received doesn't exceed requiredqty
+	; 							if option set to check
+	; 07-Aug-2008	PP		SR15812: Do not update DEMAND (Rewrite of Transfers)
+	; 06-Jun-2008	GRF		SR15785: Check if INWEMERKER flag is blank - report error
+	; 08-May-2008	GRF		SR15717: $$$MakeStatus replaces $listbuild
+	; 03-Sep-2007	GM		BR014609: Included line in language text IN00514
+	; 05-Apr-2007	HeberB	BR014313: Check Entered quantity
+	; 08-Feb-2007	PO		SR15318: Plus Received Quantity
+	; 31-Jan-2007	PO		SR15318: Created
+	;-------------------------------------------------------------------------------
+	new fltOrderQty,fltReceiveQty,fltRecQty,fltReportedRecQty,fltTotalQty
+	new idDemand,idFlag,idSendingLocn
+	new objDemand,objIncomingGoodsFlag,objLine,strDemandLink,strStatus
+	
+	set strStatus = $$$OK
+	
+	set objLine = $get(^INRECLine(YM,pidReceipt,pidRecLine,1))
+	
+	; vvvvv SR15812
+	;set strTFRLink    = $$$INRECLineCacheLink(objLine)           ; FIXME : Not used after SR15812 change
+	;set idTFR         = $$$KEY1(strTFRLink)                      ;    vvv
+	;set idTFRLine     = $$$KEY2(strTFRLink)                      ;    vvv
+	;set objTFR        = $get(^INTFRLine(YM,idTFR,idTFRLine,1))   ;    vvv
+	;
+	;set strDemandLink = $$$INTFRLineDemand(objTFR)
+	;set idSendingLocn = $$$KEY1(strDemandLink)
+	;set idDemand      = $$$KEY2(strDemandLink)
+	;set objDemand     = $get(^INDRPDEMAND(YM,idSendingLocn,idDemand,1))
+	;
+	;set fltRecQty = +$$$INDRPDEMANDReceivedQuantity(objDemand)
+	;set fltReportedRecQty = $$AlreadyReceived^INRECTFRLine(pidReceipt,objLine)
+	;
+	;if fltRecQty '= fltReportedRecQty {
+	;	set strStatus = $$$MakeStatus("IN00657",pidRecLine)
+	; ; Line '%1' has already been received. Data entry record not in step with data processing, contact support to rectify this problem.
+	;}
+ 	; ^^^^^
+	
+	;---------------------------------------
+	; fltReceiveQty		: This line's received quantity
+	; fltReportedRecQty	: Sum of all *OTHER* "Processed" batches matching same Cache Link
+	; fltTotalQty		: Sum of all lines in *THIS* batch matching same Cache Link
+	; fltOrderQty		: The original requested quantity [Does not appear to
+	; 					  be reduced by any earlier receipts hence the need to
+	; 					  subtract fltReportedRecQty when testing]
+	;---------------------------------------
+	
+	set fltReportedRecQty = $$AlreadyReceived^INRECTFRLine(pidReceipt,objLine)
+	
+	; vvv SR15785	
+	;if $$$ISOK(strStatus) {
+	;	set objIncomingGoodsFlag = $get(^INWEMERKER(YM,$$$INRECLineFlag(objLine),1)) // check for flag be blank ?
+	if $$$ISOK(strStatus) {
+		set idFlag = $$$INRECLineFlag(objLine)
+		if idFlag = "" set strStatus = $$$MakeStatus("IN00752",pidRecLine) ; "Line %1 is missing a required status flag."
+	}
+	if $$$ISOK(strStatus) {
+		set objIncomingGoodsFlag = $get(^INWEMERKER(YM,idFlag,1))
+	; ^^^ SR15785	
+		if $$$INWEMERKERTransferReceiptExceedsOrder(objIncomingGoodsFlag) = $$$EnumWWWTRISTATE1Disallow {
+			//SR16815
+			set fltOrderQty   = $$$INRECLineOrderQuantity(objLine)
+			set fltReceiveQty = $$$INRECLineQuantity(objLine)
+			set fltTotalQty   = $$GetTotalQty^INRECTFRLine(pidReceipt,pidRecLine) ; SR16172
+		; SR16172 ^^^^ vvvv
+		;	if fltReceiveQty > (fltOrderQty - fltReportedRecQty) {
+		;		set strStatus = $$$MakeStatus("IN00514",fltReportedRecQty,pidRecLine)
+		; SR16172 ^^^^ REPLACED
+			; SR16172 vvvv
+			if fltTotalQty > (fltOrderQty - fltReportedRecQty) {
+		;		set strStatus = $$$MakeStatus("IN00514",(fltTotalQty-fltReceiveQty),pidRecLine)  ; SR17534
+				set strStatus = $$$MakeStatus("IN00514",(fltTotalQty-fltReceiveQty+fltReportedRecQty),pidRecLine)
+			; SR16172 ^^^^
+			; "Receipt has exceeded ordered quantity in line ´%2´, other existing receipts account for ´%1´."
+			}
+		}
+	}
+	quit strStatus
+	*/
+	
+	
+Post(pidReceipt,pblnShowInfo=$$$YES)
+	;-------------------------------------------------------------------------------
+	; Post an INREC record
+	; 
+	; Called by : Form INREC Button 1 "Process" (also INRECB, INMOREC)
+	; 
+	; Params:	pidReceipt - INREC id
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 27-Oct-2008	GRF		SR16080: Always showing error if pblnShowInfo is $$$NO; 
+	; 							shouldn't decompose strStatus (was basing on sc)
+	; 06-Jun-2008	GRF		SR15785: i => loop
+	; 09-May-2008	shobby	SRBR014754: INARTHISTL tracking information.
+	; 27-Mar-2008	HQN		SR15640: Decoding error from V2 Processing returned
+	;							Development errors, most likely, this is a bad way to do it
+	; 03-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new err,loop,strStatus
+	
+	set strStatus=$$Transaction^COMTransaction("PostTxn^INRECPost("""_pidReceipt_""","""_$$GetLineForm^INTFRInterface($get(YFORM),"INRECLine")_""")",pblnShowInfo) ;BR014754 23-Apr-2008
+	
+	if pblnShowInfo && $$$ISOK(strStatus) {
+		do ReloadForm^COMUtilForm()
+	}
+	quit strStatus
+	
+	
+PostTxn(pidReceipt,pidForm="")
+	;-------------------------------------------------------------------------------
+	; Post Txn for an INREC record
+	;
+	; Params:	pidReceipt - INREC id
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 10-Feb-2010	GRF		SR17138: Use new Ordered Unit data
+	; 02-Oct-2009	GRF		SR16361: Implement changed code - Receive^INRECReceive
+	; 							rather than SaveReceive
+	; 08-Sep-2009	GRF		SR16875: set QtyRequired in inventory units; preserve
+	; 							some values for reuse
+	; 05-Jun-2009	GRF		SR16508: Add ReceiptDate & UnitCost to dMovement object
+	; 03-Jun-2009	GRF		SR16547: round ExtendedCost to currency
+	; 18-May-2009	DWR		SR16541: Added populating of Extended which is used to
+	; 							calculate Average Cost and INStockVal when Confirm
+	; 							movement is called via Change state.
+	; 13-Mar-2009	GRF		SR16361: remove unneeded $$$ISOK check; objLine rather
+	; 							than strLine (already used for half code)
+	; 18-Nov-2008	HQN		Cache2008, ByRef sc for %OpenId doesn't get set...
+	; 07-Aug-2008 	Luke 	SR15825: Added additional parameters to movement 
+	; 06-Aug-2008	HQN		SR15809: Moving V2 logic to after V1 succeeds
+	; 							Miscommunication about V2 as primary...V2 only
+	; 							primary regarding alSOH package usage.
+	; 01-Aug-2008	HQN		SR15809: Scrapping V1.5 and directly use dMovement...
+	; 							as per instructions from PP
+	; 31-Jul-2008	HQN		SR15809: Moved V2 processing into PostTxn() from UpdateHeader()
+	; 09-May-2008	shobby	SRBR014754: INARTHISTL tracking information.
+	; 20-Jul-2007	SC		SR15576: Add Hook for new processing
+	; 18-Oct-2006	JW		SR15134: Look at kill status
+	; 05-Sep-2006	JW		SR14979: Exclude to include. Kill excluded lines
+	; 04-Jul-2006	SC		SR14772: Exclude lines in checkbox selected.
+	; 03-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new arrRecDate,enumOrderUnit,fltRequiredQty,fltOrderConv
+	new idItem,idOrder,idOrderLine,idRecLine
+	new objLine,objMove,objOrderLine,objRec,objRec15
+	new sc,strDelivDate,strDelivGate,strDelivNum,strStatus
+	
+	if $get(YDECIMALLEN)="" set YDECIMALLEN = 2
+	
+	set sc = $$$OK
+	set strStatus = $$Postable(pidReceipt,$$$EnumINRECSupplierReceipt)
+ 
+	if $$$ISOK(strStatus) {                            // POST
+		set objRec       = $get(^INREC(0,pidReceipt,1))
+		set strDelivGate = $$$INRECDeliveryGate(objRec)
+		set strDelivNum  = $$$INRECDeliveryNoteNumber(objRec)
+		set strDelivDate = $$$INRECDeliveryNoteDate(objRec)
+		
+		; Pass 1 : Identify Lines
+		;-----------------------------------
+		set idRecLine=""                  // Transfer receipts
+		for {
+			set idRecLine = $order(^INRECLine(0,pidReceipt,idRecLine))
+			quit:idRecLine=""
+			
+			set objLine = $get(^INRECLine(0,pidReceipt,idRecLine,1))
+			
+			if $$$INRECLineInclude(objLine) {
+				kill ^CacheTempHistoryTracking(YUCI,YUSER)							   
+				set ^CacheTempHistoryTracking(YUCI,YUSER,"SourceForm") = pidForm
+				set ^CacheTempHistoryTracking(YUCI,YUSER,"SourceId")   = pidReceipt_","_idRecLine
+				
+				do Receive^INRECReceive(pidReceipt,idRecLine)
+				kill ^CacheTempHistoryTracking(YUCI,YUSER)
+			
+			} else {
+				set strStatus = $$$Kill("INRECLine",pidReceipt_","_idRecLine)
+			}
+			quit:$$$ISERR(strStatus)
+		}
+		
+		if $$$ISOK(strStatus) {
+			set strStatus = $$UpdateHeader(pidReceipt)
+			if $$$INRECType(objRec)=$$$EnumINRECSupplierReceipt {
+			
+		; Pass 2 : Create Movement
+		;-----------------------------------
+				set idRecLine = ""
+				for {
+					set idRecLine = $order(^INRECLine(0,pidReceipt,idRecLine))
+					quit:idRecLine=""
+					
+					set objLine  = $get(^INRECLine(0,pidReceipt,idRecLine,1))
+					set objMove  = ##class(alREC.dMovement).%New()
+					set objRec15 = ##class(alREC.dUReceiptLine).%OpenId("0||"_pidReceipt_"||"_idRecLine)
+					
+					set idItem      = $$$INRECLineItem(objLine)
+					set idOrder     = $$$INRECLineOrder1(objLine)
+					set idOrderLine = $$$INRECLineOrderLine(objLine)
+					
+					if (idOrder'="") && (idOrderLine'="") {
+						set objOrderLine = $get(^INAUFP(0,idOrder,idOrderLine,1))
+					} else {
+						set objOrderLine = ""   ; should never happen for INREC processing
+					}
+					
+					// Covert to full V2 Objects via interfaces 
+					set objMove.Item         = ##class(alINV.iUINV).GetItem(idItem)
+					set objMove.FromLocn     = ""
+					set objMove.ToLocn       = ##class(alLOC.iLOC).GetLocation($$$INRECLineLocation(objLine))
+					set objMove.FromStorage  = ""
+					set objMove.ToStorage    = ##class(alLOC.iLOC).GetStorage($$$INRECLineLocation(objLine),$$$INRECLineStockLocation(objLine))
+					set objMove.Reference    = pidReceipt
+					set objMove.LineNumber   = idRecLine
+					set objMove.QtyPicked    = 0
+					set objMove.QtyReceived  = $$$INRECLineQuantity(objLine)
+					set objMove.Supply       = ""
+					set objMove.Demand       = ""
+					set objMove.Completed    = $$$NO
+					set objMove.ExtendedCost = $justify($$$INRECLineQuantity(objLine)*$$$INRECLineEach(objLine),0,YDECIMALLEN)
+					set objMove.UnitCost     = $$$INRECLineEach(objLine)
+					set objMove.ReceiptDate  = $get(arrRecDate(idRecLine))
+					
+					set fltRequiredQty = $$$INRECLineOrderQuantity(objLine)    ; in Order Units
+				;	set enumOrderUnit  = $$$INAUFPQuantityUnit(objOrderLine)  ; SR17138
+					set enumOrderUnit  = $$$INAUFPOrderedUnit(objOrderLine)
+					if enumOrderUnit'="" {
+						set fltOrderConv   = $$GetUOMConversion^INUOMConversion(idItem,enumOrderUnit)  ; Conversion Order to Inventory
+						set fltRequiredQty = fltRequiredQty*fltOrderConv
+					}
+					set objMove.QtyRequired  = fltRequiredQty                  ; in Inventory Units
+					
+					set objMove.Bundle       = objRec15.Bundle
+					set objMove.OrderNumber  = idOrder
+					set objMove.OrderLine    = idOrderLine
+								
+					if $$$ISOK(sc) set sc = objMove.ChangeState(4)
+					
+					set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+					quit:$$$ISERR(strStatus)
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+SaveReceive(pidReceipt,pidRecLine,pstrDelivGate="",pstrDelivNum="",pstrDelivDate="",&parrRecDate)
+	;-------------------------------------------------------------------------------
+	; DEPRECATED  - call Receive^INRECReceive directly
+	;   Convert INWEAUFVOR into INWEAUF, using delivery defaults
+	;
+	; Called By: PostTxn^INRECPost
+	;
+	; Params:	pidReceipt,pidRecLine - INRECLine keys
+	;			pstrDelivGate,pstrDelivNum,pstrDelivDate - delivery defaults
+	;
+	; ByRefs:	parrRecDate (Output)
+	;
+	; Returns:	status
+	;
+	; History:
+	; 02-Oct-2009	GRF		SR16361: Implement changed code
+	; 11-Sep-2009	GRF		SR16361: Remove INWEAUF(VOR) processing
+	; 05-Jun-2009	GRF		SR16508: Return ReceiptDate from INWECounter in array
+	; 27-Aug-2008	GRF		SR15691: Change from 15-Aug reverted
+	; 15-Aug-2008	Luke	SR15691: Changed the call to refactored method 
+	; 18-Oct-2006	JW		SR15134: Look at kill status
+	; 03-Apr-2006	JW		SR14421: Created from SAVE^INWEAUFVORS
+	;-------------------------------------------------------------------------------
+	; SR16361  ; retain for VAR* direct access
+	new strStatus
+	
+	set strStatus = $$$OK
+	do Receive^INRECReceive(pidReceipt,pidRecLine)
+	quit strStatus
+	
+	
+UpdateHeader(pidReceipt) 
+	;-------------------------------------------------------------------------------
+	; Update INREC record after processing
+	;
+	; Params:	pidReceipt - INREC key
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 31-Jul-2008	HQN		SR15809: Moved V2 processing into PostTxn()
+	; 08-May-2008	GRF		SR15717: Update V2 data from Transfer Receipt
+	; 08-May-2008	GRF		SR15723: Correction to error status management
+	; 08-Apr-2008	HQN		SR15640: Retain value of YBED, $$$Save mangles it while
+	;							we're in a transaction
+	; 03-Apr-2008	PPP		SR15640: Only do V2 processing for Supplier Receipts (ie type = 2)
+	; 27-Mar-2008	HQN		SR15640: Translated Cache Error
+	; 18-Mar-2008	HQN		SR15640: Added V2 processing
+	; 03-Apr-2006	JW		SR14221: Created
+	;-------------------------------------------------------------------------------
+	new objRecHeader,objUReceipt,prevYBED,strStatus, pidReversed, objReversed
+	
+	set objRecHeader = $get(^INREC(0,pidReceipt,1))
+	set strStatus = $$$OK
+	
+	;05-0ut-2011	Karine vvvvvv
+	if $$$INRECType(objRecHeader) = 5 {  ;If is a Receipt Reverse, change the Status of this Receipt reversed 
+		
+		set pidReversed = $$$INRECReceiptSourceNo(objRecHeader)
+		
+		set objReversed = $get(^INREC(0,pidReversed,1))
+		set $$$INRECStatus(objReversed) = $$$EnumINSTATUSReversed
+		set $$$INRECProcessedDate(objRecHeader) = $horolog
+		set $$$INRECProcessedBy(objRecHeader)   = $get(YBED,"UNKNOWN")
+		
+		set strStatus = $$$Save("INREC",pidReversed,objReversed,$$$YES)	
+	} 		
+	set $$$INRECStatus(objRecHeader)        = $$$EnumINSTATUSProcessed
+	set $$$INRECProcessedDate(objRecHeader) = $horolog
+	set $$$INRECProcessedBy(objRecHeader)   = $get(YBED,"UNKNOWN")
+	
+	set prevYBED = YBED                                         
+	if strStatus = $$$OK {                                              ; FIXME : <GRF> This shouldn't be necessary - if it is
+		set strStatus = $$$Save("INREC",pidReceipt,objRecHeader,$$$YES) ;     we need to fix where the problem is occurring
+		; => $$Save^COMUtils() => $$^WWWSPEI                            ;     Possibly in WWWVAR from $GET(%(YQUERY,"YBED"))?
+	}
+	set YBED = prevYBED
+	quit strStatus
+	
+]]></Routine>
+</Export>

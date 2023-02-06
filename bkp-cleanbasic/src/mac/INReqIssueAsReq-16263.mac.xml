@@ -1,0 +1,668 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReqIssueAsReq" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReqIssueAsReq
+	
+#include COMSYS
+#include COMConst
+#include INConst
+#include %occInclude
+
+#define AddToMenuList(%1) set lstNewMenuItems = lstNewMenuItems_$listbuild(%1)
+#define ClassPropertyId(%FormFieldId)	$piece($get(^WWW122(0,YFORM,%FormFieldId,1)),Y,1)
+	
+OnAfterPrimaryKey(YKEY,YLOCATION)  ; DEPRECATED
+	;-------------------------------------------------------------------------------
+	;	Fires when a check box is clicked
+	;	
+	; Called By : Form  INReqIssueAsReq (Commented now there is no action)
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;	YKEY		-	Primary Key for this line record
+	;	YLOCATION	-	Current Location ID
+	;	YROW		-	Current GridRow Id
+	; Returns :
+	;
+	;
+	; History :
+	; 11-Dec-2007	HQN		Moved all calculations into Initial Values on FORMSPEC
+	; 12-Nov-2007	HQN		SR15598: Created/Documented
+	; 06-Dec-2007	HQN		changed to After KEY, modified ANM form to suit
+	;-------------------------------------------------------------------------------
+	;set LinesOutstanding = $$GetLinesOutstanding^INReqIssue(YKEY, YLOCATION)
+	;do UpdateManualField^COMGridEdit31Interface(YROW,2,intLinesOutstanding)
+	;set ActiveIssueNumber = $$GetActiveIssueNumber^INReqIssue(YKEY)
+	;do UpdateManualField^COMGridEdit31Interface($$$GRIDGetCurrentYKEY,3,LinesOutstanding)
+	
+	;set EarliestDueDate  = $$GetEarliestDueDate^INReqIssue(YKEY)
+	quit
+	
+	
+CreateIssue(pYKEY)
+	;-------------------------------------------------------------------------------
+	;	Creates an INIssue from the selected INReq
+	;	
+	; Called By :
+	;	(Button)Create Issue (FORMSPEC) INReqLine
+	;	For every line in a INReq, if it doesn't have a corresponding IssueLine, 
+	;	create a new header and assign the line to it
+	;		
+	; Inputs : 
+	;	pYKEY	-	INReq ID
+	;	
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 15-May-2012	PPP		SR18010:Use the existing method to get the Issue Number ($$GetActiveIssueNumber)
+	;						(instead of SQL); also includes the Type check
+	; 06-Nov-2009	PPP		SR17012:Save the Issue Again (to update @NET CreatedBy & CreatedOn)
+    ; 01-Jun-2009	PPP		SR16586: Simplify Process (remove unnecessary calls to
+    ; 							Script Engine/State Engine)
+    ; 25-May-2009	PPP		SR16565: Scanning Prompt for Grid,If a Scanning Form
+    ; 							then clearout IssueQty
+	; 03-Sep-2008	HQN		SR15867: Corrected setting of issueNumber from the 
+	; 							code change from SR15814
+	; 08-Aug-2008 	Luke 	SR15832: Corrected Null Check on the Issue creation 
+	; 01-Aug-2008	Luke	SR15814: Corrected sc formation and use of $$$Text
+	; 24-Jan-2008	HQN		SR15625 Changed class signature dREQ to dUReq
+	;							Changed class signature dLocation to dULocation
+	;							Changed class signature dINIssue to dUIssue
+	; 18-Dec-2007	PPP		Added Text (INREQ22)
+	; 18-Dec-2007	HQN		Removed Act/Pnd Issues as a valid Active issue
+	; 12-Dec-2007	HQN		Fixed YBACK and YFORM with logic to redirect
+	;							so back button works
+	; 11-Dec-2007	HQN		Corrected query to work with open issues
+	; 07-Dec-2007	HQN		Changed DemandType value comparison to reflect new
+	;							status code (5 -> 7)
+	; 06-Nov-2007	GRF		CreateIssue & CreateIssueLines return blnStatus as ByRef
+	; 03-Dec-2007	HQN		Implemented Resourcing on LineLess Issue header
+	;							Included updated SQL to detect LineLess headers
+	; 05-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new YBACK,YFORM,blnIssueExists,enumIssueType,loopIssueLines,loopReqLines,objIssue
+	new objIssueLines,objLocn,objReq,objReqLine,reqNum,sc,strIssueNumber,strStatus
+	
+	set blnIssueExists = $$$NO
+	set strStatus      = $$$OK
+	set sc             = $$$OK
+	
+	//	since $$GetKey^COMGridEdit31G() is based on current view and click,
+	// it can get invalidated when using mutiple windows
+	set reqNum = $$GetKey^COMGridEdit31G()
+	if (pYKEY '= $$$NULLOREF) {
+		set reqNum = pYKEY
+	}
+	if (reqNum = $$$NULLOREF) {
+		$$$StartScript()
+		write "alert("_$$$Text("INREQ22")_");"					; "Unable to determine Requisition Number"
+		$$$EndScript()
+		do RedirectForm^COMUtils("INReqIssue")
+		quit                                                    ; *** EARLY EXIT ***
+	}
+	set strIssueNumber = $$$NULLOREF
+ 
+	set objReq  = ##class(alREQ.dUReq).%OpenId("0||"_reqNum)
+	set objLocn = ##class(alLOC.dULocation).%OpenId("0||"_YLOCATION)
+	
+	// retrieve Headers for Lines for this location which are outstanding
+	// should be moved into a class method
+	
+	//SR18010: vvv : Do not use SQL, use method instead below
+	//set objResultSet = ##class(%Library.ResultSet).%New("%DynamicQuery:SQL")
+	//do objResultSet.Prepare("SELECT INIssue.IssueNumber, INIssue.Status, Count(INIssueLine.ID) As IssueLineCount FROM SQLUser.INIssue AS INIssue INNER JOIN SQLUser.INReqLine AS INReqLine ON INReqLine.ReqNumber = INIssue.Reference LEFT JOIN INIssueLine ON INIssueLine.IssueNumber = INIssue.IssueNumber WHERE DemandType = 7 AND INIssue.FromLocn = INReqLine.FromStockLocn AND INReqLine.Status <> 8 AND INReqLine.Status <> 9 AND (INIssue.Status = 3 OR INIssue.Status = 1) AND INIssue.Reference = ? AND INReqLine.FromStockLocn = ? GROUP BY INIssue.IssueNumber") ; INReqLine.Status <> 3
+	//do objResultSet.Execute(reqNum,objLocn.Location)
+	//SR18010 ^^^
+
+ 	set enumIssueType = +$$$WWW0121RequisitionIssue($get(^WWW0121(0,0,YLOCATION,1)))
+	//set strIssueNumber  = $$GetActiveIssueNumber(reqNum) //SR18010
+	set strIssueNumber  = $$GetActiveIssueNumber^INReqIssue(reqNum)
+	
+	// No Summary Review, Direct Pick, as previously 
+	//
+	if enumIssueType=0 {
+		if strIssueNumber'="" {
+			set blnIssueExists = $$$YES
+		
+			// are the lines empty for this header, resource it for this header if so
+			if '$data(^INIssueLine(0,strIssueNumber)) {			//SR18010
+				set objIssue = ##class(alISS.dUIssue).GetInstance("0||"_strIssueNumber)
+			;+++++++++++++++++++++++++++++++++++++++
+				tstart
+			;+++++++++++++++++++++++++++++++++++++++
+				set strStatus = $$$YES
+				for loopReqLines=1:1:objReq.ReqLines.Count() {
+					set objReqLine = objReq.ReqLines.GetAt(loopReqLines)
+					if ((objReqLine.QtyRequired > objReqLine.QtyIssued) &&  (objReqLine.FromStockLocn = objIssue.FromLocn)) {
+						set objIssueLines = objIssue.CreateIssueLines(objReqLine,.sc)
+						if ($$$ISERR(sc)) {
+							set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+							set strIssueNumber = $$$NULLOREF
+							quit                               ; for break
+						}
+						for loopIssueLines=1:1:objIssueLines.Count() {
+							do objIssue.IssueLines.Insert(objIssueLines.GetAt(loopIssueLines))
+						}
+					}
+				}
+			;+++++++++++++++++++++++++++++++++++++++
+				if ('$$$ISERR(strStatus)) {
+					tcommit:($tlevel > 0)
+				} else {
+					trollback
+				}
+			;+++++++++++++++++++++++++++++++++++++++
+			}
+		}
+	
+		if (strIssueNumber = $$$NULLOREF) {
+			// no Issue exists, create it
+			set objIssue = objReq.CreateIssue(objLocn,.sc)
+	
+			if objIssue '= $$$NULLOREF {    //SR15832:
+				set strIssueNumber = objIssue.IssueNumber
+				do objIssue.%Close()
+			}
+ 
+			if ($$$ISERR(sc)) {
+				set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+			}
+		}
+		do objReq.%Close()
+	
+		if (strIssueNumber '= $$$NULLOREF) {
+	 		//SR17012 : Save the Issue Again (to update @NET CreatedBy & CreatedOn)
+	 		set objReq = $get(^INIssue(0,strIssueNumber,1))
+			set strStatus = $$$Save("INIssue",strIssueNumber,objReq,$$$YES)	
+ 		
+	 		if $$$ISOK(strStatus) {
+ 
+				//If a Scanning Form then clearout IssueQty		//SR16565
+				if $$IsScanReq^WWW120Scan("INIssueLine") {
+					set strStatus = $$Transaction^COMTransaction("ClearIssueQty^INReqIssueAsReq("""_strIssueNumber_""")",1)
+				}
+ 
+				set YFORM = ""                          ; used by reference
+				set YBACK = "INReqIssue,"
+ 
+				if blnIssueExists {
+					do GoToForm^COMUtils("INIssue",strIssueNumber,1,"REQUISITION")           ; TODO : Should be goto but toolbar draws before processing so status is wrong on button disabling code
+				} else {
+					do RedirectForm^COMUtils("INIssue",strIssueNumber,YBACK) ; TODO : Should be goto but toolbar draws before processing so status is wrong on button disabling code
+				}	
+	 		}
+  		
+		} else {
+			$$$DecomposeStatus(strStatus)
+			$$$StartScript()
+			write "alert("""_$$$Text($lb("INREQ16",reqNum))_"\n"_$e($$DecodeError^COMUtils(strStatus),1,80)_""");" //SR16586
+			$$$EndScript()     ; "Couldn't create an issue for Requisition %1"
+		
+			//$$$Alert()
+		
+			do RedirectForm^COMUtils("INReqIssue")
+			;set strStatus = $$$MakeStatus("INREQ16",reqNum)  ; "Couldn't create an issue for Requisition %1" 
+		}	               ; "No lines could be created"
+		
+	} else {
+		
+		//SR18081 Review and Pick Option
+		set YFORM = ""
+
+		set YBACK = "INReqIssue,"
+		if strIssueNumber = "" { 
+
+			//Create the Summary
+			set strIssueNumber = $$CreateIssue^INReqIssueSummary(reqNum ,.strStatus)
+	
+			if $$$ISERR(strStatus) {
+				$$$DecomposeStatus(strStatus)
+				$$$StartScript()
+				write "alert("""_$$$Text($lb("INREQ16",reqNum))_"\n"_$e($$DecodeError^COMUtils(strStatus),1,80)_""");"
+				$$$EndScript()     ; "Couldn't create an issue for Requisition %1"	
+				do RedirectForm^COMUtils("INReqIssue")
+			} else {
+				do GoToForm^COMUtils("INIssue",strIssueNumber,1,"REQUISITION")
+			}
+
+		} else {
+				do GoToForm^COMUtils("INIssue",strIssueNumber,1,"REQUISITION")
+		}
+		
+	} 
+	
+
+	quit    ; FIXME - neither new strStatus nor pass it back through quit.  Is it used? Add new? <GRF>
+	
+	
+OnBeforeFormat(pYFIELDNAME,pYTEXT,pYFELD)
+	;-------------------------------------------------------------------------------
+	;	Highlights Errors in Red
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;	pYFIELDNAME		FORMSPEC Field Name
+	;	pYTEXT			Value to be displayed
+	;	YFELD			The Class Record! Should be the FORMSPEC!
+	;
+	; ByRef :
+	;	YM
+	;	YUSER
+	;	YBACKGROUNDCOLOR
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 18-Feb-2010	PPP		SR17182: Add colours to the Status field based on Req
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	/*
+	if ($piece(pYFIELDNAME,"_",2) = 2) {
+		// Direct access at daten to get value, shouldn't be like this!
+		if ($get(^WWWDATEN(0,+$horolog,YUSER,"INReqIssueAsReq","V","REFERENCEVALUE",pYFIELDNAME,1)) = 0) {
+			set YBACKGROUNDCOLOR = "RED"
+		}
+	}
+ 	*/
+ 	new idReq,intCol,intOK,intOOS,intOut,intPar,intRow
+ 	
+ 	set idReq = YKEY
+ 	
+	$$$GRIDSplitKey(pYFIELDNAME,intRow,intCol)
+
+	//SR17182
+	if ($$$ClassPropertyId(intCol) = 1) {
+		if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(0,YM,1)))) {
+			set intOut 	= $$GetOutLineForReq^INReqLineStatus(idReq,0)	// Lines Outstanding
+			set intOK 	= $$GetOutLineForReq^INReqLineStatus(idReq,1)	// Fulfilled Lines
+			//set intPar 	= $$GetOutLineForReq^INReqLineStatus(idReq,2)	// Lines Partial
+			//set intOOS 	= $$GetOutLineForReq^INReqLineStatus(idReq,3)	// Lines Out of Stock
+		
+			if (intOut=intOK) {
+				set YBACKGROUNDCOLOR = "LIGHTGREEN"
+				//set YWARNING=$$$YES		
+		
+			} elseif (intOut=$$GetOutLineForReq^INReqLineStatus(idReq,3)) {
+				set YBACKGROUNDCOLOR = "RED"
+				//set YWARNING=$$$YES
+			
+			} else {
+				set YBACKGROUNDCOLOR = "YELLOW"
+				//set YWARNING=$$$YES
+			}
+		}else {
+			set intOut 	= $$GetOutLineForReq^INReqLineStatus(idReq,0)	// Lines Outstanding
+			set intOK 	= $$GetOutLineForReq^INReqLineStatus(idReq,1)	// Fulfilled Lines
+			set intPar 	= $$GetOutLineForReq^INReqLineStatus(idReq,2)	// Lines Partial
+			set intOOS 	= $$GetOutLineForReq^INReqLineStatus(idReq,3)	// Lines Out of Stock
+		
+			if (intOut=intOK) {
+				set YBACKGROUNDCOLOR = "LIGHTGREEN"
+				//set YWARNING=$$$YES		
+		
+			} elseif (intOut=intOOS) {
+				set YBACKGROUNDCOLOR = "RED"
+				//set YWARNING=$$$YES
+			
+			} else {
+				set YBACKGROUNDCOLOR = "YELLOW"
+				//set YWARNING=$$$YES
+			}
+		}
+	}
+	
+	;Core change que aplica cor no campo também feito via core change 31-Status
+	if ((+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(0,YM,1)))) ||
+		 (+$$$WWWClientParamCoreChangesHCB($get(^WWWClientParam(0,YM,1))))) {
+		if ($piece(pYFIELDNAME,"_",2) = 31) {
+			do ApplyColorStatusSeparacao^VARINReqIssue(idReq)
+		}
+	}
+	
+	quit $$$YES
+	
+	
+OnDisplayRightClickMenu(pYKEY="",pYFELD="",pYFORM="")  ; FIXME : Only returning null now macro commented?
+	;-------------------------------------------------------------------------------
+	; OnDisplayRightClickMenu
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;	pYFIELDNAME		FORMSPEC Field Name
+	;	pYTEXT			Value to be displayed
+	;	YFELD			The Class Record! Should be the FORMSPEC!
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 03-Apr-2008	GRF		Relocate definition to top of routine
+	; 19-Dec-2007   HQN		Removed menu entry, should be DEV only
+	; 11-Dec-2007	HQN		Code cleanup, added new[s]
+	; 30-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new blnEnabled,lstNewMenuItems,strIssueNumber
+	
+	set lstNewMenuItems = $$$NULLOREF    ;FIXME There is no change to the right click menu here? is it required at all? <DWR>
+	set blnEnabled      = $$$NO
+	set strIssueNumber  = $$GetActiveIssueNumber^INReqIssue($translate($get(pYKEY),""""))
+	set:(strIssueNumber '= $$$NULLOREF) blnEnabled = $$$YES
+	
+	;$$$AddToMenuList($lb("","Open Issue","CallBack(""GoToForm^COMUtils"",""INIssue"","""_strIssueNumber_""")",,blnEnabled))
+	quit lstNewMenuItems
+	
+	
+CreateTransfer(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Creates a transfer for a Requistion identified by pYKEY
+	; 
+	; Returns: Transfer ID
+	; 
+	; History:
+	; 14-Jan-2009	HQN		Refactored to use alTFR.dUTransfer::CreateFromReq
+	; 08-Jan-2009	HQN		Created
+	;-------------------------------------------------------------------------------
+	new idTransfer,objTFR,objUReq,sc,strStatus
+	
+	set strStatus  = $$$OK
+	set idTransfer = ""
+
+	set objUReq = ##class(alREQ.dUReq).%OpenId("0||"_pYKEY,,.sc)
+	if (objUReq '= $$$NULLOREF) {
+		set objTFR = ##class(alTFR.dUTransfer).CreateFromReq(objUReq)
+		
+		set sc = objTFR.%Save()		;SR17485
+		if sc set idTransfer = objTFR.TransferNumber
+	}
+	quit idTransfer
+	
+
+GetActiveTransfer(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Returns the Transfer ID for the first record that is still active for this 
+	; Requisition ID
+	; 
+	; History:
+	; 05-Dec-2013	SCR		SESDF-655: Use CacheIndex if no @NM Index is found.
+	; 16-Jan-2013	RGB	 	Rewrote, routine needs to loop and find an open transfer.
+	; 08-Jan-2012	shobby	SESPE-395: Rewrote. Faster without the SQL
+	; 16-Jun-2011	PPP	 	SR17804: Do not include Sent & Receipted Transfers (ie Status 2,3)
+	; 29-Jan-2009	HQN	 	SR16296: refactored SQL
+	; 14-Jan-2009	HQN	 	SR16296: Created
+	;-------------------------------------------------------------------------------
+	new idTFR,idxReq,idxYKEY,objReq,idTransfer,objTfr
+
+	set idTransfer=""
+	set objReq = $get(^INReq(0,pYKEY,1))
+	if objReq '= $$$NULLOREF {
+		if $$$INReqType(objReq) = 2 {            ; Transfer
+		set idxYKEY=$$$Index(pYKEY)
+		set idxReq=idxYKEY
+		set idxYKEY=$Order(^INTFRLines(0,2,idxYKEY))
+		while $extract(idxYKEY,1,$length(idxReq))=idxReq {
+			set idTFR=""
+			set idTFR=$Order(^INTFRLines(0,2,idxYKEY,idTFR))
+			while idTFR'="" {
+				set objTfr=$get(^INTFR(0,idTFR,1))
+				IF $$$INTFRStatus(objTfr)<2&&(objTfr'="") set idTransfer=idTFR
+				if idTransfer="" {
+					set idTFR=$Order(^INTFRLines(0,2,idxYKEY,idTFR))
+				}else {
+					set idTFR=""
+				}
+
+				}
+			set idxYKEY=$Order(^INTFRLines(0,2,idxYKEY))
+			}
+		}
+	}
+	
+	if idTransfer'="" {
+		if '$data(^INTFR(YM,idTransfer)) {
+			set idTransfer	= ""
+		}
+	}
+	quit:idTransfer'="" idTransfer
+	
+	set idTransfer=""
+	set objReq = $get(^INReq(0,pYKEY,1))
+	if objReq '= $$$NULLOREF {
+		if $$$INReqType(objReq) = 2 {            ; Transfer
+		set idxYKEY=$$$CacheIndex(pYKEY)			; Try Chache Index
+		set idxReq=idxYKEY
+		set idxYKEY=$Order(^INTFRLines(0,2,idxYKEY))
+		while $extract(idxYKEY,1,$length(idxReq))=idxReq {
+			set idTFR=""
+			set idTFR=$Order(^INTFRLines(0,2,idxYKEY,idTFR))
+			while idTFR'="" {
+				set objTfr=$get(^INTFR(0,idTFR,1))
+				if $$$INTFRStatus(objTfr)<2&&(objTfr'="") set idTransfer=idTFR
+				if idTransfer="" {
+					set idTFR=$Order(^INTFRLines(0,2,idxYKEY,idTFR))
+				}else {
+					set idTFR=""
+				}
+
+				}
+			set idxYKEY=$Order(^INTFRLines(0,2,idxYKEY))
+			}
+		}
+	}
+	if idTransfer'="" {
+		if '$data(^INTFR(YM,idTransfer)) {
+			set idTransfer	= ""
+		}
+	}
+	quit idTransfer
+	
+	
+FulfilRequisition(pYKEY,pidRetForm = "")
+	;-------------------------------------------------------------------------------
+	; Depending on the ReqType of the Requisition, either create an Issue or a
+	; Transfer and redirect to the correct Form
+	; 
+	; Called by : Form INReqIssueAsReq : Button 1 [C]reate Issue from Requisition
+	; 
+	; ByRef:
+	; 	YFORM
+	; 	YBACK
+	; 
+	; History:
+	; 22-Oct-2013	SCR		SESDF-669: Pass in optional return form.
+	; 04-Nov-2010	PPP		SR17485: Check if the default Dispatch is defined - 
+	;							required for Intersite Transfer creation.
+	; 22-Feb-2010	PPP		SR17182: Removed previous change
+	; 18-Feb-2010	PPP		SR17182: Clear Saved Data created in GetOutLineForReq^INReqLineStatus
+	; 14-Aug-2009	DWR		SR16555: Removed un-necessary checks that would never
+	; 							equate to true.
+	; 04-Jun-2009	PPP		SR16544 : Create a Kit Issue if req is Kit Req
+	; 03-Jun-2009	DWR		SR16544: chaged code to set a variable with Req Type in it
+	; 							because this check is done a number of times. Added 
+	; 							surgical Kits to this routine as well.
+	; 15-Jan-2009	HQN		SR16296: Update req status
+	; 14-Jan-2009	HQN		SR16296: Created
+	;-------------------------------------------------------------------------------
+	new enumReqType,idReq,idTFR,objReq,strStatus,objTransf,intPage
+ 	
+ 	set strStatus = $$$OK
+ 	set:pidRetForm="" pidRetForm="INReqIssue" ; Default Return form
+	set idReq = $$GetKey^COMGridEdit31G()
+	if (pYKEY '= "") set idReq = pYKEY
+
+	if idReq'="" {
+
+		set objReq = $get(^INReq(0,idReq,1))
+		set enumReqType = $$$INReqType(objReq)             ; SR16544
+ 	
+		if (enumReqType = 1) || (enumReqType = 4) {        ; Department/Surgical Kits
+			do CreateIssue(idReq)
+			
+		} elseif (enumReqType = 2) {                       ; Transfer
+			if $$DefaultDispatch^INTFR($$$INReqFromLocn(objReq),$$$INReqToLocn(objReq))'="" {  //SR17485
+				set idTFR = $$GetActiveTransfer(idReq)
+			
+				if idTFR="" {
+				;***************************************
+					tstart
+					set idTFR = $$CreateTransfer(idReq)
+					if idTFR '= $$$NULLOREF {
+						set $$$INReqStatus(objReq) = 3         ; Active
+						set strStatus = $$$Save("INReq",idReq,objReq,$$$YES)
+						if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(0,0,1)))) ||
+						   (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(0,0,1))))) {
+							if $$$ISOK(strStatus){
+								set objTransf = $get(^INTFR(0,idTFR,1))
+								set strStatus = $$$Save("INTFR",idTFR,objTransf,$$$YES) 
+							}
+						}
+					}
+					; testing..
+					if $$$ISOK(strStatus) {
+						tcommit:$tlevel>0
+					} else {
+						trollback
+						set idTFR = ""
+					}
+				;***************************************
+				}
+				if idTFR = "" {
+					$$$Alert($$$MakeStatus("IN00426"))          ; "Record not created by Transfer Order form."
+					do RedirectForm^COMUtils(pidRetForm)
+				} else {
+					set objTransf	= $get(^INTFR(YM,idTFR,1))
+					if $$$INTFRPickListPrinted(objTransf)="" {
+						set intPage = 1
+					} else {
+						set intPage = 2
+					}
+					do RedirectForm^COMUtils("INTFR",idTFR,YBACK_$$$COMMA_pidRetForm_$$$COMMA,"REQUISITION",intPage)
+				}
+			
+			} else {
+			    if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(0,YM,1))))
+				{
+					set idTFR = $$GetActiveTransfer(idReq)
+
+					if idTFR="" {
+					;***************************************
+						tstart
+						set idTFR = $$CreateTransfer(idReq)
+						if idTFR '= $$$NULLOREF {
+							set $$$INReqStatus(objReq) = 3         ; Active
+							set strStatus = $$$Save("INReq",idReq,objReq,$$$YES)
+							if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(0,0,1)))) ||
+							   (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(0,0,1))))) {
+								;if $$$ISOK(strStatus){
+								;	set objTransf = $get(^INTFR(0,idTFR,1))
+								;	set strStatus = $$$Save("INTFR",idTFR,objTransf,$$$YES) 
+								;}
+							}
+						}
+						if $$$ISOK(strStatus) {
+							tcommit:$tlevel>0
+						} else {
+							trollback
+							set idTFR = ""
+						}
+					;***************************************
+					}
+					;if (enumReqType = 2) { ;SR16544
+					if idTFR = "" {
+						$$$Alert($$$MakeStatus("IN00426"))          ; "Record not created by Transfer Order form."
+						do RedirectForm^COMUtils(pidRetForm)
+					} else {
+						do RedirectForm^COMUtils("INTFR",idTFR,YBACK_$$$COMMA_"INReqIssue"_$$$COMMA,"REQUISITION",1)
+					}
+				}else{
+					//SR17485
+					$$$Alert($$$MakeStatus("IN01276",$$$INReqFromLocn(objReq),$$$INReqToLocn(objReq)))
+					; "Inter-Site Transfer cannot be created because the Default Dispatch information between Locations %1 and %2 has not been defined"
+					do RedirectForm^COMUtils(pidRetForm)			
+				}
+			}
+		}		
+	}
+	quit
+	
+	
+ClearIssueQty(pidReq)
+	;-------------------------------------------------------------------------------
+	; Sets the Issue Qty of the Pick Lines to 0, ready for scanning
+	; 
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message
+	;
+	; History:
+    ; 25-May-2009	PPP	SR16565: Scanning Prompt for Grid
+	;-------------------------------------------------------------------------------
+	new idLine,objLine,strStatus
+	
+	set strStatus = $$$OK
+	set idLine = ""
+	
+	for {
+		quit:$$$ISERR(strStatus)
+		
+		set idLine = $order(^INIssueLine(0,pidReq,idLine))
+		quit:idLine=""
+ 
+		set objLine = $get(^INIssueLine(0,pidReq,idLine,1))
+		set $$$INIssueLineQtyIssued(objLine) = 0
+ 		
+		set strStatus = $$$Save("INIssueLine",pidReq_","_idLine,objLine,$$$YES)	
+	}
+	quit strStatus
+	
+	
+GetActiveIssueNumber(pidReq)  
+	;-------------------------------------------------------------------------------
+	; Grabs the Requisition number from the Key of the grid, and uses that to get 
+	; the type. THen uses both to get the last indexed Issue for that requisition
+	; 
+	; Called by:
+	; GetActiveIssueNumber^INReqIssue
+	; 
+	; History:
+	; 15-Aug-2012	PPP		SR18081: Updated with the right GetIssueRoutine
+	; 10-Jun-2009	DWR		SR16544: Created		
+	;-------------------------------------------------------------------------------
+	new enumType,idIssue,idxReqNo,idxType,objReq,objIssue
+	
+	set idIssue=""
+	if pidReq'="" {
+		set objReq = $get(^INReq(0,pidReq,1))
+		set enumType = $$$INReqType(objReq) 
+	
+		set idxReqNo = $$$CacheIndex(pidReq)
+		set idxType  = $$$CacheIndex(enumType)
+		
+		//SR18081
+		set idIssue=""
+		for {
+			
+			set idIssue = $order(^INIssues(0,5,idxType,idxReqNo,idIssue),-1)
+			quit:idIssue=""
+			
+			set objIssue = $get(^INIssue(0,idIssue,1))
+			continue:$$$INIssueStatus(objIssue)>3
+			quit
+		}
+	}
+
+	quit idIssue
+	
+]]></Routine>
+</Export>

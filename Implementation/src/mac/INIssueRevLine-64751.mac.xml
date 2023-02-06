@@ -1,0 +1,794 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INIssueRevLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INIssueRevLine		; copy from SES for INIssue development : DavidR 08-Jan-2009
+	
+#include COMSYS
+#include INConst
+#include %occInclude
+	
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+#define FORMFldINIssueRevLineUnit			2
+#;define FORMFldINIssueRevLineQtyReturned	9 
+	
+DeleteLines(pidDocNo)
+	new pidReturnLine,strStatus
+ 
+	set pidReturnLine = ""
+	for { 
+		set pidReturnLine = $order(^INIssueRevLine(0,pidDocNo,pidReturnLine))
+		quit:pidReturnLine=""
+ 
+		set strStatus = $$$Kill("INIssueRevLine",pidDocNo_$$$COMMA_pidReturnLine)
+	}
+	quit 
+	
+	
+RepeatItemsChck(pYKEY) ; DEPRECATED - do not use - legacy - name change SR17196
+	do CheckRepeatItems($get(pYKEY))
+	quit
+	
+CheckRepeatItems(pidIssRev)
+	;------------------------------------------------------------------------------- 
+	; Validate total quantity against SOH for any repeated items in the grid.
+	; 
+	; Called By : CanPost^INIssueRev
+	; 
+	; History:
+	; 24-Sep-2013	SCR		CORE-93: Handle To Location on the Line
+	; 20-Oct-2010	GRF		SR17539.1: Dispense To Patient doesn't have To Storage
+	; 23-Sep-2010	GRF		SR17539: Only care that we aren't trying to return more
+	;							than we have on hand for bundle in storage - if
+	;							original issue had multiple lines for an item match
+	;							1:1 on creation of reversal.
+	; 09-Mar-2010	GRF		SR17196: variables to comply with coding standard; fix
+	;							faulty $find logic and simplify recognition of
+	;							duplicated items
+	; 12-Jan-2009	DavidR	copied and modified for Core use
+	; 19-Jun-2008	GFiuza	Created (VARSESRetornoAoEstoque)
+	;------------------------------------------------------------------------------- 
+	new arrCount,arrLines,arrTotal,blnRepeatsExist,fltQtyOH,fltQtyReturned
+	new idBundle,idBundleStock,idItem,idLineNo,idToLocn,idToStorage
+	new objReversal,strDelim,strLineList,strMsgLine,strMessages,strStatus
+	
+	set strMessages = ""
+	
+	set idToLocn = $$$INIssueRevToLocn($get(^INIssueRev(0,pidIssRev,1)))
+	
+	set idLineNo = ""
+	for {
+		set idLineNo = $order(^INIssueRevLine(0,pidIssRev,idLineNo)) 
+		quit:idLineNo=""
+    	
+		set objReversal    = $get(^INIssueRevLine(0,pidIssRev,idLineNo,1))
+    	if $$$INIssueRevLineToLocation(objReversal)'="" {
+	    	set idToLocn	= $$$INIssueRevLineToLocation(objReversal)
+    	}
+		set idItem         = $$$INIssueRevLineItemNo(objReversal)
+		set idToStorage    = $$$INIssueRevLineToStorage(objReversal)
+		set idBundle       = $$$INIssueRevLineBundle(objReversal)
+		set fltQtyReturned = $$$INIssueRevLineQuantityReturned(objReversal)
+		if $$$INIssueRevLineToLocation(objReversal)'="" {
+			set idToLocn	= $$$INIssueRevLineToLocation(objReversal)
+		} else {
+			set idToLocn	= $$$INIssueRevToLocn($get(^INIssueRev(0,pidIssRev,1)))
+		}	
+		continue:idToLocn=""
+		continue:idToStorage=""
+		continue:$$IsStorageBlocked^INLP(idToLocn,idToStorage) 
+		
+		set arrCount(idItem,idToStorage,idBundle)  = $get(arrCount(idItem,idToStorage,idBundle)) + 1
+		set arrTotal(idItem,idToStorage,idBundle)  = $get(arrTotal(idItem,idToStorage,idBundle)) + fltQtyReturned
+		set arrLines(idItem,idToStorage,idBundle,idLineNo) = ""
+	}
+	
+	set idItem = ""
+	for {
+		set idItem = $order(arrCount(idItem))
+		quit:idItem=""
+		
+		set idToStorage = ""
+		for {
+			set idToStorage = $order(arrCount(idItem,idToStorage))
+			quit:idToStorage=""
+			
+			set idBundle = ""
+			for {
+				set idBundle = $order(arrCount(idItem,idToStorage,idBundle))
+				quit:idBundle=""
+				
+				continue:arrCount(idItem,idToStorage,idBundle)=1    ; already checked elsewhere
+				
+				set idBundleStock = idItem_"||"_idToLocn_"||"_idToStorage_"||"_idBundle
+				set fltQtyOH      = $$GetBundleQty^INARTMENGE(idBundleStock,.strStatus)
+			
+				if $$$ISOK(strStatus) {
+					if fltQtyOH < arrTotal(idItem,idToStorage,idBundle) {
+						set strDelim    = ""
+						set strLineList = ""
+						
+						set idLineNo = ""
+						for {
+							set idLineNo = $order(arrLines(idItem,idToStorage,idBundle,idLineNo))
+							quit:idLineNo=""
+							
+							set strLineList = strLineList_strDelim_idLineNo
+							set strDelim = ", "
+						}
+						set strMsgLine = $$$Text("IN00925")_" "_idItem_" -> "_$$$Text("IN00926")_" "_strLineList
+						; "Item -> Seq."
+						
+						if $length(strMessages)<32000 {
+							set strMessages = strMessages_$char(10)_strMsgLine
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	if strMessages'="" { 
+		set YQ = 1_$$$Text("IN01266")_" "_$char(10)_""_strMessages_""
+	} ; "Insufficient Stock available to perform reversal for the following items."
+	
+	quit
+	
+	
+OldCheckRepeatItems(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Validate if there are any repeated items in the grid.
+	;
+	; Called By : CanPost^INIssueRev
+	; 
+	; History:
+	; 09-Mar-2010	GRF		SR17196: variables to comply with coding standard; fix
+	;							faulty $find logic and simplify recognition of
+	; 							duplicated items
+	; 12-Jan-2009	DavidR	copied and modified for Core use
+	; 19-Jun-2008	GFiuza	Created (VARSESRetornoAoEstoque)
+	;------------------------------------------------------------------------------- 	
+	new arrItems,blnRepeatsExist,idDocNo,idItem,idLineNo,objReversal
+	new strDelim,strLineList,strMsgLine,strMessages
+	
+	set idDocNo     = $$$KEY1(pYKEY)
+	set strMessages = ""
+	
+	set idLineNo = ""
+	for {
+   		set idLineNo = $order(^INIssueRevLine(0,idDocNo,idLineNo))            
+   		quit:idLineNo=""
+   	
+    	set objReversal = $get(^INIssueRevLine(0,idDocNo,idLineNo,1))
+    	set idItem      = $$$INIssueRevLineItemNo(objReversal)
+ 		
+ 		set arrItems(idItem,idLineNo) = ""
+	}
+	
+	set idItem = ""
+	for {
+		set idItem = $order(arrItems(idItem))
+		quit:idItem=""
+		continue:$order(arrItems(idItem,""))=$order(arrItems(idItem,""),-1)   ; only one entry
+		
+		set strDelim    = ""
+		set strLineList = ""
+		
+		set idLineNo = ""
+		for {
+			set idLineNo = $order(arrItems(idItem,idLineNo))
+			quit:idLineNo=""
+			
+			set strLineList = strLineList_strDelim_idLineNo
+			set strDelim    = ", "
+		}
+		set strMsgLine = $$$Text("IN00925")_" "_idItem_" -> "_$$$Text("IN00926")_" "_strLineList
+		; "Item -> Seq."
+		if $length(strMessages)<32000 {
+			set strMessages = strMessages_$char(10)_strMsgLine
+		}
+	}
+	if strMessages'="" {		
+		set YQ = 1_$$$Text("IN00924")_" "_$char(10)_""_strMessages_""
+	} ; "Unable to process because there are repeated items in the returns"		   		
+	
+	quit
+	
+	/*   SR17196 ^^^ replaces vvv
+	new ArrayItems,ArrayLines,ArrayMessages,ArrayRepeat,cnt,Count,Count1,Count2,blnStarted
+	new idDocNo,ExistRepeat,idItem,idLineNo,Message,objReversal,Rec
+	
+	set ArrayItems  = ""
+	set ArrayRepeat = ""
+	set blnStarted  = $$$NO
+	set Count       = 0
+	set ExistRepeat = $$$NO
+	set idDocNo     = $$$KEY1(pYKEY)
+	set idLineNo    = ""
+	for {
+   		set idLineNo = $order(^INIssueRevLine(0,idDocNo,idLineNo))            
+   		quit:idLineNo=""
+   		
+   		set Count = Count + 1
+    	set objReversal = $get(^INIssueRevLine(0,idDocNo,idLineNo,1))
+    	set idItem      = $$$INIssueRevLineItemNo(objReversal)
+ 		
+		if ($find(ArrayItems,idItem) && (Count > 1)) {
+			set ExistRepeat = $$$YES
+			
+			if '$find(ArrayRepeat,idItem) {
+				if blnStarted {
+					set ArrayRepeat = ArrayRepeat_";"_idItem
+				} else { 
+					set ArrayRepeat = idItem
+					set blnStarted = $$$YES
+				}
+			}											
+		}  
+		
+		set ArrayItems = ArrayItems_";"_idItem_"("_Count_")"
+	}
+	set ArrayMessages = ""
+	
+ 	for cnt=1:1:$length(ArrayRepeat) {
+		set Rec = $piece(ArrayRepeat,";",cnt)
+		quit:Rec=""
+			
+		set Count1 = 0
+		set ArrayLines = ""
+		set blnStarted  = $$$NO
+		
+		set idLineNo = ""
+		for {
+   			set idLineNo = $order(^INIssueRevLine(0,idDocNo,idLineNo))            
+   			quit:idLineNo=""
+   			
+   			set Count1      = Count1 + 1
+    		set objReversal = $get(^INIssueRevLine(0,idDocNo,idLineNo,1))
+    		set idItem      = $$$INIssueRevLineItemNo(objReversal)
+    		
+    		if $piece(ArrayRepeat,";",cnt) = idItem {
+	  		  	if blnStarted {	
+	  		  		set ArrayLines = ArrayLines_", "_idLineNo 
+	  		  	} else { 
+	  		  		set ArrayLines = idLineNo
+					set blnStarted = $$$YES
+	  		  	}
+	  		  	set Count2 = Count2 + 1
+    		}    			
+		}
+		
+		set Message = $$$Text("IN00925")_" "_Rec_" -> "_$$$Text("IN00926")_" "_ArrayLines  ;"Item -> Seq."
+		set ArrayMessages = ArrayMessages_$char(10)_Message
+ 	}
+	
+	if ExistRepeat = $$$YES {		
+		set YQ = 1_$$$Text("IN00924")_" "_$char(10)_""_ArrayMessages_""
+	} ; "Unable to process because there are repeated items in the returns"		   		
+	
+	quit
+	*/
+	
+QtyIsAvailable(pidLocn,pobjLine,pidLine)
+	;-------------------------------------------------------------------------------
+	; There must be sufficient stock on hand in the ToStorage at the ToLocation to
+	; meet the return quantity.
+	; 
+	; Assumptions :
+	;		1.	An item will appear only once (hence CheckRepeatItems validation)
+	;			Will not need to total by item & storage before checking
+	;		2.	QuantityReturned is in Inventory Units (UnitQuantityReturned will be
+	;			converted but currently reversal must be in IU anyway)
+	;		3.	Gets all stock in storage regardless of whether blocked or allocated
+	; 
+	; Called By : CanPost^INIssueRev, OnBeforeFormat^INIssueRevLine
+	; 
+	; Inputs:	pidLocn		"ToLocation" - source for reversal
+	; 			pobjLine	INIssueRevLine record (allows WWWDATEN check on blur)
+	; 
+	; History:
+    ; 09-Mar-2010	GRF		SR17196: Created
+	;-------------------------------------------------------------------------------
+	new fltQtyOH,fltQtyReturned,idItem,idStorage,strStatus
+	
+	set strStatus = $$$OK
+	
+	set idItem         = $$$INIssueRevLineItemNo(pobjLine)
+	set fltQtyReturned = $$$INIssueRevLineQuantityReturned(pobjLine) ; in Inventory Units
+	set idStorage      = $$$INIssueRevLineToStorage(pobjLine)
+	
+	set fltQtyOH = +##class(alSOH.iSOH).GetQtyOnHand(idItem,pidLocn,pidLocn_"||"_idStorage,$$$NO)
+	
+	if fltQtyOH<fltQtyReturned {
+		set strStatus = $$$MakeStatus("IN01208",idStorage,fltQtyOH,pidLine)
+	} ; "Insufficient stock in storage %1 (%2) for line %3"
+	
+	quit strStatus
+	
+	
+BundleQtyIsAvailable(pidLocn,pobjLine,pidLine)
+	;-------------------------------------------------------------------------------
+	; There must be sufficient stock on hand in the ToStorage at the ToLocation to
+	; meet the return quantity.
+	; 
+	; Assumptions :
+	;		1.	An item will appear only once (hence CheckRepeatItems validation)
+	;			Will not need to total by item & storage before checking
+	;		2.	QuantityReturned is in Inventory Units (UnitQuantityReturned will be
+	;			converted but currently reversal must be in IU anyway)
+	;		3.	Gets all stock in storage regardless of whether blocked or allocated
+	; 
+	; Called By : CanPost^INIssueRev, OnBeforeFormat^INIssueRevLine
+	; 
+	; Inputs:	pidLocn		"ToLocation" - source for reversal
+	; 			pobjLine	INIssueRevLine record (allows WWWDATEN check on blur)
+	; 
+	; History:
+	; 23-Sep-2010	GRF		SR17539: Created from QtyIsAvailable
+	;-------------------------------------------------------------------------------
+	new fltQtyOH,fltQtyReturned,idBundle,idBundleStock,idItem,idStorage,objBS,sc,strStatus
+	
+	set strStatus = $$$OK
+	
+	set idItem         = $$$INIssueRevLineItemNo(pobjLine)
+	set fltQtyReturned = $$$INIssueRevLineQuantityReturned(pobjLine) ; in Inventory Units
+	set idStorage      = $$$INIssueRevLineToStorage(pobjLine)
+	set idBundle       = $$$INIssueRevLineBundle(pobjLine)
+	
+	set idBundleStock  = idItem_"||"_pidLocn_"||"_idStorage_"||"_idBundle
+	set fltQtyOH       = $$GetBundleQty^INARTMENGE(idBundleStock,.strStatus)
+	
+	if $$$ISOK(strStatus) && (fltQtyOH<fltQtyReturned) {
+		set strStatus = $$$MakeStatus("IN01208",idStorage,fltQtyOH,pidLine)
+	} ; "Insufficient stock in storage %1 (%2) for line %3"
+	quit strStatus
+	
+	
+OnBeforeFormat(pstrYFIELDNAME,pstrText,pobjRevLine)
+	;-------------------------------------------------------------------------------
+	; Determine how fields on the Issue Reversal Line are to be displayed.
+	;
+	; Params:
+	;	pstrYFIELDNAME	Field name
+	;	pstrText		Not used
+	;	pobjRevLine		
+	;
+	; ByRefs: 
+	;	YTOOLTIP
+	;	YBACKGROUNDCOLOR
+	; 
+	; Returns: Nothing
+	;
+	; History:
+	; 23-Sep-2013	SCR		CORE-93: Exclude returnt to supplier
+	; 20-Oct-2010	GRF		SR17539.1: Don't perform bundle stock check for Dispense
+	;							to Patient
+	; 23-Sep-2010	GRF		SR17539: BundleQtyIsAvailable replaces QtyIsAvailable
+    ; 16-Mar-2010	GRF		SR17229: no qty check if consumed; use idToLocn; new strStatus
+	; 09-Mar-2010	GRF		SR17196: Add test for UnitQuantityReturned
+	; 14-Jan-2010	shobby	SR15753: Clean up redundant code.
+	; 30-Jul-2009	PPP		SR16804: Validate To Storage based on Header Details
+	; 11-May-2009	DWR		SR16509: Modified the field that quantity returned checks
+	; 							its value against. older field was not set yet.
+	; 06-Mar-2009	DavidR	SR16409: Modified routine to correctly use Issue instead
+	; 							of transfer.
+	; 03-Mar-2009	DavidR	SR16406: Added a quit if there is not a sum figure
+	; 25-Feb-2009	GRF		SR16394: Clarify idClassField rather than idField
+	; 19-Feb-2009	DavidR	SR16293: Created: copied from INTFRRevLine
+	;-------------------------------------------------------------------------------
+	new arrPick,arrTfrLine,fltConsumed,fltPickQty,fltReturned,fltRevQty,fltTfrSumRev
+	new idClassField,idIssue,idIssueRev,idItem,idKey,idLineNo,idToLocn,idToStorage,idType
+	new intCol,intRow,objIssue,objPickLine,objReversal,objTfrLine
+	new strDefaultColor,strDisabledColor,strRequiredColor,strStatus,strWarningColor,objIssueLine
+	
+	quit:$translate(pobjRevLine,Y)=""
+	
+	set objReversal = $$$GRIDYFELDContainer
+	set idItem      = $$$INIssueRevLineItemNo(pobjRevLine)
+	
+	quit:($$$INIssueRevStatus(objReversal)'=1)||(idItem="")
+	
+	$$$GRIDSplitKey(pstrYFIELDNAME,intRow,intCol) 
+	
+	set idClassField = $$$GetClassField(YFORM,intCol)
+	
+	set idKey       = $$ReferenceKey^COMGridEdit31Interface(YFORM,intRow)
+	set idIssueRev  = $$$KEY1(idKey)
+	set idLineNo    = $$$KEY2(idKey)
+	
+	set idIssue     = $$$INIssueRevIssueNumber(objReversal)
+	set objIssue	= $get(^INIssue(0,idIssue,1))
+	set idType 		= $$$INIssueType(objIssue) 
+	
+	set fltConsumed = $$$INIssueRevLineQtyConsumed(pobjRevLine)
+	set fltReturned = $$$INIssueRevLineQtyAlreadyRetrn(pobjRevLine)
+	
+	if (idClassField=$$$FldINIssueRevLineQuantityReturned) {
+		set fltRevQty = $$$INIssueRevLineUnitQuantityReturned(pobjRevLine)
+		quit:fltRevQty=""    										  ; SR16406
+		
+		if fltRevQty < 0 {
+			set YTOOLTIP = $$$Text($$$MakeStatus("IN00490"))    ; "Quantity can not be negative."
+			set YWARNING = $$$YES
+			set $$$TempStore("IssueRevLineErrors",intRow) = ""
+ 
+		} else {
+			if (fltReturned + fltRevQty) > fltConsumed  {
+				set YTOOLTIP = $$$Text($$$MakeStatus("IN00932",idLineNo,$$^WWWTR(0,12,fltConsumed-fltReturned)))
+				set YWARNING = $$$YES
+				set $$$TempStore("IssueRevLineErrors",intRow) = ""
+			}  ; "Reversal Quantity too great in line %1 (Maximum %2)"
+		}
+ 
+	} elseif (idClassField=$$$FldINIssueRevLineUnitQuantityReturned) {      ; SR17196
+		set idToLocn  = $$$INIssueRevToLocn(objReversal)                    ; SR17229
+	;	if '$$IsConsumable^INARTLOCPAR($$$INIssueRevLineItemNo(pobjRevLine),idToLocn) {    ; SR17229  ; SR17539.1
+		if '$$IsConsumable^INARTLOCPAR($$$INIssueRevLineItemNo(pobjRevLine),idToLocn) &&
+		   ($$GetIssueType^INIssueRev(idIssue)'=3)    && ($$GetIssueType^INIssueRev(idIssue)'=7)                                       {
+		
+		;	set strStatus = $$QtyIsAvailable(idToLocn,pobjRevLine,idLineNo)                ; SR17539
+			set strStatus = $$BundleQtyIsAvailable(idToLocn,pobjRevLine,idLineNo)
+			
+			if $$$ISERR(strStatus) {
+				set YTOOLTIP = $$$Text(strStatus)
+				set YWARNING = $$$YES
+			}
+		} ; SR17229 
+		
+	} elseif (idClassField=$$$FldINIssueRevLineToStorage) {
+		set idToStorage = $$$INIssueRevLineToStorage(pobjRevLine)
+
+		if idType = 1 {		// Department Issue
+			set YMANDATORY = $$$YES
+			
+			if $$IsConsumable^INARTLOCPAR(idItem,$$$INIssueRevToLocn(objReversal)) {
+				set YENABLED = $$$NO			
+			}
+	
+		} else {
+			set YENABLED = $$$NO			
+		}
+	}
+    if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+    	set objIssueLine = $get(^INIssueLine(YM,idIssue,idLineNo,1))
+		set idFromLocn   = $$$INIssueFromLocn(objIssue)
+		set idFromStore  = $$$INIssueLineFromStorage(objIssueLine)
+		set idBundle     = $$$INIssueLineBundle(objIssueLine)
+		set strBundleKey = idItem_"||"_idFromLocn_"||"_idFromStore_"||"_idBundle
+		set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(strBundleKey)
+		if ($IsObject(objBundleStock)) {
+			set objBundle = objBundleStock.Bundle
+		}
+		else {
+			set objBundle = ##class(alSOH.dBundle).%OpenId(idBundle)
+		}
+		if ($IsObject(objBundle)){
+			set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundle,SPRACHE)
+			do UpdateManualField^COMGridEdit31Interface(intRow,10,strBundleValues)
+		}
+	}
+	quit
+	
+	
+OnBeforeSave(pYKEY,pobjRevLine)
+	;-------------------------------------------------------------------------------
+	; Validate the line based on Header Details
+	; 
+	; Called by : FORM INIssueRevLine
+	;
+	; History:
+	; 16-Sep-2013	SCR		CORE-93: Handle no Issue on header
+	; 30-Jul-2009	PPP		SR16804: Created
+	;-------------------------------------------------------------------------------
+	new blnConsumable,idIssue,idItem,idToLocn,idToStorage,idType
+	new objIssue,objReversal,strStatus
+	new idReturnType
+
+		
+	kill YRETVAL
+	set strStatus = $$$OK
+
+	set objReversal = $$$GRIDYFELDContainer
+	set objReversal = $get(^INIssueRev(YM,$$$KEY1(pYKEY),1))
+	set idIssue		= $$$INIssueRevIssueNumber(objReversal)
+	set idItem      = $$$INIssueRevLineItemNo(pobjRevLine)
+
+	set idToLocn	= $$$INIssueRevToLocn(objReversal)
+	set idIssue     = $$$INIssueRevIssueNumber(objReversal)
+	if idIssue="" {	; Get From Line
+		set idIssue		= $$$INIssueRevLineIssue(pobjRevLine)
+		set idToLocn	= $$$INIssueRevLineToLocation(pobjRevLine)
+	}
+	if idIssue="" {
+
+		;set strStatus	= $$$MakeStatus("IN01442",$$$KEY2(pYKEY))  ;Please select Lot for Line %1
+	}
+	if $$$ISOK(strStatus)&&(idIssue'="") {
+		set objIssue	= $get(^INIssue(0,idIssue,1))
+		set idType 		= $$$INIssueType(objIssue) 
+
+		set idToStorage = $$$INIssueRevLineToStorage(pobjRevLine)
+		set blnConsumable = $$IsConsumable^INARTLOCPAR(idItem,idToLocn)
+
+		if idType = 1 {		//Department Issue
+			if 'blnConsumable && (idToStorage="") {
+				set strStatus = $$$MakeStatus("IN01082",$$$KEY2(pYKEY))  ; "To Storage has not been set in line %1"
+				set YRETVAL   = strStatus
+			}
+		}	
+	}
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError(strStatus)
+		set Q = $$$QDontSave
+	}
+	quit strStatus
+	
+	
+OnBlurUnitQty(pYFORM,pYKEY,pGridRow,pGridCol,pstrFieldValue,&pstrFieldData)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 14-Jan-2010	shobby	SR15753: Removed redundant code.
+	; 19-May-2009	DWR		SR16509: changed add reference to call format of field
+	; 							not form field. commented out the define for the old 
+	; 							value also.(see top of routine)
+	; 11-May-2009	DWR		SR16509: Modified, shouldn't change stock unit - loaded
+	; 							from order line and should not return any other unit
+	; 14-Apr-2009	PPP		Created
+	;-------------------------------------------------------------------------------
+	new fltQuantity,fltUnitQty,idClassField,idItem,idUnit
+ 
+	set idClassField = $$$GetClassField(pYFORM,pGridCol)
+	
+	if (idClassField = $$$FldINIssueRevLineUnitQuantityReturned) ||
+	   (idClassField = $$$FldINIssueRevLineQuantityReturned)        {
+		
+		set fltUnitQty = $$$INIssueRevLineUnitQuantityReturned(pstrFieldData)
+		
+		if (fltUnitQty '= $$$NULLOREF) {
+			set $$$INIssueRevLineQuantityReturned(pstrFieldData) = fltUnitQty
+			; NOTE : This is ALWAYS in defined Stock Unit (1:1). There is no
+			;        conversion to inventory or base unit.
+		}
+	}
+	quit
+	
+	
+OnBeforeDisplayCombo(pstrKeys,pobjIss,pintCol,&pSUCH)
+	;-------------------------------------------------------------------------------
+	; Populates the Unit with the UOM as defined in INARTPACK only, excludes
+	; units that the item does not come in.
+	; 
+	; set pSUCH as the items to be used when you override the list (set via blnOverride)
+	;
+	; Called By: COMGridEdit executable
+	; 
+	; Inputs:
+	;	pstrKeys		YKEY
+	;	pobjSummary		YFELD
+	; 
+	; Returns: $$$YES or $$$NO (override the data) 
+	;
+	; History:
+	; 15-Jul-2011	GRF		SR17669: Call common code
+	; 03-Nov-2009	DavidR	SR16983: Created
+	;-------------------------------------------------------------------------------
+	new blnOverride,enumLineType,enumUnit,idClassField,idItem
+
+	set blnOverride = $$$NO
+	
+	; Unit
+	;---------------------------------------
+	if pintCol = $$$FORMFldINIssueRevLineUnit {      ; SR17669 vvv
+		set blnOverride = $$LoadCombo^INARTPACK($$$INIssueRevLineItemNo(pobjIss),blnOverride,.pSUCH)
+	}
+	quit blnOverride
+	/*
+	if pintCol = $$$FORMFldINIssueRevLineUnit  {
+		kill pSUCH
+		set pSUCH  = "SUCH"
+		set idItem = $$$INIssueRevLineItemNo(pobjIss)
+		if idItem '= "" {
+			set enumUnit = ""
+			for {
+				set enumUnit = $order(^INARTPACK(0,idItem,enumUnit))
+				quit:enumUnit=""
+				
+				set pSUCH(enumUnit) = enumUnit
+			}
+			set blnOverride = $$$YES
+		}
+	}
+	quit blnOverride
+	*/                                           ; SR17669 ^^^
+	
+	
+GetQtyEntered(pstrKeys)
+	;-------------------------------------------------------------------------------
+	; Get the quantity input on the screen for this line and its children
+	;
+	; Params:	pstrKey - keys of INRECLine
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than objGrid
+	; 27-Jul-2009	DWR		SR16783: Created - modified version INRECLine
+	;-------------------------------------------------------------------------------
+	new arrGrid,idRev,idParent,idLine,fltQty
+	
+	$$$GRIDGetContents(.arrGrid)
+	
+	set fltQty = 0
+	
+	// loop through all the lines for the same return
+	set idRev    = $$$KEY1(pstrKeys)
+	set idParent = $$$KEY2(pstrKeys)\1
+	set idLine   = $order(arrGrid(idRev,idParent),-1)		// Go back one
+	
+	for {
+		set idLine = $order(arrGrid(idRev,idLine))
+		quit:idLine\1'=idParent
+		
+		set fltQty = fltQty + $$$INIssueRevLineQtyConsumed(arrGrid(idRev,idLine))
+	}
+	
+	quit fltQty
+	
+	
+OnBeforeCopy(pstrKeys,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; Update the qty field with the difference between the returned qty and what has
+	; already been entered.
+	;
+	; Params:
+	;
+	; ByRefs:	pobjLine - copied line yfeld
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Jul-2009	DWR		SR16783: Created - modified version INRECLine
+	;-------------------------------------------------------------------------------
+	new fltQty,idCacheLink,idLocn,idRev,idRevLine,objIssue,tempQTY
+	
+	set idRev     = $$$KEY1(pstrKeys)
+	set idRevLine = $$$KEY2(pstrKeys)
+	
+	quit:pobjLine=""
+	set objIssue = $get(^INIssueLine(YM,idRev,idRevLine,1))
+	set fltQty   = $$$INIssueLineQtyIssued(objIssue)
+
+	set tempQTY = fltQty - $$GetQtyEntered(pstrKeys)
+	if tempQTY < 0 {
+ 		set tempQTY = 0
+	}
+	set $$$INIssueRevLineQtyConsumed(pobjLine) = tempQTY
+	
+	quit
+	
+	
+	/* DEPRECATED SR16983 - REPLACED BY OnBeforeDisplayCombo	 
+OnBeforeFormConstruction(pidClassField,pobjLine)
+	;-------------------------------------------------------------------------------
+	; Generate data for Unit of Measure drop down before constructing Edit Grid field
+	;
+	; Params:	pidClassField - Form Field Id
+	; 			pobjLine      - Adj Line record
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Apr-2009	PPP		SR: Created
+	;-------------------------------------------------------------------------------
+	new idItem
+ 	
+	if pidClassField = $$$FldINIssueRevLineStockUnit {
+		set idItem = $$$INIssueRevLineItemNo(pobjLine)
+		if idItem '= "" {
+			do LoadUnitOfMeasureList^INARTUtilities(idItem)
+		}
+	}
+	
+	quit
+	*/	
+	/*
+CanProcess(pYKEY) 	
+	;-------------------------------------------------------------------------------
+	; Called By: Process Button - form VARSESRetornoAoEstoque
+	; 
+	; History:
+	; 24-Nov-2008	HQN		SR16135: Use $$$NoKey & $$$YQHandler macros;
+	; 							Added individual line validation
+	;-------------------------------------------------------------------------------
+	new AdjLocn,AdjNo,intLine,odjRtrn,Status,strStatus
+	
+	set strStatus = $$$OK
+	
+	;if (pYKEY '= "") {
+	if '$$$NoKey(pYKEY) { ; SR16135
+		set odjRtrn 	= $get(^INIssueRev(YM,pYKEY,1))
+		set AdjLocn 	= $piece(odjRtrn,Y,1)
+		set AdjNo       = $piece(odjRtrn,Y,2)
+		set Status 		 	= $piece(odjRtrn,Y,7)
+	
+		if ((AdjLocn = "") && (AdjNo = "")) {
+			do RepeatItemsChck(pYKEY)
+		}
+		
+		; Validate each line
+		; SR16135 vvvv
+		set intLine = ""
+		for {
+			set intLine = $order(^INIssueRevLine(YM,pYKEY,intLine))
+			quit:intLine=""
+			set strStatus = $$CanProcess^INIssueRevLine(pYKEY_$$$COMMA_intLine)
+			quit:$$$ISERR(strStatus)
+		}
+		; SR16135 ^^^^
+		
+		if (Status > 0) { 
+			$$$YQHandler($$$MakeStatus("MED01157")) ; "The record has already been processed"
+		} elseif $$$ISERR(strStatus) {
+			$$$YQHandler(strStatus)
+		}
+	}
+	
+	quit
+	*/
+	
+	
+QtyIssued(pidIssue,&parrPick,&parrTfrLine)	; DEPRECATED - NO LONGER CALLED
+	;-------------------------------------------------------------------------------
+	; Sum of all quantities picked for a particular Issue order line
+	; 
+	; Called by :
+	; 	OnBeforeFormat^INIssueRevLine - call is commented
+	; 
+	; Inputs:
+	; 	pidTfr			key for transfer order & transfer order picks
+	; 
+	; ByRef :
+	; 	parrPick		transfer line totals also broken down by lot no & expiry date
+	; 	parrTfrLine		totals for each transfer line
+	; 	
+	; Returns: nothing
+	; 
+	; History:
+	; 06-Mar-2009	DavidR	SR16409 created; modified from INTFRRevLine
+	;-------------------------------------------------------------------------------
+	new dteExpiry,fltLineQty,idBatch,idLotNo,intPickLine,intIssueLine,objIssueLine
+	new objPickLine,parrIssueLine
+	
+	set intIssueLine=""
+	for {
+		set intIssueLine = $order(^INIssueLine(YM,pidIssue,intIssueLine))
+		quit:intIssueLine=""
+		
+		set objIssueLine  = $get(^INIssueLine(YM,pidIssue,intIssueLine,1))
+	;	set intIssueLine  = $$$INIssueLineSourceLine(objIssueLine)
+	;	set idLotNo       = $$$INIssueLineLotNo(objIssueLine)     if idLotNo=""   set idLotNo=" "
+	;	set dteExpiry     = $$$INIssueLineUseByDate(objIssueLine) if dteExpiry="" set dteExpiry=" "
+		set fltLineQty    =  $$$INIssueLineQtyIssued(objIssueLine)
+		set parrIssueLine(intIssueLine)  = $get(parrIssueLine(intIssueLine))  + fltLineQty
+	
+		set parrPick(intIssueLine) = $get(parrPick(intIssueLine)) + fltLineQty
+	}  ; FIXME : parrIssueLine probably is parrTfrLine but summation is pointless since 1:1
+	quit
+
+
+		
+]]></Routine>
+</Export>

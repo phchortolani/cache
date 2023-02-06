@@ -1,0 +1,552 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTFRRevLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTFRRevLine
+	
+#include COMGridEdit31
+#include INConst
+	
+	;---------------------------------------                    INTFRRevLine                       Pick   Tfr
+	; INTFRLine   =>   INTFRPickLine            =>   INRECLine :        (Rev 1) (Rev 2)
+	;   1:20       a  6 (Bundle 1, Store X) \
+	;              b  1 (Bundle 1, Store X) -> 12        8        4 max     3       1       8+3+1 = 12 \
+	;              c  5 (Bundle 1, Store Y) /                                                           > 20
+	;              d  8 (Bundle 2, Store Z)     8        5        3 max     3       -       5+3   =  8 /
+	;
+	;   2:15       e  5 (Bundle 1, Store Y) \  15        8        7 max     0       -       8+4+3 =  5 \  15
+	;              f 10 (Bundle 1, Store Y) /                               4       3               10 /
+	;
+	; We don't care where the goods were sourced once we process the SEND.  Always send qty picked.
+	; Receipts are based on total qty for bundle split across receiving storage.
+	; Total Receipts for bundle cannot(?) exceed total picked for bundle.
+	; Qty that can be reversed is picked qty less actual received qty less any previous reversals
+	;  - for bundle within transfer line.  (a+b+c) but keep d separate since different bundle and
+	; e separate since different transfer line even if for same item.
+	; Bundles and Source are same for e and f.  Single Receipt line for total sent.  Prior reversals
+	; have to be identified against balance unreceived.
+	;
+	; D3 Order Unit
+	; D4 Order Qty
+	; D2 Inventory Qty D3 Order Qty IU
+	;                  D4 Invent Unit
+	;                 D11 Picked Qty IU   =>  D6 Order Qty IU
+	;             **   D2 Sending Storage **
+	;-----------
+	; D9 Received Qty                         D4 Inventory Qty 
+	; D5 Reversal Qty  D9 Reversal Qty                             D5 Reversal Qty
+	;
+	;     P2      <=  D12 Source Line
+	;   P1,P2                            <=  D16 Cache Link
+	;    ---               P2                     ---        <=      P3
+	;-----------
+	;    ---          D19 Bundle             D60 Bundle          D24 Bundle (unique for each item)
+	;-----------
+	; CreateReversalTxn	: If Pick less Receipts less other Reversals not zero,
+	;					  create new Reversal Line (and header)
+	; GetOpenPickLines	: Build qty arrays for Pick, Receipt and Reversal bundles;
+	;					  Determine if there are any lines open for reversal
+	;---------------------------------------
+	; do AnalyseTransfer^INTFRUtilities(pidTfr,.arrTfr)
+	; Returns
+	;   arrTfr(TfrLine)                     = Order     Qty
+	;   arrTfr(TfrLine,Bundle,PickLine,"P") = Pick/Sent Qty
+	;   arrTfr(TfrLine,Bundle,PickLine,"R") = Receipt   Qty - Already assigned to pick line
+	;   arrTfr(TfrLine,Bundle,PickLine,"X") = Reversal  Qty - If processed
+	;-----
+	; On processing Receipt need to Allocate [TfrLine,Bundle] across PickLine "P"
+	; within [TfrLine,Bundle] so don't exceed "P".
+	;   
+	; If Pick has been fully receipted or reversed then balance goes to next entry for
+	;  [TfrLine,Bundle].  Shouldn't be able to overflow.
+	; This forms part of OnBeforeFormat and CanProcess validation.
+	;-------------------------------------------------------------------------------
+	
+CreateReversalTxn(pidTfr)
+	;-------------------------------------------------------------------------------
+	; Create Transfer Reversal
+	;
+	; Params:	pidTfr - INTFR id
+	;
+	; ByRefs:	YBED,YUCI,YUSER
+	;
+	; Returns:
+	; strStatus : $$$OK no error, otherwise the error that occurred.
+	;
+	; History:
+	; 28-Jun-2011	GRF		SR17770: Simplify based on 
+	; 03-Dec-2009	DWR		SR17068: changed macro label for BaseQuantity -> PickedQty
+	; 07-Oct-2008	Luke	SR15862: PEER fixing news 
+	; 26-Sep-2008	HQN		SR15862: INTFRRevLine now based on INTFRPickLine instead
+	; 							of INTFRLine; Need Bundle set on INTFRRevLine
+	; 02-Apr-2008	GRF		SRBR014859: Don't copy processed information - different
+	; 01-Apr-2008	shobby	SRBR014859: Don't copy complete objects from Transfer to
+	; 							Reversal (Header or Line).  This tends to create a
+	; 							bit of excitement with the free fields.
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new arrLines,fltAvailQty,idLineKey,idPickLine,idTfrLine,intRevSeq
+	new objPickLine,objReversal,objRevLine,objTransfer,objTfrLine,strStatus
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	lock +^INTFR(0,pidTfr,1):1
+	;+++++++++++++++++++++++++++++++++++++++ ; If no lines to reverse, don't continue with header either
+	if $test && $$GetOpenPickLines(pidTfr,.arrLines) {
+		set intRevSeq = $order(^INTFRRev(0,pidTfr,""),-1)+1
+		set ^CacheTempINTFRRev(YUCI,YUSER) = pidTfr_$$$COMMA_intRevSeq
+		
+	;---------------------------------------
+	; INTFRRev
+	;---------------------------------------
+		set objTransfer = $get(^INTFR(0,pidTfr,1))
+		set objReversal = ""
+		
+		set $$$INTFRRevTransferDate(objReversal)      = $$$INTFRTransferDate(objTransfer)
+		set $$$INTFRRevTransferType(objReversal)      = $$$INTFRTransferType(objTransfer)
+		set $$$INTFRRevSendingLocation(objReversal)   = $$$INTFRSendingLocation(objTransfer)
+		set $$$INTFRRevReceivingLocation(objReversal) = $$$INTFRReceivingLocation(objTransfer)
+		set $$$INTFRRevDispatch(objReversal)          = $$$INTFRDispatch(objTransfer)
+		set $$$INTFRRevDueDate(objReversal)           = $$$INTFRDueDate(objTransfer)
+		set $$$INTFRRevStatus(objReversal)            = $$$EnumINSTATUSUnprocessed
+		set $$$INTFRRevPickListPrinted(objReversal)   = $$$INTFRPickListPrinted(objTransfer)
+		set $$$INTFRRevShipped(objReversal)           = $$$INTFRShipped(objTransfer)
+		set $$$INTFRRevReversed(objReversal)          = ""
+		set $$$INTFRRevTour(objReversal)              = $$$INTFRTour(objTransfer)
+		set $$$INTFRRevCreatedBy(objReversal)         = YBED
+		set $$$INTFRRevCreatedDate(objReversal)       = $horolog
+		set $$$INTFRRevTourDate(objReversal)          = $$$INTFRTourDate(objTransfer)
+		
+		set strStatus = $$$Save("INTFRRev",pidTfr_$$$COMMA_intRevSeq,objReversal,$$$YES)
+		
+	;---------------------------------------
+	; INTFRRevLine
+	;---------------------------------------
+		
+		if $$$ISOK(strStatus) {
+			set idPickLine = ""
+			for {
+				set idPickLine = $order(arrLines(idPickLine))
+				quit:idPickLine=""
+				
+				set fltAvailQty = +arrLines(idPickLine)  ; always non-zero
+				set idTfrLine   = $piece(arrLines(idPickLine),Y,2)
+				
+				; For each available TFRLine to reverse, grab all PickLines to create reverse lines
+				set objTfrLine  = $get(^INTFRLine(0,pidTfr,idTfrLine,1))
+				set objPickLine = $get(^INTFRPickLine(0,pidTfr,idPickLine,1))
+				
+				set objRevLine=""
+				set $$$INTFRRevLineItem(objRevLine)             = $$$INTFRPickLineItem(objPickLine)
+				set $$$INTFRRevLinePickedQty(objRevLine)        = $$$INTFRPickLinePickedQuantity(objPickLine)    ; [IU]
+				set $$$INTFRRevLineOriginalQuantity(objRevLine) = $$$INTFRPickLineQuantity(objPickLine)          ; [IU]
+				set $$$INTFRRevLineUnit(objRevLine)             = $$$INTFRPickLineUnit(objPickLine)              ; [IU]
+				set $$$INTFRRevLineBundle(objRevLine)           = $$$INTFRPickLineBundle(objPickLine)
+				set $$$INTFRRevLineReversalQuantity(objRevLine) = 0 ; could be fltAvailQty
+				
+				set $$$INTFRRevLineImportedDemand(objRevLine)   = $$$INTFRRevLineImportedDemand(objTfrLine)
+				set $$$INTFRRevLineDemand(objRevLine)           = $$$INTFRRevLineDemand(objTfrLine)
+				set $$$INTFRRevLineSupply(objRevLine)           = $$$INTFRRevLineSupply(objTfrLine)
+				
+				set idLineKey = pidTfr_$$$COMMA_intRevSeq_$$$COMMA_idPickLine
+				set strStatus = $$$Save("INTFRRevLine",idLineKey,objRevLine,$$$YES)
+				quit:$$$ISERR(strStatus)
+			}
+		}
+	;+++++++++++++++++++++++++++++++++++++++
+		lock -^INTFR(0,pidTfr,1)#"I"
+	;+++++++++++++++++++++++++++++++++++++++
+		
+	} else {
+		set strStatus = $$$MakeStatus("IN00530",pidTfr)  ; "Unable to lock Transfer Order '%1'."
+	}
+	quit strStatus
+	
+	
+OnBeforeFormat(pstrYFIELDNAME,pstrText,pobjRevLine)
+	;-------------------------------------------------------------------------------
+	; Determine how fields on the Transfer Order Reversal Line are to be displayed.
+	;
+	; Params:
+	; pstrYFIELDNAME	Field name
+	; pstrText			Not used
+	; pobjRevLine		Transfer Order Reversal Line record
+	;
+	; ByRefs: 
+	;	YTOOLTIP
+	;	YBACKGROUNDCOLOR
+	; 
+	; Returns: Nothing
+	;
+	; History:
+	; 23-Jun-2011	GRF		SR17770: Can still reverse unreceived stock; correct
+	;							variable name - INTFRRevLine P3 is Pick Line No not
+	;							Transfer Line No (Not an integer - e.g. 2.01);
+	;							Get Transfer Line from Pick record
+	; 20-Jan-2010	shobby	SR15753: Cleanup of redundant code.
+	; 27-Jan-2009	HQN		SR16296: RevLine now based on PickLine not TFRLine
+	; 06-Mar-2008	PPP		SRBR014859: inTfrLine from the Key is piece #3 not #2
+	; 							(2nd one is the Reversal Number)
+	; 03-Mar-2008	GRF		SRBR014859: Created from INTFRLine
+	;-------------------------------------------------------------------------------
+	new arrLines,blnAvailable,fltAvailQty,fltRevQty,idField,idItem,idKey,idPickLine,idTfr
+	new intCol,intRow,objPickLine,objReversal
+	
+	quit:$translate(pobjRevLine,Y)=""
+	
+	set objReversal = $$$GRIDYFELDContainer	
+	set idItem      = $$$INTFRRevLineItem(pobjRevLine)
+	
+	quit:($$$INTFRRevStatus(objReversal)'=$$$EnumINSTATUSUnprocessed)||(idItem="")
+	
+	$$$GRIDSplitKey(pstrYFIELDNAME,intRow,intCol) 
+	
+	set idField = $$$GetClassField(YFORM,intCol)
+	
+	set idKey      = $$ReferenceKey^COMGridEdit31Interface(YFORM,intRow)
+	set idTfr      = $piece(idKey,$$$COMMA,1)
+	set idPickLine = $piece(idKey,$$$COMMA,3)  ; 2nd key is the Reversal Number
+	
+	if (idField=$$$FldINTFRRevLineReversalQuantity) {
+		set blnAvailable = $$GetOpenPickLines(idTfr,.arrLines)    ; FIXME : Can we do once and preserve arrLines?
+		set fltAvailQty  = +$get(arrLines(idPickLine))
+		
+		set fltRevQty  = $$$INTFRRevLineReversalQuantity(pobjRevLine)
+		
+		if fltRevQty < 0 {
+			set YTOOLTIP = $$$Text($$$MakeStatus("IN00490"))    ; "Quantity can not be negative."
+			set YWARNING = $$$YES
+		
+		} elseif fltRevQty > 0 {                                ; Only these lines will be processed
+			if fltAvailQty = 0 {
+				set YTOOLTIP = $$$Text($$$MakeStatus("IN00745",idPickLine))
+				set YWARNING = $$$YES                           ; "Pick line %1 already fully reversed"
+				
+			} elseif fltRevQty>fltAvailQty {
+				set YTOOLTIP = $$$Text($$$MakeStatus("IN00746",idPickLine,fltAvailQty))
+				set YWARNING = $$$YES
+			} ; "Reversal Quantity too great in Pick line %1 (Maxm %2)"
+		}	
+	}
+	quit
+	
+	
+GetOpenPickLines(pidTfr,&parrLines)
+	;-------------------------------------------------------------------------------
+	; Create Transfer Reversal (Revised)
+	; 
+	; Called by: CanCreateReversal^INTFRButtons, CreateReversalTxn^INTFRRevLine
+	; 
+	; Params:	pidTfr		INTFR key
+	;
+	; ByRefs:	arrLines	List of Transfer lines that can be reversed
+	;
+	; Returns:
+	; 	blnOpenLineFound	
+	;
+	; History:
+	; 23-Jun-2011	GRF		SR17770: Created as replacement for GetPickLines; Can
+	;							still reverse unreceived stock; use AnalyseTransfer
+	;-------------------------------------------------------------------------------
+	new arrTfr,blnOpenLineFound,fltAvailQty,idBundle,idPickLine,idTfrLine
+	
+	set blnOpenLineFound = $$$NO
+	do AnalyseTransfer^INTFRUtilities(pidTfr,.arrTfr)
+	
+	set idTfrLine = ""
+	for {
+		set idTfrLine = $order(arrTfr(idTfrLine))
+		quit:idTfrLine=""
+		
+		set idBundle = ""
+		for {
+			set idBundle = $order(arrTfr(idTfrLine,idBundle))
+			quit:idBundle=""
+			
+			set idPickLine = ""
+			for {
+				set idPickLine = $order(arrTfr(idTfrLine,idBundle,idPickLine))
+				quit:idPickLine=""
+				
+				set fltAvailQty = $get(arrTfr(idTfrLine,idBundle,idPickLine,"P")) -
+				                  $get(arrTfr(idTfrLine,idBundle,idPickLine,"R")) -
+				                  $get(arrTfr(idTfrLine,idBundle,idPickLine,"X"))
+				
+				if fltAvailQty>0 {
+					set blnOpenLineFound     = $$$YES
+					set parrLines(idPickLine) = fltAvailQty_Y_idTfrLine
+				}
+			}
+		}
+	}
+	quit blnOpenLineFound
+	
+	; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DEPRECATED CODE vvvvvvvvvvvvvvvvvvvvvvv ; SR17770
+	
+OldCreateReversalTxn(pidTfr)
+	;-------------------------------------------------------------------------------
+	; Create Transfer Reversal
+	;
+	; Params:	pidTfr - INTFR id
+	;
+	; ByRefs:	YBED,YUCI,YUSER
+	;
+	; Returns:
+	; strStatus : $$$OK no error, otherwise the error that occurred.
+	;
+	; History:
+	; 03-Dec-2009	DWR		SR17068: changed macro label for BaseQuantity -> PickedQty
+	; 07-Oct-2008	Luke	SR15862: PEER fixing news 
+	; 26-Sep-2008	HQN		SR15862: INTFRRevLine now based on INTFRPickLine instead
+	; 							of INTFRLine; Need Bundle set on INTFRRevLine
+	; 02-Apr-2008	GRF		SRBR014859: Don't copy processed information - different
+	; 01-Apr-2008	shobby	SRBR014859: Don't copy complete objects from Transfer to
+	; 							Reversal (Header or Line).  This tends to create a
+	; 							bit of excitement with the free fields.
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new arrLines,fltAvailQty,idLineKey,idPickLine
+	new intFldNo,intRevSeq,intTfrLine,objReversal,objRevLine,objTfrLine,objTransfer
+	new objPickLine,strStatus
+ 
+	;+++++++++++++++++++++++++++++++++++++++
+	lock +^INTFR(0,pidTfr,1):1
+	;+++++++++++++++++++++++++++++++++++++++
+	if $test {
+		set objTransfer = $get(^INTFR(0,pidTfr,1))
+		
+		set intRevSeq = $order(^INTFRRev(0,pidTfr,""),-1)+1
+		set ^CacheTempINTFRRev(YUCI,YUSER) = pidTfr_$$$COMMA_intRevSeq
+		
+	;---------------------------------------
+	; INTFRRev
+	;---------------------------------------
+		set objReversal=""
+		set $$$INTFRRevTransferDate(objReversal)      = $$$INTFRTransferDate(objTransfer)
+		set $$$INTFRRevTransferType(objReversal)      = $$$INTFRTransferType(objTransfer)
+		set $$$INTFRRevSendingLocation(objReversal)   = $$$INTFRSendingLocation(objTransfer)
+		set $$$INTFRRevReceivingLocation(objReversal) = $$$INTFRReceivingLocation(objTransfer)
+		set $$$INTFRRevDispatch(objReversal)          = $$$INTFRDispatch(objTransfer)
+		set $$$INTFRRevDueDate(objReversal)           = $$$INTFRDueDate(objTransfer)
+		set $$$INTFRRevStatus(objReversal)            = $$$EnumINSTATUSUnprocessed
+		set $$$INTFRRevPickListPrinted(objReversal)   = $$$INTFRPickListPrinted(objTransfer)
+		set $$$INTFRRevShipped(objReversal)           = $$$INTFRShipped(objTransfer)
+		set $$$INTFRRevReversed(objReversal)          = ""
+		set $$$INTFRRevTour(objReversal)              = $$$INTFRTour(objTransfer)
+		set $$$INTFRRevCreatedBy(objReversal)         = YBED
+		set $$$INTFRRevCreatedDate(objReversal)       = $horolog
+		set $$$INTFRRevTourDate(objReversal)          = $$$INTFRTourDate(objTransfer)
+		
+		set strStatus = $$$Save("INTFRRev",pidTfr_$$$COMMA_intRevSeq,objReversal,$$$YES)
+		
+	;---------------------------------------
+	; INTFRRevLine - skips when TfrLine has been accounted for in full (Pick Qty fully received or reversed)
+	;---------------------------------------
+		
+		if $$$ISOK(strStatus) && $$GetOpenLines(pidTfr,.arrLines) {
+			set intTfrLine = ""
+			for {
+				set intTfrLine = $order(arrLines(intTfrLine))
+				quit:intTfrLine=""
+				
+				set fltAvailQty = arrLines(intTfrLine)      ; FIXME : Not Used (sum $$$INTFRPickLinePickedQuantity less $$$INTFRLineReversalQuantity)
+			
+				; For each available TFRLine to reverse, grab all PickLines to create reverse lines
+				set objTfrLine = $get(^INTFRLine(0,pidTfr,intTfrLine,1))
+				
+				set idPickLine = ""
+				for {
+					set idPickLine = $order(^INTFRPickLine(0,pidTfr,idPickLine))
+					quit:idPickLine=""
+					set objPickLine = $get(^INTFRPickLine(0,pidTfr,idPickLine,1))
+					continue:$$$INTFRPickLineSourceline(objPickLine)'=intTfrLine
+					
+					set objRevLine=""
+					set $$$INTFRRevLineItem(objRevLine)             = $$$INTFRPickLineItem(objPickLine)
+					set $$$INTFRRevLinePickedQty(objRevLine)        = $$$INTFRPickLinePickedQuantity(objPickLine)    ; [IU]
+					set $$$INTFRRevLineOriginalQuantity(objRevLine) = $$$INTFRPickLineQuantity(objPickLine)          ; [IU]
+					set $$$INTFRRevLineUnit(objRevLine)             = $$$INTFRPickLineUnit(objPickLine)              ; [IU]
+					set $$$INTFRRevLineBundle(objRevLine)           = $$$INTFRPickLineBundle(objPickLine)
+					set $$$INTFRRevLineReversalQuantity(objRevLine) = 0 ; TfrLine contains sum of previous reversals
+					set $$$INTFRRevLineImportedDemand(objRevLine)   = $$$INTFRRevLineImportedDemand(objTfrLine)
+					set $$$INTFRRevLineDemand(objRevLine)           = $$$INTFRRevLineDemand(objTfrLine)
+					set $$$INTFRRevLineSupply(objRevLine)           = $$$INTFRRevLineSupply(objTfrLine)
+					
+					set idLineKey = pidTfr_$$$COMMA_intRevSeq_$$$COMMA_idPickLine
+					set strStatus = $$$Save("INTFRRevLine",idLineKey,objRevLine,$$$YES)
+					quit:$$$ISERR(strStatus)
+				}
+			}
+		}
+	;+++++++++++++++++++++++++++++++++++++++
+		lock -^INTFR(0,pidTfr,1)#"I"
+	;+++++++++++++++++++++++++++++++++++++++
+		
+	} else {
+		set strStatus = $$$MakeStatus("IN00530",pidTfr)  ; "Unable to lock Transfer Order '%1'."
+	}
+	quit strStatus
+	
+	
+OldOnBeforeFormat(pstrYFIELDNAME,pstrText,pobjRevLine)
+	;-------------------------------------------------------------------------------
+	; Determine how fields on the Transfer Order Reversal Line are to be displayed.
+	;
+	; Params:
+	; pstrYFIELDNAME	Field name
+	; pstrText			Not used
+	; pobjRevLine		Transfer Order Reversal Line record
+	;
+	; ByRefs: 
+	;	YTOOLTIP
+	;	YBACKGROUNDCOLOR
+	; 
+	; Returns: Nothing
+	;
+	; History:
+	; 23-Jun-2011	GRF		SR17770: Replaced
+	; 20-Jan-2010	shobby	SR15753: Cleanup of redundant code.
+	; 27-Jan-2009	HQN		SR16296: RevLine now based on PickLine not TFRLine
+	; 06-Mar-2008	PPP		SRBR014859: inTfrLine from the Key is piece #3 not #2
+	; 							(2nd one is the Reversal Number)
+	; 03-Mar-2008	GRF		SRBR014859: Created from INTFRLine
+	;-------------------------------------------------------------------------------
+	new arrPick,arrTfrLine,fltPickQty,fltRevQty,fltTfrSumRev
+	new intCol,intRow,intTfrLine
+	new idField,idItem,idKey,idTfr,objPickLine,objReversal,objTfrLine
+	
+	quit:$translate(pobjRevLine,Y)=""
+	
+	set objReversal = $$$GRIDYFELDContainer	
+	set idItem      = $$$INTFRRevLineItem(pobjRevLine)
+	
+	quit:($$$INTFRRevStatus(objReversal)'=$$$EnumINSTATUSUnprocessed)||(idItem="")
+	
+	$$$GRIDSplitKey(pstrYFIELDNAME,intRow,intCol) 
+	
+	set idField = $$$GetClassField(YFORM,intCol)
+	
+	set idKey      = $$ReferenceKey^COMGridEdit31Interface(YFORM,intRow)
+	set idTfr      = $piece(idKey,$$$COMMA,1)
+	set intTfrLine = $piece(idKey,$$$COMMA,3)  ; 2nd key is the Reversal Number
+	
+	do QtyPicked(idTfr,.arrPick,.arrTfrLine)
+	set objPickLine = $get(^INTFRPickLine(0,idTfr,intTfrLine,1))
+	
+	if (idField=$$$FldINTFRRevLineReversalQuantity) {
+		set fltRevQty  = $$$INTFRRevLineReversalQuantity(pobjRevLine)
+		
+		if fltRevQty < 0 {
+			set YTOOLTIP = $$$Text($$$MakeStatus("IN00490"))    ; "Quantity can not be negative."
+			set YWARNING = $$$YES
+		
+		} elseif fltRevQty > 0 {                                ; Only these lines will be processed
+			set objTfrLine   = $get(^INTFRLine(0,idTfr,intTfrLine,1))
+			set fltTfrSumRev = $$$INTFRPickLineReversalQuantity(objPickLine)
+			set fltPickQty   = +$get(arrTfrLine(intTfrLine))
+			
+			if $$$INTFRLineReceivedQuantity(objTfrLine) {
+				set YTOOLTIP = $$$Text($$$MakeStatus("34344"))  ; "Already Received"
+				set YWARNING = $$$YES
+				
+			} elseif fltPickQty = fltTfrSumRev {
+				set YTOOLTIP = $$$Text($$$MakeStatus("IN00745",intTfrLine))
+				set YWARNING = $$$YES                           ; "Transfer line %1 already fully reversed"
+				                                                ; => "Pick line %1 already fully reversed"
+			} else {
+				set fltPickQty = $$$INTFRPickLinePickedQuantity($get(^INTFRPickLine(0,idTfr,intTfrLine,1)))
+				if fltPickQty < (fltTfrSumRev + fltRevQty) {    ; Get Picked Qty for PickLine
+					set YTOOLTIP = $$$Text($$$MakeStatus("IN00746",intTfrLine,fltPickQty-fltTfrSumRev))
+					set YWARNING = $$$YES
+				} ; "Reversal Quantity too great in Transfer line %1 (Maxm %2)"
+			}
+		}
+	}
+	quit
+	
+	
+GetOpenLines(pidTfr,&arrLines) ; use GetOpenPickLines instead
+	;-------------------------------------------------------------------------------
+	; Create Transfer Reversal
+	; 
+	; Called by: CanCreateReversal^INTFRButtons, CreateReversalTxn^INTFRRevLine
+	; 
+	; Params:	pidTfr		INTFR key
+	;
+	; ByRefs:	arrLines	List of Transfer lines that can be reversed
+	;
+	; Returns:
+	; 	blnOpenLineFound	
+	;
+	; History:
+	; 23-Jun-2011	GRF		SR17770: Replaced by GetOpenPickLines
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new arrPick,arrTfrLine,blnOpenLineFound,fltAvailQty,fltPickQty
+	new intTfrLine,objPickLine,objTfrLine
+	
+	set blnOpenLineFound = $$$NO
+	do QtyPicked(pidTfr,.arrPick,.arrTfrLine)
+	set intTfrLine = ""
+	for {
+		set intTfrLine = $order(^INTFRLine(0,pidTfr,intTfrLine))
+		quit:intTfrLine=""
+		
+		set objTfrLine = $get(^INTFRLine(0,pidTfr,intTfrLine,1))
+		continue:$$$INTFRLineReceivedQuantity(objTfrLine)   ; If *ANY* stock received on line, treats that line as closed.
+		
+		set fltPickQty  = +$get(arrTfrLine(intTfrLine))
+		set fltAvailQty = fltPickQty - $$$INTFRLineReversalQuantity(objTfrLine)
+		continue:fltAvailQty<=0
+		
+		set blnOpenLineFound     = $$$YES
+		set arrLines(intTfrLine) = fltAvailQty
+	}
+	quit blnOpenLineFound
+	
+	
+QtyPicked(pidTfr,&parrPick,&parrTfrLine) ; use AnalyseTransfer^INTFRUtilities instead
+	;-------------------------------------------------------------------------------
+	; Sum of all quantities picked for a particular transfer order line
+	; 
+	; Called by :                   ; FIXME : arrPick not used in any of these - sum by bundle
+	; 	Postable^INTFRRev
+	; 	OnBeforeFormat^INTFRRevLine
+	; 	GetOpenLines^INTFRRevLine
+	; 
+	; Inputs:
+	; 	pidTfr			key for transfer order & transfer order picks
+	; 
+	; ByRef :
+	; 	parrPick		transfer line totals also broken down by lot no & expiry date
+	; 	parrTfrLine		totals for each transfer line
+	; 	
+	; Returns: nothing
+	; 
+	; History:
+	; 24-Jun-2011	GRF		SR17770: record receipts (REVERTED); sum by actual bundle id
+	; 19-May-2008	GRF		SR15742: Process Lot rather than Batch Number
+	; 03-Mar-2008	GRF		SRBR014859: Created - Isolated code
+	;-------------------------------------------------------------------------------
+	new fltLineQty,idBatch,idBundle,idReceipt,idRecLine,idxLink
+	new intLength,intPickLine,intTfrLine,objPickLine,objRecLine,strBase,strLink
+	
+	set intPickLine=""
+	for {
+		set intPickLine = $order(^INTFRPickLine(0,pidTfr,intPickLine))
+		quit:intPickLine=""
+		
+		set objPickLine = $get(^INTFRPickLine(0,pidTfr,intPickLine,1))
+		set intTfrLine  = $$$INTFRPickLineSourceline(objPickLine)
+	;	set idLotNo     = $$$INTFRPickLineLotNumber(objPickLine) if idLotNo=""    set idLotNo=" "    ; SR17770
+	;	set dteExpiry   = $$$INTFRPickLineUsebyDate(objPickLine) if dteExpiry=""  set dteExpiry=" "
+		set idBundle    = $$$INTFRPickLineBundle(objPickLine)
+		set fltLineQty  = $$$INTFRPickLinePickedQuantity(objPickLine)                                ; [IU]
+		
+		set parrTfrLine(intTfrLine)                = $get(parrTfrLine(intTfrLine))                + fltLineQty
+	;	set parrPick(intTfrLine,idLotNo,dteExpiry) = $get(parrPick(intTfrLine,idLotNo,dteExpiry)) + fltLineQty ; SR17770
+		set parrPick(intTfrLine,idBundle) = $get(parrPick(intTfrLine,idBundle)) + fltLineQty
+	}
+	quit
+		
+	; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DEPRECATED CODE ^^^^^^^^^^^^^^^^^^^^^^^
+]]></Routine>
+</Export>

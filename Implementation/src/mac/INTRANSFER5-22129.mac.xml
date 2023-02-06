@@ -1,0 +1,874 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRANSFER5" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRANSFER5
+
+#include INConst
+#include COMSYS
+#include WWWConst
+	
+	;-------------------------------------------------------------------------------
+	; PRINT PICK LIST
+	;
+	; History:
+	; 16-Mar-2011	GRF		-: Close Font tags
+	; 19-Jun-2006	PO		SR14669: Depending on how the Tour / Dispatch was
+	;							created call different code to set up the cache
+	; 01-May-2006	GRF		Doco; Convert indented dot level to dot/space
+	; 07.09.2005	FIS		created
+	;-------------------------------------------------------------------------------
+	NEW ShipLoc,ANZM,SOR,VERSNR,TOUR,TOUR1,TOURB,TOURD,RecLoc,RecLocB,DEMAND,DEMAND1,CallBy,objTour
+	NEW PICK,ART,ART1,ARTB,MENGE,MENGEREST,INWE1,LAP,LAP1,WED,SATZ,SOR1,YDDSATZ,ABTEILUNG,ANZSEIT
+	
+	SET ShipLoc = $GET(YLOCATION)
+	SET VERSNR  = $PIECE($GET(^INUSER(0,YBED,1)),Y,76)  ;DISPATCH NUMBER
+	IF VERSNR="" DO ^WWWINFO($$^WWWTEXT(46),1,,1) QUIT
+	
+	KILL ^WWWSOR(YUSER)
+	SET ANZM=0
+	
+	SET SOR=+$PIECE($GET(^INVORG(0,0,1)),Y,106)
+	if SOR=0 set SOR=1
+	set objTour = $get(^INDRPUMTOUR(0,ShipLoc,VERSNR,1))
+	if $$$INDRPUMTOURTransfer(objTour) = "" {
+		do SORT
+	} else {
+		do StoreLinesInCache(SOR,ShipLoc,VERSNR,$get(EINHEIT))
+	}
+	SET YNOFOOT=1
+	IF ANZM'=0 DO ^WWWBACK
+	DO DRUCK
+	IF ANZM=0 DO ^WWWINFO($$^WWWTEXT(46),1,,1)
+	KILL ^WWWSOR(YUSER)
+	QUIT
+	
+	
+SORT ;SORTIERUNG ;sorting 
+	/*-------------------------------------------------------------------------------
+    ; Build session dependent, temporary table of possible locations to source stock from.
+    ;
+    ; Params: None
+    ;
+    ; Returns: Nothing, stores result in ^WWWSOR
+    ;
+    ; NOTE: CHANGES HERE PROBABLY NEED TO BE MADE TO SORT in INTRANSFER [4,5,61,62,7,8,9]
+    ;       AND SAVE^INTRANSFER6 (& possibly other places)
+    ;
+    ; History:
+	; 18-Jan-2006	PPP&JW	SR14186: Pick List to show only items that can be sourced
+    ; 12-Nov-2005	PO		SR13824: Skip deleted demands, dont show stk locs providing
+    ; 						0 qty & do not require 'Print "Move Items To Pick-Level"
+    ; 						List' to be used.
+    ; 11-Nov-2005	PO		SR13831: Ensure proposed location to source stock from would
+    ; 						not be reduced to less than zero from multiple demands
+    ;-------------------------------------------------------------------------------*/
+	new fltInitialSOH,fltStockOnHand,arrStockOnHand,objDemand,YI,blnQuantity
+	
+	kill ^CacheTempPickListRemove(YUSER)		;14186
+	
+	DO
+	. SET TOUR1=$GET(^INDRPUMTOUR(0,ShipLoc,VERSNR,1))
+	. SET TOURB=""
+	. SET TOURD=""
+	. SET RecLocB=""
+	. SET RecLoc=$PIECE(TOUR1,Y,3)
+	. SET TOUR=$PIECE(TOUR1,Y,2)
+	. IF TOUR'=""   SET TOURB   = $PIECE($GET(^INDRPUMLKW(0,TOUR,1)),Y,2)
+	. IF RecLoc'="" SET RecLocB = $PIECE($GET(^WWW0121(0,0,RecLoc,1)),Y,1)
+	. IF RecLoc=""  SET RecLoc  = " "
+	. IF TOUR=""    SET TOUR    = " "
+	. SET TOURD=""
+	. IF $PIECE(TOUR1,Y,1)'="" SET TOURD=$$^WWWDATE($PIECE(TOUR1,Y,1))
+	. SET PICK=0
+	. ;IF $PIECE(TOUR1,Y,9)=1 SET PICK=1 // SR13824
+	. set $PIECE(TOUR1,Y,9)=1
+	. SET PICK=1
+	. DO
+	. . NEW KEY
+	. . SET KEY=ShipLoc_","_VERSNR 
+	. . SET $PIECE(TOUR1,Y,4)=1
+	. . DO SAVE^WWWSPEI("INDRPUMTOUR",KEY,TOUR1,1)
+	. . QUIT
+	. set sVERSNR=$$^WWWUMLAU(VERSNR,1)
+	. SET DEMAND=""
+	. FOR  SET DEMAND=$ORDER(^INDRPDEMANDs(0,8,sVERSNR,ShipLoc,DEMAND)) QUIT:DEMAND=""  DO
+	. . SET DEMAND1=$GET(^INDRPDEMAND(0,ShipLoc,DEMAND,1))
+	. . quit:+$$$INDRPDEMANDDeleteOrder(DEMAND1) // SR13824
+	. . SET ART=$PIECE(DEMAND1,Y,4)
+	. . QUIT:ART=""
+	. . QUIT:'$DATA(^INART(0,ART,1))  SET ART1=$GET(^(1))
+	. . ;
+	. . set ^CacheTempPickListRemove(YUSER,DEMAND)=""
+	. . IF $PIECE(ART1,Y,40)'="" SET EINHEIT=$PIECE($GET(^WWW101(0,"EINHEIT",SPRACHE,$PIECE(ART1,Y,40),1)),Y,1)
+	. . SET ARTB=$EXTRACT($PIECE(ART1,Y,1),0,15)
+	. . IF $EXTRACT($PIECE(ART1,Y,1),16,30)'="" SET ARTB=ARTB_"..."
+	. . IF $PIECE(DEMAND1,Y,50)'="" SET MENGE=$PIECE(DEMAND1,Y,50)    ;GEPICKT MENGE ;quantity 
+	. . IF $PIECE(DEMAND1,Y,50)="" SET MENGE=$PIECE(DEMAND1,Y,5)
+	. . QUIT:MENGE=""
+	. . SET AUF=$PIECE(DEMAND1,Y,2)
+	. . DO DEMANDEIN
+	. . SET MENGEREST=MENGE      ;LAGEPLATZ SUCHEN ;seek
+	. . ;
+	. . ; SR14427: If this is non-stock or consumable then use the delete location
+	. . set blnQuantity=$$GetAvailableQuantity^INATP1(ART,ShipLoc)=1E16
+	. . if blnQuantity do
+	. . . set LAP=$$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+	. . . SET LAP1=$GET(^INLP(0,ShipLoc,LAP,1))
+	. . . QUIT:$PIECE(LAP1,Y,12)=1  ;IST BEREITS AUF PICK-LAGER ;yet upon 
+	. . . QUIT:$PIECE(LAP1,Y,8)=1   ;LAGEPLATZ GESPERRT ;DISABLED 
+	. . . SET LFN=" "
+	. . . SET ABTEILUNG=" "
+	. . . IF $PIECE(LAP1,Y,11)'=""  SET LFN=$PIECE(LAP1,Y,11)    ;lfd. PICK-LAGERPLATZ
+	. . . IF $PIECE(LAP1,Y,14)'=""  SET ABTEILUNG=$PIECE(LAP1,Y,14)    ;ABTEILUNG ;speciality 
+	. . . do SaveSort(SOR,MENGE,LAP,EINHEIT,LFN,ART,ARTB,MENGE,RecLoc,RecLocB,VERSNR,TOURB,$PIECE(TOUR1,Y,1),DEMAND,AUF,PICK,ABTEILUNG)
+	. . . set MENGEREST=0
+	. . . kill ^CacheTempPickListRemove(YUSER,DEMAND)			; 14186 - ok to leave
+	. . ;
+	. . if 'blnQuantity do
+	. . . SET LAP=""
+	. . . FOR  SET LAP=$ORDER(^INWE(0,ART,ShipLoc,LAP)) QUIT:LAP=""  QUIT:MENGEREST=0  DO
+	. . . . SET MENGE(LAP)=0
+	. . . . SET LAP1=$GET(^INLP(0,ShipLoc,LAP,1))
+	. . . . QUIT:$PIECE(LAP1,Y,12)=1  ;IST BEREITS AUF PICK-LAGER ;yet upon 
+	. . . . QUIT:$PIECE(LAP1,Y,8)=1   ;LAGEPLATZ GESPERRT ;DISABLED 
+	. . . . SET LFN=" "
+	. . . . SET ABTEILUNG=" "
+	. . . . IF $PIECE(LAP1,Y,11)'=""  SET LFN=$PIECE(LAP1,Y,11)    ;lfd. PICK-LAGERPLATZ
+	. . . . IF $PIECE(LAP1,Y,14)'=""  SET ABTEILUNG=$PIECE(LAP1,Y,14)    ;ABTEILUNG ;speciality 
+	. . . . ;
+	. . . . SET WED=""
+	. . . . FOR  SET WED=$ORDER(^INWE(0,ART,ShipLoc,LAP,WED)) QUIT:WED=""  QUIT:MENGEREST'>0  DO
+	. . . . . SET INWE1=$GET(^INWE(0,ART,ShipLoc,LAP,WED,1))
+	. . . . . ;
+	. . . . . set fltInitialSOH = $$$INWEQuantity(INWE1) // SR13831
+	. . . . . set fltStockOnHand = $get(arrStockOnHand(ART,ShipLoc,LAP,WED))
+	. . . . . if fltStockOnHand = "" do
+	. . . . . . set arrStockOnHand(ART,ShipLoc,LAP,WED) = fltInitialSOH
+	. . . . . . set fltStockOnHand = fltInitialSOH
+	. . . . . ;
+	. . . . . ;IF MENGEREST'>$PIECE(INWE1,Y,4) DO  QUIT
+	. . . . . IF MENGEREST'>fltStockOnHand DO  QUIT // SR13831
+	. . . . . . set arrStockOnHand(ART,ShipLoc,LAP,WED) = fltStockOnHand - MENGEREST
+	. . . . . . SET MENGE(LAP)=MENGEREST+MENGE(LAP)
+	. . . . . . SET MENGEREST=0
+	. . . . . ;
+	. . . . . ;IF MENGEREST>$PIECE(INWE1,Y,4) IF +$PIECE(INWE1,Y,4)'=0 DO
+	. . . . . IF MENGEREST>fltStockOnHand IF +fltStockOnHand'=0 DO // SR13831
+	. . . . . . set arrStockOnHand(ART,ShipLoc,LAP,WED) = 0
+	. . . . . . ;SET MENGE(LAP)=$PIECE(INWE1,Y,4)+MENGE(LAP)
+	. . . . . . SET MENGE(LAP)=fltStockOnHand+MENGE(LAP)
+	. . . . . . ;SET MENGEREST=MENGEREST-$PIECE(INWE1,Y,4)
+	. . . . . . SET MENGEREST=MENGEREST-fltStockOnHand
+	. . . . ;
+	. . . . do SaveSort(SOR,MENGE(LAP),LAP,EINHEIT,LFN,ART,ARTB,MENGE,RecLoc,RecLocB,VERSNR,TOURB,$PIECE(TOUR1,Y,1),DEMAND,AUF,PICK,ABTEILUNG) // SR14427
+	. . . . kill ^CacheTempPickListRemove(YUSER,DEMAND)			; 14186 - ok to leave
+	
+	; SR14186: If not on printed picklist, don't want them on this dispatch
+	set DEMAND=""
+	for {
+		set DEMAND=$order(^CacheTempPickListRemove(YUSER,DEMAND))
+		quit:DEMAND=""
+		
+		SET objDemand=$GET(^INDRPDEMAND(0,ShipLoc,DEMAND,1))
+		FOR YI=40,41,42,46,50,56,60,61 SET $PIECE(objDemand,Y,YI)=""  	;DELETE SHIPPING INFORMATION -> REMOVE FROM DISPATCH
+		DO SAVE^WWWSPEI("INDRPDEMAND",ShipLoc_","_DEMAND,objDemand,1) 	;SPEICHERN ÄNDERUNGEN ;Save CHANGES
+		DO ^INDRPSAVED(ShipLoc_","_DEMAND,objDemand)  					;UPDATE SUPPLY OF DESTINATION LOCATION;FIS;01.04.04 ;LOCATION 
+	}
+	kill ^CacheTempPickListRemove(YUSER)
+	
+	QUIT
+ 
+ ; pfltQuantity = $case($$$INDRPDEMANDPickedQuantity(pobjDemand),"":$$$INDRPDEMANDQuantity(pobjDemand),:$$$INDRPDEMANDPickedQuantity(pobjDemand))
+ ; Could redetermine qty to display on pick list however since it is already calculated unless there is a reason to recalc prefer to use result of prior calc.
+ 
+ 
+	;-------------------------------------------------------------------------------
+	; This sub-routine is to replace SORT when displaying the Pick List of a Transfer Order (as opposed to an Inter-Warehouse Traffic Workflow)
+	;
+	; A number of changes have occurred due the implementing of reservations in Transfer Orders, subsequently this sub-routine
+	; is a complete replacement.
+	;
+	; Params:
+	; pidSort - The way in which to sort the stored lines
+	; pidSendingLocn - The site location that is provding the stock
+	; pidTour - The background processing record id of the Tour / Dispatch
+	; pstrUnit - The default unit of measure description
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 19-Jun-2006	PO		SR14669: Created
+	;-------------------------------------------------------------------------------
+StoreLinesInCache(pidSort,pidSendingLocn,pidTour,pstrUnit)
+	new idKey,idTFR,idxLine,idPickLine,objPickLine,objLine,strUnit,idItem,fltQuantity,objTour,objItem,dteDeliveryDate,idUOM,strItemDescription
+	new idDemand,objDemand,idSupply,idReceivingLocn,objLocation,strLocation,idPickSequence,idDepartment,idSendingStockLocn,objStockLocns
+	new idDispatch,strDesignation,strStatus,objTFR,idxTFR
+ 
+	new ShipLoc,DEMAND,DEMAND1 // These two lines are support code for updating demand & supply
+	set ShipLoc = pidSendingLocn
+ 
+ 	set objTour = $get(^INDRPUMTOUR(0,pidSendingLocn,pidTour,1))
+	set $$$INDRPUMTOURPickListPrinted(objTour) = $$$YES
+	set strStatus = $$$Save("INDRPUMTOUR",pidSendingLocn_","_pidTour,objTour,$$$YES)
+ 
+ 	set idDispatch = $$$INDRPUMTOURDispatch(objTour)
+ 	set strDesignation = $$$INDRPUMLKWDesignation($get(^INDRPUMLKW(0,idDispatch,1)))	; Designation
+ 
+	set idTFR = $$$INDRPUMTOURTransfer(objTour)
+	set idxTFR = $$$Index(idTFR)
+	set objTFR = $get(^INTFR(0,idTFR,1))
+	set idReceivingLocn = $$$INTFRReceivingLocation(objTFR)	; Receiving location
+	set objLocation = $get(^WWW0121(0,0,idReceivingLocn,1))
+	set strLocation = $$$WWW0121LocationName(objLocation)	; Stock location description
+	set dteDeliveryDate = $$$INDRPUMTOURDeliveryDate(objTour)	; Delivery Date
+ 
+ if $$$NEVER { // Can call SaveSort more than enough times so Stock Locn field has same location listed more than once
+	
+	; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	kill ^CacheTempTFRPickListQuantity(YUSER)
+ 
+	$$$Order4(^INTFRPickLines,0,1,idxTFR,idxLine)
+		set objPickLine = $get(^INTFRPickLine(0,idTFR,$order(^INTFRPickLines(0,1,idxTFR,idxLine,idTFR,"")),1))
+		set objLine = $get(^INTFRLine(0,idTFR,$$$INTFRPickLineSourceline(objPickLine),1))
+ 
+		set idItem = $$$INTFRLineItem(objLine)
+		set objItem = $get(^INART(0,idItem,1))
+ 
+		set idUOM = $$$INARTUnitofMeasure(objItem)	; Items Unit of Measure
+		if idUOM = "" {
+			set strUnit = pstrUnit
+		} else {
+			set strUnit = $$$AppEnum("EINHEIT",idUOM)
+		}
+ 
+		set strItemDescription = $$$INARTSearchName(objItem)	; Item Description
+		if $length(strItemDescription) > 15 {
+			set strItemDescription = $extract(strItemDescription,1,15)_"..."
+		}
+ 
+		set idDemand = $piece($$$INTFRLineDemand(objLine),$$$COMMA,2)	; Demand ID
+		set objDemand = $get(^INDRPDEMAND(0,pidSendingLocn,idDemand,1))
+ 
+		set DEMAND = idDemand // These three lines are for updating the demand & supply
+		set DEMAND1 = objDemand
+		do DEMANDEIN
+ 
+		set idSupply = $$$INDRPDEMANDOrderNo(objDemand)	; Supply ID - Field never appears to be populated
+ 
+		$$$Order6(^INTFRPickLines,0,1,idxTFR,idxLine,idTFR,idPickLine)
+			set objPickLine = $get(^INTFRPickLine(0,idTFR,idPickLine,1))
+ 
+			set fltQuantity = $$$INTFRPickLinePickedQuantity(objPickLine)				; Picked Quantity
+			set idSendingStockLocn = $$$INTFRPickLineSendingStockLocation(objPickLine)	; Sending Stock Location
+			set objStockLocns = $get(^INLP(0,pidSendingLocn,idSendingStockLocn,1))
+			set idPickSequence = $$$INLPPickSequence(objStockLocns)						; Pick Sequence
+			set idDepartment = $$$INLPDepartment(objStockLocns)							; Department
+ 
+			// v Quick fix
+			if pidSort = 0 {
+				set fltQuantity = $get(^CacheTempTFRPickListQuantity(YUSER,idDepartment,idPickSequence,idDemand)) + fltQuantity
+				set ^CacheTempTFRPickListQuantity(YUSER,idDepartment,idPickSequence,idDemand) = fltQuantity
+			} elseif pidSort = 1 {
+				set fltQuantity = $get(^CacheTempTFRPickListQuantity(YUSER,idDemand,idSendingStockLocn)) + fltQuantity
+				set ^CacheTempTFRPickListQuantity(YUSER,idDemand,idSendingStockLocn) = fltQuantity
+			} elseif pidSort = 2 {
+				set fltQuantity = $get(^CacheTempTFRPickListQuantity(YUSER,idSendingStockLocn,idDemand)) + fltQuantity
+				set ^CacheTempTFRPickListQuantity(YUSER,idSendingStockLocn,idDemand) = fltQuantity
+			}
+			// ^ Quick fix
+ 
+					   ;SOR,    MENGE(LAP), LAP,               EINHEIT,LFN,           ART,   ARTB,              MENGE,      RecLoc,         RecLocB,    VERSNR, TOURB,         $PIECE(TOUR1,Y,1),DEMAND,AUF,     PICK,ABTEILUNG
+			do SaveSort(pidSort,fltQuantity,idSendingStockLocn,strUnit,idPickSequence,idItem,strItemDescription,fltQuantity,idReceivingLocn,strLocation,pidTour,strDesignation,dteDeliveryDate,idDemand,idSupply,1,idDepartment)
+		$$$End
+	$$$End
+ 
+	kill ^CacheTempTFRPickListQuantity(YUSER)
+	; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DISABLED BLOCK END
+	
+ } else { // Will call SaveSort the appropriate number of times
+	new idLine,objRecord,idRow,idFirstKey,idSecondKey
+	 
+	kill ^CacheTempTFRPickList(YUSER)
+ 
+	$$$Order4(^INTFRPickLines,0,1,idxTFR,idxLine)
+		set objPickLine = $get(^INTFRPickLine(0,idTFR,$order(^INTFRPickLines(0,1,idxTFR,idxLine,idTFR,"")),1))
+		set objLine = $get(^INTFRLine(0,idTFR,$$$INTFRPickLineSourceline(objPickLine),1))
+ 
+		set idItem = $$$INTFRLineItem(objLine)
+		set objItem = $get(^INART(0,idItem,1))
+ 
+		set idUOM = $$$INARTUnitofMeasure(objItem)	; Items Unit of Measure
+		if idUOM = "" {
+			set strUnit = pstrUnit
+		} else {
+			set strUnit = $$$AppEnum("EINHEIT",idUOM)
+		}
+ 
+		set strItemDescription = $$$INARTSearchName(objItem)	; Item Description
+		if $length(strItemDescription) > 15 {
+			set strItemDescription = $extract(strItemDescription,1,15)_"..."
+		}
+ 
+		set idDemand = $piece($$$INTFRLineDemand(objLine),$$$COMMA,2)	; Demand ID
+		set objDemand = $get(^INDRPDEMAND(0,pidSendingLocn,idDemand,1))
+ 
+		set DEMAND = idDemand // These three lines are for updating the demand & supply
+		set DEMAND1 = objDemand
+		do DEMANDEIN
+ 
+		set idSupply = $$$INDRPDEMANDOrderNo(objDemand)	; Supply ID - Field never appears to be populated
+ 
+		set ^CacheTempTFRPickList(YUSER,"DISPLAY",$$$INTFRPickLineSourceline(objPickLine)) = strUnit_Y_idItem_Y_strItemDescription_Y_idSupply
+	$$$End
+ 
+	set objTFR = $get(^INTFR(0,idTFR,1))
+	$$$Order3(^INTFRPickLine,0,idTFR,idLine)
+		set objRecord = $get(^INTFRPickLine(0,idTFR,idLine,1))
+		set objLine = $get(^INTFRLine(0,idTFR,$$$INTFRPickLineSourceline(objRecord),1))
+		set objStockLocns = $get(^INLP(0,$$$INTFRSendingLocation(objTFR),$$$INTFRPickLineSendingStockLocation(objRecord),1))
+ 
+		if pidSort = 0 {
+			set ^CacheTempTFRPickList(YUSER,"SORTED",$$$INLPDepartment(objStockLocns),$$$INLPPickSequence(objStockLocns),$$$KEY2($$$INTFRLineDemand(objLine)),idLine) = objRecord
+ 
+			set fltQuantity = $get(^CacheTempTFRPickList(YUSER,"SORTED",$$$INLPDepartment(objStockLocns),$$$INLPPickSequence(objStockLocns),$$$KEY2($$$INTFRLineDemand(objLine))))
+			set ^CacheTempTFRPickList(YUSER,"SORTED",$$$INLPDepartment(objStockLocns),$$$INLPPickSequence(objStockLocns),$$$KEY2($$$INTFRLineDemand(objLine))) = fltQuantity + $$$INTFRPickLinePickedQuantity(objRecord)
+		} elseif pidSort = 1 { // Sorting structure for type 1 and 2 are the same
+			set ^CacheTempTFRPickList(YUSER,"SORTED",$$$KEY2($$$INTFRLineDemand(objLine)),$$$INTFRPickLineSendingStockLocation(objRecord),idLine) = objRecord
+ 
+			set fltQuantity = $get(^CacheTempTFRPickList(YUSER,"SORTED",$$$KEY2($$$INTFRLineDemand(objLine)),$$$INTFRPickLineSendingStockLocation(objRecord)))
+			set ^CacheTempTFRPickList(YUSER,"SORTED",$$$KEY2($$$INTFRLineDemand(objLine)),$$$INTFRPickLineSendingStockLocation(objRecord)) = fltQuantity + $$$INTFRPickLinePickedQuantity(objRecord)
+		} elseif pidSort = 2 {
+			set ^CacheTempTFRPickList(YUSER,"SORTED",$$$INTFRPickLineSendingStockLocation(objRecord),$$$KEY2($$$INTFRLineDemand(objLine)),idLine) = objRecord
+ 
+			set fltQuantity = $get(^CacheTempTFRPickList(YUSER,"SORTED",$$$INTFRPickLineSendingStockLocation(objRecord),$$$KEY2($$$INTFRLineDemand(objLine))))
+			set ^CacheTempTFRPickList(YUSER,"SORTED",$$$INTFRPickLineSendingStockLocation(objRecord),$$$KEY2($$$INTFRLineDemand(objLine))) = fltQuantity + $$$INTFRPickLinePickedQuantity(objRecord)
+		}
+	$$$End
+	
+	if pidSort = 0 {
+		$$$Order3(^CacheTempTFRPickList,YUSER,"SORTED",idDepartment)
+			$$$Order4(^CacheTempTFRPickList,YUSER,"SORTED",idDepartment,idPickSequence)
+				$$$Order5(^CacheTempTFRPickList,YUSER,"SORTED",idDepartment,idPickSequence,idDemand)
+					set fltQuantity = $get(^CacheTempTFRPickList(YUSER,"SORTED",idDepartment,idPickSequence,idDemand))
+ 
+					set idRow = $order(^CacheTempTFRPickList(YUSER,"SORTED",idDepartment,idPickSequence,idDemand,""))
+					set objRecord = $get(^CacheTempTFRPickList(YUSER,"SORTED",idDepartment,idPickSequence,idDemand,idRow))
+					set idSendingStockLocn = $$$INTFRPickLineSendingStockLocation(objRecord)
+					set idLine = $$$INTFRPickLineSourceline(objRecord)
+					set objLine = $get(^CacheTempTFRPickList(YUSER,"DISPLAY",idLine))
+					set strUnit = $piece(objLine,Y,1)
+					set idItem = $piece(objLine,Y,2)
+					set strItemDescription = $piece(objLine,Y,3)
+					set idSupply = $piece(objLine,Y,4)
+ 
+					do SaveSort(pidSort,fltQuantity,idSendingStockLocn,strUnit,idPickSequence,idItem,strItemDescription,fltQuantity,idReceivingLocn,strLocation,pidTour,strDesignation,dteDeliveryDate,idDemand,idSupply,1,idDepartment)
+				$$$End
+			$$$End
+		$$$End
+	} elseif (pidSort = 1) || (pidSort = 2) {
+		$$$Order3(^CacheTempTFRPickList,YUSER,"SORTED",idFirstKey)
+			$$$Order4(^CacheTempTFRPickList,YUSER,"SORTED",idFirstKey,idSecondKey)
+				set fltQuantity = $get(^CacheTempTFRPickList(YUSER,"SORTED",idFirstKey,idSecondKey))
+ 
+				set idRow = $order(^CacheTempTFRPickList(YUSER,"SORTED",idFirstKey,idSecondKey,""))
+				set objRecord = $get(^CacheTempTFRPickList(YUSER,"SORTED",idFirstKey,idSecondKey,idRow))
+				set idLine = $$$INTFRPickLineSourceline(objRecord)
+				set objLine = $get(^CacheTempTFRPickList(YUSER,"DISPLAY",idLine))
+				set strUnit = $piece(objLine,Y,1)
+				set idItem = $piece(objLine,Y,2)
+				set strItemDescription = $piece(objLine,Y,3)
+				set idSupply = $piece(objLine,Y,4)
+ 
+				if pidSort = 1 {
+					set idDemand = idFirstKey
+					set idSendingStockLocn = idSecondKey
+				} elseif pidSort = 2 {
+					set idDemand = idSecondKey
+					set idSendingStockLocn = idFirstKey
+				}
+ 
+				set objStockLocns = $get(^INLP(0,$$$INTFRSendingLocation(objTFR),idSendingStockLocn,1))
+				set idPickSequence = $$$INLPPickSequence(objStockLocns)
+				set idDepartment = $$$INLPDepartment(objStockLocns)
+ 
+				do SaveSort(pidSort,fltQuantity,idSendingStockLocn,strUnit,idPickSequence,idItem,strItemDescription,fltQuantity,idReceivingLocn,strLocation,pidTour,strDesignation,dteDeliveryDate,idDemand,idSupply,1,idDepartment)
+			$$$End
+		$$$End
+	}
+ 
+	kill ^CacheTempTFRPickList(YUSER)
+ }
+ 
+	quit
+ 
+	;-------------------------------------------------------------------------------
+	; Params:
+	; pidSort              : How to show the pick list
+	; pfltStockLocnQuantity: The stock quantity at this location
+	; pidStockLocation     : The location we are getting the stock from
+	; pidUnit              : The unit name
+	; pidPickSequence      : The order of picking
+	; pidItem              : The product id
+	; pstrItemDescription  : The description of the product
+	; pfltQuantity         : The quantity to gain
+	; pRecLoc              : Whether it's printed
+	; pRecLocB             : Printed Location
+	; pidDispatch          : The id of the Tour/Dispatch
+	; pidDesignation       : Mode of Shipment Designation
+	; pdteDelivery         : The date of the delivery
+	; pidDemand            : The id of the demand
+	; pidOrder             : The id of the order
+	; pintPick             : The pick type (usually 1)
+	; pidDepartment        : The locations department
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Jun-2006	PO		SR14669: Renamed pidUnitOfMeasure to pstrItemDescription
+	; 28-Apr-2006	RPW		SR14427: Created
+	;-------------------------------------------------------------------------------
+SaveSort(pidSort,pfltStockLocnQuantity,pidStockLocation,pstrUnit,pidPickSequence,pidItem,pstrItemDescription,pfltQuantity,pRecLoc,pRecLocB,pidDispatch,pidDesignation,pdteDelivery,pidDemand,pidOrder,pintPick,pidDepartment)
+	new SATZ,SATZOLD
+	
+	QUIT:+pfltStockLocnQuantity=0			; 14186
+	
+	;---------------------------------------
+	
+	SET SATZ=""
+	IF +pidSort=0 SET SATZOLD=$GET(^WWWSOR(YUSER,pidDispatch,pidDepartment,pidPickSequence,pidDemand))
+	IF +pidSort=2 SET SATZOLD=$GET(^WWWSOR(YUSER,pidDispatch," ",pidStockLocation,pidDemand))
+	IF +pidSort=1 SET SATZOLD=$GET(^WWWSOR(YUSER,pidDispatch,pidDemand,pidStockLocation))
+	if pfltStockLocnQuantity { // SR13824
+		SET $PIECE(SATZ,Y,1)=pidStockLocation
+		IF +pfltStockLocnQuantity'=pfltQuantity SET $PIECE(SATZ,Y,1)=$PIECE(SATZ,Y,1)_" ("_pfltStockLocnQuantity_" "_pstrUnit_")"
+		IF $PIECE(SATZOLD,Y,1)'=""              SET $PIECE(SATZ,Y,1)=$PIECE(SATZ,Y,1)_"<Br>"_$PIECE(SATZOLD,Y,1)
+	}
+	
+	SET $PIECE(SATZ,Y,2)  = pidPickSequence
+	SET $PIECE(SATZ,Y,3)  = pidItem
+	SET $PIECE(SATZ,Y,4)  = pstrItemDescription // SR14669
+	SET $PIECE(SATZ,Y,5)  = +pfltQuantity          ;soll menge ;quantity 
+	SET $PIECE(SATZ,Y,6)  = pstrUnit
+	SET $PIECE(SATZ,Y,7)  = pRecLoc
+	SET $PIECE(SATZ,Y,8)  = pRecLocB
+	SET $PIECE(SATZ,Y,9)  = pidDispatch
+	SET $PIECE(SATZ,Y,10) = pidDesignation
+	SET $PIECE(SATZ,Y,11) = pdteDelivery
+	SET $PIECE(SATZ,Y,12) = pidDemand
+	SET $PIECE(SATZ,Y,13) = pidOrder
+	SET $PIECE(SATZ,Y,14) = pintPick
+	SET $PIECE(SATZ,Y,15) = pidDepartment
+	SET $PIECE(SATZ,Y,16) = +pfltStockLocnQuantity        ;ist menge ;is quantity 
+	SET $PIECE(SATZ,Y,17) = +$HOROLOG      
+	SET $PIECE(SATZ,Y,18) = YBED       
+	
+	IF +pidSort=0 SET ^WWWSOR(YUSER,pidDispatch,pidDepartment,pidPickSequence,pidDemand)=SATZ
+	IF +pidSort=2 SET ^WWWSOR(YUSER,pidDispatch," ",pidStockLocation,pidDemand)=SATZ // SR14427
+	IF +pidSort=1 SET ^WWWSOR(YUSER,pidDispatch,pidDemand,pidStockLocation)=SATZ		; 14186 - new sort type
+ 
+	quit
+ 
+DRUCK ;
+	;------------------------------------------------------------------
+	;PRINT PICK LIST
+	;
+	;History:
+	; 27-Apr-2006	SC		SR14320: Modified to use INVORGLANG, allows other languages.
+	; 07.09.2005	FIS		created
+	;------------------------------------------------------------------
+	;ÜBERSCHRIFT ;superscription 
+	new objVORGLANG
+	
+	SET VORG1=$GET(^INVORG(0,0,1))
+	set objVORGLANG = $get(^INVORGLANG(0,0,SPRACHE,1)) //SR14230
+	SET TEXT=$$$INVORGLANGTextAfterPickList(objVORGLANG)          ;ZUSATZTEXT
+	;SET TEXT=$PIECE(VORG1,Y,85)          ;ZUSATZTEXT
+	SET ANZSEIT=$PIECE(VORG1,Y,82)       ;MAXIMAL ANZAHL PRO SEITE ;Number within side 
+	IF ANZSEIT="" SET ANZSEIT=30
+	
+	NEW UES
+	SET UES=$$^WWWTEXT(207)           ;NR.
+	SET UES=UES_Y_$$^WWWTEXT(32054)   ;LAGERPLATZ ;stock location 
+	SET UES=UES_Y_$$^WWWTEXT(32024)   ;ART        ;Type
+	SET UES=UES_Y_$$^WWWTEXT(31407)   ;MENGE      ;quantity 
+	SET UES=UES_Y_$$^WWWTEXT(32806)   ;GEPICKT MENGE ;quantity 
+	
+	SET UES=UES_Y_$$^WWWTEXT(32612)   ;DEMAND
+	SET UES=UES_Y_$$^WWWTEXT(32047)   ;AUFTRAG    ;order 
+	
+	;ARTIKEL DRUCKEN ;item print 
+	IF (+SOR=0) || (+SOR=2) SET VERSNR="" FOR  SET VERSNR=$ORDER(^WWWSOR(YUSER,VERSNR)) QUIT:VERSNR=""  DO
+	. SET ABTEILUNG=""
+	. FOR  SET ABTEILUNG=$ORDER(^WWWSOR(YUSER,VERSNR,ABTEILUNG)) QUIT:ABTEILUNG=""  DO
+	. . SET ANZM=0
+	. . ;
+	. . IF ANZM>0 DO FF^WWWW()
+	. . DO UEBER
+	. . SET YDDSATZ=0
+	. . SET LFN=""
+	. . FOR  SET LFN=$ORDER(^WWWSOR(YUSER,VERSNR,ABTEILUNG,LFN)) QUIT:LFN=""  DO
+	. . . SET DEMAND=""
+	. . . FOR  SET DEMAND=$ORDER(^WWWSOR(YUSER,VERSNR,ABTEILUNG,LFN,DEMAND)) QUIT:DEMAND=""  DO
+	. . . . SET YFELD=$GET(^WWWSOR(YUSER,VERSNR,ABTEILUNG,LFN,DEMAND))
+	. . . . ;
+	. . . . IF ANZM'=0 IF ANZM#ANZSEIT=0 DO   ;NEUE SEITE
+	. . . . . WRITE "</TD></TR>"
+	. . . . . WRITE "</TABLE>"
+	. . . . . ;DO ZUSATZTEXT
+	. . . . . DO FF^WWWW()
+	. . . . . DO UEBER
+	. . . . ;
+	. . . . DO ANZ
+	. . ;
+	. . ;IF ANZM=0 DO ZEILE
+	. . DO LEER^WWWTAB(15,7)
+	. . DO STOP^WWWTAB
+	. . DO ZUSATZTEXT
+	
+	IF +SOR=1 SET VERSNR="" FOR  SET VERSNR=$ORDER(^WWWSOR(YUSER,VERSNR)) QUIT:VERSNR=""  DO
+	. DO
+	. . SET ANZM=0
+	. . ;
+	. . IF ANZM>0 DO FF^WWWW()
+	. . DO UEBER
+	. . SET YDDSATZ=0
+	. . DO
+	. . . SET DEMAND=""
+	. . . FOR  SET DEMAND=$ORDER(^WWWSOR(YUSER,VERSNR,DEMAND)) QUIT:DEMAND=""  DO
+	. . . . set idStockLocn = ""
+	. . . . for  set idStockLocn=$order(^WWWSOR(YUSER,VERSNR,DEMAND,idStockLocn)) quit:idStockLocn=""  do
+	. . . . . SET YFELD=$GET(^WWWSOR(YUSER,VERSNR,DEMAND,idStockLocn))
+	. . . . . ;
+	. . . . . IF ANZM'=0 IF ANZM#ANZSEIT=0 DO   ;NEUE SEITE ;side 
+	. . . . . . WRITE "</TD></TR>"
+	. . . . . . WRITE "</TABLE>"
+	. . . . . . ;DO ZUSATZTEXT
+	. . . . . . DO FF^WWWW()
+	. . . . . . DO UEBER
+	. . . . . ;
+	. . . . . DO ANZ
+	. . ;IF ANZM=0 DO ZEILE
+	. . DO LEER^WWWTAB(15,7)
+	. . DO STOP^WWWTAB
+	. . ;ZUSATZTEXT
+	. . DO ZUSATZTEXT
+	
+	QUIT
+	
+ANZ ;einzelne ANZs
+	;-------------------------------------------------------------------------------
+	; 18-Jul-2006	PO		SR14847: Show quantity to be picked in initially selected unit as well as base
+	; 18-Jan-2006	PPP		If priority flag demand (14186)
+	;-------------------------------------------------------------------------------
+	new strAlternate
+ 
+	SET ANZM = ANZM+1
+	WRITE YCR
+	DO NL^WWWTAB    
+	DO NF^WWWTAB
+	WRITE YCR       ;,"<FONT SIZE=2>"    ;NR
+	WRITE ANZM
+	WRITE "&nbsp;"
+	WRITE YCR        ;,"</FONT>"
+	
+	DO ZWL^WWWTAB
+	WRITE YCR       ;,"<FONT SIZE=2>"   ;LAGER
+	IF +$PIECE(YFELD,Y,2)'=0 WRITE "("_$PIECE(YFELD,Y,2)_")<BR>"  ;LFN
+	IF $PIECE(YFELD,Y,14)=1 DO
+	. SET LAP=$PIECE(YFELD,Y,1)
+	. DO PICKWRITE
+	
+	WRITE "&nbsp;"
+	WRITE YCR        ;,"</FONT>"
+	
+	DO ZWL^WWWTAB
+	WRITE YCR      ;,"<FONT SIZE=2>"
+	WRITE "("_$PIECE(YFELD,Y,3)_") "   ;ARTIKEL ;item 
+	WRITE "&nbsp;"
+	WRITE "<BR> "
+	WRITE $PIECE(YFELD,Y,4)
+	WRITE YCR        ;,"</FONT>"
+	
+	DO ZWR^WWWTAB
+	WRITE YCR       ;,"<FONT SIZE=2>"
+	set strAlternate = $$BaseQuantity(ShipLoc,$piece(YFELD,Y,12),$piece(YFELD,Y,6)) // SR14847
+	if strAlternate = "" {
+		WRITE "&nbsp;"
+		WRITE "<BR> "
+	} else {
+		write strAlternate
+	}
+	if $PIECE(YFELD,Y,16) { // SR14847
+		WRITE $PIECE(YFELD,Y,16)_" "_$PIECE(YFELD,Y,6)   ;MENGE  ;quantity  ;14186
+	} else {
+		WRITE $PIECE(YFELD,Y,5)_" "_$PIECE(YFELD,Y,6)    ;MENGE  ;quantity 
+	}
+	WRITE "&nbsp;"
+	WRITE YCR       ;,"</FONT>"
+	
+	DO ZW^WWWTAB
+	WRITE YCR       ;,"<FONT SIZE=2>"    ;MENGE GEPICKT
+	WRITE "&nbsp;"
+	WRITE "<BR> "
+	WRITE "_________"
+	WRITE $PIECE(YFELD,Y,6)
+	WRITE YCR       ;,"</FONT>"
+	
+	DO ZW^WWWTAB
+	WRITE YCR        ;,"<FONT SIZE=2>"    ;DEMAND
+	WRITE $PIECE(YFELD,Y,12)
+	WRITE "&nbsp;"
+	WRITE YCR        ;,"</FONT>"
+	
+	DO ZW^WWWTAB
+	WRITE YCR        ;,"<FONT SIZE=2>"    ;SUPPLY
+	WRITE $PIECE(YFELD,Y,13)
+	WRITE "&nbsp;"
+	WRITE YCR        ;,"</FONT>"
+	
+	DO EL^WWWTAB
+	QUIT
+	
+	
+BaseQuantity(pidSendingLocn,pidDemand,pstrBaseUnit) ; $$BaseQuantity(ShipLoc,$piece(YFELD,Y,12),$piece(YFELD,Y,6))
+	;-------------------------------------------------------------------------------
+	; Return a string of HTML containing quantity in terms of base unit followed by base unit description.
+	;
+	; Params:
+	; pidSendingLocn - Sending Stock Location Id
+	; pidDemand - Demand Id
+	; pstrBaseUnit - Base / Default unit
+	;
+	; ByRefs: None
+	;
+	; Returns: strResult - QUANTITY UNIT if demand dealt with by Transfer Order system and unit
+	; 					   entered into Transfer Order Line is not base unit.
+	;
+	; History:
+	; 18-Jul-2006	PO		SR14847: Created
+	;-------------------------------------------------------------------------------
+	new objDemand,idKey,idTFR,idLine,objLine,strQuantities,idItem,idUnit,strResult
+ 
+	set strResult = ""
+ 
+	set objDemand = $get(^INDRPDEMAND(0,pidSendingLocn,pidDemand,1))
+	if objDemand '= "" {
+		set idKey = $$$INDRPDEMANDTransfer(objDemand)
+		if idKey '= "" {
+			set idTFR   = $$$KEY1(idKey)
+			set idLine  = $$$KEY2(idKey)
+			set objLine = $get(^INTFRLine(0,idTFR,idLine,1))
+			set idItem  = $$$INTFRLineItem(objLine)
+			set idUnit  = $$$INTFRLineUnit(objLine)
+			if $$GetUOMConversion^INUOMConversion(idItem,idUnit) '= 1 {
+				set strQuantities = $$CalculateQuantity^INUOMConversion(idItem,idUnit,$$$INDRPDEMANDPickedQuantity(objDemand))
+				if +$piece(strQuantities,Y,2) = 0 {
+					set strResult = "("_$piece(strQuantities,Y,1)_" "_$$$AppEnum("EINHEIT",idUnit)_")&nbsp;<br />"
+				} else {
+					set strResult = "("_$piece(strQuantities,Y,1)_" "_$$$AppEnum("EINHEIT",idUnit)_", "_
+									$piece(strQuantities,Y,2)_" "_pstrBaseUnit_")&nbsp;<br />"
+				}
+			}
+		}
+	}
+	quit strResult
+	
+	
+DEMANDEIN     ;IN DRP DEMAND SPEICHE ;within DRP spoke 
+	NEW SATZ,KEY
+	
+	SET KEY  = ShipLoc_","_DEMAND
+	SET SATZ = DEMAND1
+	IF $PIECE(DEMAND1,Y,50)="" DO
+	. SET $PIECE(SATZ,Y,42) = +$HOROLOG           ;PICKLISTE DRUCK AM ;printing to the 
+	. SET $PIECE(SATZ,Y,50) = $PIECE(SATZ,Y,5)    ;GEPICKT MENGE ;quantity 
+	. SET YOK = $$^WWWSPEI("INDRPDEMAND",KEY,SATZ,$$$YES)
+	. DO ^INDRPSAVED(KEY,SATZ)  ;UPDATE SUPPLY OF DESTINATION LOCATION;FIS;01.04.04 ;LOCATION 
+	
+	QUIT
+	
+LIST	; SR14427 Is this in use ??
+	DO START100^WWWTAB  ;STARTEN DER ÜBERSCHRIFT ;launching the superscription 
+	WRITE "<THEAD>" 
+	DO NL^WWWTAB
+	FOR I=1:1 QUIT:$PIECE(UES,Y,I,99)=""  DO NHWZ^WWWTAB WRITE $PIECE(UES,Y,I),"&nbsp;" DO EH^WWWTAB
+	DO EL^WWWTAB
+	WRITE "</THEAD>"
+	QUIT
+	
+	;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	SET VERSNR=""
+	FOR  SET VERSNR=$ORDER(^WWWSOR(YUSER,VERSNR)) QUIT:VERSNR=""  DO
+	. SET DEMAND=""
+	. FOR  SET DEMAND=$ORDER(^WWWSOR(YUSER,VERSNR,DEMAND)) QUIT:DEMAND=""  DO
+	. . SET YFELD=$GET(^WWWSOR(YUSER,VERSNR,DEMAND))
+	. . DO ANZ
+	. . QUIT
+	. . ;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+	. . ;  FIXME : THIS CODE IS DISABLED BY THE PRECEDING "QUIT" - IS THIS CORRECT?  <GRF> - see query re "in use".
+	. . DO LEER^WWWTAB(15,7)
+	. . DO STOP^WWWTAB
+	. . DO ZUSATZTEXT
+	
+	QUIT
+	;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	
+ZUSATZTEXT   ;ZUSATZTEXT
+ 	
+	IF ANZM'=0 IF TEXT'="" DO
+	. WRITE "<BR>"
+	. IF '$FIND(TEXT,"<") DO  QUIT
+	. . FOR YI=1:1  QUIT:$PIECE(TEXT,"|",YI,9999)=""  WRITE $PIECE(TEXT,"|",YI),"<BR>",YCR  ;NUR TEXT ;only Text 
+	. ;
+	. FOR YI=1:1  QUIT:$PIECE(TEXT,"|",YI,9999)=""  WRITE $PIECE(TEXT,"|",YI),YCR  ;HTML
+	
+	WRITE YCR
+	DO FF^WWWW()
+	WRITE YCR
+	WRITE YCR
+	QUIT
+	
+UEBER
+	DO KOPF
+	
+	DO START100^WWWTAB  ;STARTEN DER ÜBERSCHRIFT ;launching the superscription 
+	WRITE "<THEAD>" 
+	DO NL^WWWTAB
+	FOR I=1:1 QUIT:$PIECE(UES,Y,I,99)=""  DO NHWZ^WWWTAB WRITE $PIECE(UES,Y,I),"&nbsp;" DO EH^WWWTAB
+	DO EL^WWWTAB
+	WRITE "</THEAD>"
+	QUIT
+	
+KOPF 
+	;-------------------------------------------------------------------------------
+	; Method Usage
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-May-2006	PO		SR14427: If transfer performed via Transfer Order form
+	;							then display relevant details (Phase 2)
+	;-------------------------------------------------------------------------------
+	new idTFR,dteTransfer,objRecord,strDescription
+ 
+	DO START1000^WWWTAB
+	WRITE YCR,"<TR>"
+	WRITE YCR,"<TD><NOBR>"
+	
+	WRITE YCR,"<TABLE BORDER=0 CELLSPACING=1 WIDTH=100%>"
+	WRITE YCR,"<TR>"
+	
+	WRITE YCR,"<TD ALIGN=CENTER COLSPAN=2>"
+	WRITE "<FONT SIZE=3><B>"
+	WRITE YKOPF
+	WRITE "</B></FONT><BR>"
+	
+	WRITE YCR,"<FONT SIZE=1>"
+	WRITE $$^WWWTEXT(388)_": "_ShipLoc_" "_$PIECE($GET(^WWW0121(0,0,ShipLoc,1)),Y,1)      ; "Location"
+	IF +$GET(SOR)=0 DO
+	. WRITE YCR,"&nbsp;&nbsp;&nbsp;&nbsp;"
+	. WRITE YCR,$$^WWWTEXT(3172)_": "_$GET(ABTEILUNG)                                      ; "Department"  *** DEPRECATED ***
+	. IF $GET(ABTEILUNG)'=" " WRITE " - "_$PIECE($GET(^WWW0124(0,$GET(ABTEILUNG),1)),Y,1)     ;ABTEILUNG ;speciality 
+	WRITE "</FONT></TD>"
+	
+	WRITE YCR,"</TR>"
+	WRITE YCR,"</TABLE>",YCR
+	
+	DO
+	. NEW TOUR1
+	. SET TOUR1=$GET(^INDRPUMTOUR(0,ShipLoc,VERSNR,1))
+	. WRITE YCR,"<TABLE BORDER=0 CELLSPACING=1 WIDTH=100%>"
+	. WRITE "<TR>"
+	. ;
+	. WRITE YCR,"<TD WIDTH=33%>",YCR
+	. WRITE "<FONT SIZE=2><B>"
+	. WRITE $$^WWWTEXT(32807)_" "_$$^WWWTEXT(388)_": "  ; "For"   "Location"
+	. WRITE $PIECE(TOUR1,Y,3)       ;to location 
+	. IF $PIECE(TOUR1,Y,3)'="" WRITE " "_$PIECE($GET(^WWW0121(0,0,$PIECE(TOUR1,Y,3),1)),Y,1)  ;NAME
+	. WRITE "<BR>"
+	. WRITE $$^WWWTEXT(32808)_": "  ; "Route"
+	. WRITE $PIECE(TOUR1,Y,2)
+	. IF $PIECE(TOUR1,Y,2)'="" WRITE " "_$PIECE($GET(^INDRPUMLKW(0,$PIECE(TOUR1,Y,2),1)),Y,2)
+	. ;IF $PIECE(TOUR1,Y,10)'="" WRITE " ( "_$PIECE(TOUR1,Y,10)_" )"
+	. WRITE "</B></FONT></TD>"
+	. ;
+	. WRITE YCR,"<TD ALIGN=CENTER VALIGN=BOTTOM WIDTH=33%>",YCR
+	. WRITE "<FONT SIZE=2><B>"
+	. WRITE " "
+	. WRITE "<BR>"
+	. DO
+	. . IF $DATA(^WWW0031(0,"INDRPUMTOUR",10,SPRACHE,1)) WRITE $PIECE(^(1),Y,1) QUIT
+	. . WRITE $PIECE($GET(^WWW003(0,"INDRPUMTOUR",10,1)),Y,1)
+	. WRITE ": "_$PIECE(TOUR1,Y,10)  ;VERSANDTERMIN
+	. WRITE "</B></FONT></T]]><![CDATA[D>"
+	. ;
+	. WRITE YCR,"<TD ALIGN=RIGHT VALIGN=BOTTOM WIDTH=33%>",YCR
+	. WRITE "<FONT SIZE=2><B>"
+	. set idTFR = $$$INDRPUMTOURTransfer(TOUR1)
+	. if idTFR = "" do
+	. .;set strDescription = $$^WWWFELDNAME("INDRPDEMAND","D",41) // Use this instead ?
+	. . set objRecord      = $get(^WWW0031(0,"INDRPDEMAND",41,SPRACHE,1))
+	. . set strDescription = $$$WWW0031PropertyDescription(objRecord)
+	. . if strDescription="" do
+	. . . set objRecord      = $get(^WWW003(0,"INDRPDEMAND",41,1))
+	. . . set strDescription = $$$WWW0031PropertyDescription(objRecord)
+	. . write strDescription_": "_VERSNR_"<br />"
+	. . write $$$Text(32168)_": "_$$^WWWDATE($piece(TOUR1,Y,1))              ; "Delivery Date"
+	. ;
+	. if idTFR '= "" do
+	. . write $$^WWWFELDNAME("INTFR","P",1)_": "_idTFR
+	. . ;set dteTransfer = $$$INTFRTransferDate($get(^INTFR(0,idTFR,1)))
+	. . ;write "<br />"_$$$StrINTFRTransferDate_": "_$$^WWWDATE(dteTransfer)
+	. . write "<br />"_$$$Text(32168)_": "_$$^WWWDATE($piece(TOUR1,Y,1))     ; "Delivery Date"
+	. WRITE "</B></FONT></TD>"
+	. ;
+	. WRITE YCR,"</TR>"
+	
+	WRITE YCR,"</TABLE>",YCR
+	
+	DO EH^WWWTAB
+	DO EL^WWWTAB
+	DO STOP^WWWTAB
+	QUIT
+	
+	
+PICKWRITE
+	DO  ;NÄCHSTE KLEINERE PICK-EBENE ;next 
+	. SET PICK = $ORDER(^WWWSOR(YUSER,"PICK",ShipLoc,LAP),-1)
+	. QUIT:PICK=""
+	. SET PICK1 = $GET(^WWWSOR(YUSER,"PICK",ShipLoc,PICK))
+	. IF +$PIECE(PICK1,Y,2)'=0 IF $PIECE(PICK1,Y,3)'=1 SET PICK = ""
+	
+	IF PICK="" DO  ;NÄCHSTE GRÖSSERE PICK-EBENE ;next 
+	. SET PICK = $ORDER(^WWWSOR(YUSER,"PICK",ShipLoc,LAP),1)
+	. QUIT:PICK=""
+	. SET PICK1 = $GET(^WWWSOR(YUSER,"PICK",ShipLoc,PICK))
+	. IF $PIECE(PICK1,Y,2)'=0 IF $PIECE(PICK1,Y,3)'=1 SET PICK = ""
+	
+	IF PICK="" DO  ;NÄCHSTE FREIE PICK-EBENE (KLEINER) ;next 
+	. SET PICKX = LAP
+	. FOR  QUIT:PICK'=""  SET PICKX = $ORDER(^WWWSOR(YUSER,"PICK",ShipLoc,PICKX),-1) QUIT:PICKX=""  DO
+	. . SET PICKX1=$GET(^WWWSOR(YUSER,"PICK",ShipLoc,PICKX))
+	. . IF ($PIECE(PICKX1,Y,2)=0) || ($PIECE(PICKX1,Y,3)=1) SET PICK = PICKX SET PICK1 = PICKX1
+	
+	IF PICK'="" DO
+	. WRITE ">> "
+	. WRITE PICK  ;PICK-EBENE
+	. WRITE "&nbsp;"
+	. IF $PIECE(PICK1,Y,3)'=1 KILL ^WWWSOR(YUSER,"PICK",ShipLoc,PICK)  ;KEINE MEHRFACHBELEGUNG ;no 
+	
+	IF PICK="" WRITE LAP               ;BITTE PRÜFEN ;please check
+	
+	WRITE "&nbsp;",YCR
+	QUIT
+	
+]]></Routine>
+</Export>

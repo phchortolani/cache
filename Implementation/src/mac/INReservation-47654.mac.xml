@@ -1,0 +1,386 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReservation" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReservation
+	
+#include INConst
+#include COMSYS
+#include %occInclude
+#include COMConst
+#include COMView
+	
+OnBeforeSave(pYMFELD)
+	;-------------------------------------------------------------------------------
+	; NOTE : Manual forms do not process "OnBeforeSave" executables.
+	; 
+	; This code is not therefore called from the INReservation form
+	; 
+	; History:
+	; 08-Jan-2009	DavidR	SR16275: changed logic
+	; 16-Oct-2008	PP		SR15973: Created
+	;-------------------------------------------------------------------------------
+	if $piece(pYMFELD,Y,4)'>0 {
+		set YRETVAL = $$$MakeStatus("IN00632")  ; "Quantity must be greater than 0."
+	}
+	quit
+ 
+ClearReservation(pstrReserveKey,pidType,pidLocation="",pintLine="")
+	;-------------------------------------------------------------------------------
+	; Removes all Current and Future Temporary Reservations. 
+	; Preserves reservations from the reserve list.
+	;
+	; Returns: -
+	;
+	; History:
+	; 24-May-2013	SCR		CORE-94: Added Location, Line & Type
+	; 01-Oct-2008   PPP  	SR15973: Created
+	;-------------------------------------------------------------------------------
+	new objResultSet,sc,strSQL,strStatus
+ 	
+ 	set strStatus    = $$$OK
+	set objResultSet = ##class(%Library.ResultSet).%New()
+	set strSQL       = "SELECT ID FROM alDRP.dPlannedMovement WHERE Reference = ? and (MovementType_MovementTypeId = ?) "
+	; CORE-94 vvvv
+	set:pidLocation'="" strSQL	= strSQL_" and (FromLocn = '"_pidLocation_"')" 
+	set:pintLine'="" strSQL		= strSQL_" and (LineNumber = '"_pintLine_"')" 
+ 	; CORE-94 ^^^^
+	if objResultSet.Prepare(strSQL) {
+		if objResultSet.Execute(pstrReserveKey,$listbuild(pidType)) {
+			while objResultSet.Next() {
+				quit:$$$ISERR(strStatus)
+				
+				set sc = ##class(alDRP.dPlannedMovement).%DeleteId(objResultSet.Data("ID"))
+			//	set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+			}
+		}
+	}
+ 
+	quit
+ 
+ 
+CreateReserve(pstrReserveKey,pidItem,pidLocn,pidStore,pdteReservedTo,pfltQtyReqd)
+	;-------------------------------------------------------------------------------
+	; Sets the reservation global and calls a routine to set 
+	; Available Quantity on Hand.
+	;
+	; Returns: Reserved Quantity
+	;
+	; History:
+	; 21-Oct-2008	PPP		SR16046: REVERTED - This is the reservation created by
+	; 							the POS and hence *IS* of type Sale
+	; 21-Oct-2008	HQN		SR16046: Create Reservation Type Reservation instead of
+	; 							Sale
+	; 01-Oct-2008   PPP		SR15973: Created
+	;-------------------------------------------------------------------------------
+	new fltQtyIssued,fltTotal,lstAvailable,loop
+	new objBundle,objItem,objReservation,objStorage,sc,strStatus
+ 
+	set sc = $$$OK
+    
+    if (pidItem'="") && (pidLocn'="") {
+		set fltTotal = 0
+		
+	//	set objToLocn   = ##class(alLOC.iULOC).GetLocation($$$INDRPUMLKWLocation(strDispatch))
+	//	set objFromLocn = ##class(alLOC.iULOC).GetLocation(pidLocn)
+		
+		set lstAvailable = ##class(alDRP.iDRP).SourceIssue(pidItem,pidLocn,pfltQtyReqd)
+		
+		for loop=1:1:lstAvailable.Count() {
+			quit:$$$ISERR(sc)
+			
+			set objItem      = lstAvailable.GetAt(loop).Item
+			set objStorage   = lstAvailable.GetAt(loop).Storage
+			set objBundle    = lstAvailable.GetAt(loop).Bundle
+			set fltQtyIssued = lstAvailable.GetAt(loop).QtyToIssue
+ 
+			; Reserve first, 
+			; 23-Sep-2008 vvvv
+			write "<Reserve>"_pidItem_","_pidLocn_","_objStorage.%Id()_","_pdteReservedTo_","_pstrReserveKey_","_fltQtyIssued_"</Reserve>" 
+	
+			set objReservation = ##class(alDRP.dPlannedMovement).%New()
+			set objReservation.MovementType = ##class(alDRP.dMovementType.Sale).%New()
+			//set objReservation.MovementType = ##class(alDRP.dMovementType.Reservation).%New() ; 21-Oct-2008 SR16046
+			set objReservation.Item         = objItem
+			set objReservation.FromLocn     = objStorage.Location
+			set objReservation.FromStorage  = objStorage
+			set objReservation.ToLocn       = $$$NULLOREF
+			set objReservation.ToStorage    = $$$NULLOREF
+			set objReservation.Bundle       = objBundle
+			set objReservation.QtyRequired  = fltQtyIssued
+			set objReservation.Reference    = pstrReserveKey
+			set objReservation.LineNumber   = ""
+			set objReservation.DueDate      = pdteReservedTo
+			set sc = objReservation.ChangeState(3)
+	
+			set fltTotal = fltTotal + fltQtyIssued
+		}		
+    }
+    
+    quit fltTotal
+	
+	
+CreateManualReserve(pidUser)
+	; Assumes INPUT
+	new strStatus
+	
+	quit:$get(INPUT(1))=""
+ 
+	if $get(INPUT(4))<0 {
+		do ReturnError^COMUtilError($$$MakeStatus("IN00632"))
+		quit
+	}
+	
+	set strStatus = $$Transaction^COMTransaction("CreateManualReserveTxn^INReservation("""_pidUser_""")")
+	
+	if $$$ISOK(strStatus) {
+		do GoToForm^COMUtilForm("INListBundles",YKEY)
+	} else {
+		do ReturnError^COMUtilError(strStatus)
+	}
+ 
+	quit
+	
+	
+CreateManualReserveTxn(pidUser)
+	;-------------------------------------------------------------------------------
+	; Sets the Reservation data/classs (^alDRP.iMovementD - "dPlannedMovement")
+	;
+	; Returns: status
+	;
+	; History:
+	; 21-Oct-2008	HQN		SR16046: Create Reservation Type Reservation instead of
+	; 							Sale
+	; 21-Oct-2008   PPP  	SR16046: Need to identify Manual Reservations (used
+	; 							hyphen '-' instead of ':')
+	; 01-Oct-2008   PPP  	SR15973: Created
+	;-------------------------------------------------------------------------------
+	new dteReservedTo,fltQtyIssued,fltQtyReqd,fltTotal,idItem,idLocn,idReference
+	new loop,lstAvailable,objBundle,objItem,objReservation,objStorage,sc,strStatus
+	
+	set idItem        = $get(INPUT(1))
+	set idLocn        = $get(INPUT(2))
+	set fltQtyReqd    = $get(INPUT(4))
+	set dteReservedTo = $get(INPUT(5))
+ 
+    if (idItem'="") && (idLocn'="") {
+		set fltTotal = ##class(alSOH.iSOH).GetQtyAvailable(idItem,idLocn,"",$$$YES)
+	    
+	    if (fltTotal < fltQtyReqd) {
+			set strStatus = $$$MakeStatus("IN00859")  ; "Total Reserve Quantity Unavailable"
+	    } else {
+		    set sc = $$$OK
+		    
+		    set idReference = $get(pidUser)_"-"_$$^WWWNEXT("INReserve")
+		    
+		    set lstAvailable = ##class(alDRP.iDRP).SourceIssue(idItem,idLocn,fltQtyReqd)
+			for loop=1:1:lstAvailable.Count() {
+				quit:$$$ISERR(sc)
+				
+				set objItem      = lstAvailable.GetAt(loop).Item
+				set objStorage   = lstAvailable.GetAt(loop).Storage
+				set objBundle    = lstAvailable.GetAt(loop).Bundle
+				set fltQtyIssued = lstAvailable.GetAt(loop).QtyToIssue
+	 			
+				set objReservation = ##class(alDRP.dPlannedMovement).%New()
+				set objReservation.MovementType = ##class(alDRP.dMovementType.Reservation).%New()
+				set objReservation.Item         = objItem
+				set objReservation.FromLocn     = objStorage.Location
+				set objReservation.FromStorage  = objStorage
+				set objReservation.ToLocn       = $$$NULLOREF
+				set objReservation.ToStorage    = $$$NULLOREF
+				set objReservation.Bundle       = objBundle
+				set objReservation.QtyRequired  = fltQtyIssued
+				set objReservation.Reference    = idReference
+				set objReservation.LineNumber   = ""
+				set objReservation.DueDate      = dteReservedTo
+				set sc = objReservation.ChangeState(3)
+		    }
+			set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+		}
+    } else {
+	    set strStatus = $$$MakeStatus("IN00859")      ; "Total Reserve Quantity Unavailable"
+    }
+    
+    quit strStatus
+ 
+ 
+ListReservations(idItem="", idLoc="")
+	;-------------------------------------------------------------------------------
+	;	Show COMView with "Stock History" for the Item
+	; 
+	; Called by : 
+	;
+	; History:
+	; 01-Oct-2008	PPP		SR15866: Created
+	;-------------------------------------------------------------------------------
+	new enumOperator,idClass,idItem,idLocn,idStore,strData
+ 
+	set strData = $get(^CacheTemp(YUSER,"INReserve"))
+  	set idItem  = $$$KEY1(strData)
+ 	set idLocn  = $$$KEY2(strData)
+ 	set idStore = $$$KEY3(strData)
+ 
+	if idItem'="" {
+		set enumOperator = $$$EnumCOMVIEWCOMPARATOREquals
+	} else {
+		set enumOperator = $$$EnumCOMVIEWCOMPARATORStartsWith
+	}
+ 	
+ 	set idClass = "alDRP.dPlannedMovement"
+	$$$ClearExternalFilter(idClass)
+	do Initialise^COMViewCustom(idClass,,$$$NO,$$$NO,$$$YES) 
+	do AddExternalFilter^COMViewFilter(idClass,"Item->ItemId",     idItem, enumOperator,$$$YES)
+	do AddExternalFilter^COMViewFilter(idClass,"FromLocn->Code",   idLocn, $$$EnumCOMVIEWCOMPARATOREquals,$$$YES)
+	do AddExternalFilter^COMViewFilter(idClass,"FromStorage->Code",idStore,$$$EnumCOMVIEWCOMPARATOREquals,$$$YES)
+	do AddExternalFilter^COMViewFilter(idClass,"State->StateId",   3,      $$$EnumCOMVIEWCOMPARATOREquals,$$$NO)
+	
+	do AddCommand^COMViewCustom($$$Text("IN00315"),"del.gif","Delete^INReservation",$$$Text(321))   ;Delete
+ 	do Show^COMViewCustom($$$YES)
+ 
+	quit $$$OK
+	
+	
+Delete(pobjResult)
+    ;-------------------------------------------------------------------------------
+    ; Called from above via COMView to delete a Reservation
+    ;
+    ; Returns: Boolean (whether to refresh the result grid or not)
+    ;
+    ; History:
+    ; 21-Oct-2008	HQN		SR16046: Check MovementType instead to determine
+    ; 							validity of deletion
+	; 21-Oct-2008   PPP		SR16046: Stop Deletion of Reservations 
+	; 							other that Manual Reservations
+	; 01-Oct-2008   PPP 	SR15973:Created
+	;-------------------------------------------------------------------------------
+	new blnRefresh,idReserve,objRes,sc
+	
+	set blnRefresh = $$$YES
+	
+	while pobjResult.Next() {
+		set idReserve=$$GetID^COMViewCustom(pobjResult)
+		if idReserve'="" {
+			set objRes = ##class(alDRP.dPlannedMovement).%OpenId(idReserve)
+			
+			if objRes'=$$$NULLOREF {
+				;if objRes.Reference'["-" {
+				if objRes.MovementType.MovementTypeId '= 12 { ; 21-Oct-2008 SR16046
+					$$$Alert($$$Text("IN00858"))    ; "Deletion possible only for Manual Reservations"
+					set blnRefresh = $$$NO
+					do objRes.%Close()
+ 
+				} else {
+					
+					do objRes.%Close()
+					set sc = ##class(alDRP.dPlannedMovement).%DeleteId(idReserve)
+				}
+			}
+		}
+	}
+	
+	quit blnRefresh
+	
+	
+ChckDte()
+    ;-------------------------------------------------------------------------------
+	; Checks that the date entered it not before current Date
+	; %TXT(1) - placed an alert on the screen and copies back the default date
+	; 
+	; History:
+	; 08-Jan-2009	DavidR: SR16275 Created
+	;------------------------------------------------------------------------------- 
+	new dteEntered,dteYesterday,strEntered
+	
+	set dteYesterday = $horolog-1
+	set strEntered   = YINHALT
+	set dteEntered   = $$^WWWDATE1(strEntered)
+	
+	if dteEntered'>dteYesterday {
+		set strEntered = $$^WWWDATE($horolog+30)
+		set %TXT(1) = %TXT(1)_"#Y"_YFORM_"M5"_Y_strEntered_"#!"_"Date must be now or in the future"
+	}
+	quit
+	
+	
+ChckQty()
+	;-------------------------------------------------------------------------------
+	; Checks that there is a Qty entered is more than 0
+	; %TXT(1) - placed an alert on the screen and places a NULL string back into
+	;           the field to ensure you cant save it without a valid entry
+	; 
+	; History:
+	; 08-Jan-2009	DavidR: SR16275 Created
+	;------------------------------------------------------------------------------- 
+	new qty
+	
+	set qty = YINHALT
+	
+	if qty'>0 {
+		set qty = ""
+		set %TXT(1) = %TXT(1)_"#Y"_YFORM_"M4"_Y_qty_"#!"_"Quantity must be more than 0"
+    }
+ 	quit
+
+FixReservation(pblnKill=0)
+	;-------------------------------------------------------------------------------
+	; Removes all Current and Future Temporary Reservations. 
+	; Preserves reservations from the reserve list.
+	;
+	; Returns: -
+	;
+	; History:
+	; 13-Nov-2013	SCR		HEVA-1265: Created
+	;-------------------------------------------------------------------------------
+	new blnDel,idRes,intStatus,intType,objIssue,objRes,objResultSet,objTfr,objType
+	new sc,strRef,strSQL,strStatus
+ 	
+ 	do ^WWWVAR
+ 	set strStatus    = $$$OK
+	set objResultSet = ##class(%Library.ResultSet).%New()
+	set strSQL       = "SELECT ID FROM alDRP.dPlannedMovement"
+	if objResultSet.Prepare(strSQL) {
+		if objResultSet.Execute() {
+			while objResultSet.Next() {
+				quit:$$$ISERR(strStatus)
+				
+				set objRes = ##class(alDRP.dPlannedMovement).%OpenId(objResultSet.Data("ID"))
+				set objType = objRes.MovementType
+				set intType	= objType.MovementTypeId
+				set strRef	= objRes.Reference
+				set idRes	= objRes.%Id()
+				set blnDel	= 0
+				if intType = 30 {
+					if strRef="" Write " ************** No Ref" CONTINUE
+					set objTfr = $get(^INTFR(YM,strRef,1))
+					set intStatus = $$$INTFRStatus(objTfr)
+					if intStatus>1 {
+						set blnDel	= 1
+					}
+				}
+				if intType = 11 {
+					if strRef="" Write " ************** No Ref" CONTINUE
+					set objIssue = $get(^INIssue(YM,strRef,1))
+					set intStatus = $$$INIssueStatus(objIssue)
+					if intStatus>7 {
+						set blnDel	= 1
+					}
+				}
+				if blnDel = 1 {
+						write !,idRes," Type=",objType.MovementTypeId," Ref ",strRef," "
+						write " Status = ",intStatus					
+						write " Delete ++++++++++ "
+						;merge ^alDRP.iMovementDSave(idRes)=^alDRP.iMovementD(idRes)
+						if pblnKill=1 {
+							set sc=##class(alDRP.dPlannedMovement).%DeleteId(objResultSet.Data("ID"))
+							write " Gone sc="_sc
+							if sc'=1 quit
+						}
+				}
+
+			}
+		}
+	}
+	quit
+
+]]></Routine>
+</Export>

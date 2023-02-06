@@ -1,0 +1,376 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="Report.VARMapaMovMensal">
+<Super>%Persistent</Super>
+
+<Method name="VARMapaMovMensalClose">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;QHandle:%Binary</FormalSpec>
+<PlaceAfter>VARMapaMovMensalExecute</PlaceAfter>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// Clean up by purging the temporary node in ^CacheTemp global
+	Set reportId = $List(QHandle,2)
+
+	Kill ^CacheTemp("REPORTSP",reportId)
+	Quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="VARMapaMovMensalExecute">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;QHandle:%Binary,mes:%Integer,ano:%Integer,local:%String,grupo:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// Get reportid i.e. use $INCREMENT to add another node to ^CacheTemp global. 
+	// We use ^CacheTemp global because it will always use memory before disk
+
+	// Use $Increment to get the next node
+	Set reportId = $Increment(^CacheTemp("REPORTSP"))
+	Kill ^CacheTemp("REPORTSP",reportId)
+
+	set dataInicial = $zdateh(mes_"/01/"_ano)
+	set dataFinal  	= $$SQLGetUltimoDiaMes^VARSQL(mes,ano)
+	
+	if (local = $char(0)) {
+		set local = ""
+	}
+	if (grupo = $char(0)) {
+		set grupo = ""
+	}
+	
+	&sql(
+		DECLARE MapaMovMensal CURSOR FOR
+		SELECT	Item,
+				DateConfirmed,
+				Location,
+				QtyMoved,
+				TxValue,
+				$LISTGET(MovementType,1) as MovementType,
+				MovementType as MovementTypeList,
+				Reference,
+				Storage->Code,
+				Location
+		INTO	:item,
+				:dateConfirmed,
+				:location,
+				:qtyMoved,
+				:txValue,
+				:movementType,
+				:movementTypeList,
+				:reference,
+				:storage,
+				:location
+		FROM	alSOH.dStockHistory
+		WHERE	DateConfirmed BETWEEN TO_DATE(:dataInicial, 'DD/MM/YYYY') AND TO_DATE(:dataFinal, 'DD/MM/YYYY')
+		AND		((:local IS NULL)
+				 OR (((Location = :local) AND (:local IS NOT NULL))
+				     OR (($LISTGET(MovementType,1) = 30) AND (:local IS NOT NULL))))
+		AND		((:grupo IS NULL) OR ($$SQLGetGrupoPai^VARSQL($$SQLGetGrupoItem^VARSQL(Item)) = $$SQLGetGrupoPai^VARSQL(:grupo)))
+  	)
+
+
+	&sql(OPEN MapaMovMensal)
+	&sql(FETCH MapaMovMensal)
+	While (SQLCODE = 0){
+		
+		set movmtVetor = $$GetMovmtVetor^VARStockHistory(movementType, qtyMoved)
+		set tipoRecebimento = $$GetTipoRecebimento^VARSQL(reference)
+		set tipoEstorno = $$GetTipoEstorno^VARSQL(reference)
+		set reasonCode = $$GetReasonCode^VARMapaMovMensal(reference)
+		set tipoINADJ = $$GetTipoINADJ^VARMapaMovMensal(reference)
+		set grupoPai = $$SQLGetGrupoPai^VARSQL($$SQLGetGrupoItem^VARSQL(item))
+		set txValueFormatado = $fnumber($$GetValorPositivo^VARSQL(txValue),"",4)
+		set isRouteFromReq = $$IsRouteFromRequisitante^VARSQL(reference)
+		set isLocalDestinoTransf = $$IsLocalDestinoTransfArmazenagem^VARSQL(reference)
+		set isLocalAceiteTransf = $$IsLocalAceiteTransfArmazenagem^VARSQL(reference)
+		set isRouteFromAbast = $$IsRouteFromAbastecedor^VARSQL(reference)
+		
+		//DEVOLUCAO
+		if (((movementType = 22)
+			 && (movmtVetor = "Entrada"))
+			||((movementType = 1)
+			   && (tipoRecebimento = 4)
+			   && (movmtVetor = "Entrada"))
+			||((movementType = 7)
+			   && (tipoEstorno = 4)
+			   && (movmtVetor = "Saída")))
+		 {
+			 if (movmtVetor = "Entrada") {
+				 set Devolucao(grupoPai) = +$get(Devolucao(grupoPai)) + txValueFormatado
+			 }
+			 else {
+				 set Devolucao(grupoPai) = +$get(Devolucao(grupoPai)) - txValueFormatado
+			 }
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //REQUISICAO
+		 elseif (((movementType = 11)
+		   	   || (movementType = 21))
+			  && (movmtVetor = "Saída"))
+		 {
+			 set Requisicao(grupoPai) = +$get(Requisicao(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //DOACAO-ENTRADA
+		 elseif (((movementType = 1)
+			   && (tipoRecebimento = 2)
+			   && (movmtVetor = "Entrada"))
+			  ||((movementType = 7)
+				 && (tipoEstorno = 2)
+				 && (movmtVetor = "Saída")))
+		 {
+			 if (movmtVetor = "Entrada") {
+				 set DoacaoEntrada(grupoPai) = +$get(DoacaoEntrada(grupoPai)) + txValueFormatado
+			 }
+			 else {
+				 set DoacaoEntrada(grupoPai) = +$get(DoacaoEntrada(grupoPai)) - txValueFormatado
+			 }
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //DOACAO-SAIDA
+		 elseif ((movementType = 40)
+			  && (movmtVetor = "Saída")
+			  && (reasonCode = 5)
+			  && (tipoINADJ = 1))
+		 {
+			 set DoacaoSaida(grupoPai) = +$get(DoacaoSaida(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //EMPRESTIMO
+		 elseif ((movementType = 40)
+			  && (movmtVetor = "Saída")
+			  && (reasonCode = 5)
+			  && (tipoINADJ = 2))
+		 {
+			 set Emprestimo(grupoPai) = +$get(Emprestimo(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //MONT-KIT
+		 elseif ((movementType = 36)
+			  && (movmtVetor = "Entrada"))
+		 {
+			 set MontKit(grupoPai) = +$get(MontKit(grupoPai)) + txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //DESMONT-KIT
+		 elseif ((movementType = 38)
+			  && (movmtVetor = "Saída"))
+		 {
+			 set DesmontKit(grupoPai) = +$get(DesmontKit(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //ESTORNO-ITEM-KIT
+		 elseif ((movementType = 37)
+			  && (movmtVetor = "Entrada"))
+		 {
+			 set EstornoItemKit(grupoPai) = +$get(EstornoItemKit(grupoPai)) + txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //SAIDA-ITEM-KIT
+		 elseif ((movementType = 35)
+			  && (movmtVetor = "Saída"))
+		 {
+			 set SaidaItemKit(grupoPai) = +$get(SaidaItemKit(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //NF-RECEBIMENTO
+		 elseif (((movementType = 1)
+			   && (movmtVetor = "Entrada"))
+			  && ((tipoRecebimento = 1)
+			 	  || ((tipoRecebimento '= 1)
+			 	      && (tipoRecebimento '= 2)
+			 	      && (tipoRecebimento '= 4))))
+		 {
+			 set NfRecebimento(grupoPai) = +$get(NfRecebimento(grupoPai)) + txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //NF-ESTORNO
+		 elseif ((movementType = 7)
+			  && (tipoEstorno = 1)
+			  && (movmtVetor = "Saída"))
+		 {
+			 set NfEstorno(grupoPai) = +$get(NfEstorno(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //AJUSTE
+		 elseif ((movementType = 40)
+			  && ((reasonCode = 0)
+			      ||(reasonCode = 1)
+			      ||(reasonCode = 2)
+			      ||(reasonCode = 4)
+			      ||(reasonCode = 9)))
+		 {
+			 if (movmtVetor = "Entrada") {
+				 set Ajuste(grupoPai) = +$get(Ajuste(grupoPai)) + txValueFormatado
+			 }
+			 else {
+				 set Ajuste(grupoPai) = +$get(Ajuste(grupoPai)) - txValueFormatado
+			 }
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //INVENTARIO-ENTRADA
+		 elseif (((movementType = 41)
+		       && (movmtVetor = "Entrada"))
+			  || ((movementType = 1)
+			      && (tipoRecebimento = 1)
+			      && ($$GetMesAnoInicialFechamento^VARMapaMovMensal(mes, ano) = 1)))
+		 {
+			 set InventarioEntrada(grupoPai) = +$get(InventarioEntrada(grupoPai)) + txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //INVENTARIO-SAIDA
+		 elseif ((movementType = 41)
+		      && (movmtVetor = "Saída"))
+		 {
+			 set InventarioSaida(grupoPai) = +$get(InventarioSaida(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //na rede
+		 elseif ($length($get(local)) = 0) {
+			 //TFR-ENTRADA
+			 if ((((movementType = 30)
+			         && (isLocalDestinoTransf = 0)
+			         && (storage '= "EmTransito"))
+			       || ((movementType = 32)
+			          && (storage '= "EmTransito")))
+			      && (movmtVetor = "Entrada"))
+			 {
+				 set TfrEntrada(grupoPai) = +$get(TfrEntrada(grupoPai)) + txValueFormatado
+				 set arrGrupoPai(grupoPai) = ""
+			 }
+			 //TFR-SAIDA
+			 elseif ((((movementType = 31)
+			       && (isLocalAceiteTransf = 0))
+			      || ((movementType = 32)
+			          && (storage '= "EmTransito")))
+			         && (movmtVetor = "Saída"))
+			{
+				 set TfrSaida(grupoPai) = +$get(TfrSaida(grupoPai)) - txValueFormatado
+				 set arrGrupoPai(grupoPai) = ""
+			}
+		 }
+		 //no local
+		 elseif ($length($get(local)) > 0) {
+			 //TFR-ENTRADA
+			 if (((movementType = 30)
+			         && (isRouteFromReq = 1)
+			         && (isLocalDestinoTransf = 1)
+			         && (storage '= "EmTransito")
+			         && ($$GetLocalDestinoTransf^VARMapaMovMensal(reference) = local))
+		       || ((movementType = 31)
+			         && (isRouteFromAbast = 1)
+			         && (isLocalAceiteTransf = 1)
+			         && (movmtVetor = "Saída")
+			         && (location = local))
+		       || ((movementType = 32)
+			         && (storage '= "EmTransito")
+			         && (location = local)))
+			 {
+				 set TfrEntrada(grupoPai) = +$get(TfrEntrada(grupoPai)) + txValueFormatado
+				 set arrGrupoPai(grupoPai) = ""
+			 }
+			 //TFR-SAIDA
+			 elseif (((movementType = 30)
+			         && (isRouteFromReq = 1)
+			         && (storage '= "EmTransito"))
+		       || ((movementType = 31)
+			         && (isRouteFromAbast = 1)
+			         && (movmtVetor = "Saída"))
+		       || ((movementType = 32)
+			         && (storage '= "EmTransito")
+			         && (movmtVetor = "Saída"))
+			   && (location = local))
+			{
+				 set TfrSaida(grupoPai) = +$get(TfrSaida(grupoPai)) - txValueFormatado
+				 set arrGrupoPai(grupoPai) = ""
+			}
+		 }
+		
+		&sql(FETCH MapaMovMensal)
+	}
+	&sql(CLOSE MapaMovMensal)
+	
+	
+	
+	Set line = 1
+	set grupoPai = $order(arrGrupoPai(""))
+	while (grupoPai '= "") {
+		set descGrupoPai = grupoPai_" - "_$$SQLGetDescGrupoItem^VARSQL(grupoPai)
+		if ($length($get(local)) > 0) {
+			set saldoInicialGrupo = $$GetSaldoInicial^VARMapaMovMensal(mes, ano, grupoPai, local)
+		}
+		else {
+			set saldoInicialGrupo = $$GetSaldoInicial^VARMapaMovMensal(mes, ano, grupoPai)
+		}
+		set saldoAtualGrupo = $fnumber(saldoInicialGrupo,"",2) +$fnumber($get(Devolucao(grupoPai)),"",2) +$fnumber($get(Requisicao(grupoPai)),"",2) +$fnumber($get(DoacaoEntrada(grupoPai)),"",2) +$fnumber($get(DoacaoSaida(grupoPai)),"",2) +$fnumber($get(Emprestimo(grupoPai)),"",2) +$fnumber($get(MontKit(grupoPai)),"",2) +$fnumber($get(DesmontKit(grupoPai)),"",2) +$fnumber($get(EstornoItemKit(grupoPai)),"",2) +$fnumber($get(SaidaItemKit(grupoPai)),"",2) +$fnumber($get(NfRecebimento(grupoPai)),"",2) +$fnumber($get(NfEstorno(grupoPai)),"",2) +$fnumber($get(Ajuste(grupoPai)),"",2) +$fnumber($get(InventarioEntrada(grupoPai)),"",2) +$fnumber($get(InventarioSaida(grupoPai)),"",2) +$fnumber($get(TfrEntrada(grupoPai)),"",2) +$fnumber($get(TfrSaida(grupoPai)),"",2)
+		set ^CacheTemp("REPORTSP",reportId,line) = $ListBuild(grupoPai, descGrupoPai,  $fnumber(saldoInicialGrupo,"",2), $fnumber(+$get(Devolucao(grupoPai)),"",2), $fnumber(+$get(Requisicao(grupoPai)),"",2), $fnumber(+$get(DoacaoEntrada(grupoPai)),"",2), $fnumber(+$get(DoacaoSaida(grupoPai)),"",2), $fnumber(+$get(Emprestimo(grupoPai)),"",2), $fnumber(+$get(MontKit(grupoPai)),"",2), $fnumber(+$get(DesmontKit(grupoPai)),"",2), $fnumber(+$get(EstornoItemKit(grupoPai)),"",2), $fnumber(+$get(SaidaItemKit(grupoPai)),"",2), $fnumber(+$get(NfRecebimento(grupoPai)),"",2), $fnumber(+$get(NfEstorno(grupoPai)),"",2), $fnumber(+$get(Ajuste(grupoPai)),"",2), $fnumber(+$get(InventarioEntrada(grupoPai)),"",2), $fnumber(+$get(InventarioSaida(grupoPai)),"",2), $fnumber(+$get(TfrEntrada(grupoPai)),"",2), $fnumber(+$get(TfrSaida(grupoPai)),"",2), $fnumber(saldoAtualGrupo,"",2))
+		set grupoPai = $order(movMensal(grupoPai))
+		Set line = line +1
+	}
+	
+	// Build QHandle (AtEnd,ReportID,Index)
+	Set QHandle = $ListBuild(0,reportId,0)
+
+	Quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="VARMapaMovMensalFetch">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;QHandle:%Binary,&amp;Row:%List,&amp;AtEnd:%Integer=0</FormalSpec>
+<PlaceAfter>VARMapaMovMensalExecute</PlaceAfter>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// This fetch method should never have to change. 
+
+	// reportId - Report ID
+	// line   - sequence lineex which represents each row
+
+	// Restore QHandle
+	Set AtEnd = $List(QHandle,1)
+	Set reportId = $List(QHandle,2)
+	Set line = $List(QHandle,3)
+	Set line = $Order(^CacheTemp("REPORTSP",reportId,line))
+
+	If (line = "") {	// if there are no more rows, finish fetching
+	 Set AtEnd = 1
+	 Set Row = ""
+	}
+	Else {	// fetch row
+		Set Row = ^CacheTemp("REPORTSP",reportId,line)
+	}
+
+	// Save QHandle
+	Set QHandle = $ListBuild(AtEnd,reportId,line)
+	
+	Quit $$$OK
+]]></Implementation>
+</Method>
+<Query name="VARMapaMovMensal">
+<Type>%SQLQuery</Type>
+<FormalSpec>mes:%Integer,ano:%Integer,local:%String,grupo:%String</FormalSpec>
+<SqlProc>1</SqlProc>
+
+<Parameter name="CONTAINID" value="0"/>
+
+<Parameter name="ROWSPEC" value="GrupoPai:%String(MAXLEN=255), DescGrupoPai:%String(MAXLEN=255), SaldoInicialGrupo:%Double,  Devolucao:%Double, Requisicao:%Double, DoacaoEntrada:%Double, DoacaoSaida:%Double, Emprestimo:%Double, MontKit:%Double, DesmontKit:%Double, EstornoItemKit:%Double, SaidaItemKit:%Double, NfRecebimento:%Double, NfEstorno:%Double, Ajuste:%Double, InventarioEntrada:%Double, InventarioSaida:%Double, TfrEntrada:%Double, TfrSaida:%Double, SaldoAtualGrupo:%Double"/>
+</Query>
+
+<Storage name="Default">
+<Type>%Library.CacheStorage</Type>
+<DataLocation>^Report.VARMapaMovMensalD</DataLocation>
+<DefaultData>VARMapaMovMensalDefaultData</DefaultData>
+<IdLocation>^Report.VARMapaMovMensalD</IdLocation>
+<IndexLocation>^Report.VARMapaMovMensalI</IndexLocation>
+<StreamLocation>^Report.VARMapaMovMensalS</StreamLocation>
+<Data name="VARMapaMovMensalDefaultData">
+<Structure>listnode</Structure>
+<Subscript/>
+<Value name="1">
+<Value>%%CLASSNAME</Value>
+</Value>
+</Data>
+</Storage>
+</Class>
+</Export>

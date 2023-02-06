@@ -1,0 +1,309 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INDRPRUN12" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INDRPRUN12(YAUFART,YART,YMENGE,YNR,TEXT1,TEXT2,BESTVOR,YONCE,pidOrder)
+	
+#include INConst
+#include COMSYS
+#define Log(%1) do Log^INDRPRUNLog(%1)
+	
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		NEUANLAGE AUFTRAG AUS DRP
+	;
+	; Inputs : 
+	;	YAUFART		= AUFTRAGSART  1=EIGENAUFTRAG 2=LF-BESTELLUNG 3=BETRIEBANFORDERUNG
+	;	YART		= ARTIKEL
+	;	YMENGE		= MENGE
+	;	YNR			= KUNDENNUMMER/LIEFERANTENNUMMER
+	;	TEXT1		= ARTIKELBEZEICHNUNG (KATALOGARTIKEL)
+	;	TEXT2		= ZUSATZTEXT/HINWEIS (KATALOGARTIKEL)
+	;	BESTVOR		= EINSPRUNG AUS BESTELLVORSCHLAGSLISTE
+	;	YONCE		= SPEICHERN UHRZEIT DRP BEARBEITUNG BEI BESTELLREGEL O/B (VERHINDERT LÖSCHEN UND KONSOLIDIERUNG)
+	;
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+    ; 12-Mar-2009	PPP		SR16397: Added Logging for the process
+	; 09-Jan-2007	JW		SR15347: Added creation of INRequisition records.
+	; 06-Oct-2006	RPW/SB	SR14933: removed an undefined YART2
+	; 22-Sep-2006	RPW		SR14933: Fixed a naked reference.
+	; 						If we need to create a MO, check that we are allowed to.
+	; 						Note this check is tempered by whether this is coming
+	; 						through the POS (ie BGJOB("No MO"))
+	; 02-Jun-2006	FrankF	SR14639: PO Release screen single item PO/PR creation
+	; 04.09.2001	FIS
+	;-------------------------------------------------------------------------------
+	NEW YAUFTRAG,YPOSITION,AUFNR,KONS,YQQ,idResp,dteDue,idReq
+	
+	IF $GET(BGJOB)'=1 IF $$^WWWRELOAD()=1 DO  QUIT
+	. IF $GET(BESTVOR)=1 QUIT 
+	. SET %("VAR","YFORM")="INDRPRUN"
+	. DO ^WWWFORM
+	
+	;BESTELLVORSCHLAGSLISTE ANLEGEN ;put onto
+	
+	SET YQQ = 0
+	IF $GET(BGJOB)=1 IF ($$$INDRPITEMProcurementCode($GET(ART2))=4) || $$$INDRPSYSOrderSuggestions($GET(^INDRPSYS(YM,YLOCATION,1))) DO  QUIT:YQQ=1   ;AUCH GRUPPE ODER ARTIKEL EINZEL AUF BESTELLVORSCHLAG SETZEN;TYBD;6,10,2004;26433;
+	. IF ($PIECE($GET(ART2),Y,8)="O") || ($PIECE($GET(ART2),Y,8)="B") QUIT  ;NICHT BACK-TO-BACK / ORDER-TO-ORDER
+	. NEW YOK,SATZ,YVOR,YFORM
+	. SET SATZ=""
+	. SET $$$INDRPBESTVORPlannedReleaseQty(SATZ)                 = YMENGE
+	. SET $$$INDRPBESTVORProcurementCode(SATZ)                   = YAUFART
+	. set:YAUFART=2 $$$INDRPBESTVORPurchaseOrderOfSupplier(SATZ) = YNR
+	. set:YAUFART=3 $$$INDRPBESTVORDemandForLocation(SATZ)       = YNR
+	. SET $$$INDRPBESTVORDemandCreationBy(SATZ)                  = $HOROLOG
+	. SET $$$INDRPBESTVOROpenDemands(SATZ)                       = $GET(DEMQTY)  ;ANZAHL DEMANDS;FIS;22.10.04;26433
+	. SET $$$INDRPBESTVORPlanner(SATZ)                           = $PIECE($get(ART2),Y,6)  ;ZUSTÄNDIGE PLANER;FIS;30.12.04;26433 // SR14933
+	. SET YOK = $$^WWWSPEI("INDRPBESTVOR",YLOCATION_","_YART,SATZ,$$$YES)
+	. SET YQQ = 1
+	
+	;AUFTRÄGE ANLEGEN ;put onto 
+	DO
+	. QUIT:$GET(YSOURCING)=1
+	. QUIT:$GET(YAUFART)=""
+	. QUIT:$GET(YART)=""
+	. QUIT:$GET(YMENGE)=""
+	. SET YNR=$GET(YNR)
+	. ;
+	. SET YAUFTRAG=""
+	. SET YPOSITION=""
+	. ;
+	. ;FREIGABE PRÜFEN ;check 
+	. DO
+	. . IF $GET(BGJOB)=1  SET $$$INAUFBlockPurchaseOrder(YAUFTRAG)=1 QUIT  ;POSITION GESPERRT ;DISABLED 
+	. . IF $$$INDRPPLANNEREverythingAllowed($GET(^INDRPPLANNER(YM,YLOCATION,YBED,1)))'=1 IF $$$INDRPPLANNERReleasePurchaseOrdersAuto($GET(^INDRPPLANNER(YM,YLOCATION,YBED,1)))'=1 SET $$$INAUFBlockPurchaseOrder(YAUFTRAG)=1 // SR14933
+	. ;
+	. ;ZUSTÄNDIGER MITARBEITER + LIEFERTERMIN ;time of delivery 
+	. //SET $$$INAUFRequiredDeliveryDate(YAUFTRAG)=(+$HOROLOG+$$LEADTIME^INATP1(YART,YLOCATION))  ;FIS;07.02.05;TERMIN IMMER SETZEN;26299
+	. set dteDue = (+$HOROLOG+$$LEADTIME^INATP1(YART,YLOCATION))  ;FIS;07.02.05;TERMIN IMMER SETZEN;26299
+	. set $$$INAUFRequiredDeliveryDate(YAUFTRAG) = dteDue		//SR15347
+	. ;
+	. //SET $$$INAUFResponsible(YAUFTRAG)=$PIECE($$$INDRPITEMPlanner($GET(^INDRPITEM(YM,YLOCATION,YART,1))),";",1)
+	. //IF $$$INAUFResponsible(YAUFTRAG)="" DO
+	. set idResp = $piece($$$INDRPITEMPlanner($get(^INDRPITEM(YM,YLOCATION,YART,1))),";",1)	//SR15347
+	. if idResp="" do
+	. . NEW WG
+	. . SET WG = $$$INARTItemGroup($GET(^INART(YM,YART,1)))  ;WARENGRUPPE
+	. . IF WG="" SET WG = $$$INVORGDefaultItemGroup($get(^INVORG(YM,YM,1)))  ;DFLT. WARENGRUPPE
+	. . set idResp = $piece($$$INDRPITEMSPlanner($get(^INDRPITEMS(YM,YLOCATION,WG,1))),";",1)  ;ZUSTÄNDIGER MITARBEITER
+	. . //IF WG'="" SET $$$INAUFResponsible(YAUFTRAG)=$PIECE($$$INDRPITEMSPlanner($GET(^INDRPITEMS(YM,YLOCATION,WG,1))),";",1)  ;ZUSTÄNDIGER MITARBEITER
+	. set $$$INAUFResponsible(YAUFTRAG)=idResp
+	. ;
+	. ;;;IF $GET(BGJOB)=1 DO  ;AUCH BEI MANUELLER AUFTRAGSANLAGE  ;FIS;07.02.05;ALT!
+	. ;. NEW WG
+	. ;. IF $DATA(^INDRPITEM(YM,YLOCATION,YART,1)) DO  QUIT  ;IM DRP ANGELEGT
+	. ;. . SET $PIECE(YAUFTRAG,Y,14)=$PIECE($PIECE($GET(^INDRPITEM(YM,YLOCATION,YART,1)),Y,6),";",1) // SR14933
+	. ;. . SET $PIECE(YAUFTRAG,Y,19)=+($HOROLOG+$PIECE($GET(^INDRPITEM(YM,YLOCATION,YART,1)),Y,11))  ;BESTELLZEIT/FERTIGUNGSZEIT // SR14933
+	. ;. ;
+	. ;. SET WG=$PIECE($GET(^INART(YM,YART,1)),Y,30)  ;WARENGRUPPE
+	. ;. IF WG="" SET WG=$PIECE($GET(^INVORG(YM,YM,1)),Y,13)  ;DFLT. WARENGRUPPE
+	. ;. IF WG'="" IF $DATA(^INDRPITEMS(YM,YLOCATION,WG,1)) DO
+	. ;. . SET $PIECE(YAUFTRAG,Y,14)=$PIECE($TRANSLATE($PIECE($GET(^INDRPITEMS(YM,YLOCATION,WG,1)),Y,6),",",";"),";",1)  ;ZUSTÄNDIGER MITARBEITER // SR14933
+	. ;. . SET $PIECE(YAUFTRAG,Y,19)=+($HOROLOG+$PIECE($GET(^INDRPITEMS(YM,YLOCATION,WG,1)),Y,11))  ;BESTELLZEIT/FERTIGUNGSZEIT // SR14933
+	. ;
+	. ;ZUSATZTEXTE IN BESTELLUNG ÜBERNEHMEN ;within sales order assume 
+	. SET $$$INAUFPItemName(YPOSITION) = $GET(TEXT1)  ;ARTIKELBEZEICHNUNG
+	. SET $$$INAUFPRemarks(YPOSITION)  = $GET(TEXT2)  ;ZUSATZTEXT HINWEIS/SPEZIFIKATION
+	. 
+	. ;EIGENAUFTRAG
+	. ;------------
+	. IF YAUFART=1 DO  // If this is a make item, then create a Manufacturing Order
+	. . // SR14933: This is where the check for Allow to create manufacturing order needs to start
+	. . quit:'$$$INDRPITEMAutoCreateManufacturingOr($get(ART2))&&($get(BGJOB("No MO"))=1) // SR14933
+	. . SET $PIECE(YAUFTRAG,Y,2)  = 1
+	. . SET $PIECE(YPOSITION,Y,4) = $GET(YART)     ;ARTIKELNUMMER
+	. . SET $PIECE(YPOSITION,Y,5) = +$GET(YMENGE)  ;MENGE   ;quantity
+	. . IF +$GET(YONCE)=1 DO
+	. . . SET $PIECE(YPOSITION,Y,256)=$PIECE(YONCE,"|",2)  ;SAVE ORDER REFERENCE;FIS;25.04.05;SR12200
+	. . . IF $PIECE(YONCE,"|",2)'="" SET $PIECE(YAUFTRAG,Y,249)=1  ;SET PRIORITY;FIS;25.04.05;SR12200
+	. . ;
+	. . IF $GET(BGJOB)=1 IF $FIND(";"_$TRANSLATE($PIECE($GET(^INDRPSYS(YM,YLOCATION,1)),Y,43),",",";")_";",";2;") SET $PIECE(YAUFTRAG,Y,38)=""  ;SOFORT FREIGEBEN;FIS;26350;01.09.04
+	. . ;
+	. . ;AUFTRAG ANLEGEN ;order put onto 
+	. . SET AUFNR=$$^INAUFANLAGE(YAUFTRAG,YPOSITION)
+	. . $$$Log($$$Text($listbuild("IN00985",AUFNR)))		//Created M/O #:%1
+	. ;
+	. ;LIEFERANTENBESTELLUNG
+	. ;---------------------
+	. IF YAUFART=2 DO  // Customer Based Order
+	. . IF $GET(YNR)="" QUIT         ;KEIN LIEFERANT ;no supplier 
+	. . ;
+	. . if YNR="MARKET" do  quit	//SR15347 - quit and go into requisition condition
+	. . . do Requisition(YAUFART,YART,YMENGE,dteDue,idResp,.idReq)
+	. . ;
+	. . SET $$$INAUFOrderType(YAUFTRAG)=2
+	. . ;
+	. . ;IF YNR="MARKET" DO		//SR15347
+	. . ;. SET YNR="LFBEST" 
+	. . ;. SET $PIECE(YAUFTRAG,Y,265)=1  ;FIS;23848;01.07.03;BESTELLUNG/WH ÜBER MARKET PLACE
+	. . ;. SET $PIECE(YAUFTRAG,Y,2)=5   ;TYBD;ANLEGEN REQUISITION ;put onto 
+	. . ;
+	. . SET $$$INAUFSupplierNumber(YAUFTRAG)         = YNR                    ;LIEFERANT   ;supplier 
+	. . SET $$$INAUFPItemNumber(YPOSITION)           = $GET(YART)             ;ARTIKELNUMMER
+	. . SET $$$INAUFPQuantity(YPOSITION)             = +$GET(YMENGE)          ;MENGE   ;quantity 
+	. . SET $$$INAUFPSource(YPOSITION)               = 1                      ;WH BESTELLUNG ;sales order
+	. . SET $$$INAUFPRequiredDeliveryDate(YPOSITION) = $PIECE(YAUFTRAG,Y,19)  ;LIEFERTERMIN
+	. . SET KONS=$$$INDRPSYSPoolPurchaseOrdersperSupp($GET(^INDRPSYS(YM,YLOCATION,1)))
+	. . ;
+	. . IF +$GET(YONCE)=1 DO
+	. . . SET KONS=0
+	. . . SET $$$INAUFPPurchaseOrderReference(YPOSITION)=$PIECE(YONCE,"|",2)  ;SAVE ORDER REFERENCE;FIS;25.04.05;SR12200
+	. . . IF $PIECE(YONCE,"|",2)'="" SET $$$INAUFPPriority(YAUFTRAG)=1  ;SET PRIORITY;FIS;25.04.05;SR12200
+	. . ;
+	. . IF $GET(BGJOB)=1 IF $$$INAUFOrderType(YAUFTRAG)=2 IF $FIND(";"_$TRANSLATE($$$INDRPSYSImmediateReleaseOfSupply($GET(^INDRPSYS(YM,YLOCATION,1))),",",";")_";",";1;") SET $$$INAUFBlockPurchaseOrder(YAUFTRAG)=""  ;SOFORT FREIGEBEN;FIS;26350;01.09.04
+	. . IF $GET(BGJOB)=1 IF $$$INAUFOrderType(YAUFTRAG)=5 IF $FIND(";"_$TRANSLATE($$$INDRPSYSImmediateReleaseOfSupply($GET(^INDRPSYS(YM,YLOCATION,1))),",",";")_";",";5;") SET $$$INAUFBlockPurchaseOrder(YAUFTRAG)=""  ;SOFORT FREIGEBEN;FIS;26350;01.09.04
+	. . ;
+	. . ;AUFTRAG ANLEGEN ;order put onto 
+	. . ;SET AUFNR=$$^INAUFANLAGE(YAUFTRAG,YPOSITION,KONS,YONCE) 
+	. . SET AUFNR=$$^INAUFANLAGE(YAUFTRAG,YPOSITION,KONS)         ;SR12001;IPRENDPRIO;26.04.05/05.04.2005
+	. . $$$Log($$$Text($listbuild("IN00986",AUFNR)))		//Created P/O #:%1
+	. ;
+	. ;WARENVERLAGERUNG - Goods Misalignment
+	. ;----------------
+	. IF YAUFART=3 DO  // We need to get this from somewhere else.
+	. . SET AUFNR = $$^INDRPRUN13(YART,YMENGE,YNR,$GET(YONCE))  ;FIS;22.04.05;SR12200
+	. . $$$Log($$$Text($listbuild("IN00987",AUFNR)))		//Created Supply #:%1
+	. ;
+ 	. ; REQUISITION
+	. ;---------------------
+	. if YAUFART=5 || (YAUFART=6) do  		//SR15347
+	. . do Requisition(YAUFART,YART,YMENGE,dteDue,idResp,.idReq)
+	. . set YAUFART=2		// set this back for msg type etc
+	. ;
+	. ;INFO-MELDUNG: AUFTRAG ANGELEGT + DRP-PROTOKOLL ;order 
+	. IF $GET(BGJOB)=1 DO
+	. . NEW INFOTEXT,XSPRACHE,ID,MITARB,MITARB2,REGEL,PRIO
+	. . SET XSPRACHE=SPRACHE
+	. . //IF $PIECE(YAUFTRAG,Y,14)'="" SET SPRACHE=$PIECE($GET(^WWW013(0,$PIECE(YAUFTRAG,Y,14),1)),Y,6)  ;SPRACHE ;Language  ;Language Language 
+	. . IF idResp'="" SET SPRACHE=$PIECE($GET(^WWW013(0,idResp,1)),Y,6)  ;SPRACHE ;Language  ;Language Language 
+	. . IF SPRACHE="" SET SPRACHE=XSPRACHE
+	. . IF $GET(AUFNR)="" SET AUFNR=" "
+	. . SET INFOTEXT=$$^WWWTEXT(32680)_": "_AUFNR  ;NEUER AUFTRAG ANGELEGT ;order
+	. . IF YAUFART=1 SET INFOTEXT=INFOTEXT_" ("_$$^WWWTEXT(32037)_")"  ;Manufacturing Order
+	. . IF YAUFART=2 SET INFOTEXT=INFOTEXT_" ("_$$^WWWTEXT(32235)_")"  ;LF-BESTELLUNG		Order  - this translation is probably incorrect (JW)
+	. . IF YAUFART=3 SET INFOTEXT=INFOTEXT_" ("_$$^WWWTEXT(32639)_")"  ;Location Order
+	. . ;
+	. . if $get(idReq)'="" do  		//SR15347
+	. . . set INFOTEXT = $$^WWWTEXT(32062)_": "_idReq			;Requisition	
+	. . . set AUFNR = idReq
+	. . . $$$Log($$$Text($listbuild("IN00988",AUFNR)))		//Created Requisition #:%1
+	. . ;
+	. . SET MITARB = idResp			// $PIECE(YAUFTRAG,Y,14)  ;ZUST. MITARBEITER	SR15347
+	. . SET MITARB2=""
+	. . SET PRIO=0
+	. . IF $GET(YMENGE)'=0 SET INFOTEXT=INFOTEXT_" "_$$^WWWTEXT(32025)_": "_YMENGE  ;MENGE;QTY;TYBD;25.1.2005:27231
+	. . IF $DATA(^INDRPMELDUNG(YM,YLOCATION,YAUFART,1)) DO
+	. . . SET REGEL=$GET(^INDRPMELDUNG(YM,YLOCATION,YAUFART,1))
+	. . . IF $PIECE(REGEL,Y,2)'=1  SET MITARB="" QUIT  ;KEINE MELDUNG ;no status signal 
+	. . . IF $PIECE(REGEL,Y,3)'="" SET MITARB=$PIECE(REGEL,Y,3)  ;MELDUNG AN MITARBEITER ;status signal upon 
+	. . . SET MITARB2=$PIECE(REGEL,Y,4)  ;KOPIE AN MITARBEITER ;copy upon 
+	. . . SET PRIO=$PIECE(REGEL,Y,5)
+	. . . SET INFOTEXT=INFOTEXT_" "_$PIECE(REGEL,Y,1)  ;MELDUNGSTEXT
+	. . ;
+	. . IF MITARB'=""  DO ^INDRPWV(INFOTEXT,MITARB,YAUFART,AUFNR,YART,PRIO)  ;TEXT,MITARBEITER,TYP,ID,ARTIKEL,PRIORITÄT
+	. . IF MITARB2'="" DO ^INDRPWV(INFOTEXT,MITARB2,YAUFART,AUFNR,YART,PRIO)  ;KOPIE ;copy 
+	. . SET SPRACHE=XSPRACHE
+	. . ;
+	. . ;PROTOKOLL ;protocol 
+	. . DO ^INDRPRUNPROT($$^WWWTEXT(32816)_": "_AUFNR,YLOCATION,$GET(RUNID),YART)  ;AUFTRAG GENERIERT ;order created
+	
+	; SR14639
+	set pidOrder = $get(AUFNR)
+	
+	IF $GET(BGJOB)=1   QUIT
+	IF $GET(BESTVOR)=1 QUIT
+	
+	;ZURUECK ZUR ÜBERSICHT ;summary 
+	SET %("VAR","YFORM")="INDRPRUN"
+	DO ^WWWFORM
+	QUIT
+	
+	
+Requisition(penumProcurement,pidItem,pfltQty,pdteDue,pidPlanner,&pidReq)
+	;-------------------------------------------------------------------------------
+	; Create a requistion
+	;
+	; Params:	pidItem		- DRP item
+	; 			pfltQty		- qty required
+	; 			pdteDue 	- date required
+	; 			pidPlanner 	- DRP planner
+	; 			pidReq		- req id
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Sep-2010	SCR		SR17309: Check Item Status and Quit if not useable
+	; 02-Mar-2010	PPP		SR17209:Update the Unit Cost of the Req
+	;							Corrected the Unit inserted on the Req record
+	; 24-Feb-2009	GRF		Clear unused variables in new command
+	; 21-Aug-2007	shobby	SRBR014680: Use correct field for the Supplier
+	; 21-May-2007	RPW		SR15513: Check for Transfer vs supplier order type reqs
+	; 08-Jan-2007	JW		SR15347: Created
+	;-------------------------------------------------------------------------------
+	new curCost,fltUnitCost,idSupp,idSupplyLocn,objReq,objSuppItemTerms,strStatus
+	
+	; SR17309 Check Item Status (Other)  vvvvvvvv
+	set strStatus = $$IsUsable^INARTDataAccess(pidItem,"INDRPITEM") ; "INDRPITEM" equates to other.
+	if strStatus'=$$$OK quit strStatus ; ^^^^^^^^
+	
+	
+	set $$$INRequisitionItem(objReq) 		= pidItem
+	//set $$$INRequisitionUnit(objReq)		= $$$INARTSalesUnit($get(^INART(YM,pidItem,1)))	//SR17209
+	set $$$INRequisitionUnit(objReq)		= $$$INARTUnitofMeasure($get(^INART(YM,pidItem,1)))
+	set $$$INRequisitionQuantity(objReq) 	= pfltQty
+	set $$$INRequisitionPlanDue(objReq) 	= pdteDue
+	set $$$INRequisitionPlanQty(objReq) 	= pfltQty
+	set $$$INRequisitionDueDate(objReq) 	= pdteDue
+	set $$$INRequisitionLocation(objReq) 	= YLOCATION
+	set $$$INRequisitionPlanner(objReq) 	= pidPlanner
+	
+	set $$$INRequisitionFirmBy(objReq)      = $$GetDate^INRequisition(pdteDue,$$$DRPFirm,    YLOCATION,pidItem)
+	set $$$INRequisitionSourceBy(objReq)    = $$GetDate^INRequisition(pdteDue,$$$DRPSource,  YLOCATION,pidItem)
+	set $$$INRequisitionRaiseBy(objReq)     = $$GetDate^INRequisition(pdteDue,$$$DRPRaise,   YLOCATION,pidItem)
+	set $$$INRequisitionPlaceBy(objReq)     = $$GetDate^INRequisition(pdteDue,$$$DRPPlace,   YLOCATION,pidItem)
+	set $$$INRequisitionConfirmBy(objReq)   = $$GetDate^INRequisition(pdteDue,$$$DRPConfirm, YLOCATION,pidItem)
+	set $$$INRequisitionToSupplierBy(objReq)= $$GetDate^INRequisition(pdteDue,$$$DRPSupplier,YLOCATION,pidItem)
+	
+	if $$CreateFirmed^INRequisition(pidItem,YLOCATION) { ; Create Firmed Orders based on parameters
+		set $$$INRequisitionFirm(objReq) 	= $$$YES
+		set $$$INRequisitionStatus(objReq) 	= $$$EnumINREQSTATUSFirmed    ; Firmed
+	} else {
+		set $$$INRequisitionStatus(objReq) 	= $$$EnumINREQSTATUSUnfirmed  ; Unfirmed
+	}
+	
+	if penumProcurement=6 {
+		set $$$INRequisitionType(objReq)=$$$EnumINREQUISITIONTYPETfr
+		set idSupplyLocn = $$$INDRPITEMSupplyLocation($get(ART2))
+		if idSupplyLocn'=YLOCATION {
+			set $$$INRequisitionSourcingLocation(objReq) = idSupplyLocn
+		}
+		
+	} else {
+		set $$$INRequisitionType(objReq)     = $$$EnumINREQUISITIONTYPEBuy
+		set idSupp = $$$INDRPITEMSupplierOfStockOrder($get(ART2))
+		set $$$INRequisitionSupplier(objReq) = idSupp
+		
+		//SR17209	- Update the Unit Cost of the Req
+		if idSupp'="" {			
+			set objSuppItemTerms = $get(^INARTK(YM,pidItem,idSupp,1))
+			set curCost = $$$INARTKNetPurchasePrice(objSuppItemTerms)
+			set fltUnitCost =  $$$INARTKConversionFactor(objSuppItemTerms)*curCost
+			set $$$INRequisitionUnitPrice(objReq) = fltUnitCost
+		}
+	}
+	
+	set pidReq    = $$^WWWNEXT("INRequisition")
+	set strStatus = $$$Save("INRequisition",YM_","_pidReq,objReq,$$$YES)
+	
+	if $$$ISOK(strStatus) {
+		do OnAfterSave^INRequisition(YM_","_pidReq,objReq)
+	}
+	quit strStatus
+	
+]]></Routine>
+</Export>

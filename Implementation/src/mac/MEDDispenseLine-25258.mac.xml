@@ -1,0 +1,1487 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDDispenseLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDDispenseLine
+	quit
+
+#include WWWConst
+#include COMConst
+#include INConst
+#include COMGridEdit31
+#include MEDConst 
+#include VARConst
+
+#define FORMFldMEDDispenseLineIssueUOM 	12
+#define FORMFldMEDDispenseLineFrom		20
+#define FORMFldMEDDispenseLineTo		21
+#define FORMFldMEDDispenseLineDose		22
+#define FORMFldMEDDispenseLineTotalRequested	26
+#define FORMFldMEDDispenseLineSolution	29
+#define YCR	"|"
+#define ReasonOther 99
+
+Enabled(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Called By : Form MEDDispense : Grid Tab (COMGridEditParameter)
+	;
+	;
+	; History:
+	; 09-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new enumPresType
+	new blnEnabled
+	
+	set blnEnabled = $$$YES
+	
+	if '$$$NoKey(pYKEY) {
+
+		if $data(^MEDDispensePickLine(0,$$$KEY1(pYKEY))) {
+			set blnEnabled = $$$NO	
+		}
+	}
+	
+	quit blnEnabled
+
+
+OnBeforeButtonLine(YKEY)
+	;-------------------------------------------------------------------------------
+	; Lock the Line if Rejected.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 21-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	/* Not working need to revisit, Added core rules on the fields
+	new objLine
+	new idKey1 
+	new idKey2
+	
+	set idKey1 = $$$KEY1(YKEY)
+	set idKey2 = $$$KEY2(YKEY)
+	
+	if '$$$NoKey(idKey2) {
+		set objLine = $get(^MEDDispenseLine(0,idKey1,idKey2,1))
+		if $$$MEDDispenseLineValidatedStatus(objLine) = "refuse.gif" {
+			set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+		}
+	}
+	*/
+	quit
+
+
+OnBeforeDisplayCombo(pstrKeys,pobjDisp,pintCol,&pSUCH)
+	;-------------------------------------------------------------------------------
+	; Populates the Dose UOM with the UOM as defined in INARTPACK only, excludes
+	; units that the item does not come in.
+	; 
+	; set pSUCH as the items to be used when you override the list (set via blnOverride)
+	;
+	; Inputs:
+	;	pstrKeys	- YKEY
+	;	pobjDisp	- YFELD
+	;	pintCol     - Edit Grid Column Id
+	;	pSUCH       - Search Array
+	; 
+	; Returns: $$$YES or $$$NO (override the data) 
+	;
+	; History:
+	; 13-Jun-2012	PPP		SR18002.1: Added Unit check for DispenseUOM (#D15)
+	; 08-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new blnOverride
+	
+	set blnOverride = $$$NO
+	
+	; F11 - Received Unit
+	;---------------------------------------
+	if pintCol = $$$FldMEDDispenseLineIssueUOM {
+		set blnOverride = $$LoadCombo^INARTPACK($$$MEDDispenseLineItemName(pobjDisp),blnOverride,.pSUCH)
+	} 
+	elseif pintCol = $$$FldMEDDispenseLineDiluentUOM  {
+		if $$$MEDDispenseLineDiluent(pobjDisp)'="" {
+			set blnOverride = $$LoadCombo^INARTPACK($$$MEDDispenseLineDiluent(pobjDisp),blnOverride,.pSUCH)	
+		}
+	}
+		
+	quit blnOverride
+	
+OnBeforeFormat(pYFIELDNAME,pobjLine)  
+	;-------------------------------------------------------------------------------
+	; set Color on fields that fail validation
+	;	
+	; Called By :
+	;	Form - GridEdit:INIssueLine
+	;	Routines -
+	;		
+	; Inputs : 
+	;	pYFIELDNAME	-	Browser Element ID "tdY#row#_#col#"
+	;	pobjLine	-	@nM INIssueLine Data record
+	;
+	; ByRef :
+	;
+	; Returns : 
+	;
+	; History :
+	; 17-Sep-2013	shobby	HEVA-1113A: Preserve the colours even after record is processed.
+	; 15-Aug-2013	SCR		CORE-247: Remove 2nd Parameter SR17847
+	; 08-Feb-2013	SCR		HEVA-826: Multidose change
+	; 07-Feb-2013	shobby	HEVA-731: Moved colour determination into a subroutine
+	; 29-Jan-2013	shobby	HEVA-731: FREE21 has been replaced with field MultidoseInjectable
+	; 15-Feb-2013	shobby	HEVA-750: Multidose can be dispensed in integer quantities.
+	; 02-Jan-2013	SCR		HEVA-725: Check Alternate Item Qty
+	; 19-Dec-2012	shobby	HEVA-700.3: Subroutined calculation of quantities
+	; 13-Dec-2012	shobby	HEVA-700.2: Get Adjusted DoseTotal
+	; 12-Dec-2012	SCR		HEVA-704 Show a different icon color
+	; 11-Dec-2012	SCR		HEVA-704 Do not validate alternate item
+	; 01-Aug-2012	PPP		SR18067: Get the Total Dispensed in Dispense Units
+	; 18-May-2012	PPP		SR18002.1 - Changed, check not required anymore; maybe be 
+	;						reinstated later 
+	; 02-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new blnAlt,dteFrom,fltDoseQty,fltQty,fltQtyIssued,idClassField,idFromLocn,idIssueNumber
+	new idItem,idLineNumber,idPres,idPrevDispense,idRxItem,idUnit,intCol,intDoses
+	new intRow,objHeader,objLine,objTestLine
+	
+	quit:YKEY=""
+
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pYFIELDNAME,intRow,intCol)
+	set idClassField = $$$GetClassField(YFORM,intCol)
+		
+	set idIssueNumber = $$$KEY1(YKEY)
+	set idLineNumber  = $$$KEY2(YKEY)
+	
+	; MEDDispense Header
+	;---------------------------------------
+	set objHeader  = $$$GRIDYFELDContainer
+
+	set idItem       	= $$$MEDDispenseLineItemName(pobjLine)					;HEVA-1113A 
+	if ((idItem '= "") && (idClassField = $$$FldMEDDispenseLineItemName)) {		;HEVA-1113A 
+		do SetColor^MEDDispenseBackground(idItem)	;HEVA-731					;HEVA-1113A 
+	}																			;HEVA-1113A 
+
+	quit:$$$MEDDispenseStatus(objHeader)>2         		// Processed
+	set idFromLocn = $$$MEDDispenseSupplyingLocation(objHeader)
+	
+	; MEDDispenseLine from Grid
+	;---------------------------------------
+	set idItem       	= $$$MEDDispenseLineItemName(pobjLine)
+	set fltQtyIssued 	= $$$MEDDispenseLineIssueQuantity(pobjLine)
+	set idUnit			= $$$MEDDispenseLineIssueUOM(pobjLine)
+		
+	;HEVA-1113A if ((idItem '= "") && (idClassField = $$$FldMEDDispenseLineItemName)) {
+	;HEVA-1113A 	do SetColor^MEDDispenseBackground(idItem)	;HEVA-731
+	;HEVA-1113A }
+	; Qty Issued
+	;-----------------------------------
+	if (idClassField = $$$FldMEDDispenseLineFromDate) {
+
+		set dteFrom =  $$^WWWTR(0,1,$$$MEDDispenseLineFromDate(pobjLine)) _ " " _
+										  $piece($$^WWWTR(0,7,$$$MEDDispenseLineFromTime(pobjLine)),":",1,2)
+		do UpdateManualField^COMGridEdit31Interface(intRow,$$$FORMFldMEDDispenseLineFrom,dteFrom)
+
+	; Issued UOM
+	;-----------------------------------
+	} elseif (idClassField = $$$FldMEDDispenseLineIssueQuantity) {
+		new fltQty
+		
+		set idPres = $$$MEDDispensePrescription(objHeader)
+		 
+		if (idPres'="") {
+			set objLine = $get(^MEDPrescriptionLine(0,idPres,idLineNumber,1))
+			//set fltTotDisp 	= ( fltQtyIssued + $$$MEDPrescriptionLineDispensedQty(objLine))
+			set idRxItem 	= $$$MEDPrescriptionLineItem(objLine)
+			; HEVA-725 vvvvv
+			set objTestLine	= $$UpdateDispenseLine^MEDDispenseCalc(idIssueNumber,idLineNumber,pobjLine,$$$YES,,.intDoses,.fltDoseQty)
+			set YTOOLTIP =  $$$Text($listbuild("MED01411",intDoses,$$^WWWTR(0,12,fltDoseQty)))  ;%1 Dose(s) of %2
+			
+			; HEVA-750
+			set fltQty=$$$MEDDispenseLineIssueQuantity(objTestLine)
+
+			if $$MultidoseInjectable^INART(idRxItem) set fltQty=fltQty+.999999\1 ; HEVA-826
+			;if $$MultidoseInjectable^INART(idRxItem) set fltQty=fltQty/$$$MEDPrescriptionLineDuration(objLine)+.999999\1 * $$$MEDPrescriptionLineDuration(objLine)
+
+			if ($$$MEDDispenseLineIssueQuantity(pobjLine)> fltQty ) {
+				//Total Dispensed Qty (%) cannot be greater than Total Dose Qty (%2)
+				set YWARNING = $$$YES
+				set YTOOLTIP = $$$Text($listbuild("MED00408",$$$MEDDispenseLineIssueQuantity(pobjLine),fltQty))			
+			}
+			;new fltSingleDoseQty,fltTotalDoseQty,fltDispenseQty
+			;do GetQtys^MEDDispenseCalc(idIssueNumber,idLineNumber,objLine,idUnit,.fltSingleDoseQty,.fltTotalDoseQty,.fltDispenseQty)
+			;if ($$$MEDDispenseLineIssueQuantity(pobjLine)> fltDispenseQty ) {
+			;	//Total Dispensed Qty (%) cannot be greater than Total Dose Qty (%2)
+			;	set YWARNING = $$$YES
+			;	set YTOOLTIP = $$$Text($listbuild("MED00408",$$$MEDDispenseLineIssueQuantity(pobjLine),fltDispenseQty))			
+			;}
+			; HEVA-725 ^^^^^
+				
+		}
+
+	; Issued UOM
+	;-----------------------------------
+	} elseif (idClassField = $$$FldMEDDispenseLineIssueUOM) {
+
+		/* SR18002.1 - Changed, check not required anymore; maybe be reinstated later 
+		set idIssUOM = $$GetPickUOM^INUOMConversion(idItem,$$$MEDDispenseIssueType(objHeader))
+		if $$$MEDDispenseLineIssueUOM(pobjLine)'=idIssUOM {
+			set strIssueType = $$GetParamDesc^INPARA("ISSUETYPE",$$$MEDDispenseIssueType(objHeader))
+			//Selected Issue UOM is not associated with Issue Type (%1) for Line (%2)			
+			set YWARNING = $$$YES
+			set YTOOLTIP = $$$Text($listbuild("MED00406",strIssueType,idLineNumber))			
+		}
+		*/
+	; Remarks
+	;-----------------------------------
+	} elseif (idClassField = $$$FldMEDDispenseLineRemarks) {
+		if $$$MEDDispenseLineRemarks(pobjLine) '= "blank_flat.gif" {
+			set idPres = $$$MEDDispensePrescription(objHeader)
+			if idPres'="" {
+				set objLine = $get(^MEDPrescriptionLine(0,idPres,idLineNumber,1))
+				set idRxItem 	= $$$MEDPrescriptionLineItem(objLine)
+				set blnAlt 		= idRxItem'=idItem 
+				if blnAlt {
+					;set YBACKGROUNDCOLOR = "YELLOW"
+					set YTEXT ="MEDDispAlternateRem.gif"
+				}
+				set YTOOLTIP = $$$MEDPrescriptionLineRemarks(objLine)
+				set YTOOLTIP = $translate(YTOOLTIP,"|",$c(13))
+				set idPrevDispense = $$GetPrevDispense(idIssueNumber, idPres,(idLineNumber\1))
+				if idPrevDispense'="" {
+					set YTOOLTIP = YTOOLTIP_YCR_"# "_$$$Text($listbuild("MED00407",idPrevDispense)) //Item was refused in Dispensation (%1)
+				}
+			}
+		} else {
+			set YTOOLTIP = 	$$$Text("IN00333")	//"None"	
+		}
+	}
+	
+	quit
+
+GetPrevDispense(pidDispense, pidPres, pidLn)
+	;-------------------------------------------------------------------------------
+	; Get the details of a Previous Instance of MEDDispenseLine
+	; 
+	; Params:	pidDispense	- Current Dispense
+	;			pidPres		- Prescription
+	;			pidPrevLn  	- Line Key
+	;
+	; Returns:	strStatus
+	;
+	; History :
+	; 17-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------	
+	new objDisp
+	new idDispense
+	new idxPres
+	
+	set idDispense=""
+	set idxPres = $$$Index(pidPres)
+	
+	for {
+		set idDispense = $order(^MEDDispenses(0,1,idxPres,idDispense))
+		quit:idDispense=""
+		
+		continue:idDispense=pidDispense		//Current one
+		
+		set objDisp = $get(^MEDDispenseLine(0,idDispense,pidLn,1))
+		if $$$MEDDispenseLineValidatedStatus(objDisp) = "refuse.gif" {
+			quit
+		}
+	
+	}
+
+	quit idDispense 
+	
+OnBeforeSave(pYKEY,&pYFELD)
+	;-------------------------------------------------------------------------------
+	; OnBeforeSave of the MEDDispenseLine
+	; 
+	; Params:	pYKEY	- Dispense, Line Key
+	;			pYFELD  - Line Object
+	;
+	; Returns:	strStatus
+	;
+	; History :
+	; 08-Feb-2013	SCR		HEVA-826: Multidose change
+	; 15-Jan-2013	shobby	HEVA-750: Multidose can be dispensed in integer quantities.
+	; 02-Jan-2013	SCR		HEVA-725: Check Alternate Item Qty
+	; 19-Dec-2012	shobby	HEVA-700.3: Subroutined calculation of quantities
+	; 12-Dec-2012	SCR		HEVA-704 Update Line Remark
+	; 11-Dec-2012	SCR		HEVA-704 do not check when alternate product
+	; 10-Dec-2012	SCR		HEVA-702 Diluent Qty & UOM Validation
+	; 30-Oct-2012	SCR		SR18132: Correction 
+	; 02-Oct-2012	shobby	SR18127: Don't worry about checking quantities if refused.
+	; 07-Aug-2012	PPP		SR18067: Diluents cannot be partially dispensed
+	; 01-Aug-2012	PPP		SR18067: Get the Total Dispensed in Dispense Units
+	; 18-May-2012	PPP		SR18002.1 - Changed, check not required anymore; maybe be 
+	;						reinstated later 
+	; 17-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------	
+	new objDispense,strStatus,fltTotDisp,fltDose,idPres,objLine,fltDoseDispense,fltDispensed
+	new blnAlt,idRxItem,idItem
+	
+	set strStatus = $$$OK	
+	set objDispense = $get(^MEDDispense(0,$$$KEY1(pYKEY),1))
+	
+	set idPres = $$$MEDDispensePrescription(objDispense)	
+	if idPres'="" {
+		set objLine 	= $get(^MEDPrescriptionLine(0,idPres,$$$KEY2(pYKEY),1))
+		set qtPrescription = +$$$MEDPrescriptionLineDoseQty(objLine)
+	}
+	if (qtPrescription > 0) { ; HEVA-1110
+		if $$$MEDDispenseLineIssueQuantity(pYFELD) <= 0 {
+			set YRETVAL   = $$$MakeStatus("IN00632")  ; "Quantity must be greater than 0."
+			set strStatus = $$$NO
+		}
+	}
+	
+	if $$$MEDDispenseLineDiluent(pYFELD) '="" {
+		if $$$MEDDispenseLineDiluentQty(pYFELD)<= 0 {	
+			set YRETVAL   = $$$MakeStatus("MED01402")  ;Diluent Quantity must be greater than 0
+			set strStatus = $$$NO
+		}
+		if $$$MEDDispenseLineDiluentUOM(pYFELD)<= 0 {	
+			set YRETVAL   = $$$MakeStatus("MED01403")  ;Diluent UOM required
+			set strStatus = $$$NO
+		}
+	}
+	if $$$ISOK(strStatus) {
+		new fltQty
+		set idPres = $$$MEDDispensePrescription(objDispense)
+		
+		if idPres'="" {
+			set objLine 	= $get(^MEDPrescriptionLine(0,idPres,$$$KEY2(pYKEY),1))
+			set idItem 		= $$$MEDDispenseLineItemName(pYFELD)
+			set idRxItem 	= $$$MEDPrescriptionLineItem(objLine)
+			set blnAlt 		= idRxItem'=idItem 
+			if 'blnAlt {
+				if $$$MEDDispenseLineValidatedStatus(pYFELD)'="refuse.gif" {						;SR18127
+					; HEVA-725 vvvvv
+					set objTestLine	= $$UpdateDispenseLine^MEDDispenseCalc($$$KEY1(pYKEY),$$$KEY2(pYKEY),pYFELD,$$$YES)
+					
+					;HEVA-750
+					set fltQty=$$$MEDDispenseLineIssueQuantity(objTestLine)
+					if $$MultidoseInjectable^INART(idRxItem) set fltQty=fltQty+.999999\1 ; HEVA-826
+					;if $$MultidoseInjectable^INART(idRxItem) set fltQty=fltQty/$$$MEDPrescriptionLineDuration(objLine)+.999999\1 * $$$MEDPrescriptionLineDuration(objLine)
+					if ($$$MEDDispenseLineIssueQuantity(pYFELD)> fltQty ) {
+						//Total Dispensed Qty (%) cannot be greater than Total Dose Qty (%2)
+						set YRETVAL = $$$Text($listbuild("MED00408",$$$MEDDispenseLineIssueQuantity(pYFELD),fltQty ))
+						set strStatus=$$$NO
+					}
+					;new fltSingleDoseQty,fltTotalDoseQty,fltDispenseQty
+					;do GetQtys^MEDDispenseCalc($$$KEY1(pYKEY),$$$KEY2(pYKEY),objLine,$$$MEDDispenseLineIssueUOM(pYFELD),.fltSingleDoseQty,.fltTotalDoseQty,.fltDispenseQty)
+					;if ($$$MEDDispenseLineIssueQuantity(pYFELD)> fltDispenseQty ) {
+					;	//Total Dispensed Qty (%) cannot be greater than Total Dose Qty (%2)
+					;	set YRETVAL = $$$Text($listbuild("MED00408",$$$MEDDispenseLineIssueQuantity(pYFELD),fltDispenseQty))
+					;	set strStatus=$$$NO
+					;}
+					; HEVA-725 ^^^^^
+					
+					;HEVA-700.3
+				}
+			} else {
+				set $$$MEDDispenseLineRemarks(pYFELD) 			= "information.gif"
+			}																		
+		}
+	}
+
+	//SR18067
+	if $$$ISOK(strStatus) {
+		if '$$$MEDDispenseLineIssueQuantity(pYFELD) {
+			if $$$MEDDispenseLineDiluentQty(pYFELD) {
+				set YRETVAL   = $$$Text($listbuild("MED00425"))	 //Diluents cannot be partially dispensed
+				set strStatus = $$$NO				
+			}
+		}
+	}
+
+	quit strStatus
+			
+	//---------------------------------------  START VALIDATION ---------------------------------
+
+CheckValidate(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Check if any lines need Validation
+	;
+	; Params:	pYKEY	- Dispense, Line Key
+	;
+	; Returns:	
+	;
+	; History:
+	; 03-May-2013	SCR		CORE-96: Add Validation - Improve Dispense validation tab performance
+	; 11-Apr-2013	SCR		HEVA-764: Quantity Check added
+	; 11-Dec-2013	SCR		HEVA-751: Disable Solution Grouping
+	; 10-Dec-2012	SCR		HEVA-702: Diluent Qty & UOM Validation
+	; 24-Jul-2012	PPP		SR18067: Added Prescription Suspended check
+	; 12-Jun-2012	shobby	SR18033: Rewrote to use unsaved data.
+	; 02-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,arrSol,blnOK,fltQty,idDispense,idLine,idRx,idRxItem,idRxLine,intSol
+	new lstBadLines,objDisp,objLine,objPrescription,objRxLine,objTestLine,qtPrescription
+	new strStatus,YKEY
+	
+	set idDispense=$$$KEY1(pYKEY)
+	set strStatus=$$$OK
+	set blnOK=$$$NO
+	
+	set objDisp = $get(^MEDDispense(YM,idDispense,1))
+	set idRx 	= $$$MEDDispensePrescription(objDisp)
+	set idRxLine= ""
+	set lstBadLines	= "" ; HEVA-764
+	for {
+		set idRxLine=$order(^MEDPrescriptionLine(YM,idRx,idRxLine))
+		quit:idRxLine=""
+		set objRxLine=$get(^MEDPrescriptionLine(YM,idRx,idRxLine,1))
+		set intSol = $$$MEDPrescriptionLineSolution(objRxLine)
+		if intSol'="" {
+			set arrSol("s",intSol,idRxLine)=""
+			set arrSol("l",idRxLine)=intSol
+		}
+	}
+	
+	do GetGridContents^COMGridEdit31Interface(.arrGrid,"MEDDispenseLine")  	; CORE-96
+	;do GetGridContents^COMGridEdit31Interface(.arrGrid,YFORM)
+	set idLine="" for { set idLine=$order(arrGrid(idDispense,idLine)) quit:idLine=""
+		set objLine = $get(arrGrid(idDispense,idLine))
+		if $$$MEDDispenseLineValidatedStatus(objLine) = "blank_flat.gif" {
+			if $$$MEDDispenseLineValidation(objLine) {
+				set blnOK = $$$YES
+				set intSol=$get(arrSol("l",idLine))
+				if intSol {
+					set arrSol("s",intSol,idLine)=1
+					set arrSol("v",intSol)=""
+				}
+			}	
+			set qtPrescription = 1
+			if idRx'="" {
+				set objPrescription	= $get(^MEDPrescriptionLine(0,idRx,idLine,1))
+				set qtPrescription = +$$$MEDPrescriptionLineDoseQty(objPrescription)
+			}
+
+			if $$$MEDDispenseLineDiluent(objLine) '="" {
+				if $$$MEDDispenseLineDiluentQty(objLine)<= 0 {	
+					if (qtPrescription > 0) {;HEVA-1110
+						set strStatus   = $$$MakeStatus("MED01402")  ;Diluent Quantity must be greater than 0
+					}
+				}
+				if $$$MEDDispenseLineDiluentUOM(objLine)<= 0 {
+					if (qtPrescription > 0) {;HEVA-1110
+						set strStatus   = $$$MakeStatus("MED01403")  ;Diluent UOM required
+					}
+				}
+			}
+			if $$$MEDDispenseLineIssueQuantity(objLine) <= 0 {
+				if (qtPrescription > 0) {;HEVA-1110
+					set strStatus   = $$$MakeStatus("IN00632")  ; "Quantity must be greater than 0."
+				}
+			}
+		
+			if $$$MEDDispenseLineIssueUOM(objLine) = "" {
+				if (qtPrescription > 0) { ;HEVA-1110
+					set strStatus   = $$$MakeStatus("MED01404")  ;UOM Required
+				}
+			}
+			; HEVA-764 vvvv
+			set objTestLine	= $$UpdateDispenseLine^MEDDispenseCalc(idDispense,idLine,objLine,$$$YES,,,)
+			set fltQty		= $$$MEDDispenseLineIssueQuantity(objTestLine)
+			set objRxLine=$get(^MEDPrescriptionLine(YM,idRx,idLine,1))
+			set idRxItem 	= $$$MEDPrescriptionLineItem(objRxLine)
+
+			if $$MultidoseInjectable^INART(idRxItem) set fltQty=fltQty+.999999\1 ; HEVA-826
+			if ($$$MEDDispenseLineIssueQuantity(objLine)> fltQty ) {
+				set lstBadLines	= lstBadLines_idLine_","
+			}
+
+
+		}
+	}
+	if lstBadLines'="" {  ; HEVA-764
+		set strStatus = $$$MakeStatus("MED01426",$extract(lstBadLines,1,$length(lstBadLines)-1))  ;Line(s) (%1) has incorrect Quantity ; HEVA-764
+	}
+	if 'blnOK {
+	 	set strStatus = $$$MakeStatus("MED00396")   ; //"No lines to Validate/Refuse"
+	}
+
+	//SR18067
+	if $$$ISOK(strStatus) {
+		if $$IsPresSuspended^MEDDispense(idDispense) {
+			set strStatus = $$$MakeStatus("MED00424")  ;Cannot perform current operation as Prescription is suspended
+		}
+	}
+ 	;$$$YQHandler(strStatus) 	; CORE-96
+	
+	quit strStatus
+
+
+
+ValidateDrugInteraction(pidDispense)
+	;-------------------------------------------------------------------------------
+	; Validate the Drug Interaction
+	;
+	; Params:	pidDispense	- Dispense
+	;
+	; Returns:	
+	;
+	; History:
+	; 03-May-2013	SCR		CORE-96: Add Validation - Improve Dispense validation tab performance
+	; 21-Feb-2012	SCR		HEVA-800: Do Qty Check before validation
+	; 26-Oct-2012	shobby	SR18130.2: Check for valid admission
+	; 14-May-2012	PPP		SR18002: Created
+    ;-------------------------------------------------------------------------------
+	new blnInteraction,strStatus							;SR18130.2
+	
+	set strStatus=$$$OK
+	
+	; CORE-96 vvvv
+	set strStatus=$$CheckValidate(pidDispense)
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtils(strStatus)
+		quit strStatus  ; Early Exit
+	}
+	; CORE-96 ^^^^
+	
+	set strStatus=$$CheckAdmitted^MEDPatient(pidDispense)	;SR18130.2
+
+	if $$$ISERR(strStatus) {								;SR18130.2
+		do ReturnError^COMUtils(strStatus) 					;SR18130.2
+	} else {												;SR18130.2
+		set blnInteraction = $$CheckDrugInteraction^MEDDrugInteraction(pidDispense,$$$YES)  //Only ones that are being validated
+
+		if (blnInteraction){ 
+	
+		&js<
+		
+			//Show messages
+			messageInteractions(1);
+		
+			//Confirmation from User and then Validate	
+		    messageValid();
+		> 
+	
+		} else { 
+					
+			do QtyCheck^MEDDispenseLine(pidDispense) ; HEVA-800
+			;do Validate^MEDDispenseLine(pidDispense)
+	
+		}
+	}														;SR18130.2
+
+	quit
+
+QtyCheck(pidDispense)
+	;-------------------------------------------------------------------------------	
+	; Check the Qty before validation
+	;
+	; Params:	pYKEY	- Dispense, Line Key
+	;
+	; Returns:	
+	;
+	; History:
+	; 
+	; 21-Feb-2013	SCR		HEVA-800: Created
+	;-------------------------------------------------------------------------------	
+	new strStatus,arrGrid,idLine,idDispense,objLine,strWarning,objTestLine,fltQty,fltDispensed
+	new idItem,intLines
+	
+	$$$GRIDGetContents(.arrGrid)
+	set strWarning	= "" ; HEVA-800
+	set idLine		= "" 
+	for { 
+		set idLine=$order(arrGrid(pidDispense,idLine))  
+		quit:idLine=""
+		set objLine = $get(arrGrid(pidDispense,idLine))
+		
+		if ($$$MEDDispenseLineValidation(objLine)&&($$$MEDDispenseLineValidatedStatus(objLine) = "blank_flat.gif")) { ;SR18173
+			set idItem =  $$$MEDDispenseLineItemName(objLine)
+			set objTestLine	= $$UpdateDispenseLine^MEDDispenseCalc(pidDispense,idLine,objLine,$$$YES,,,)
+			set fltQty=$$$MEDDispenseLineIssueQuantity(objTestLine)
+			if $$MultidoseInjectable^INART(idItem) set fltQty=fltQty+.999999\1 ; HEVA-826
+			set fltDispensed = $$$MEDDispenseLineIssueQuantity(objLine)
+			if ((+$justify(fltDispensed,0,2))<(+$justify(fltQty,0,2))) {
+				set strWarning = strWarning_"</br></br>"_$$$Text("179")_" <b>"_idLine_"</b>, "_
+											"<b>"_$e("("_idItem_") "_$$^INARTNAME(idItem)_$j("",30),1,30)_"</b>"_", "_
+											$$$Text("MED00421")_":"_"<b>"_$j(fltQty,10,2)_"</b>"_", "_
+											$$$Text("MED00422")_":"_"<b>"_$j(fltDispensed,10,2)_"</b>"
+			}
+		}
+	}
+	if strWarning'="" {
+		set intLines = $l(strWarning,"</br>")+2
+		set intSize = intLines * 27
+	
+		if (intSize > 600){
+			set intSize = 600
+		}
+		set strWarning = $replace(strWarning,"'","`")			
+		set strWarning = $$$Text("MED00419")_strWarning		//The following items have dispensation quantity(ies) that are less than the requested quantity</br>
+		$$$JS("messageDispenseQty( '"_strWarning_"','"_intSize_"');")
+	
+	} else {
+		do Validate(pidDispense)
+	}
+	quit $$$OK
+
+	//---------------------------------------  END VALIDATION ---------------------------------
+
+Validate(pidDispense)
+	;-------------------------------------------------------------------------------	
+	; Validate the lines that need Validation and flag the Validation Status
+	;
+	; Params:	pYKEY	- Dispense, Line Key
+	;
+	; Returns:	
+	;
+	; History:
+	; 
+	; 15-Mar-2014	shobby	HEVA-1238: ValidatedDate
+	; 21-Feb-2013	SCR		HEVA-800: Qty check moved to QtyCheck
+	; 20-Feb-2013	SCR		HEVA-800: Warn if Disp Qty is less than Rx Qty
+	; 02-Nov-2012	SCR		SR18177: Set Validated Date Time
+	; 30-Oct-2012	shobby	SR18173: To Refuse must not already be refused/validated.
+	; 30-Oct-2012	shobby	SR18173: Tick should remain.
+	; 08-Aug-2012	SCR		SR18033: Added Save
+	; 13-Jun-2012	shobby	SR18033: Rewrote to work on in memory data.
+	; 30-Apr-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------	
+	new arrGrid,idLine,objLine
+	
+	$$$GRIDGetContents(.arrGrid)
+	set idLine		= "" 
+	for { 
+		set idLine=$order(arrGrid(pidDispense,idLine))  
+		quit:idLine=""
+		set objLine = $get(arrGrid(pidDispense,idLine))
+		
+		if ($$$MEDDispenseLineValidation(objLine)&&($$$MEDDispenseLineValidatedStatus(objLine) = "blank_flat.gif")) { ;SR18173
+			;SR18173 set $$$MEDDispenseLineValidation(objLine)		= ""
+			set $$$MEDDispenseLineValidatedStatus(objLine) 	= "accept.gif"
+			set $$$MEDDispenseLineValidatedBy(objLine) 		= $get(YBED)
+			set $$$MEDDispenseLineValidatedOn(objLine)		= $horolog ; SR18177
+			set $$$MEDDispenseLineValidatedDate(objLine)	= +$horolog ; HEVA-1238
+		}
+		set arrGrid(pidDispense,idLine)=objLine
+	}
+	$$$GRIDSetContents(.arrGrid)
+	&JS<
+	SAVENOW();
+	>
+	quit $$$OK
+
+
+
+	//---------------------------------------  START REFUSE -----------------------------------
+
+
+
+RefuseReason(pYKEY)
+	;-------------------------------------------------------------------------------	
+	; Get the Reason for Refusal of the Dispense Lines
+	;
+	; Params:	pYKEY	- Dispense, Line Key
+	;
+	; Returns:	
+	;
+	; History:
+	; 16-Aug-2013	SCR		HEVA-1044: Prescription Dispense -> rejection reason populated in the grid
+	; 03-May-2013	SCR		CORE-96: Add Validation - Improve Dispense validation tab performance
+	; 25-Feb-2013	SCR		HEVA-792: Check Drug Validation
+	; 19-Feb-2013	SCR		HEVA-792: Disable Drug Validation
+	; 01-Feb-2013	SCR		HEVA-792: Check Drug Validation
+	; 28-May-2012	PPP		SR18002.1 Added Alert, new FORM iePrompt
+	; 02-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------	
+	
+	new strPrompt,strCallback,idDispense,strYKEY,strAlert,blnNeedReason,idLine,objLine
+	new idReason,strReason,arrGrid
+
+	; CORE-96 vvvv
+	set strStatus=$$CheckValidate(pYKEY)
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtils(strStatus)
+		quit strStatus  ; Early Exit
+	}
+	; CORE-96 ^^^^
+	if ($get(pYKEY) '= "") {
+		set strYKEY = pYKEY
+	} else {
+		set strYKEY = $$GetKey^COMGridEdit31G()
+	}
+	; HEVA-1044 vvvv
+	set idDispense 		= $$$KEY1(strYKEY)
+	set blnNeedReason	= $$$NO
+	set idLine			= ""
+	$$$GRIDGetContents(.arrGrid)
+	for { 
+		set idLine=$order(arrGrid(idDispense,idLine)) 
+		quit:idLine=""
+		quit:$$$ISERR(strStatus)
+		set objLine 	= $get(arrGrid(idDispense,idLine))
+		set idReason	= $$$MEDDispenseLineFREE5(objLine)
+		
+		
+		if ($$$MEDDispenseLineValidation(objLine) &&($$$MEDDispenseLineValidatedStatus(objLine) = "blank_flat.gif")) { 
+			
+			;HEVA-1651 - Removida a validação que colocava automaticamente a razão quando esta não era preenchida
+			
+			if idReason'="" {
+				set strReason	= $$$VARPARAText($get(^VARPARA(YM, "MOTIVOREJEICAO", LANGUAGE,idReason, 1)))
+				set $$$MEDDispenseLineRejectReason(objLine)	= strReason
+				if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {					
+					Set idRejeicao = idDispense_"||"_idLine_"||"_idReason
+					Set objRejeicao = "" 
+					Set $Piece(objRejeicao,Y,0) = 0
+					Set $Piece(objRejeicao,Y,1)  = YM_"||"_idDispense_"||"_idLine //ID DispenseLine
+ 					Set $Piece(objRejeicao,Y,2)  = strReason // Motivo Rejeição
+					set statusRejeitado = $$$Save("VARHistRejeicaoDisp",idDispense_"||"_idLine_$$$COMMA_idReason,strReason,1)
+				}
+				;set strStatus	= $$$Save("MEDDispenseLine",idDispense_","_idLine,objLine,$$$YES)
+				set arrGrid(idDispense,idLine)=objLine
+			} else {
+				set blnNeedReason	= $$$YES		
+			}
+		}
+	}
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtils(strStatus)
+		quit strStatus 
+	}
+	$$$GRIDSetContents(.arrGrid)
+	if blnNeedReason	= $$$NO {
+		do Refuse(idDispense,"")
+		quit strStatus
+	}
+	; HEVA-1044 ^^^^
+	
+	set strPrompt   = $$$JSText($$$Text("MED00404"))  //"Please specify the reason why the prescription was Refused/Cancelled"
+	set strCallback = "Refuse^MEDDispenseLine"
+	set strAlert 	= $$$JSText($$$Text("MED00415")) //Please enter a Reason
+
+	$$$StartScript()
+	; HEVA-792 vvvv
+	set blnInteraction = $$CheckDrugInteraction^MEDDrugInteraction(idDispense,$$$YES)  //Only ones that are being validated
+
+	if (blnInteraction){ 
+	
+		&js<
+	
+			//Show messages
+			messageInteractions(1);
+		
+		>
+	} 
+	; HEVA-792 ^^^^
+	; HEVA-1044 vvvv
+	;&js<
+	;	var strResult=prompt('#(strPrompt)#','','');
+	;	
+	;>
+	;if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+	;	&js<
+	;		var strResult = rejectPrompt('#(strPrompt)#');
+	;	>
+	;} else {
+	;	&js<
+	;		var strResult = iePrompt('#(strPrompt)#');
+	;	>
+	;}
+	&js<
+		var strResult = iePrompt('#(strPrompt)#');
+	>
+	; HEVA-1044 ^^^^
+	&js<
+				
+		if (strResult!=false) {
+			CallBackNow('#(strCallback)#','#(idDispense)#',strResult);
+		} else {
+			alert('#(strAlert)#');
+			CallBackNow('GoToForm^COMUtilForm','MEDDispense','#(idDispense)#');		
+		}
+		
+	>
+	$$$EndScript()
+	
+	quit $$$OK
+	
+	
+Refuse2(pidPrescription, pidLine, pstrReason)
+	;-------------------------------------------------------------------------------	
+	; Refuse when called from 'Medical Prescription' form.
+	;
+	; Returns:	
+	;
+	; History:
+	; 15-Mar-2014	shobby	HEVA-1238: ValidatedDate
+	; 01-Mar-2013	SCR		HEVA-874: Dont update non existent lines
+	; 13-Nov-2012	SCR		SR18203: Allow lines to suspended at anytime
+	; 12-Nov-2012	SCR		SR18199: Set all Dispenses
+	; 09-Nov-2012	SCR		SR18177: Set Validated Date Time
+	; 30-Oct-2012	shobby	SR18173: To Refuse must not already be refused/validated.
+	; 02-Oct-2012	shobby	SR18127: Created
+	;-------------------------------------------------------------------------------	
+	new strStatus,objLine,idDispense
+
+	set strStatus=$$$OK
+	if (pidPrescription'="") && (pidLine'="") {
+		if $data(^MEDDispenses(0,1,$$$Index(pidPrescription))) {
+			set idDispense=""
+			for {
+				set idDispense=$order(^MEDDispenses(0,1,$$$Index(pidPrescription),idDispense))
+				quit:idDispense=""
+				set objLine=$get(^MEDDispenseLine(0,idDispense,pidLine,1))
+				
+				if objLine'="" { ; HEVA-874
+				
+					set $$$MEDDispenseLineValidatedStatus(objLine) 	= "refuse.gif"
+					set $$$MEDDispenseLineValidatedBy(objLine) 		= $get(YBED)
+					set $$$MEDDispenseLineValidatedOn(objLine)		= $horolog ; SR18177
+					set $$$MEDDispenseLineValidatedDate(objLine)	= +$horolog ; HEVA-1238
+					set $$$MEDDispenseLineRemarks(objLine) 			= "information.gif"
+					set $$$MEDDispenseLineRejectReason(objLine)		= pstrReason
+					set strStatus = $$$Save("MEDDispenseLine",idDispense_$$$COMMA_pidLine,objLine,$$$YES)
+
+				}
+			}
+		}
+	}
+	
+	quit strStatus
+
+Refuse(pidDispense, pstrReason)
+	;-------------------------------------------------------------------------------	
+	; Validate the lines that need Refusal and flag the Validation Status
+	;
+	; Params:	pYKEY	- Dispense, Line Key
+	;
+	; Returns:	
+	;
+	; History:
+	; 06-Nov-2014	SCR		HEVA-1623: Do Not Update Prescription if Dispense has Times and the There is a balance left
+	; 15-Mar-2014	shobby	HEVA-1238: ValidatedDate
+	; 16-Aug-2013	SCR		HEVA-1044: Prescription Dispense -> rejection reason populated in the grid
+	; 03-Jan-2013	SCR		HEVA-738: Set Rx line Status to 10 'Rejected'
+	; 29-Nov-2012	SCR		SR18215: Auto-close rejected items on the Prescription Line 
+	; 09-Nov-2012	SCR		SR18177: Set Validated Date Time
+	; 30-Oct-2012	shobby	SR18173: To Refuse must not already be refused/validated.
+	; 08-Aug-2012	SCR		SR18033: Added Save
+	; 13-Jun-2012	shobby	SR18033: Rewrote to work on in memory data.
+	; 02-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------	
+	new arrGrid,blnUpdate,fltAct,fltDispense,fltPrev,idItem,idLine,idPres,idUnit
+	new objDispense,objLine,objRxLine,strRemarks,strStatus
+
+	set strStatus= $$$OK ; SR18215
+	
+	if (pidDispense '= "") {
+		set objDispense = $get(^MEDDispense(0,pidDispense,1))
+		set idPres		= $$$MEDDispensePrescription(objDispense) 
+		
+ 		set idLine = ""
+	 	set blnUpdate = $$$NO
+		
+		set strRemarks 	= ""
+
+		$$$GRIDGetContents(.arrGrid)
+		set idLine="" 
+		for { set idLine=$order(arrGrid(pidDispense,idLine)) quit:idLine=""
+			set objLine = $get(arrGrid(pidDispense,idLine))
+		
+			if ($$$MEDDispenseLineValidation(objLine) &&($$$MEDDispenseLineValidatedStatus(objLine) = "blank_flat.gif")) {  ;SR18173
+				;SR18173 set $$$MEDDispenseLineValidation(objLine)		= ""
+				set $$$MEDDispenseLineValidatedStatus(objLine) 	= "refuse.gif"
+				set $$$MEDDispenseLineValidatedBy(objLine) 		= $get(YBED)
+				set $$$MEDDispenseLineValidatedOn(objLine)		= $horolog ; SR18177
+				set $$$MEDDispenseLineValidatedDate(objLine)	= +$horolog ; HEVA-1238
+				set $$$MEDDispenseLineRemarks(objLine) 			= "information.gif"
+
+				; HEVA-1044 vvvv
+				;if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+				;	set $$$MEDDispenseLineFREE5(objLine) 		= $$GetCodigoRazaoRejeicao^VARMEDDispense(pstrReason)
+				;	set $$$MEDDispenseLineRejectReason(objLine)	= $$GetDescricaoRazaoRejeicao^VARMEDDispense(pstrReason)
+				;} else {
+					;set $$$MEDDispenseLineRejectReason(objLine)	= pstrReason
+				;}
+				if $$$MEDDispenseLineRejectReason(objLine)="" {
+					set $$$MEDDispenseLineFREE5(objLine)		= $$$ReasonOther
+					;set $$$MEDDispenseLineRejectReason(objLine)	= pstrReason
+					set $$$MEDDispenseLineRejectReason(objLine)	= ("(Outros):"_" "_pstrReason) ;HEVA-1746
+					;HEVA-1513
+					if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+						set statusRejeitado = $$$Save("VARHistRejeicaoDisp",pidDispense_"||"_idLine_$$$COMMA_$$$ReasonOther,"Outros",1)
+					}
+				}
+				; SR18215 ^^^^
+				if idPres'="" {
+					set objRxLine 	= $get(^MEDPrescriptionLine(YM,idPres,idLine,1))
+					set fltPrev		= $$$MEDPrescriptionLineDispenseTotQty(objRxLine)
+					set idItem		= $$$MEDDispenseLineItemName(objLine)
+					set idUnit		= $$$MEDDispenseLineIssueUOM(objLine)
+					set fltDispense	= $$$MEDDispenseLineIssueQuantity(objLine)
+					set fltAct		= $$ActualUsed^MEDDispenseCalc(	fltDispense, idItem, idUnit, objRxLine)
+
+					;HEVA-1651 - Comentado por que na rejeição, estava deixando o item como pendente para validação
+				]]><![CDATA[	;if fltPrev+fltAct'< $$$MEDPrescriptionLineDoseTotalQuantity(objRxLine) {
+						set $$$MEDPrescriptionLineStatus(objRxLine) = 10
+						;set $$$MEDPrescriptionLineStatus(objRxLine) = 9
+						set strStatus=$$$Save("MEDPrescriptionLine",idPres_","_idLine,objRxLine,1)
+					;}
+					quit:strStatus'=$$$OK
+				}
+				; SR18215 ^^^^
+
+				//If refused, the Issued Qty is 0'ed
+				//set $$$MEDDispenseLineIssueQuantity(objLine) = 0		//SR18002.1  //SR18002.4
+			}
+			set arrGrid(pidDispense,idLine)=objLine
+		}
+		$$$GRIDSetContents(.arrGrid)
+	&JS<
+	SAVENOW();
+	>
+	}
+	quit strStatus ; SR18215
+	;quit $$$OK
+
+
+
+	//---------------------------------------  END REFUSE -------------------------------------
+
+GetValue(pintField) ;HEVA-775
+	;-------------------------------------------------------------------------------
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jan-2013	shobby	HEVA-775: Creation
+	;-------------------------------------------------------------------------------
+	new strValue
+
+	set strValue=$piece(YFELD,Y,pintField)
+	set strValue=$$Convert^WWWTR(0,$$$WWW003InputType($get(^WWW003(0,$$$GetClass(YFORM),pintField,1))),strValue,2)
+
+	quit strValue
+
+
+
+GetDescription(pintField="",pintUOMField="") 				;HEVA-679
+	;-------------------------------------------------------------------------------
+	;
+	; Returns:
+	;
+	; History:
+	; 22-Jan-2013	shobby	HEVA-775.2: Return a blank string if no value
+	; 18-Jan-2013	shobby	HEVA-775: Use for dispense and prescription, with appropriate YDECIMAL
+	; 18-Jan-2013	shobby	HEVA-775: Creation
+	;-------------------------------------------------------------------------------
+	;HEVA-775	quit $piece(YFELD,Y,pintField)_" "_$$$AppEnum("EINHEIT",$$$MEDDispenseLineDoseUOM(YFELD))
+	new strValue
+	
+	set strValue=$$GetValue(pintField)_" "_$$$AppEnum("EINHEIT",$piece(YFELD,Y,pintUOMField))
+	if strValue=" " set strValue=""
+	quit strValue
+
+
+GetAbbreviatedDescription(pintField="",pintUOMField="")		;HEVA-679
+	; History
+	; 22-Jan-2013	shobby	HEVA-775.2: Return a blank string if no value
+	; 18-Jan-2013	shobby	HEVA-775: Use for dispense and prescription, with appropriate YDECIMAL
+	; 30-Nov-2012	shobby	HEVA-679: If value is 'ML - Milliletres' return only 'ML'
+	;-------------------------------------------------------------------------------
+	;HEVA-775 quit $piece(YFELD,Y,pintField)_" "_$piece($$$AppEnum("EINHEIT",$$$MEDDispenseLineDoseUOM(YFELD))," -",1)
+	new strValue
+	
+	set strValue=$$GetValue(pintField)_" "_$piece($$$AppEnum("EINHEIT",$piece(YFELD,Y,pintUOMField))," -",1)
+	if strValue=" " set strValue=""
+	quit strValue
+	
+		
+OnLineAdded(pintRow,pstrKey)
+	;-------------------------------------------------------------------------------
+	; Description : Set values for manual fields
+	;			
+	; Called By : OnLineAdded^COMGridEdit31Events via CallEvent
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 17-Jan-2013	shobby	HEVA-769: Moved display of error message to OnBeforeClick
+	; 30-Nov-2012	shobby	HEVA-679: Move some manual field values into 'Default Variable Input'
+	;								  so they can be customised.
+	; 27-Nov-2012	SCR		SR18213: Added Solution
+	; 02-Aug-2012	PPP		SR18067: Added Total Dose Qty
+	; 27-Jul-2012	PPP		SR18067: Corrected Diluent List
+	; 18-May-2012	PPP		SR18002: Added $$$Alert for Route
+	; 17-May-2012	PPP		SR18002: Removed $$$Alert for Route (in OnBlurRoute)
+	; 16-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new idDispense,strStatus,idItem,objItem,idLineNo,dteFrom,dteTo
+	new strDose,objHeader,objLine,strDoseTot,objRxLine,idRx,idSolution
+	
+	set idDispense = $$$KEY1(pstrKey)
+	set idLineNo  = $$$KEY2(pstrKey)
+	set strStatus = $$$OK
+ 
+	set objHeader   = $$$GRIDYFELDContainer	
+	//set idFromLocn  = $$$MEDDispenseSupplyingLocation(objHeader)
+	
+	quit:idLineNo="" strStatus
+	
+	set objLine     = $get(^MEDDispenseLine(0,idDispense,idLineNo,1))
+	
+	; SR18213 vvvv
+	set idRx		= $$$MEDDispensePrescription(objHeader)
+	set idSolution	= ""
+	if idRx'="" {
+		set objRxLine	= $get(^MEDPrescriptionLine(0,idRx,idLineNo,1))
+		set idSolution	= $$$MEDPrescriptionLineSolution(objRxLine)
+		do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldMEDDispenseLineSolution,idSolution)
+
+	}
+	; SR18213 ^^^^
+	
+	set idItem      = $$$MEDDispenseLineItemName(objLine)
+		
+	if idItem'="" {
+		set dteFrom =  $$^WWWTR(0,1,$$$MEDDispenseLineFromDate(objLine)) _ " " _
+										  $piece($$^WWWTR(0,7,$$$MEDDispenseLineFromTime(objLine)),":",1,2)
+		do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldMEDDispenseLineFrom,dteFrom)
+
+		set dteTo =  $$^WWWTR(0,1,$$$MEDDispenseLineToDate(objLine)) _ " " _
+										  $piece($$^WWWTR(0,7,$$$MEDDispenseLineToTime(objLine)),":",1,2)
+		do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldMEDDispenseLineTo,dteTo)
+		
+		;HEVA-679 set strDose = $$$MEDDispenseLineDoseQuantity(objLine)_" "_$$$AppEnum("EINHEIT",$$$MEDDispenseLineDoseUOM(objLine))
+		;HEVA-679 do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldMEDDispenseLineDose,strDose)
+
+		;HEVA-679 //SR18067
+		;HEVA-679 set strDoseTot = $$$MEDDispenseLineTotalRequestedQuantity(objLine)_" "_$$$AppEnum("EINHEIT",$$$MEDDispenseLineDoseUOM(objLine))
+		;HEVA-679 do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldMEDDispenseLineTotalRequested,strDoseTot)
+
+		//SR18002.1
+		;HEVA-769 if $$$MEDDispenseLineValidatedStatus(objLine)="blank_flat.gif" {
+		;HEVA-769 	set objItem = $get(^INART(0,idItem,1))
+		;HEVA-769 	if ($$$INARTMedRouteOfAdministration(objItem)'="") 
+		;HEVA-769 		&& ($$$MEDDispenseLineRoute(objLine) '= $$$INARTMedRouteOfAdministration(objItem)) {
+		;HEVA-769 		$$$Alert($lb("MED00405",idLineNo))
+		;HEVA-769 	}
+		;HEVA-769 }
+
+	}
+	//SR18067  Field - Diluent = #13
+	do UpdateDiluent^MEDPrescriptionHosp(idItem,"Y"_YFORM_"13")
+
+	quit strStatus
+
+
+IsItemNeeded(pYKEY, &pstrFontColor)
+	;-------------------------------------------------------------------------------
+	; Called CORE Rules on Field Item on MEDDispenseLine
+	;
+	; Params:	pYKEY		- Keys
+	;
+	; Returns : 
+	;
+	; History:
+	; 17-Sep-2013	shobby	HEVA-1113A: format sublines as well when multiple dispenses are created from one prescription line
+	; 07-Jun-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new idDispense
+	new blnNeeded
+	new objHeader
+	new idPres
+	new idLn
+	
+	set idDispense = $$$KEY1(pYKEY)
+	set blnNeeded = $$$NO
+	
+	if idDispense'="" {
+		set objHeader  = $$$GRIDYFELDContainer
+		set idPres = $$$MEDDispensePrescription(objHeader)
+		
+		if (idPres'="") {
+			set idLn = $$$KEY2(pYKEY)\1	;HEVA-1113A
+			if idLn'="" {
+				if $$$MEDPrescriptionLineIfNeeded($get(^MEDPrescriptionLine(0,idPres,idLn,1))) {
+					set blnNeeded = $$$YES
+					set pstrFontColor = $$$SysEnum("FARBE",$$$MEDPrescriptionSetupIfRequiredColour($get(^MEDPrescriptionSetup(0,0,1))))
+				}
+			}
+		}
+	
+	}
+	quit blnNeeded
+
+IsItemUrgent(pYKEY, &pstrFontColor)
+	;-------------------------------------------------------------------------------
+	; Called CORE Rules on Field Item on MEDDispenseLine
+	;
+	; Params:	pYKEY		- Keys
+	;
+	; Returns : 
+	;
+	; History:
+	; 17-Sep-2013	shobby	HEVA-1113A: format sublines as well when multiple dispenses are created from one prescription line
+	; 07-Jun-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new idDispense
+	new blnUrgent
+	new objHeader
+	new idPres
+	new idLn
+	
+	set idDispense = $$$KEY1(pYKEY)
+	set blnUrgent = $$$NO
+	
+	if idDispense'="" {
+		set objHeader  = $$$GRIDYFELDContainer
+		set idPres = $$$MEDDispensePrescription(objHeader)
+		
+		if (idPres'="") {
+			set idLn = $$$KEY2(pYKEY)\1	;HEVA-1113A
+			if idLn'="" {
+				if $$$MEDPrescriptionLineUrgent($get(^MEDPrescriptionLine(0,idPres,idLn,1))) {
+					set blnUrgent = $$$YES
+					set pstrFontColor = $$$SysEnum("FARBE",$$$MEDPrescriptionSetupUrgentColour($get(^MEDPrescriptionSetup(0,0,1))))
+				}
+			}
+		}
+	}
+	
+	quit blnUrgent
+
+OnBeforeClick(pYFELD)
+	//OnClick(intCol,pYFELD,pshift,pControl)
+	;-------------------------------------------------------------------------------
+	; Called by OnClick^COMGridEdit31S
+	;
+	; Params:	intCol		: The column number
+	; 			pYFELD		: The YFELD value (record)
+	;
+	; Returns :  
+	;
+	; History:
+	; 03-May-2013	SCR		CORE-96: Remove ROA test
+	; 24-Jan-2013	SCR		HEVA-785: Remove hardcoded "Remarks"
+	; 22-Jan-2013	shobby	HEVA-769.2: Only display message when clicking in the 'validation' column. 
+	; 17-Jan-2013	shobby	HEVA-769: Display message beforeclick 
+	; 31-Jul-2012	PPP		SR18067: Do not new intRow, intCol
+	; 07-Jun-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new idLineNumber
+	new idPres
+	new strKey
+	new idDispense
+	new idPrevDispense
+	new strMessage,blnContinue
+	//SR18067
+	//intRow, intCol - do not new (comes from OnClick^COMGridEdit)
+	
+	set blnContinue = $$$YES
+		
+    if ($get(intCol) = $$$FldMEDDispenseLineRemarks) {
+
+		if $$$MEDDispenseLineRemarks(pYFELD) '= "blank_flat.gif" {
+			
+			set strKey 			= $$GetYKEY^COMGridEdit31G(intRow,YFORM)
+			set idDispense 		= $$$KEY1(strKey)
+			set idLineNumber  	= $$$KEY2(strKey)
+
+			set idPres = $$$MEDDispensePrescription($$$GRIDYFELDContainer)
+			if idPres'="" {
+				set strMessage = $$$MEDPrescriptionLineRemarks($get(^MEDPrescriptionLine(0,idPres,(idLineNumber\1),1)))		
+				set idPrevDispense = $$GetPrevDispense(idDispense, idPres,(idLineNumber\1))
+				if idPrevDispense'="" {
+					set strMessage = strMessage_"<br /># "_$$$Text($listbuild("MED00407",idPrevDispense)) //Item was refused in Dispensation (%1)
+				}
+				do Show^WWWPopupMessage(strMessage,$$$Text("MED01271")) ; HEVA-785
+				;do Show^WWWPopupMessage(strMessage,"Remarks")
+				set blnContinue = $$$NO
+			}
+		}
+    }
+	;CORE-96 vvvvv
+	;if ($get(intCol) =  $$$FldMEDDispenseLineValidation) { ;HEVA-769.2
+	;	if '$$$MEDDispenseLineValidation(pYFELD) {
+	;		new idItem,objItem,YKEY,idLine
+	;		set idItem=$$$MEDDispenseLineItemName(pYFELD)
+	;		if idItem'="" {
+	;			set objItem = $get(^INART(0,idItem,1))
+	;			if ($$$INARTMedRouteOfAdministration(objItem)'="") && ($$$MEDDispenseLineRoute(pYFELD) '= $$$INARTMedRouteOfAdministration(objItem)) {
+	;				set YKEY 			= $$GetYKEY^COMGridEdit31G(intRow,YFORM)
+	;				set idLine  		= $$$KEY2(YKEY)
+	;				$$$Alert($lb("MED00405",idLine))
+	;			}
+	;		}
+	;	}
+	;}
+	;CORE-96 ^^^^^
+
+	/* Test code to check if Validate/Reject buttons can work without 'Save'
+	// Here we are manually setting the value and not allowing @NM to do the work thus
+	// bypassing the 'Save Changes ?' message
+    if ($get(intCol) = $$$FldMEDDispenseLineValidation) {
+		if (intRow > +$get($$$WWWDATEN("ROWCOUNT"))) {
+			set $$$WWWDATEN("ROWCOUNT") = intRow
+		}
+
+	    set $$$WWWDATEN("Y"_intRow_"_"_intCol, 1) = '$get($$$WWWDATEN("Y"_intRow_"_"_intCol, 1))
+
+		if ($get($$$WWWDATEN("REFERENCEROW", 1, 1)) = intRow) {
+			set $$$WWWDATEN("REFERENCEVALUE", "Y"_intRow_"_"_intCol, 1) =
+				$$$WWWDATEN("Y"_intRow_"_"_intCol, 1)
+		}
+		//set ^zzPP($i(^zzPP))=intRow_":"_intCol_":"_$get($$$WWWDATEN("Y"_intRow_"_"_intCol, 1))
+
+	    quit 0	
+    }
+    */
+    
+	quit blnContinue
+	//quit
+
+OnBlurDiluent(pidItem, &pobjLine)
+	;-------------------------------------------------------------------------------
+	; On Blur from Diluent
+	;	Populates Unit dropdown
+	;
+	; Called By : form MEDDispenseLine
+	;		
+	; Params:	(YINHALT,.YFELD)
+	;
+	; ByRefs:	pobjLine	- current line object
+	;
+	; Returns:
+	;
+	; History :
+	; 14-Jun-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	
+	//Populate Unit Listing
+	if pidItem'="" {
+		set $$$MEDDispenseLineDiluentUOM(pobjLine) = $$LoadUnitOfMeasureList^INARTUtilities(pidItem)
+	}
+	quit
+
+
+GetLastDispWithSuspPresToday(pidKey,pobjDispLine)
+	;-------------------------------------------------------------------------------
+	;  
+	;	Populates calculated field Last Dispense/Suspended Drug
+	;
+	; Called By : Core rules form MEDDispenseLine
+	;		
+	; Params:	(YKEY,YFELD)
+	;
+	; ByRefs:
+	;
+	; Returns:	strOut - Last dispense with a suspended prescription on 
+	;							  current day, to patient and drug
+	;
+	; History :
+	; 10-May-2013	shobby	CORE-96: Disabled as per Rubens' recommendation
+	; 10-Oct-2012	SLV		SR18131: Created
+	;-------------------------------------------------------------------------------
+	quit ""
+	new dtDay,idDispWithSupPres,objDispense,idPres,objPres,idPatient,SQLCODE,strOut
+
+	set dtDay  			  = $piece($horolog,",",1)
+	set idDisp			  = $$$KEY1(pidKey)
+	set idItem			  = $$$MEDDispenseLineItemName(pobjDispLine)
+	set idDispWithSupPres = ""
+	set strPrescription	  = ""
+	set strOut			  = ""
+	
+	set objDispense = $get(^MEDDispense(0,idDisp,1))
+	if (objDispense '= "") {
+		set idPres	= $$$MEDDispensePrescription(objDispense)
+		set objPres	= $get(^MEDPrescription(0,idPres,1))
+		if (objPres '= "") {
+			
+			set idPatient	= $$$MEDPrescriptionPatientID(objPres)
+			&sql(DECLARE MEDDisp CURSOR FOR 
+			    SELECT Dispensation,Pres.PrescriptionNumber 
+				INTO :idDispWithSupPres,:strPrescription
+				FROM MEDDispense,MEDDispenseLine,
+				   (SELECT MEDPrescription.Company, 
+				           MEDPrescription.PrescriptionNumber, 
+				           MEDPrescriptionLine.Item,          
+				           MEDPrescription.ChangedOn
+				    FROM 
+				       MEDPrescription,MEDPrescriptionLine
+				    WHERE
+				       MEDPrescription.Company = 0
+				       AND MEDPrescription.Company = MEDPrescriptionLine.Company 
+				       AND MEDPrescription.PrescriptionNumber = MEDPrescriptionLine.PrescriptionNumber
+				       AND MEDPrescriptionLine.Status = 6
+				       AND MEDPrescription.PatientID = :idPatient
+				       AND +MEDPrescription.ChangedOn = :dtDay
+				       AND MEDPrescriptionLine.Item = :idItem) AS Pres
+				WHERE MEDDispense.Company = 0
+				   AND MEDDispense.Company = MEDDispenseLine.Company
+				   AND MEDDispense.Company = Pres.Company
+				   AND MEDDispense.Dispensation != :idDisp
+				   AND MEDDispense.Dispensation = MEDDispenseLine.Dispense
+				   AND MEDDispense.Prescription = Pres.PrescriptionNumber
+				   AND MEDDispense.Status = 3
+				   AND MEDDispenseLine.ItemName = Pres.Item
+				ORDER BY 2 DESC)
+				
+				&sql(OPEN MEDDisp)
+ 				&sql(FETCH MEDDisp)
+ 				
+ 				while (SQLCODE = 0) {
+	 				set strOut = $get(strOut)_$select(strOut="":"",1:";")_idDispWithSupPres
+ 					&sql(FETCH MEDDisp)
+ 				}
+ 				&sql(CLOSE MEDDisp)
+		}
+	}
+	
+	quit strOut
+
+OnBlurQty(&pobjRec,pidFld)
+	;-------------------------------------------------------------------------------
+	; On Blur Qty
+	; Used by MEDDispesneLine
+	;
+	; Inputs: Rec , Field id
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Feb-2013	SCR		HEVA-800: Created
+	;-------------------------------------------------------------------------------
+	new fltQty
+	set fltQty=$piece(pobjRec,Y,pidFld)
+	set fltQty = $$RoundDose^MEDPrescriptionCommon(fltQty)
+	set $piece(pobjRec,Y,pidFld)=fltQty
+	set YINHALT=fltQty
+	quit
+
+OnBlurUDO(&pobjRec)
+	;-------------------------------------------------------------------------------
+	; On UDO
+	; Used by MEDDispesneLine
+	;
+	; Inputs: Rec
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Oct-2014	SCR		HEVA-1580: Created
+	;-------------------------------------------------------------------------------
+	if ($$$KEY1(YKEY)'="")&&($$$KEY2(YKEY)'="")
+	set pobjRec=$$UpdateDispenseLine^MEDDispenseCalc($$$KEY1(YKEY),$$$KEY2(YKEY),pobjRec)
+	quit
+
+OnDisplayRightClickMenu(YKEY,YFELD,YFORM)
+	;-------------------------------------------------------------------------------
+	; Right click menu for Reviewing a single line
+	; Used by MEDDispesneLine
+	;
+	; Inputs: 
+	;
+	; Returns:
+	;
+	; History:
+	; 17-May-2013	SCR		HEVA-953: Custom Code
+	; 14-Mar-2013	SCR		HEVA-953: Created
+	;-------------------------------------------------------------------------------
+	new lstNewMenuItems,idDisp,idLine,objDisp,objLine,blnOK,idStatus,idRx,objRxLine
+	set lstNewMenuItems	= ""
+	set blnOK			= $$$OK
+	set YKEY			= $Translate(YKEY,"""")
+	set idDisp			= $$$KEY1(YKEY)
+	set idLine			= $$$KEY2(YKEY)
+	if $$$ISOK(blnOK) {
+		if (idDisp="")||(idLine="") {
+			set blnOK = $$$NO
+		}
+	}
+ 
+	if $$$ISOK(blnOK) {
+		set objDisp 	= $get(^MEDDispense(0,idDisp,1))
+		set idRx		= $$$MEDDispensePrescription(objDisp)
+		set objLine		= $get(^MEDDispenseLine(0,idDisp,idLine,1))
+		if idRx'="" {
+			set objRxLine = $get(^MEDPrescriptionLine(YM,idRx,idLine,1))
+			set idStatus=$$$MEDPrescriptionLineStatus(objRxLine)
+			set:idStatus=10 idStatus=2.5 
+			if '$$$MEDDispenseLineUDO(objLine) {
+				set:idStatus>4 blnOK=$$$NO
+			}
+		}
+	}
+	if $$$ISOK(blnOK) {
+		if $$$MEDDispenseLineValidatedStatus(objLine) = "blank_flat.gif" {
+			set blnOK = $$$NO
+		}
+	}	
+	if $$$ISOK(blnOK) {
+		set idStatus = $$$MEDDispenseStatus(objDisp)
+		if (idStatus > 2) {  ; Validated 	
+			set blnOK = $$$NO			
+		}
+	}
+	if $$$ISOK(blnOK) {
+		if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+			if (($$$MEDDispenseLineFREE6(objLine) = 1) && ($$$MEDDispenseLineUDO(objLine) '= "")) {
+				set blnOK = $$$NO			
+			}
+		}
+	}
+	if $$$ISOK(blnOK) {
+		set lstNewMenuItems = lstNewMenuItems_$listbuild($listbuild("r.gif",$$$Text($listbuild("MED01427")),"CallBack(""ReviewSingleLine^MEDDispenseLine"","""_YKEY_""")",,$$$YES))
+	}
+	quit lstNewMenuItems
+	
+ReviewSingleLine(YKEY)
+	;-------------------------------------------------------------------------------
+	; Review a single line
+	; Used by MEDDispesneLine
+	;
+	; Inputs: 
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Mar-2013	SCR		HEVA-953: Created
+	;-------------------------------------------------------------------------------
+	new idLine,idDisp
+	set idDisp			= $$$KEY1(YKEY)
+	set idLine			= $$$KEY2(YKEY)
+	do Review^MEDDispense(idDisp,idLine)
+	quit $$$OK
+
+
+Date()
+	;-------------------------------------------------------------------------------
+	; Populate the new ValidatedDate field
+	;
+	; Inputs: 
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Mar-2014	shobby		HEVA-1238: Created
+	;-------------------------------------------------------------------------------
+	new id,obj,idLine
+	
+	set id="" for { set id=$order(^MEDDispenseLine(0,id)) quit:id=""
+		set idLine="" for { set idLine=$order(^MEDDispenseLine(0,id,idLine)) quit:idLine=""
+			set obj=$get(^MEDDispenseLine(0,id,idLine,1))
+			set $$$MEDDispenseLineValidatedDate(obj)=+$$$MEDDispenseLineValidatedOn(obj)
+			set ^MEDDispenseLine(0,id,idLine,1)=obj
+		}
+	}
+	do ReIndex^COMIndex("MEDDispenseLine")
+	quit
+]]></Routine>
+</Export>

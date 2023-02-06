@@ -1,0 +1,536 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INLocking" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INLocking
+	
+#include COMSYS
+#include INConst
+	
+	;-------------------------------------------------------------------------------
+	; API for managing locking of locations
+	; 
+	; currently only locations can be locked, and only being done due to 
+	; "closed-door" stocktaking. 
+	; 
+	; But later we are likely to expand this to locking ranges of storage places 
+	; or item groups
+	; 	  
+ 	; Note that ^INLocationLocking is just one possible table in the database 
+ 	; that can store locking information. Don't access it directly, always use the 
+ 	; functions defined here because they may later be expanded to check other
+ 	; types of locking.
+ 	; 
+ 	; INLocationLocking has three fields
+	;   Type codes 
+	; 		0	- Other				$$$EnumINLOCKTYPEOther
+	; 		1	- Stocktaking		$$$EnumINLOCKTYPEStocktake
+	; 		... there may be more if we discover other processes that lock locations
+	;   Reason			free text defining the reason
+	;   Stocktake		an optional stocktaking ID associated with the lock
+	;-------------------------------------------------------------------------------
+	
+Create(pidLocn,pintType,pstrReason="",pstrRef="") 
+	;-------------------------------------------------------------------------------
+	; construct a new INLocationLock object
+	;
+	; Params: 
+	; 	pidLocn  : location to be locked
+	; 	pintType : type code for locking
+	;
+	; 	pstrReason : reason for locking
+	; 	pstrRef    : optional Reference - e.g. the stocktake for which we're locking
+	;
+	; Returns:
+	; 	new object of lock object (ie. record)
+	;
+	; History:
+	; 09-Nov-2007	shobby	BR014781:  Changed StocktakeNumber property to Reference
+	; 							to make more generic.
+	; 05-Nov-2007	PJones	BR014730, lock a site location when stocktaking
+	;-------------------------------------------------------------------------------
+	new objLock
+	
+	set objLock = ""
+	set $$$INLocationLockingLockType(objLock)  = pintType 
+	set $$$INLocationLockingReason(objLock)    = pstrReason
+	set $$$INLocationLockingReference(objLock) = pstrRef
+	quit objLock	
+	
+	
+	;=======================================
+	; Location-based Subroutines
+	;=======================================
+	
+	
+GetLocationLock(pidLocn,pidSeq) 
+	;-------------------------------------------------------------------------------
+	; load a lock object from the database. Use this instead of accessing the table directly
+	;	
+	; Params: pidLocn, location of site we're getting the lock for
+	;
+	; Returns: the lock record
+	;
+	; History:
+	; 08-Jul-2013	SCR		CORE-83: Add Sequence
+	; 09-Nov-2007	shobby	 SRBR014781: INLocationLocking should use YM
+	; 05-Nov-2007	PJones,  BR014730, lock a site location when stocktaking
+	;-------------------------------------------------------------------------------
+	quit $get(^INLocationLocking(0,pidLocn,pidSeq,1))
+	;quit $get(^INLocationLocking(0,pidLocn,1)) ; CORE-83
+	
+ 
+IsLockedSiteLocation(pidLocn)
+	;-------------------------------------------------------------------------------
+	;	test if a location is locked
+	;	
+	; Params: pidLocn, location we're testing
+	;
+	; Returns: $$$YES if the location is locked
+	;
+	; History:
+	; 08-Jul-2013	SCR		CORE-83: Add Sequence
+	; 24-Apr-2013	SCR		CORE-83: Items check
+	; 18-Apr-2013	SCR		CORE-83: Check for whole Location Locked
+	; 15-Dec-2009	GRF		SR17080: simplify result
+	; 23-Oct-2009	Karine	SR16963: Check if Location parameter is blank
+	; 05-Nov-2007	PJones	BR014730: test if a site location is locked
+	;-------------------------------------------------------------------------------
+	new objLock,idStk,objStk,blnLock,idSeq
+	
+	if pidLocn 	= "" set pidLocn = $get(YLOCATION)
+	set idSeq	= "" ; CORE-83
+	
+	; CORE-83 vvvv
+	set blnLock	= $$$NO
+	; CORE-83 vvv
+	for {
+		set idSeq = $order(^INLocationLocking(YM,pidLocn,idSeq))
+		quit:idSeq=""
+		quit:blnLock=$$$YES
+		if $data(^INLocationLocking(YM,pidLocn,idSeq,1)) {
+		;if $data(^INLocationLocking(YM,pidLocn,1)) {
+		; CORE-83 ^^^
+			set blnLock	= $$$YES
+			set objLock	= $get(^INLocationLocking(YM,pidLocn,idSeq,1)) ; CORE-83
+			;set objLock	= $get(^INLocationLocking(YM,pidLocn,1))
+			set idStk	= $$$INLocationLockingReference(objLock)
+			if idStk'="" {
+				set objStk	= $get(^INWEINVP(YM,idStk,1))
+				set:$$$INWEINVPItemGroup(objStk)'="" blnLock			= $$$NO
+				set:$$$INWEINVPFromStockLocation(objStk)'="" blnLock	= $$$NO
+				set:$$$INWEINVPToStockLocation(objStk)'="" blnLock		= $$$NO
+				set:$data(^INWEINVPLine(YM,idStk)) blnLock				= $$$NO
+			}
+		}
+	}
+	quit blnLock	
+	
+	;quit $select($data(^INLocationLocking(0,pidLocn,1)):$$$YES,1:$$$NO)
+	; CORE-83 ^^^^
+	
+LockSiteLocation(pidLocn,pintType,pstrReason="",pstrRef="")
+	;-------------------------------------------------------------------------------
+	;	lock a location with optional reason and reference to stocktake number
+	;	
+	; Params: 
+	; 	pidLocn   : location we're locking
+	; 	pintType  : type code for locking
+	; 	pstReason : free text reason for locking (optional)
+	; 	pstrRef   : Reference - e.g. the stocktake for which we're locking 
+	; 		(optional, only relevant if this is locking due to stocktaking)
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 08-Jul-2013	SCR		CORE-83: Add Sequence
+	; 09-Nov-2007	shobby	SRBR014781: Changed pintStocktakeNumber to pstrRef
+	; 							to make more generic.  Use standard save routine
+	; 							rather than setting global directly.
+	; 05-Nov-2007	PJones	BR014730, lock a site location
+	;-------------------------------------------------------------------------------
+	new objLock,strStatus,idSeq
+	
+	set idSeq		= $order(^INLocationLocking(YM,pidLocn,""),-1)+1
+	set objLock   	= $$Create(pidLocn,pintType,pstrReason,pstrRef)
+	set strStatus 	= $$$Save("INLocationLocking",pidLocn_","_idSeq,objLock)
+	
+ 
+	quit strStatus
+	
+	
+IsLockedSiteLocations(pstrLocnList,&pidLockedLocn)
+	;-------------------------------------------------------------------------------
+	;	test if any locations in list are locked
+	;
+	; Called By: CreateList^INWEINVP1 (+ VAR code)
+	; 
+	; Params: 
+	;
+	; Returns: $$$YES if the location is locked
+	;
+	; History:
+	; 05-Nov-2007	PJones,  BR014730, test if any location in the list is locked
+	;-------------------------------------------------------------------------------
+	new blnResult,idLocn,loop
+	
+	set blnResult = $$$NO
+	for loop=1:1:$length(pstrLocnList,";") {
+		quit:blnResult=$$$YES
+		
+		set idLocn = $piece(pstrLocnList,";",loop)
+		if idLocn'="" {
+			set blnResult = $$IsLockedSiteLocation(idLocn)
+			set pidLockedLocn = idLocn
+		}
+	}
+	quit blnResult	
+	
+	
+UnlockSiteLocation(pidLocn,pintType,pstrRef)
+	;-------------------------------------------------------------------------------
+	; unlock a location
+	;	
+	; Params: pidLocn, location we're removing the lock from
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 08-Jul-2013	SCR		CORE-83: Add Sequence
+	; 15-Dec-2009	GRF		SR17080: Kill macro
+	; 09-Nov-2007	shobby	SRBR014781: Only unlock if the Type and Reference match
+	; 							(or allow a force)
+	; 08-Nov-2007	shobby	BR014781: Routine did not have 'quit' at the end.
+	; 05-Nov-2007	PJones	BR014730, unlock a location
+	;-------------------------------------------------------------------------------
+ 	new objLock,strStatus,idSeq
+ 	
+	; CORE-83 vvv
+ 	set idSeq	= ""
+ 	for {
+	 	set idSeq	= $order(^INLocationLocking(YM,pidLocn,idSeq))
+	 	quit:idSeq=""
+	 	set objLock = $get(^INLocationLocking(0,pidLocn,idSeq,1))
+
+	 	if (pintType="") && (pstrRef="") && 
+	 		($$$INLocationLockingLockType(objLock)="") && ($$$INLocationLockingReference(objLock)="") {
+		 	set strStatus = $$$Kill("INLocationLocking",pidLocn_","_idSeq)
+	 	} elseif pidLocn'="" {
+	 		if (pintType = $$$INLocationLockingLockType(objLock))  &&
+	 	   	(pstrRef  = $$$INLocationLockingReference(objLock))    {
+		 		set strStatus = $$$Kill("INLocationLocking",pidLocn_","_idSeq)
+ 			}
+	 	}
+ 	}
+ 	;if (pintType="") && (pstrRef="") {
+	; 	set strStatus = $$$Kill("INLocationLocking",pidLocn)
+	; 	
+ 	;} elseif pidLocn'="" {
+	; 	set objLock = $get(^INLocationLocking(0,pidLocn,1))
+	; 	if (pintType = $$$INLocationLockingLockType(objLock))  &&
+	; 	   (pstrRef  = $$$INLocationLockingReference(objLock))    {
+	;	 	set strStatus = $$$Kill("INLocationLocking",pidLocn)
+ 	;	}
+ 	;}
+	; CORE-83 ^^^
+
+ 	quit
+	
+	
+LockSiteLocationList(pstrLocnList,pintType,pstrRef)
+	;-------------------------------------------------------------------------------
+	;   lock a list of locations
+	;	note that we default reason to stocktaking. later on we may change this 
+	;	
+	; Params: pstrLocnList : a list of semi-colon delimited locations
+	; 		  pintType     : The type of lock (ie 0-Other, 1-Stocktaking)
+	; 		  pstrRef      : Reference - e.g. the stocktake for which we're locking
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 06-Jun-2008	GRF		SR15786: Corrected text id in comment
+	; 09-Nov-2007	shobby	SRBR014781: Include lock type.  Changed pidStocktake to
+	; 							pstrRef
+	; 05-Nov-2007	PJones	BR014730, lock a list of siteLocations
+	;-------------------------------------------------------------------------------
+	new idLocn,loop
+	
+	for loop=1:1:$length(pstrLocnList,";") {
+		set idLocn = $piece(pstrLocnList,";",loop)
+		if idLocn '="" {
+			do LockSiteLocation(idLocn,pintType,"",pstrRef)
+		}
+	}
+	; $text("IN00777") when available     ??? IN00777 => "Site location locked for stocktaking"
+	quit
+	
+	
+UnlockSiteLocationList(pstrLocnList,pintType,pstrRef)
+	;-------------------------------------------------------------------------------
+	;   unlock a list of locations
+	;	
+	; Params: pstrLocnList, a list of semi-colon delimited locations
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 15-Dec-2009	GRF		SR17080: prefixes, standardise
+	; 09-Nov-2007	shobby	BR014781: Included pintType and pstrRef
+	; 05-Nov-2007	PJones	BR014730, unlock a list of siteLocations
+	;-------------------------------------------------------------------------------
+	new idLocn,loop
+ 
+	for loop=1:1:$length(pstrLocnList,";") {
+		if $piece(pstrLocnList,";",loop)'="" {
+			set idLocn = $piece(pstrLocnList,";",loop)
+			do UnlockSiteLocation(idLocn,pintType,pstrRef)
+		}
+	}
+	quit
+	
+	
+LockTypeSiteLocation(pidLocn,pidSeq) 
+	;-------------------------------------------------------------------------------
+	; find out the type of lock on a location
+	; 
+	; Params: 
+	; 	pidLocn, a location 
+	;
+	; Returns: the lock type for the location
+	;
+	; History:
+	; 08-Jul-2013	SCR		CORE-83: Add Sequence
+	; 05-Nov-2007	PJones	BR014730, 
+	;-------------------------------------------------------------------------------
+	quit $$$INLocationLockingLockType($$GetLocationLock(pidLocn,pidSeq)) ; CORE-83
+	;quit $$$INLocationLockingLockType($$GetLocationLock(pidLocn))
+	
+	
+	;=======================================
+	; Storage-based Subroutines
+	; 
+	; At time of writing we only lock by location so we can just check that.
+	; 
+	; Later, we may have other kinds of locking, eg. by group or by storage etc.
+	; So these subroutines will need to be changed.
+	; However, the *signatures* should be sufficient.
+	;=======================================
+	
+	
+IsLockedStockLocation(pidLocn,pidStorage)	
+	;-------------------------------------------------------------------------------
+	; test if a storage is locked
+	;	
+	; Params: 
+	; 	pidLocn			a location 
+	; 	pidStorage		the storage	 
+	;
+	; Returns: $$$YES if the stocklocation is locked
+	;
+	; History:
+	; 05-Nov-2007	PJones,  BR014730, 
+	;-------------------------------------------------------------------------------
+	quit $$IsLockedSiteLocation(pidLocn)
+ 
+ 
+IsLockedStockRecord(pidItem,pidLocn,pidStorage,pdteReceivedOn) ; NOTE INWE is now DEPRECATED
+	;-------------------------------------------------------------------------------
+	; test if an INWE record refers to something locked
+	; 
+	; Params: 
+	; 	pidLocn         a location 
+	; 	pidStorage      the storage
+	; 	pidItem         the item id
+	; 	pdteReceivedOn  received on date
+	;
+	; Returns: $$$YES if the INWE record is locked
+	;
+	; History:
+	; 05-Nov-2007	PJones	BR014730, 
+	;-------------------------------------------------------------------------------
+	quit $$IsLockedSiteLocation(pidLocn)
+	
+	
+ReasonLocked(pidLocn,pidStorage="",pidItem="")
+	;-------------------------------------------------------------------------------
+	; find out the reason for the lock on a location
+	; 
+	; Params: 
+	; 	pidLocn, a location 
+	;
+	; Returns: the reason a location is locked
+	;
+	; History:
+	; 17-Jul-2013	SCR		CORE-83: Bug fix
+	; 08-Jul-2013	SCR		CORE-83: Add Sequence
+	; 06-Jan-2010	GRF		SR17080: Add language text for unknown situation; use
+	; 							specified reason if available; return strStatus
+	; 14-Nov-2007   PJones	Added default arguments for pidStorage and pidItem.
+	;							*** Currently not used ***
+	;							Note : this is potentially dangerous as someone
+	;							might call it without sufficient arguments and find
+	;							that the location is not locked when a
+	;							particular storage is (or vice  versa).
+	;							Be aware of this when modifying this function with
+	;							finer-grained locking (item/storage/group)
+	; 09-Nov-2007	shobby	SRBR014781: INLocationLocking should use YM
+	; 05-Nov-2007	PJones	BR014730, 
+	;-------------------------------------------------------------------------------
+	new enumLockType,intReason,strReason,strStatus,idSeq
+
+	; CORE-83 vvv
+	set strStatus	= $$$OK
+	set idSeq		= ""
+	for {
+		set idSeq	= $order(^INLocationLocking(YM,pidLocn,idSeq))
+		quit:idSeq=""
+		;quit:idSeq'=""
+		quit:strStatus'=$$$OK
+		set enumLockType= $$LockTypeSiteLocation(pidLocn,idSeq)
+		;set str = "unknown reason for locking "_enumLockType ; SR17080
+	
+		if enumLockType = $$$EnumINLOCKTYPEStocktake {
+			set strStatus = $$$MakeStatus("IN00709",$$$INLocationLockingReference($get(^INLocationLocking(0,pidLocn,idSeq,1))),pidLocn)
+		; "Stocktake No.'%1' has locked Location '%2'."
+	
+		} else {
+			set strReason = $$$INLocationLockingReason($get(^INLocationLocking(0,pidLocn,idSeq,1))) ; user's reason
+			if strReason="" set strReason = $$$Text("IN01187")    ; "Reason Unknown"
+			set strStatus = $$$MakeStatus("IN01188",strReason)
+		} ; "Location Locked (%1)"
+	}
+	;set enumLockType= $$LockTypeSiteLocation(pidLocn)
+	;set str = "unknown reason for locking "_enumLockType ; SR17080
+	
+	;if enumLockType = $$$EnumINLOCKTYPEStocktake {
+	;	set strStatus = $$$MakeStatus("IN00709",$$$INLocationLockingReference($get(^INLocationLocking(0,pidLocn,1))),pidLocn)
+	; "Stocktake No.'%1' has locked Location '%2'."
+	;
+	;} else {
+	;	set strReason = $$$INLocationLockingReason($get(^INLocationLocking(0,pidLocn,1))) ; user's reason
+	;	if strReason="" set strReason = $$$Text("IN01187")    ; "Reason Unknown"
+	;	set strStatus = $$$MakeStatus("IN01188",strReason)
+	;} ; "Location Locked (%1)"
+	; CORE-83 ^^^
+
+	quit strStatus
+	
+SOHPostCheck(pidItem,pidLocn,pidStorage,pidMoveType,pidTxType,pstrRef,pidLine,pidExRef="")
+	;-------------------------------------------------------------------------------
+	; Check Stocktake Locking during SOH processing
+	; 
+	; Params: 
+	; 	pidItem,
+	;	pidLocn,
+	;	pidStorage,
+	;	pidMoveType,
+	;	pidTxType,
+	;	pstrRef,
+	;	pidLine
+	;	pidExRef = Optional exclude Stock Ref, used by GetAllItems^INStocktakeCreateUtil
+	;
+	;	Called from alSOH.piSOH.Post,alDRP.iDRP.SourceStock & GetAllItems^INStocktakeCreateUtil
+	;
+	; Returns: Status (Cache Error code)
+	;
+	; History:
+	; 03-Sep-2013	SCR		CORE-243: Dont Convert strStatus to Object Error when called from GetAllItems
+	; 18-Jul-2013	SCR		CORE-83: If there is a Group & Storage filters treat them as 'and'
+	; 11-Jul-2013	SCR		CORE-83: Improve Checking with Item Locking
+	; 08-Jul-2013	SCR		CORE-83: Add Sequence checking & exclude Stocktake option
+	; 24-Apr-2013	SCR		CORE-83: Items check
+	; 18-Apr-2013	SCR		CORE-83: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,lstGroups,idGroup,strStorFrom,strStorTo,idStk,objStk,blnFilter,idSeq,idxStk,blnItemSkip
+	new strGrpStatus
+
+	set strStatus	= $$$OK
+	set blnFilter	= $$$NO
+	set strGrpStatus= $$$OK
+	; CORE-83 vvv
+	set idSeq		= ""
+	for {
+		set idSeq	= $order(^INLocationLocking(YM,pidLocn,idSeq))
+		quit:idSeq=""
+		quit:strStatus'=$$$OK
+	; CORE-83 ^^^
+	; This code is part of Core SOH processing and should be fast
+		set pidLine	= $piece(pidLine,"||",$length(pidLine,"||"))
+		set objLock	= $get(^INLocationLocking(YM,pidLocn,idSeq,1)) ; CORE-83
+		;set objLock	= $get(^INLocationLocking(YM,pidLocn,1))
+		if ( ($$$INLocationLockingReference(objLock)=pidExRef) && (pidExRef'="")) {
+			continue  ; If Stocktake create , exclude current lock
+		}
+		if ((pidMoveType=41) && (pidTxType=9)) && (pidExRef="") {
+			continue  ; If Stocktake posting , exclude all checking
+		}
+		set idStk	= $$$INLocationLockingReference(objLock)
+		if idStk'="" {
+			set objStk		= $get(^INWEINVP(YM,idStk,1))
+			set idxStk		= $$$Index(idStk)
+			set lstGroups	= $$$INWEINVPItemGroup(objStk)
+			if '$data(^INWEINVPLines(YM,1,pidItem,idxStk)) && $data(^INWEINVPLine(YM,idStk)) {
+				set blnItemSkip	= $$$YES  ; There is an Item List but the current item is not on it - Group 
+			} else {
+				set blnItemSkip	= $$$NO
+			}
+			set strStorFrom	= $$$INWEINVPFromStockLocation(objStk)
+			set strStorTo	= $$$INWEINVPToStockLocation(objStk)
+			if lstGroups'="" && 'blnItemSkip {
+				set idGroup		= $$$INARTItemGroup($get(^INART(YM,pidItem,1)))
+				if idGroup'="" {
+					if (";"_lstGroups_";")[(";"_idGroup_";") {
+						set strGrpStatus =  $$$Text($listBuild("IN01416",pidItem,pidLine,idGroup,idStk))  ;Item %1 on Line %2 is in Group %3 which is locked by Stocktake %3 and can not be processed
+						if (strStorFrom="") && (strStorTo="") {
+							set strStatus = strGrpStatus ; If no storage filters, passon the error
+						}
+					} else {
+					set blnItemSkip	= $$$YES  ; There is Group List but the current item is not on it
+					}
+				}
+			}
+			if $$$ISOK(strStatus) && 'blnItemSkip {
+				if (strStorFrom'="")&&(strStorTo="") && '(strStorFrom]]pidStorage) {
+					set strStatus =  $$$Text($listBuild("IN01417",pidItem,pidLine,pidStorage,idStk,strStorFrom))  ;Item %1 on Line %2 Storage %3 is Locked on Stocktake %4 , Storage from %5
+				}
+			}	
+		
+			if $$$ISOK(strStatus) && 'blnItemSkip {
+				if (strStorTo'="")&&(strStorFrom="")   && '(pidStorage]]strStorTo) {
+					set strStatus =  $$$Text($listBuild("IN01418",pidItem,pidLine,pidStorage,idStk,strStorTo))  ;Item %1 on Line %2 Storage %3 is Locked on Stocktake %4 , Storage to %5
+				}	
+			}
+			if $$$ISOK(strStatus) && 'blnItemSkip {
+				if (strStorTo'="")&&(strStorFrom'="")   && '(strStorFrom]]pidStorage) && '(pidStorage]]strStorTo) {
+					set strStatus =  $$$Text($listBuild("IN01419",pidItem,pidLine,pidStorage,idStk,strStorFrom,strStorTo))  ;Item %1 on Line %2 Storage %3 is Locked on Stocktake %4 , Storage from %5 to %6
+				}	
+			}
+			if $$$ISOK(strStatus) {
+				if (strStorFrom="") && (strStorTo="") && (lstGroups="") && $data(^INWEINVPLines(YM,1,pidItem,idxStk)) {
+					 set strStatus =  $$$Text($listbuild("IN01421",pidItem,pidLine,idStk))  ;Item %1 on Line %2 is Locked on Stocktake %3
+				}
+			}
+			if $$$ISOK(strStatus) {
+				if (strStorFrom="") && (strStorTo="") && (lstGroups="") && 'blnItemSkip {
+					; No stocktake filter
+				 	set strStatus =  $$$Text($listbuild("IN01421",pidItem,pidLine,idStk))  ;Item %1 on Line %2 is Locked on Stocktake %3				
+				}
+			}
+		
+		}
+	}
+	if $$$ISERR(strStatus) && (pidExRef="") { ; CORE-83 dont convert if used by stocktake create
+		set strStatus =$$$ERROR($$$GeneralError,strStatus) ; Convert to Cache Error code
+	}
+
+	if $$$ISERR(strStatus) && (pidExRef="") { ; CORE-243 dont convert if used by stocktake create
+		Do $system.Status.DecomposeStatus(strStatus,.Err) 
+	}
+	quit strStatus
+
+	
+	
+	
+
+]]></Routine>
+</Export>

@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alDRP.dMovementType.ReceiptReverse">
+<ClassType>serial</ClassType>
+<IncludeCode>INConst</IncludeCode>
+<Super>alDRP.dMovementType</Super>
+
+<Property name="MovementTypeId">
+<Description><![CDATA[
+Source of transaction
+Based On : ^WWW101(0,"UMSATZART1",SPRACHE,Class,1)   ; TODO]]></Description>
+<Type>alSYS.dt.dtInteger</Type>
+<Final>1</Final>
+<InitialExpression>"7&quot;</InitialExpression>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="AL00470"/>
+</Property>
+
+
+<Method name="Validate">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set sc = $$$OK
+	if pobjMove.Completed {
+		set strMessage = $$$Text("IN00711")      ; "This movement is already completed."
+		set sc =$$$ERROR($$$GeneralError,strMessage)
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="Confirm">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; 1)  Update V1 Average Cost (ReceiptWithOrder)
+	; 2)  Create alSOH.dStockHistory                           [Simple sequential key]
+	; 3)  Update alSOH.dPeriodBalance (creating if required)   [Locn, Item, PeriodID]
+	; 4)  Stock-Finance Interface + INStockValAdjust
+	; 5a) ReceiptWithOutOrderMovement
+	; 5b) ReceiptWithOrderMovement
+	; 
+	; History:
+	; 04-Aug-2010	SCR		SR17387: Pass Source Details to Auto Adjust.
+	; 12-Jul-2010	SCR		SR17387: Pass Source Details, Form & Rec to Finance
+	; 19-Nov-2009	GRF		SR16471: Change scope of lock by making it a global
+	; 11-Nov-2009	GRF		SR16871: relocate unlock to cover data being updated
+	; 05-Nov-2009	GRF		SR16871: add "R" to strReceiptRef
+	; 27-Oct-2009	GRF		SR16871: INAvgCost replaces INARTAVG; INStockValCCAdj
+	; 							replaces ^INStockValAdjustt; Remove ConfirmMovement
+	; 21-Oct-2009	GRF		SR16875: TxnValue should be extended cost
+	; 15-Oct-2009	GRF		SR16941: INStockVal error message; testing strStatus
+	; 							when should test sc
+	; 15-Oct-2009	GRF		SR16941: INStockVal error message
+	; 07-Oct-2009	GRF		SR16928: Calc Avg cost *BEFORE* alSOH.piSOH::Post;
+    ; 							include Unit and Extended Costs; was not performing
+    ; 							PeriodBalance update nor locking around average cost
+    ; 							Correct AutoUpdate^INStockValAdjust references
+	; 07-Oct-2009	GRF		SR16928: Use 0,0 in place of order/Line in strReceiptRef
+	; 02-Oct-2009	GRF		SR16875: data correction
+	; 28-Sep-2009	GRF		SR16914: Supplier sent to alSFI.dStockFin rather than
+	; 							obtaining from order since may be receipt without
+	; 							order.
+	; 21-Sep-2009	GRF		SR16361: Call to INARTAVG replaces ConfirmMovement (with
+	;							extended reference); reuse variables
+	; 14-Sep-2009	DWR		SR16880: call to new alSFI.dStockFin class
+	;-------------------------------------------------------------------------------
+	set sc        = $$$OK
+	set strStatus = $$$OK
+	
+	set idItem	  	 = pobjMove.Item.ItemId
+	set objTransType = ##class(alSOH.dTransactionType).%OpenId(1)
+	
+ ;	set fltUnitCost  = $$GetCostV2^INARTKOST(idItem)    ; current average cost - should we reverse actual? SR16928
+	set fltUnitCost  =  pobjMove.UnitCost
+	set dteRecvd     =  pobjMove.ReceiptDate       ; SR16361 vvv
+	set idReceipt    =  pobjMove.Reference
+	set idRecLine    =  pobjMove.LineNumber
+	set idLocn       =  pobjMove.FromLocn.Code
+	set idStorage    =  pobjMove.FromStorage.Code
+	set idOrder      =  pobjMove.OrderNumber
+	set idOrderLine  =  pobjMove.OrderLine
+	set fltRevQty    = -pobjMove.QtyReceived       ; SR16361 ^^^
+	
+	set idCostCentre = $$GetCostCentre^INCostCentre(idLocn)     ; SR16871
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	LOCK +^alSOHProcessing(idItem):2 ; Use a timeout of 2 to help stop dead lock
+	if '$test {   ; "Can not acquire a lock for Item: (%1) please try again "
+		set strMessage = $$$Text($listbuild("IN00853",idItem))
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+    
+	if $$$ISOK(sc) { 
+	
+	; Update Average Costs
+	;---------------------------------------   ; SR16928 relocate
+		if idOrder="" {   ; SR16928
+			set strReceiptRef = "0,0,"
+		} else {
+			set strReceiptRef = idOrder_","_idOrderLine_","
+		}
+		set strReceiptRef = strReceiptRef_idLocn_","_idStorage_","_dteRecvd_","_idReceipt_","_idRecLine_",R"
+		
+	;	set fltAvgCost = $$^INARTAVG(idItem,fltRevQty,fltUnitCost,strReceiptRef,$$$NO,$$$YES,idLocn) ;SR16871
+		; SR16928 ^^^
+		set fltAvgCost = $$UpdateCost^INAvgCost(idItem,idLocn,fltRevQty,fltUnitCost,strReceiptRef,idCostCentre)
+		
+	;+++++++++++++++++++++++++++++++++++++++ ; SR16871
+	;	LOCK -^alSOHProcessing(idItem)
+	;+++++++++++++++++++++++++++++++++++++++
+		
+	; Supplier Receipt Reversal : Stock History & Period Balance
+	;---------------------------------------
+		set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove,
+													   pobjMove.FromLocn,
+													   pobjMove.FromStorage,
+													   fltRevQty,
+													   fltUnitCost,
+													   objTransType,
+													   .sc)
+		if $$$ISOK(sc) set sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist) ; 15-Oct-2008
+	;+++++++++++++++++++++++++++++++++++++++ ; SR16871
+		LOCK -^alSOHProcessing(idItem)
+	;+++++++++++++++++++++++++++++++++++++++
+	}
+	
+	; Stock to Finance Interface            ; SR16880
+	;---------------------------------------
+	if $$$ISOK(sc) {
+	;	; vvv SR16361     ; SR16928 relocate
+	;	if idOrder="" {   ; SR16928
+	;		set strReceiptRef = "0,0,"_idLocn_","_idStorage_","_dteRecvd_","_idReceipt_","_idRecLine
+	;	} else {
+	;		set strReceiptRef = idOrder_","_idOrderLine_","_idLocn_","_idStorage_","_dteRecvd_","_idReceipt_","_idRecLine
+	;	}
+	;	set fltAvgCost = $$^INARTAVG(idItem,fltRevQty,fltUnitCost,strReceiptRef,$$$NO,$$$YES,idLocn)
+	;	; ^^^ SR16361
+		
+		set objRECLine = $get(^INRECLine(0,idReceipt,idRecLine,1))   ; SR16914
+		set idSupplier = $$$INRECLineSupplier(objRECLine)            ; SR16914
+		
+		set objStockFin = ##class(alSFI.dStockFin).%New()            ; SR16880 vvv
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "REC"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.ReceiptReverse"
+		set objStockFin.TxnInformation = "Receipt Reverse"
+		set objStockFin.Item           = pobjMove.Item
+	;	set objStockFin.TxnValue       = fltUnitCost                 ; SR16875
+		set objStockFin.TxnValue       = -pobjMove.ExtendedCost
+		set objStockFin.Quantity       = fltRevQty       ; pobjMove.QtyPicked  ; SR16875 vvv
+	;	set objStockFin.FromLocn       = pobjMove.FromLocn
+	;	set objStockFin.FromStorage    = pobjMove.FromStorage
+	;	set objStockFin.ToLocn         = pobjMove.ToLocn
+	;	set objStockFin.ToStorage      = pobjMove.ToStorage
+		set objStockFin.FromLocn       = pobjMove.ToLocn
+		set objStockFin.FromStorage    = pobjMove.ToStorage
+		set objStockFin.ToLocn         = pobjMove.FromLocn
+		set objStockFin.ToStorage      = pobjMove.FromStorage                    ; SR16875 ^^^
+		set objStockFin.Supplier       = idSupplier                  ; SR16914
+		set objStockFin.SourceRec      = idReceipt                   ; SR17387
+		set objStockFin.SourceForm     = "INRECReverse"              ; SR17387
+		set objStockFin.SourceDetail   = 34347_","_idReceipt_","_idRecLine_","_idOrder_","_idOrderLine_","_idSupplier ; SR17387
+		                                 ; "Receipt Reverse %1, Line %2, Order %3, Line %4, Supplier %5"
+		set sc = objStockFin.StockToFin()
+		
+	; Adjust Stock Values if cost centres differ - AFTER Post called so QOH updated in INStockVal    ; SR16871
+	;---------------------------------------
+		if $$$ISOK(sc) {    ; FIXME : Distinguish beteen receipt and reversal?  Better ref than order/line?
+		;	set strStatus = $$AutoUpdate^INStockValAdjust("RECEIPT",idOrder_","_idOrderLine,idItem,fltAvgCost)  ; SR16928
+	;		set strStatus = $$AutoUpdate^INStockValAdjust("RCPTREV",idReceipt_","_idRecLine,idItem,fltAvgCost)  ; SR16871
+		;	set strStatus = $$AutoUpdate^INStockValCCAdj("RcptRev",idReceipt_","_idRecLine,idItem,idCostCentre,fltAvgCost)
+			set strStatus = $$AutoUpdate^INStockValCCAdj("RcptRev",idReceipt_","_idRecLine,idItem,idCostCentre,fltAvgCost,objStockFin) ; SR17387
+		;	set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"Error Back Populating INWE") ///$$$Text("IN00711")) ; SR16941
+			set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"Error Updating Stock Values")
+		}
+		
+		set YUSER =%("%KEY","YUSER") 
+		set:YUSER="" YUSER=" "
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		set:$$$ISOK(sc) ^CacheTemp(YUSER,"FIBURecord") = $$$YES      ; SR16941
+		
+	}
+	
+ /* ; SR16871 vvv
+	; Back Populate V1
+	;---------------------------------------
+ 	if $get(^SysSetup("KeepOldStockHistory")) && $$$ISOK(sc) {
+		
+		set strStatus = $$ConfirmMovement^INStockMovement(idItem,
+		                                                  pobjMove.Bundle,
+		                                                  fltRevQty,
+		                                                  idLocn,
+		                                                  idStorage,
+		                                                  pobjMove.ToLocn.Code,
+		                                                  pobjMove.ToStorage.Code,
+		                                                  pobjMove.MovementType.MovementTypeId,
+		                                                  idReceipt,
+		                                                  idRecLine,
+		                                                  ""
+		                                                  )
+		
+		set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"Error Back Populating INWE") ///$$$Text("IN00711"))
+ 	}
+ */ ; SR16871 ^^^
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="Default">
+<Type>%Library.CacheSerialState</Type>
+</Storage>
+</Class>
+</Export>

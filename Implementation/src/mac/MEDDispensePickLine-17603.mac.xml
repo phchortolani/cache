@@ -1,0 +1,673 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDDispensePickLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDDispensePickLine
+	quit
+
+#include WWWConst
+#include COMConst
+#include INConst
+#include COMGridEdit31
+#include MEDConst
+
+#define FORMFldMEDDispensePickLineLot		5
+#define FORMFldMEDDispensePickLineBundle	8
+#define FORMFldMEDPDispensePickLineIssueUOM 2
+#define FORMFldMEDPDispensePickLineLSOH    10
+#define FORMFldMEDPDispensePickLineCSOH    11
+#define FORMFldMEDPDispensePickLineSolution 14
+
+OnBeforeFormConstruction(pintField)
+	;-------------------------------------------------------------------------------
+	; Check whether to display the network total quantity.
+	;
+	; History:
+	; 10-Jan-2013	shobby		HEVA-743 : Creation
+	;-------------------------------------------------------------------------------
+	new objINVORG
+	
+	if pintField=11 {
+		set objINVORG = $get(^INVORG(YM,YM,1))
+ 		if '$$$INVORGViewStockFromAllLocations(objINVORG) set YHID=2
+	}
+	quit 1
+	
+	
+Enabled(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Called By : Form MEDDispense : Grid Tab (COMGridEditParameter)
+	;
+	;
+	; History:
+	; 09-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new blnEnabled
+	
+	set blnEnabled = $$$YES
+	
+	if '$$$NoKey(pYKEY) {
+
+		if $$$MEDDispenseStatus(pYFELD) > 3   {   ;"Partially Processed"
+			set blnEnabled = $$$NO
+		}
+	}
+	
+	quit blnEnabled
+
+OnBeforeDisplayCombo(pstrKeys,pobjDisp,pintCol,&pSUCH)
+	;-------------------------------------------------------------------------------
+	; Populates the Dose UOM with the UOM as defined in INARTPACK only, excludes
+	; units that the item does not come in.
+	; 
+	; set pSUCH as the items to be used when you override the list (set via blnOverride)
+	;
+	; Inputs:
+	;	pstrKeys	- YKEY
+	;	pobjDisp	- YFELD
+	;	pintCol     - Edit Grid Column Id
+	;	pSUCH       - Search Array
+	; 
+	; Returns: $$$YES or $$$NO (override the data) 
+	;
+	; History:
+	; 08-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new blnOverride
+	
+	set blnOverride = $$$NO
+	
+	; F11 - Received Unit
+	;---------------------------------------
+	if pintCol = $$$FORMFldMEDPDispensePickLineIssueUOM {
+		set blnOverride = $$LoadCombo^INARTPACK($$$MEDDispensePickLineItem(pobjDisp),blnOverride,.pSUCH)
+	}
+	quit blnOverride
+	
+OnBeforeFormat(pYFIELDNAME,pobjLine)
+	;-------------------------------------------------------------------------------
+	; set Color on fields that fail validation
+	;	
+	; Called By :
+	;	Form - GridEdit:INIssueLine
+	;	Routines -
+	;		
+	; Inputs : 
+	;	pYFIELDNAME	-	Browser Element ID "tdY#row#_#col#"
+	;	pYFELD		-	@nM INIssueLine Data record
+	;
+	; ByRef :
+	;
+	; Returns : 
+	;
+	; History :
+	;
+	; 21-Jun-2014	SCR		HEVA-1505: Early exit if not MEDDispensePickLine or MEDDispenseManPickLine
+	; 09-Jun-2014	SCR		HEVA-1505: Separate logic for MEDDispenseManLine
+	; 17-Sep-2013	shobby	HEVA-1113A: Preserve the colours even after record is processed.
+	; 15-Aug-2013	SCR		CORE-247: Remove 2nd Parameter SR17847
+	; 07-Feb-2013	shobby	HEVA-731: Moved colour determination into a subroutine
+	; 29-Jan-2013	shobby	HEVA-731: FREE21 has been replaced with field MultidoseInjectable
+	; 02-Oct-2012	SCR		SR17993: Added Dummy parameter to match older version of EditGrid
+	; 02-Aug-2012	PPP		SR18067: Ensure Diluent Pick line is identified
+	;						No qty check for Diluents
+	; 02-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+
+	new blnDiluent,fltCSOH,fltIssTot,fltLSOH,fltQOH,fltQtyIssued,fltQtyPlanned
+	new fltQtyReqd,fltStockBundleQty,fltTotQtyIssFromStore,fltTotalIssued,idBundle
+	new idClassField,idFromLocn,idFromStore,idIssueLine,idIssueNumber,idItem,idLineNumber
+	new idLn,intCol,intRow,objBundle,objBundleStock,objHeader,objIssueLine,sc,strBundleValues
+
+	if YFORM="MEDDispenseManPickLine"  {
+		do OnBeforeFormatClass^MEDDispenseManPickLine(pYFIELDNAME,pobjLine)
+		quit
+	}
+
+	quit:YFORM'="MEDDispensePickLine"
+	
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pYFIELDNAME,intRow,intCol)
+	set idClassField = $$$GetClassField(YFORM,intCol)
+
+	set objHeader  = $$$GRIDYFELDContainer
+	
+	set idItem       = $$$MEDDispensePickLineItem(pobjLine)						;HEVA-1113A
+	if ((idItem '= "") && (idClassField = $$$FldMEDDispensePickLineItem)) {		;HEVA-1113A
+		do SetColor^MEDDispenseBackground(idItem)	;HEVA-731					;HEVA-1113A
+	}																			;HEVA-1113A
+	
+	quit:$$$MEDDispenseStatus(objHeader)>2         		// Processed
+	
+	set idBundle     = $$$MEDDispensePickLineBundle(pobjLine)
+	
+	if (idClassField = $$$FldMEDDispensePickLineBundle) {
+		; Manual F Lot = Bundle Attribute Values
+		
+		if idBundle '= "" { 
+		    //Update "Bundle Values" as well as styling
+			set objBundle       = ##class(alSOH.dBundle).%OpenId(idBundle)
+			set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundle,SPRACHE)
+			set YTOOLTIP        = idBundle
+			do UpdateManualField^COMGridEdit31Interface(intRow,$$$FORMFldMEDDispensePickLineLot,strBundleValues) ; YTEXT can't be set here, workaround
+			
+		} else {
+			set YWARNING	= $$$YES
+			set YTOOLTIP	= $$$Text($listbuild("alINV0102",$$$MEDDispensePickLineFromStorage(pobjLine)))  ;
+		} ; "No bundle, or bundle doesn't exist in Storage '%1'"
+	}
+	
+	; don't bother formatting if it is firmed/a-closed/m-closed, locked anyway
+	;---------------------------------------
+	
+	; FIXME : Early exit
+	//quit:(($$$INIssueLineStatus(pobjLine) = 2) || ($$$INIssueLineStatus(pobjLine) = 8) || ($$$INIssueLineStatus(pobjLine) = 9))
+	
+	set idIssueNumber = $$$KEY1(YKEY)
+	set idLineNumber  = $$$KEY2(YKEY)
+	
+	; MEDDispense Header
+	;---------------------------------------
+	set objHeader  = $$$GRIDYFELDContainer
+	quit:$$$MEDDispenseStatus(objHeader)>5         		// Processed
+	set idFromLocn = $$$MEDDispenseSupplyingLocation(objHeader)
+	
+	; MEDDispensePickLine from Grid
+	;---------------------------------------
+	set idItem       = $$$MEDDispensePickLineItem(pobjLine)
+	set idFromStore  = $$$MEDDispensePickLineFromStorage(pobjLine)
+	set idBundle     = $$$MEDDispensePickLineBundle(pobjLine)
+	set fltQtyIssued = $$$MEDDispensePickLineIssueQty(pobjLine)
+	set fltQtyReqd   = $$$MEDDispensePickLineRequestedQty(pobjLine)
+	set blnDiluent	 = +$$$MEDDispensePickLineIsDiluent(pobjLine)	//SR18067
+	
+	; Qty Issued
+	;-----------------------------------
+	if (idClassField = $$$FldMEDDispensePickLineIssueQty) {
+		set fltIssTot = $$GetTotalIssued(idLineNumber)
+		set fltTotalIssued = fltIssTot + fltQtyIssued
+		
+		if fltQtyIssued = "" {
+			set YWARNING = $$$YES		
+		} elseif (fltTotalIssued > fltQtyReqd) && 'blnDiluent  {	//SR18067
+			set YWARNING = $$$YES
+			set YTOOLTIP = $$$Text($listbuild("IN01222",fltTotalIssued,fltQtyReqd,idLineNumber))
+			; "Total Quantity Issued (%1) has to be equal to the Unit Quantity (%2) for Line %3"
+			
+		} else {
+			// Read from On Screen Value before On Disk Value
+			set fltQOH         = ##class(alSOH.iSOH).GetQtyOnHand(idItem,idFromLocn,idFromLocn_"||"_idFromStore)
+			set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idItem_"||"_idFromLocn_"||"_idFromStore_"||"_idBundle,,.sc)
+			
+			//set ^zzPP($i(^zzPP))=idItem_"||"_idFromLocn_"||"_idFromStore_"||"_idBundle
+
+			if $$$ISOK(sc) {
+				set fltStockBundleQty = 0
+				set:(objBundleStock '= $$$NULLOREF) fltStockBundleQty = objBundleStock.QtyOnHand
+				
+				; FIXME : can we use idItem, idFromLocn, idFromStore and idBundle in next line rather than extracting when we have used them as the keys?
+				
+				set fltQtyPlanned = ##class(alSOH.iSOHBalance).GetQtyPlanned(objBundleStock.Item.%Id(),objBundleStock.Storage.Location.%Id(),objBundleStock.Storage.%Id(),objBundleStock.Bundle.%Id())
+
+				//set ^zzPP($i(^zzPP))="fltQtyIssued:"_fltQtyIssued_" fltStockBundleQty:"_fltStockBundleQty_" fltQtyPlanned:"_fltQtyPlanned_" fltQOH:"_fltQOH
+				
+				if (fltQtyIssued > (fltStockBundleQty-fltQtyPlanned)) {
+					set YWARNING = $$$YES
+					set YTOOLTIP  =$$$Text("IN00437")_" = "_(fltStockBundleQty-fltQtyPlanned) ; "Available Quantity"
+					
+				} elseif (fltQtyIssued > fltQOH) {
+					set YWARNING = $$$YES
+					set YTOOLTIP = $$$Text("IN00437")_" = "_fltQOH                            ; "Available Quantity"
+					
+				} else {
+					//	Check Prior Line entries, sum quantities
+					if objBundleStock '= $$$NULLOREF {
+						set idIssueLine = "" 
+						set fltTotQtyIssFromStore = 0
+						
+						set idLn = $translate(idLineNumber,"x",".")
+						for {
+							set idIssueLine = $order($$$WWWDATEN("REFERENCEROW",idIssueLine))
+							quit:(idIssueLine = "")
+							continue:(idIssueLine = idLn) 
+							continue:(idIssueLine\1)'=(idLn\1)
+							continue:($get($$$WWWDATEN("KILLEDRECORD",$get($$$WWWDATEN("REFERENCEROW",idIssueLine,1))))=$$$YES)
+							
+							set objIssueLine = $$$GRIDGetYFELD(idIssueLine)
+							continue:($$$MEDDispensePickLineItem(objIssueLine)    '= idItem)
+							continue:($$$MEDDispensePickLineFromStorage(objIssueLine) '= idFromStore)
+							continue:($$$MEDDispensePickLineBundle(objIssueLine)      '= idBundle)
+							
+							set fltTotQtyIssFromStore = fltTotQtyIssFromStore + $$$MEDDispensePickLineIssueQty(objIssueLine)
+						}
+						
+						if (fltTotQtyIssFromStore > objBundleStock.QtyOnHand) {
+							set YWARNING = $$$YES
+							set YTOOLTIP = $$$Text($listbuild("alMOV0003",objBundleStock.QtyOnHand))
+						} ; "Not enough Items in Storage (Quantity = %1)"
+					}
+				}
+			} else {
+				//Problem could be related to Storage			
+				if idFromStore="" {
+					set YWARNING = $$$YES
+					set YTOOLTIP = $$$Text("IN00447")   //"Invalid Storage"
+				}
+			}
+		}
+	
+	;Storage
+	;---------------------------------------
+	} elseif (idClassField = $$$FldMEDDispensePickLineFromStorage) {
+		if idFromStore="" {
+			set YWARNING = $$$YES
+			set YTOOLTIP = $$$Text("IN00447")   //"Invalid Storage"
+		}
+	}
+	
+	;HEVA-1113A if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+	;HEVA-1113A 	;Item
+	;HEVA-1113A 	;---------------------------------------
+	;HEVA-1113A 	if ((idItem '= "") && (idClassField = $$$FldMEDDispensePickLineItem)) {
+	;HEVA-1113A 		do SetColor^MEDDispenseBackground(idItem)	;HEVA-731
+	;HEVA-1113A 	}
+	;HEVA-1113A }
+	
+	if (intCol = $$$FORMFldMEDPDispensePickLineLSOH)    ||
+	   (intCol = $$$FORMFldMEDPDispensePickLineCSOH)    {	
+		
+		set fltLSOH   	= $$GetSOHLocal(idItem,idFromLocn)
+		set fltCSOH 	= $$GetSOHCompany(idItem)
+		//set YENABLED 	= $$$NO
+		
+		do UpdateManualField^COMGridEdit31Interface(intRow,$$$FORMFldMEDPDispensePickLineLSOH,fltLSOH) ; YTEXT can't be set here, workaround
+		do UpdateManualField^COMGridEdit31Interface(intRow,$$$FORMFldMEDPDispensePickLineCSOH,fltCSOH) ; YTEXT can't be set here, workaround
+	}
+	
+	quit
+	
+	
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; OnBeforeSave of the MEDPrescriptionLine
+	; 
+	; History :
+	; 11-Feb-2013	SCR		HEVA-834: Improve SOH Validation
+	; 30-Oct-2012	SCR		SR18132: Improve SOH validation
+	; 09-May-2012	SCR		SR18132: Validate Pick Qty
+	; 02-Aug-2012	PPP		SR18067: Ensure Diluent Pick line is identified
+	;						No qty check for Diluents
+	; 09-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new blnDiluent,fltAvlQty,fltIssued,fltLocnQOH,fltPickQty,fltQtyPlanned,fltReqQty
+	new fltTotQtyIssued,idItem,idLn,idLocn,idPickUOM,objBundleStock,objItem,sc
+	new strUnit
+	
+	set objBundleStock = ##class(alSOH.dBundleStock).%OpenId($$$MEDDispensePickLineItem(pYFELD)_"||"_$$$MEDDispenseSupplyingLocation($$$GRIDYFELDContainer)_"||"_$$$MEDDispensePickLineFromStorage(pYFELD)_"||"_$$$MEDDispensePickLineBundle(pYFELD),0,.sc)
+	set idLn = $$$KEY2(pYKEY)
+	set blnDiluent	 = +$$$MEDDispensePickLineIsDiluent(pYFELD)	//SR18067
+	
+	if $$$ISERR(sc) { 
+		set YRETVAL= $$$MakeStatus("alINV0003") ;"Bundle not found in storage" 
+		
+	} else {
+		set fltIssued		= $$$MEDDispensePickLineIssueQty(pYFELD)
+		set fltPickQty		= $$$MEDDispensePickLinePickQty(pYFELD) ;SR18132
+		set fltTotQtyIssued = $$GetTotalIssued(idLn) + fltPickQty	;SR18132
+		set idItem			= objBundleStock.Item.%Id()
+		set idLocn			= objBundleStock.Storage.Location.%Id()
+		set idPickUOM		= $$$MEDDispensePickLinePickUOM(pYFELD) ;SR18132
+		set fltReqQty		= $$$MEDDispensePickLineRequestedQty(pYFELD)
+		if (fltTotQtyIssued > fltReqQty) && 'blnDiluent {	;SR18132
+			set YRETVAL = $$$Text($listbuild("IN01222",fltTotQtyIssued,$$$MEDDispensePickLineRequestedQty(pYFELD),idLn))
+		// "Total Quantity Issued (%1) has to be equal to the Unit Quantity (%2) for Line '%3'"
+		
+		} else {
+			set fltQtyPlanned = ##class(alSOH.iSOHBalance).GetQtyPlanned(idItem,idLocn,objBundleStock.Storage.%Id(),objBundleStock.Bundle.%Id())
+			set strUnit = $$$AppEnum("EINHEIT",idPickUOM)
+			set objItem = $get(^INART(YM,idItem,1))
+			set fltAvlQty = $$Convert^INUOMConversion(idItem,objBundleStock.QtyOnHand,$$$INARTBaseUnit(objItem),idPickUOM,   $$$NO)
+
+			if ((fltIssued) > (objBundleStock.QtyOnHand-fltQtyPlanned)) {
+				if (fltQtyPlanned > 0) {
+					set YRETVAL =  $$$Text($listbuild("alMOV0004",objBundleStock.QtyOnHand,fltQtyPlanned))
+					// "Not enough Items in Storage (Quantity = %1)(Planned Quantity = %2)"
+				
+				} else {
+					set YRETVAL =  $$$Text($listbuild("MED01424",fltAvlQty,strUnit))  ;$listbuild("MED01424",)  ;Not enough Items in Storage (Quantity = %1 , Unit = %2)
+					;set YRETVAL =  $$$Text($listbuild("alMOV0003",objBundleStock.QtyOnHand)) 
+				}   // "Not enough Items in Storage (Quantity = %1)"
+			}
+			set fltLocnQOH		= ##class(alSOH.iSOHBalance).GetQOH(idItem,idLocn)
+			set fltTotQtyIssued = $$CalcInventoryQty^INUOMConversion(idItem,idPickUOM,fltTotQtyIssued) ; SR18132
+			if ((fltTotQtyIssued) > (fltLocnQOH))&&($get(YRETVAL)="") { ;HEVA-834
+			;if ((fltTotQtyIssued) > (fltLocnQOH)) {
+				set YRETVAL =  $$$Text($listbuild("IN00701"))		
+			} // "No quantity available at the sending stock location"
+		}
+	}
+
+	quit
+	
+	
+GetTotalIssued(pidLn)
+	;-------------------------------------------------------------------------------
+	; Get the Sum of all Issued quantity for a Line
+	;
+	; ByRef :
+	;
+	; Returns : 
+	;
+	; History :
+	; 09-May-2012	SCR		SR18132: Return Pick Qty Total
+	; 10-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new fltQtyIssued,idDataLine,idGridRow,objIssueLine
+	
+	set fltQtyIssued = 0
+	set idDataLine   = ""
+	for {
+		set idDataLine =  $order($$$WWWDATEN("REFERENCEROW",idDataLine))
+		quit:idDataLine=""
+
+		continue:(idDataLine=pidLn)                       //Skip current line
+		continue:(idDataLine\1)'=(pidLn\1)
+
+		set idGridRow = $get($$$WWWDATEN("REFERENCEROW",idDataLine,1))
+		continue:($get($$$WWWDATEN("KILLEDRECORD",idGridRow))=$$$YES)
+		
+		set objIssueLine = $$GetYFELD^COMGridEdit31G(YFORM,idGridRow)		
+		;set fltQtyIssued = fltQtyIssued + $$$MEDDispensePickLineIssueQty(objIssueLine)
+		set fltQtyIssued = fltQtyIssued +  $$$MEDDispensePickLinePickQty(objIssueLine) ; SR18132
+	}
+
+	quit fltQtyIssued
+	
+OnBeforeDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; This routine makes sure you cant delete the lines created by Sourcing
+	; CAN delete copied lines.
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Jun-2014	SCR		HEVA-1505: Allow UDO delete
+	; 03-Jan-2012	shobby	HEVA-736: Changed the error message.
+	; 02-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new idDisp,objDisp
+	if pYKEY '[ "." {	
+		set idDisp	= $$$KEY1(pYKEY)
+		quit:(idDisp="")
+		set objDisp	= $get(^MEDDispense(YM,idDisp,1))
+		if $$$MEDDispenseStatusManual(objDisp) ="" {
+			;set Q = $$$QDontDelete_$$$Text("IN01400") ;Please 'Review' this record before trying to delete it.
+		}
+	}
+	quit
+	
+
+GetSOHLocal(pidItem,pidLocation)
+	;-------------------------------------------------------------------------------
+	; GetSOHLocal
+	;
+	; History:
+	; 09-May-2012	PPP		SR18002.1: Changed to exclude expired Stock (available SOH)
+	; 09-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	quit:($get(pidItem) = "") ""
+	//quit $$^INARTMENGE(pidItem,,pidLocation,,1,0,1)
+	quit $$^INARTMENGE(pidItem,,pidLocation,,0,0,1)
+	
+	
+GetSOHCompany(pidItem)
+	;-------------------------------------------------------------------------------
+	; GetSOHLocal
+	;
+	; History:
+	; 09-May-2012	PPP		SR18002.1: Changed to exclude expired Stock (available SOH)
+	; 09-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	quit:($get(pidItem) = "") ""
+	//quit $$^INARTMENGE(pidItem,,,,1,0)
+	quit $$^INARTMENGE(pidItem,,,,0,0)
+
+ClearIssueQty(pidDispense)
+	;-------------------------------------------------------------------------------
+	; Sets the Issue Qty of the Pick Lines to 0, ready for scanning
+	; 
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message
+	;
+	; History:
+	; 09-Oct-2012	SCR		SR18132: Set Pick Qty to 0
+	; 10-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new idLine,objLine,strStatus
+	
+	set strStatus = $$$OK
+	set idLine = ""
+	for {
+		set idLine = $order(^MEDDispensePickLine(0,pidDispense,idLine))
+		quit:idLine=""
+		
+		set objLine = $get(^MEDDispensePickLine(0,pidDispense,idLine,1))
+		
+		set $$$MEDDispensePickLineIssueQty(objLine)		= 0
+		set $$$MEDDispensePickLinePickQty(objLine) 		= 0
+		
+		set strStatus = $$$Save("MEDDispensePickLine",pidDispense_","_idLine,objLine,$$$YES)	
+		quit:$$$ISERR(strStatus)
+	}
+	
+	quit strStatus
+
+Solution(pstrKey)
+	;-------------------------------------------------------------------------------
+	; Description : Get the solution Number
+	;			
+	; Called By : Default Variable Input for Solution on pick tab
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 29-Nov-2012	SCR		SR18213: Exclude Diluent Lines
+	; 27-Nov-2012	SCR		SR18213: Created
+	;-------------------------------------------------------------------------------
+	new idIssueNo,strStatus,idLineNo,objHeader,idFromLocn,objLine,idItem,idFromStore
+	new idRx,idSolution,idRxLine,objRxLine
+	
+	set strStatus = $$$OK
+	set idIssueNo = $$$KEY1(pstrKey)
+	set idLineNo  = $$$KEY2(pstrKey)
+	quit:idLineNo="" ""                 
+ 
+	set objHeader   = $get(^MEDDispense(YM,idIssueNo,1))
+	set idFromLocn  = $$$MEDDispenseSupplyingLocation(objHeader)
+	
+	set objLine     = $get(^MEDDispensePickLine(YM,idIssueNo,idLineNo,1))
+	set idSolution	= ""
+	if '$$$MEDDispensePickLineIsDiluent(objLine) { ; dont do diluents
+		set idItem      = $$$MEDDispensePickLineItem(objLine)
+		set idFromStore = $$$MEDDispensePickLineFromStorage(objLine)
+ 
+		set idRx		= $$$MEDDispensePrescription(objHeader)
+		set idRxLine	= idLineNo\1
+		if idRx'="" {
+			set objRxLine	= $get(^MEDPrescriptionLine(YM,idRx,idRxLine,1))
+			set idSolution	= $$$MEDPrescriptionLineSolution(objRxLine)
+		}
+	}
+	quit idSolution
+
+
+OnLineAdded(pintRow,pstrKey)
+	;-------------------------------------------------------------------------------
+	; Description : Set values for manual fields
+	;			
+	; Called By : OnLineAdded^COMGridEdit31Events via CallEvent
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 24-Aug-2012	SCR		SR18092: Display bundle details when there is no SOH for the bundle
+	; 01-Jun-2012	PPP		SR18002.1: Corrected error, Lot details not showing up
+	; 10-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new fltCSOH,fltLSOH,idFromLocn,idFromStore,idIssueNo,idItem,idLineNo,objBundle
+	new objBundleStock,objHeader,objLine,strBundleValues,strStatus
+	
+	set strStatus = $$$OK
+	
+	set idIssueNo = $$$KEY1(pstrKey)
+	set idLineNo  = $$$KEY2(pstrKey)
+	quit:idLineNo="" strStatus                 ; SR17577
+ 
+	set objHeader   = $$$GRIDYFELDContainer	
+	set idFromLocn  = $$$MEDDispenseSupplyingLocation(objHeader)
+	
+	set objLine     = $get(^MEDDispensePickLine(0,idIssueNo,idLineNo,1))
+	set idItem      = $$$MEDDispensePickLineItem(objLine)
+	set idFromStore = $$$MEDDispensePickLineFromStorage(objLine)
+ 
+	set fltLSOH   	= $$GetSOHLocal(idItem,idFromLocn)
+	do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldMEDPDispensePickLineLSOH,fltLSOH)
+	
+	set fltCSOH 	= $$GetSOHCompany(idItem)
+	do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldMEDPDispensePickLineCSOH,fltCSOH)
+	
+	if (idItem '= "") && (idFromStore '= "") {
+		//SR18002.1
+		set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idItem_"||"_idFromLocn_"||"_idFromStore_"||"_$$$MEDDispensePickLineBundle(objLine))
+		if objBundleStock '= $$$NULLOREF {             ; Tested above
+			set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundleStock.Bundle,SPRACHE)
+			do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldMEDDispensePickLineLot,strBundleValues) 
+		} else { ; SR18092 vvvvvv
+ 			set objBundle = ##class(alSOH.dBundle).%OpenId($$$MEDDispensePickLineBundle(objLine)) 
+			if objBundle '= $$$NULLOREF {
+ 				set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundle,SPRACHE) 
+ 				do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldMEDDispensePickLineLot,strBundleValues)
+			}	; SR18092 ^^^^^^		                                             
+		}
+
+	}
+
+	quit strStatus	
+
+OnBlurPickQty(pYKEY, pidGridRow, pintPickQty, &pobjLine)
+	;-------------------------------------------------------------------------------
+	; On Blur from Item
+	;	Update Issue Qty from Pick Qty
+	;
+	; Called By : form MEDDispensePickLine
+	;		
+	; Params:	(YKEY,GROW,YINHALT,.YFELD)
+	;
+	; ByRefs:	pobjLine	- current line object
+	;
+	; Returns:
+	;
+	; History :
+	; 08-Feb-2013	SCR		HEVA-800: Round to 2 dp
+	; 09-Oct-2012	SCR		SR18132:Created
+	;-------------------------------------------------------------------------------
+	new intIssueQty,idIssueUOM,idPickUOM,idItem
+	set idItem		= $$$MEDDispensePickLineItem(pobjLine)
+	set idIssueUOM	= $$$MEDDispensePickLineIssueUOM(pobjLine)
+	set idPickUOM	= $$$MEDDispensePickLinePickUOM(pobjLine)
+	set pintPickQty = $$RoundDose^MEDPrescriptionCommon(pintPickQty) ; HEVA-800
+	set intIssueQty	= $$Convert^INUOMConversion(idItem,pintPickQty,idPickUOM,idIssueUOM,   $$$NO)
+	
+	set $$$MEDDispensePickLinePickQty(pobjLine) = pintPickQty ; HEVA-800
+	set $$$MEDDispensePickLineIssueQty(pobjLine) = intIssueQty
+
+	quit
+
+GetIssueQtyDesc(pobjPickLine)
+	;-------------------------------------------------------------------------------
+	; Get Issue Qty and Unit
+	;
+	; Called By : form MEDDispensePickLine Core Rule
+	;		
+	; Params:	PiceLine
+	;
+	;
+	; Returns:	Test tot display Qty (Unit Desc)
+	;
+	; History :
+	; 22-Jan-2013	shobby	HEVA-775.2: Common routine includes number formatting.
+	; 09-Oct-2012	SCR		SR18132:Created
+	;-------------------------------------------------------------------------------
+	quit $$GetDescription^MEDDispenseLine(4,11) 				;HEVA-679
+
+	;HEVA-775.2 new fltQty,idUOM,objUOM,strText
+	
+	;HEVA-775.2 set strText = $$$MEDDispensePickLineIssueQty(pobjPickLine)
+	;HEVA-775.2 if $$$MEDDispensePickLineIssueUOM(pobjPickLine) '="" {
+	;HEVA-775.2 	set strText=strText_" "_$$$AppEnum("EINHEIT", $$$MEDDispensePickLineIssueUOM(pobjPickLine))
+	;HEVA-775.2 }
+	;HEVA-775.2 quit strText
+
+IsQuantityReadOnly(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Returns if the quantity field must be read only according to a MEDPrescriptionSetup parameter
+	;
+	; Called By : form MEDDispensePickLine Core Rule
+	;			  form INDispenseToPatientLine Core Rule
+	;		
+	; Params:	YKEY
+	;
+	;
+	; Returns:	Boolean
+	;
+	; History :
+	; 11-Sep-2013	Thiago		HEVA-1183:Created
+	;-------------------------------------------------------------------------------
+	new blnReadOnly,cnt,cnt2,objSetup,objUser,profile,restrictedProfile,restrictedProfiles
+	new userProfiles
+	
+	set blnReadOnly = $$$NO
+
+	if ($get(YBED) '= ""){
+		set objUser = $get(^WWW013(YM,$get(YBED),1))
+		set objSetup = $get(^MEDPrescriptionSetup(YM,YM,1))
+		
+		set userProfiles = $$$WWW013UserAccess(objUser)
+		set restrictedProfiles = $$$MEDPrescriptionSetupRestrictQuantityField(objSetup)
+		
+		quit:(restrictedProfiles="") $$$NO
+		
+		for cnt = 1:1:$length(userProfiles,";") {
+			set profile = $piece(userProfiles,";",cnt)
+
+			for cnt2 = 1:1:$length(restrictedProfiles,";") {
+				set restrictedProfile = $piece(restrictedProfiles,";",cnt2)
+				
+				if (profile = restrictedProfile){
+					set blnReadOnly = $$$YES
+					quit
+				}
+			}
+			
+			quit:blnReadOnly
+		}
+	}	
+
+	quit blnReadOnly
+]]></Routine>
+</Export>

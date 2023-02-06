@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRNUnFirm" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRNUnFirm
+	;              * * * * *   Associated with form INTFR   * * * * *
+	
+#include COMConst
+#include INConst
+#include COMSYS
+	
+CanUnFirm(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Determine whether Transfer Order can be Unfirmed.
+	; Reasons for preventing firming from being allowed
+	;  - No key / record
+	;  - Transfer Order status is not firmed
+	;
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing (changes @NM variable YQ)
+	;
+	; History:
+	; 27-Apr-2011	PPP		SR17726: Added the IN00423 message
+	; 15-Apr-2011	PPP		SR17726: Created
+	;-------------------------------------------------------------------------------
+	new objTFR,strStatus
+	
+	set strStatus = $$$OK
+		
+	if '$$$NoKey(pidTFR) {
+		
+		set objTFR    = $get(^INTFR(YM,pidTFR,1))
+		
+		if $$$ISOK(strStatus) {
+			if $case($$$INTFRStatus(objTFR),
+		                    $$$EnumINTFRSTATUSSent    :$$$YES,
+		                    $$$EnumINTFRSTATUSReceived:$$$YES,
+		                                              :$$$NO    ) {
+				set strStatus = $$$MakeStatus("IN00424")   ; "Cannot perform action as Transfer has been sent."
+		    
+		    } elseif $$$INTFRStatus(objTFR) '= $$$EnumINTFRSTATUSFirmed {
+				set strStatus = $listbuild("IN00423")      ; "Transfer not Firmed."
+
+			} elseif $data(^INTFRPickLine(0,pidTFR)) {
+				set strStatus = $listbuild("33680")
+			} ; "Picklist Has Already Been Printed.."
+		}
+	
+	} else {
+		set strStatus = $listbuild(32072)
+	} ; "Please select a data record first."
+	
+	$$$YQHandler(strStatus)
+	quit
+
+
+UnFirm(pidTFR,pblnReloadForm=$$$YES)
+  	;-------------------------------------------------------------------------------
+	; Determine whether Unfirming can be performed, if so perform Unfirm.
+	;
+	; Params:
+	; pidTFR         - Key of header record
+	; pblnReloadForm - $$$YES then reload form else do not
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message or $$$NO
+	;
+	; History:
+	; 15-Apr-2011	PPP		SR17726: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$NO
+	
+	do CanUnFirm(pidTFR)
+ 
+	if YQ = $$$YQEnable {
+		set strStatus = $$Transaction^COMTransaction("UnFirmTxn^INTRNUnFirm("""_pidTFR_""")",1)
+		
+		if $$$ISOK(strStatus) && pblnReloadForm {
+			set YSEITE = 1 // FIXME: This does not even fix all cases where page two is displayed.
+			do ReloadForm^COMUtilForm()
+		}
+	} else {
+		do ReturnError^COMUtils($$$YQMessage)
+	}
+	quit strStatus
+	
+	
+UnFirmTxn(pidTFR)
+	;-------------------------------------------------------------------------------
+	; 1. Remove Create Demands and Supplies
+	; 2. Update Status details on Header.
+	; 3. Reverse calculation of INReqLine D27 QtyRejected set by FirmTxn^INTRNFirm
+	; 
+	; ----------
+	; Params:
+	; 	pidTFR - Key of header record
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message
+	;
+	; History:
+	; 06-Sep-2011	GRF		SR17823: Reverse QtyRejected calculation
+	; 15-Apr-2011	PPP		SR17726: Created
+	;-------------------------------------------------------------------------------
+	new idLine,idReq,idReqLine,objReqLine,objTFR,objTFRLine,strReference,strStatus
+	
+	set strStatus = $$$OK
+	set objTFR    = $get(^INTFR(0,pidTFR,1))
+	
+	if $$$ISOK(strStatus) {
+		set $$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSCreated
+		set $$$INTFRFirmed(objTFR) = ""
+		
+		set strStatus = $$$Save("INTFR",pidTFR,objTFR,$$$YES)
+	}
+	
+	if $$$ISOK(strStatus) {
+		set idLine = ""
+		for {
+			set idLine = $order(^INTFRLine(0,pidTFR,idLine))
+			quit:idLine=""
+			
+			set strStatus = $$ClearDemandForTrnLine^INTRNDemand(pidTFR,idLine)
+			quit:$$$ISERR(strStatus)
+			
+	; SR17823 vvv
+			set objTFRLine = $get(^INTFRLine(0,pidTFR,idLine,1))
+			set strReference = $$$INTFRLineReference(objTFRLine)
+			if strReference'="" {
+				set idReq     = $$$KEY1(strReference)
+				set idReqLine = $$$KEY2(strReference)
+				set objReqLine = $get(^INReqLine(0,idReq,idReqLine,1))
+				
+				set $$$INReqLineQtyRejected(objReqLine) = ""   ; simple clearance - only if not possible to have multiple qty against the same line
+				
+				set strStatus = $$$Save("INReqLine",strReference,objReqLine,$$$YES)
+			}
+	; SR17823 ^^^
+		}
+	}
+	quit strStatus
+	
+	/*
+	new idLine,objTFR,strStatus
+	
+	set strStatus = $$$OK
+	set objTFR    = $get(^INTFR(YM,pidTFR,1))
+	
+	if $$$ISOK(strStatus) {
+		set $$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSCreated
+		set $$$INTFRFirmed(objTFR) = ""
+		
+		set strStatus = $$$Save("INTFR",pidTFR,objTFR,$$$YES)
+		
+		if $$$ISOK(strStatus) {
+			set idLine = ""
+			for {
+				set idLine = $order(^INTFRLine(0,pidTFR,idLine))
+				quit:idLine=""
+				
+				set strStatus = $$ClearDemandForTrnLine^INTRNDemand(pidTFR,idLine)
+				quit:$$$ISERR(strStatus)
+			}
+		}
+	}
+	quit strStatus
+	*/
+	
+	
+]]></Routine>
+</Export>

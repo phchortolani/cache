@@ -1,0 +1,462 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMHCCalculate" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMHCCalculate
+	;-------------------------------------------------------------------------------
+	; Health Check Calculate
+	;-------------------------------------------------------------------------------
+#include COMConst
+#include COMSYS
+	
+SetupDefaults(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Removes all 'Daily' health checks then recreates all Methods as 'Daily' Health Checks.
+	;
+	; Returns:
+	;
+	; History:
+	; 07-MAr-2011	GRF		Macros
+	; 17-Nov-2004	GRF		Replace YKOMMA with $$$COMMA
+	; 01-Jul-2004	Shobby	Created (SR10032)
+	;-------------------------------------------------------------------------------
+	new idCalculate,idMethod,objCOMHCCalculate,strStatus
+	
+	if $get(pYKEY)'="" {
+		set pYKEY = $$$KEY1(pYKEY)
+		
+	; Out with the old
+		set idCalculate = ""
+		for {
+			set idCalculate = $order(^COMHCCalculate(0,pYKEY,idCalculate))
+			quit:idCalculate=""
+			
+			set objCOMHCCalculate = $get(^COMHCCalculate(0,pYKEY,idCalculate,1))
+			if $$$COMHCCalculateSchedule(objCOMHCCalculate)="Daily" {
+				do KILL^COMUtils("COMHCCalculate",pYKEY_$$$COMMA_idCalculate)
+			}
+		}
+		
+	; In with the new
+		set idMethod = ""
+		for {	
+			set idMethod = $order(^COMHCMethod(0,idMethod))
+			quit:idMethod=""
+			
+			set objCOMHCCalculate = ""
+			set $$$COMHCCalculateSchedule(objCOMHCCalculate) = "Daily"
+			set $$$COMHCCalculateMethod(objCOMHCCalculate)   = idMethod
+			set idCalculate = $order(^COMHCCalculate(0,pYKEY,""),-1)+1
+			set strStatus = $$Save("COMHCCalculate",pYKEY_$$$COMMA_idCalculate,objCOMHCCalculate,$$$YES)
+		}
+	}
+	do RedirectForm^COMUtils(YFORM,YKEY,YFORM,YPARA,YSEITE)
+	quit
+	
+	
+CalcCheckType(pYPARA)
+    ;-------------------------------------------------------------------------------
+    ; Runs all the Health Checks that belong to the specified Method.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 17-Aug-2004	shobby	Call to RefreshForm instead of RedirectForm.
+    ; 05-Aug-2004	shobby	Created
+    ;-------------------------------------------------------------------------------
+	new blnNeedCompare,idMethod,objCOMHCMethod,idEntry,idCurrLocn,strMethod,strType
+	new objCOMHCCalculate
+	
+	set idCurrLocn = $$getCurrentLocation^COMDCMUtilities()
+	set strType    = $piece(pYPARA,":",3)
+	set blnNeedCompare = $$$NO
+	set idEntry = ""
+	for {
+		set idEntry = $order(^COMHCCalculate(0,idCurrLocn,idEntry))
+		quit:idEntry=""
+		
+		set objCOMHCCalculate = $get(^COMHCCalculate(0,idCurrLocn,idEntry,1))
+		set strMethod         = $$$COMHCCalculateMethod(objCOMHCCalculate)
+		set objCOMHCMethod    = $get(^COMHCMethod(0,strMethod,1))
+		if $$$COMHCMethodCheckType(objCOMHCMethod)=strType {
+			do Calc(idEntry)
+			set blnNeedCompare = $$$YES
+		}
+	}
+	if blnNeedCompare {
+		do CompareAll^COMHCCompare()
+	}
+	do RefreshForm^COMUtilForm()
+	quit
+	
+	
+CalcSchedule(Schedule="")
+    ;-------------------------------------------------------------------------------
+    ; Run Health Check Calculation for a Schedule
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 08-Mar-2004	SCR		Added Clean Up Code
+    ; 04-Feb-2004   SCR   	Created
+    ;-------------------------------------------------------------------------------
+	new blnNeedCompare,idCurrLocn,Entry,EntrySchedule,Rec
+	
+	do CleanUp(15) ; Clean Up old results
+	set idCurrLocn = $$getCurrentLocation^COMDCMUtilities()
+	if idCurrLocn="" set idCurrLocn = " "
+	set Entry = ""
+	for {
+		set Entry = $order(^COMHCCalculate(0,idCurrLocn,Entry))
+		quit:Entry=""
+		
+		set Rec = $get(^COMHCCalculate(0,idCurrLocn,Entry,1))
+		set EntrySchedule = $$$COMHCCalculateSchedule(Rec)
+		if EntrySchedule="" set EntrySchedule = " "
+		if EntrySchedule=Schedule {
+			do Calc(Entry)
+		}
+	}
+	quit 1
+	
+	
+Calc(Entry="")
+	;-------------------------------------------------------------------------------
+    ; Calculate Health for an entry
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 03-May-2006	RPW		SR14606: STORE error, so store the Result array in
+    ; 							CacheTempResult and then kill it, and use the
+    ; 							CacheTempResult. Added a nice error message for the user.
+    ; 07-Jan-2005	GRF		SR11441 : MAXSTRING error when too many entries added
+    ; 							to string
+    ; 03-Apr-2004	shobby	Put each error message on a new line.
+    ; 12-Feb-2004	SCR		Added Source Data Option
+    ; 04-Feb-2004   SCR		Created
+	;-------------------------------------------------------------------------------
+	new blnOversize,Code,Complete,Count,idCurrLocn,Date,Duration,EndDate,Hash,HashValue
+	new Key,Level,Location,Method,MethodRec,Rec,Result,ResultRec
+	new Source,StartDate,StartDuration,Status,strResult,strStatus,Total,Type
+	
+	set strStatus     = $$$OK
+	set StartDuration = $zhorolog
+	if Entry="" set Entry = " "
+	set idCurrLocn = $$getCurrentLocation^COMDCMUtilities()
+	if idCurrLocn="" set idCurrLocn = " "
+	
+	set Rec       = $get(^COMHCCalculate(0,idCurrLocn,Entry,1))
+	set StartDate = $$$COMHCCalculateStart(Rec)
+	set EndDate   = $$$COMHCCalculateEnd1(Rec)
+	set Location  = $$$COMHCCalculateLocation(Rec)
+	set Level     = $$$COMHCCalculateLevel1(Rec)
+	set Source    = $$$COMHCCalculateSource(Rec)
+	set Method    = $$$COMHCCalculateMethod(Rec)
+	
+	if Method="" set Method = " "
+	set MethodRec = $get(^COMHCMethod(0,Method,1))
+	set Code      = $$$COMHCMethodCode(MethodRec)
+	set Type      = $$$COMHCMethodCheckType(MethodRec)
+	
+	set Status    = 0
+	set Status    = $$Run(Code,Location,StartDate,EndDate,Level,.Result) 
+	set Total     = $get(Result("Total"))
+	set Complete  = $horolog
+	set Duration  = $zhorolog-StartDuration
+	set Date      = +$horolog
+	set HashValue = ""
+	if Level="" set Level="Top"
+	
+	; *******************************************************
+	;	TODO : At present it is better to lose some than all
+	;	       but should try to capture all results.
+	;	<GRF>  May need to have intermediate stage to build
+	;	       a Hash array from Result array and then generate
+	;	       multiple records, one for each Hash array element.
+	;	       
+	; *******************************************************
+	; REPLACE
+	; *******************************************************
+	
+	kill ^CacheTempResult("Hash")
+	
+	merge ^CacheTempResult("Hash")=Result("Hash")
+	kill Result("Hash")
+	
+	set blnOversize = $$$NO
+	set Hash = ""
+	for {
+		set Hash = $order(^CacheTempResult("Hash",Hash))
+		quit:Hash=""
+		
+		set strResult = $get(^CacheTempResult("Hash",Hash))
+		continue:strResult=""
+		
+		if $length(HashValue)+$length("|"_Hash_"="_strResult)<31940 {
+			set HashValue = HashValue_"|"_Hash_"="_strResult
+		
+		} else {
+			set blnOversize = $$$YES
+		}
+	}
+	if blnOversize {
+		set HashValue = HashValue_"|WARNING: Incomplete dump due to memory constraints."
+	}
+	
+	kill ^CacheTempResult("Hash")
+	
+	set HashValue = $extract(HashValue,2,99999)
+	set ResultRec = ""
+	set $$$COMHCResultLocation(ResultRec)  = Location
+	set $$$COMHCResultTotal(ResultRec)     = Total
+	set $$$COMHCResultHashValue(ResultRec) = HashValue
+	set $$$COMHCResultStart(ResultRec)     = StartDate
+	set $$$COMHCResultEnd1(ResultRec)      = EndDate
+	set $$$COMHCResultComplete(ResultRec)  = Complete
+	set $$$COMHCResultDuration(ResultRec)  = Duration
+	set $$$COMHCResultStatus(ResultRec)    = Status
+	set $$$COMHCResultType1(ResultRec)     = Type
+	set $$$COMHCResultMethod1(ResultRec)   = Method
+	set $$$COMHCResultDate2(ResultRec)     = Date
+	set $$$COMHCResultSite1(ResultRec)     = idCurrLocn
+	set $$$COMHCResultLevel1(ResultRec)    = Level
+	set $$$COMHCResultSource(ResultRec)    = Source
+	
+	set Key       = $$^WWWNEXT("COMHCResult")
+	set strStatus = $$Save("COMHCResult",Key,ResultRec,$$$YES)
+	
+	; *******************************************************
+	; WITH
+	; *******************************************************
+	if $$$NEVER {	; possible alternative
+	new arrHash,idxHash,SaveHash
+	
+	set Hash = ""
+	set idxHash = 1
+	set SaveHash = $$$NO
+	for {	
+		set Hash=$order(Result("Hash",Hash))
+		quit:Hash=""
+		
+		set strResult = $get(Result("Hash",Hash))
+		continue:strResult=""
+		
+		set SaveHash = $$$YES
+		if $length(HashValue)+$length(strResult)>32000 {
+			set arrHash(idxHash) = HashValue
+			set idxHash   = idxHash + 1
+			set HashValue = ""
+			set SaveHash  = $$$NO
+		}
+		set HashValue = HashValue_"|"_Hash_"="_strResult
+	}
+	if SaveHash {
+		set arrHash(idxHash) = HashValue
+	}
+	
+	set idxHash = ""
+	for {
+		set idxHash = $order(arrHash(idxHash))
+		quit:idxHash=""
+		
+		set HashValue = $extract(arrHash(idxHash),2,39999)
+		
+		set ResultRec = ""
+		set $$$COMHCResultLocation(ResultRec)  = Location
+		set $$$COMHCResultTotal(ResultRec)     = Total
+		set $$$COMHCResultHashValue(ResultRec) = HashValue
+		set $$$COMHCResultStart(ResultRec)     = StartDate
+		set $$$COMHCResultEnd1(ResultRec)      = EndDate
+		set $$$COMHCResultComplete(ResultRec)  = Complete
+		set $$$COMHCResultDuration(ResultRec)  = Duration
+		set $$$COMHCResultStatus(ResultRec)    = Status
+		set $$$COMHCResultType1(ResultRec)     = Type
+		set $$$COMHCResultMethod1(ResultRec)   = Method
+		set $$$COMHCResultDate2(ResultRec)     = Date
+		set $$$COMHCResultSite1(ResultRec)     = idCurrLocn
+		set $$$COMHCResultLevel1(ResultRec)    = Level
+		set $$$COMHCResultSource(ResultRec)    = Source
+		
+		set Key       = $$^WWWNEXT("COMHCResult")
+		set strStatus = $$Save("COMHCResult",Key,ResultRec,$$$YES)
+	}
+	}  ; end $$$NEVER
+	; *******************************************************
+	
+	quit
+	
+	
+Save(Class,Key,Data,Lock)
+	;-------------------------------------------------------------------------------
+	; WWWSPEI Wrapper
+	;-------------------------------------------------------------------------------
+	new Status,YFORM,YVOR
+	
+	set:($g(Lock)'=1) Lock=0
+	set YFORM=Class
+	set Status=$$^WWWSPEI(Class,Key,Data,Lock)
+	if Status'=1 {
+		set Status=$listbuild("Fin00212",Class,Key,Status)  ; System save failed, Class:%1 Key:2 Error%3
+	}
+	quit Status
+	
+Run(Code,Location,StartDate,EndDate,Level,Result) ;
+    ;-------------------------------------------------------------------------------
+    ; Run Check Method
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 03-May-2006	RPW		SR14606: Fixed the Error handler to handle STORE errors
+    ; 06-Feb-2004   SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Status
+	
+	set $ztrap = "RunError"
+	set Status = 0
+	xecute "Set Status="_Code
+	
+	quit Status
+	
+RunError  ;Internal Tag
+	if $zerror["STORE" {
+		kill Result("Hash",$order(Result("Hash",""),-1))
+	}
+	set Result("Hash","Error")=$ze
+	quit 0
+	
+	
+ShowSchedule()
+	;-------------------------------------------------------------------------------
+    ; Show Schedule for Calculations
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 19-Feb-2004	SCR		Updated Schedule Key
+    ; 04-Feb-2004   SCR   	Created
+    ;-------------------------------------------------------------------------------
+	new idCurrLocn,Entry,Rec,Schedule,Schedules
+	
+	set idCurrLocn = $$getCurrentLocation^COMDCMUtilities()
+	if idCurrLocn="" set idCurrLocn=" "
+	
+	; Step 1: Build a List Schedule Entries, Example Week, Day
+	set Entry = ""
+	for {
+		set Entry=$order(^COMHCCalculate(0,idCurrLocn,Entry))
+		quit:Entry=""
+		
+		set Rec      = $get(^COMHCCalculate(0,idCurrLocn,Entry,1))
+		set Schedule = $$$COMHCCalculateSchedule(Rec)
+		if Schedule="" set Schedule = " "
+		set Schedules(Schedule) = ""
+	}
+	
+	; Step 2: Show each Schedule
+	set Schedule = ""
+	for {
+		set Schedule = $order(Schedules(Schedule))
+		quit:Schedule=""
+		
+		do AfterDataField^COMSchedule(Schedule,"COMHCCalc","CalcSchedule^COMHCCalculate("""_Schedule_""")","Health Check Calculate ("_Schedule_")")
+	}
+	quit
+	
+	
+CleanUp(Days=15)
+    ;-------------------------------------------------------------------------------
+    ; Clean Up old Results
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 08-Mar-2004	SCR		Created
+	;-------------------------------------------------------------------------------
+    new Date,DaysBack,Count,Result
+    
+    if Days<7 set Days = 7 ; Keep at least a weeks worth of Results
+    set DaysBack = $horolog-Days
+    set Count    = 0
+	
+	set Date     = ""
+	for {
+		set Date = $order(^COMHCResults(0,5,Date))
+		quit:Date=""
+		quit:Date>DaysBack
+		
+		set Result = ""
+		for {
+			set Result = $order(^COMHCResults(0,5,Date,Result))
+			quit:Result=""
+			
+			do ^WWWKILL("COMHCResult",Result)
+			set Count = Count+1
+		}
+		write !,Date," ",Count
+	}
+	quit Count
+	
+	
+DummyData()
+    ;-------------------------------------------------------------------------------
+    ; Build Dummy Data
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 12-Feb-2004   SCR   Created
+    ;-------------------------------------------------------------------------------
+    new ResultRec,Date,Type,Method,Hash,Site,Key,SiteNumber
+    
+	for Type="FINGL","FINPR","FINPRC","FINAR","FINAP","FINGLBAL","FINARBAL","FINAPBAL","INPRO","INORD","INPRC","SALCNT","SALLB","SALVO","SALHLD" {
+		for Method="Send","Rec" {
+			continue:((Type="FINGL") && (Method="Rec"))
+			
+			for SiteNumber=1:1:300 {
+				set Site = "X"_$translate($justify(SiteNumber,3)," ","0")
+				do DummySetup(Site,Type,Method)
+				
+				write Site," ",Type," ",Method,!
+				
+				for Date=$horolog-20:1:$horolog {
+					set Hash      = $select($random(1000)=1:999,1:30)
+					set ResultRec = ""
+					set $$$COMHCResultLocation(ResultRec)  = ""
+					set $$$COMHCResultTotal(ResultRec)     = Hash
+					set $$$COMHCResultHashValue(ResultRec) = Hash
+					set $$$COMHCResultStart(ResultRec)     = ""
+					set $$$COMHCResultEnd1(ResultRec)      = ""
+					set $$$COMHCResultComplete(ResultRec)  = $horolog
+					set $$$COMHCResultDuration(ResultRec)  = 0
+					set $$$COMHCResultStatus(ResultRec)    = $$$OK
+					set $$$COMHCResultType1(ResultRec)     = Type
+					set $$$COMHCResultMethod1(ResultRec)   = Method
+					set $$$COMHCResultDate2(ResultRec)     = Date
+					set $$$COMHCResultSite1(ResultRec)     = Site
+					set $$$COMHCResultLevel1(ResultRec)    = "Top"
+					set $$$COMHCResultSource(ResultRec)    = (Site="X001") ; WAS set ResultRec=$$$DtCOMHCResultSource(ResultRec,Site="X001")
+					set Key = $$^WWWNEXT("COMHCResult")
+					set ^COMHCResult(0,Key,1) = ResultRec
+					;do Save("COMHCResult",Key,ResultRec,$$$YES)
+				}
+			}
+		}
+	}
+	quit
+	
+	
+DummySetup(Site,Type,Method)
+	;-------------------------------------------------------------------------------
+	;-------------------------------------------------------------------------------
+	new Rec
+	
+	set Rec = ""
+	set $$$COMHCCalculateType(Rec)   = Type
+	set $$$COMHCCalculateMethod(Rec) = Method
+	if Site="X001" set $$$COMHCCalculateSource(Rec) = 1
+	set ^COMHCCalculate(0,Site,Type_"-"_Method,1) = Rec
+	quit
+	
+]]></Routine>
+</Export>

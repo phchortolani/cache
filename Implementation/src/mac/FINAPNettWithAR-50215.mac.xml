@@ -1,0 +1,579 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPNettWithAR" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPNettWithAR 	;  SR10415: Nett AP with AR payments
+					;  SR11057: Manual
+					;  SR15101: Account bug fix
+ 
+#Include INConst 
+#Include FINConst
+#Include COMSYS
+ 
+	// SR15101 - name pieces of mtemp
+#define Customer(%1)	$piece(%1,Y,1)
+#define APBalance(%1)	$piece(%1,Y,2)
+#define ARBalance(%1)	$piece(%1,Y,3)
+ 
+ 
+AfterDataFields()
+    ;-------------------------------------------------------------------------------
+    ; Display suppliers who are also customers and have outstanding AR & AP balances.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 24-Nov-2004	JW	SR11057: Editted for manual use.
+    ; 12-Oct-2004	JW	SR10415: Created
+    ;-------------------------------------------------------------------------------
+	new lstHeader,strAuto,strManual
+	new APBalance,ARBalance,customer,customerRec,supplier,supplierRec
+	
+	set strAuto 	= $$$Text("Fin00520")	 ;Auto
+	set strManual 	= $$$Text("Fin00521")	;Manual
+	
+	set lstHeader=$listBuild(
+					$$$StrFINAPInvSupplier,
+					$$$StrFINAPSupplierSupplierNumber,
+					$$$EnumFININTLINESLINTSupplier_" "_$$$StrFINAPBalanceBalance,
+					$$$StrFINARCustomerCustomerNumber,
+					$$$EnumFININTLINESLINTCustomer_" "_$$$StrFINAPBalanceBalance,
+					strAuto,strManual)  
+				
+	do Start^COMTable(lstHeader)
+	
+	kill ^mtemp(YUSER,"Nett")
+	
+	set supplier=""
+	for {
+		set supplier=$order(^INLIEF(YM,supplier))
+		quit:supplier=""
+		
+		set supplierRec=$get(^INLIEF(YM,supplier,1))
+		set customer = $$$INLIEFSupplierisCustomer(supplierRec)
+ 		
+		if (customer'="") {
+			set APBalance = $get(^FINAPBalance(YM,supplier,1))
+			set ARBalance = $get(^FINARBalance(YM,customer,1))
+			
+			if (APBalance=+APBalance) && (ARBalance=+ARBalance) && ; no FC
+				(ARBalance>0) { ; SR11057 allow manual 'nett'ing even if APBalance '> 0
+			   ; (APBalance>0) && (ARBalance>0) { ; balances must be > 0
+				set customerRec = $get(^INKUNDE(YM,customer,1))
+				
+				set ^mtemp(YUSER,"Nett",supplier) = customer_Y_APBalance_Y_ARBalance
+				
+				do NewLine^COMTable()
+				do InsertCell^COMTable($$$INLIEFShortName(supplierRec))
+				do InsertCell^COMTable(supplier)
+				do InsertCurrencyCell^COMTable(APBalance)
+				do InsertCell^COMTable(customer)
+				do InsertCurrencyCell^COMTable(ARBalance)
+				if (APBalance>0) {
+					do InsertCell^COMTable(strAuto,"FINAPNettWithAR",supplier,"Auto,"_supplier)
+				} else {
+					do InsertCell^COMTable("&nbsp -") ; SR11057 don't allow auto 'nett'ing
+				}	
+ 
+				do InsertCell^COMTable(strManual,"FINAPNettWithARManual",customer,customer_","_supplier)
+				do EndLine^COMTable()
+			}	
+		}
+	}
+	
+	do Stop^COMTable()
+	
+	quit
+	
+ 
+AfterButtonLine()
+    ;-------------------------------------------------------------------------------
+    ; Nett the payments of the selected supplier (if any) and display result.
+    ;
+    ; Returns: nil
+    ;
+    ; History:
+    ; 24-Nov-2004	JW	SR11057: Added extra messages
+    ; 11-Oct-2004	JW	SR10415: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus
+	
+	write "<font size=2><B>"_
+		$$$Text("Fin00418")_  						;Click on a line to nett Supplier with Customer invoices
+		"</B>"_
+		"<br>&nbsp &nbsp "_$$$Text("Fin00419")_		;Auto: Nett all possible invoices"
+		"<br>&nbsp &nbsp "_$$$Text("Fin00420")		;Manual: Nett a single invoice"
+	
+	if $piece(YAUSWAHL,",",1)="Auto" {
+		set strStatus = $$NettAPWithAR($piece(YAUSWAHL,",",2))
+		w "<p><font color=red>&nbsp &nbsp "_strStatus
+	}
+	
+	do DisplayMessage()
+	
+	quit
+	
+	
+NettAll()
+    ;-------------------------------------------------------------------------------
+    ; Nett the payments of all the listed suppliers. Print results.
+    ;
+    ; Returns: nil
+    ;
+    ; History:
+    ; 24-Oct-2006	JW		SR15101: Don't need to decode. Coding standards. Macro
+    ; 24-Nov-2004	JW		SR11057: Ignore suppliers with balance < 0
+    ; 15-Oct-2004	JW		SR10415: Created
+    ;-------------------------------------------------------------------------------
+	new strNettMsg,strStatus,idSupplier,objNett,strMessage
+	
+	set idSupplier=""
+	set strMessage=""
+	for {
+		set idSupplier=$order(^mtemp(YUSER,"Nett",idSupplier))
+		quit:idSupplier=""
+		
+		set objNett=$get(^mtemp(YUSER,"Nett",idSupplier))
+		if $$$APBalance(objNett) > 0 { ; SR11057
+			set strNettMsg = $$NettAPWithAR(idSupplier)
+			//set strMessage = strMessage_"&nbsp; "_$$$Text(strMsg,0)_"<br>"		//SR15101
+			set strMessage = strMessage_"&nbsp; "_strNettMsg_"<br>"
+		}
+	}
+	if strMessage="" set strMessage = $$$Text("Fin00389") ;No suppliers available
+	
+	set ^mtemp(YUSER,"NettMsg") = "<p>"_strMessage
+	
+	do RedirectForm^COMUtils("FINAPNettWithAR","","FINAPNettWithAR","",1)
+	
+	quit
+	
+	
+NettAPWithAR(pidSupplier) private
+    ;-------------------------------------------------------------------------------
+    ; Nett a supplier's payments against its income. Want to get the smaller balance,
+    ; and remove the amount from both accounts. At least one will become zero.
+    ;
+    ; Params: pSupplier - supplier whose accts are to be 'netted'.
+    ;
+    ; Returns: message - ok or err msg.
+    ;
+    ; History:
+    ; 19-Oct-2006	JW			SR15101: Rewrote. Return message, not status. Format Currency.
+    ; 27-Jan-2005	RobertW		SR11273: Fixed TCOMMIT and TROLLBACK
+    ; 13-Oct-2004	JW			SR10415: Created
+    ;-------------------------------------------------------------------------------
+	new curAmount,idCustomer,strStatus,objNett,strMessage
+	
+	set objNett=$get(^mtemp(YUSER,"Nett",pidSupplier))		// customer_Y_APBalance_Y_ARBalance
+	set idCustomer = $$$Customer(objNett)
+	
+	// Get smaller balance.
+	set curAmount = $$$Min($$$ARBalance(objNett),$$$APBalance(objNett))
+	
+	tstart   ;---------------------------------Transaction Start--------------------------------
+	
+	set strStatus = $$NegateInvoices(pidSupplier,"AP",curAmount)
+	if $$$ISOK(strStatus) {
+		set strStatus = $$NegateInvoices(idCustomer,"AR",curAmount)
+	}
+	
+	if $$$ISERR(strStatus) {
+		trollback ;---------------------------Transaction Rollback------------------------------
+		
+	} else {
+		if $tlevel>0 tcommit   ;---------------------------Transaction Commit--------------------------------
+		set strStatus = $listbuild("Fin00390",pidSupplier,$$FormatCurrency^COMTable(curAmount))  ;Supplier %1 had %2 balanced
+	}
+	
+	quit $$$Text(strStatus)
+ 
+ 
+NegateInvoices(pidNumber,pType,pcurNett) private
+    ;-------------------------------------------------------------------------------
+    ; Negates (adjusts) all the invoices for a particular supplier or customer up 
+    ; to a certain amount.
+    ; 
+    ; Params:	pidNumber - # of supplier or customer
+    ; 			pType - "AR" or "AP"
+    ; 			pcurNett - amount to be negated.
+    ;
+    ; Returns:	status - $$$OK or error msg
+    ;
+    ; History:
+    ; 24-Oct-2006	JW	SR15101: Use new account. Encapsulate. Use $$$Save
+    ; 14-Oct-2004	JW	SR10415: Created
+    ;-------------------------------------------------------------------------------
+	new idAdj,idInv,objInv,strStatus
+	new curAmount,idLine,objAdjLine,strClass,idNettAccount
+	
+	set strClass = "FIN"_pType_"ADJ"
+	
+	set strStatus = $$CreateAdjustment(strClass,.idAdj,pcurNett,"APNettWithAR")		//SR15101
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$GetNettAccount(.idNettAccount)
+		
+		if $$$ISOK(strStatus) {
+			//if pType="AR" set objClient = $get(^FINARCustomer(YM,pidNumber,1))		//SR15101
+			//if pType="AP" set objClient = $get(^FINAPSupplier(YM,pidNumber,1))
+			
+			set $$$FINARADJLineCustomer(objAdjLine) = pidNumber
+			//set $$$FINARADJLineGLAccount(objAdjLine) = $$$FINARCustomerControlAccount(objClient)	// SR15101
+			set $$$FINARADJLineGLAccount(objAdjLine) = idNettAccount
+			
+			set idInv = ""	; loop through invoices
+			for {
+				if pType="AR" set idInv = $order(^FINARInvoice(YM,pidNumber,idInv))
+				if pType="AP" set idInv = $order(^FINAPInvoice(YM,pidNumber,idInv))
+				quit:idInv=""
+					
+				if pType="AR" set objInv = $get(^FINARInvoice(YM,pidNumber,idInv,1))
+				if pType="AP" set objInv = $get(^FINAPInvoice(YM,pidNumber,idInv,1))
+				
+				; only nett the total amount, no more.
+				set curAmount = $$$FINARInvoiceBalance(objInv)
+				if curAmount > 0 {
+					if pcurNett < curAmount set curAmount = pcurNett
+					set $$$FINARADJLineCredit(objAdjLine) = curAmount
+					set pcurNett = pcurNett-curAmount
+					
+					set $$$FINARADJLineRef(objAdjLine) = idInv
+					set $$$FINARADJLineInvoiceDate(objAdjLine) = $$$FINARInvoiceInvoiceDate(objInv)
+					set $$$FINARADJLineDue(objAdjLine) = $$$FINARInvoiceDueDate(objInv)
+					
+					set strStatus=$$$Save(strClass_"Line",idAdj_","_$increment(idLine),objAdjLine,1)  ; create line
+					
+					quit:$$$ISERR(strStatus)
+					quit:pcurNett=0
+				}
+			}
+			//if $$$ISOK(strStatus) set strStatus = $$Post(idAdj,pType)		SR15101
+			if $$$ISOK(strStatus) {
+			 	if pType="AP" set strStatus=$$PostTxn^FINAPADJ(idAdj)
+				if pType="AR" set strStatus=$$PostTxn^FINARADJ(idAdj)
+			}
+		}
+	}
+ 	
+	quit strStatus
+ 
+ 
+CreateAdjustment(pstrClass,&pidAdj,pcurCredit,pstrComment)
+	;-------------------------------------------------------------------------------
+	; Create adjustment
+	;
+	; Params:	pstrClass	- FINARADJ or FINAPADJ
+	; 			pidAdj		- id of the new adjustment
+	; 			pcurCredit	- credit amount
+	;
+	; ByRefs:	pidAdj
+	;
+	; Returns:	status
+	;
+	; History:
+	; 24-Oct-2006	JW		SR15101: Encapsulated. Added status.
+	;-------------------------------------------------------------------------------
+	new objAdj,strStatus
+	
+	set pidAdj = $$^WWWNEXT(pstrClass)
+ 	
+	set $$$FINARADJTransactionDate(objAdj)  = +$horolog
+	set $$$FINARADJComment(objAdj)			= pstrComment
+	set $$$FINARADJTotalCharges(objAdj)		= 0
+	set $$$FINARADJTotalCredits(objAdj)		= pcurCredit
+	set $$$FINARADJTotalAdjustments(objAdj) = pcurCredit
+	set $$$FINARADJStatus(objAdj)			= $$$EnumFINSYSSTATUSUnposted	//SR15101
+	
+	set strStatus=$$$Save(pstrClass,pidAdj,objAdj,1)  ; Create adjustment
+ 
+	quit strStatus
+ 
+ 
+GetNettAccount(&pidNettAccount)
+	;-------------------------------------------------------------------------------
+	; Get the account to nett into
+	;
+	; Params:
+	;
+	; ByRefs:		pidNettAccount - the nett account
+	;
+	; Returns:		status
+	;
+	; History:
+	; 24-Oct-2006	JW		SR15101: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	set strStatus = $$$OK
+ 
+	set pidNettAccount = $$$FINGeneralSetupNettAccount($get(^FINGeneralSetup(YM,YM,1)))
+	if pidNettAccount="" {
+		set strStatus = $listbuild("Fin01083")  ;The 'Nett AP / AR Suspense Account' is not set up in the General Parameters form.
+	}
+	quit strStatus
+ 
+	/*
+Post(pidAdjustment,pType) private
+    ;-------------------------------------------------------------------------------
+    ; Post Adjustment to Interface - Copied/modified from Post^FINAPADJ.
+    ;
+    ; Params:	pidAdjustment - adjustment to be posted
+    ; 			pType -	"AR" or "AP"
+    ; 
+    ; Returns: status - $$$OK or error msg
+    ;
+    ; History:
+    ; 24-Oct-2006	JW		SR15101: Not in use. Simply use PostTxn^FINAPADJ/FINARADJ
+	; 19-Apr-2005	SCR		SR11476: Pass YLOCATION to Allocate Block
+    ; 14-Oct-2004	JW		Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,Batch,Block,objAdjustment,intStatus,blnPost
+	new adjLine, curAdjLine, curSupplier, idLine
+	
+	set strStatus=$$$OK
+	set blnPost=$$$OK
+	
+	if pType="AP" set objAdjustment=$get(^FINAPADJ(YM,pidAdjustment,1))
+	if pType="AR" set objAdjustment=$get(^FINARADJ(YM,pidAdjustment,1))
+	
+	if strStatus=$$$OK {
+		if strStatus=$$$OK set strStatus=$$Allocate^FININTBatch(.Batch,.Block,pType_"ADJ",$get(YLOCATION),$$$FINAPADJTransactionDate(objAdjustment))
+		
+		set idLine=""
+		for {
+			if pType="AP" set idLine=$order(^FINAPADJLine(YM,pidAdjustment,idLine))
+			if pType="AR" set idLine=$order(^FINARADJLine(YM,pidAdjustment,idLine))
+			
+			quit:idLine=""
+			quit:$$$ISERR(strStatus)
+			
+			if pType="AP" set strStatus=$$PostLine^FINAPADJ(pidAdjustment,idLine,Batch,Block)
+			if pType="AR" set strStatus=$$PostLine^FINARADJ(pidAdjustment,idLine,Batch,Block)
+		}
+		
+		if strStatus=$$$OK set strStatus=$$PostBlock^FININTBatch(Batch,Block)
+		if strStatus=$$$OK set $$$FINAPADJPostedDate(objAdjustment)=$horolog
+	
+		if strStatus=$$$OK {
+			set $$$FINAPADJStatus(objAdjustment)=$$$EnumFINSYSSTATUSPosted
+			set strStatus=$$$Save("FIN"_pType_"ADJ",pidAdjustment,objAdjustment,1)
+		}
+	}
+	
+	quit strStatus
+ 	*/
+ 
+NettInvoice()
+    ;-------------------------------------------------------------------------------
+    ; Nett a single customer invoice.
+    ;  YPARA contains customer, supplier, customer invoice and balance.
+    ;  VORG(1) is the supplier invoice to be netted
+    ;  VORG(2) is the amount to be netted
+    ; 
+    ; Returns: nil
+    ;
+    ; History:
+    ; 24-Oct-2006	JW			SR15101: Rewrote. Decode status last.
+    ; 10-Mar-2005	Steve S		SR11832: Use Language Text Fin00693 for message
+    ; 27-Jan-2005	RobertW		SR11273: Fixed TCOMMIT and TROLLBACK
+    ; 24-Nov-2004	JW			SR11057: Created
+    ;-------------------------------------------------------------------------------
+	new curAmount,curBalance,idCustomer,idInvoice,Message,Reference,strStatus,idSupplier
+	new idAdj,objAdjLine,objClient,objInv,strAmount,idNettAccount
+	
+	set idCustomer =$piece(YPARA,$$$COMMA,1)
+	set idSupplier =$piece(YPARA,$$$COMMA,2)
+	set idInvoice  =$piece(YPARA,$$$COMMA,3)
+	set curBalance  =$piece(YPARA,$$$COMMA,4)
+ 
+	set Reference = VORG(1)
+	set curAmount = VORG(2)
+	
+	if (idInvoice="") {
+		set strStatus = $listbuild("Fin00089")  ;No Record Selected.
+		
+	} elseif (Reference="") {
+		set strStatus = $listbuild("Fin00416")  ;Supplier Reference invalid"
+		
+	} elseif (+curAmount'>0) || (curAmount>curBalance) {
+		set strStatus = $listbuild("Fin00417")  ;curAmount to Nett invalid
+		
+	} else {
+		tstart   ;---------------------------------Transaction Start--------------------------------
+		
+		set strStatus = $$CreateAdjustment("FINARADJ",.idAdj,curAmount,"APNettWithARMan")		//SR15101
+		
+		if $$$ISOK(strStatus) set strStatus = $$GetNettAccount(.idNettAccount)				//SR15101
+		
+		if $$$ISOK(strStatus) {
+			set objClient = $get(^FINARCustomer(YM,idCustomer,1))
+			set objInv = $get(^FINARInvoice(YM,idCustomer,idInvoice,1))
+			
+			set $$$FINARADJLineCustomer(objAdjLine) = idCustomer
+			set $$$FINARADJLineRef(objAdjLine) = idInvoice
+			set $$$FINARADJLineCredit(objAdjLine) = curAmount
+			set $$$FINARADJLineDue(objAdjLine) = $$$FINARInvoiceDueDate(objInv)
+			//set $$$FINARADJLineGLAccount(objAdjLine) = $$$FINARCustomerControlAccount(objClient)	// SR15101
+			set $$$FINARADJLineGLAccount(objAdjLine) = idNettAccount
+			set $$$FINARADJLineInvoiceDate(objAdjLine) = $$$FINARInvoiceInvoiceDate(objInv)
+			
+			set strStatus=$$$Save("FINARADJLine",idAdj_",1",objAdjLine,1)  ; create line
+		}
+		if $$$ISOK(strStatus) set strStatus=$$PostTxn^FINARADJ(idAdj)		//SR15101
+		
+		if $$$ISOK(strStatus) {
+			set strStatus = $$CreateAdjustment("FINAPADJ",.idAdj,curAmount,"APNettWithARMan")		//SR15101
+		}
+		if $$$ISOK(strStatus) {
+			set objClient = $get(^FINAPSupplier(YM,idSupplier,1))
+			
+			set $$$FINARADJLineCustomer(objAdjLine) = idSupplier
+			set $$$FINARADJLineRef(objAdjLine) = Reference
+			//set $$$FINARADJLineGLAccount(objAdjLine) = $$$FINARCustomerControlAccount(objClient)		// SR15101
+			
+			set strStatus=$$$Save("FINAPADJLine",idAdj_",1",objAdjLine,1)  ; create line
+		}
+		if $$$ISOK(strStatus) set strStatus=$$PostTxn^FINAPADJ(idAdj)		//SR15101
+		
+		if $$$ISERR(strStatus) {
+			trollback ;---------------------------Transaction Rollback------------------------------
+		} else {
+			if $tlevel>0 tcommit   ;---------------------------Transaction Commit--------------------------------
+			
+			set strAmount = $$FormatCurrency^COMTable(curAmount)		;SR11832
+			set strStatus = $listbuild("Fin00693",idInvoice,strAmount,Reference)  ;Customer invoice '%1' had %2 balanced with Supplier invoice '%3'.
+			set $piece(YPARA,",",3) = ""
+			set $piece(YPARA,",",4) = ""
+		}
+	}
+	set ^mtemp(YUSER,"NettMsg") = $$$Text(strStatus)		//SR15101
+	
+	do RedirectForm^COMUtils("FINAPNettWithARManual","","FINAPNettWithAR",YPARA,1)
+	
+	quit
+ 
+ 
+ManualBeforeButtonLine()
+    ;-------------------------------------------------------------------------------
+    ; Checks paramaters for a data record (sets YOPTION)
+    ; 
+    ; Returns: nil
+    ;
+    ; History:
+    ; 24-Nov-2004	JW		SR11057: Created
+    ;-------------------------------------------------------------------------------
+	if YAUSWAHL="" set YAUSWAHL=YPARA
+	set YOPTION = $piece(YAUSWAHL,",",3)'=""	
+	quit
+	
+ManualAfterButtonLine()
+    ;-------------------------------------------------------------------------------
+    ; Prints header
+    ; 
+    ; Returns: nil
+    ;
+    ; History:
+    ; 24-Nov-2004	JW		SR11057: Created
+    ;-------------------------------------------------------------------------------
+	new idCustomer
+	
+	quit:YAUSWAHL=""
+	
+	set idCustomer=$piece(YAUSWAHL,",",1)
+	write "<font size=2><b>"_$$$Text($listbuild("Fin00415",idCustomer))_"</b><p>" ; Nett Invoices for Customer: %1
+	
+	quit
+	
+	
+ManualAfterDataFields()
+    ;-------------------------------------------------------------------------------
+    ; Taken from ShowInvoices^FINARInvoice.
+    ; Show a customer's outstanding invoices (to be netted)
+    ; Also prints message from Netting process.
+    ;
+    ; Returns: nil
+    ;
+    ; History:
+    ; 23-Nov-2004	JW		SR11057: Created
+    ;-------------------------------------------------------------------------------
+	new curBalance,lstHeader,Form,curInvoice,idCustomer,CustomerKey,DueDate,InvoiceKey,idInvoice,Para,objInvoice
+	
+	quit:YAUSWAHL=""
+	
+	set idCustomer=$piece(YAUSWAHL,",",1)
+	set curInvoice=$piece(YAUSWAHL,",",3)
+	
+	do DisplayMessage()
+	
+	set lstHeader=$listBuild(
+				$$$StrFINARInvoiceInvoiceNumber,
+				$$$StrFINARInvoiceInvoiceDate,
+				$$$StrFINARInvoiceDueDate,
+				$$$StrFINARInvoiceInvoiceTotal,
+				$$$StrFINARInvoiceBalance,
+				$$$StrFINARInvoiceOnHold)
+	set Form="FINAPNettWithARManual"
+ 
+	do Start^COMTable(lstHeader,$$$Text($listbuild("Fin00414")))  ;Select a Customer Invoice
+	set CustomerKey=$$Index^FINSYS(idCustomer)
+	set DueDate=""
+	for {
+		set DueDate=$order(^FINARInvoices(YM,1,CustomerKey,DueDate))
+		quit:DueDate=""
+		set InvoiceKey=""
+		for {
+			set InvoiceKey=$order(^FINARInvoices(YM,1,CustomerKey,DueDate,InvoiceKey))
+			quit:InvoiceKey=""
+			set idInvoice=""
+			for {
+				set idInvoice=$order(^FINARInvoices(YM,1,CustomerKey,DueDate,InvoiceKey,idCustomer,idInvoice))
+				quit:idInvoice=""
+				set objInvoice=$get(^FINARInvoice(YM,idCustomer,idInvoice,1))
+ 				
+ 				set curBalance=$$$FINARInvoiceBalance(objInvoice)
+	 			if (curBalance>0) { ; outstanding invoices
+					set Para=$piece(YAUSWAHL,",",1,2)_","_idInvoice_","_curBalance
+					if curInvoice=idInvoice {
+						do NewLine^COMTable("lightgreen")
+	 				} else {
+		 				do NewLine^COMTable()
+	 				}
+					do InsertCell^COMTable(idInvoice,Form,idCustomer_","_idInvoice,Para)  
+					do InsertCellDate^COMTable($$$FINARInvoiceInvoiceDate(objInvoice),Form,idCustomer,Para)
+					do InsertCellDate^COMTable($$$FINARInvoiceDueDate(objInvoice),Form,idCustomer,Para)
+					do InsertCurrencyCell^COMTable($$$FINARInvoiceInvoiceTotal(objInvoice),0,Form,idCustomer,Para)
+					do InsertCurrencyCell^COMTable($$$FINARInvoiceBalance(objInvoice),0,Form,idCustomer,Para)
+					do InsertCellBoolean^COMTable($$$FINARInvoiceOnHold(objInvoice),Form,idCustomer,Para) 
+					do EndLine^COMTable()
+				}
+			}
+		}
+	}
+	do Stop^COMTable()
+	
+	quit
+	
+DisplayMessage()
+	;-------------------------------------------------------------------------------
+	; Display and kill msg in mtemp
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Nov-2004	JW		SR11057: Created
+	;-------------------------------------------------------------------------------
+	new Message
+	
+	set Message=$get(^mtemp(YUSER,"NettMsg"))
+	if Message'="" {
+		write "<font color=red size=2>"_Message_"</font>"
+		kill ^mtemp(YUSER,"NettMsg")
+	}
+	
+	quit
+	
+]]></Routine>
+</Export>

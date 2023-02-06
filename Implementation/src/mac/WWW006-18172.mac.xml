@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWW006" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWW006
+	
+#include COMSYS
+	
+IsLocked(pidUser,pstrClass,pstrKeys)
+	;-------------------------------------------------------------------------------
+	; Checks whether a record is locked
+	; 
+	; Called By: OnBeforeFormConstruction^COMHelp [YUSER,YFORM,YKEY]
+	;            Delete^COMHelp                   ["","COMHelp","idClass,idLanguage"]
+	; 
+	; Inputs:
+	;	pidUser		(YUSER) Check if locked by other than specified user.  If null
+	;				looks to see if locked by anyone.
+	;
+	;
+	; Returns:
+	;
+	; History:
+	; 03-May-2010	GRF		SR15961.1: pstrKeys rather than pid; check against
+	; 							pidUser rather than YUSER
+	; 24-Feb-2010	GRF		SR15961: reorder test for efficiency
+	; 10-Sep-2008	shobby	SRBR014980: Created
+	;-------------------------------------------------------------------------------
+	new blnLocked,strId,objClass,objLock
+	
+	set blnLocked = $$$NO
+	set strId     = "^"_pstrClass_"/"_YM_"."_$translate(pstrKeys,",",".")_".1/"
+	set objLock   = $get(^WWW006(0,+$horolog,strId,1))
+	
+	if objLock'="" {
+	;	if ($$$WWW006User1(objLock)'=YUSER) { ; SR15961.1
+		if ($$$WWW006User1(objLock)'=pidUser) {
+			set objClass = $get(^WWW001(0,pstrClass,1))
+	;		if ($piece($horolog,",",2)<($$$WWW006LockedUntilTime(objLock)+$$$WWW001NumberOfLockSeconds(objClass))) && ; SR15961
+	;		   (+$$$WWW001NumberOfLockSeconds(objClass)'=0) {
+			if (+$$$WWW001NumberOfLockSeconds(objClass)'=0) &&
+			   ($piece($horolog,",",2) < ($$$WWW006LockedUntilTime(objLock)+$$$WWW001NumberOfLockSeconds(objClass))) {
+				
+				set blnLocked = $$$YES
+			}
+		}
+	}
+	quit blnLocked
+	
+	
+CleanUpLocks(pidCurrentUser="",pblnKillOwn=$$$NO) 
+	;-------------------------------------------------------------------------------
+	; Remove unwanted locks, including all for current user
+	;
+	; Params: 	pidCurrentUser - current user id
+	; 			pblnKillOwn - kill locks for current user - if $$$NO only cleans up orphans
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Feb-2006	JW		Created
+	;-------------------------------------------------------------------------------
+	new dteLock,strFile,idLockOwner
+	
+	; FIXME : What about ^WWW0061?
+	
+	set dteLock=""
+	for {
+		set dteLock=$order(^WWW006(0,dteLock))
+		quit:dteLock=""
+		
+		if +dteLock'=+$horolog {		; Delete if not today
+			kill ^WWW006(0,dteLock)
+		} else {
+			set strFile = ""		; LOSCHEN ALLE EINTRÄGE WENN LEERES FELD
+			for {
+				set strFile = $order(^WWW006(0,dteLock,strFile))
+				quit:strFile=""
+				
+				set idLockOwner = $$$WWW006User1($get(^WWW006(0,dteLock,strFile,1))) ; D1
+				
+					// If user doesn't exist
+				if (idLockOwner="") || '$data(^WWWUSER(0,idLockOwner)) {
+					kill ^WWW006(0,dteLock,strFile)
+					
+					// Current user's lock
+				} elseif pblnKillOwn && (idLockOwner=pidCurrentUser) {
+					kill ^WWW006(0,dteLock,strFile)
+				}
+			}
+		}
+	}
+	quit
+	
+	
+	/* Not In Use Yet - ??? See WWWFORMLocking
+CreateLock(pidClass,pidKey,pidUser="",&pstrLocked)
+	;-------------------------------------------------------------------------------
+	; Take out a lock if it does not already exist.
+	;
+	; Params:
+	; pidClass - Class Id
+	; pidKey - Record key
+	; pidUser - User Id OPTIONAL
+	;
+	; ByRefs: None
+	;
+	; Returns: $$$OK if lock taken, otherwise error message
+	;
+	; History:
+	; 22-Aug-2006	PO		SR14924: Created
+	;-------------------------------------------------------------------------------
+	new idToLock,strClassLockKey,tmeStamp,dteToday,tmeNow,strStatus
+	
+	set strStatus = $$$OK
+	if pidUser = "" set pidUser = YUSER
+	
+	set tmeStamp = $horolog
+	set dteToday = +tmeStamp
+	set tmeNow = $piece(tmeStamp,$$$COMMA,2)
+	
+	set strClassLockKey = $translate(pidKey,",",".")
+	
+	set idToLock = "^"_pidClass_"/"_YM_"."_strClassLockKey_".1/"
+	
+	lock +^WWW006(0,dteToday,idToLock):1
+	if $test {
+		if $data(^WWW006(0,dteToday,idToLock)) {
+			set strStatus = $listbuild("",) // Lock on %1 not available to be taken.
+		} else {
+			set ^WWW006(0,dteToday,idToLock,1) = pidUser_Y_tmeNow
+			set pstrLocked = idToLock
+		}
+		lock -^WWW006(0,dteToday,idToLock)#"I"
+	} else {
+		set strStatus = $listbuild("",) // Lock on %1 not available to be taken.
+	}
+	quit strStatus
+	
+	
+LockTree(pidClass,pidKey,pidUser,pblnCleanup=$$$YES,&parrSubClass)
+	;-------------------------------------------------------------------------------
+	; Lock a record and all its sub records
+	;
+	; Notes:
+	;
+	; INPUT 
+	; ^CacheTempWWW006SubRecords - Details the records to lock
+	; 		idLine subscript needs to be full sub key structure
+	; 
+	; eg. When locking a FINAPPayment record and all its sub records
+	; 
+	; For FINAPPaymentInvoice idLine needs to be in the form idPayLine,idPayInvoice ... "10,P00600001"
+	;
+	; OUTPUT
+	; ^CacheTempWWW006Locked - Details the locked records
+	;
+	; Params:
+	; pidClass - 
+	; pidKey - 
+	; pidUser - 
+	; parrSubClass - 
+	;
+	; ByRefs: parrSubClass - Array
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 22-Aug-2006	PO		SR14924: Created
+	;-------------------------------------------------------------------------------
+	new idLock,tmeStamp,dteToday,tmeNow,idLocked,idSubClass,idLockParentLevel,idLineLock,idLine,strStatus
+	new idClass,idKey
+	
+	set strStatus = $$CreateLock(pidClass,pidKey,pidUser,.idLock)
+	if $$$ISOK(strStatus) {
+		set tmeStamp = $horolog
+		set dteToday = +tmeStamp
+		set tmeNow = $piece(tmeStamp,$$$COMMA,2)
+		set idLocked = idLock
+		
+		$$$Order3(^CacheTempWWW006Records,pidUser,idClass,idKey) ; REPLACE IF UNCOMMENTED
+			set strStatus = $$CreateLock(idClass,idKey,pidUser,.idLock)
+			quit:$$$ISERR(strStatus)
+		$$$End
+		
+		$$$Order1(parrSubClass,idSubClass) ; REPLACE IF UNCOMMENTED
+			quit:$$$ISERR(strStatus)
+			set idLockParentLevel = "^"_idSubClass_"/"_YM_"."_idLock
+			lock +^WWW006(0,dteToday,idLockParentLevel):2
+			if $test {
+				set idLineLock = $order(^WWW006(0,+$horolog,idLockParentLevel))
+				if $extract(idLineLock,1,$length(idLockParentLevel)) = idLockParentLevel {
+					set strStatus = $listbuild("",) // Lock on %1 not available to be taken.
+				} else {
+					set ^CacheTempWWW006Locked(pidUser,idLocked) = ""
+					set idLine = ""
+					$$$Order3(^CacheTempWWW006SubRecords,pidUser,idSubClass,idLine) ; REPLACE IF UNCOMMENTED
+						set idLineLock = idLockParentLevel_"."_$translate(idLine,",",".")_".1/" 
+						set ^WWW006(0,dteToday,idLineLock,1) = pidUser_Y_tmeNow
+						set ^CacheTempWWW006Locked(pidUser,idLineLock) = ""
+					$$$End
+				}
+				lock -^WWW006(0,dteToday,idLockParentLevel)#"I"
+			} else {
+				set strStatus = $listbuild("",) // Lock on %1 not available to be taken.
+			}
+		$$$End
+	}
+	
+	if pblnCleanup kill ^CacheTempWWW006SubRecords(pidUser)
+	
+	if $$$ISERR(strStatus) {
+		do CleanUpLocks(pidUser,$$$YES) // May not be appropriate in all cases, fine for IN Batch printing
+	}
+	quit strStatus
+	*/
+]]></Routine>
+</Export>

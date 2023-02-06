@@ -1,0 +1,438 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INARTPLUS" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INARTPLUS(AUFTRAG,POS,ART,REST,FERTIGUNG,SN,LOT,LAGER,VERS,WHSTORNO)
+#include COMSYS
+#include INConst
+#include WWWConst
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		ARTIKELBESTAND ÄNDERN UND AUS AUFTAG IN BESTAND SETZEN ODER FERTIGUNG
+	;		(ARTICLE SUPPLY CHANGING AND FROM AUFTAG IN EXISTENCE SETTING OR MANUFACTURING)
+	;
+	; Inputs : 
+	;	AUFTRAG   = AUFTRAGSNUMMER
+	;				WENN FERTIGUNG=1 AUFTRAG=FERTIGUNGSNUMMER (WIRD ABER WIEDER UMGESCHLüSSELT)
+	;				(However it is ?restored? again)
+	;	POS		  = POSITIONSNUMMER
+	;	ART		  = ARTIKELNUMMER
+	;	REST	  = RESTMENGE ; odd lot/residue/rest amount   ?Remaining stock quantity?
+	;	FERTIGUNG = 1 AUS TEILEN ZUSAMMENGESETZT ; manufactured (compound from parts) 
+	;	SN		  = SERIENNUMMER
+	;	LOT		  = LOT-NUMMER
+	;	LAGER	  = LAGERPLATZ
+	;	VERS	  = VERSION (KANN ÃBERGEBEN WERDEN) ;transfer 
+	;	WHSTORNO  = 1 STORNIERUNG DER WARENHERKUNFT ; Cancellation of the goods origin
+	;
+	; ByRef :
+	;
+	;
+	; Returns : OK	boolean
+	;
+	;
+	; History :
+	; 04-Nov-2009	GRF		Naked Reference
+	; 04-Dec-2006	GRF		Doco
+	; 12-Oct-2006	GRF		Doco
+	; 05-Oct-2006	RPW		SR14746: Corrected missed direct global writes.
+	; 21-SEP-2006	FAN		SR14746 Sales statistics incorrect
+	; 05-Apr-2006	GRF		Doco
+	; 24-Mar-2006	JW		SR14422: Increment date
+	; 24-Feb-2006	GRF		SR14203: Clarify NOPOST with $$$YES
+	; 22-Nov-2005	JW		SR13877: Rewrote deletion to record history for every stk locn
+	; 16-Nov-2005	RPW		SR13869: Added the stock location to the History INARTHIST
+	; 21-Jul-2005	GRF		SR13024: Doco
+	; 16-Jun-2005	GRF		Don't repeat extraction of DeleteLocn
+	; 26-Apr-2005	GRF		SR10478: pass OrderNo & LineNo to INARTHIST
+	; 11-Apr-2005	Paul K	A reference to INAUF had 2 primary keys(SR#10790)
+	; 05.07.2000	DT
+	;-------------------------------------------------------------------------------
+	new BET,BETRIEB,CANR,DeleteLocn,FERTIG1,FERTIGNR,HAL,INFOTEXT,LAP,LONR,LOTX
+	new MENGE,MENGE1,OK,PRUEF,QKON,SUCH,TEIL,WED,WEN
+	
+	SET OK=0
+	QUIT:+$GET(REST)=0 OK     ;KEINE MENGE    ;no quantity 
+	QUIT:$GET(ART)="" OK      ;KEINEN ARTIKEL ;item 
+	QUIT:$GET(AUFTRAG)="" OK  ;KEINEN AUFTRAG ;order 
+	QUIT:$GET(POS)="" OK      ;KEINE POSITON  ;order line 
+	SET POS = $TRANSLATE(POS,",","-")
+	
+	SET FERTIGUNG = $GET(FERTIGUNG)  ;FERTIGUNG
+	SET SN        = $GET(SN)         ;SERIENNUMMER
+	SET LOT       = $GET(LOT)        ;LOTNUMMER
+	SET VERS      = $GET(VERS)       ;VERSION
+	SET LAGER     = $GET(LAGER)      ;LAGERPLATZ ;stock locn 
+	
+	;		D26		$$$INARTItemType()
+	;		D29		$$$INARTItemWithoutInventoryMaint()
+	IF $PIECE($GET(^INART(YM,ART,1)),Y,29)=1 QUIT OK  ;KEINE BESTANDSFÜHRUNG  TYBD 16.05.2002 ;no 
+	IF $PIECE($GET(^INART(YM,ART,1)),Y,26)=2 QUIT OK  ;ACHTUNG LEISTUNG        ;service Item 
+	IF $PIECE($GET(^INART(YM,ART,1)),Y,26)=5 QUIT OK  ;ACHTUNG PHANTOM-ARTIKEL ;estimation 
+	IF $PIECE($GET(^INART(YM,ART,1)),Y,26)=6 QUIT OK  ;ACHTUNG Pauschale       ;all inclusive/lump sum
+	IF $PIECE($GET(^INART(YM,ART,1)),Y,26)=7 QUIT OK  ;ACHTUNG KONFIGURATION   ;estimation configuration 
+	
+	;BETRIEB
+	SET BET=""
+	IF AUFTRAG'="" IF $DATA(^INAUF(YM,AUFTRAG)) SET BET=$PIECE($GET(^INAUF(YM,AUFTRAG,1)),Y,6)  ;ORDER LOCATION;FIS;16.06.05;SR12556
+	IF BET="" SET BET=$GET(YLOCATION)
+	IF BET="" SET BET=$ORDER(^WWW0121(0,YM,""))
+	IF BET="" SET BET=1                         ;FIXME: Is defaulting to location 1 always valid? <Steve S>
+	
+	set DeleteLocn = $PIECE($GET(^INVORG(YM,YM,1)),Y,87)
+	
+	;LAGERPLATZ BESTIMMEN WENN KEINE FERTIGUNG
+	;Determine storage when no manufacture
+	IF FERTIGUNG="" IF LAGER="" DO 
+	. IF $DATA(^INARTLP(YM,ART)) SET LAGER=$ORDER(^INARTLP(YM,ART,BET,""))  ;FESTER LAGERPLATZ ;set storage 
+	. SET QKON=$PIECE($GET(^INAUFP(YM,AUFTRAG,POS,1)),Y,174)
+	. QUIT:QKON=""
+	. IF $PIECE($GET(^INQPRUEF(YM,BET,QKON,1)),Y,6)'="" SET LAGER=$PIECE($GET(^INQPRUEF(YM,BET,QKON,1)),Y,6)  ;LAGERPLATZ GEM. QUALITÄTSPRÜFUNG ;Quality Assurance Storage
+	
+	;***************************************************************************************
+	;------------- AUS FERTIGUNGSAUFTRAG ----------------
+	;------------- From Production Order
+	;
+	;+++++++++++++++++++++++++++++++++++++++
+	; FERTIG1		objINPROSTEMP1		Processed Manufacturing Numbers
+	; 			or	objINPROSTEMP		Open Production Order  
+	;+++++++++++++++++++++++++++++++++++++++
+	; AUFTRAG is initially the Work Order No not the Order No.
+	; Get the Order No & Line from ^INPROSTEMP1 or ^INPROSTEMP.
+	; Override Site Locn & Storage if required.
+	; Call INARTPLUS1 to update.
+	; Set Stock Corrected date.
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	IF FERTIGUNG'="" DO  QUIT OK   ;KEINE WEITERE BEARBEITUNG NACH AUFBUCHUNG ;no adaptation within 
+	. SET FERTIGNR=AUFTRAG
+	. SET FERTIG1=""
+	. SET FERTIG1=$GET(^INPROSTEMP1(YM,FERTIGNR,1))
+	. IF $TRANSLATE($PIECE(FERTIG1,Y,1,21),Y)="" SET FERTIG1=$GET(^INPROSTEMP(YM,FERTIGNR,1))
+	. ;
+	. ; Stock Corrected Date present - don't process again. 
+	. IF $PIECE(FERTIG1,Y,22)'="" QUIT  ;BESTAND BEREITS BERICHTIGT
+	. ;
+	. SET AUFTRAG = $PIECE(FERTIG1,Y,1)
+	. SET POS     = $PIECE(FERTIG1,Y,3)
+	. SET TEIL    = $PIECE($PIECE(FERTIG1,Y,6),",",3,999)
+ 	. IF AUFTRAG'="" IF $DATA(^INAUF(YM,AUFTRAG)) SET BET=$PIECE($GET(^INAUF(YM,AUFTRAG,1)),Y,6)  ;ORDER LOCATION;FIS;16.06.05;SR12556
+ 	. ;
+ 	. ; FIXME : ? We have already gone past YLOCATION above - shouldn't similar logic apply here?
+ 	. ;           Perhaps set BET1 and only replace BET if BET1 is not null? <GRF>
+ 	. ; 
+ 	. IF BET="" SET BET=YLOCATION
+	. ;LAGERPLATZ ;storage 
+	. IF LAGER="" DO
+	. . IF $DATA(^INARTLP(YM,ART)) SET LAGER=$ORDER(^INARTLP(YM,ART,BET,""))  ;FESTER LAGERPLATZ ;storage 
+	. . ;SET QKON=$PIECE($GET(^INART(YM,ART,1)),Y,174)
+	. . SET QKON=$PIECE($GET(^INAUFP(YM,AUFTRAG,POS,1)),Y,174)
+	. . QUIT:QKON=""
+	. . IF $PIECE($GET(^INQPRUEF(YM,BET,QKON,1)),Y,7)'="" SET LAGER=$PIECE($GET(^INQPRUEF(YM,BET,QKON,1)),Y,7)  ; Quality Assurance storage ; Naked Ref
+	. ;
+	. SET HAL=LAGER
+	. IF HAL="" SET HAL=$PIECE($GET(^INVORGB(YM,YM,BET,1)),Y,1)  ;HAND/PRODUKTIONSLAGER
+	. IF HAL="" SET HAL=$ORDER(^INLP(YM,BET,""))
+	. IF HAL="" SET HAL=0
+	. ;
+	. ;KEINE BUCHUNG BEI FERTIGSTELLUNG (ACHTUNG: X NICHT LÖSCHLAGERPLATZ !) ;no next to finishing X Not 
+	. QUIT:HAL=DeleteLocn
+	. ;
+	. ;ARTIKELVERSION
+	. IF VERS="" SET VERS=$PIECE($GET(^INART(YM,ART,1)),Y,203)  ;AKTUELLE VERSION
+	. ;
+	. ;LAGERBERICHTIGUNG AUS FERTIGUNG ;Update stock from manufacture 
+	. SET OK=$$^INARTPLUS1(FERTIGNR,AUFTRAG,POS,TEIL,ART,REST,SN,LOT,HAL,VERS)
+	. IF OK=1 DO
+	. . IF $DATA(^INPROSTEMP(YM,FERTIGNR,1))  SET $PIECE(^INPROSTEMP(YM,FERTIGNR,1),Y,22) =+$HOROLOG
+	. . IF $DATA(^INPROSTEMP1(YM,FERTIGNR,1)) SET $PIECE(^INPROSTEMP1(YM,FERTIGNR,1),Y,22)=+$HOROLOG
+	
+	
+	;***************************************************************************************
+	;-------- NEU AUS RUECKNAHME DER WARE ---------------
+	;-------- Return of goods? --------------
+	IF REST<0 DO  QUIT OK
+	. NEW POS1,LAP,BET,MENGE,LOTX,VERSX,EKX,LIEFKUN
+	. SET POS1=$GET(^INAUFP(YM,AUFTRAG,POS,1))
+	. ;SET BET=+$PIECE($GET(^INAUF(YM,AUFTRAG,1)),Y,6)
+	. SET BET=$PIECE($GET(^INAUF(YM,AUFTRAG,1)),Y,6)  ;FIS;13.12.04;26987
+	. IF BET="" SET BET=YLOCATION
+	. IF BET="" SET BET=1
+	. SET LAP=$GET(LAGER)                                           ;VORGABE DES LAGERS ;default storage
+	. IF $PIECE(POS1,Y,223)'="" SET LAP=$PIECE(POS1,Y,223)
+	. IF LAP="" SET LAP=$PIECE($GET(^INVORGB(YM,YM,BET,1)),Y,1)     ; Default Stock on Hand storage
+	. IF LAP="" SET LAP=0
+	. QUIT:$PIECE(POS1,Y,234)'=""  ;RÜCKNAHME BEREITS GEBUCHT ;yet
+	. ; 
+	. SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,234)=+$HOROLOG   ;RÜCKBUCHUNG ERFOLGT
+	. SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,223)=LAP         ;RÜCKBUCHUNG AUF LAGER ;upon storage
+	. SET REST=REST*-1
+	. SET WED=+$HOROLOG
+	. SET WEN=""
+	. SET $PIECE(WEN,Y,4)  = REST
+	. SET $PIECE(WEN,Y,9)  = AUFTRAG_"-"_POS
+	. SET $PIECE(WEN,Y,28) = AUFTRAG  ;SPEICHERN WARENHERKUNFT/URSPRUNG ;Save 
+	. SET $PIECE(WEN,Y,29) = POS
+	. SET $PIECE(WEN,Y,19) = $GET(LOT)
+	. SET $PIECE(WEN,Y,48) = $GET(VERS)
+	. IF $PIECE(WEN,Y,5)=0 SET $PIECE(WEN,Y,5)=1
+	. ;
+	. ; FIXME : SR15107 : Use D109 Received quantity if non-null? <GRF>
+	. ;                   No longer using batch price from INWE - Low priority
+	. ; 
+	. SET $PIECE(WEN,Y,8)  = $PIECE(POS1,Y,47) / $PIECE(POS1,Y,5)  ;EINZEL-EK
+	. IF $PIECE(WEN,Y,8)<0  SET $PIECE(WEN,Y,8)=-$PIECE(WEN,Y,8)   ;MINUS BESTANDSWERTE;TYBD ;17,11,2003;24620
+	. IF +$PIECE(WEN,Y,8)=0 SET $PIECE(WEN,Y,8)=$$^INARTKOST(ART)  ;EK AUS ARTIKEL ;Planned Cost out of item 
+	. ;		D26		$$$INARTItemType()
+	. ;		D29		$$$INARTItemWithoutInventoryMaint()
+	. ;IF LAP'="X" DO
+	. IF LAP'=DeleteLocn DO   ;WEM;22698;22.10.2003;ERSETZEN HARDCODED LÖSCHLAGERPLATZ
+	. . QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,29)=1  ;KEINE BESTANDSFÜHRUNG  TYBD 16.05.2002 ;no 
+	. . QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,26)=2  ;KEINE LEISTUNG  TYBD 16.05.2002 ;not Service Item 
+	. . ;
+	. . set WED = $$Increment^INWECounter(ART,BET,LAP,WED)	//SR14422
+	. . ;
+	. . IF '$DATA(^INWE(YM,ART,BET,LAP,WED,1)) DO  QUIT  ;NEUER LAGERPLATZ ;storage 
+	. . . SET ^INWE(YM,ART,BET,LAP,WED,1)=WEN
+	. . . DO ^WWWSSORT("INWE",ART_","_BET_","_LAP_","_WED)
+	. . . ; do $$$Save("INWE",ART_","_BET_","_LAP_","_WED,WEN,$$$YES) // SR14546
+	. . ;
+	. . // Under SR14422, the following 'merging' code should never be executed
+	. . // vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+	. . ;
+	. . ; MENGE ;quantity 
+	. . SET MENGE=$PIECE(WEN,Y,4)
+	. . SET MENGE1=$PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,4)  ;MENGE AUF LAGERPLATZ ;quantity at storage 
+	. . SET $PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,4)=MENGE+MENGE1
+	. . ; set MENGE = $$$INWEQuantity(WEN) // SR144546
+	. . ; set objINWE = $get(^INWE(YM,ART,BET,LAP,WED,1)) // SR144546
+	. . ; set MENGE1 = $$$INWEQuantity(objINWE) // SR144546
+	. . ; set $$$INWEQuantity(objINWE) = MENGE + MENGE1 // SR144546
+	. . ;
+	. . ; LOTNUMMER
+	. . IF $GET(LOT)'="" DO
+	. . . SET LOTX=$PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,19)  ;LOT AUF LAGERPLATZ ; lot number from storage 
+	. . . ; set LOTX = $$$INWELotNo(objINWE) // SR14546
+	. . . QUIT:LOTX=LOT
+	. . . IF LOTX'="" SET LOT=LOTX_";"_LOT
+	. . . ;SET $PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,19)=LOT  // SR14746
+	. . . ; set $$$INWELotNo(objINWE) = LOT // SR14546
+	. . ;
+	. . ; VERSIONSNUMMER
+	. . IF $GET(VERS)'="" DO
+	. . . SET VERSX=$PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,48)  ;VERSION AUF LAGERPLATZ ;revision from storage 
+	. . . ; set VERSX = $$$INWEVersionRev(objINWE) // SR14546
+	. . . QUIT:VERSX=VERS
+	. . . IF VERSX'="" SET VERS=VERSX_";"_VERS
+	. . . //SET $PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,48)=VERS  // SR14746
+	. . . ; set $$$INWEVersionRev(objINWE) = VERS // SR14546
+	. . . ; 
+	. . ;
+	. . ; EINZEL-EK ; Single Cost(?)
+	. . IF +$PIECE(WEN,Y,8)'=0 DO
+	. . . SET EKX=$PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,8)  ;EK AUF LAGERPLATZ ;Planned Cost from storage 
+	. . . ; set EKX = $$$INWEUnitPrice(objINWE) // SR14546
+	. . . ;IF +EKX'=0 QUIT  ;KEINE ÄNDERUNG ;no alteration  // SR14746
+	. . . ;SET $PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,8)=$PIECE(WEN,Y,8)  ;SPEICHERN NEUER EK ;Save Planned Cost  // SR14746
+	. . . ; set $$$INWEUnitPrice(objINWE) = $$$INWEUnitPrice(WEN) // SR14546
+	. . ; do $$$Save("INWE",ART_","_BET_","_LAP_","_WED,objINWE,$$$YES) // SR14546
+	. . ;
+	. . DO // SR14546
+	. . . NEW SATZ
+	. . . SET SATZ=$GET(^INWE(YM,ART,BET,LAP,WED,1))
+	. . . SET $PIECE(SATZ,Y,19)=$GET(LOT)  // SR14746
+	. . . set $PIECE(SATZ,Y,48)=$GET(VERS) // SR14746
+	. . . if +$GET(EKX)=0 set $PIECE(SATZ,Y,8)=$piece(WEN,Y,8) // SR14746
+	. . . SET strStatus=$$$Save("INWE",ART_","_BET_","_LAP_","_WED,SATZ,$$$YES)     // SR14746
+	. . // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	. ;
+	. IF LAP'=DeleteLocn DO
+	. . SET LIEFKUN=$PIECE($GET(^INAUF(YM,AUFTRAG,1)),Y,1)  ;FIS;10.05.01;26560  ;PJK;2005-04-11;Previously had 2 primary keys, now has 1. (SR#10790)
+	. . ; +MENGE AUS RÜCKNAHME  ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. . ; "+" Qty "from Return" OrderNo-OrdLine
+	. . DO ^INARTHIST(ART,"+"_REST_" "_$$^WWWTEXT(32855)_" "_AUFTRAG_"-"_POS,BET,REST,,,LIEFKUN,($PIECE(WEN,Y,4)*$PIECE(WEN,Y,8)),LAP,,,AUFTRAG,POS,,,"REC")
+	. . ;  ART,TEXT,BET,PlusQty,#5,
+	. . ;  #6,LIEFKUN,($P(WEN,Y,4)*$P(WEN,Y,8)),LAP,#10,
+	. . ;  #11,AUFTRAG,POS,#14,#15,"REC"
+	. ;
+	. IF $GET(SN)'="" DO
+	. . SET SN=$TRANSLATE(SN,",",";")
+	. . FOR YI=1:1  QUIT:$PIECE(SN,";",YI,99)=""  DO
+	. . . QUIT:$PIECE(SN,";",YI)=""
+	. . . SET ^INWEAUFS(YM,AUFTRAG,POS,BET,LAP,WED,$PIECE(SN,";",YI),1)=""
+	. . . DO ^WWWSSORT("INWEAUFS",AUFTRAG_","_POS_","_BET_","_LAP_","_WED_","_$PIECE(SN,";",YI))
+	. . ;
+	. . DO SERIE
+	
+	
+	;***************************************************************************************
+	;------------- AUS WARENHERKUNFT RÜCKGÄNGIG MACHEN ----------------
+	;------------- Declined from goods origin? -----------
+	IF +$GET(WHSTORNO)=1 DO  QUIT OK
+	. NEW POS1,LAP,BET,WED,WEN,INFOTEXT,LIEFKUN
+	. ;		D26		$$$INARTItemType()
+	. ;		D29		$$$INARTItemWithoutInventoryMaint()
+	. QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,29)=1  ;KEINE BESTANDSFÜHRUNG  TYBD 16.05.2002 ;no 
+	. QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,26)=2  ;KEINE LEISTUNG  TYBD 16.05.2002 ; Not Service Item 
+	. SET BET=""
+	. FOR  SET BET=$ORDER(^INWEAUF(YM,AUFTRAG,POS,BET)) QUIT:BET=""  DO                 ;BETRIEB
+	. . SET LAP=""
+	. . FOR  SET LAP=$ORDER(^INWEAUF(YM,AUFTRAG,POS,BET,LAP)) QUIT:LAP=""  DO           ;LAGERPLATZ ;storage 
+	. . . SET WED=""
+	. . . FOR  SET WED=$ORDER(^INWEAUF(YM,AUFTRAG,POS,BET,LAP,WED)) QUIT:WED=""  DO     ;WEDATUM
+	. . . . SET WEN=$GET(^INWEAUF(YM,AUFTRAG,POS,BET,LAP,WED,1))
+	. . . . DO
+	. . . . . ;
+	. . . . . ;---------------------------------------
+	. . . . . ;
+	. . . . . ; *** UPDATE INWE POINT ***  (set + kill)
+	. . . . . ; 
+	. . . . . ; This comment marks where the INWE class is being
+	. . . . . ; saved or killed as an indication of where a
+	. . . . . ; common method may need to be located.     <GRF>
+	. . . . . ;
+	. . . . . ;---------------------------------------
+	. . . . . ;
+	. . . . . IF '$DATA(^INWE(YM,ART,BET,LAP,WED,1)) DO  QUIT  ;NEUER LAGERPLATZ ;storage 
+	. . . . . . SET ^INWE(YM,ART,BET,LAP,WED,1)=WEN
+	. . . . . . DO ^WWWSSORT("INWE",ART_","_BET_","_LAP_","_WED)  ;AUFBEREITEN SORTKEY
+	. . . . . . ; do $$$Save("INWE",ART_","_BET_","_LAP_","_WED,WEN,$$$YES) // SR14546
+	. . . . . . DO SERIE
+	. . . . . ;
+	. . . . . DO ^WWWSKILL("INWE",ART_","_BET_","_LAP_","_WED,1)  ;LÖSCHEN SORTKEY ;Delete 
+	. . . . . SET MENGE=$PIECE(WEN,Y,4)   ;MENGE ;quantity
+	. . . . . SET MENGE1=$PIECE($GET(^INWE(YM,ART,BET,LAP,WED,1)),Y,4)  ;MENGE AUF LAGERPLATZ ;quantity from storage 
+	. . . . . ;IF LAP'="X" SET $PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,4)=MENGE+MENGE1 SET YQ=1
+	. . . . . IF LAP'=DeleteLocn SET $PIECE(^INWE(YM,ART,BET,LAP,WED,1),Y,4)=MENGE+MENGE1 SET YQ=1   ;WEM;22698;22.10.2003;ERSETZEN HARDCODED LÖSCHLAGERPLATZ
+	. . . . . DO ^WWWSSORT("INWE",ART_","_BET_","_LAP_","_WED)  ;AUFBEREITEN SORTKEY
+	. . . . . DO SERIE
+	. . . . ;
+	. . . . ; FIXME : <GRF> INWEAUF has indices.
+	. . . . KILL ^INWEAUF(YM,AUFTRAG,POS,BET,LAP,WED,1)  ;LÖSCHEN DATENSATZ NACH ÜBERGABE ;Delete data record within 
+	. . . . ; To Stock From Cancellation Of Source Of Item  (Order ...)
+	. . . . SET INFOTEXT="+"_$PIECE(WEN,Y,4)_" "_$$^WWWTEXT(32512)_" "_$$^WWWTEXT(33585)_" ("_$$^WWWTEXT(32047)_" "_AUFTRAG_"-"_POS_")"  ;+ MENGE AUF BESTAND AUS STORNIERUNG WARENHERKUNFT ;quantity upon out of 
+	. . . . SET LIEFKUN=$PIECE($GET(^INAUF(YM,AUFTRAG,1)),Y,1)  ;FIS;10.05.01;26560 ;PJK;2005-04-11;Previously had 2 primary keys, now has 1. (SR#10790)
+	. . . . ; MENGE ZURÜCKGBUCHT ;TRANSACTION TYPE;FIS;10.05.01;26560
+	. . . . DO ^INARTHIST(ART,INFOTEXT,BET,$PIECE(WEN,Y,4),,,LIEFKUN,($PIECE(WEN,Y,4)*$PIECE(WEN,Y,8)),LAP,,,AUFTRAG,POS,,$$$YES,"REC")
+	. . . . ;  ART,INFOTEXT,BET,PlusQty,#5,
+	. . . . ;  #6,LIEFKUN,($P(WEN,Y,4)*$P(WEN,Y,8)),LAP,#10,
+	. . . . ;  #11,AUFTRAG,POS,#14,1,"REC"
+	
+	
+	;***************************************************************************************
+	;------------- AUS LÖSCHEN AUFTRÄGE ----------------
+	;------------- From Deleted Orders
+	new idClass,arrRec,curCost			//SR13877 - rewrote
+	
+	SET PRUEF=0
+	
+	for idClass="^INWEAUF","^INWEAUFALT" {
+		
+		kill arrRec
+		merge arrRec = @idClass@(YM,AUFTRAG,POS)
+		
+		SET BET = ""
+		FOR {
+			SET BET = $ORDER(arrRec(BET)) QUIT:BET=""		; location
+			SET LAP = ""
+			FOR {
+				SET LAP = $ORDER(arrRec(BET,LAP)) QUIT:LAP=""	; stock location
+				SET WED = ""
+				FOR {
+					SET WED = $ORDER(arrRec(BET,LAP,WED)) QUIT:WED=""	; date
+					SET WEN = $GET(arrRec(BET,LAP,WED,1))
+					
+					SET MENGE   = $$$INWEQuantity(WEN)
+					set curCost = $$$INWEUnitPrice(WEN)*MENGE
+					
+					SET PRUEF = 1
+					set YQ    = 0
+					
+	;---------------------------------------
+	;
+	; *** UPDATE INWE POINT ***  (set + kill)
+	; 
+	; This comment marks where the INWE class is being
+	; saved or killed as an indication of where a
+	; common method may need to be located.     <GRF>
+	;
+	;---------------------------------------
+					IF '$DATA(^INWE(YM,ART,BET,LAP,WED,1)) {
+						SET ^INWE(YM,ART,BET,LAP,WED,1)=WEN
+						; do $$$Save("INWE",ART_","_BET_","_LAP_","_WED,WEN,$$$YES)
+						set CANR=""
+						set LONR=""
+						
+					} else {
+						DO ^WWWSKILL("INWE",ART_","_BET_","_LAP_","_WED,1)	; delete sort keys
+						SET MENGE1 = $$$INWEQuantity($GET(^INWE(YM,ART,BET,LAP,WED,1)))
+						IF LAP'=DeleteLocn {
+							SET $$$INWEQuantity(^INWE(YM,ART,BET,LAP,WED,1)) = MENGE+MENGE1
+							SET YQ=1
+						}
+						set CANR = $$$INWEBatchNumber(WEN)
+						set LONR = $$$INWELotNo(WEN)
+					}
+					DO ^WWWSSORT("INWE",ART_","_BET_","_LAP_","_WED)  ;Prepare sortkeys
+					DO SERIE
+					KILL @idClass@(YM,AUFTRAG,POS,BET,LAP,WED,1)
+					; do $$$Kill(idClass,AUFTRAG_","_POS_","_BET_","_LAP_","_WED) // SR14546
+					
+					; History for stock location
+					IF YQ=1 {
+						SET INFOTEXT="+"_MENGE_" "_$$^WWWTEXT(32512)_" "_$$^WWWTEXT(32514)    ; "To Stock From Cancellation"
+					} else {
+						SET INFOTEXT=MENGE_" "_$$^WWWTEXT(42)                                 ; "Deleted!"
+					}
+					set INFOTEXT = INFOTEXT_" ("_$$^WWWTEXT(32047)_" "_AUFTRAG_"-"_POS_")"    ; "Order " OrderNo-OrdLine
+					
+					if CANR'="" SET INFOTEXT=INFOTEXT_" ("_CANR_")"
+					if LONR'="" SET INFOTEXT=INFOTEXT_" ("_LONR_")"
+					
+					DO ^INARTHIST(ART,INFOTEXT,BET,MENGE,,,,curCost,LAP,,,AUFTRAG,POS,,$$$YES,"REC")
+				}
+			}
+		}
+	}
+	
+	;HISTORY for SN
+	IF PRUEF=1 DO
+	. IF $GET(SN)'="" DO
+	. . SET SN=$TRANSLATE(SN,",",";")
+	. . FOR YI=1:1  QUIT:$PIECE(SN,";",YI,99)=""  DO
+	. . . QUIT:$PIECE(SN,";",YI)=""
+	. . . DO ^INSNHIST($PIECE(SN,";",YI),$$^WWWTEXT(32116)_" "_$$^WWWTEXT(42)_" "_AUFTRAG_"-"_POS,ART)  ;SERIENNUMMER GELÖSCHT
+	
+	SET OK=1
+	QUIT OK
+	
+SERIE ;ZURUECK BUCHEN SERIENNUMMER
+	new DeleteLocn,SN
+	
+	set DeleteLocn = $PIECE($GET(^INVORG(YM,YM,1)),Y,87)
+	set SN=""
+	for  {
+		set SN=$ORDER(^INWEAUFS(YM,AUFTRAG,POS,BET,LAP,WED,SN))
+		quit:SN=""
+		
+		if LAP'=DeleteLocn {
+			;WEM;22698;22.10.2003;ERSETZEN HARDCODED LÖSCHLAGERPLATZ
+			set ^INWES(YM,ART,BET,LAP,WED,SN,1)=$GET(^INWEAUFS(YM,AUFTRAG,POS,BET,LAP,WED,SN,1))
+		}
+		set ^INWEAUFALTS(YM,AUFTRAG,POS,BET,LAP,WED,SN,1)=$GET(^INWEAUFS(YM,AUFTRAG,POS,BET,LAP,WED,SN,1))
+		do ^WWWSSORT("INWEAUFALTS",AUFTRAG_","_POS_","_BET_","_LAP_","_WED_","_SN)  ;SORTKEY NEU ;recent 
+		do ^WWWSKILL("INWEAUFS",AUFTRAG_","_POS_","_BET_","_LAP_","_WED_","_SN)     ;LÖSCHEN SERIENNUMMER ;Delete 
+		
+		if LAP=DeleteLocn  {
+			;SN GELÖSCHT   ;WEM;22698;22.10.2003;ERSETZEN HARDCODED LÖSCHLAGERPLATZ
+			; "Serial No. Deleted! ###-#"
+			do ^INSNHIST(SN,$$^WWWTEXT(32116)_" "_$$^WWWTEXT(42)_" "_AUFTRAG_"-"_POS,ART)
+		} else {
+			;AUF BESTAND AUS STORNO   ;WEM;22698;22.10.2003;ERSETZEN HARDCODED LÖSCHLAGERPLATZ
+			; "To Stock From Cancellation ###-#"
+			do ^INSNHIST(SN,$$^WWWTEXT(32512)_" "_$$^WWWTEXT(32514)_" "_AUFTRAG_"-"_POS,ART)
+		}
+	}
+	quit
+	
+]]></Routine>
+</Export>

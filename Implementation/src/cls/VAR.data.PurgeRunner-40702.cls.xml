@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Class name="VAR.data.PurgeRunner">
+<ClassType/>
+<IncludeCode>VARConst,VARLog,VARUtil,COMSYS,WWWConst,VARService,VARErros,INConst</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>VAR.infra.services.ServiceRunner</Super>
+
+<Method name="Register">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit ..RegisterRunner($$$ServiceIdPurgeData, $$$ServiceFrequencyWeekly, $$$ServicePriorityHighLow, ..%ClassName(1), "Purge of expired data")]]></Implementation>
+</Method>
+
+<Method name="Unregister">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit ..UnregisterRunner($$$ServiceIdPurgeData, "Purge of expired data")]]></Implementation>
+</Method>
+
+<Method name="Execute">
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	do ..SavePurge(.sessionId, "Initialized")
+	$$$VARLOGINFO("Service of 'Purge of expired data' has started the session "_sessionId)
+
+	if ($length($get(^VARPurgeNamespace("From"))) = 0) || ($length($get(^VARPurgeNamespace("To"))) = 0){
+		set msgStatus = "Purge namespaces are not defined."
+		$$$VARLOGERROR("Error: "_msgStatus)
+		quit $$$MakeStatus(msgStatus)
+	}
+	
+	set fromNamespace = $get(^VARPurgeNamespace("From"))
+	set toNamespace = $get(^VARPurgeNamespace("To"))
+
+	set class = ""
+	set class = $order(^VARPurgeClass(0,class))
+	while(class '= "") {
+		do ..SavePurge(sessionId, "Running")
+		set objVARPurgeClass	= ^VARPurgeClass(0,class,1)
+		set childClasses	= $$$VARPurgeClassChildClasses(objVARPurgeClass)
+		set expiryDateField	= $$$VARPurgeClassExpiryDateField(objVARPurgeClass)
+		set expireIn		= $$$VARPurgeClassExpireIn(objVARPurgeClass)
+		if (+expireIn < 6) {
+			$$$VARLOGERROR("Invalid expire value for class """_class_"""")
+			set class = $order(^VARPurgeClass(0,class))
+			continue
+		}
+		set minorDateFound = ""
+		set majorDateFound = ""
+		set totalRecords = 0
+		set totalChildRecords = 0
+		set sumRecords = 0
+		set sumChildRecords = 0
+		do ..ClassRecords(class,childClasses,.sumRecords,.sumChildRecords)
+		$$$VARLOGINFO("Purge of class "_class_" is running")
+		$$$VARLOGINFO("The class "_class_" has "_sumRecords_" records and "_sumChildRecords_" child records before the purge")
+		if (..PurgeClass(fromNamespace, toNamespace, class, expireIn, expiryDateField, childClasses, .minorDateFound, .majorDateFound, .totalRecords, .totalChildRecords, sessionId)) {
+			do ..SavePurgeHistory(sessionId, class, totalRecords, totalChildRecords, minorDateFound, majorDateFound)
+		}
+		set sumRecords = 0
+		set sumChildRecords = 0
+		do ..ClassRecords(class,childClasses,.sumRecords,.sumChildRecords)
+		$$$VARLOGINFO("Purge of class "_class_" is completed "_totalRecords_" records and "_totalChildRecords_" child records were purged")
+		$$$VARLOGINFO("The class "_class_" has "_sumRecords_" records and "_sumChildRecords_" child records after the purge")
+		set class = $order(^VARPurgeClass(0,class))
+	}
+	do ..SavePurge(sessionId, "Completed")
+	$$$VARLOGINFO("Service of 'Purge of expired data' has ended the session "_sessionId)
+	quit $$$OK]]></Implementation>
+</Method>
+
+<Method name="PurgeClass">
+<FormalSpec>fromNamespace:%String,toNamespace:%String,class:%String,expireIn:%Integer,expiryDateField:%String,childClasses:%String="",&amp;minorDateFound:%String="",&amp;majorDateFound:%String="",&amp;totalRecords:%Integer=0,&amp;totalChildRecords:%Integer=0,sessionId:%Integer</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	#define MAXINTERVAL 50000
+	
+	set $ztrap = "exception"
+	set status = $$$OK
+
+	set objDateField = $get(^WWW003(0,class,expiryDateField,1))
+	if (($$$WWW003InputType(objDateField) '= 1) &&
+		($$$WWW003InputType(objDateField) '= 14) &&
+		($$$WWW003InputType(objDateField) '= 17)) {
+		$$$THROW("The field selected for the class """_class_""" is not a date type field")
+	}
+	set baseMonth = ##class(%SYSTEM.SQL).MONTH($zdate($horolog,3))
+	set baseYear = ##class(%SYSTEM.SQL).YEAR($zdate($horolog,3))
+	set limitDate = $zdateh("1/"_baseMonth_"/"_baseYear,4)
+	set limitDate = $zdateh(##class(%SYSTEM.SQL).DATEADD("month",-expireIn,limitDate),3)
+	if (($horolog-limitDate)<(expireIn*30)) {
+		$$$THROW("Error on calculate the limit date ("_limitDate_").")
+	}
+	do ..GetIndex(class, .arrIndex)
+	set strClass = "^|"""_fromNamespace_"""|"_class
+	set globalNode = $query(@strClass)
+	while (globalNode '= "") {
+		set dateValue = $piece(@globalNode,"~",expiryDateField)
+		if (($$$WWW003InputType(objDateField) = 14) ||($$$WWW003InputType(objDateField) = 1)) {
+			set dateValue = +dateValue
+		}
+		elseif ($$$WWW003InputType(objDateField) = 17) {
+			set dateValue = +$zdateh(dateValue,8)
+		}
+		if (dateValue <= 0) {
+			$$$VARLOGERROR("Invalid date value: class="""_class_""", global="""_globalNode_""", field="""_expiryDateField_""", value="""_$piece(@globalNode,"~",expiryDateField)_"""")
+			set globalNode = $query(@globalNode)
+			continue
+		}
+		set dateValue = +$zdateh($zdate(dateValue))
+		if (dateValue = 0) {
+			$$$VARLOGERROR("Invalid date value: class="""_class_""", global="""_globalNode_""", field="""_expiryDateField_""", value="""_$piece(@globalNode,"~",expiryDateField)_"""")
+			set globalNode = $query(@globalNode)
+			continue
+		}
+		if (fromNamespace = "SESDF") {
+			if (class = "VARTRKPAM") {
+				set idPAM = $qsubscript(globalNode,2)
+				set idPAMLine = ""
+				
+				set objPAM = $get(@globalNode)
+				set blnMissing = $$$NO
+				set statusPAM = $$$VARTRKPAMProcessado(objPAM)
+				
+				if (statusPAM '= 3) {
+					for{
+						set idPAMLine = $order(^VARTRKPAMLineFake(0,idPAM,idPAMLine))
+						quit:idPAMLine=""
+					
+						set quantityMissing = $$GetQuantidadeAAtender^VARTRKSQL(idPAM,idPAMLine)
+					
+						if (quantityMissing){
+							set blnMissing = $$$YES
+							quit
+						}
+					}
+				}
+
+				if (blnMissing){
+					set globalNode = $query(@globalNode)
+					continue
+				}
+			}
+			if (class = "INAUF") {
+				set objAFM = $get(@globalNode)
+				set statusAFM = $$$INAUFFREE14(objAFM)
+			
+				if ( (statusAFM = 1) || (statusAFM = 2) ) {
+					set globalNode = $query(@globalNode)
+					continue
+				}
+			}
+		}
+		if (dateValue < limitDate) {
+			if (($length($get(minorDateFound)) = 0) || (dateValue < minorDateFound)) set minorDateFound = dateValue
+			if (($length($get(majorDateFound)) = 0) || (dateValue > majorDateFound)) set majorDateFound = dateValue
+			if ($length(childClasses) > 0) {
+				set childClass = ""
+				for i=1:1:$length(childClasses,";") {
+					set childClass = $piece(childClasses,";",i)
+					do ..GetIndex(childClass, .arrChildIndex)
+					set strChildClass = "^"_childClass_"(0,"""_$qsubscript(globalNode,2)_""")"
+					set childGlobalNode = $query(@strChildClass)
+					while ((childGlobalNode '= "") && (($qsubscript(globalNode,2)) = $qsubscript(childGlobalNode,2))) {
+						do ..PurgeNode(fromNamespace, toNamespace, childGlobalNode, .arrChildIndex)
+						set totalChildRecords = totalChildRecords + 1
+						if (totalChildRecords#$$$MAXINTERVAL = 0) do ..SavePurgeHistory(sessionId, class, totalRecords, totalChildRecords, minorDateFound, majorDateFound)
+						set childGlobalNode = $query(@childGlobalNode)
+					}
+				}
+			}
+			do ..PurgeNode(fromNamespace, toNamespace, globalNode, .arrIndex)
+			set totalRecords = totalRecords + 1
+			if (totalRecords#$$$MAXINTERVAL = 0) do ..SavePurgeHistory(sessionId, class, totalRecords, totalChildRecords, minorDateFound, majorDateFound)
+		}
+		set globalNode = $query(@globalNode)
+	}
+finally
+	quit status
+
+exception
+ 	set $ztrap = ""
+	
+	if ($$$ISERROESPECIAL) {
+		set status = $$$VARERRO
+	}
+	else {
+		set status = $$$ERROR("Erro: "_$zerror)
+	}
+	
+ 	$$$VARLOGERROR("Class: "_class_" Global: "_$get(globalNode)_" Error: "_status)
+
+	goto finally]]></Implementation>
+</Method>
+
+<Method name="PurgeNode">
+<FormalSpec>fromNamespace:%String,toNamespace:%String,fromGlobalNode:%String,&amp;arrIndex</FormalSpec>
+<ProcedureBlock>0</ProcedureBlock>
+<Implementation><![CDATA[	new class, index, keyIndex, fieldIndex, fromIndex, toIndex, toGlobalNode, i
+
+	set %("%KEY","YBED") = "DATAPURGE"
+	set %("%KEY","YPWD") = ""
+	set %("%KEY","YM") = 0
+
+	$$$VAR
+	
+	set class = $extract($qsubscript(fromGlobalNode,0),2,$length($qsubscript(fromGlobalNode,0)))
+	set index = ""
+	set index = $order(arrIndex(index))
+	while (index '= "") {
+		set keyIndex = YM_","_index
+		for i=1:1:$length(arrIndex(index),",") {
+			set fieldIndex = $piece(arrIndex(index),",",i)
+			if ($extract(fieldIndex) = "K") {
+				set keyIndex = keyIndex_","""_$$$Index($qsubscript(fromGlobalNode,1 + $extract(fieldIndex,2,$length(fieldIndex))))_""""
+			}
+			elseif ($extract(fieldIndex) = "F") {
+				set keyIndex = keyIndex_","""_$$$Index($piece(@fromGlobalNode,Y,$extract(fieldIndex,2,$length(fieldIndex))))_""""
+			}
+		}
+		for i=2:1:$qlength(fromGlobalNode)-1 {
+			set keyIndex = keyIndex_","""_$qsubscript(fromGlobalNode,i)_""""
+		}
+		set fromIndex = "^|"""_fromNamespace_"""|"_class_"s("_keyIndex_")"
+		set toIndex = "^|"""_toNamespace_"""|"_class_"s("_keyIndex_")"
+		set @toIndex = ""
+		kill @fromIndex
+		set index = $order(arrIndex(index))
+	}
+	set toGlobalNode = "^|"""_toNamespace_"""|"_class_"("_YM
+	for i=2:1:$qlength(fromGlobalNode) {
+		set toGlobalNode = toGlobalNode_","""_$qsubscript(fromGlobalNode,i)_""""
+	}
+	set toGlobalNode = toGlobalNode_")"
+	
+	set @toGlobalNode = @fromGlobalNode
+	kill @fromGlobalNode]]></Implementation>
+</Method>
+
+<Method name="GetIndex">
+<FormalSpec>class:%String,&amp;arrIndex</FormalSpec>
+<Implementation><![CDATA[	kill arrIndex
+	set lowerCase = "áàãâéèêíìîóòõôúùûçÜÄÖüäöß][\}{|abcdefghijklmnopqrstuvwxyz,()@#$%^&*_=+<>?/"_$CHAR(128)_""""_" "
+	set upperCase = "ÁÀÃÂÉÈÊÍÌÎÓÒÕÔÚÙÛÇUAOUAOSUAOUAOABCDEFGHIJKLMNOPQRSTUVWXYZ                   "
+	set classeUpper = $translate(class, lowerCase, upperCase)
+	
+	set indexedKey = ""
+	set indexedKey = $order(^WWW002s(0,4,classeUpper,indexedKey))
+	while (indexedKey '= "") {
+		if (indexedKey '= " ") {
+			set field = ""
+			set field = $order(^WWW002s(0,4,classeUpper,indexedKey,class,field))
+			while (field '= "") {
+				set indexKey = $$$WWW002IndexKey($get(^WWW002(0,class,field,1)))
+				for i=1:1:$length(indexKey,",") {
+					set index = $piece(indexKey,",",i)
+					set pieceIndex(1) = $piece(index,".",1)
+					set pieceIndex(2) = $piece(index,".",2)
+					if (+pieceIndex(1) = 0) quit
+					if (+pieceIndex(2) = 0) set pieceIndex(2) = 1
+					set $piece(arrIndex(pieceIndex(1)),",",pieceIndex(2))="K"_field
+				}				
+				set field = $order(^WWW002s(0,4,classeUpper,indexedKey,class,field))
+			}
+		}
+		set indexedKey = $order(^WWW002s(0,4,classeUpper,indexedKey))
+	}
+
+	set indexedKey = ""
+	set indexedKey = $order(^WWW003s(0,4,classeUpper,indexedKey))
+	while (indexedKey '= "") {
+		if (indexedKey '= " ") {
+			set field = ""
+			set field = $order(^WWW003s(0,4,classeUpper,indexedKey,class,field))
+			while (field '= "") {
+				set indexKey = $$$WWW003IndexKey($get(^WWW003(0,class,field,1)))
+				for i=1:1:$length(indexKey,",") {
+					set index = $piece(indexKey,",",i)
+					set pieceIndex(1) = $piece(index,".",1)
+					set pieceIndex(2) = $piece(index,".",2)
+					if (+pieceIndex(1) = 0) quit
+					if (+pieceIndex(2) = 0) set pieceIndex(2) = 1
+					set $piece(arrIndex(pieceIndex(1)),",",pieceIndex(2))="F"_field
+				}				
+				set field = $order(^WWW003s(0,4,classeUpper,indexedKey,class,field))
+			}
+		}
+		set indexedKey = $order(^WWW003s(0,4,classeUpper,indexedKey))
+	}]]></Implementation>
+</Method>
+
+<Method name="SavePurge">
+<FormalSpec>&amp;sessionId:%Integer,status:%String</FormalSpec>
+<ProcedureBlock>0</ProcedureBlock>
+<Implementation><![CDATA[	new objVARPurge
+
+	set %("%KEY","YBED") = "DATAPURGE"
+	set %("%KEY","YPWD") = ""
+	set %("%KEY","YM") = 0
+
+	$$$VAR
+
+	if ($length($get(sessionId)) = 0) set sessionId = $$^WWWNEXT("VARPurge")
+
+	set objVARPurge = $get(^VARPurge(YM, sessionId, 1))
+	if ($length($$$VARPurgeStart(objVARPurge)) = 0) {
+		set $$$VARPurgeStart(objVARPurge) = $horolog
+	}
+	set $$$VARPurgeEnd1(objVARPurge) = $horolog
+	set $$$VARPurgeStatus(objVARPurge) = status
+
+	quit $$$Save("VARPurge", sessionId, objVARPurge, $$$YES)]]></Implementation>
+</Method>
+
+<Method name="SavePurgeHistory">
+<FormalSpec>sessionId:%Integer,class:%String,totalRecords:%Integer,totalChildRecords:%Integer,minorDateFound:%TimeStamp,majorDateFound:%TimeStamp</FormalSpec>
+<ProcedureBlock>0</ProcedureBlock>
+<Implementation><![CDATA[	new objVARPurgeHistory
+
+	set %("%KEY","YBED") = "DATAPURGE"
+	set %("%KEY","YPWD") = ""
+	set %("%KEY","YM") = 0
+
+	$$$VAR
+
+	set objVARPurgeHistory = $get(^VARPurgeHistory(YM, sessionId, class, 1))
+	if ($length($$$VARPurgeHistoryStart(objVARPurgeHistory)) = 0) {
+		set $$$VARPurgeHistoryStart(objVARPurgeHistory) = $horolog
+	}
+	set $$$VARPurgeHistoryEnd1(objVARPurgeHistory) = $horolog
+	set $$$VARPurgeHistoryTotalRecords(objVARPurgeHistory) = totalRecords
+	set $$$VARPurgeHistoryMinorDateFound(objVARPurgeHistory) = minorDateFound
+	set $$$VARPurgeHistoryMajorDateFound(objVARPurgeHistory) = majorDateFound
+	set $$$VARPurgeHistoryTotalChildRecords(objVARPurgeHistory) = totalChildRecords
+
+	quit $$$Save("VARPurgeHistory", sessionId_$$$COMMA_class, objVARPurgeHistory, $$$YES)]]></Implementation>
+</Method>
+
+<Method name="ClassRecords">
+<FormalSpec>class:%String,childClasses:%String,&amp;sumRecords:%Integer=0,&amp;sumChildRecords:%Integer=0</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	set status 		= $$$OK
+	set strClass	= "^"_class
+	set globalNode	= $query(@strClass)
+	while (globalNode '= "") {
+		set childClass = ""
+		for i=1:1:$length(childClasses,";") {
+			set childClass = $piece(childClasses,";",i)
+			set strChildClass = "^"_childClass_"(0,"""_$qsubscript(globalNode,2)_""")"
+			set childGlobalNode = $query(@strChildClass)
+			while ((childGlobalNode '= "") && (($qsubscript(globalNode,2)) = $qsubscript(childGlobalNode,2))) {
+				set sumChildRecords = sumChildRecords + 1
+				set childGlobalNode = $query(@childGlobalNode)
+			}
+		}	
+		set sumRecords = sumRecords + 1
+		set globalNode = $query(@globalNode)
+	}
+	quit status]]></Implementation>
+</Method>
+</Class>
+</Export>

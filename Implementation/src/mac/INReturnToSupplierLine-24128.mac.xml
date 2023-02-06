@@ -1,0 +1,651 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReturnToSupplierLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReturnToSupplierLine
+	
+#include COMGridEdit31
+#include COMSYS
+#include INConst
+#include %occInclude
+#include FINConst
+	
+#define DELIM	$char(31)
+#define FORMFldINIssueLineFromStorage	 2
+#define FORMFldINIssueLineQtyIssued		 3
+#define FORMFldINIssueLineItem			 1
+#define FORMFldINIssueLineUnit			 4
+#define FORMFldINIssueLineBundle		10
+#define FORMFldINIssueLineLotNo			15
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReturnToSupplierLine("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+OnBeforeSave(pidKey,&pobjLine,pblnQtyCheck=$$$YES)
+	;-------------------------------------------------------------------------------
+	; OnBeforeSave for the INReturnToSupplierLine record
+	; 
+	; Params:	
+	;
+	; ByRefs:	pobjLine	- current line object
+	;
+	; Returns:  sc (should be strStatus)
+	;           YRETVAL ? implicit - how used?
+	;
+	; History:
+	; 07-Apr-2011	GRF		SR17579: QtyRequired is in Required Units; QtyIssued and
+	;							V2 quantities are in Inventory Units
+	; 01-Mar-2011	PPP		SR17672: Added Check for Previous Returned Qty
+	; 30-Jun-2010	PPP		SR17297: Created 
+	;-------------------------------------------------------------------------------
+	new fltConv,fltOutRec,fltQtyReqd,fltQtySum,fltQtyIss,fltQtyPlanned
+	new fltReqdQtyInIU,fltTotReqdInIU,idBundle,idBundleStk,idInventUnit
+	new idIssue,idIssueLine,idItem,idLine,idLocn,idStore,idUnit
+	new objBundleStock,objGridLine,objIssue,objItem,objItemPolicy
+	new sc,strStatus
+	
+	set strStatus   = $$$OK
+	set idIssue     = $$$KEY1(pidKey)
+	set idIssueLine = $$$KEY2(pidKey)
+	
+	set idItem     = $$$INIssueLineItem(pobjLine)
+	set idStore    = $$$INIssueLineFromStorage(pobjLine)
+	set idBundle   = $$$INIssueLineBundle(pobjLine)
+	set fltQtyReqd = $$$INIssueLineQtyRequired(pobjLine)     ; Required Units
+	set fltQtyIss  = $$$INIssueLineQtyIssued(pobjLine)       ; Inventory Units
+	set idUnit     = $$$INIssueLineUnit(pobjLine)            ; Required Unit          ; SR17579 vvv
+	
+	set fltConv        = $$GetUOMConversion^INUOMConversion(idItem,idUnit,.idInventUnit)
+	set fltReqdQtyInIU = fltQtyReqd * fltConv                ; Inventory Units        ; SR17579 ^^^
+	
+	//MAY NEED THIS ????
+	//set $$$INIssueLineReference(pobjLine) = idIssue
+	
+	if idIssue="" {
+		set strStatus = $$$MakeStatus("IN00754")                     ; "Missing Key Value"
+		set YRETVAL   = strStatus
+	}
+	
+	if $$$ISOK(strStatus) {  
+		set objItem = ##class(alINV.dItem).%OpenId(idItem,0)
+		
+		if objItem '= $$$NULLOREF {
+			set objItemPolicy = objItem.ItemPolicy
+			
+			if objItemPolicy = $$$NULLOREF {  ; "Can not access Item Policy for item : %1" 
+				set strStatus = $$$MakeStatus("alINV0100",idItem)
+				set YRETVAL   = strStatus
+			}
+			do objItem.%Close()
+		}
+	}                    
+	
+	if $$$ISOK(strStatus) { // SR15713
+		set idLocn      = $$$INIssueFromLocn($get(^INIssue(0,idIssue,1)))
+		set idBundleStk = idItem_"||"_idLocn_"||"_idStore_"||"_idBundle
+		
+		set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idBundleStk,,.sc)
+		if $$$ISERR(sc) {
+			set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+			set YRETVAL   = $$$MakeStatus("alINV0003")               ; "Bundle not found in storage"
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set fltOutRec = $$GetReceivedQty($$$INIssueLineReference(pobjLine))	  ; Inventory Units //SR17672
+
+		if pblnQtyCheck && (fltQtyReqd = 0) {
+			set strStatus = $$$MakeStatus("alMOV0001")               ; "Required Quantity can not be 0"
+			set YRETVAL   = strStatus
+			
+		} elseif fltQtyIss > fltOutRec {             				 ; "Maximum return qty was exceeded for item: %1"  //SR17672
+			set strStatus = $$$MakeStatus("IN00917",idItem)
+			set YRETVAL   = strStatus
+			
+	;	} elseif fltQtyReqd > objBundleStock.QtyOnHand {             ; "Not enough Items in Storage (Quantity = %1)"  ; SR17579
+		} elseif fltReqdQtyInIU > objBundleStock.QtyOnHand {         ; "Not enough Items in Storage (Quantity = %1)"
+				set strStatus = $$$MakeStatus("alMOV0003",objBundleStock.QtyOnHand)
+			set YRETVAL   = strStatus
+			
+		} elseif fltQtyIss > objBundleStock.QtyOnHand {              ; "Not enough Items in Storage (Quantity = %1)"
+				set strStatus = $$$MakeStatus("alMOV0003",objBundleStock.QtyOnHand)
+			set YRETVAL   = strStatus	
+		
+		} elseif fltQtyReqd < 0 {
+			set strStatus = $$$MakeStatus("IN00490")                 ; "Quantity can not be negative."
+			set YRETVAL   = strStatus
+			
+		} else {
+			set fltQtySum = 0
+			set idLine = ""
+			for {
+				set idLine = $order($$$WWWDATEN("REFERENCEROW",idLine))
+		 		quit:(idLine = "")
+		 		continue:(idLine = idIssueLine)
+		 		continue:($get($$$WWWDATEN("KILLEDRECORD",$get($$$WWWDATEN("REFERENCEROW",idLine,1))))=$$$YES)
+		 		
+		 		set objGridLine = $$$GRIDGetYFELD(idLine)
+		 		continue:($$$INIssueLineItem(objGridLine)        '= idItem)
+		 		continue:($$$INIssueLineFromStorage(objGridLine) '= idStore)
+		 		continue:($$$INIssueLineBundle(objGridLine)      '= idBundle)
+		 		
+		 		set fltQtySum = fltQtySum + $$$INIssueLineQtyRequired(objGridLine)     ; Required Units
+			}
+			
+			set fltTotReqdInIU = fltQtySum *fltConv                                  ; Inventory Units  ; SR17579
+			set fltQtyPlanned  = ##class(alSOH.iSOHBalance).GetQtyPlanned(idItem,idLocn,idLocn_"||"_idStore,idBundle) ; Inventory Units
+			
+	;		if (fltQtyReqd + fltQtySum) > (objBundleStock.QtyOnHand - fltQtyPlanned) {  ; SR17579
+			if (fltReqdQtyInIU + fltTotReqdInIU) > (objBundleStock.QtyOnHand - fltQtyPlanned) {
+				if (fltQtyPlanned > 0) {    ;  "Not enough Items in Storage (Quantity = %1)(Planned Quantity = %2)"
+					set strStatus = $$$MakeStatus("alMOV0004",objBundleStock.QtyOnHand,fltQtyPlanned)
+					
+				} else {                    ; "Not enough Items in Storage (Quantity = %1)"
+					set strStatus = $$$MakeStatus("alMOV0003",objBundleStock.QtyOnHand)
+				}
+				set YRETVAL = strStatus
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set objIssue = $get(^INIssue(0,idIssue,1))
+		if $$$INIssueLineFromStorage(pobjLine) = "" {
+			set YRETVAL = $$$MakeStatus("IN01032",$$$INIssueFromLocn(objIssue))
+		}
+	}
+	quit strStatus
+
+
+OnBlur(pYM,pYFORM,pYKEY,&pYFELD,pGridRow,pGridCol,pYINHALT)
+	;-------------------------------------------------------------------------------
+	; On Blur from Item, Qty and Unit fields : Calculate unit and costs
+	;
+	; Params:	
+	;
+	; ByRefs:	pobjLine	- current line object
+	;			QOH 		- Value of QuantityOnHand Manual Field   ; see FIXME
+	;			YRED		- Error colour
+	;			YTOOLTIP
+	;			
+	; Returns:
+	;
+	; History:
+	; 20-Feb-2012	GRF		SR17980: Use GetAvgCost rather than GetAverageCost
+	; 07-Feb-2012	GRF		SR17980: Add ReasonCode (Avg Cost update)
+	; 04-Feb-2011	GRF		SR17579: Rename CalculateBaseQuantity
+	; 30-Jun-2010	PPP		SR17297: Created 
+	;-------------------------------------------------------------------------------
+	new fltQuantity,fltReq,idClassField,idItem,idToLocn,idUnit
+	new intCol,intRow,objHeader,objItem
+ 
+	$$$LogR("OnBlur",pYKEY_"<"_$get(pGridRow)_"<"_$get(pGridCol)_"<"_$get(pYINHALT)_"<")
+	
+	set objHeader  = $$$GRIDYFELDContainer
+ 	
+	$$$GRIDSplitKey(pYKEY,intRow,intCol)
+ 
+	; FIXME : Check where QOH is used and pass it properly! <GRF>
+	//set QOH     = $$GetQtyByStorage($$$INMOVLineItem(pYFELD),$$$INMOVLocation(objHeader),$$$INMOVLineFromStorage(pYFELD))
+	set idClassField = $$$GetClassField(pYFORM,pGridCol)
+	$$$LogRx("OB:"_idClassField_"<")
+		
+	; Item
+	;---------------------------------------
+	if idClassField = $$$FldINIssueLineItem {
+		$$$LogRx("OB:Item")
+		
+		set idItem = $$$INIssueLineItem(pYFELD)
+		if idItem'="" {
+			; Initial Required Unit = Inventory Unit
+			set $$$INIssueLineUnit(pYFELD) =  $$$INARTUnitofMeasure($get(^INART(0,idItem,1)))
+ 
+			; Department Issue
+			if $$$INIssueType(objHeader) = 1 {
+				set idToLocn = $$$INIssueToLocn(objHeader)
+				if idToLocn '="" {
+		 			set $$$INIssueLineToStorage(pYFELD) = $$GetStorage^INIssueAuto(idItem,idToLocn)
+				}
+			}
+			; FIXME : At this point Required Unit = Inventory Unit so conversion is not required
+ 			set $$$INIssueLineUnitCost(pYFELD) = $$GetCost^INItemCost(idItem,$$$INIssueFromLocn(objHeader))*$$GetUOMConversion^INUOMConversion(idItem,$$$INIssueLineUnit(pYFELD)) 
+			
+			; FIXME : At this point Required Unit = Inventory Unit so conversion is not required
+			set idUnit      = $$$INIssueLineUnit(pYFELD)                ; Required Unit
+			set fltReq		= $$$INIssueLineQtyRequired(pYFELD)         ; Required Units
+			set fltQuantity = $$CalcInventoryQty^INUOMConversion(idItem,idUnit,fltReq) ; SR17579
+			if fltQuantity {
+				set $$$INIssueLineQtyIssued(pYFELD) = fltQuantity       ; Inventory Units
+			}
+		}
+		
+	; Unit
+	;---------------------------------------
+	} elseif idClassField = $$$FldINIssueLineUnit {
+		$$$LogRx("OB:Unit")
+		
+		set idItem     	= $$$INIssueLineItem(pYFELD)
+		set idUnit 		= pYINHALT                                  ; Required Unit
+		set fltReq		= $$$INIssueLineQtyRequired(pYFELD)         ; Required Units
+		set fltQuantity = $$CalcInventoryQty^INUOMConversion(idItem,idUnit,fltReq) ; SR17579
+		if fltQuantity {
+			set $$$INIssueLineQtyIssued(pYFELD) = fltQuantity       ; Inventory Units
+		}
+
+ 		set $$$INIssueLineUnitCost(pYFELD) = $$GetCost^INItemCost(idItem,$$$INIssueFromLocn(objHeader))*$$GetUOMConversion^INUOMConversion(idItem,idUnit) 
+	; ReasonCode
+	;---------------------------------------                     SR17980
+	} elseif idClassField = $$$FldINIssueLineReasonCode {
+		; If Reason Code is removed, warn and reset manual average cost
+		; Perhaps Avg Cost to include tool tip showing calculated value? (even if not manually set so always clear)
+		if pYINHALT="" {
+			set idItem        = $$$INIssueLineItem(pYFELD)                                     ; SR17980 vvv
+			set fltConvFactor = $$GetUOMConversion^INUOMConversion(idItem,$$$INIssueLineUnit(pYFELD))
+			set fltQuantity   = $$$INIssueLineQtyIssued(pYFELD)                  ; IU
+			set curRecvdEach  = $$$INIssueLineUnitCost(pYFELD) / fltConvFactor   ; RU => IU    ; SR17980 ^^^
+			
+			$$$Alert("IN01331")   ; "Resetting Proposed Average Cost to calculated value"
+			set $$$INIssueLineAverageCost(pYFELD) = $$GetAvgCost^INReturnToSupplier(idItem,$$$INIssueFromLocn(objHeader),fltQuantity,curRecvdEach)
+		}
+	}
+	; Redraw DynTable
+	do ShowItems^INReturnToSupplierTable($$$EnumWWWDYNTABLEGridLineFocus,"INReturnToSupplier"_$$$DELIM_"INReturnToSupplierLine"_$$$DELIM_"dStockBundle"_$$$DELIM_pGridRow)
+	quit
+
+
+OnBlurQtyRequired(pintRow,pintCol,pstrValue,&pobjLine) 
+	;-------------------------------------------------------------------------------
+	;			
+	; Called By :
+	;	OnBlur:event INReturnToSupplierLine:QtyRequired FORM
+	; 
+	; Inputs : 
+	;	pintRow		Grid Row Id
+	;	pintCol		Grid Col Id
+	;	pstrValue	Qty in Required Units
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 20-Feb-2012	GRF		SR17980: Use GetAvgCost rather than GetAverageCost
+	; 09-Feb-2012	GRF		SR17980: Add Avg Cost update
+	; 04-Feb-2011	GRF		SR17579: Rename CalculateBaseQuantity
+	; 30-Jun-2010	PPP		SR17297: Created 
+	;-------------------------------------------------------------------------------
+	new fltQuantity,idBundle,idItem,idLine,idStore,idUnit
+	
+	$$$LogR("OnBlurQtyRequired",$get(pintRow)_"<"_$get(pintCol)_"<"_$get(pstrValue)_"<")
+	
+	set idItem     	= $$$INIssueLineItem(pobjLine)
+	set idStore    	= $$$INIssueLineFromStorage(pobjLine)
+	set idBundle   	= $$$INIssueLineBundle(pobjLine)
+	set idUnit 		= $$$INIssueLineUnit(pobjLine)            ; Required Unit
+	
+	;set fltQuantity  = $$CalcInventoryQty^INUOMConversion(idItem,idUnit,pstrValue) ; SR17579  ; SR17980 vvv
+	set fltConvFactor = $$GetUOMConversion^INUOMConversion(idItem,idUnit)
+	set fltQuantity   = pstrValue * fltConvFactor                          ; RU => IU
+	set curRecvdEach  = $$$INIssueLineUnitCost(pobjLine) / fltConvFactor   ; RU => IU          ; SR17980 ^^^
+	
+	set $$$INIssueLineQtyIssued(pobjLine) = fltQuantity       ; Inventory Units
+	
+	; SR17980 vvv
+	; if Qty changes then average cost should be recalculated unless reason code exists.
+	; Warn of manual over-ride.  (Include what would be recalculated avg cost figure if not over-ridden?)
+	set objHeader     = $$$GRIDYFELDContainer
+	;et fltNewAvgCost = +$$GetAverageCost^INReturnToSupplier(pobjLine,$$$INIssueFromLocn(objHeader))   ; SR17980
+	set fltNewAvgCost = +$$GetAvgCost^INReturnToSupplier(idItem,$$$INIssueFromLocn(objHeader),fltQuantity,curRecvdEach)
+	set fltCurAvgCost = +$$$INIssueLineAverageCost(pobjLine)
+		
+	if fltNewAvgCost'=fltCurAvgCost {
+		if $$$INIssueLineReasonCode(pobjLine)'="" {
+			$$$Alert($listbuild("IN01332",fltNewAvgCost))   ; "Manually set Average Cost over-rides proposed value : %1"
+		
+		} else {
+			set $$$INIssueLineAverageCost(pobjLine) = fltNewAvgCost
+		}
+	}
+	; SR17980 ^^^
+	quit
+	
+	
+OnBeforeDisplayCombo(pstrKeys,pobjIss,pintCol,&pSUCH)
+	;-------------------------------------------------------------------------------
+	; Populates the Unit with the UOM as defined in INARTPACK only, excludes
+	; units that the item does not come in.
+	; 
+	; set pSUCH as the items to be used when you override the list (set via blnOverride)
+	;
+	; Called By: COMGridEdit executable
+	; 
+	; Inputs:
+	;	pstrKeys		YKEY
+	;	pobjSummary		YFELD
+	; 
+	; Returns: $$$YES or $$$NO (override the data) 
+	;
+	; History:
+	; 15-Jul-2011	GRF		SR17669: Call common code
+	; 30-Jun-2010	PPP		SR17297: Created 
+	;-------------------------------------------------------------------------------
+	new blnOverride,enumLineType,enumUnit,idClassField,idItem
+
+	set blnOverride = $$$NO
+	
+	; F7 - Unit
+	;---------------------------------------
+	if pintCol = $$$FORMFldINIssueLineUnit {     ; SR17669 vvv
+		set blnOverride = $$LoadCombo^INARTPACK($$$INIssueLineItem(pobjIss),blnOverride,.pSUCH)
+	}
+	quit blnOverride
+	/*
+	if pintCol = $$$FORMFldINIssueLineUnit  {
+		kill pSUCH
+		set pSUCH  = "SUCH"
+		set idItem = $$$INIssueLineItem(pobjIss)
+		if idItem '= "" {
+			set enumUnit = ""
+			for {
+				set enumUnit = $order(^INARTPACK(0,idItem,enumUnit))
+				quit:enumUnit=""
+				
+				set pSUCH(enumUnit) = enumUnit
+			}
+			set blnOverride = $$$YES
+		}
+	}
+	quit blnOverride
+	*/                                           ; SR17669 ^^^
+	
+	
+OnLineAdded(pintRow,pstrKey)
+	;-------------------------------------------------------------------------------
+	; Description : 
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 30-Jun-2010	PPP		SR17297: Created 
+	;-------------------------------------------------------------------------------
+	new fltSOHLocal,fltSOHNetwork,idFromLocn,idFromStore,idIssueNo,idItem,idLineNo
+	new objBundleStock,objHeader,objLine,strBundleValues,strStatus
+	
+	set strStatus = $$$OK
+	
+	set idIssueNo = $$$KEY1(pstrKey)
+	set idLineNo  = $$$KEY2(pstrKey)
+ 
+	set objHeader   = $$$GRIDYFELDContainer	
+	set idFromLocn  = $$$INIssueFromLocn(objHeader)
+	
+	set objLine     = $get(^INIssueLine(0,idIssueNo,idLineNo,1))      ;$$$GRIDGetYFELD(pstrKey)
+	set idItem      = $$$INIssueLineItem(objLine)
+	set idFromStore = $$$INIssueLineFromStorage(objLine)
+ 
+ 	/*
+	set fltSOHLocal = $$GetSOHLocal(idItem,idFromLocn)
+	do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldINIssueLineInventoryLocn,fltSOHLocal)
+	
+	set fltSOHNetwork = $$GetSOHCompany(idItem)
+	do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldINIssueLineInventoryNetwork,fltSOHNetwork)
+	*/
+	
+	if (idItem '= "") && (idFromStore '= "") {
+		set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idItem_"||"_idFromLocn_"||"_idFromStore_"||"_$$$INIssueLineBundle(objLine))
+		if objBundleStock '= $$$NULLOREF {             ; Tested above
+			set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundleStock.Bundle,SPRACHE)
+			do UpdateManualField^COMGridEdit31Interface(pintRow,$$$FORMFldINIssueLineLotNo,strBundleValues) 
+		}
+	}
+	quit strStatus	
+	
+	
+OnBeforeFormat(pstrYFIELDNAME,pstrText,pobjLine)
+	;-------------------------------------------------------------------------------
+	; Determine how particular fields on the Movement Line are to be displayed.
+	;
+	; Params:
+	;	pstrYFIELDNAME		Field name   (e.g. Y3_6)
+	;	pstrText			Not used
+	;	pobjLine			Movement Line record (INMOVLine format corresponding to grid line from pstrYFIELDNAME)
+	;
+	; ByRefs:
+	;	YGRIDWHITE
+	;	YFONTCOLOR
+	;	YKEY
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 07-Apr-2011	GRF		SR17579: QtyRequired is in Required Units; QtyIssued and
+	;							V2 quantities are in Inventory Units
+	; 01-Mar-2011	PPP		SR17672: Added Check for Previous Returned Qty
+	;							2. Ensure that the Lot details are displayed even 
+	;							after the record has been posted.
+	; 30-Jun-2010	PPP		SR17297: Created 
+	;-------------------------------------------------------------------------------
+	new arrResult,blnError,fltConv,fltOutRec,fltQtyOnHand,fltQtyIssued
+	new fltQtyIssueSum,fltQtyReqd,fltQtySum,fltQtyPlanned,fltReqdQtyInIU
+	new fltTotReqdInIU,fltSOHLocal,fltSOHNetwork
+	new idBundle,idClassField,idFromStore,idGridLine,idInventUnit,idItem
+	new idKey,idLine,idLineNumber,idLocn,idMovNumber,idToStore,idUnit,intRow,intCol
+	new objBundle,objBundleStock,objGridLine,objHeader,objIssueLine,objItem
+	new objStorage,objWWW122,sc,strBundleValues,strDefaultColor,strDisabledColor
+	new strError,strRequiredColor,strWarningColor
+	
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pstrYFIELDNAME,intRow,intCol)
+	set idClassField = $$$GetClassField(YFORM,intCol)	
+
+	; INIssue Header
+	;---------------------------------------
+	set objHeader  = $$$GRIDYFELDContainer
+	set idBundle     = $$$INIssueLineBundle(pobjLine)
+
+	//SR17672:2
+	if ($$$INIssueStatus(objHeader)>3) && (idClassField = $$$FldINIssueLineBundle) {
+		set objBundle = ##class(alSOH.dBundle).%OpenId(idBundle)	
+		if objBundle'=$$$NULLOREF {
+			set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundle,SPRACHE)
+			do UpdateManualField^COMGridEdit31Interface(intRow,$$$FORMFldINIssueLineLotNo,strBundleValues)
+		}
+	}
+
+	quit:$$$INIssueStatus(objHeader)>3         		; Active
+ 
+	set idLocn = $$$INIssueFromLocn(objHeader)
+	
+	; INIssueLine from Grid
+	;---------------------------------------
+	set idItem       = $$$INIssueLineItem(pobjLine)
+	set idFromStore  = $$$INIssueLineFromStorage(pobjLine)
+	set idToStore    = $$$INIssueLineToStorage(pobjLine)
+	set fltQtyReqd   = $$$INIssueLineQtyRequired(pobjLine)     ; Required Units
+	set fltQtyIssued = $$$INIssueLineQtyIssued(pobjLine)       ; Inventory Units
+	set idUnit       = $$$INIssueLineUnit(pobjLine)            ; Required Unit        ; SR17579 vvv
+	
+	set fltConv        = $$GetUOMConversion^INUOMConversion(idItem,idUnit,.idInventUnit)
+	set fltReqdQtyInIU = fltQtyReqd * fltConv                ; Inventory Units        ; SR17579 ^^^
+	
+	;---------------------------------------
+	; Cell Validation
+	;---------------------------------------
+	
+	; Bundle
+	;---------------------------------------
+	if (idClassField = $$$FldINIssueLineBundle) {
+		// Don't bother to validate until a value exists
+		if (idItem '= "") && (idFromStore '= "") {
+			set objBundle = ##class(alSOH.dBundle).%OpenId(idBundle)
+			if idBundle = "" {
+				set YWARNING = $$$YES
+				set YTOOLTIP = "No Bundle Selected"
+				
+			} elseif objBundle '= $$$NULLOREF {
+				//Update "Bundle Values" as well as styling
+				set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundle,SPRACHE)
+				set YENABLED = $$$NO
+				do UpdateManualField^COMGridEdit31Interface(intRow,$$$FORMFldINIssueLineLotNo,strBundleValues) ; YTEXT can't be set here, workaround
+
+			} else {
+				set YWARNING = $$$YES
+				set YTOOLTIP = "Bundle "_idBundle_" doesn't exist in Storage:'"_idFromStore_"'"
+			}
+		}
+		
+	; From Storage
+	;---------------------------------------
+	} elseif (idClassField = $$$FldINIssueLineFromStorage) {
+		if idFromStore'="" {
+			set objStorage = ##class(alLOC.dUStorage).%OpenId("0||"_idLocn_"||"_idFromStore,0,.sc)
+			//	TODO : sc => strStatus
+			if $$$ISERR(sc) {
+				set YTOOLTIP = $$$Text($listbuild("IN00821",idFromStore,idLocn))
+				set YWARNING = $$$YES
+			} ; "Storage location %1 does not exist in site location %2"
+		}
+	
+		
+	; Qty Required
+	;---------------------------------------
+	} elseif (idClassField = $$$FldINIssueLineQtyRequired) {
+		if fltQtyReqd=0 {
+			set YWARNING = $$$YES
+			set YTOOLTIP = $$$Text($listbuild("alMOV0001"))     ; "Required Quantity can not be 0"
+			
+		} elseif fltQtyReqd < 0 {
+			set YWARNING = $$$YES
+			set YTOOLTIP = $$$Text($listbuild("IN00490"))       ; "Quantity can not be negative."
+		
+		} elseif fltQtyReqd'="" {
+			set fltOutRec = $$GetReceivedQty($$$INIssueLineReference(pobjLine))  ; Inventory Units //SR17672
+			if (fltQtyIssued > fltOutRec) {
+				set YWARNING = $$$YES
+				set YTOOLTIP = $$$Text($listbuild("IN00917",idItem))
+			} ; "Maximum return qty was exceeded for item: %1"
+
+			if YWARNING'=$$$YES {			//SR17672
+				//Qty Checks
+				if (idFromStore'="") && (idItem'="") && (idBundle'="") {
+					set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idItem_"||"_idLocn_"||"_idFromStore_"||"_idBundle)
+					if objBundleStock '= $$$NULLOREF {
+						set fltQtyOnHand = objBundleStock.QtyOnHand       ; Inventory Units
+				;		if fltQtyOnHand < fltQtyReqd {              ; SR17579
+						if fltQtyOnHand < fltReqdQtyInIU {
+							set YWARNING = $$$YES
+							set YTOOLTIP = $$$Text($listbuild("alMOV0003",fltQtyOnHand))
+						; "Not enough Items in Storage"
+					
+						} else {
+							//	Check Prior Line entries, sum quantities
+							set idGridLine = "" 
+							set fltQtySum = 0
+							for {
+								set idGridLine = $order($$$WWWDATEN("REFERENCEROW",idGridLine))
+								quit:(idGridLine = "")
+								continue:(idGridLine = $$$KEY2($$GetYKEY^COMGridEdit31G(intRow)))
+								continue:($get($$$WWWDATEN("KILLEDRECORD",$get($$$WWWDATEN("REFERENCEROW",idGridLine,1))))=$$$YES)
+							
+								set objGridLine = $$$GRIDGetYFELD(idGridLine)
+								continue:($$$INIssueLineItem(objGridLine)        '= idItem)
+								continue:($$$INIssueLineFromStorage(objGridLine) '= idFromStore)
+								continue:($$$INIssueLineBundle(objGridLine)      '= idBundle)
+								set fltQtySum = fltQtySum + $$$INIssueLineQtyRequired(objGridLine)   ; Required Units
+							}
+							
+							set fltTotReqdInIU = fltQtySum *fltConv                                  ; Inventory Units  ; SR17579
+							set fltQtyPlanned = ##class(alSOH.iSOHBalance).GetQtyPlanned(objBundleStock.Item.%Id(),objBundleStock.Storage.Location.%Id(),objBundleStock.Storage.%Id(),objBundleStock.Bundle.%Id())
+							
+						;	if (fltQtyReqd + fltQtySum) > (objBundleStock.QtyOnHand-fltQtyPlanned) {  ; SR17579
+							if (fltReqdQtyInIU + fltTotReqdInIU) > (objBundleStock.QtyOnHand-fltQtyPlanned) {
+								set YWARNING = $$$YES
+								if (fltQtyPlanned > 0) {
+									set YTOOLTIP = $$$Text($listbuild("alMOV0004",fltQtyOnHand,fltQtyPlanned))
+								  ; "Not enough Items in Storage (Quantity = %1)(Planned Quantity = %2)"	
+							
+								} else {
+									set YTOOLTIP = $$$Text($listbuild("alMOV0003",fltQtyOnHand))
+								} ; "Not enough Items in Storage (Quantity = %1)"
+							}
+						}
+				
+					} else {     ; no bundle stock = zero QOH
+						set YWARNING = $$$YES
+						set YTOOLTIP = $$$Text($listbuild("alMOV0003",0)) ; SR16045 20-Oct-2008
+					} ; "Not enough Items in Storage (Quantity = %1)"
+				}  //Endif QOH Checks
+			}
+		}
+		
+	; Item
+	} elseif (idClassField = $$$FldINIssueLineItem) && (idItem'="") {
+		set objItem = $get(^INART(0,idItem,1))
+		if $$$INARTItemWithoutInventoryMaint(objItem) {
+			set YTOOLTIP = $$$Text("IN00445")
+			set YWARNING = $$$YES
+		} ; "Non-stock items can not be transferred."
+	}
+	quit
+
+
+GetReceivedQty(pidInvMatch)
+	;-------------------------------------------------------------------------------
+	; Get the Total Outstanding Rec qty based on the Invoice Match ID.
+	;
+	; Params:
+	;	pidInvMatch		InvMatch Record ID
+	;
+	; ByRefs:
+	;
+	; Returns: Quantity (in Inventory Units)
+	;
+	; History:
+	; 07-Feb-2012	GRF		SR17980: If form accesses a INIssue record that is not
+	;							a Return To Supplier can have missing item and thus
+	;							return subscript error
+	; 01-Mar-2011	PPP		SR17672: Created 
+	;-------------------------------------------------------------------------------
+	new fltInventQty,idInventUnit,idItem,idOrder,idOrderLine,idOrderUnit
+	new objItem,objInvMatch,objOrderLine,idInvMatch
+	
+	&sql(
+		SELECT Number INTO :idInvMatch
+		FROM FINAPInvMatchCache
+		WHERE Number = :pidInvMatch
+	)
+	
+	if SQLCODE '= 0 {
+		quit ""	
+	}
+	
+	set objInvMatch  = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+	set idOrder      = $$$FINAPInvMatchCacheSourceOrder(objInvMatch)
+	set idItem       = $$$FINAPInvMatchCacheItem(objInvMatch)
+
+	if idItem="" quit 0               ; SR17980
+
+	set objItem      = $get(^INART(0,idItem,1))
+	set idInventUnit = $$$INARTUnitofMeasure(objItem)                   ; Inventory Unit
+	set fltInventQty = $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)  ; Order Units
+	
+	if idOrder'="" {
+		set idOrderLine  = $$$FINAPInvMatchCacheOrderLine(objInvMatch)
+		set objOrderLine = $get(^INAUFP(0,idOrder,idOrderLine,1))
+		set idOrderUnit  = $$$INAUFPOrderedUnit(objOrderLine)
+		set fltInventQty = $$ConvOtherQtyToInvQty^INRECLineUtil(idItem,idOrderUnit,fltInventQty)
+	}
+	quit fltInventQty
+	
+]]></Routine>
+</Export>

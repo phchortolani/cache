@@ -1,0 +1,356 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INItemCost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INItemCost
+	;-------------------------------------------------------------------------------
+	; Item-based Cost Routines
+	;-------------------------------------------------------------------------------
+	
+#include COMSYS
+#include INConst
+	
+	; Application Parameter "HERSTELLKOSTEN"
+#define enumOrderCost		1
+#define enumMfgCost			2
+#define enumLowestCost		3
+#define enumHighestCost		4
+#define enumHighMfgCost		5
+#define enumFIFOCost		7
+#define enunLIFOCost		8
+#define enumAverageCost		9
+#define enumFixedCost		10
+	
+#define enumAccumulated		1
+	
+GetEnterpriseCost(pidItem)
+	;-------------------------------------------------------------------------------
+	; Get Current Cost for an Item as
+	; Sum [ QOH(%) * AvgCost(%) ]   /   Sum [ QOH(%) ]         for all locations (%)
+	; 
+	; Excludes consignment stock
+	; 
+	; If no stock is held will return average cost for the default cost centre
+	; (obtained from top level entity)
+	; 
+	; WARNING : if QOH at any location is negative then it can skew the results
+	;           This is a consequence of the policy to allow negative stock and
+	;           not in itself a fault of this algorithm.   (GIGO)
+	;           Also returns average cost for default cost centre in this case.
+	; 
+	; 
+	; History:
+	; 03-Jan-2014 	shobby 	CORE-303: CacheIndex
+	; 29-Sep-2010	GRF		-: Correction to enum description - 1 is "Accumulated by
+	;							Storage" not "Separated by Date"
+	; 12-Nov-2009	GRF		SR16871: created
+	;-------------------------------------------------------------------------------
+	new curCost,fltQty,fltTotalQty,idLocn,loop,strPair,strQOH
+	
+	set curCost = 0
+	if $get(pidItem)="" quit curCost
+	
+	set strQOH  = $$GetQty^INARTMENGE(pidItem,$$$enumAccumulated,"",$$$NO,9,$$$NO,$$$NO)
+	
+	set fltTotalQty = +strQOH
+	if fltTotalQty {
+		set strQOH = $piece(strQOH,"#",2)
+		for loop=1:1:$length(strQOH,";") {
+			set strPair = $piece(strQOH,";",loop)    ; "Qty*Storage" e.g. "18*1004||A"
+			set fltQty  = +strPair
+			set idLocn  = $piece($piece(strPair,"*",2),"||",1)
+			set curCost = curCost + (fltQty * $$GetCost(pidItem,idLocn,""))
+		}
+		set curCost = $justify(curCost/fltTotalQty,0,$$DPforInventoryCost^INVORG())
+	}
+	
+	if (fltTotalQty=0) || (curCost<0) {
+		set idLocn = $$GetTopLevel^WWW0121()  ; Top Level ;CORE-303
+		set curCost = $$GetCost(pidItem,idLocn,"")
+	}
+	
+	quit curCost
+	
+	
+GetCost(pidItem,pidLocn="",pidCostType,pdteEffect,ptmeEffect="",pidCostCentre="")
+	;-------------------------------------------------------------------------------
+	; Get Cost for an Item effective at a given Date and Time
+	; for a location or cost centre
+	; If Location is not specified, try YLOCATION - otherwise GetCostCentre will
+	; default to the top-level entity
+	;
+	; Inputs:
+	;	pidItem			Item ID
+	;	pidLocn			Location   - optional if cost centre provided; default YLOCATION
+	;	pidCostType		Cost Type (9 - Avg)
+	;	pdteEffect		Date Effective      \ Leave both blank for "now"
+	;	ptmeEffect		Time Effective      /
+	;	pidCostCentre	CostCentre - will obtain from Location if not specified
+	;
+	; Returns:
+	;	Cost		%Float
+	;
+	; History:
+	; 18-Aug-2010	GRF		SR17509: shouldn't use INARTT values unless getting
+	; 							Manufacturing Cost
+	; 10-Nov-2009	GRF		SR16871: call INARTKOST for other than Avg Cost types
+	; 							using separate wrappers so can be converted
+	; 26-Oct-2009	GRF		SR16871: Copied from INARTCOST; put std calc first for
+	; 							improved performance
+	;-------------------------------------------------------------------------------
+	new fltCost,idBaseUnit,objItem
+	
+	set fltCost = 0
+	
+	quit:pidItem="" fltCost
+	set objItem = $get(^INART(0,pidItem,1))
+	quit:$$$INARTItemWithoutInventoryMaint(objItem) fltCost
+	set idBaseUnit = $$$INARTBaseUnit(objItem)
+	
+	if pidCostCentre="" {
+		if pidLocn=""       set pidLocn = $get(YLOCATION)
+		set pidCostCentre = $$GetCostCentre^INCostCentre(pidLocn)
+		if pidCostCentre="" quit fltCost
+	}
+	
+	if $get(pidCostType)="" set pidCostType = +$$$INVORGDefaultCostType($get(^INVORG(0,0,1)))
+	if $get(pdteEffect)=""  set pdteEffect  = +$horolog
+	
+	; Standard Item Calculation
+	;---------------------------------------
+	if pidCostType = $$$enumAverageCost {
+		set fltCost = $$GetCostAtTimeForCC^INAvgCost(pidItem,pidCostCentre,pdteEffect,ptmeEffect)
+	
+	} elseif pidCostType = $$$enumOrderCost {
+		set fltCost = $$GetOrderCost(pidItem,idBaseUnit)
+	
+	} elseif pidCostType = $$$enumMfgCost {
+		set fltCost = $$GetMfgCost(pidItem,idBaseUnit)
+	
+	} elseif pidCostType = $$$enumLowestCost {
+		set fltCost = $$GetLowCost(pidItem,idBaseUnit)
+	
+	} elseif pidCostType = $$$enumHighestCost {
+		set fltCost = $$GetHighCost(pidItem,idBaseUnit)
+	
+	} elseif pidCostType = $$$enumHighMfgCost {
+		set fltCost = $$GetHighMfgCost(pidItem,idBaseUnit)
+	
+	} elseif pidCostType = $$$enumFIFOCost {
+		set fltCost = $$GetFIFOCost(pidItem,idBaseUnit,pdteEffect,ptmeEffect)
+	
+	} elseif pidCostType = $$$enunLIFOCost {
+		set fltCost = $$GetLIFOCost(pidItem,idBaseUnit,pdteEffect,ptmeEffect)
+	
+	} elseif pidCostType = $$$enumFixedCost {
+		set fltCost = $$GetFixedCost(pidItem,idBaseUnit)
+	
+	} else {
+		set fltCost = $$^INARTKOST(pidItem,idBaseUnit,pidCostType)
+	}
+	quit $justify(fltCost,0,$$DPforInventoryCost^INVORG())
+	
+	/*
+	new fltCost,idBaseUnit,idChildItem,idLine,objBillMats,objItem
+	
+	set fltCost = 0
+	
+	quit:pidItem="" fltCost
+	set objItem = $get(^INART(0,pidItem,1))
+	quit:$$$INARTItemWithoutInventoryMaint(objItem) fltCost
+	set idBaseUnit = $$$INARTBaseUnit(objItem)
+	
+	if pidCostCentre="" {
+		if pidLocn=""       set pidLocn = $get(YLOCATION)
+		set pidCostCentre = $$GetCostCentre^INCostCentre(pidLocn)
+		if pidCostCentre="" quit fltCost
+	}
+	
+	if $get(pidCostType)="" set pidCostType = +$$$INVORGDefaultCostType($get(^INVORG(0,0,1)))
+	if $get(pdteEffect)=""  set pdteEffect  = +$horolog
+	
+	; Standard Item Calculation
+	;---------------------------------------
+	if '$data(^INARTT(0,pidItem)) {   ; when "Modify Item Parts" class not used
+		if pidCostType = $$$enumAverageCost {
+			set fltCost = $$GetCostAtTimeForCC^INAvgCost(pidItem,pidCostCentre,pdteEffect,ptmeEffect)
+		
+		} elseif pidCostType = $$$enumOrderCost {
+			set fltCost = $$GetOrderCost(pidItem,idBaseUnit)
+		
+		} elseif pidCostType = $$$enumMfgCost {
+			set fltCost = $$GetMfgCost(pidItem,idBaseUnit)
+		
+		} elseif pidCostType = $$$enumLowestCost {
+			set fltCost = $$GetLowCost(pidItem,idBaseUnit)
+		
+		} elseif pidCostType = $$$enumHighestCost {
+			set fltCost = $$GetHighCost(pidItem,idBaseUnit)
+		
+		} elseif pidCostType = $$$enumHighMfgCost {
+			set fltCost = $$GetHighMfgCost(pidItem,idBaseUnit)
+		
+		} elseif pidCostType = $$$enumFIFOCost {
+			set fltCost = $$GetFIFOCost(pidItem,idBaseUnit,pdteEffect,ptmeEffect)
+		
+		} elseif pidCostType = $$$enunLIFOCost {
+			set fltCost = $$GetLIFOCost(pidItem,idBaseUnit,pdteEffect,ptmeEffect)
+		
+		} elseif pidCostType = $$$enumFixedCost {
+			set fltCost = $$GetFixedCost(pidItem,idBaseUnit)
+		
+		} else {
+			set fltCost = $$^INARTKOST(pidItem,idBaseUnit,pidCostType)
+		}
+	
+	; Bill of Materials Calculation
+	;---------------------------------------
+	} else {
+		set idLine = ""
+		for {
+			set idLine = $order(^INARTT(0,pidItem,idLine))
+			quit:idLine=""
+			
+			set objBillMats = $get(^INARTT(0,pidItem,idLine,1))
+			set idChildItem = $$$INARTTItemNumber1(objBillMats)
+			
+			if idChildItem'="" {
+				if pidCostType  = $$$enumAverageCost {
+					set fltCost = fltCost + $$GetCost(idChildItem,"",pidCostType,pdteEffect,ptmeEffect,pidCostCentre)
+				
+				} else {
+					set fltCost = fltCost + $$$INARTTValue1(objBillMats)
+				}
+			}
+		}
+	}
+	
+	quit $justify(fltCost,0,$$DPforInventoryCost^INVORG())
+	*/
+	
+	
+TransferCost(pidItem,pfltBaseCost,pidCCFrom,pidCCTo) ; PLACE HOLDER
+	;-------------------------------------------------------------------------------
+	; Given an item and a base cost (initially the average cost at piddCCFrom)
+	; use whatever rules apply for the cost centres to determine what cost should
+	; be used to update the average cost at pidCCto.
+	;
+	; History :
+	; 06-Nov-2009	GRF		SR16871: created - no rules, so returns base cost
+	;-------------------------------------------------------------------------------
+	
+	;  suggestion : assign an "internal supplier" and set cost prices in INARTK
+	
+	quit $get(pfltBaseCost)
+	
+	
+GetOrderCost(pidItem,idBaseUnit)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 10-Nov-2009	GRF		SR16871: created as wrapper
+	;-------------------------------------------------------------------------------
+	new fltCost
+	set fltCost = $$^INARTKOST(pidItem,idBaseUnit,$$$enumOrderCost)
+	quit fltCost
+	
+	
+GetMfgCost(pidItem,idBaseUnit)
+	;-------------------------------------------------------------------------------
+	; Get Standard Manufacturing Cost - based on Raw Materials in INARTT
+	;   - ignores Service Costs
+	; 
+	; History :
+	; 18-Aug-2010	GRF		SR17509: replace with calculation from Raw Materials
+	; 10-Nov-2009	GRF		SR16871: created as wrapper
+	;-------------------------------------------------------------------------------
+	new fltCost,idChildItem,idLine,objBillMats
+	
+	set fltCost = 0
+	
+	set idLine = ""
+	for {
+		set idLine = $order(^INARTT(0,pidItem,idLine))
+		quit:idLine=""
+		
+		set objBillMats = $get(^INARTT(0,pidItem,idLine,1))
+		set idChildItem = $$$INARTTItemNumber1(objBillMats)
+		
+		if idChildItem'="" {
+		
+		; Currently not implemented since CostType will be $$$enumMfgCost to get here
+		;	if pidCostType  = $$$enumAverageCost {
+		;		set fltCost = fltCost + $$GetCost(idChildItem,"",pidCostType,pdteEffect,ptmeEffect,pidCostCentre)
+			
+		;	else {
+		
+			set fltCost = fltCost + $$$INARTTValue1(objBillMats)
+		;	}
+		}
+	}
+	quit fltCost
+	/*
+	new fltCost
+	set fltCost = $$^INARTKOST(pidItem,idBaseUnit,$$$enumMfgCost)
+	quit fltCost
+	*/
+	
+GetLowCost(pidItem,idBaseUnit)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 10-Nov-2009	GRF		SR16871: created as wrapper
+	;-------------------------------------------------------------------------------
+	new fltCost
+	set fltCost = $$^INARTKOST(pidItem,idBaseUnit,$$$enumLowestCost)
+	quit fltCost
+	
+	
+GetHighCost(pidItem,idBaseUnit)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 10-Nov-2009	GRF		SR16871: created as wrapper
+	;-------------------------------------------------------------------------------
+	new fltCost
+	set fltCost = $$^INARTKOST(pidItem,idBaseUnit,$$$enumHighestCost)
+	quit fltCost
+	
+	
+GetHighMfgCost(pidItem,idBaseUnit)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 10-Nov-2009	GRF		SR16871: created as wrapper
+	;-------------------------------------------------------------------------------
+	new fltCost
+	set fltCost = $$^INARTKOST(pidItem,idBaseUnit,$$$enumHighMfgCost)
+	quit fltCost
+	
+	
+GetFIFOCost(pidItem,idBaseUnit,pdteEffect,ptmeEffect)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 10-Nov-2009	GRF		SR16871: created as wrapper
+	;-------------------------------------------------------------------------------
+	new fltCost
+	set fltCost = $$^INARTKOST(pidItem,idBaseUnit,$$$enumFIFOCost)
+	quit fltCost
+	
+	
+GetLIFOCost(pidItem,idBaseUnit,pdteEffect,ptmeEffect)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 10-Nov-2009	GRF		SR16871: created as wrapper
+	;-------------------------------------------------------------------------------
+	new fltCost
+	set fltCost = $$^INARTKOST(pidItem,idBaseUnit,$$$enunLIFOCost)
+	quit fltCost
+	
+	
+GetFixedCost(pidItem,idBaseUnit)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 10-Nov-2009	GRF		SR16871: created as wrapper
+	;-------------------------------------------------------------------------------
+	new fltCost
+	set fltCost = $$^INARTKOST(pidItem,idBaseUnit,$$$enumFixedCost)
+	quit fltCost
+		
+]]></Routine>
+</Export>

@@ -1,0 +1,557 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINARBank" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINARBank
+ 	#Include FINConst
+	#Include FIN
+ 
+	#define YFORM "FINARBank"
+ 
+OnBeforeButtonLine(pidBank="")
+    ;-------------------------------------------------------------------------------
+    ; Code to run before button line.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 26-Jun-2006		RPW				SR13173: Check if the gl effective date has expired
+    ; 10-Mar-2004		shobby			Created
+    ;-------------------------------------------------------------------------------
+    set pidBank=$piece(pidBank,$$$COMMA,1)
+	if (pidBank'="")&&(pidBank'="+") {
+		do CheckGLEffectiveDateExpiration^FINAPUtilities() // SR13173
+		if '$$Editable^FINSYSReview("FINARBank",$$$FINARBankStatus($get(^FINARBank(YM,pidBank,1)))) {
+			set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+		}
+	}
+	
+	quit
+ 
+IsPosted(pidBank="")
+    ;-------------------------------------------------------------------------------
+    ; Determine whether record is posted.
+    ;
+    ; Params: Key
+    ;
+    ; Returns: strStatus 0 if posted, 1 + message if not posted
+    ;
+    ; History:
+    ; 18-Jul-2005	PO		SR12980: Changed language text Fin00832
+    ; 06-Jul-2005	PO		SR12881: Created
+    ;-------------------------------------------------------------------------------
+    ;
+	new objFINARBank,strStatus
+ 
+	set strStatus = $$$OK
+ 
+	if '$$$NoKey(pidBank) {
+		set objFINARBank = $get(^FINARBank(YM,pidBank,1))
+		set strStatus = $$UnPostable^FINSYSReview($$$YFORM,$$$FINARBankStatus(objFINARBank))
+		if $$$ISOK(strStatus) && $$$FINARBankBeenUnPosted(objFINARBank) {
+			set strStatus = $listbuild("Fin00832")  ;Record is already Unposted.
+		}
+	}
+ 
+	if $$$ISOK(strStatus) {
+		set YQ=0
+	} else {
+		set YQ="1 "_$$$Text(strStatus)
+	}
+	quit strStatus
+ 
+UnPost(pidFINARBank)
+    ;-------------------------------------------------------------------------------
+    ; Method Usage
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 06-Jul-2005	PO		SR12881: Created
+    ;-------------------------------------------------------------------------------
+    ;
+	new strStatus,objFINARBank
+	
+	set strStatus=$$Transaction^COMTransaction("UnPostTxn^FINARBank("""_pidFINARBank_""")",1)
+	
+	if $$$ISOK(strStatus) {
+		;do RedirectForm^COMUtils($$$YFORM,pidFINARBank,$$$YFORM_",",YPARA,1)
+		do ReloadForm^COMUtilForm()
+	} elseif $$GetKey^COMUtilClass(pidFINARBank,,1) {
+		set objFINARBank = $get(^FINARBank(YM,pidFINARBank,1))
+		set $$$FINARBankBeenUnPosted(objFINARBank) = $$$YES
+		set strStatus = $$$Save($$$YFORM,pidFINARBank,objFINARBank)
+	}
+ 
+	quit strStatus
+ 
+UnPostTxn(pidFINARBank)
+    ;-------------------------------------------------------------------------------
+    ; UnPost a posted record
+    ;
+    ; Params: Key
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 21-Jun-2006	SC		SR14734: Update obsolete save call from Save^FINSYS to $$$Save.
+    ; 18-Jul-2005	PO		SR12980: Changed language text Fin00832
+    ; 06-Jul-2005	PO		SR12881: Created
+    ;-------------------------------------------------------------------------------
+    ;
+	new blnUnPost,strStatus,objFINARBank,idBatch,idBlock,dteBankingDate,BankMessage
+	new idFINARBankLine,objFINARBankLine
+ 
+	set strStatus = $$$OK
+ 
+	set blnUnPost = 1
+	set strStatus = $$GetRecord^COMUtilClass($$$YFORM,pidFINARBank,.objFINARBank) ; ****** It is assumed the only change to objFINARBank is the field BeenUnPosted at the end of this proc.
+ 
+	if $$$ISOK(strStatus) set strStatus = $$UnPostable^FINSYSReview($$$YFORM,$$$FINARBankStatus(objFINARBank),.blnUnPost)
+ 
+	if $$$ISOK(strStatus) && blnUnPost && $$$FINARBankBeenUnPosted(objFINARBank) {
+		set strStatus = $listbuild("Fin00832")  ;Record is already Unposted.
+		set blnUnPost = 0
+	}
+ 
+	if blnUnPost {
+		set BankMessage("Number")=pidFINARBank
+		set BankMessage("BankAccount")=$$$FINARBankBankAccount(objFINARBank)
+		set BankMessage("BankingDate")=$$$FINARBankBankingDate(objFINARBank)
+		set idFINARBankLine = ""
+		for {
+			set idFINARBankLine=$order(^FINARBankLine(YM,pidFINARBank,idFINARBankLine))
+			quit:idFINARBankLine=""
+			do BuildMessage(pidFINARBank,idFINARBankLine,"BankMessage")
+		}
+ 
+		set strStatus=$$UnPostLines("BankMessage")
+	}
+ 
+	if $$$ISOK(strStatus) {
+		set $$$FINARBankBeenUnPosted(objFINARBank) = $$$YES
+		set strStatus = $$$Save("FINARBank",pidFINARBank,objFINARBank,1) //SR14734
+	}
+ 
+	quit strStatus
+ 
+UnPostLines(parrBank)
+    ;-------------------------------------------------------------------------------
+    ; Looks through the receives and posts a line with the value sign switched
+    ; effectively undoing the previous transaction but leaving an audit trail.
+    ;
+    ; Params:
+    ;
+    ; Returns: strStatus
+    ;
+    ; History:
+    ; 19-Aug-2007	shobby	SRAdhoc: Replaced call to GetFormDescription with WWWFORMNAME
+    ; 26-Jun-2006	SC		SR14734: Store UnPost Batch + Block number to FINARBankLine rec.
+    ; 21-Jun-2006	SC		SR14734: Update obsolete save call from Save^FINSYS to $$$Save.
+    ; 28-Feb-2006	PO		SR14225: Added Drill Down Detail to Allocate
+    ; 06-Jul-2005	PO		SR12881: Created
+    ;-------------------------------------------------------------------------------
+    ;
+	new strStatus,idFINARBank,idFINARBankLine,idBatch,idBlock,objFINARBankLine,intPayLine
+	new strStatusAllBeenUnPosted,strForm,strDetail ; SR14225
+ 
+	set idFINARBank = @parrBank@("Number")
+	set strStatusAllBeenUnPosted = '$$$OK
+	set strForm = $$CheckForm^FINUtils($get(YFORM),"FINARBank")   ; SR14225 Get the form using YFORM, with validation
+	set strDetail = "Fin00989,"_idFINARBank  ;Customer Banking Reversal %1
+	set strStatus=$$Allocate^FININTBatch(.idBatch,.idBlock,"ARBANK",$get(YLOCATION),@parrBank@("BankingDate"),,,,strForm,idFINARBank,strDetail)
+	;set strStatus=$$Allocate^FININTBatch(.idBatch,.idBlock,"ARBANK",$get(YLOCATION),@parrBank@("BankingDate"))
+ 
+	if $$$ISOK(strStatus) {
+		set intPayLine=""
+		for {
+			set intPayLine=$order(@parrBank@("Payments",intPayLine))
+			quit:intPayLine=""
+			set idFINARBankLine = @parrBank@("Payments",intPayLine,"BankLine")
+ 
+			do SubBlockNumber^FININTBatch(.idBlock)
+ 
+			set objFINARBankLine = $get(^FINARBankLine(YM,idFINARBank,idFINARBankLine,1))
+			continue:objFINARBankLine="" ; To replace if test further down
+ 
+			if '$$$FINARBankLineBeenUnPosted(objFINARBankLine) {
+				set strStatusAllBeenUnPosted = $$$OK
+				set strStatus=$$PostPayment^FININTBank(parrBank,intPayLine,idBatch,idBlock,$$$YES)
+				quit:$$$ISERR(strStatus)
+				set $$$FINARBankLineBeenUnPosted(objFINARBankLine) = $$$YES
+				set $$$FINARBankLineUnPostedDate(objFINARBankLine) = $horolog
+				set $$$FINARBankLineUnPostBatch(objFINARBankLine) = idBatch //SR14734
+				set $$$FINARBankLineUnPostBlock(objFINARBankLine) = $piece(idBlock,".",1) //Remove sub-block num //SR14734 
+				set strStatus = $$$Save("FINARBankLine",idFINARBank_","_idFINARBankLine,objFINARBankLine,1) //SR14734
+				quit:$$$ISERR(strStatus)
+			}
+		}
+	}
+ 
+	if $$$ISOK(strStatus) {
+		if '$$$ISOK(strStatusAllBeenUnPosted) {
+			set strStatusAllBeenUnPosted = $listbuild("Fin00836",$$^WWWFORMNAME("FINARBankLine"))  ;All %1 records have already been unposted.
+		}
+		set strStatus = strStatusAllBeenUnPosted
+	}
+	if $$$ISOK(strStatus) {
+		set strStatus=$$PostBlock^FININTBatch(idBatch,idBlock)
+ 		kill ^CacheTempUnPostUnAlloc(YUSER) //SR14734
+	}
+	quit strStatus
+ 
+ 
+Post(pidBank="")
+	;-------------------------------------------------------------------------------
+	; Post Adjustment to Interface
+	;
+	; History:
+	; 10-Apr-2006 	SC		SR14539: Created to wrap previous Post(now PostTxn) in Transaction
+	;-------------------------------------------------------------------------------
+	new strStatus
+ 
+	set strStatus=$$Transaction^COMTransaction("PostTxn^FINARBank("""_pidBank_""")",1)
+	if $$$ISOK(strStatus) {
+		do ReloadForm^COMUtilForm()
+	}
+	quit strStatus
+ 
+    ;Post(pidBank)
+	;-------------------------------------------------------------------------------
+	;
+	; History
+	; 
+	; 26-Jun-2006	SC			SR14734: Store Post Batch + Block number to FINARBank rec.
+	; 10-Apr-2006	SC			SR14539: Renamed to use Transaction with Post. Moved 
+	; 							error handing to Post.
+	; 06-Jul-2005	PO			SR12881: Using $$$ISOK
+	; 01-Oct-2004	Paul K		Added Editable routine call (creating "pending" status)
+	; 07-Aug-2003	shobby		Call to CanPost (TR005827)
+	; 05-Aug-2003	shobby		Replaced WWWFORM with RedirectForm
+	; 
+	;-------------------------------------------------------------------------------
+PostTxn(pidBank) ;SR14539
+	new idBankLine,BankMessage,strStatus,objBank,blnPost,intStatus,idBatch,idBlock
+	set idBankLine=""
+	set blnPost=$$$YES
+	set intStatus=""
+	set BankMessage=""
+	set strStatus=$$$OK
+	set objBank=$get(^FINARBank(YM,pidBank,1))
+	
+	set strStatus=$$Editable^FINSYSReview("FINARBank",$$$FINARBankStatus(objBank),.blnPost,.intStatus)
+	if $$$ISOK(strStatus)&&(blnPost=$$$YES) {
+		set BankMessage("Number")=pidBank
+		set BankMessage("BankAccount")=$$$FINARBankBankAccount(objBank)
+		set BankMessage("BankingDate")=$$$FINARBankBankingDate(objBank)
+ 
+		for {
+			set idBankLine=$order(^FINARBankLine(YM,pidBank,idBankLine))
+			quit:idBankLine=""
+			do BuildMessage(pidBank,idBankLine,"BankMessage")
+		}
+			
+		set strStatus=$$Post^FININTBank("BankMessage",.idBatch,.idBlock)
+ 
+		//SR14734
+		if $$$ISOK(strStatus) {
+			set $$$FINARBankPostBatch(objBank) = idBatch
+			set $$$FINARBankPostBlock(objBank) = idBlock
+		}
+		
+		if $$$ISOK(strStatus) do CleanBank(pidBank)  ;removes accounts with zero amounts, and removes unpaid invoices.	
+		if $$$ISOK(strStatus) set $$$FINARBankPostedDate(objBank)=$horolog
+	}
+	
+	if $$$ISOK(strStatus) {
+		set $$$FINARBankStatus(objBank)=intStatus
+		set strStatus=$$Save^FINSYS("FINARBank",pidBank,objBank,1)
+		kill ^CacheTempUnAlloc(YUSER) //SR14734
+	}
+ 
+ 
+	
+	quit strStatus
+ 
+BuildInvoiceMessage(pidBank,pidBankLine,parrBank,pintPayLine)
+	;
+	;--------------------------------------------------------------------------------
+	; History
+	; 04-May-2006	Steve S		SR14597: Check ALL invoices
+	; 31-Jul-2003	shobby		Only create non zero Invoices
+	; 28-Jul-2003	shobby		intPayLine variable was undefined at this point, used pintPayLine instead. (TR005723)
+	;
+	;---------------------------------------------------------------------------------
+	; 
+	new idBankInvoice,objBankInvoice,curDiscount
+	; use invoices for payment
+	set idBankInvoice=""
+	for {
+		set idBankInvoice=$order(^FINARBankInvoice(YM,pidBank,pidBankLine,idBankInvoice))
+		quit:idBankInvoice=""
+		
+		;if ($$^WWWTEXT("Fin00057")'=idBankInvoice) {  ;dummy unallocted bank invoice. //SR14597
+		set objBankInvoice=$get(^FINARBankInvoice(YM,pidBank,pidBankLine,idBankInvoice,1))
+		if +$$$FINARBankInvoicePayAmount(objBankInvoice)'=0 {
+			if $$$FINARBankInvoiceDiscountApplied(objBankInvoice) set curDiscount=$$$FINARBankInvoiceDiscount(objBankInvoice)
+			if '$$$FINARBankInvoiceDiscountApplied(objBankInvoice) set curDiscount=0
+			;w "parrBank="_$get(parrBank)_","_$get(intPayLine)_","_$get(idBankInvoice)_","_$get(objBankInvoice)
+			set @parrBank@("Payments",pintPayLine,"Invoice",idBankInvoice,"PayAmount")=$$$FINARBankInvoicePayAmount(objBankInvoice)
+			set @parrBank@("Payments",pintPayLine,"Invoice",idBankInvoice,"Discount")=curDiscount
+		}
+	}
+	
+	quit
+	
+ 
+BuildMessage(pidBank,pidBankLine,parrBank)
+	;---------------------------------------------------------------------------------
+	;
+	; History
+	; 27-Sep-2004	shobby		pidBankLine required as part of the message, used to determine the ChequeNumber when displaying payments. (SR10453)
+	; 01-Aug-2003	SCR			Corrected Pay Line for Multiple Payments
+	; 29-Jul-2003	shobby		Added intPayLine as a parameter to BuildAccountMessage (TR005723)
+	; 
+	;---------------------------------------------------------------------------------
+	;
+	new objBankLine,idCustomer,objCustomer,intPayLine
+	
+	; Builds Message for a Line that gets posted to the Interface
+	set objBankLine=$get(^FINARBankLine(YM,pidBank,pidBankLine,1))
+	set idCustomer=$$$FINARBankLineCustomerNumber(objBankLine)
+	if idCustomer'="" {
+		set objCustomer=$get(^FINARCustomer(YM,idCustomer,1))
+		
+		set intPayLine=$order(@parrBank@("Payments",""),-1)+1
+		set @parrBank@("Payments",intPayLine,"Account")=$$$FINARCustomerControlAccount(objCustomer)
+		set @parrBank@("Payments",intPayLine,"Amount")=$$$FINARBankLineTotal(objBankLine)
+		set @parrBank@("Payments",intPayLine,"Customer")=idCustomer
+		set @parrBank@("Payments",intPayLine,"BankLine")=pidBankLine  ;SR10453
+		
+		if $$$FINARBankLineExpensePayment(objBankLine)  {
+			; use accounts for payment
+			do BuildAccountMessage^FINARBankAccountGroup(pidBank,pidBankLine,parrBank,intPayLine)
+		}
+		else {
+			; use invoices for payment
+			do BuildInvoiceMessage(pidBank,pidBankLine,parrBank,intPayLine)
+		}
+	}
+	
+	quit
+ 
+CleanBank(pidBank)
+	;-------------------------------------------------------------------------------
+	; Method Usage
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 23-Oct-2006	JW			SR15134: Look at kill status. Return status.
+	;-------------------------------------------------------------------------------
+	new YFORM,YVOR,idBankLine,idInvoice,objBankInvoice,strStatus
+	set strStatus = $$$OK
+	set idBankLine=""
+	for {
+		set idBankLine=$order(^FINARBankLine(YM,pidBank,idBankLine))
+		quit:idBankLine=""
+		set idInvoice=""
+		for {
+			set idInvoice=$order(^FINARBankInvoice(YM,pidBank,idBankLine,idInvoice))
+			quit:idInvoice=""
+			set objBankInvoice=$get(^FINARBankInvoice(YM,pidBank,idBankLine,idInvoice,1))
+			if +$$$FINARBankInvoicePayAmount(objBankInvoice)=0 {
+				new YFORM
+				set YFORM="FINARBankInvoice"
+				set strStatus = $$$Kill("FINARBankInvoice",pidBank_$$$COMMA_idBankLine_$$$COMMA_idInvoice)		//SR15134
+			}
+			if $$$ISOK(strStatus) {
+				set strStatus = $$RemoveUnusedAccount^FINARBankAccountGroup(pidBank,idBankLine)		//SR15134
+			}
+			quit:$$$ISERR(strStatus)
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+ 
+OnAfterDelete(pYKEY)
+	;------------------------------------------------------------------------------
+	; Remove FINARBankInvoices
+	; 
+	; History:
+	; 23-Oct-2006	JW			SR15134: Look at kill status.
+    ; 03-May-2004   shobby   	Replaced YKOMMA with ","
+	; 31-Jul-2003	shobby		Creation
+	;------------------------------------------------------------------------------
+	new pidBank,strStatus
+	
+	set pidBank=$$$KEY1(pYKEY)
+	set strStatus = $$CleanBank(pidBank)		// SR15134
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontDelete		// SR15134
+	}
+	
+	quit
+ 
+ 
+Postable(pidBank="")
+	;-------------------------------------------------------------------------------
+	; Check that the Banking can be posted.
+	; 
+	; History
+	; 26-Jun-2006	RPW			SR13173: Check if the GL Effective Date is valid
+	; 06-Jan-2006 	SC			SR13798: Decode wrapper removed. Decode in COMSYS.INC
+	; 28-Jul-2005	PO			SR12980: If been un-posted display appropriate message
+	; 20-Jul-2005	PO			SR12991: Pass across date to GetPeriodsForDate not full horolog
+	; 11-Jul-2005	Steve S		SR11767: Added check for zero payments
+	; 13-Aug-2004	shobby		Corrected status testing (SR10249)
+	; 07-Jul-2004	shobby		Check that required cheque numbers are present (SR7289)
+	; 04-Sep-2003	shobby		Check for valid periods setup.  (TR005772)
+	; 07-Aug-2003	shobby		Creation (TR005827)
+	;-------------------------------------------------------------------------------
+	new strStatus,lstPeriods,objBank
+	
+	set strStatus=$$$OK
+	
+	if $$$ISOK(strStatus) if $$$NoKey(pidBank) set strStatus="Fin00089"  ;No Record Selected.
+	if $$$ISOK(strStatus) set objBank=$get(^FINARBank(YM,pidBank,1)) // SR13173
+	if $$$ISOK(strStatus) if $$$FINARBankBeenUnPosted(objBank) set strStatus="Fin00856"  ;Record is already unposted, cannot modify or repost.  Please create a new record. // SR13173
+	if $$$ISOK(strStatus) if '$data(^FINARBankLine(YM,pidBank)) set strStatus="Fin00200"  ;Customer Banking cannot be posted without lines.
+	if $$$ISOK(strStatus) set strStatus=$$CheckZeroPayments(pidBank) ;SR11767
+	if $$$ISOK(strStatus) set strStatus=$$ValidBankAccount(pidBank)
+ 
+	// SR13173
+	if $$$ISOK(strStatus) {
+		set strStatus=$$ValidGLEffectiveDate^FINGLEffectiveDate($$$FINARBankBankingDate(objBank),$$$FINARBankBankingDate(objBank),$$$FldFINARBankBankingDate)
+	}
+	
+	if $$$ISOK(strStatus) set strStatus=$$Editable^FINSYSReview("FINARBank",$$$FINARBankStatus(objBank)) // SR13173
+	if $$$ISOK(strStatus) set strStatus=$$GetPeriodsForDate^FINGLPeriod(+$horolog)
+	if $$$ISOK(strStatus) set strStatus=$$ChequeNumberCheck^FINARBankLine(pidBank)
+	
+	if $$$ISOK(strStatus) {
+		set YQ=$$$YQEnable
+	} else {
+		set YQ=$$$YQDisable(strStatus) ;SR13798
+	}
+	
+	quit
+ 
+CheckZeroPayments(pidBank)
+    ;-------------------------------------------------------------------------------
+    ; Check lines for zero payments
+    ; 
+    ; Returns: strStatus
+    ;
+    ; History:
+    ; 28-Jul-2005	RPW			SR11767: Allowing "" in the parameter and then checking for '=""
+    ; 							is not good practice. You allow the value then consider it an error.
+    ; 11-Jul-2005	Steve S		SR11767: Created
+    ;-------------------------------------------------------------------------------
+    new strStatus,idLine,objBankLine,fltPaymentAmount,strPaymentType
+ 
+	set strStatus=$$$OK
+	
+	if ($get(pidBank)'="") {
+		set idLine=""
+		for {
+			set idLine=$order(^FINARBankLine(YM,pidBank,idLine))
+			quit:(idLine="")||($$$ISERR(strStatus))
+			
+			set objBankLine=$get(^FINARBankLine(YM,pidBank,idLine,1))
+			
+			set fltPaymentAmount=$$$FINARBankLineTotal(objBankLine)
+			set strPaymentType=$$$FINARBankLineMethod(objBankLine)
+			
+			if strPaymentType=$$$EnumFINARBANKLINEMETHODZeroPayment {
+				if +fltPaymentAmount'=0 {
+					set strStatus=$listbuild("Fin00838",idLine)  ;Payment line must be zero to use Zero Payment method (line %1).
+				}
+			} else {
+				if +fltPaymentAmount=0 {
+					set strStatus=$listbuild("Fin00837",idLine)  ;Must select Zero Payment method when a payment line is zero (line %1).	
+				}
+			}
+		}
+	} else {
+		set strStatus=$listbuild("Fin00089")  ;No Record Selected.	
+	}
+ 
+ 
+	quit strStatus
+	
+	
+ValidBankAccount(pidBank)
+    ;-------------------------------------------------------------------------------
+    ; Determine if the entered bank account is valid
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 31-May-2005	shobby		Created SR12469
+    ;-------------------------------------------------------------------------------
+    ;
+	new strStatus,objFINARBank,idFINGLBank
+	set strStatus=$listbuild("Fin00217")  ;Bank Account is not valid.
+	set objFINARBank=$get(^FINARBank(YM,pidBank,1))
+	set idFINGLBank=$$$FINARBankBankAccount(objFINARBank)
+	if idFINGLBank'="" {
+		if $data(^FINGLBank(YM,idFINGLBank,1)) {
+			set strStatus=$$$OK
+		} else {
+			set strStatus=$listbuild("Fin00784",$get(idFINGLBank))  ;Not a valid Bank Account.
+		}
+	}
+	quit strStatus
+ 
+ 
+Editable(pidBank)
+    ;-------------------------------------------------------------------------------
+    ; If there is no data, just let the user know to select one
+    ; 
+    ; If there is some, check if the record is editable and if not return it's
+    ; error message.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 17-Mar-2005	RobertW		SR10749 Copied from FINAPPayment
+    ;-------------------------------------------------------------------------------
+	new strStatus
+	set strStatus=$$$OK
+	
+	if ($get(pidBank)="")||($get(pidBank)="+")  set strStatus=$lb("Fin00690")  ;Please Select A Data Record First.
+	
+	if strStatus=$$$OK set strStatus=$$Editable^FINSYSReview("FINARBank",$$$FINARBankStatus($get(^FINARBank(YM,pidBank,1))))
+	
+	if strStatus=$$$OK {
+		set YQ=0
+	} else {
+		set YQ="1 "_$$$Text(strStatus)
+	}	
+	quit strStatus	
+	
+ 
+GetType()
+	;-------------------------------------------------------------------------------
+	; Get the Type for the Effective Date
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; The type of the effective date
+	;
+	; History:
+	; 26-Jun-2006	RPW		SR13173: Created
+	;-------------------------------------------------------------------------------
+	quit "ARBANK"
+]]></Routine>
+</Export>

@@ -1,0 +1,414 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="SourceControl.xml.XMLFileFilter">
+<Description><![CDATA[
+This class filters out some elements of Cache's exported routines and globals.]]></Description>
+<ClassType/>
+<Import>SourceControl.control,VAR.infra.xml,VAR.infra.util</Import>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>Base</Super>
+
+<Parameter name="STATICDICTIONARYVERSION">
+<Description><![CDATA[
+%occVersion.inc => $$$CLASSDEFINITIONVERSION]]></Description>
+<Type>%String</Type>
+<Default>22</Default>
+</Parameter>
+
+
+<Parameter name="STATICPRODUCTVERSION">
+<Description><![CDATA[
+$zversion]]></Description>
+<Type>%String</Type>
+<Default>CACHE</Default>
+</Parameter>
+
+
+<Parameter name="STATICDATEHOUR">
+<Type>%String</Type>
+<Default>2001-01-01 00:00:00</Default>
+</Parameter>
+
+
+<Method name="Filter">
+<Description><![CDATA[
+This method cleans an XML file, stripping attributes and tags related to
+timestamps and checksums. This must be done to avoid having lots of
+conflicts when updating.
+You must specify two files: source and target (target is always overiden)]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>sourceFileName:%String="&quot;,targetFileName:%String="&quot;</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set sc = $$$YES
+
+	// Quick verification
+	if ((sourceFileName = "") || (targetFileName = "")) quit $$$NO
+
+	if ('##class(%File).Exists(sourceFileName)) {
+		write !, "The source file '"_sourceFileName_"' was not found!"
+		quit $$$NO
+	}
+
+	// Create target dir
+	set sc = ##class(DirectoryFile).CreateDirectoryChainFromFile(targetFileName)
+	if (##class(Errors).IsErrorQuiet(sc)) quit sc
+
+	// Prepare to write
+	//set writer = ##class(%XML.Writer).%New()
+	set writer = ##class(XMLWriter).%New()
+	set writer.Charset = "UTF-8"
+	set writer.Indent = 1
+	set writer.IndentChars = ""
+
+	set message = ""
+	if ('##class(DirectoryFile).IsFileOverwritable(targetFileName, .message, .sc)) {
+		write !, message
+
+		// Print the internal error message
+		do ##class(Errors).IsError(sc)
+		quit sc
+	}
+
+	set sc = writer.OutputToFile(targetFileName)
+	if (##class(Errors).IsError(sc)) quit sc
+
+	// Create an instance of %XML.TextReader (returned by reference)
+    set sc = ##class(XMLReader).ParseFile(sourceFileName, .reader)
+
+    // Is it waiting for an "endelement" to close <checksum>?
+    set ignoreEndelement = 0
+
+    // Identify the first element (rootelement)
+    set rootElementName = ""
+
+    // We must store the last node name because Caché's parser doesn't 
+    set lastElement = ""
+
+    if ($$$ISOK(sc)) {
+        // Read all elements within the document
+        while (reader.Read()) {
+	        set nodeType = reader.NodeType
+           	set sc = $$$OK
+
+	        // Process an element 
+            if (nodeType = "element") {
+                set lastElement = reader.Name
+                set name = reader.Name
+                if (rootElementName = "") set rootElementName = name
+
+                if (name = "Export") {
+	                set sc = ..ProcessExportElement(.reader, .writer)
+                }
+                elseif (name = "Project") {
+	                set sc = ..ProcessProjectElement(.reader, .writer)
+                }
+                elseif (name = "Routine") {
+	                set sc = ..ProcessRoutineElement(.reader, .writer)
+                }
+                elseif ((name = "Parameter") ||
+                		(name = "Property") ||
+                		(name = "Method")) {
+	                set sc = ..ProcessSpecialElement(.reader, .writer, name)
+                }
+                elseif (..IsElementIgnored(name)) {
+	                // Skip this element and the associated endelement
+	                set ignoreEndelement = 1
+                }
+                else {
+	             	// Just copy any other element
+	             	set sc = ..ProcessGenericElement(.reader, .writer)
+                }
+            }
+            elseif (nodeType = "endelement") {
+	            if (ignoreEndelement) {
+		            // OK, it is ignored. Now restore the state for other
+		            // elements.
+		            set ignoreEndelement = 0
+	            }
+	            else {
+		            // Check to see if this is the root
+		            if (reader.LocalNameGet() = rootElementName) {
+			            set sc = writer.EndRootElement()
+		            }
+		            else {
+			            // Just copy the endelement to the destination file
+		             	set sc = writer.EndElement()
+		            }
+	            }
+            }
+            else {
+				// Check if this node is nested within an ignored element
+				if ('..IsElementIgnored(lastElement)) {
+					// Just copy the node
+					set sc = ..ProcessNonElementNode(reader, writer, lastElement)
+				}
+			}
+
+			if (##class(Errors).IsError(sc)) quit
+		}
+	}
+
+	if (##class(Errors).IsError(sc)) quit sc
+
+	quit writer.EndDocument()
+]]></Implementation>
+</Method>
+
+<Method name="IsElementIgnored">
+<Description><![CDATA[
+This method tries to identifiy all elements that must be ignored]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>elementName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	quit $case(elementName, "Checksum":1,
+							"TimeChanged":1,
+							"TimeCreated":1,
+							"Inheritance":1,
+							:0)
+]]></Implementation>
+</Method>
+
+<Method name="ProcessExportElement">
+<Description><![CDATA[
+This method cleans the <Export> element of any ts attributes.]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;reader:%XML.TextReader,&amp;writer:%XML.Writer</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// Write the element
+	set sc = writer.RootElement("Export")
+	
+	// Go through all attributes, leaving out those that we don't want
+	set n = reader.AttributeCount
+	for i = 1:1:n {
+		do reader.MoveToAttributeIndex(i)
+
+		set name = reader.LocalName
+		if (name = "version") {
+			set sc = writer.WriteAttribute(name, ..#STATICDICTIONARYVERSION)
+		}
+		elseif (name = "zv") {
+			set sc = writer.WriteAttribute(name, ..#STATICPRODUCTVERSION)
+		}
+		elseif (name = "ts") {
+			set sc = writer.WriteAttribute(name,
+				$zdatetime($zdatetimeh(..#STATICDATEHOUR, 3, 1), 3, 1))
+		}
+		else  {
+			set sc = writer.WriteAttribute(name, reader.Value)
+		}
+
+		if (##class(Errors).IsError(sc)) quit
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="ProcessProjectElement">
+<Description><![CDATA[
+This method cleans the <Project> element of any timestamp attributes.]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;reader:%XML.TextReader,&amp;writer:%XML.Writer</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// Write the element
+	set sc = writer.Element("Project")
+
+	// Go through all attributes, leaving out those that we don't want
+	set n = reader.AttributeCount
+	for i = 1:1:n {
+		do reader.MoveToAttributeIndex(i)
+
+		set name = reader.LocalName
+		if (name = "LastModified") {
+			set sc = writer.WriteAttribute(name,
+				$zdatetime($zdatetimeh(..#STATICDATEHOUR, 3, 1), 3, 1))
+		}
+		else  {
+			set sc = writer.WriteAttribute(name, reader.Value)
+		}
+
+		if (##class(Errors).IsError(sc)) quit
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="ProcessRoutineElement">
+<Description><![CDATA[
+This method cleans the <Routine> element of any timestamp attributes.]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;reader:%XML.TextReader,&amp;writer:%XML.Writer</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// Write the element
+	set sc = writer.Element("Routine")
+
+	// Go through all attributes, leaving out those that we don't want
+	set n = reader.AttributeCount
+	for i = 1:1:n {
+		do reader.MoveToAttributeIndex(i)
+
+		set name = reader.LocalName
+		if (name = "timestamp") {
+			set sc = writer.WriteAttribute(name,
+				$zdatetimeh(..#STATICDATEHOUR, 3, 1))
+		}
+		else  {
+			set sc = writer.WriteAttribute(name, reader.Value)
+		}
+
+		if (##class(Errors).IsError(sc)) quit
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="ProcessSpecialElement">
+<Description><![CDATA[
+This method inserts a line break before the <Routine> element.]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;reader:%XML.TextReader,&amp;writer:%XML.Writer,name:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	if (writer.%IsA(##class(XMLWriter).%ClassName(1))) {
+		do writer.WriteLineBreak()
+	}
+
+	// Write the element
+	set sc = writer.Element(name)
+
+	// Go through all attributes, leaving out those that we don't want
+	set n = reader.AttributeCount
+	for i = 1:1:n {
+		do reader.MoveToAttributeIndex(i)
+
+		set name = reader.LocalName
+		set sc = writer.WriteAttribute(name, reader.Value)
+		if (##class(Errors).IsError(sc)) quit
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="ProcessGenericElement">
+<Description><![CDATA[
+This method just copies any element]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;reader:%XML.TextReader,&amp;writer:%XML.Writer</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// Write the element that was read
+	set sc = writer.Element(reader.Name)
+
+	// Go through all attributes, leaving out those that we don't want
+	set n = reader.AttributeCount
+	for i = 1:1:n {
+		do reader.MoveToAttributeIndex(i)
+
+		set sc = writer.WriteAttribute(reader.LocalName, reader.Value)
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="ProcessNonElementNode">
+<Description><![CDATA[
+This method just copies any node that is not related to an element]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;reader:%XML.TextReader,&amp;writer:%XML.Writer,lastElementName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set nodeType = reader.NodeType
+	set sc = $$$OK
+
+	if (nodeType = "cdata") {
+		set sc = writer.WriteCData(reader.ValueGet())
+	}
+	elseif (nodeType = "chars") {
+		if (..IsCDataRequired(lastElementName)) {
+			set value = reader.ValueGet()
+
+			/* The follwing code is necessary only if %XML.TextReader is used
+			// Cache's XML handlers incorreclty strips leading white spaces
+			if (..IsCDataFixRequired(lastElementName)) {
+				// If it is a routine and it starts with a comment, it should
+				// not be in the first column. We fix that
+				if (..StartsWith(.value,";") || ..StartsWith(.value,"/")) {
+					set value = " "_value
+					write !, "Fix activated"
+				}
+			}
+			*/	
+			set valuebkp = value
+			set valuebkp = $translate(valuebkp, $char(10)_$char(13), "")
+			set valuebkp = $zstrip(valuebkp, "<>W")
+
+			if ($length(valuebkp) > 0) {
+				set sc = writer.WriteCData(value)
+			}
+		}
+		else {
+			set sc = writer.WriteChars(reader.ValueGet())
+			/*if (value = $char(10)) {
+				//set sc = writer.WriteChars("")
+				//do writer.InsertLineBreak()
+			}
+			else {
+				set sc = writer.WriteChars(value)
+			}*/
+		}
+	}
+	elseif (nodeType="comment") {
+		set sc = writer.WriteComment(reader.ValueGet())
+	}
+	else {
+		write !, "Warning! The XML NodeType '"_nodeType_"' was found "_
+			"but it is not supported!"
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="IsCDataRequired">
+<Description><![CDATA[
+Caché's parser doesn't identify CDATA as CDATA (it shows it only as Chars). We
+must make sure a CDATA is really not required by listing all known CDATA element containers.]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>elementName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	quit $case(elementName,	"Routine":1,		// MAC
+							"Implementation":1,	// MAC, CLS
+							"Description":1,	// CLS
+							"Data":1,			// (GBL) Globals
+							:0)
+]]></Implementation>
+</Method>
+
+<Method name="IsCDataFixRequired">
+<Description><![CDATA[
+Caché's parser incorrectly removes leading and trailing whitespecaes, whichi mey lead to
+syntax error. This method returns true if the element name requires a fix.]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>elementName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	quit $case(elementName, "Routine":1,		// MAC
+							"Implementation":1,	// MAC, CLS
+							"Description":1,	// CLS
+							"Data":0,			// (GBL) Globals - No. we
+												//     can't change a global!
+							:0)
+]]></Implementation>
+</Method>
+</Class>
+</Export>

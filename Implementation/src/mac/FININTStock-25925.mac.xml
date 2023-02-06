@@ -1,0 +1,703 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FININTStock" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FININTStock
+	;-------------------------------------------------------------------------------
+	; Stock related Interface
+	;-------------------------------------------------------------------------------
+#include COMSYS
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^FININTStock("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Transfer(Tran)
+	;-------------------------------------------------------------------------------
+	; Stock Transfers / Adjustments
+	; 
+	; 1.  Extract details from Web Service record
+	; 2.  Differentiate between From and To Location information
+	; 3.  Revise accounts from Account Identification Matrix
+	; 
+	; Returns: Status
+	;
+	; History:
+	; 08-Aug-2011	GRF		SR17849: Issue To Consumption based on expense acct and
+	;							(ISS/NoOrder) Matrix
+	; 30-Sep-2005	GRF		SR13589 : Split Adjustments from Transfers to simplify
+	; 							the correction to the Transfer code.
+	; 21-Sep-2005	GRF		SR13546 : InterWarehouse Transfer "REC" not inverted
+	; 16-Jun-2005	GRF		SR10478 : Standardise spelling "Dispatch"
+	; 02-Jun-2005	GRF		Transfers can be ISS & REC as well
+	; 18-Apr-2005	GRF		SR10478 : Add Dispatch No for Warehouse Orders
+	; 11-Apr-2005	GRF		SR10478 : Adjustment doesn't use To Locations; BatchType
+	; 08-Apr-2005	GRF		SR10478 : Activate changes; Need to collect all 3 accts
+	; 						(differentiating between the two SOH Accounts) BEFORE
+	; 						call is made to AddLine
+	; 01-Apr-2005	GRF		SR10478 : rename error tag
+	; 16-Mar-2005	GRF		SR10478 : add profile post-extraction
+	; 10-Mar-2005	GRF		SR10478 : preparation to process MVI (& MVO, ADJ?)
+	; 10-Feb-2005	GRF		SR11273 : Apply TLEVEL test to TCOMMIT instead of TROLLBACK
+	; 10-Mar-2005	GRF		Wrong Account tested before AddLine call
+	; 11-Feb-2005	GRF		SR10478 : Change PreFix to Prefix throughout
+	; 11-Nov-2004	Paul K	Return the Batch and Block number if successful.
+	;-------------------------------------------------------------------------------
+	new OrderType,Prefix,Status,TranType
+	
+	$$$LogR("Transfer",Tran)
+	
+	;***************************************
+	tstart
+	;***************************************
+	
+	set Status = $$$OK
+	set Prefix = "@Tran@("   ; from argument list
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("TranType", .TranType, Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("OrderType",.OrderType,Prefix,$$$YES)   ; SR17849
+	if Status=$$$OK {
+		if TranType = "ADJ" {
+			set Status = $$Adjust(Tran,TranType)
+			
+		} elseif (TranType="ISS") && (OrderType=9) {            ; SR17849
+			set Status = $$Consumed(Tran,TranType,OrderType)
+			
+		} else {
+			set Status = $$Xfer(Tran,TranType)
+		}
+	}
+	quit Status
+	
+	
+Adjust(Tran,TranType) PRIVATE
+	;-------------------------------------------------------------------------------
+	; Stock Adjustments
+	; 
+	; 1.  Extract details from Web Service record
+	; 2.  Revise accounts from Account Identification Matrix
+	; 
+	; Returns: Status
+	;
+	; History:
+	; 12-Jul-2010	SCR		SR17387 : Pass Source Details to FININTBatch Block
+	; 13-Mar-2007	GRF		SR15356: Use correct transaction type
+	; 01-May-2006	GRF		SR14593: Status Code from missing data item not being
+	; 							detected on construction of Reference
+	; 10-Nov-2005	GRF		SR13833 : correction - passing unconverted account
+	; 							numbers to finance processing.
+	; 30-Sep-2005	GRF		SR13589 : split from Transfers
+	;-------------------------------------------------------------------------------
+	new AdjustAcct,Amount,arrAccts,arrChars,arrCSTKey,arrCSTVals,Batch,BlockNo,CSTVals
+	new Date,Dispatch,FromLocn,FromStockLocn,idx,Line,LineRef,OrderType
+	new Prefix,Profile,Reference,SOHAcctFr,SourceGroup,SourceLocn,Status
+	new strSourceDetail,strSourceForm,strSourceRecord
+	
+	set $zt = "TransferError"
+	
+	set Status = $$$OK
+	set Prefix = "@Tran@("
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Date",             .Date,            Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("OrderType",        .OrderType,       Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Dispatch",         .Dispatch,        Prefix,$$$NO)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("FromLocation",     .FromLocn,        Prefix,$$$NO)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("FromStockLocation",.FromStockLocn,   Prefix,$$$NO)
+
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceDetail",  .strSourceDetail, Prefix) ; SR17387
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceForm",    .strSourceForm,   Prefix) ; SR17387
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceRecord",  .strSourceRecord, Prefix) ; SR17387
+
+	if (Status=$$$OK) && (FromLocn="") set FromLocn = "None"         ; Default Location
+	if (Status=$$$OK) set SourceLocn = FromLocn
+	
+	set Batch   = ""
+	set BlockNo = ""
+	;f Status=$$$OK set Status = $$Allocate^FININTBatch(.Batch,.BlockNo,"INADJ",FromLocn,Date)    ; SR17387
+	if Status=$$$OK set Status = $$Allocate^FININTBatch(.Batch,.BlockNo,"INADJ",FromLocn,Date,,,,strSourceForm,strSourceRecord,strSourceDetail)
+	
+	if Status=$$$OK {
+		set Line = ""
+		for {
+			set Line = $order(@Tran@("Lines",Line))
+			quit:(Line="")||(Status'=$$$OK)
+			
+			set Prefix = "@Tran@(""Lines"",Line,"
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Cost",          .Amount,     Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("LineRef",       .LineRef,    Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceGroup",   .SourceGroup,Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("AccountSOHFrom",.SOHAcctFr,  Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("AccountAdjust", .AdjustAcct, Prefix,$$$YES)
+		;	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Audit",         .strAudit,   Prefix,$$$NO) ; SR17229
+			
+			
+			; Extract Characteristic Values
+			if Status=$$$OK {
+				kill arrAccts
+				kill arrChars
+				
+				merge arrChars = @Tran@("Lines",Line,"CharVal")
+			
+				set arrAccts(1) = SOHAcctFr		; INVENTORY
+				set arrAccts(2) = AdjustAcct	; Adjustment Expense
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			if (Status=$$$OK) && ($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+				
+				; Handle ledger profiles returned from Account Identification Matrices
+				set idx = ""
+				for {
+					set idx = $order(arrAccts(idx))
+					quit:idx=""
+					
+					set Profile = arrAccts(idx)
+					if Profile["{" {
+						set Status = $$SALConvert^FINGLProfileConv(.Profile,FromLocn,SourceGroup)
+						if $$$ISOK(Status) set arrAccts(idx) = Profile
+					}
+				}
+			}
+			
+			if (Status=$$$OK) {
+				set Reference = LineRef_$$$COMMA_FromLocn_$$$COMMA_FromStockLocn
+				set CSTVals   = CSTVals_Y_FromLocn_Y_SourceGroup
+			;	set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(1),-Amount,"SOH",
+			;	                                   LineRef,FromLocn,Reference,,,
+			;	                                   ,$get(arrCSTKey(1)),CSTVals)
+				set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(1),-Amount,"SOH",
+				                                   LineRef,strSourceRecord,Reference,,,
+				                                   ,$get(arrCSTKey(1)),CSTVals)               ;SR17387
+			}
+ 
+			if (Status=$$$OK) {
+			;	set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(2),Amount,"INADJ",
+			;	                                   LineRef,FromLocn,Reference,,,
+			;	                                   ,$get(arrCSTKey(2)),CSTVals)
+				set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(2),Amount,"INADJ",
+				                                   LineRef,strSourceRecord,Reference,,,
+				                                   ,$get(arrCSTKey(2)),CSTVals)               ;SR17387
+			}
+		}
+	}
+	
+	
+	if Status=$$$OK set Status = $$PostBlock^FININTBatch(Batch,BlockNo)
+	set ^CacheTempFIB($increment(^CacheTempFIB),$job) = "5:"_Status
+	;***************************************
+	if Status=$$$OK {
+		if $tlevel>0 tcommit
+		set Status = $$$OK_Y_Batch_","_BlockNo
+	} else {
+		trollback
+		set Status = $$$NO_Y_$$$Text(Status)
+	}
+	;***************************************
+	quit Status
+	
+	
+Xfer(Tran,TranType) PRIVATE
+	;-------------------------------------------------------------------------------
+	; Stock Transfers
+	; 
+	; 1.  Extract details from Web Service record
+	; 2.  Differentiate between From and To Location information
+	; 3.  Revise accounts from Account Identification Matrix
+	; 
+	; MVI - Between Stock Locations          within a Site Location
+	; MVO - QA Location to Stock Location    within a Site Location
+	; ISS - InterWarehouse Order (Source     to In-Transit locn)
+	; REC - InterWarehouse Order (In-Transit to Desitination locn)
+	; 
+	; NOTE : 2 pass approach not needed for ISS/REC and inversion of
+	;        accounts is ONLY needed for REC.  Could simplify further
+	;        at expense of duplication.
+	; 
+	; Returns: Status
+	;
+	; History:
+	; 12-Jul-2010	SCR		SR17387: Pass Source Details to FININTBatch Block
+	; 13-Mar-2007	GRF		SR15356: Use correct transaction type
+	; 02-May-2006	GRF		SR14593: second instance missed
+	; 01-May-2006	GRF		SR14593: Status Code from missing data item not being
+	; 							detected on construction of Reference
+	; 30-Sep-2005	GRF		SR13589: split from Transfers
+	;-------------------------------------------------------------------------------
+	new Amount,arrAccts,arrChars,arrCSTKey,arrCSTVals,arrSave,Batch,BlockNo,CharType,CSTVals
+	new Date,Dispatch,FromLocn,FromStockLocn,idx,Line,LineRef,OrderType
+	new Prefix,Profile,Reference,SOHAcctFr,SOHAcctTo,SourceGroup,SourceLocn,Status,StockLocn,ToLocn,ToStockLocn
+	new strSourceDetail,strSourceForm,strSourceRecord
+
+
+	set $zt="TransferError"
+	
+	set Status = $$$OK
+	set Prefix = "@Tran@("
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Date",             .Date,         Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("OrderType",        .OrderType,    Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Dispatch",         .Dispatch,     Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("FromLocation",     .FromLocn,     Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("ToLocation",       .ToLocn,       Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("FromStockLocation",.FromStockLocn,Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("ToStockLocation",  .ToStockLocn,  Prefix)
+
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceDetail",   .strSourceDetail,Prefix) ; SR17387
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceForm",     .strSourceForm,  Prefix) ; SR17387
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceRecord",   .strSourceRecord,Prefix) ; SR17387
+
+	if (Status=$$$OK) && (FromLocn="") set FromLocn = "None"             ; Default Location
+	
+	set Batch   = ""
+	set BlockNo = ""
+	;f Status=$$$OK set Status = $$Allocate^FININTBatch(.Batch,.BlockNo,"INTRAN",FromLocn,Date)
+	if Status=$$$OK set Status = $$Allocate^FININTBatch(.Batch,.BlockNo,"INTRAN",FromLocn,Date,,,,strSourceForm,strSourceRecord,strSourceDetail) ; SR17387
+	
+	if Status=$$$OK {
+		set Line = ""
+		for {
+			set Line = $order(@Tran@("Lines",Line))
+			quit:(Line="")||(Status'=$$$OK)
+			
+			set Prefix = "@Tran@(""Lines"",Line,"
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Cost",          .Amount,     Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("LineRef",       .LineRef,    Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceGroup",   .SourceGroup,Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("AccountSOHFrom",.SOHAcctFr,  Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("AccountSOHTo",  .SOHAcctTo,  Prefix,$$$YES)
+			
+			if Status=$$$OK if TranType="REC" set Amount = -Amount
+			
+			;+++++++++++++++++++++++++++++++ PASS 1
+			; Extract Characteristic Values
+			if Status=$$$OK {
+				kill arrAccts
+				kill arrChars
+				kill arrSave
+				
+				merge arrChars = @Tran@("Lines",Line,"CharVal")
+				for CharType="LC1","LC2","LC3" {
+					set arrSave(CharType) = $get(arrChars("T-"_CharType))
+					kill arrChars("T-"_CharType)
+				}
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+				
+				if TranType="REC" {
+					; INVENTORY
+					set SourceLocn  = ToLocn
+					set StockLocn   = ToStockLocn
+					set arrAccts(1) = SOHAcctTo
+					set arrAccts(2) = ""
+				
+				} else {
+					; INVENTORY FROM  - MVI/MVO/ISS
+					set SourceLocn  = FromLocn
+					set StockLocn   = FromStockLocn
+					set arrAccts(1) = SOHAcctFr
+					set arrAccts(2) = ""
+				}
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			if (Status=$$$OK) && ($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				
+				; Handle ledger profiles returned from Account Identification Matrices
+				set Profile = arrAccts(1)
+				if Profile["{" {
+					set Status = $$SALConvert^FINGLProfileConv(.Profile,SourceLocn,SourceGroup)
+					if $$$ISOK(Status) set arrAccts(1) = Profile
+				}
+			}
+			
+			if (Status=$$$OK) {
+				set Reference = LineRef_$$$COMMA_SourceLocn_$$$COMMA_StockLocn
+				set CSTVals   = CSTVals_Y_FromLocn_Y_SourceGroup
+			}
+			
+			if (Status=$$$OK)&&(arrAccts(1)'="") {
+			;	set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(1),-Amount,"SOH",
+			;	                                   LineRef,SourceLocn,Reference,,,
+			;	                                   ,$get(arrCSTKey(1)),CSTVals)
+				set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(1),-Amount,"SOH",
+				                                   LineRef,strSourceRecord,Reference,,,
+				                                   ,$get(arrCSTKey(1)),CSTVals)              ;SR17387
+			}
+			
+			;+++++++++++++++++++++++++++++++ PASS 2
+			
+			if Status=$$$OK {
+				kill arrAccts
+				
+				for CharType="LC1","LC2","LC3" {
+					set arrChars(CharType) = arrSave(CharType)
+				}
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+				
+				if TranType="REC" {
+					; ORDER CONTRA - In Transit
+					set SourceLocn  = FromLocn
+					set StockLocn   = FromStockLocn
+					set arrAccts(1) = ""
+					set arrAccts(2) = SOHAcctFr
+				} else {
+					; INVENTORY TO    - MVI/MVO or ORDER CONTRA - In Transit
+					set SourceLocn  = ToLocn
+					set StockLocn   = ToStockLocn
+					set arrAccts(1) = ""
+					set arrAccts(2) = SOHAcctTo
+				}
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			if (Status=$$$OK)&&($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				
+				; Handle ledger profiles returned from Account Identification Matrices
+				set Profile = arrAccts(2)
+				if Profile["{" {
+					set Status = $$SALConvert^FINGLProfileConv(.Profile,SourceLocn,SourceGroup)
+					if $$$ISOK(Status) set arrAccts(2) = Profile
+				}
+			}
+			if (Status=$$$OK) {
+				set Reference = LineRef_$$$COMMA_SourceLocn_$$$COMMA_StockLocn             ; SR14539
+				set CSTVals   = CSTVals_Y_FromLocn_Y_SourceGroup
+			}
+			if (Status=$$$OK) && (arrAccts(2)'="") {
+				;set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(2),Amount,"SOH",
+				;                                   LineRef,SourceLocn,Reference,,,
+				;                                   ,$get(arrCSTKey(2)),CSTVals)
+				set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(2),Amount,"SOH",
+				                                   LineRef,strSourceRecord,Reference,,,
+				                                   ,$get(arrCSTKey(2)),CSTVals)				; SR17387
+			}
+			
+			;+++++++++++++++++++++++++++++++ END PASSES
+		}
+	}
+	
+	if Status=$$$OK set Status = $$PostBlock^FININTBatch(Batch,BlockNo)
+	set ^CacheTempFIB($increment(^CacheTempFIB),$job) = "5:"_Status
+	;***************************************
+	if Status=$$$OK {
+		if $tlevel>0 tcommit
+		set Status = $$$OK_Y_Batch_","_BlockNo
+	} else {
+		trollback
+		set Status = $$$NO_Y_$$$Text(Status)
+	}
+	;***************************************
+	
+	quit Status
+	
+	
+Consumed(Tran,TranType,OrderType) PRIVATE
+	;-------------------------------------------------------------------------------
+	; Issue to Consumption
+	; 
+	; 1.  Extract details from Web Service record
+	; 2.  Differentiate between From and To Location information
+	; 3.  Revise accounts from Account Identification Matrix
+	; 
+	; ISS - No Order (Requisition issued to Consumption)
+	; 
+	; Returns: Status
+	;
+	; History:
+	; 08-Aug-2011	GRF		SR17849: Created from Xfer
+	;-------------------------------------------------------------------------------
+	new Amount,arrAccts,arrChars,arrCSTKey,arrCSTVals,arrSave,Batch,BlockNo,CharType,CSTVals
+	new Date,Dispatch,ExpAcctTo,FromLocn,FromStorage,idStorage,idx,Line,LineRef
+	new Prefix,Profile,Reference,SOHAcctFr,SourceGroup,SourceLocn,Status,ToLocn
+	new strSourceDetail,strSourceForm,strSourceRecord
+
+	$$$LogR("Consumed",Tran_"<"_TranType_"<"_OrderType)
+
+	set $zt="TransferError"
+	
+	set Status = $$$OK
+	set Prefix = "@Tran@("
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Date",             .Date,       Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Dispatch",         .Dispatch,   Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("FromLocation",     .FromLocn,   Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("ToLocation",       .ToLocn,     Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("FromStockLocation",.FromStorage,Prefix)
+	;f Status=$$$OK set Status = $$GetValue^FINSYSDCM("ToStockLocation",  .ToStorage,  Prefix)  ; Delete Storage
+
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceDetail",   .strSourceDetail,Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceForm",     .strSourceForm,  Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceRecord",   .strSourceRecord,Prefix)
+
+	if (Status=$$$OK) && (FromLocn="") set FromLocn = "None"             ; Default Location
+	
+	set Batch   = ""
+	set BlockNo = ""
+	if Status=$$$OK set Status = $$Allocate^FININTBatch(.Batch,.BlockNo,"INTRAN",FromLocn,Date,,,,strSourceForm,strSourceRecord,strSourceDetail)
+	$$$LogRx("Con1:"_Batch_","_BlockNo_"<")
+	
+	if Status=$$$OK {
+		set Line = ""
+		for {
+			set Line = $order(@Tran@("Lines",Line))
+			quit:(Line="")||(Status'=$$$OK)
+			
+			set Prefix = "@Tran@(""Lines"",Line,"
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Cost",          .Amount,     Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("LineRef",       .LineRef,    Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceGroup",   .SourceGroup,Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("AccountSOHFrom",.SOHAcctFr,  Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("AccountAdjust", .ExpAcctTo,  Prefix,$$$YES)
+			
+			;+++++++++++++++++++++++++++++++ PASS 1
+			; Extract Characteristic Values
+			if Status=$$$OK {
+				kill arrAccts
+				kill arrChars
+				kill arrSave
+				
+				merge arrChars = @Tran@("Lines",Line,"CharVal")
+				for CharType="LC1","LC2","LC3" {
+					set arrSave(CharType) = $get(arrChars("T-"_CharType))
+					kill arrChars("T-"_CharType)
+				}
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+				
+				; INVENTORY FROM  - MVI/MVO/ISS
+				set SourceLocn  = FromLocn
+				set idStorage   = FromStorage
+				set arrAccts(1) = SOHAcctFr
+				set arrAccts(2) = ""
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			if (Status=$$$OK) {
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				
+				; Handle ledger profiles returned from Account Identification Matrices
+				set Profile = arrAccts(1)
+				if Profile["{" {
+					set Status = $$SALConvert^FINGLProfileConv(.Profile,SourceLocn,SourceGroup)
+					if $$$ISOK(Status) set arrAccts(1) = Profile
+				}
+			}
+			
+			if (Status=$$$OK) {
+				set Reference = LineRef_$$$COMMA_SourceLocn_$$$COMMA_idStorage
+				set CSTVals   = CSTVals_Y_FromLocn_Y_SourceGroup
+			}
+			
+			if (Status=$$$OK) && (arrAccts(1)'="") {
+				set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(1),-Amount,"SOH",
+				                                   LineRef,strSourceRecord,Reference,,,
+				                                   ,$get(arrCSTKey(1)),CSTVals)
+			}
+			
+			;+++++++++++++++++++++++++++++++ PASS 2
+			
+			if Status=$$$OK {
+				kill arrAccts
+				
+				for CharType="LC1","LC2","LC3" {    ; FIXME : VERIFY LC* & T-LC* handled correctly for ToLocn
+					set arrChars(CharType) = arrSave(CharType)
+				}
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+				
+				; INVENTORY TO    - MVI/MVO or ORDER CONTRA - In Transit
+				set SourceLocn  = ToLocn
+				set idStorage   = ""             ; ToStorage may not exist for solely consumption location.
+				set arrAccts(1) = ""
+				set arrAccts(2) = ExpAcctTo
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			if (Status=$$$OK) {
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				
+				; Handle ledger profiles returned from Account Identification Matrices
+				set Profile = arrAccts(2)
+				if Profile["{" {
+					set Status = $$SALConvert^FINGLProfileConv(.Profile,SourceLocn,SourceGroup)
+					if $$$ISOK(Status) set arrAccts(2) = Profile
+				}
+			}
+			if (Status=$$$OK) {
+				set Reference = LineRef_$$$COMMA_SourceLocn_$$$COMMA_idStorage
+				set CSTVals   = CSTVals_Y_FromLocn_Y_SourceGroup
+			}
+			if (Status=$$$OK) && (arrAccts(2)'="") {
+				set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(2),Amount,"CONEX",
+				                                   LineRef,strSourceRecord,Reference,,,
+				                                   ,$get(arrCSTKey(2)),CSTVals)
+			}
+			
+			;+++++++++++++++++++++++++++++++ END PASSES
+		}
+	}
+	
+	if Status=$$$OK set Status = $$PostBlock^FININTBatch(Batch,BlockNo)
+	set ^CacheTempFIB($increment(^CacheTempFIB),$job)="5:"_Status
+	;***************************************
+	if Status=$$$OK {
+		if $tlevel>0 tcommit
+		set Status = $$$OK_Y_Batch_","_BlockNo
+	} else {
+		trollback
+		set Status = $$$NO_Y_$$$Text(Status)
+	}
+	;***************************************
+	
+	quit Status
+	
+TransferError	; Internal Tag
+	if $get(Status)="" set Status = "0~"_$$$Text("Fin01013")_" "_$ze ; "Error in Stock Transfer Post"
+	
+	;***************************************
+	trollback
+	;***************************************
+	quit Status
+	
+	
+ChangeCC(pstrTran) ; UNDER DEVELOPMENT
+	;-------------------------------------------------------------------------------
+	; Process stock on hand adjustments following reassignemt of location from one
+	; cost centre to another.
+	; 
+	; Returns: Status
+	;
+	; History:
+	; 19-Jul-2011	GRF		SR17048: Created
+	;-------------------------------------------------------------------------------
+	;new Prefix,Status,TranType   ; WIP - starting to reconstruct new list
+	
+	new AdjustAcct,Amount,arrAccts,arrChars,arrCSTKey,arrCSTVals,Batch,BlockNo,CSTVals
+	new Date,Dispatch,FromCC,FromLocn,Storage,loop,Line,LineRef,OrderType
+	new Prefix,Profile,Reference,SOHAcctFr,SourceGroup,SourceLocn,Status
+	new strSourceDetail,strSourceForm,strSourceRecord,ToCC
+
+	;***************************************
+	tstart
+	;***************************************
+	
+	set $zt = "CCCError"
+	
+	set Status = $$$OK
+	set Prefix = "@pstrTran@("
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Date",          .Date,            Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("TranType",      .TranType,        Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("OrderType",     .OrderType,       Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("FromCC",        .FromCC,          Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("ToCC",          .ToCC,            Prefix,$$$YES)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Location",      .FromLocn,        Prefix,$$$YES)
+
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceDetail",  .strSourceDetail, Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceForm",    .strSourceForm,   Prefix)
+	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceRecord",  .strSourceRecord, Prefix)
+
+	if (Status=$$$OK) && (FromLocn="") set FromLocn = "None"         ; Default Location
+	if (Status=$$$OK) set SourceLocn = FromLocn
+	
+	set Batch   = ""
+	set BlockNo = ""
+	if Status=$$$OK set Status = $$Allocate^FININTBatch(.Batch,.BlockNo,"INCCC",FromLocn,Date,,,,strSourceForm,strSourceRecord,strSourceDetail)
+	
+	if Status=$$$OK {
+		set Line = ""
+		for {
+			set Line = $order(@pstrTran@("Lines",Line))
+			quit:(Line="")||(Status'=$$$OK)
+			
+			set Prefix = "@pstrTran@(""Lines"",Line,"
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Value",       .Amount,     Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Item",        .Item,       Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("SourceGroup", .SourceGroup,Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("AcctSOHFrom", .SOHAcctFr,  Prefix,$$$YES)
+			if Status=$$$OK set Status = $$GetValue^FINSYSDCM("AcctSOHTo",   .SOHAcctTo,  Prefix,$$$YES)
+		;	if Status=$$$OK set Status = $$GetValue^FINSYSDCM("Audit",       .strAudit,   Prefix,$$$NO)
+			
+			
+			; Extract Characteristic Values
+			if Status=$$$OK {
+				kill arrAccts
+				kill arrChars
+				
+				merge arrChars = @pstrTran@("Lines",Line,"CharVal")
+			
+				set arrAccts(1) = SOHAcctFr      ; INVENTORY
+				set arrAccts(2) = SOHAcctTo	     ; INVENTORY
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			if (Status=$$$OK) && ($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+				
+				; Handle ledger profiles returned from Account Identification Matrices
+				set loop = ""
+				for {
+					set loop = $order(arrAccts(loop))
+					quit:loop=""
+					
+					set Profile = arrAccts(loop)
+					if Profile["{" {
+						set Status = $$SALConvert^FINGLProfileConv(.Profile,FromLocn,SourceGroup)
+						if $$$ISOK(Status) set arrAccts(loop) = Profile
+					}
+				}
+			}
+			
+			if (Status=$$$OK) {
+				set Reference = LineRef_$$$COMMA_FromLocn_$$$COMMA_Storage
+				set CSTVals   = CSTVals_Y_FromLocn_Y_SourceGroup
+				set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(1),-Amount,"SOH",
+				                                 LineRef,strSourceRecord,Reference,,,
+				                                 ,$get(arrCSTKey(1)),CSTVals)
+			}
+ 
+			if (Status=$$$OK) {
+				set Status = $$AddLine^FININTBatch(Batch,BlockNo,arrAccts(2),Amount,"SOH",
+				                                 LineRef,strSourceRecord,Reference,,,
+				                                 ,$get(arrCSTKey(2)),CSTVals)
+			}
+		}
+	}
+	
+	
+	if Status=$$$OK set Status = $$PostBlock^FININTBatch(Batch,BlockNo)
+	set ^CacheTempFIB($increment(^CacheTempFIB),$job) = "5:"_Status
+	;***************************************
+	if Status=$$$OK {
+		if $tlevel>0 tcommit
+		set Status = $$$OK_Y_Batch_","_BlockNo
+	} else {
+		trollback
+		set Status = $$$NO_Y_$$$Text(Status)
+	}
+	;***************************************
+	quit Status
+	
+CCCError	; Internal Tag
+	if $get(Status)="" set Status = "0~"_$$$Text("Fin01013")_" "_$ze ; "Error in Stock Transfer Post"    ; FIXME - Revise error message
+	
+	;***************************************
+	trollback
+	;***************************************
+	quit Status
+	
+	/*
+	new Prefix,Status,TranType
+
+	new AdjustAcct,Amount,arrAccts,arrChars,arrCSTKey,arrCSTVals,Batch,BlockNo,CSTVals
+	new Date,Dispatch,FromLocn,Storage,loop,Line,LineRef,OrderType
+	new Prefix,Profile,Reference,SOHAcctFr,SourceGroup,SourceLocn,Status
+	new strSourceDetail,strSourceForm,strSourceRecord
+	
+	
+
+	*/
+	
+	
+	
+]]></Routine>
+</Export>

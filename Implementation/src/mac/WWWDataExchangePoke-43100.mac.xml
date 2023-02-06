@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWWDataExchangePoke" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWWDataExchangePoke
+	
+#include WWWConst
+#include COMSYS
+#include COMConst
+	
+NotifyExternalSystems(pblnScheduled=$$$NO) 
+	;-------------------------------------------------------------------------------
+	; Notify the external system(s) that there is data exchange info on the queue
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Nov-2009	DWR		SR16846: changed routine name call to avoid confusion
+	; 02-Nov-2009 	SCR		SR16929: Added Push Data test
+	; 20-Apr-2009	shobby	SR16438: Created
+	;-------------------------------------------------------------------------------
+ 	new dteLastRun,idClient,objWWWDataExchangeClient
+ 
+ 	$$$VAR
+	set idClient = ""
+ 	for {
+	 	set idClient = $order(^WWWDataExchangeClient(YM,idClient))
+	 	quit:idClient=""
+	 	
+	 	if $data(^WWWDataExMessageSend(YM,idClient)) { ; Don't send if nothing on the queue for this client
+		 	set objWWWDataExchangeClient = $get(^WWWDataExchangeClient(YM,idClient,1))
+		 	if ($$$WWWDataExchangeClientInterface(objWWWDataExchangeClient)'="") {
+			 	if ($$$WWWDataExchangeClientMachine(objWWWDataExchangeClient)=$zutil(110)) &&
+			 	   ($$$WWWDataExchangeClientNamespace(objWWWDataExchangeClient)=$zutil(5))    {
+				 	
+				 	set dteLastRun = $get(^CacheTempDataExchange(YUCI,"Notify",idClient))  ;don't want YUSER as the first key here.  It is shared amongst all users.
+				 	if (dteLastRun="") || (pblnScheduled) || ($$DateDiff^COMUtilDate(dteLastRun,$horolog)>60) {
+					 	if $$$WWWDataExchangeClientPushData(objWWWDataExchangeClient)=1 {  ; SR16929  
+						 	job PushData(idClient)
+					 	} else {
+		;			 		job NotifyExternalSystem(idClient)
+					 		job NotifySystem(idClient)   ;SR16846
+					 	}
+					 	do CreateTask(idClient)
+				 	}
+			 	}
+		 	}
+	 	}
+	}
+	quit $$$OK
+	
+	
+CreateTask(pidClient)
+	;-------------------------------------------------------------------------------
+	; If the NotifyExternalSystem function called on save fails because the remote
+	; system is down, then the CacheTempDataExchange will not be removed preventing
+	; future updates.
+	; This task works as a failsafe by kicking the system to get it moving again.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Apr-2009	SHOBBY	SR16438: Created
+	;-------------------------------------------------------------------------------
+	new idSchedule,objSchedule
+ 
+	if '$data(^COMSchedules(YM,1,"DATAEXCHANGE")) {
+		set idSchedule = $$^WWWNEXT("COMSchedule")
+		set $$$COMScheduleClass(objSchedule)            = "DATAEXCHANGE"
+		set $$$COMScheduleTypeReference(objSchedule)    = 1
+		set $$$COMScheduleDescription(objSchedule)      = "Data Exchange Failsafe"
+		set $$$COMScheduleCode(objSchedule)             = "NotifyExternalSystems^WWWDataExchangePoke(1)"
+		set $$$COMScheduleTimeIncrement(objSchedule)	= 2
+		set $$$COMScheduleIncrementValue(objSchedule)   = 10
+		set $$$COMScheduleTimeToRun(objSchedule)        = ""
+		set $$$COMScheduleMonthsOfYear(objSchedule)     = ""
+		set $$$COMScheduleDaysOfWeek(objSchedule)       = ""
+		set $$$COMScheduleMultiDaysOfMonth(objSchedule) = ""
+		set $$$COMScheduleSingleDOM(objSchedule)        = ""
+	
+		do Save^COMUtils("COMSchedule",idSchedule,objSchedule,1)
+	}
+	quit
+	
+	
+		;NotifyExternalSystem(pidClient)  ;SR16846
+NotifySystem(pidClient)
+	;-------------------------------------------------------------------------------
+	; Notify the external system(s) that there is data exchange info on the queue
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Nov-2009	DWR		SR16846: Rename method to avoid wrong call
+	; 02-Nov-2009	SCR		SR16929: Added Locking
+	; 31-Aug-2009	GRF		SR16846: manage sc rather than strStatus
+	; 20-Aug-2009	shobby	SR16846: added missing parameter
+	; 28-Apr-2009	shobby	SR16438: Broken out of NotifyExternalSystems
+	; 20-Apr-2009	shobby	SR16438: Created
+	;-------------------------------------------------------------------------------
+	new dteToday,idWWWWSLog,objWWWDataExchangeClient,objWWWWSLog,sc,strCall,strStatus
+ 
+	$$$VAR
+	set $ZTRAP = "NotifyExternalSystemError"
+ 	
+ 	lock +^WWWDataExchangeClient(YM,pidClient,1):30 else  quit ; SR16929
+ 	
+ 	set ^CacheTempDataExchange(YUCI,"Notify",pidClient) = $horolog  ;don't want YUSER as the first key here.  It is shared amongst all users.
+ 
+ 	set objWWWDataExchangeClient=$get(^WWWDataExchangeClient(YM,pidClient,1))
+	set dteToday     = $horolog
+	set objWWWWSLog  = ""
+	set idWWWWSLog   = $$^WWWNEXT("WWWWSLog")
+	set $$$WWWWSLogMethodName(objWWWWSLog)  = $$WebserviceMethod^WWWDataExchangeClient(pidClient,objWWWDataExchangeClient)
+	set $$$WWWWSLogRemoteAddr(objWWWWSLog)  = $$$WWWDataExchangeClientInterface(objWWWDataExchangeClient)
+	set $$$WWWWSLogMsgReceived(objWWWWSLog) = dteToday
+	set $$$WWWWSLogClientID(objWWWWSLog)    = pidClient
+	set $$$WWWWSLogUserID(objWWWWSLog)      ="Poke"
+	set $$$WWWWSLogErrorLog(objWWWWSLog)    = 1 ;Assume error
+	set $$$WWWWSLogResponse(objWWWWSLog)    = "Webservice failed to respond."
+	set $$$WWWWSLogDuration(objWWWWSLog)    = $$DateDiff^COMUtilDate(dteToday,$horolog)
+	
+	set sc        = $$$OK
+	set strStatus = $$Save^COMUtils("WWWWSLog",idWWWWSLog,objWWWWSLog) ;Can't do too much if this fails. (Saving a log of the fail to save a log?)
+	
+	set sc = ##class(%Library.CompiledClass).%ExistsId($$WebserviceName^WWWDataExchangeClient(pidClient,objWWWDataExchangeClient)) 
+	if $$$ISERR(sc) {
+		set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	}
+
+	if $$$ISOK(strStatus) {  
+	 	set strCall = "set strStatus=##class("_$$WebserviceName^WWWDataExchangeClient(pidClient,objWWWDataExchangeClient)
+	 	set strCall = strCall_").%New()."_$$$WWWDataExchangeClientMethod(objWWWDataExchangeClient)_"()"     ;SR16846
+		
+		xecute strCall
+		
+		set $$$WWWWSLogErrorLog(objWWWWSLog) = (strStatus["ERROR") ;will report that the call didn't crash but not whether the operation was handled successfully.  This can be found from the Response field.
+		set strStatus = "REMOTE SYSTEM: "_strStatus
+ 
+	} else {
+		set $$$WWWWSLogErrorLog(objWWWWSLog) = 1 ;Fail
+	}
+	; ^^^ FIXME
+	
+	set $$$WWWWSLogResponse(objWWWWSLog) = $extract(strStatus,1,100)   ; FIXME : do we want to keep "0 " prefix? sc handling?
+	set $$$WWWWSLogDuration(objWWWWSLog) = $$DateDiff^COMUtilDate(dteToday,$horolog)
+	
+	set strStatus = $$Save^COMUtils("WWWWSLog",idWWWWSLog,objWWWWSLog) ;Can't do too much if this fails. (Saving a log of the fail to save a log?)
+ 
+ 	kill ^CacheTempDataExchange(YUCI,"Notify",pidClient)  ;don't want YUSER as the first key here.  It is shared amongst all users.
+ 	lock -^WWWDataExchangeClient(YM,pidClient,1) ; SR16929
+	quit
+ 
+NotifyExternalSystemError  ; Internal Tag
+	; Try again next time
+	set $ZTRAP=""
+	kill ^CacheTempDataExchange(YUCI,"Notify",pidClient)  ;don't want YUSER as the first key here.  It is shared amongst all users.
+	quit
+
+PushData(pidClient)
+	;-------------------------------------------------------------------------------
+	; Push Data to external client
+	;
+	; Params: Client
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Jun-2011	SCR		SR17785: idWWWWSLog not defined.
+	; 08-Jan-2010	SCR		SR16929: Added Warning option that logs the Message but continues processing
+	; 11-Nov-2009	SCR		SR16929: Added Count to Message
+	; 02-Nov-2009	SCR		SR16929: Created
+	;-------------------------------------------------------------------------------
+ 	new objWWWDataExchangeClient,idWWWWSLog,dteToday,objWWWWSLog,sc,strStatus,idSend
+ 	new objMessage,idRule,objRule,strCode,strPushMethod,intCount
+ 	new strWarn
+	$$$VAR
+	set strWarn=""
+	set $ZTRAP = "PushDataError"
+ 
+ 	lock +^WWWDataExchangeClient(YM,pidClient,1):30 else  quit 
+ 	
+ 	set objWWWDataExchangeClient=$get(^WWWDataExchangeClient(YM,pidClient,1))
+	set dteToday     = $horolog
+	set objWWWWSLog  = ""
+	set $$$WWWWSLogRemoteAddr(objWWWWSLog)  = $$$WWWDataExchangeClientInterface(objWWWDataExchangeClient)
+	set $$$WWWWSLogMsgReceived(objWWWWSLog) = dteToday
+	set $$$WWWWSLogMethodName(objWWWWSLog)  = $$$Text("WWW00132")  ;Data Exchange Push
+	set $$$WWWWSLogClientID(objWWWWSLog)    = pidClient
+	set $$$WWWWSLogUserID(objWWWWSLog)      ="Push"
+	set $$$WWWWSLogErrorLog(objWWWWSLog)    = $$$OK ;Assume not OK
+	set $$$WWWWSLogDuration(objWWWWSLog)    = $$DateDiff^COMUtilDate(dteToday,$horolog)
+	set intCount	= 0
+	set sc        = $$$OK
+	set strStatus = $$$OK
+	;set strStatus = $$Save^COMUtils("WWWWSLog",idWWWWSLog,objWWWWSLog) ;Can't do too much if this fails. (Saving a log of the fail to save a log?)
+	if $$$ISOK(strStatus) {
+		set idSend=""
+		for {
+			quit:'$$$ISOK(strStatus)
+			set idSend=$order(^WWWDataExMessageSend(YM,pidClient,idSend))
+			quit:idSend=""
+			set objMessage=$get(^WWWDataExMessageSend(YM,pidClient,idSend,1))
+			if $$$WWWDataExMessageSendTimestampProcessed(objMessage)'="" continue
+			set idRule=$$$WWWDataExMessageSendRule(objMessage)
+			if idRule'="" {
+				set objRule=$get(^WWWDataExchange(YM,idRule,1))
+				set strPushMethod=$$$WWWDataExchangePushMethod(objRule)
+				if strPushMethod'="" {
+					set strCode="set strStatus="_strPushMethod
+					xecute strCode
+					set intCount=intCount+1
+				}
+				if strStatus=$$$OK {
+					set $$$WWWDataExMessageSendTimestampProcessed(objMessage)=$h
+					set strStatus=$$$Save("WWWDataExMessageSend",pidClient_","_idSend,objMessage,1)
+					
+				}
+			} 
+		}
+	}	
+	if $$$ISERR(strStatus) {
+		set $$$WWWWSLogResponse(objWWWWSLog) = $extract($$$Text(strStatus),1,100) _ " ; "   ; FIXME : do we want to keep "0 " prefix? sc handling?
+	}
+	set $$$WWWWSLogDuration(objWWWWSLog) = $$DateDiff^COMUtilDate(dteToday,$horolog)
+	if $$$ISOK(strStatus) {
+		set $$$WWWWSLogErrorLog(objWWWWSLog)    = "" ;OK
+	}
+	if intCount>0 {
+		set idWWWWSLog   = $$^WWWNEXT("WWWWSLog")		
+		
+		set $$$WWWWSLogResponse(objWWWWSLog)    =  $$$WWWWSLogResponse(objWWWWSLog) _strWarn
+		set $$$WWWWSLogResponse(objWWWWSLog)    =  $$$WWWWSLogResponse(objWWWWSLog) _$$$Text($listbuild("WWW00130",pidClient,intCount))  ;Data Exchange Push
+		set strStatus = $$Save^COMUtils("WWWWSLog",idWWWWSLog,objWWWWSLog) ;Can't do too much if this fails. (Saving a log of the fail to save a log?)
+ 		lock -^WWWDataExchangeClient(YM,pidClient,1)
+	}
+	quit
+
+PushDataError  ; Internal Tag
+	; Try again next time
+ 	lock -^WWWDataExchangeClient(YM,pidClient,1)
+	set idWWWWSLog   = $$^WWWNEXT("WWWWSLog")	; SR17785	
+	set $ZTRAP=""
+	set $$$WWWWSLogResponse(objWWWWSLog) = $translate($zerror,"~","")
+	set $$$WWWWSLogDuration(objWWWWSLog) = $$DateDiff^COMUtilDate(dteToday,$horolog)
+	
+	set strStatus = $$Save^COMUtils("WWWWSLog",idWWWWSLog,objWWWWSLog) ;Can't do too much if this fails. (Saving a log of the fail to save a log?)
+	quit
+	
+
+		
+]]></Routine>
+</Export>

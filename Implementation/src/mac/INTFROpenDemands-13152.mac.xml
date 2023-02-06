@@ -1,0 +1,593 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTFROpenDemands" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTFROpenDemands
+ 
+#include COMSYS
+#include INConst
+#include WWWConst
+#include COMConst
+ 
+	;-------------------------------------------------------------------------------
+	; Whether or not the demand is Outstanding.
+	; NOTE: The term open is confusing as there is a field on the demand named closed,
+	; 		just not closed does not make the demand 'open'.
+	;
+	; Params:
+	; pobjDemand - Demand record.
+	;
+	; ByRefs: None
+	;
+	; Returns: blnStatus - $$$YES if demand is Outstanding otherwise $$$NO
+	;
+	; History:
+	; 26-May-2006	PO		SR14427: Created
+	;-------------------------------------------------------------------------------
+IsDemandOpen(pobjDemand)
+	new blnStatus
+ 
+	set blnStatus = $$$NO
+	
+	if $$$INDRPDEMANDReadyForDelivery(pobjDemand) && '$$$INDRPDEMANDDemandClosed(pobjDemand) && '$$$INDRPDEMANDDeleteOrder(pobjDemand) &&
+	   '$$$INDRPDEMANDBlocked(pobjDemand) && ($$$INDRPDEMANDDispatchNumber(pobjDemand) = "") && ($$$INDRPDEMANDItemNo(pobjDemand) '= "") &&
+	   ($$$INDRPDEMANDDemandType(pobjDemand) '= 9) && ($$$INDRPDEMANDQuantity(pobjDemand) '= 0) {
+		set blnStatus = $$$YES
+	}
+ 
+	quit blnStatus
+ 
+	;-------------------------------------------------------------------------------
+	; Used to determine whether the Outstanding Demands can be listed, eg. can you use
+	; the Load Open Demands.
+	;
+	; Params:
+	; pidTFR - Transfer Order Id
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 08-May-2006	PO		SR14427: Created (Phase 2)
+	;-------------------------------------------------------------------------------
+CanListOpenDemands(pidTFR="")
+	new objTFR,strStatus
+
+	set strStatus = $$$OK
+ 
+	if '$$$NoKey(pidTFR) {
+		set objTFR = $get(^INTFR(YM,pidTFR,1))
+		if $$$INTFRStatus(objTFR) '= $$$EnumINTFRSTATUSCreated {
+			set strStatus = $listbuild("IN00467")  ;Can not load Open Demands once the transfer is firmed.
+		}
+	}
+ 
+	$$$YQHandler(strStatus)
+ 
+	quit
+ 
+	;-------------------------------------------------------------------------------
+	; Custom COMView for listing Outstanding Demands.
+	;
+	; Params:
+	; pidTFR - Transfer Order Id
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 29-Apr-2006	PO		SR14427: Created (Phase 2)
+	;-------------------------------------------------------------------------------
+OpenDemandList(pidTFR="")
+	new objTFR,idSendingLocn,idReceivingLocn
+ 
+	set objTFR = $get(^INTFR(YM,pidTFR,1))
+	set idReceivingLocn = $$$INTFRReceivingLocation(objTFR)
+	set idSendingLocn = $$$INTFRSendingLocation(objTFR)
+ 
+	// FILTER FOR OPEN DEMANDS
+ 
+	do Initialise^COMViewCustom("INDRPDEMAND","OpenDemandSelected^INTFROpenDemands")
+	do AddFilter^COMViewCustom("P1","=",idSendingLocn)
+	do AddFilter^COMViewCustom("D"_$$$FldINDRPDEMANDRequestingLocation,"=",idReceivingLocn)
+	do AddFilter^COMViewCustom("D"_$$$FldINDRPDEMANDDemandClosed,"'=",$$$YES)
+	do AddFilter^COMViewCustom("D"_$$$FldINDRPDEMANDDeleteOrder,"'=",$$$YES)
+	do AddFilter^COMViewCustom("D"_$$$FldINDRPDEMANDDemandType,"'=",9)
+	do AddFilter^COMViewCustom("D"_$$$FldINDRPDEMANDDispatchNumber,"=","")
+	do AddFilter^COMViewCustom("D"_$$$FldINDRPDEMANDBlocked,"'=",$$$YES)
+	do AddFilter^COMViewCustom("D"_$$$FldINDRPDEMANDItemNo,"'=","")
+	do AddFilter^COMViewCustom("D"_$$$FldINDRPDEMANDQuantity,"'=",0)
+	do AddFilter^COMViewCustom("D"_$$$FldINDRPDEMANDReadyForDelivery,"=",$$$YES)
+ 
+	do Start^COMViewCustom()
+ 
+	quit
+ 
+	;-------------------------------------------------------------------------------
+	; Handle selection of Outstanding demands. Attempt to take out a lock, if successful
+	; then add demand to Transfer Order.
+	;
+	; Params:
+	; pobjResultSet - SQL result set from COMView
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 29-Apr-2006	PO		SR14427: Created (Phase 2)
+	;-------------------------------------------------------------------------------
+OpenDemandSelected(pobjResultSet)
+	new idKey,idDemandLoc,idDemand,objINDRPDEMAND,idReceivingLocn,lstLangText,strStatus,enmStatus,idTFR
+ 
+	set strStatus = $$$OK
+ 
+	set idTFR = $$$GRIDYKEYContainer
+ 
+	$$$GRIDAddBatchStart
+ 
+	while pobjResultSet.Next() {
+		set idKey = $$GetID^COMViewCustom(pobjResultSet)
+		
+		set enmStatus = $$AddLock^COMLock(YFORM,idTFR,"INDRPDEMAND",idKey)
+ 
+		set idDemandLoc = $piece(idKey,$$$COMMA,1)
+		set idDemand = $piece(idKey,$$$COMMA,2)
+ 
+		set lstLangText = $listbuild("IN00430",idDemand,idDemandLoc)  ;Demand %1 to be sent from location %2 is no longer available to be loaded.
+ 
+		if enmStatus = $$$EnumCOMLOCKLockSuccessful {
+	 		set objINDRPDEMAND = $get(^INDRPDEMAND(YM,idDemandLoc,idDemand,1))
+			set idReceivingLocn = $$$INDRPDEMANDRequestingLocation(objINDRPDEMAND)
+ 
+			set strStatus = $$Transaction^COMTransaction("LoadOpenDemandTxn^INTFROpenDemands("""_idDemandLoc_""","""_idDemand_""")")
+		} elseif enmStatus '= $$$EnumCOMLOCKLockOwnedByMe {
+			set strStatus = $$$NO
+		}
+ 
+		quit:$$$ISERR(strStatus)
+	}
+	
+	$$$GRIDAddBatchStop
+ 
+	if $$$ISERR(strStatus) $$$Alert(lstLangText)
+ 
+	quit
+ 
+	;-------------------------------------------------------------------------------
+	; Load an Outstanding demand on to a Transfer Order.
+	;
+	; Params:
+	; pidDemandLoc - Sending Site Location
+	; pidDemand - Demand Id
+	; pblnLoadInToGrid - $$$YES - Use $$$GRIDAddLine else use $$$Save - SR15090
+	; pidTFR - Transfer Id (Only required when pblnLoadInToGrid is $$$NO) - SR15090
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if successfully loaded demand on Transfer Order, otherwise $$$NO
+	;
+	; History:
+	; 21-May-2007	RPW		SR15513: Copy the group number to the TFR Line
+	; 10-Oct-2006	PO		SR15090: Now able to save directly (bypass adding grid line)
+	; 04-May-2006	PO		SR14427: Created (Phase 2)
+	;-------------------------------------------------------------------------------
+LoadOpenDemandTxn(pidDemandLoc,pidDemand,pblnLoadInToGrid=$$$YES,pidTFR)
+	new objDemand,objTFR,idSendingLocn,idReceivingLocn,BET,idTour ;,idxSendingLocn,idFullDemand
+	new objLine,idSupply,idItem,strStatus,objSupply,idLine,idKey ;,idxDemand,idFullSupply
+ 
+	set strStatus = $$$NO
+ 
+	set objTFR = $$$GRIDYFELDContainer
+ 
+	set objDemand = $get(^INDRPDEMAND(YM,pidDemandLoc,pidDemand,1))
+ 
+	set idReceivingLocn = $$$INTFRReceivingLocation(objTFR)
+	set idSendingLocn   = $$$INTFRSendingLocation(objTFR)
+ 
+	if $$IsDemandOpen(objDemand) && ($$$INDRPDEMANDRequestingLocation(objDemand) = idReceivingLocn) {
+		
+		;set idxSendingLocn  = $$$Index(idSendingLocn)
+		;set idxDemand       = $$$Index(pidDemand)
+		;set idFullDemand    = idSendingLocn_$$$COMMA_pidDemand
+		
+		set objLine = ""
+		set idItem = $$$INDRPDEMANDItemNo(objDemand)
+		set $$$INTFRLineItem(objLine)           = idItem
+		set $$$INTFRLineQuantity(objLine)       = $$$INDRPDEMANDQuantity(objDemand)
+		set $$$INTFRLineBaseQuantity(objLine)   = $$$INDRPDEMANDQuantity(objDemand) // SR14847
+		set $$$INTFRLineUnit(objLine)           = $$$INARTUnitofMeasure($get(^INART(YM,idItem,1)))
+		set $$$INTFRLineImportedDemand(objLine) = $$$YES
+		set $$$INTFRLineDemand(objLine)         = idSendingLocn_$$$COMMA_pidDemand
+	;	set idSupply                            = $order(^INDRPSUPPLYs(YM,6,idxSendingLocn,idxDemand,idReceivingLocn,""))
+	;	set idFullSupply                        = idReceivingLocn_$$$COMMA_idSupply
+	;	set $$$INTFRLineSupply(objLine)         = idFullSupply
+		set $$$INTFRLineSupply(objLine)         = $$GetSupplyKey^INTFRInterface(idSendingLocn,pidDemand)
+		set $$$INTFRLineGroupNumber(objLine)	= $$$INDRPDEMANDGroupNumber(objDemand) // SR15513
+		
+		if pblnLoadInToGrid { // SR15090
+			$$$GRIDAddLine(objLine,,"INTFRLine") // SR15090
+			set strStatus = $$$OK // SR15090
+		} else { // SR15090
+			set strStatus = $$$Save("INTFRLine",pidTFR_$$$COMMA_($order(^INTFRLine(YM,pidTFR,""),-1)+1),objLine,$$$YES) // SR15090
+		} // SR15090
+	
+	}
+	
+	quit strStatus
+ 
+ 
+		 
+	;-------------------------------------------------------------------------------
+	; Create a COMQuery for Outstanding demands.
+	;
+	; Params:
+	; pidLocation - Sending Site Location
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 16-Oct-2006	PO		SR15122: Provide links for priorities
+	; 08-May-2006	PO		SR14427: Created (Phase 2)
+	;-------------------------------------------------------------------------------
+OpenDemandsTable(pidLocation)
+	new Query,intCount,idAppParm
+	
+	set intCount = 1
+	set Query("Col",intCount) = "D~"_intCount_"~L~~~~~"_$$$StrINDRPDEMANDPriority
+	set idAppParm = ""
+	for {
+		set idAppParm = $order(^WWW101(0,"PRIORITAET",SPRACHE,idAppParm))
+		set intCount = intCount + 1
+		quit:idAppParm=""
+ 
+		set Query("Col",intCount) = "D~"_intCount_"~R~~~~~"_$$$WWW101Text($get(^WWW101(0,"PRIORITAET",SPRACHE,idAppParm,1)))
+	}
+	set Query("Col",intCount) = "D~"_intCount_"~R~~~~~"_$$$Text("IN00333") ; None
+ 
+	set Query("Col",1,"DoInstead") = "LocationLink^INTFROpenDemands"
+	set Query("Col",2,"DoInstead") = "PriorityLink^INTFROpenDemands" // SR15122
+	set Query("Col",3,"DoInstead") = "PriorityLink^INTFROpenDemands" // SR15122
+	set Query("Col",4,"DoInstead") = "PriorityLink^INTFROpenDemands" // SR15122
+	set Query("Col",5,"DoInstead") = "PriorityLink^INTFROpenDemands" // SR15122
+	set Query("Parameters","location") = pidLocation
+ 
+	set Query("Loop") = "MessageQueryLoop^INTFROpenDemands"
+	set Query("Get") = "set id = ^CacheTempTFROpenDemands(YUSER,id)"
+ 
+	set Query("Title") = $$$Text("IN00466")  ;Open Demands
+	set Query("PageSize") = 10
+ 
+	do Query^COMQuery(.Query,.VORG)
+ 
+	quit
+ 
+	;-------------------------------------------------------------------------------
+	; Generate the records COMQuery will use to build the table from.
+	;
+	; Params:
+	; pQuery - Object containing details of what COMQuery needs to use and do.
+	; pStorage - Where to store data, indirection used.
+	; pVORG - Not used.
+	;
+	; ByRefs: None
+	;
+	; Returns: intCount - The number of records to be displayed in the COMQuery
+	;
+	; History:
+	; 16-Oct-2006	PO		SR15122: Only include demands that can be fulfilled & pass through receiving location
+	; 08-May-2006	PO		SR14427: Created (Phase 2)
+	;-------------------------------------------------------------------------------
+MessageQueryLoop(pQuery,pStorage,pVORG)
+	new idLocation,idPriority,arrDRPDemands,intCount,objRecord,idOrder,idReceivingLocn,idDemand,objDemand,fltQuantity
+	new idxReady,idxDispatchNo,idxClosed
+ 
+	kill ^mtemp("Query",$job)
+	kill ^CacheTempTFROpenDemands(YUSER)
+ 
+	set idLocation = pQuery("Parameters","location")
+ 
+	// FILTER FOR OPEN DEMANDS
+ 
+	set idxReady = $$$YES
+	set idxDispatchNo = " "
+	for idxClosed = " ", $$$NO {
+		$$$Order7(^INDRPDEMANDs,YM,5,idxClosed,idxReady,idxDispatchNo,idLocation,idDemand)
+			set objDemand = $get(^INDRPDEMAND(YM,idLocation,idDemand,1))
+			;if ($$$INDRPDEMANDBlocked(objDemand) = $$$YES) || ($$$INDRPDEMANDDeleteOrder(objDemand) = $$$YES) ||
+			;   ($$$INDRPDEMANDDemandType(objDemand) = 9) || ($$$INDRPDEMANDItemNo(objDemand) = "") ||
+			;   ($$$INDRPDEMANDQuantity(objDemand) = 0) {
+			if '$$IsDemandOpen(objDemand) || $$IsExternallyLocked^COMLock("INDRPDEMAND",idLocation_$$$COMMA_idDemand) {
+				continue
+			}
+ 
+			set idReceivingLocn = $$$INDRPDEMANDRequestingLocation(objDemand)
+ 
+			set fltQuantity = $piece($$GetQuantity^INTRNValidation($$$INDRPDEMANDItemNo(objDemand),idLocation),Y,1) // SR15122
+			continue:fltQuantity<$$$INDRPDEMANDQuantity(objDemand) // SR15122
+ 
+			set idPriority = $$$INDRPDEMANDPriority(objDemand)
+			set:idPriority="" idPriority = " "
+			set:idPriority=0 idPriority = " "
+			set arrDRPDemands(idReceivingLocn,idPriority) = $increment(arrDRPDemands(idReceivingLocn,idPriority))_$$$COMMA_idReceivingLocn // SR15122
+		$$$End
+	}
+ 
+	set intCount = 0
+	set idLocation = ""
+	for {
+		set idLocation = $order(arrDRPDemands(idLocation))
+		quit:idLocation=""
+ 
+		set objRecord = idLocation_Y
+ 
+		set idPriority = ""
+		for {
+			set idPriority = $order(^WWW101(0,"PRIORITAET",SPRACHE,idPriority))
+			quit:idPriority=""
+ 
+			set objRecord = objRecord_$get(arrDRPDemands(idLocation,idPriority))_Y
+		}
+		if $data(arrDRPDemands(idLocation," ")) {
+			set objRecord = objRecord_arrDRPDemands(idLocation," ")_Y
+		}
+		set ^CacheTempTFROpenDemands(YUSER,idLocation) = $extract(objRecord,1,$length(objRecord)-1)
+		set @pStorage@($increment(intCount)) = idLocation 
+	}
+ 
+	quit intCount
+ 
+	;-------------------------------------------------------------------------------
+	; Return hyperlink that will be displayed in the column listing the site locations.
+	;
+	; Params:
+	; pidCol - Not used.
+	; pidLocation - Sending Site Location
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 16-Oct-2006	PO		SR15122: Return string instead of writing out
+	; 08-May-2006	PO		SR14427: Created (Phase 2)
+	;-------------------------------------------------------------------------------
+LocationLink(pidCol,pidLocation)
+	new strArgs,strOutput
+ 
+	set strArgs = "'SetLocations^INTFROpenDemands','"_YLOCATION_"','"_pidLocation_"'"
+ 
+	set strOutput = "<a href=""#"" onclick=""javascript:CallBack("_strArgs_");"">"
+	set strOutput = strOutput_"("_pidLocation_") "_$$$WWW0121LocationName($get(^WWW0121(0,YM,pidLocation,1)))
+	set strOutput = strOutput_"</a>"
+ 
+	quit strOutput
+ 
+PriorityLink(pidCol,pstrData)
+	;-------------------------------------------------------------------------------
+	; Return hyperlink that will be displayed in the column listing the site locations.
+	;
+	; Params:
+	; pidCol - Column Id
+	; pstrData - 
+	;
+	; ByRefs: None
+	;
+	; Returns: strOutput - HTML
+	;
+	; History:
+	; 13-Oct-2006	PO		SR15122: Created
+	;-------------------------------------------------------------------------------
+	new strArgs,strOutput,intNumberOfDemands,idLocation,idPriority
+	
+	set intNumberOfDemands = $piece(pstrData,$$$COMMA,1)
+	set idLocation = $piece(pstrData,$$$COMMA,2)
+ 
+	if pidCol = 2 {
+		set idPriority = 1
+	} elseif pidCol = 3 {
+		set idPriority = 2
+	} elseif pidCol = 4 {
+		set idPriority = 3
+	} elseif pidCol = 5 {
+		set idPriority = ""
+	}
+ 
+	set strArgs = "'SetLocations^INTFROpenDemands','"_YLOCATION_"','"_idLocation_"','"_idPriority_"'"
+ 
+	set strOutput = "<a href=""#"" onclick=""javascript:CallBack("_strArgs_");"">"
+	set strOutput = strOutput_intNumberOfDemands
+	set strOutput = strOutput_"</a>"
+ 
+	quit strOutput
+ 
+	;-------------------------------------------------------------------------------
+	; When user clicks a location hyperlink, set the Sending and Receiving Location fields
+	; and if the Transfer Date and Dispatch fields are populated then save the record.
+	;
+	; Params:
+	; pidSendingLocn - Sending Site Location
+	; pidReceivingLocn - Receiving Site Location
+	;
+	; ByRefs: Nothing
+	;
+	; Returns: None
+	;
+	; History:
+	; 16-Oct-2006	PO		SR15122: Pass through priority
+	; 10-Oct-2006	PO		SR15090: Call LinesToCreate
+	; 04-May-2006	PO		SR14427: Created (Phase 2)
+	;-------------------------------------------------------------------------------
+SetLocations(pidSendingLocn,pidReceivingLocn,pidPriority) // SR15122
+	new lstDispatch,objTFR
+	
+	set objTFR = $$GetFormData^COMUtilForm("INTFR")
+ 
+ 	do PopulateDataField^COMUtils(YFORM, $$$FldINTFRReceivingLocation, "")
+	do PopulateDataField^COMUtils(YFORM, $$$FldINTFRSendingLocation, pidSendingLocn)
+	do PopulateDataField^COMUtils(YFORM, $$$FldINTFRReceivingLocation, pidReceivingLocn)
+	;set $$$INTFRSendingLocation(objTFR) = pidSendingLocn
+	;set $$$INTFRReceivingLocation(objTFR) = pidReceivingLocn
+	if $$$INTFRTransferDate(objTFR) '= "" {
+		set lstDispatch = $$DefaultDispatch^INTFR(pidSendingLocn, pidReceivingLocn)
+		if $listget(lstDispatch,1) '= "" {
+			if $data(pidPriority) { // v SR15122
+				do LinesToCreate(pidSendingLocn, pidReceivingLocn, pidPriority) // SR15090
+			} else {
+				do LinesToCreate(pidSendingLocn, pidReceivingLocn) // SR15090
+			} // ^ SR15122
+			write "SAVENOW();"
+			;do CreateFirmAndPick(objTFR)
+		}
+	}
+ 
+	quit
+  
+LinesToCreate(pidSendingLocn, pidReceivingLocn, pidPriority)
+	;-------------------------------------------------------------------------------
+	; Create a list of demands that are to be loaded on to the transfer
+	;
+	; Params:
+	; pidSendingLocn - Sending Site Location
+	; pidReceivingLocn - Receiving Site Location
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 16-Oct-2006	PO		SR15122: Handle priority if passed through
+	; 10-Oct-2006	PO		SR15090: Created
+	;-------------------------------------------------------------------------------
+	new idxReady,idxDispatchNo,idxClosed,idDemand,objDemand,fltQuantity
+ 
+	kill ^CacheTempTFRLinesToCreate(YUSER)
+ 
+	set idxReady = $$$YES
+	set idxDispatchNo = " "
+	for idxClosed = " ", $$$NO {
+		$$$Order7(^INDRPDEMANDs,YM,5,idxClosed,idxReady,idxDispatchNo,pidSendingLocn,idDemand)
+			set objDemand = $get(^INDRPDEMAND(YM,pidSendingLocn,idDemand,1))
+			continue:pidReceivingLocn'=$$$INDRPDEMANDRequestingLocation(objDemand)
+ 
+			if '$$IsDemandOpen(objDemand) || $$IsExternallyLocked^COMLock("INDRPDEMAND",pidSendingLocn_$$$COMMA_idDemand) {
+				continue
+			}
+ 
+			set fltQuantity = $piece($$GetQuantity^INTRNValidation($$$INDRPDEMANDItemNo(objDemand),pidSendingLocn),Y,1)
+			continue:fltQuantity<$$$INDRPDEMANDQuantity(objDemand)
+			continue:+$$$INDRPDEMANDPriority(objDemand)'=+$get(pidPriority)
+ 
+			set ^CacheTempTFRLinesToCreate(YUSER,pidSendingLocn,idDemand) = ""
+		$$$End
+	}
+ 
+	quit
+ 
+ 
+ 
+CreateLinesTxn(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Load "open" demands that can be fulfilled
+	;
+	; Params:
+	; pidTFR - Transfer Id
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 10-Oct-2006	PO		SR15090: Created
+	;-------------------------------------------------------------------------------
+	new idLocation,idDemand,enmStatus,lstLangText,objDemand,strStatus
+ 
+	set strStatus = $$$OK
+ 
+	set idLocation = $order(^CacheTempTFRLinesToCreate(YUSER,""))
+	if idLocation '= "" {
+		$$$Order3(^CacheTempTFRLinesToCreate,YUSER,idLocation,idDemand)
+			set enmStatus = $$AddLock^COMLock(YFORM,pidTFR,"INDRPDEMAND",idLocation_$$$COMMA_idDemand)
+ 
+			set lstLangText = $listbuild("IN00430",idDemand,idLocation)  ;Demand %1 to be sent from location %2 is no longer available to be loaded.
+ 
+			if enmStatus = $$$EnumCOMLOCKLockSuccessful {
+	 			set objDemand = $get(^INDRPDEMAND(YM,idLocation,idDemand,1))
+ 
+				set strStatus = $$Transaction^COMTransaction("LoadOpenDemandTxn^INTFROpenDemands("""_idLocation_""","""_idDemand_""",0,"""_pidTFR_""")")
+			}
+ 
+			quit:$$$ISERR(strStatus)
+		$$$End
+	}
+	// need to report error
+	if strStatus = $$$NO set strStatus = lstLangText
+ 
+	quit strStatus
+ 
+	;-------------------------------------------------------------------------------
+	; Remove all references a demand & supply pair have to a Transfer Order
+	;
+	; Params:
+	; pobjLine - Transfer Order Line record
+	; pidDispatch - Tour / Dispatch Id
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 18-Oct-2006	JW			SR15134: Look at kill status
+	; 04-May-2006	PO			SR14427: Pass by ref the dispatch demand is attached to (Phase 2)
+	; 26-Apr-2006	RPW/PO		SR14427: Created
+	;-------------------------------------------------------------------------------
+RemoveLoadedDemand(pobjLine)
+	new objRecord,strStatus,idKey,idLocation,idDemand,idSupply,idSeq
+ 
+	set idKey = $$$INTFRLineDemand(pobjLine)
+	set idLocation = $piece(idKey,$$$COMMA,1)
+	set idDemand = $piece(idKey,$$$COMMA,2)
+ 
+	set objRecord = $get(^INDRPDEMAND(YM,idLocation,idDemand,1))
+	set pidDispatch = $$$INDRPDEMANDDispatchNumber(objRecord)
+ 
+	set $$$INDRPDEMANDTransfer(objRecord) = ""
+	set $$$INDRPDEMANDIsNew(objRecord) = ""
+	set $$$INDRPDEMANDDispatchNumber(objRecord) = ""
+	set $$$INDRPDEMANDShippedQuantity(objRecord) = ""
+	set $$$INDRPDEMANDPickListPrintDate(objRecord) = ""
+	set $$$INDRPDEMANDPickedQuantity(objRecord) = ""
+	set $$$INDRPDEMANDPickedBy(objRecord) = ""
+	set $$$INDRPDEMANDLoadListPrintDate(objRecord) = ""
+	set $$$INDRPDEMANDLoadedQuantity(objRecord) = ""
+	set $$$INDRPDEMANDDeliveryNotePrintedTo(objRecord) = ""
+	set $$$INDRPDEMANDDeliveryNotePrintedThroug(objRecord) = ""
+	set $$$INDRPDEMANDDateShipped(objRecord) = ""
+	set $$$INDRPDEMANDDemandClosed(objRecord) = ""
+	set strStatus = $$$Save("INDRPDEMAND",idLocation_$$$COMMA_idDemand,objRecord,$$$YES)
+ 
+	if $$$ISOK(strStatus) {
+		set idKey = $$$INTFRLineSupply(pobjLine)
+ 		
+ 		if $$$ISOK(strStatus) && (idKey'="") {		//SR15134
+			set idLocation = $$$KEY1(idKey)
+			set idSupply   = $$$KEY2(idKey)
+	 
+			quit:((idLocation="")||(idSupply="")) strStatus ; Required for situations where there is no supply for demand (EXISTING DATA) - $PIECE($GET(^INVORG(YM,YM,1)),Y,80)'=2
+	 
+			set objRecord=$get(^INDRPSUPPLY(YM,idLocation,idSupply,1))
+			set $$$INDRPSUPPLYTransfer(objRecord) = ""
+			set $$$INDRPSUPPLYIsNew(objRecord) = ""
+			set $$$INDRPSUPPLYDispatchNumber(objRecord) = ""
+			set $$$INDRPSUPPLYPickedQuantity(objRecord) = "" // ??
+			set $$$INDRPSUPPLYPickedBy(objRecord) = "" // ??
+			set strStatus = $$$Save("INDRPSUPPLY",idLocation_$$$COMMA_idSupply,objRecord,$$$YES)
+ 		}
+	}
+ 
+	quit strStatus
+]]></Routine>
+</Export>

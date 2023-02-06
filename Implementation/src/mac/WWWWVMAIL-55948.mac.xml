@@ -1,0 +1,262 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWWWVMAIL" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWWWVMAIL
+#include WWWConst
+#include COMSYS
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		WIEDERVORLAGEN UND ERINNERUNGEN ALS AUTOMATISCHE E-MAIL
+	;		RESUMBISSIONS/FOLLOW-UPS AND REMINDERS AS AUTOMATIC E-MAIL
+	;
+	; Inputs : 
+	;
+	;
+	; ByRef :
+	;
+	;
+	; Returns :	Nothing
+	;
+	; History :
+	; 23-Mar-2007	GRF		SR15482: doco; create Reminders as replacement entry point;
+	; 						use here.
+	; 24.10.2001	FIS
+	;-------------------------------------------------------------------------------
+	
+	do Reminders()
+	quit
+	
+	;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv SR15482 disabled
+	/*
+	;HINTERGRUNDJOB AUS WWWTAG ;out of 
+	IF $PIECE($GET(^INVORG(YM,YM,1)),Y,71)'=1 QUIT  ;KEIN E-MAIL ERWÜNSCHT ;no 
+	KILL ^WWWSOR(YUSER)
+	DO SORT
+	DO SEND
+	KILL ^WWWSOR(YUSER)
+	QUIT
+	*/
+	;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ SR15482
+Schedule(pidUser)
+	;-------------------------------------------------------------------------------
+	; Inputs:
+	;	pidUser		The specific user identified by a scheduled job.  Notifications
+	;				may go to many users, only those with scheduled jobs get e-mails.
+	; 
+	; History :
+	; 30-Mar-2007	GRF		SR15387: Called via COMSchedule.
+	;-------------------------------------------------------------------------------
+	new strMsg,strStatus
+	quit:$get(pidUser)=""
+	
+	set strUserName = $$$WWW013Name($get(^WWW013(0,pidUser,1)))
+	if strUserName="" set strUserName = pidUser
+	
+	kill ^CacheTempWWWWV(pidUser)
+	do Reminders(pidUser)
+	
+	if $data(^CacheTempWWWWV(pidUser)) {
+		set strStatus = $get(^CacheTempWWWWV(pidUser))
+		if $$$ISERR(strStatus) {
+			set strMsg = $$$Text($listbuild(74,strUserName))     ; "Error sending e-Mail to %1"
+		} else {
+			set strMsg = $$$Text($listbuild(75,strUserName))     ; "E-Mail sent to %1"
+		}
+	} else {
+		set strMsg = $$$Text($listbuild(76,strUserName))         ; "No Messages for %1"
+	}
+	kill ^CacheTempWWWWV(pidUser)
+	quit strMsg
+	
+Reminders(pidUser="")
+	;-------------------------------------------------------------------------------
+	; New Entry Point
+	; 
+	; Inputs:
+	;	pidUser		Optional single user selection; if blank sends messages for all users.
+	; 
+	; History :
+	; 23-Jun-2014	shobby	CORE-385.18: IN Module may not exist.
+	; 30-Mar-2007	GRF		SR15387: Pass optional User ID for single user issue.
+	; 23-Mar-2007	GRF		SR15482: copied and converted to package message in ^WWWSOR
+	;-------------------------------------------------------------------------------
+	if ($data(^INVORG(YM,YM,1)))&&(##class(%Library.Routine).Exists("INVORG"))&&($$AutoReminderEmail^INVORG()) { ;CORE-385.18
+		kill ^WWWSOR(YUSER)
+		do newSORT(YUSER,pidUser)
+		if $data(^WWWSOR(YUSER)) {
+			do SendReminder(YUSER,pidUser)
+			kill ^WWWSOR(YUSER)
+		}
+	}
+	quit
+ 
+	
+newSORT(YUSER,pidUser)
+	;-------------------------------------------------------------------------------
+	;	WIEDERVORLAGEN SUCHEN
+	; 
+	; Build a list of current messages (don't include future reminders/appointments)
+	; if called via 
+	; 
+	; History :
+	; 30-Mar-2007	GRF		SR15387: log e-Mail transmission details.
+	; 23-Mar-2007	GRF		SR15482: copied and converted to package message in ^WWWSOR
+	;-------------------------------------------------------------------------------
+	new dteReminder,strForm,strKey,strUser
+	
+	set strUser=""
+	for  {
+		set strUser=$order(^WWWWV(YM,strUser))
+		quit:strUser=""
+		continue:(pidUser'="")&&(strUser'=pidUser)
+		
+		set dteReminder=""
+		for  {
+			set dteReminder=$order(^WWWWV(YM,strUser,dteReminder))
+			quit:dteReminder=""
+			quit:dteReminder>$horolog
+			
+			set strForm=""
+			for  {
+				set strForm=$order(^WWWWV(YM,strUser,dteReminder,strForm))
+				quit:strForm=""
+				
+				set strKey=""
+				for  {
+					set strKey=$order(^WWWWV(YM,strUser,dteReminder,strForm,strKey))
+					quit:strKey=""
+					
+					set ^WWWSOR(YUSER,1,strUser,dteReminder,strForm,strKey)=$get(^WWWWV(YM,strUser,dteReminder,strForm,strKey,1))
+				}
+			}
+		}
+	}
+	quit
+	
+SendReminder(YUSER,pidUser)
+	;-------------------------------------------------------------------------------
+	;	SENDEN E-MAIL VORBEREITEN ;transmit prepare
+	;	
+	; History:
+	; 23-Jun-2014	shobby	CORE-385.18: IN Module may not exist.
+	; 08-Jan-2008	GRF		Add server and namespace information to e-mail
+	; 05-Apr-2007	GRF		SR15387: Pick up if explicit user doesn't have an e-mail account
+	; 30-Mar-2007	GRF		SR15387: Log status in ^CacheTempWWWWV.
+	; 23-Mar-2007	GRF		SR15482: copied and converted to package message in ^WWWSOR
+	;-------------------------------------------------------------------------------
+	new dteReminder,idMessage,intLine,intPiece,objCompany,objGeneral,objUser
+	new strEmailAddr,strNewLine,strStatus,strSubject,strText,strUser,strUserName
+	
+	set strNewLine = "<BR>"
+	set objCompany = $get(^WWW012(0,YM,1))           ; SR15482
+	set objGeneral = $get(^INVORG(YM,YM,1))
+	
+	set strSubject = $piece(objGeneral,Y,72)
+	if strSubject="" set strSubject=$$^WWWTEXT(32694)  ; "Date Reminder"
+	
+	set strUser=""
+	for {
+		set strUser=$order(^WWWSOR(YUSER,1,strUser))
+		quit:strUser=""
+		
+		set objUser = $get(^WWW013(0,strUser,1))
+		set strUserName = $$$WWW013Name(objUser)
+		set strEmailAddr= $$$WWW013EMailAddress(objUser)  ;E-MAIL ASCHRIFT
+		if strEmailAddr=""              quit      ;KEINE E-MAIL
+		if '$find(strEmailAddr,"@")     quit      ;UNGÜLTIGE E-MAIL   ; FIXME : to alternative users? multiple addresses  <GRF>
+		if (strEmailAddr="") || (strEmailAddr'["@") {
+			if strUser=pidUser set ^CacheTempWWWWV(strUser) = $$$NO     ; SR15387
+			quit
+		}
+		
+		set idMessage = $$Allocate^WWWMAILS()
+		set intLine   = 0
+		
+		set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_$$^WWWTEXT(32694)_" - "_$$^WWWDATE(+$horolog)_" - "_strUser  ; "Date Reminder"
+		set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_$zutil(110)_":"_$zutil(5)     ; 08-Jan-2008
+		set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine
+		
+		; Break reminder text into separate lines based on vertical separators
+		set strText=""																	;CORE-385.18
+		if ($data(^INVORG(YM,YM,1)))&&(##class(%Library.Routine).Exists("INVORG")) {	;CORE-385.18
+			set strText=$$LANGTextForEmailReminder^INVORG() 							;CORE-385.18
+		}																				;CORE-385.18
+		for intPiece=1:1  {
+			quit:$piece(strText,"|",intPiece,999)=""
+			
+			set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_$piece(strText,"|",intPiece)
+		}
+		set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_" "
+		
+		set dteReminder=$piece($order(^WWWSOR(YUSER,1,strUser,"")),".",1)
+		if dteReminder<$horolog {
+			set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_"--------------------------------------------"
+			set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_$$^WWWTEXT(32743)     ; "There are still some old Reminders"
+			set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_"--------------------------------------------"
+			set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_" "
+		}
+		
+		do AppendMsgs(idMessage,YUSER,strUser)
+		
+		set strStatus = $$PackageMail^WWWMAILS(idMessage,strSubject,strEmailAddr,strUserName)
+		set ^CacheTempWWWWV(strUser) = strStatus
+		
+		do Deallocate^WWWMAILS(idMessage)
+		hang 3
+	}
+	
+	quit
+	
+AppendMsgs(idMessage,YUSER,strUser)
+	;-------------------------------------------------------------------------------
+	; Date: FormName - Reminder Text (CreatedBy / CreatedTimeStamp)
+	; History:
+	; 23-Mar-2007	GRF		SR15482: created to package message in ^WWWSOR
+	;-------------------------------------------------------------------------------
+	new dteCreated,dteReminder,idUserCreated,intLine,objReminder,strForm,strKey,strMessage
+	new strNewLine,strPart1,strPart2,strReminder,strTimestamp,tmeCreated
+	
+	set strNewLine  = "<BR>"
+	set dteReminder = +$horolog
+	
+	set strForm=""
+	for  {
+		set strForm=$order(^WWWSOR(YUSER,1,strUser,dteReminder,strForm))
+		quit:strForm=""
+		
+		set strKey=""
+		for  {
+			set strKey=$order(^WWWSOR(YUSER,1,strUser,dteReminder,strForm,strKey))
+			quit:strKey=""
+			
+			set objReminder = $get(^WWWSOR(YUSER,1,strUser,dteReminder,strForm,strKey))
+			set dteCreated    = $piece(objReminder,Y,1)
+			set tmeCreated    = $piece(objReminder,Y,2)
+			set idUserCreated = $piece(objReminder,Y,3)
+			set strReminder   = $piece(objReminder,Y,4)
+		;	set strPriority   = $piece(objReminder,Y,5)
+			
+			if strReminder'="" {
+				set strTimestamp = $$^WWWDATE(dteCreated)_" "_$$^WWWTIME(tmeCreated)
+				set strMessage   = $$^WWWDATE($piece(dteReminder,".",1))_": "_$piece($get(^WWW120(0,strForm,1)),Y,1)_" - "_strReminder_" ("_idUserCreated_" / "_strTimestamp_")"
+				
+				; Purge embedded HTML (also removes any Cache errors?)
+				for  {
+					quit:'$find(strMessage,"<")
+					quit:'$find(strMessage,">")
+					
+					set (strPart1,strPart2)=""
+					if $find(strMessage,"<") set strPart1=$piece(strMessage,"<",1)
+					if $find(strMessage,">") set strPart2=$piece(strMessage,">",2,9)
+					set strMessage=strPart1_strPart2
+				}
+				
+				set intLine = $order(^WWWSOR(idMessage,""),-1)
+				set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_"---"
+				set ^WWWSOR(idMessage,$increment(intLine)) = strNewLine_strMessage
+			}
+		}
+	}
+	quit
+]]></Routine>
+</Export>

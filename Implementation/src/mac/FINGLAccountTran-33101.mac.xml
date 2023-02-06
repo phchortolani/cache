@@ -1,0 +1,566 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLAccountTran" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLAccountTran  ; GL Account Transactions
+	
+#include COMSYS
+#include FINConst
+	
+	/*
+	SR14286: Commented
+	
+Transactions()
+	;do TransactionsOld()
+	if $get(YKEY)'="" {
+		do TransactionsNew(YKEY)
+	}
+	quit
+	
+TransactionsNew(pidAccount)
+    ;-------------------------------------------------------------------------------
+    ; Replacement for previous Transactions routine using paging technology.
+    ; Based on ShowTransactionsForAccount^FINGLBankRecon
+    ; 
+    ; If there are multiple pages, THIS subroutine will be called again whenever
+    ; a page link is used to view other information.  In that case the Browser
+    ; will pass in a value through %("%KEY","QueryPage") - this will not exist on
+    ; the initial entry.  The array Query() will be cleared by the 'new' command
+    ; and is rebuilt, losing any special values that might have been generated
+    ; elsewhere.
+    ; 
+    ; Returns:
+    ;
+    ; History:
+    ; 26-Jul-2006	SC		SR14699: Fixed date range for Opening Balance.
+    ; 22-May-2006	GRF		Doco
+    ; 19-Jun-2005	SCR		SR12692: Removed Reason Code
+    ; 08-Oct-2004	GRF		SR10464: Balance is overwriting number of entries
+    ; 						causing page numbering fault
+    ; 30-Sep-2004	SCR		Added Reason Code (Column 8)
+    ; 27-Sep-2004	shobby	Put a $get around Query("Balance")
+    ; 22-Aug-2004	shobby	Included the link to the transaction.
+    ; 20-Aug-2004	Shobby	Created (SR10268)
+    ;-------------------------------------------------------------------------------
+	new Query,FCCode
+	
+	;------------------+--------+-------+--------+---------+------------------+-----------+
+	; Transaction Date | Number | Debit | Credit | Balance | Transaction Type | Reference |
+	;------------------+--------+-------+--------+---------+------------------+-----------+
+	; DD/MM/YYYY       | XXXXXX |  #.## |   #.## |    #.## | XXXXX (XXXX)     | XXXXXXXXX |
+	; DD/MM/YYYY       | XXXXXX |  #.## |   #.## |    #.## | XXXXX (XXXX)     | XXXXXXXXX |
+	; DD/MM/YYYY       | XXXXXX |  #.## |   #.## |    #.## | XXXXX (XXXX)     | XXXXXXXXX |
+	;------------------+--------+-------+--------+---------+------------------+-----------+
+	
+	set FCCode=$$GetFCCode^FINGLFC(pidAccount)
+	
+	set Query("Name")="Many"
+	set Query("Class")="FINGLTranLine"
+	set Query("Col",1)="D~4~L~~~~~"_$$$StrFINGLTranLineTransactionDate
+	set Query("Col",2)="P1~1~R~~~~~"_$$$StrFINGLTranLineNumber
+	set Query("Col",3)="D~2~R~~~~~"_FCCode_" "_$$$StrFINGLTranLineDebit   ; Deposit
+	set Query("Col",4)="D~3~R~~~~~"_FCCode_" "_$$$StrFINGLTranLineCredit  ; Withdrawal
+ ;	set Query("Col",5)="D~1~R~R~ ~Balance~~"_FCCode_"Balance" ;(Must have 2nd piece=1, 5th=space)
+	set Query("Col",5)="D~1~R~R~~Balance~~"_FCCode_$$$Text("Fin00050",0)  ;Balance
+	set Query("Col",6)="D~1~L~R~ ~Type~~"_$$$StrFINGLTranTransactionType ;(Must have 2nd piece=1, 5th=space)
+	set Query("Col",7)="D~5~L~~~~~"_$$$StrFINGLTranLineReference
+	;set Query("Col",8)="D~7~L~~~~~"_$$$StrFINGLTranLineReason
+		
+	set Query("Ref","Type")    = "$$GetTransactionType^FINGLTranLine(id(1))"
+	set Query("Ref","Balance") = "$$GetBalance^FINGLAccountTran(.id,.Query)"
+	
+	set Query("Form") = YFORM
+	set Query("Loop") = "MessageQueryLoop^FINGLAccountTran"
+	set Query("Get")  = "set id=$get(^FINGLTranLine(YM,id(1),id(2),1))"
+	set Query("Link") = "FINGLTran~P~1"
+	
+	set Query("Account")   = pidAccount
+	set Query("StartDate") = $$^WWWDATE1($GET(VORG(1)))
+	set Query("EndDate")   = $$^WWWDATE1($GET(VORG(2)))
+ 	set Query("Type")      = $get(VORG(3))
+ 	;set Query("OpenBalance")=$$GetBalanceAtDate(pidAccount,Query("EndDate")+1)   ; SR10464
+ 	set Query("OpenBalance")=$$GetBalanceAtDate(pidAccount,Query("EndDate"))   ; SR10464 ;SR14699
+ 	
+	set VORG=""
+	do Query^COMQuery(.Query,.VORG)
+	
+	quit
+	
+MessageQueryLoop(Query,Storage,VORG)
+    ;-------------------------------------------------------------------------------
+    ; COMQuery uses this to 
+    ; 
+    ; ByRef : Query   - Array of Query Parameters built in TransactionsNew
+    ;         Storage - Data storage location (^mtemp)
+    ;         VORG    - Array of Form variables
+    ;         
+    ; Returns: the number of entries added to Storage
+    ;
+    ; History:
+    ; 08-Oct-2004	GRF		SR10464 : Build Running Total (relative to current
+    ; 						account balance) as fourth entry in @Storage - allows
+    ; 						balance to be calculated over page boundaries;
+    ; 						Date check not updated when order reversed.
+    ; 01-Sep-2004	shobby	Only show Currency type transactions (SR7707)
+    ; 24-Aug-2004	shobby	Reversed the display order (SR10265)
+    ; 20-Aug-2004	Shobby	Created (SR10265)
+    ;-------------------------------------------------------------------------------
+	new blnFinancialTransaction,fltBalance,fltCredit,fltDebit,fltRunningTotal
+	new id,idAccount,idLine,idTran,intCount,intDate,intEndDate,intStartDate,intType
+	new objFINGLTran,objFINGLTranLine,strDate
+ 
+	kill ^mtemp("Query",$job)
+	set intCount        = 0
+	set fltRunningTotal = 0
+ 
+	set intType      = $get(Query("Type"))
+	set idAccount    = $get(Query("Account"))
+	set intStartDate = $get(Query("StartDate"))		set:intStartDate="" intStartDate=0
+	set intEndDate   = $get(Query("EndDate"))		set:intEndDate="" intEndDate=99999
+	
+	// ***********************************************
+	// TODO : Validation StartDate after EndDate?			<GRF>
+	// TODO : Only need a single OK with dates in form		<GRF>
+	// TODO : Consider enhancement to display earliest 
+	//        and latest transaction dates beside the
+	//        input fields									<GRF>
+	// ***********************************************
+	
+	;set intDate=intStartDate-1
+	set intDate=intEndDate+1
+	for  {
+		set intDate=$order(^FINGLTranLines(YM,1,idAccount,intDate),-1) ; for each date
+		quit:intDate=""
+	;	quit:intDate>intEndDate			;SR10464
+		quit:intDate<intStartDate
+		
+		set strDate=$$^WWWDATE(intDate)
+		set idTran=""
+		for {
+			set idTran=$order(^FINGLTranLines(YM,1,idAccount,intDate,idTran),-1) ; for each tran
+			quit:idTran=""
+			
+			set objFINGLTran=$get(^FINGLTran(YM,idTran,1))
+			set blnFinancialTransaction=($$$FINGLTranAmountType(objFINGLTran)="BAL")
+			if $$$FINGLTranPostedDate(objFINGLTran)'="" {		; unposted filter check
+				
+				if ((intType="") || (intType=$$$FINGLTranTransactionType(objFINGLTran))) &&
+				   blnFinancialTransaction              {  		; Transaction type filter
+					
+					set idLine=""
+					for {
+						set idLine=$order(^FINGLTranLines(YM,1,idAccount,intDate,idTran,idLine)) ; for each line
+						quit:idLine=""
+						
+						set objFINGLTranLine=$get(^FINGLTranLine(YM,idTran,idLine,1))
+						set fltDebit =$$$FINGLTranLineDebit(objFINGLTranLine)
+						set fltCredit=$$$FINGLTranLineCredit(objFINGLTranLine)
+						
+						set id(1)    = idTran
+						set id(2)    = idLine
+						set id(3)    = idAccount
+						set id(4)    = fltRunningTotal
+						set intCount = intCount+1
+						merge @Storage@(intCount) = id
+ 
+						set fltRunningTotal = fltRunningTotal+fltDebit-fltCredit
+					}
+				}
+			}
+		}
+	}
+	
+	quit intCount
+	*/
+	
+GetBalance(pid,pQuery)
+    ;-------------------------------------------------------------------------------
+    ; Apply the transaction change (Debit or Credit) to the current balance to
+    ; get the new balance.
+    ; 
+    ; The first page starts with the current account balance.
+    ; The prior balance for each line is now stored in the data retrieved so
+    ; that we no longer have to worry about what the NEW value was for the last
+    ; line of the previous page (which may never be displayed).
+    ; 
+    ; 
+    ; ByRef : pid    - Array : @Storage entry for a single transaction
+    ; 		  pQuery - Array of Query Parameters built in TransactionsNew
+    ; 
+    ; Returns: amended balance
+    ;
+    ; History:
+    ; 08-Oct-2004	GRF		SR10464 : Balance is to be based on progressive offset to
+    ; 						overcome reset at start of each page
+    ; 24-Aug-2004	shobby	Reversed the balance calculation.  Now the order
+    ; 						displayed is latest first (SR10265)
+    ; 20-Aug-2004	Shobby	Created (SR10265)
+    ;-------------------------------------------------------------------------------
+	new fltBalance,fltBalanceNew,fltCredit,fltDebit,idLine,idTran,objFINGLTranLine
+	
+	set objFINGLTranLine=$get(^FINGLTranLine(YM,pid(1),pid(2),1))
+ 
+	// SR10464 start
+	
+	; Opening Balance
+	;set fltBalance=$get(pQuery("Balance"))							  ; SR10464
+	set fltBalance=$get(pQuery("OpenBalance"))-$get(pid(4))
+	
+	//*************************************************************************
+	if $$$NEVER {			 ; SR10464 original code marked as obsolete
+    
+    ; Because the transactions are shown "Most Recent => Earliest" the
+    ; NEW balance will be required for the NEXT line - it is stored in
+    ; pQuery("Balance") & the prior entry is returned for display purposes.
+    
+	;	if fltBalance="" set fltBalance=$$GetBalanceAtDate(pQuery("Account"),pQuery("StartDate")-1)
+		if fltBalance="" set fltBalance=$$GetBalanceAtDate(pQuery("Account"),pQuery("EndDate")+1)
+		
+	;	set fltBalance    = $get(id("Balance"))
+		set fltBalanceNew = fltBalance
+		set fltDebit      = $$$FINGLTranLineDebit(objFINGLTranLine)
+		set fltCredit     = $$$FINGLTranLineCredit(objFINGLTranLine)
+		
+	;	set fltBalance    = $$$FCAdd(fltBalance,fltDebit)
+	;	set fltBalance    = $$$FCSub(fltBalance,fltCredit)
+		set fltBalanceNew = $$$FCSub(fltBalanceNew,fltDebit)
+		set fltBalanceNew = $$$FCAdd(fltBalanceNew,fltCredit)
+		
+		set pQuery("Balance")=fltBalanceNew
+	}  // end $$$NEVER
+	//*************************************************************************
+	
+	// SR10464 end
+	
+	; Next command tricks the WWWFORMAT into returning the value formatted in the
+	; same way that the other currency fields are in FINGLTranLine.
+	
+ 	set fltBalance = $$^WWWFORMAT("FINGLTranLine","D",2,fltBalance)
+ 	quit fltBalance 
+	
+TransactionsOld()	
+    ;-------------------------------------------------------------------------------
+	;
+	; History
+	; 07-Jul-2004	SCR		Changed order of transaction from reverse to forward
+	; 03-Jun-2004	SCR		FC Upgrade
+	; 11-Jul-2003	SCR		added unposted transaction filter
+	; 04-Jul-2003	shobby	TR005519 : Made some changes to handle the Non financial
+	; 						Postings.
+	; 26-Jun-2003	shobby	TR005456 : handle the time part of the Transaction date
+	; 						where included.
+	; 29-May-2003	SCR		Blank Option on Debits & Credits
+	; 12-May-2003   SCR		Bug fix on running balance, Swapped Debit Credit order.
+	; 20-Mar-2003	shobby	Reversed previous change.
+	; 10-Mar-2003	shobby	Use WWWTEXT to translate the Withdrawal(Credit)/
+	; 						Deposit(Debit) data labels.
+    ;-------------------------------------------------------------------------------
+	new Balance,Base,blnColour,blnFinancialTransaction,blnEmpty,Credit,Debit,FCCode
+	new i,idAccount,idLine,idTran,idx,idx2,intDate,intEndDate,intStartDate
+	new lstHeadings,lstPreviousDetails,obj,objFINGLTran,objTran,Rate
+	new strAccount,strCredit,strData,strDate,strDebit,strTime,strType
+	
+	set blnEmpty=1
+	set idAccount=YKEY
+	if idAccount="" set idAccount=" "
+ 
+	set FCCode=$$GetFCCode^FINGLFC(idAccount)
+	
+	; Set Heading to Transaction Date, Number, Debit, Credit, Balance
+	set lstHeadings=$listbuild($$^WWWFELDNAME("FINGLTran","D",$$$FldFINGLTranTransactionDate),
+						$$^WWWFELDNAME("FINGLTran","P",1),
+						FCCode_" "_$$^WWWFELDNAME("FINGLTranLine","D",$$$FldFINGLTranLineDebit),
+						FCCode_" "_$$^WWWFELDNAME("FINGLTranLine","D",$$$FldFINGLTranLineCredit),
+						FCCode_" "_$$$Text("Fin00054"))
+	if FCCode'="" {   ; If FC Account 
+		set lstHeadings=lstHeadings_$listbuild($$$Text("Fin00327"),$$$Text("Fin00328"))
+	}
+						
+	set lstHeadings=lstHeadings_
+					$listbuild($$^WWWFELDNAME("FINGLTran","D",$$$FldFINGLTranTransactionType),
+						$$^WWWFELDNAME("FINGLTranLine","D",$$$FldFINGLTranLineReference))
+					
+	;set lstHeadings=$lb("Transaction Date","Number",strDebit,strCredit,"Balance","Transaction Type","Reference")
+	do Start^COMTable(lstHeadings,,1,1)
+	
+	set intStartDate=$$^WWWDATE1($GET(VORG(1)))
+	set intEndDate  =$$^WWWDATE1($GET(VORG(2)))
+ 	set strType=$get(VORG(3))
+	set:intStartDate="" intStartDate=0
+	set:intEndDate="" intEndDate=99999
+	set lstPreviousDetails=""
+	
+	set intDate=intStartDate-1
+	
+	set Balance=$$GetBalanceAtDate(idAccount,intDate)
+	for  {
+		set intDate=$order(^FINGLTranLines(YM,1,idAccount,intDate)) ; for each date
+		quit:intDate=""
+		quit:intDate>intEndDate
+		
+		set strDate=$$^WWWDATE(intDate)
+		set idTran=""
+		for {
+			set idTran=$order(^FINGLTranLines(YM,1,idAccount,intDate,idTran)) ; for each tran
+			quit:idTran=""
+			
+			set objFINGLTran=$get(^FINGLTran(YM,idTran,1))
+			set blnFinancialTransaction=($$$FINGLTranAmountType(objFINGLTran)="BAL")
+			set idLine=""
+			set objTran=$get(^FINGLTran(YM,idTran,1))
+			if $$$FINGLTranPostedDate(objTran)="" continue		; unposted filter check
+			if strType'="",strType'=$piece(objTran,Y,3) continue  	; Transaction type filter
+			
+			for {
+				set idLine=$order(^FINGLTranLines(YM,1,idAccount,intDate,idTran,idLine)) ; for each line
+				quit:idLine=""
+				
+				set obj=$get(^FINGLTranLine(YM,idTran,idLine,1))
+				set Debit=$$$FINGLTranLineDebit(obj)
+				set Credit=$$$FINGLTranLineCredit(obj)
+				do NewLine^COMTable()
+				set strTime=$$$FINGLTranLineTransactionDate(obj)
+				if $length(strTime,",")>1 {
+					set strTime=" "_$$^WWWTIME(strTime)
+				} else {
+					set strTime=""
+				}
+				set strDate=$$^WWWDATE($$$FINGLTranLineTransactionDate(obj))_strTime
+				do InsertCell^COMTable(strDate,"FINGLTran",idTran,idAccount) ;TransactionDate
+				do InsertCell^COMTable(idTran,"FINGLTran",idTran,idAccount)
+				set strData("Debit")  =Debit
+				set strData("Credit") =Credit
+				set strData("Balance")=""
+				set strData("TransactionType")=$$GetTransactionType^FINGLAccount($$GetFullGlobalID^COMUtils($piece(objTran,Y,3)))_" - "_$$$FINGLTranAmountType(objFINGLTran)
+ 
+				if blnFinancialTransaction {
+					set Balance=$$$FCAdd(Balance,Debit)
+					set Balance=$$$FCSub(Balance,Credit)
+					set strData("Balance")=Balance
+					if FCCode'="" {
+						set strData("Debit")  =$$$FCAmount(Debit)
+						set strData("Credit") =$$$FCAmount(Credit)
+						set strData("Balance")=$$$FCAmount(strData("Balance"))
+					}
+					set strData("Debit")  =$$FormatCurrency^COMTable(strData("Debit"),1)
+					set strData("Credit") =$$FormatCurrency^COMTable(strData("Credit"),1)
+					set strData("Balance")=$$FormatCurrency^COMTable(strData("Balance"))
+				}
+				do InsertCell^COMTable(strData("Debit"),  "FINGLTran",idTran,idAccount,"Right") ;Debit
+				do InsertCell^COMTable(strData("Credit"), "FINGLTran",idTran,idAccount,"Right") ;Credit
+				do InsertCell^COMTable(strData("Balance"),"FINGLTran",idTran,idAccount,"Right") ;Balance
+				if FCCode'="" {
+					set Base=$$FormatCurrency^COMTable(Debit-Credit,1)
+					set Rate=$$$FCRate(Debit)
+					if Rate="" {
+						set Rate=$$$FCRate(Credit)
+					}
+					do InsertCell^COMTable(Base,"FINGLTran",idTran,idAccount,"Right") ; Base Currency
+					do InsertCell^COMTable(Rate,"FINGLTran",idTran,idAccount,"Right") ; Rate
+				}
+				do InsertCell^COMTable(strData("TransactionType"),"FINGLTran",idTran,idAccount) ; Tx Type
+				do InsertCell^COMTable($$$FINGLTranLineReference(obj),"FINGLTran",idTran,idAccount)
+				do EL^WWWTAB
+			}
+		}
+	}
+	do NewLine^COMTable()
+	for i=1:1:$listlength(lstHeadings) {
+		do InsertCell^COMTable("")
+	}
+	do EL^WWWTAB
+	do Stop^COMTable()
+	quit
+ 
+ 
+GetBalanceAtDate(Account,pdteEndDate)
+    ;-------------------------------------------------------------------------------
+	; Method to return the balance of an account by adding all of the
+	; transactions.  Includes some special technology to pass in a starting
+	; point so that multiple calls don't have to recalculate the same
+	; data
+	; 
+	; Params:		Account - GL Account to search for transactions,
+	; 				pdteEndDate - end date to seach transactions up to this date,
+	; 
+	; ByRefs:
+	; 
+	; Returns:		Total - total value of GL Account for the given date range.
+	;
+	; 04-Jun-2004	SCR		Added Unposted Filter & 
+	; 03-Jun-2004	SCR		FC Update
+	; 12-May-2003   SCR		Simplified
+	; 16-Feb-2003	shobby	Creation
+    ;-------------------------------------------------------------------------------
+	new Date,Rec,Total,Tran,TranLine,TranRec
+	
+	set Total=0
+	set Date=""
+	
+	for  {
+		set Date=$order(^FINGLTranLines(YM,1,Account,Date)) 
+		quit:Date=""  
+		quit:Date>pdteEndDate
+		
+		set Tran=""
+		for  {
+			set Tran=$order(^FINGLTranLines(YM,1,Account,Date,Tran)) 
+			quit:Tran=""
+			
+			set TranRec=$get(^FINGLTran(YM,Tran,1))
+			if $$$FINGLTranAmountType(TranRec)'="BAL" continue
+			if $$$FINGLTranPostedDate(TranRec)=""     continue	; unposted filter check
+			
+			set TranLine=""
+			for  {
+				set TranLine=$order(^FINGLTranLines(YM,1,Account,Date,Tran,TranLine)) 
+				quit:TranLine=""
+				
+				set Rec=$get(^FINGLTranLine(YM,Tran,TranLine,1))
+				set Total=$$$FCAdd(Total,$$$FINGLTranLineDebit(Rec))
+				set Total=$$$FCSub(Total,$$$FINGLTranLineCredit(Rec))
+			}
+		}
+	}
+	quit Total
+	
+	
+AccountTypeTotals()
+	;-------------------------------------------------------------------------------
+	; Display the Totals in the Account for each Account Type
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Sep-2004	shobby	If the balance is not a currency amount don't display
+	; 						currency symbols.  (SR7707)
+	; 02-Jun-2004	SCR		Dont Display Zero Amounts
+	; 13-May-2004	GRF		Clarify If Test
+	; 25-Feb-2004	shobby	Variable declaration.
+	; 06-Feb-2004	shobby	Creation
+	;-------------------------------------------------------------------------------
+	new idxType,objFINGLAccount,objFINGLAccountAmountType,objFINGLAccountTotal
+	new strAccountTypeDescription,Value
+	
+	if YKEY'="" {
+		do Start^COMTable($listbuild($$$Text("Fin00231"),$$$Text("Fin00232"),$$$Text("Fin00233")))  ;Type,Total,Description
+		set idxType=""
+		for {
+			set idxType=$order(^FINGLAccountAmountType(YM,idxType))
+			quit:idxType=""
+			
+			set objFINGLAccountAmountType=$get(^FINGLAccountAmountType(YM,idxType,1))
+			set objFINGLAccountTotal=$get(^FINGLAccountTotal(YM,YKEY,idxType,1))
+			if $$$ALWAYS { ;objFINGLAccountTotal'="" {
+				set strAccountTypeDescription=$$GetDescription^FINGLAccountAmountType(idxType)
+				if strAccountTypeDescription'="" {
+					do NewLine^COMTable()
+					set objFINGLAccount=$get(^FINGLAccount(YM,YKEY,1))
+					set Value=$$$FINGLAccountTotalAmount(objFINGLAccountTotal)
+					if Value'="" {
+						if $$$FINGLAccountAccountUsage(objFINGLAccount)=$$$EnumFINGLACCOUNTUSAGEParent {
+							do InsertCell^COMTable(idxType,"FINGLAccountBalance",idxType,YKEY_","_idxType) ; Type
+							if $$$FINGLAccountAmountTypeCurrencyType(objFINGLAccountAmountType) {
+								do InsertCurrencyCell^COMTable(Value)
+							} else {
+								do InsertCell^COMTable(Value,,,,"Right")
+							}
+							do InsertCell^COMTable(strAccountTypeDescription)						
+						} else {
+							do InsertCell^COMTable(idxType) ; Type
+							if $$$FINGLAccountAmountTypeCurrencyType(objFINGLAccountAmountType) {
+								do InsertCurrencyCell^COMTable(Value)
+							} else {
+								do InsertCell^COMTable(Value,,,,"Right")
+							}
+							do InsertCell^COMTable(strAccountTypeDescription)
+						}
+					}
+					do EL^WWWTAB
+				}
+			}
+		}
+		do Stop^COMTable()
+	}
+	quit
+	
+	
+ValidateAccount(pidAccount="",pidInterfaceType="",pidTransactionType="")
+    ;-------------------------------------------------------------------------------
+    ; Validates a FINGLAccount to make sure that you can post to it
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+    ; 23-Jun-2006	JW		SR12775: Encapsulate Postable check
+    ; 24-May-2006	SC		SR14574: Added error validation for On Hold, User Access, 
+    ; 							Posting Security. Skip unknown users
+    ; 09-Sep-2005	PO		SR13458: Use a listbuild on value assigned to strStatus
+    ; 20-Jun-2005	JW		SR12627: Statistical accounts. Cleaned up.
+    ; 07-Jun-2005	PO		SR12523 
+    ; 18-Oct-2004	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new strStatus
+ 
+	set strStatus = $$$OK
+	
+	if pidAccount="" {
+		set strStatus = $listbuild("Fin00186")                  ; "Account Required"
+		
+	} else {
+		if '$data(^FINGLAccount(YM,pidAccount,1)) {
+			set strStatus = $listbuild("Fin00067",pidAccount)   ; "Account %1 does not exist"
+			
+		} else { // SR12775: If the account exists do postable check
+			set strStatus = $$PostableAccount(pidAccount,pidInterfaceType,pidTransactionType)
+		}
+	}
+	
+	quit strStatus
+	
+	
+PostableAccount(pidAccount,pidInterfaceType="",pidTransactionType="")
+	;-------------------------------------------------------------------------------
+	; Postable checking for an account
+	;
+	; Params:	pidAccount			- (mandatory) valid FINGLAccount id
+	; 			pidInterfaceType	- (optional) FININTInterfaceType for posting
+	; 			pidTransactionType	- (optional) FINGLTranType for posting
+	;
+	; ByRefs:	nil
+	;
+	; Returns:	status
+	;
+	; History:
+	; 28-Jun-2006	JW		SR14642: Changed type tested for EOY.
+	; 23-Jun-2006	JW		SR12775: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,objFINGLAccount
+	
+	set strStatus = $$$OK
+	set objFINGLAccount=$get(^FINGLAccount(YM,pidAccount,1))
+	
+	if $$$FINGLAccountAccountType(objFINGLAccount)=$$$EnumFINGLACCOUNTTYPEStatistical {
+		set strStatus = $listbuild("Fin00804",pidAccount)            ; "Cannot post to a statistical account (%1)"
+		
+	} elseif $$$FINGLAccountAccountUsage(objFINGLAccount)'=$$$EnumFINGLACCOUNTUSAGETransaction {
+		set strStatus = $listbuild("Fin00066",pidAccount)            ; "Cannot post to account ´%1´, account ´%1´ must have Account Usage as ´Transaction´"
+	
+	} elseif $$$FINGLAccountOnHold(objFINGLAccount) { //SR14574
+		set strStatus = $listbuild("Fin00105",pidAccount)            ; "Cannot post to account ´%1´ marked as On Hold."
+	
+	} elseif ($$$FINGLAccountUserAccess(objFINGLAccount)'="") && ($get(YBED)'="") && (YBED'="UNKNOWN") { //SR14574
+		if ";"_$$$FINGLAccountUserAccess(objFINGLAccount)_";"'[(";"_$$$WWW013UserAccess($get(^WWW013(0,YBED,1)))_";") {
+			set strStatus = $listbuild("Fin01030",YBED,pidAccount)
+		}          ; "User ´%1´ does not have access to General Ledger Account ´%2´."
+		
+	;If end of year then bypass following
+	} elseif (pidInterfaceType'="") && $$$FINGLAccountEnablepostingsecurity(objFINGLAccount) && (pidInterfaceType'="EOY") {
+		if ";"_$$$FINGLAccountPermitted(objFINGLAccount)_";"'[(";"_pidInterfaceType_";") {
+			set strStatus = $listbuild("Fin01034",pidAccount)
+		}          ; "Posting Security enabled. Interface type is not allowed to post to Account '%1'."
+	}
+	
+	quit strStatus
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,476 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReqSource" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReqSource
+	
+#include INConst
+#include COMSYS
+#include COMConst
+#include COMView
+	
+OnAfterDataFields()
+	;-------------------------------------------------------------------------------
+	; Routine to run after data fields
+	;
+	; Called By: Form INReqSource
+	;
+	; Returns: --
+	;
+	; History:
+	; 21-Oct-2010	GRF		SR17533: new objStoredValue
+	; 04-Sep-2007	shobby	SRBR014677: Another try. Get cached value of location,
+	; 							if not use YLOCATION
+	; 04-Sep-2007   PJones	SR15548: Removed Location filter from because we
+	; 							actually want to filter the dynamic table *not* the
+	; 							edit grid via COMView
+	; 30-Aug-2007	shobby	SRBR014677: YLOCATION is no good.  The list contains
+	; 							distribution locations which is not related to the
+	; 							users current location.
+	; 23-Aug-2007	shobby	SRBR014677: Default the location to YLOCATION
+	; 31-Jul-2007	Karine	SR15548: Location filter
+	; 28-May-2007	RPW		SR15513:  Add external filters for the raise date.
+	; 						Also clear the external filters before we go. 
+	; 						Add horizon processing
+	; 16-Feb-2007	RPW		SR15436: Load the COMViewGridEdit only on page 1
+	; 27-Dec-2006	SS		SR15316: Created (Copied from REQUISITIONVAR)
+	;-------------------------------------------------------------------------------
+	new objStoredValue,strStoredValue
+	
+	$$$ClearExternalFilter(YFORM)
+	
+	do AddExternalFilter^COMViewFilter(YFORM,"D26","",$$$EnumCOMVIEWCOMPARATORNotEquals,$$$YES)
+	do AddExternalFilter^COMViewFilter(YFORM,"D26",$horolog+$$GetHorizon^INReqCommon()+1,$$$EnumCOMVIEWCOMPARATORLessThan,$$$YES)
+	do AddExternalFilter^COMViewFilter(YFORM,"D15",$$$EnumINREQSTATUSFirmed,$$$EnumCOMVIEWCOMPARATOREquals,$$$ANNO)
+ 
+ 	if $data(^CacheTempExternalFilter(YUSER,YUCI,YFORM,"Filter","D16")) {
+	 	set objStoredValue = $get(^CacheTempExternalFilter(YUSER,YUCI,YFORM,"Filter","D16"))
+	 	if $piece(objStoredValue,Y,2)=$get(YLOCATION) {
+	 		set strStoredValue = $piece(objStoredValue,Y,1)
+	 	} else {
+		 	set strStoredValue = $get(YLOCATION)
+	 	}
+ 	} else {
+	 	set strStoredValue = $get(YLOCATION)
+ 	}
+ 	; not filtering locations by "distributor" 
+ 	do AddExternalFilter^COMViewFilter(YFORM,"D16",strStoredValue,$$$EnumCOMVIEWCOMPARATOREquals,$$$YES,,"^CacheTempExternalFilter(YUSER,YUCI,YFORM,""Filter"",""D16"")") //SR15548  ;BR014677
+	do LoadGrid^INReqCommon(YFORM,YSEITE=2)
+	do LoadCOMViewGrid^COMViewFilter(YFORM,YFORM_"Line",1)
+	quit
+	
+	
+OnBeforeSave()
+	;-------------------------------------------------------------------------------
+	; Routine to run before saving a data record
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Dec-2006	SS		SR15316: Created (Copied from REQUISITIONVAR)
+	;-------------------------------------------------------------------------------
+	do OnBeforeSave^INReqCommon()
+	quit
+	
+	
+Source(parrRequisitions="")
+	;-------------------------------------------------------------------------------
+	; Perform the sourcing
+	;
+	; Called By : Form INReqSource Button 2 "Source Supplies"
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Dec-2007	Karine	BR014709: Decouple Business Logic from User Interface
+	; 27-Dec-2006	SS		SR15316: Created (Copied from REQUISITIONVAR)
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus=$$CanSource($$$YES)
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$Transaction^COMTransaction("SourceTxn^INReqSource("""_parrRequisitions_""")",$$$YES) //BR014709
+		if $$$ISOK(strStatus) {
+			do ReloadForm^COMUtilForm()
+		}
+	}
+	
+	quit strStatus
+	
+	
+CanSource(pblnQuick=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Determines if we can source this sourcing record.
+	; 
+	; The current user must have the lock on the line, it must be marked as to be sourced.
+	; 
+	; The line must also have a Supplier and a quantity > 0.
+	; 
+	; Finally it must check that if we must have an agreement that we do.
+	; 
+	; Called By: Button 2 "Source Supplies" on form INReqSource (Execute to Check for Disabled)
+	; 
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; OK if we can source. Otherwise the relevant error and the line it appeared on.
+	;
+	; History:
+	; 19-Feb-2007	RPW		SR15436: Rewrote to break up code. 
+	; 15-Feb-2007	RPW		SR15436: Use the locks to search through much faster.
+	; 22-Jan-2007	PO		SR15400: Corrected lock check, Firstly need to check
+	; 							whether I have lock AND whether anyone else has
+	; 							the lock.  Secondly: since no longer checking
+	; 							records I have locked, need to apply the filters
+	; 18-Jan-2007	JW		SR15340: Use MakeStatus
+	; 27-Dec-2006	Steve S	SR15316: Created (Copied from REQUISITIONVAR)
+	;-------------------------------------------------------------------------------
+	new strStatus,arrLines
+	
+	set strStatus=$case(pblnQuick,$$$YES:$$CanSourceQuick(.arrLines),:$$CanSourceSlow(.arrLines))
+	
+	if $$$ISOK(strStatus) {
+		if '$data(arrLines) {
+			set strStatus = $listbuild("IN00609")  ; "No lines available for sourcing."
+		}
+	}
+	
+	$$$YQHandler(strStatus)
+	
+	quit strStatus
+	
+	
+CanSourceSlow(&parrLines)
+	;-------------------------------------------------------------------------------
+	; Loop through the requisitions index 4 to check for sourcing.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Jun-2011	GRF		SR17732: Replace error message
+	; 16-May-2007	RPW		SR15513: Allow "better" handling of the action button
+	; 							when coming from another form; Complete rewrite
+	; 19-Feb-2007	RPW		SR15436: Created
+	;-------------------------------------------------------------------------------
+	new idLine,strStatus
+	
+	set strStatus = $$$OK
+	
+	do GetLockIds^WWWMultiLock(YFORM,YFORM_"Line",YUSER)
+	
+	if '$data(^CacheTempMultiLockIds(YUSER,YUCI)) {
+	;	set strStatus = $$$Text("IN00682")  ; "Please click save to enable"   ; SR17732
+		set strStatus = $$$Text(34098) ; "Cannot process this transaction at present as associated records are currently in use."
+	
+	} else {
+		set idLine = ""
+		for {
+			set idLine = $order(^INRequisitions(0,1,"2",1,0,idLine))
+			quit:idLine=""
+			continue:$$$InUseElsewhere(YFORM,YFORM_"Line","0,"_idLine,YBED)
+			
+			set strStatus = $$CanSourceLine(idLine,.parrLines)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	kill ^CacheTempMultiLockIds(YUSER,YUCI)
+	quit strStatus
+	
+	
+CanSourceQuick(&parrLines)
+	;-------------------------------------------------------------------------------
+	; Loop through the currently locked entries to check for sourcing.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Feb-2007	RPW		SR15436: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,strKeys
+	
+	set strStatus=$$$OK
+	
+	do GetLockIds^WWWMultiLock(YFORM,YFORM_"Line",YUSER) // SR15436
+	
+	set strKeys = ""
+	for {
+		set strKeys = $order(^CacheTempMultiLockIds(YUSER,YUCI,strKeys))
+		quit:strKeys=""
+		
+		set strStatus=$$CanSourceLine($$$KEYMAX(strKeys),.parrLines)
+		quit:$$$ISERR(strStatus)
+	}
+	
+	kill ^CacheTempMultiLockIds(YUSER,YUCI)
+			
+	quit strStatus
+	
+	
+CanSourceLine(pidLine,&parrLines)
+	;-------------------------------------------------------------------------------
+	; Return status of whether the line can be sourced.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 08-May-2007	RPW		SR15513: Added check for Type = Transfer and there is a
+	;							sourcing location
+	; 19-Feb-2007	RPW		SR15436: Created
+	;-------------------------------------------------------------------------------
+	new fltCurrent,fltQuantity,idAgreement,idItem,idSupplier,objLine,strStatus
+ 
+	set strStatus = $$$OK
+	 
+	set objLine = $get(^INRequisition(0,0,pidLine,1))
+	
+	if $$$INRequisitionSource(objLine) {
+		set parrLines(pidLine) = ""
+ 
+		set idSupplier = $$$INRequisitionSupplier(objLine)
+	
+		if $$$INRequisitionQuantity(objLine)<=0 {
+			set strStatus = $$$MakeStatus("IN00559",pidLine)
+		} ; "The quantity must be greater than 0 on line %1."
+		
+		if $$$ISOK(strStatus) {
+			if $$$INRequisitionType(objLine)=$$$EnumINREQUISITIONTYPETfr {
+				if $$$INRequisitionSourcingLocation(objLine)="" {
+					set strStatus = $$$MakeStatus("IN00680",pidLine)
+				} ; "A Sourcing Location must be selected on line %1 when Transferring Stock."
+				
+			} else {		
+				if $$RequiresMasterAgreement^INReqSourceLine(objLine) &&
+				   $$HasNoMasterAgreements^INReqSourceLine(objLine)   &&
+				    '$$$INRequisitionEmergency(objLine)                  {
+					
+					set strStatus = $$$MakeStatus("IN00560",pidLine)
+					; "Line %1 is no longer valid, the DRP setup does not allow sourcing."
+				
+				} else {
+					if idSupplier="" {
+						set strStatus = $$$MakeStatus("IN00558",pidLine)
+					} ; "A supplier must be selected on line %1."
+				}
+			
+				set idAgreement = $$$INRequisitionAgreement(objLine)
+				set idItem      = $$$INRequisitionItem(objLine)
+		 
+				if (idSupplier'="") && (idAgreement'="") && $$$ISOK(strStatus) {
+					set fltQuantity = $$GetLineQuantityForAgreement^INReqCommon(idSupplier,idAgreement,idItem,$$$EnumINREQSTATUSFirmed)
+					set fltCurrent  = $$GetAgreementQty^INReqCommon(idSupplier,idAgreement,idItem)
+				
+					if fltQuantity>fltCurrent {
+						set strStatus = $$$MakeStatus("IN00610",idItem,idAgreement)
+					} ; "There are too many %1´s required for Agreement %2."
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+SourceTxn(parrRequisitions="")
+	;-------------------------------------------------------------------------------
+	; Create the supplier orders for the sourced requisition lines.
+	; Note it consolidates like lines.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Sep-2010	PPP		SR17533:Only proceed if idLocation is defined
+	; 28-Nov-2007	Karine	BR014709: Decouple Business Logic from User Interface
+	; 29-Aug-2007	shobby	SRBR014684: Store group number in INRequisition.
+	; 01-Jun-2007	RPW		SR15513: use idLocnTemp to simplify code
+	; 15-May-2007	RPW		SR15513: Update the demand field with the newly created
+	; 							demand.  Set the groupnumber.  Allow the drp created
+	; 							transfer requisitions to automatically firm but
+	; 							only if we get a supply location from INDRPITEM/S.
+	; 12-Apr-2007	RPW		SR15495: Update the agreement here.
+	; 29-Nov-2006	JW		SR15249: Added history line
+	; 30-Nov-2006	RPW		SR15249
+	;-------------------------------------------------------------------------------
+	new enumGroupBy,idDemand,idLine,idLocation,idLocnTemp,objLine,objRequisition
+	new strKeys,strNumbers,strStatus
+
+	set strStatus  = $$$OK
+	set strNumbers = ""
+	set idLocation = ""
+	
+	
+	//****************************** GET THE LOCATION FIRST ************************
+	//if parrRequisitions'="" {	
+	if $data(parrRequisitions)<10 {
+		do GetLockIds^WWWMultiLock(YFORM,YFORM_"Line",YUSER)
+		
+		set strKeys = ""
+		for {
+			set strKeys = $order(^CacheTempMultiLockIds(YUSER,YUCI,strKeys))
+			quit:strKeys=""
+			
+			set idLine  = $$$KEYMAX(strKeys)
+			set objLine = $get(^INRequisition(0,0,idLine,1))
+	
+			if $$$INRequisitionSource(objLine) {
+				set idLocation = $$$INRequisitionLocation(objLine)
+				quit
+			}
+		}
+	
+	} else {
+		set strKeys = ""
+		for {
+			set strKeys = $order(parrRequisitions(strKeys))
+			quit:strKeys=""
+			
+			set idLine  = $$$KEYMAX(strKeys)
+			set objLine = $get(^INRequisition(0,0,idLine,1))
+			if $$$INRequisitionSource(objLine) { 
+				set idLocation = $$$INRequisitionLocation(objLine)
+				quit
+			}
+		}
+	}
+	//******************************^^^^^^^^************************
+
+	//SR17533	
+	if idLocation'="" {
+		set enumGroupBy = $$GetGroupDemandsBy^WWW0121(idLocation)
+	
+		//if parrRequisitions'="" {	
+		if $data(parrRequisitions)<10 {	
+			set strKeys = ""
+			for {
+				set strKeys = $order(^CacheTempMultiLockIds(YUSER,YUCI,strKeys))
+				quit:strKeys=""
+			
+				set idLine  = $$$KEYMAX(strKeys)
+				set objLine = $get(^INRequisition(0,0,idLine,1))
+				if idLine '="" {
+					set strStatus = $$SourceTxnAux(idLine,objLine,enumGroupBy,.strNumbers)	
+				}
+				quit:('strStatus)
+			}
+		
+			kill ^CacheTempMultiLockIds(YUSER,YUCI)	
+		
+		} else {
+			set strKeys = ""
+			for {
+				set strKeys = $order(parrRequisitions(strKeys))
+				quit:strKeys=""
+			
+				set idLine  = $$$KEYMAX(strKeys)
+				set objLine = $get(^INRequisition(0,0,idLine,1))
+				if idLine '="" {
+					set strStatus = $$SourceTxnAux(idLine,objLine,enumGroupBy,.strNumbers)	
+				}
+				quit:('strStatus)
+			}
+		}
+	
+		if (strNumbers'="") && $$$ISOK(strStatus) {
+			if $extract($reverse(strNumbers))="," set strNumbers = $extract(strNumbers,1,$length(strNumbers)-1)
+			$$$Alert($listbuild("IN00683",strNumbers))
+		}
+	
+		set strStatus = $$UpdateStatus^INReqCommon(1,$$$EnumINREQSTATUSFirmed,$$$EnumINREQSTATUSSourced,$$$FldINRequisitionSourcedAt)
+	
+	}
+	quit strStatus
+	
+	
+SourceTxnAux(pidLine,pobjLine,penumGroupBy,&strNumbers)
+	;-------------------------------------------------------------------------------
+	; Create the supplier orders for the sourced requisition lines.
+	;
+	; Params: pidLine =  id Line from Sourcing
+	; 		: pobjLine = obj from Sourcing
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 24-Mar-2009	GRF		SR16433: was using undefined enumGroupBy rather than
+	; 							parameter; renamed and removed newed variable
+	; 28-Nov-2007	Karine	BR014709: Copied from SourceTxn, to switch from params
+	; 							come from Sourcing screen or from a WebServer
+	;-------------------------------------------------------------------------------
+	new arrLocations,blnFirmSF,fltQuantity,idAgreement,idDemand,idDRPUser
+	new idItem,idLanguage,idLine,idLocn,idLocnTemp,idSourcingLocn,idSupplier,idSupplyLocn
+	new intGroupNo,objLine,strStatus
+	
+	set idLocnTemp = 0
+	set strNumbers = ""
+	set strStatus  = $$$OK	
+	
+	set idDRPUser = YBED
+	do GetUserDetails^INDRPSTART1(.idDRPUser,.idLanguage)
+	
+	if $$$INRequisitionSource(pobjLine) {
+		if $$$INRequisitionType(pobjLine)=$$$EnumINREQUISITIONTYPETfr {
+			set idSourcingLocn = $$$INRequisitionSourcingLocation(pobjLine)
+			set idLocn         = $$$INRequisitionLocation(pobjLine)
+			set idItem         = $$$INRequisitionItem(pobjLine)
+			if penumGroupBy = $$$EnumINLOCATIONGROUPNUMBERShipFrom {
+				set idLocnTemp = idSourcingLocn
+			}
+			if '$data(arrLocations(idLocnTemp)) {
+			; FIXME : This array is newed on every call and not used within a loop so pointless.
+			;         If the intention is to keep all the entries for each source location together
+			;         some how/where it would appear we fail.  What was the previous version like? <GRF>
+				set arrLocations(idLocnTemp) = $$^WWWNEXT("INTfrGroupNumber")
+				set intGroupNo = $get(arrLocations(idLocnTemp))
+				set strNumbers = strNumbers_intGroupNo_","
+			}
+			
+			set idDemand = $$Process^INDRPDEMANDN(pidLine,pobjLine,intGroupNo)
+			set $$$INRequisitionGroupNumber(pobjLine)     	= intGroupNo      ;BR014684
+			set $$$INRequisitionDemand(pobjLine)         	= idDemand
+			set $$$INRequisitionRejected(pobjLine) 			= $$$NO
+			set strStatus = $$$Save("INRequisition","0,"_pidLine,pobjLine,$$$YES)
+			
+			do AddEntry^COMChangeHistory(0,"INReqSourceLine",YBED,"0,"_pidLine,$$$Text($listbuild("IN00699",intGroupNo,$$$KEY1(idDemand),$$$KEY2(idDemand))))
+			; "Group Number: %1 Demand Location: %2, ID: %3"
+				
+			// Allow AutoFirm of demands from DRP created Requisitions
+				
+			if idDRPUser=$$$INRequisitionCreatedBy(pobjLine) { // Only autofirm demands where the requisition was created by DRP		
+				set blnFirmSF    = $$GetFieldFromDRP^INDRPITEM(idLocn,idItem,$$$FldINDRPITEMFirmSFDemand)
+				set idSupplyLocn = $$GetFieldFromDRP^INDRPITEM(idLocn,idItem,$$$FldINDRPITEMSupplyLocation)
+				
+				if blnFirmSF && (idSupplyLocn'="") && (idSupplyLocn=idSourcingLocn) {
+					do ReleaseDemands^INReqDemand(idDemand)
+				}
+			}
+				
+		} else {
+			set idAgreement = $$$INRequisitionAgreement(pobjLine)
+			if idAgreement '= "" {
+				set idSupplier  = $$$INRequisitionSupplier(pobjLine)
+				set idItem      = $$$INRequisitionItem(pobjLine)
+				set fltQuantity = $$$INRequisitionQuantity(pobjLine)
+				do UpdateAppliedQuantity^INSupMastAgreeItem(idSupplier,idAgreement,idItem,fltQuantity)
+			}
+		}
+	}
+	quit strStatus
+	
+]]></Routine>
+</Export>

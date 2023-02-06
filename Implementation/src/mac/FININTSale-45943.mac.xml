@@ -1,0 +1,738 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FININTSale" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FININTSale
+	
+#include COMSYS
+#include FINConst
+	
+	;-------------------------------------------------------------------------------
+	; 
+	; TODO : Move CusShip processing elsewhere to reduce size
+	; 
+	; Structure: Posting
+	;	Post	-> PostLines 		-> PostIncome
+	;								-> PostCosts
+	;								-> PostTaxes
+	;								-> PostDiscounts
+	;			-> PostPayments 	
+	;			-> PostBlock
+	; 
+	; CST Matrix Account Types for "SAL"
+	; ----------------------------------
+	;	1   Cost of Goods Sold
+	;	2   Order Contra (GINI)
+	;	3   Income 
+	;	-   Tax
+	;	-   Discount
+	;	-   Customer or Cash
+	; 	
+	; Structure: Message
+	;	See DTD 'SALSale', "INCusInv"
+	; History:
+	; 28-Apr-2005	GRF		SR10478 : Add extra documentation; shrink long variables
+	; 11-Feb-2005	GRF		SR10478 : Change PreFix to Prefix throughout
+	; 10-Feb-2005	GRF		SR11273 : Apply TLEVEL test to TCOMMIT instead of
+	; 						TROLLBACK; use $$$OK/$$$NO; alignment of parameters in
+	; 						$$GetValue^FINSYSDCM calls allows options to be more
+	; 						easily seen
+	; 17-Nov-2004	GRF		Replace YKOMMA with $$$COMMA; new order
+	;-------------------------------------------------------------------------------
+	
+DCMPost(SaleID,Sale)
+	;-------------------------------------------------------------------------------
+	; Posts a sale from the "SAL" module.
+	;
+	; Returns:DCM Status
+	;
+	; History:
+	; 11-Nov-2004	Paul K	Return the batch & block number relating to that sale.
+	; 08-Jun-2004	SCR		Reset FININTSale before merge
+	; 29-May-2002	Paul K	Returned status if sale has already been posted. Does
+	; 						not cause error though (so DCM will keep going)
+	;-------------------------------------------------------------------------------
+	new strBatchBlock,strStatus
+ 
+	set strStatus=$$$OK
+	
+	if $get(^FININTSale(YM,SaleID,"Posted"))="" {
+		kill ^FININTSale(YM,SaleID)
+		merge ^FININTSale(YM,SaleID)=@Sale
+		set strStatus=$$Post(Sale,.strBatchBlock)
+		
+		if $$$ISOK(strStatus) {
+			set ^FININTSale(YM,SaleID,"Posted")=$h
+			set strStatus=$$$OK_Y_strBatchBlock
+		} else {
+			set strStatus=$$$NO_Y_$$$Text(strStatus)
+		}
+	} else {
+		set strStatus=$$$OK_Y_$$$Text($listbuild("Fin00170"))  ; Sale has already been posted in Finance
+	}
+ 
+	quit strStatus
+	
+DCMCusInvoice(Message)
+	;-------------------------------------------------------------------------------
+	; Customer Invoice from Back Office
+	; Convert to a Sale Account Charge Message and post as a Sale.
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Aug-2005	JW		SR13297: Subtract discounts.
+	; 22-Jun-2005	shobby	Reviewed (with PK) previous change and removed.  strBatchBlock is now initialised to ""
+	; 						If an attempt is made to post a sale a second time, basically it is just ignored
+	; 						and the message does not hold up the event queue.
+	; 21-Jun-2005	shobby	Set an error message if trying to post a record that
+	; 						has already been posted. SR12671
+	; 22-Feb-2005	GRF		SR10478 : Correct spelling "Insurance"
+	; 10-Nov-2004	Paul K	Added Batch & Block getting returned with message
+	; 02-Apr-2004	shobby	If a discount comes from in is 0 then set to "" which
+	; 						will be overridden using supplier terms.
+	; 24-Mar-2004	SCR		Added Tax to Total for Customer Charge
+	; 31-Jul-2003	SCR		Corrected Discount Amount and Perserved Message
+	; 16-Jul-2003	SCR		Add "Goods Shipped" indicator (Used for selection of
+	; 						SOH & INSHIP line types)
+	; 10-Jul-2003	SCR		Message format Changes
+	; 02-Jul-2003	SCR		Bug Correction
+	;-------------------------------------------------------------------------------
+	new Customer,Discount,Extra,ExtraAcc,ExtraValue,Line,Number,Prefix
+	new Sale,Status,strBatchBlock,TaxLine,Total,DiscountLine
+	
+	set Sale="^mtemp(""DCMCusInvoice"",$job)"
+	kill @Sale
+	merge @Sale=@Message  ; Copy Message
+	set Status=$$$OK
+	
+	set Prefix="@Sale@("
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Invoice Number",.Number,   Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Customer",      .Customer, Prefix,1)
+	
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++
+	;  * ALWAYS * treat invoice as post-delivery process 
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++
+	set @Sale@("Goods Shipped") = $$$YES
+	
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++
+	; Check for Extra Charges & create extra lines for them
+	; These are created in INFIBBUCH42 when specific codes
+	; are encountered.
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++
+	if Status=$$$OK {  
+		for Extra="Packing","Distance","Insurance","Freight" {
+			quit:Status'=$$$OK
+			
+			if Status=$$$OK                 set Status=$$GetValue^FINSYSDCM(Extra,      .ExtraValue,Prefix)
+			if (Status=$$$OK)&&(ExtraValue) set Status=$$GetValue^FINSYSDCM("Acc"_Extra,.ExtraAcc,  Prefix,1)
+			if (Status=$$$OK)&&(ExtraValue) {
+				set Line=$order(@Sale@("Lines",""),-1)+1 ; Get Next Line Number
+				set @Sale@("Lines",Line,"Value")      = ExtraValue
+				set @Sale@("Lines",Line,"AccIncome")  = ExtraAcc
+				set @Sale@("Lines",Line,"RefLine")    = Extra
+				set @Sale@("Lines",Line,"NoDiscount") = 1
+			}	
+		}
+	}
+	
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++
+	; Generate a balancing transaction to Customer account
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++
+	if Status=$$$OK { ; Convert to a POS Sale Message
+		; TODO : This next line seems unnecessary; get and put back unchanged? <GRF> Has Sale changed?
+		set @Sale@("Invoice Number")=Number
+		
+		set Discount=$get(@Sale@("Settlement Discount"))
+		if Discount=0 set Discount=""
+		if Discount'="" {
+			if Discount'["%" {
+				set Discount=Discount_"%"
+				set @Sale@("Settlement Discount")=Discount
+			}
+		}
+		
+		set Total=0 ; Get the Invoice Total
+		set Line=""
+		for {
+			set Line=$order(@Sale@("Lines",Line))
+			quit:Line=""
+			
+			set Total=Total+$get(@Sale@("Lines",Line,"Value"))
+			set TaxLine=""
+			for {
+				set TaxLine=$order(@Sale@("Lines",Line,"Taxes",TaxLine))
+				quit:TaxLine=""
+				
+				set Total=Total+$Get(@Sale@("Lines",Line,"Taxes",TaxLine,"LineTaxAmount"))
+			}
+			set DiscountLine=""	//SR13297 - Remove discounts
+			for {
+				set DiscountLine=$order(@Sale@("Lines",Line,"Discount",DiscountLine))
+				quit:DiscountLine=""
+				
+				set Total=Total-$Get(@Sale@("Lines",Line,"Discount",DiscountLine,"LineDiscAmount"))
+			}
+		}
+		
+		; Use the Invoice Total and add a "ACC" payment Line to the Message
+		set @Sale@("Payments",1,"PayAccount") = ""
+		set @Sale@("Payments",1,"PayAmount")  = Total
+		set @Sale@("Payments",1,"PayCode")    = Customer
+		set @Sale@("Payments",1,"PayType")    = "ACC"
+	}
+	
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++
+	; If not already posted take a record of the revised
+	; message.  Once successfully posted add the timestamp.
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++
+	set strBatchBlock=""
+	if Status=$$$OK {
+		; TODO : How long to we want to keep this information?
+		if $get(^FININTSale(YM,Number,"Posted"))="" {
+			kill ^FININTSale(YM,Number)  ;SR12671
+			merge ^FININTSale(YM,Number)=@Sale
+			set Status=$$Post(Sale,.strBatchBlock)
+			if Status=$$$OK {
+				set ^FININTSale(YM,Number,"Posted")=$h
+			}
+		}
+	}
+	if Status=$$$OK {
+		set Status=$$$OK_Y_strBatchBlock
+	} else {
+		set Status=$$$NO_Y_$$$Text(Status)
+	}
+	
+	quit Status
+ 
+ 	
+Post(Sale,pstrBatchBlock="")
+	;-------------------------------------------------------------------------------
+	; Post Sale
+	; 
+	; Returns :	Status
+	; 			(ByRef) pstrBatchBlock
+	; 
+	; History:
+	; 12-Oct-2005	GRF		SR13545 : "Goods Shipped" never functional and not reqd.
+	; 13-Sep-2005	GRF		SR13414 : don't insist on SourceGroup - Extra cost lines
+	; 						not using and may have invoice with only charges.
+	; 05-May-2005	shobby	SR11875 : Managed transactions to handle rollback after
+	; 						cache errors.
+	; 28-Apr-2005	GRF		SR10478 : Activate changes; pass more information to
+	; 						PostIncome & PostCosts
+	; 10-Feb-2005	GRF		SR11273 : Apply TLEVEL test to TCOMMIT instead of TROLLBACK
+	; 31-Mar-2004	shobby	disabled previous change, probably should come via IN
+	; 						from Sale (TR006419)
+	; 31-Mar-2004	shobby	Update Banking details from Cheque Payment. (TR006419)
+	; 16-Jan-2004	Paul K	Added Expenses
+	; 16-Jul-2003	SCR		Added Freight Tracking, "Goods Shipped" mode and
+	; 						Increased Checking
+	; 15-Jul-2003	Paul K	Added Charges
+	; 10-Jul-2003	SCR		Increased Error Checking
+	;-------------------------------------------------------------------------------
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	tstart
+	;+++++++++++++++++++++++++++++++++++++++
+	
+ 	new arrChars,Batch,BlockNo,CSTRef,CSTVals,ExpenseLine,ChargeLine,Date,Freight,Location
+	new OrderType,PaymentLine,Prefix,SaleID,SaleLine,SourceGroup,SourceLocn,Status,TranType
+ 	
+	set Status  = $$$OK
+	set Batch   = ""
+	set BlockNo = ""
+	set Prefix  = "@Sale@("
+	
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Date",         .Date,        Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Location",     .Location,    Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("SaleID",       .SaleID,      Prefix,1)
+	;if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Goods Shipped",.GoodsShipped,Prefix)		; SR13545
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("TranType",     .TranType,    Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("OrderType",    .OrderType,   Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("SourceLocn",   .SourceLocn,  Prefix,1)
+	
+	if Status=$$$OK set Status=$$Allocate^FININTBatch(.Batch,.BlockNo,"SALE",Location,Date)
+	set pstrBatchBlock=Batch_","_BlockNo
+	
+	set Freight=0
+	if Status=$$$OK {
+		set SaleLine=""
+		for {
+			set SaleLine=$order(@Sale@("Lines",SaleLine))
+			quit:SaleLine=""
+			
+			set Prefix="@Sale@(""Lines"",SaleLine,"
+ 
+			; Extract Characteristic Value Information once for each line
+			kill arrChars
+			set CSTRef = Prefix_"""CharVal"")"
+			merge arrChars=@CSTRef
+		;	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("SourceGroup",.SourceGroup,Prefix,1)   ; SR13414
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("SourceGroup",.SourceGroup,Prefix)
+			set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+			set CSTVals = CSTVals_Y_SourceLocn_Y_SourceGroup
+			
+			if Status=$$$OK set Status=$$PostIncome(   Prefix,       Batch,BlockNo,SaleID,TranType,OrderType,Date,SourceGroup,SourceLocn,.arrChars,CSTVals)
+		;	if Status=$$$OK set Status=$$PostCosts(    Prefix,       Batch,BlockNo,SaleID,TranType,OrderType,Date,SourceGroup,SourceLocn,.arrChars,CSTVals,GoodsShipped) ; SR13545
+			if Status=$$$OK set Status=$$PostCosts(    Prefix,       Batch,BlockNo,SaleID,TranType,OrderType,Date,SourceGroup,SourceLocn,.arrChars,CSTVals)
+			if Status=$$$OK set Status=$$PostTaxes(    Sale,SaleLine,Batch,BlockNo,SaleID)
+			if Status=$$$OK set Status=$$PostDiscounts(Sale,SaleLine,Batch,BlockNo,SaleID)
+			if (Status=$$$OK)&&($get(@Sale@("Lines",SaleLine,"NoDiscount"))) {
+				set Freight=Freight+$get(@Sale@("Lines",SaleLine,"Value"))
+			}
+			quit:Status'=$$$OK
+		}
+	}
+ 
+	if Status=$$$OK {
+		set PaymentLine=""
+		for {
+			set PaymentLine=$order(@Sale@("Payments",PaymentLine))
+			quit:PaymentLine=""
+			
+			if Status=$$$OK set Status=$$PostPayment(Sale,PaymentLine,Batch,BlockNo,SaleID,Freight)
+		;	if Status=$$$OK set Status=$$UpdateBanking^FINARCustomer(Sale,PaymentLine)
+			quit:Status'=$$$OK
+		}
+	}
+  	
+  	if Status=$$$OK {
+		set ChargeLine=""
+		for {
+			set ChargeLine=$order(@Sale@("Charges",ChargeLine))
+			quit:ChargeLine=""
+			
+			if Status=$$$OK set Status=$$PostCharge(   Sale,ChargeLine,Batch,BlockNo,SaleID)
+			if Status=$$$OK set Status=$$PostChargeTax(Sale,ChargeLine,Batch,BlockNo,SaleID)
+			quit:Status'=$$$OK
+		}
+	}
+	if Status=$$$OK {
+		set ExpenseLine=""
+		for {
+			set ExpenseLine=$order(@Sale@("Expenses",ExpenseLine))
+			quit:ExpenseLine=""
+			
+			if Status=$$$OK set Status=$$PostExpense(Sale,ExpenseLine,Batch,BlockNo,SaleID)
+			quit:Status'=$$$OK
+		}
+	}
+	if Status=$$$OK set Status=$$PostInvoices(Sale,Batch,BlockNo,SaleID)
+	
+	if Status=$$$OK set Status=$$PostBlock^FININTBatch(Batch,BlockNo)
+	;+++++++++++++++++++++++++++++++++++++++
+	if Status=$$$OK {
+		if $tlevel>0 tcommit
+	} else {
+		trollback
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+ 
+	quit Status
+ 
+PostIncome(Prefix,Batch,BlockNo,SaleID,pTranType,pOrderType,pDate,pSourceGroup,pSourceLocn,parrChars,pCSTVals="")
+	;-------------------------------------------------------------------------------
+	; Post Income
+	; 
+	; ByRef : parrChars		Characteristic Values
+	; 
+	; History:
+	; 19-Aug-2005	GRF		Bad Status not stopping processing to ledger
+	; 21-Jun-2005	GRF		SR12585 : Temporary ADRAD reassignment of Location for
+	; 						CST Matrix Calc
+	; 18-May-2005	GRF		SR10478 : ExtractProfile requires array for source locn;
+	; 						Clear out unrequired accounts
+	; 28-Apr-2005	GRF		SR10478 : Activate Acct ID Matrix code
+	; 28-Jul-2004	shobby	Foreign Currency
+	; 10-Jul-2003	SCR		Increased Error Checking
+	;-------------------------------------------------------------------------------
+	new Account,Amount,arrAccts,arrCSTKey,LineRef,Locn,Status
+	
+	set Status=$$$OK
+	
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Value",    .Amount, Prefix)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("AccIncome",.Account,Prefix,''Amount)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("RefLine",  .LineRef,Prefix)
+	; Override Accounts from Characteristics Matrix if used
+	if (Status=$$$OK)&&($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+		kill arrAccts
+		set arrAccts(3) = Account
+	    set Locn(3)     = pSourceLocn
+		
+		do GetAccts^CSTMatrix(pTranType,pOrderType,pDate,.parrChars,.arrAccts,.arrCSTKey)
+		kill arrAccts(1)
+		kill arrAccts(2)
+		set Status = $$ExtractProfile(.arrAccts,.Locn,pSourceGroup)
+		
+		set Account = arrAccts(3)
+	}
+	if Status=$$$OK set Status=$$AddLine^FININTBatch(Batch,BlockNo,Account,$$$FCSign(Amount),"Sale",LineRef,SaleID,"",,,,$get(arrCSTKey(3)),pCSTVals)
+	quit Status
+	
+	;PostCosts(Prefix,Batch,BlockNo,SaleID,pTranType,pOrderType,pDate,pSourceGroup,pSourceLocn,parrChars,pCSTVals="",pblnGoodsShipped=$$$YES)
+PostCosts(Prefix,Batch,BlockNo,SaleID,pTranType,pOrderType,pDate,pSourceGroup,pSourceLocn,parrChars,pCSTVals="")
+	;-------------------------------------------------------------------------------
+	; Post Cost of Goods Sold
+	; 
+	; ByRef : parrChars		Characteristic Values
+	; 
+	; History:
+	; 12-Oct-2005	GRF		SR13545 : "Goods Shipped" never functional and not reqd.
+	; 16-Jun-2005	GRF		SR12585 : Temporary ADRAD reassignment of Location for
+	; 						CST Matrix Calc
+	; 20-May-2005	shobby	Code Check.
+	; 18-May-2005	GRF		SR10478 : ExtractProfile requires array for source locn;
+	; 						Clear out unrequired accounts
+	; 28-Apr-2005	GRF		SR10478 : Add Acct ID Matrix code; clarify GoodsShipped
+	; 31-Jul-2003	SCR		Corrected bug with Cost of Goods Sold
+	; 17-Jul-2003	SCR		Goods Shipped mode, use "INSHIP"
+	; 10-Jul-2003	SCR		Increased Error Checking
+	;-------------------------------------------------------------------------------
+	new Account,AcctCOGS,Amount,arrAccts,arrCSTKey,LineRef,Locn,NoStockFlag,Status
+	
+	set Status = $$$OK
+	;set SOH   = $select(pblnGoodsShipped:"INSHIP",1:"SOH") ; if Goods have already been shipped use "INSHIP" else "SOH"
+	
+	if Status=$$$OK                set Status=$$GetValue^FINSYSDCM("Cost",     .Amount,     Prefix)
+	if Status=$$$OK                set Status=$$GetValue^FINSYSDCM("NonStock", .NoStockFlag,Prefix)
+	if Status=$$$OK                set Status=$$GetValue^FINSYSDCM("RefLine",  .LineRef,    Prefix)
+	if Status=$$$OK                set Status=$$GetValue^FINSYSDCM("AccCOGS",  .AcctCOGS,   Prefix,''Amount)
+	if Status=$$$OK&& NoStockFlag  set Status=$$GetValue^FINSYSDCM("AccNonSOH",.Account,    Prefix,''Amount)
+	if Status=$$$OK&&'NoStockFlag  set Status=$$GetValue^FINSYSDCM("AccSOH",   .Account,    Prefix,''Amount)
+	
+	; Override Accounts from Characteristics Matrix if used
+	if (Status=$$$OK)&&($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+		kill arrAccts
+		set arrAccts(1) = AcctCOGS
+		set arrAccts(2) = Account
+		set Locn(1)     = pSourceLocn
+		set Locn(2)     = pSourceLocn
+		
+		do GetAccts^CSTMatrix(pTranType,pOrderType,pDate,.parrChars,.arrAccts,.arrCSTKey)
+		kill arrAccts(3)
+		set Status = $$ExtractProfile(.arrAccts,.Locn,pSourceGroup)
+		
+		set AcctCOGS = arrAccts(1)
+		set Account  = arrAccts(2)
+		
+	}
+	;if Status=$$$OK&&Amount set Status=$$AddLine^FININTBatch(Batch,BlockNo,Account, -Amount,SOH,   LineRef,SaleID,"",,,,$get(arrCSTKey(2)),pCSTVals)
+	if Status=$$$OK&&Amount set Status=$$AddLine^FININTBatch(Batch,BlockNo,Account, -Amount,"INSHIP",LineRef,SaleID,"",,,,$get(arrCSTKey(2)),pCSTVals)
+	if Status=$$$OK&&Amount set Status=$$AddLine^FININTBatch(Batch,BlockNo,AcctCOGS, Amount,"COGS",  LineRef,SaleID,"",,,,$get(arrCSTKey(1)),pCSTVals)
+ 
+	quit Status
+ 
+PostTaxes(pSale,pintSaleLine,pidBatch,pintBlockNo,pstrSaleID)
+	;-------------------------------------------------------------------------------
+	; NOTE : Not subject to Account Identification Matrix
+	; 
+	; Returns:Status
+	;-------------------------------------------------------------------------------
+	new strStatus,idAccount,strLineRef,curAmount,intTaxLine
+	
+	set strStatus=$$$OK
+	set intTaxLine=""
+	for {
+		set intTaxLine=$order(@pSale@("Lines",pintSaleLine,"Taxes",intTaxLine))
+		quit:intTaxLine=""
+		
+		set idAccount  =      @pSale@("Lines",pintSaleLine,"Taxes",intTaxLine,"LineTaxAccount")
+		set strLineRef = $get(@pSale@("Lines",pintSaleLine,"Taxes",intTaxLine,"LineTaxCode"))
+		set curAmount  =     -@pSale@("Lines",pintSaleLine,"Taxes",intTaxLine,"LineTaxAmount")
+		
+		set strStatus = $$AddLine^FININTBatch(pidBatch,pintBlockNo,idAccount,curAmount,"TAX","",pstrSaleID,strLineRef)
+		quit:strStatus'=$$$OK
+		}
+	quit strStatus
+	
+PostChargeTax(pSale,pintChargeLine,pidBatch,pintBlockNo,pstrSaleID)
+	;-------------------------------------------------------------------------------
+	; Same as PostTaxes but for Charge lines.
+	;
+	; NOTE : Not subject to Account Identification Matrix
+	; 
+	; Returns:Status
+	;
+	; History:
+	; 23-Apr-2004	Paul Kalenjuk   Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idAccount,strLineRef,curAmount,intTaxLine
+	
+	set strStatus=$$$OK
+	set intTaxLine=""
+	for {
+		set intTaxLine=$order(@pSale@("Charges",pintChargeLine,"ChargeTaxes",intTaxLine))
+		quit:intTaxLine=""
+		
+		set idAccount  =      @pSale@("Charges",pintChargeLine,"ChargeTaxes",intTaxLine,"ChargeTaxAccount")
+		set strLineRef = $get(@pSale@("Charges",pintChargeLine,"ChargeTaxes",intTaxLine,"ChargeTaxCode"))
+		set curAmount  =     -@pSale@("Charges",pintChargeLine,"ChargeTaxes",intTaxLine,"ChargeTaxAmount")
+		
+		set strStatus = $$AddLine^FININTBatch(pidBatch,pintBlockNo,idAccount,curAmount,"TAX","",pstrSaleID,strLineRef)
+		quit:strStatus'=$$$OK
+		}
+	quit strStatus
+	
+PostDiscounts(pSale,pintSaleLine,pidBatch,pintBlockNo,pstrSaleID)
+	;-------------------------------------------------------------------------------
+	; NOTE : Not subject to Account Identification Matrix
+	; 
+	;-------------------------------------------------------------------------------
+	new curAmount,idAccount,intDiscLine,strLineRef,strStatus
+	
+	set strStatus=$$$OK
+	set intDiscLine=""
+	for {
+		set intDiscLine=$order(@pSale@("Lines",pintSaleLine,"Discount",intDiscLine))
+		quit:intDiscLine=""
+		
+		set idAccount  =      @pSale@("Lines",pintSaleLine,"Discount",intDiscLine,"LineDiscAccount")
+		set strLineRef = $get(@pSale@("Lines",pintSaleLine,"Discount",intDiscLine,"LineDiscCode"))
+		set curAmount  =      @pSale@("Lines",pintSaleLine,"Discount",intDiscLine,"LineDiscAmount")
+		
+		set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNo,idAccount,curAmount,"Discount","",pstrSaleID,strLineRef)
+		quit:strStatus'=$$$OK
+		}
+	quit strStatus
+	
+PostPayment(pSale,pintPayLine,pidBatch,pintBlockNo,pstrSaleID,Freight)
+	;-------------------------------------------------------------------------------
+	;
+	; NOTE : Not subject to Account Identification Matrix
+	; 
+	; Returns: strStatus
+	;
+	; History:
+	; 12-Jul-2004	shobby	Reference now includes PayRefText if it exists (SR6419)
+	; 24-May-2004	Shobby	Changed reference parameter to Customer on AddLine.
+	;-------------------------------------------------------------------------------
+	new curAmount,curDiscount,dteDueDate,dteInvoiceDate
+	new idAccount,idCustomer,idInterfaceType,idInvoice,idPayCode,idPayType
+ 	new strLineRef,strParams,strPayRefText,strStatus,strTaxCode
+ 	
+ 	set idInterfaceType="PAYMENT"
+ 	set strParams=""
+ 	
+	set idAccount      =      @pSale@("Payments",pintPayLine,"PayAccount")
+	set curAmount      =      @pSale@("Payments",pintPayLine,"PayAmount")
+	set idPayType      =     (@pSale@("Payments",pintPayLine,"PayType"))
+	set idPayCode      = $get(@pSale@("Payments",pintPayLine,"PayCode"))
+	set strPayRefText  = $get(@pSale@("Payments",pintPayLine,"PayRefText"))
+	set idCustomer     = $get(@pSale@("Customer"))
+	set idInvoice      = $get(@pSale@("Invoice Number"))
+	set dteDueDate     = $get(@pSale@("DueDate"))
+	set dteInvoiceDate = $get(@pSale@("Date"))
+	set curDiscount    = $get(@pSale@("Settlement Discount"))
+ 
+	if idPayType="ACC" {
+		set idInterfaceType="ACC"
+		set idAccount=$$GetCustomerControlAccount^FINARCustomer(idCustomer)
+		set strParams=idCustomer_","_idInvoice_","_dteDueDate_","_curDiscount_","_dteInvoiceDate_","_Freight
+	}
+	
+	set strLineRef=idCustomer
+	if strPayRefText'="" set strLineRef=strLineRef_$$$COMMA_strPayRefText
+	
+	;set strLineRef=""
+	;if idPayType'=""  set strLineRef=$$$Text($listbuild("Fin00151",idPayType_","_idPayCode))_" " ; Payment Code: %1
+	;if idCustomer'="" set strLineRef=strLineRef_$$$Text($listbuild("Fin00152",idCustomer))_" "   ; Customer: %1
+	;if idInvoice'=""  set strLineRef=strLineRef_$$$Text($listbuild("Fin00153",idInvoice))        ; Invoice Number: %1
+ 
+	set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNo,idAccount,curAmount,idInterfaceType,strParams,pstrSaleID,strLineRef)
+ 
+	quit strStatus
+ 
+PostCharge(pSale,pintPayLine,pidBatch,pintBlockNo,pstrSaleID)
+	;-------------------------------------------------------------------------------
+	; NOTE : Not subject to Account Identification Matrix
+	; 
+	;-------------------------------------------------------------------------------
+	new idAccount,surAmount,strChargeType,strChargeCode,strStatus,curAmount,strChargeRef
+	
+	set idAccount     =      @pSale@("Charges",pintPayLine,"ChargeAccount")
+	set curAmount     =     -@pSale@("Charges",pintPayLine,"ChargeAmount")
+	set strChargeType =     (@pSale@("Charges",pintPayLine,"ChargeType"))
+	set strChargeCode = $get(@pSale@("Charges",pintPayLine,"ChargeCode"))
+	set strChargeRef  = $get(@pSale@("Charges",pintPayLine,"ChargeReference"))
+	
+	set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNo,idAccount,curAmount,"SALECHARGE","",pstrSaleID,strChargeType_","_strChargeCode_","_strChargeRef)
+	
+	quit strStatus
+ 
+PostExpense(pSale,pintExpLine,pidBatch,pintBlockNo,pstrSaleID)
+	;-------------------------------------------------------------------------------
+	; Adds a Cash Expense Line to the Batch.
+	;
+	; NOTE : Not subject to Account Identification Matrix
+	; 
+	; Returns:Status
+	;
+	; History:
+	; 28-Jul-2004	shobby	Foreign Currency
+	; 16-Jan-2004   Paul K	Created
+	;-------------------------------------------------------------------------------
+	new curAmount,idAccount,strExpType,strStatus
+	
+	set strStatus=$$$OK
+	if pintExpLine'="" {
+		set idAccount  =           $get(@pSale@("Expenses",pintExpLine,"ExpenseAccount"))
+		set curAmount  = $$$FCSign($get(@pSale@("Expenses",pintExpLine,"ExpenseValue")))
+		set strExpType =           $get(@pSale@("Expenses",pintExpLine,"ExpenseCode"))
+		
+		set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNo,idAccount,curAmount,"ACCEX","",pstrSaleID,strExpType)
+	}	
+	quit strStatus
+	
+PostInvoices(pSale,pidBatch,pintBlockNo,pstrSaleID) 
+	;-------------------------------------------------------------------------------
+	; Post Invoice
+	;
+	; Returns:Status
+	;
+	; History:
+	; 21-Apr-2005	Paul K	Put posting of tax inside discount amount check SR:11830
+	; 23-May-2004	shobby	Corrected Params parameter for addline.
+	; 15-Mar-2004	SCR		Set Discount to zero for Unallocated Payments
+	;-------------------------------------------------------------------------------
+	new arrTax,curAmount,curDiscountAmount,curInvoiceAmount,curTotalTax
+	new idAccount,idCustomer,idInvoice,idInvoiceNumber,intTax
+	new lngAccountPayment,objInvoiceTax,strRef,strStatus
+	
+	set strStatus=$$$OK
+	set lngAccountPayment=""
+	for {
+		set lngAccountPayment=$order(@pSale@("Account Payment",lngAccountPayment))
+		quit:lngAccountPayment=""
+		
+		set idCustomer =  @pSale@("Account Payment",lngAccountPayment,"Account Payment Customer")
+		set curAmount  = -@pSale@("Account Payment",lngAccountPayment,"Account Payment Amount")
+		set idAccount  = $$GetCustomerControlAccount^FINARCustomer(idCustomer)
+		set idInvoiceNumber=""
+		for {
+			set idInvoiceNumber=$order(@pSale@("Account Payment",lngAccountPayment,"Invoices",idInvoiceNumber))
+			quit:idInvoiceNumber=""
+		
+			
+			set idInvoice         = @pSale@("Account Payment",lngAccountPayment,"Invoices",idInvoiceNumber,"Payment Invoice Number")
+			set curInvoiceAmount  = @pSale@("Account Payment",lngAccountPayment,"Invoices",idInvoiceNumber,"Payment Invoice Amount")
+			set curDiscountAmount = @pSale@("Account Payment",lngAccountPayment,"Invoices",idInvoiceNumber,"Payment Invoice Discount")
+			
+			if strStatus=$$$OK set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNo,idAccount,-curInvoiceAmount,"ACP",idCustomer_","_idInvoice,pstrSaleID,idCustomer)
+			set curAmount=curAmount+curInvoiceAmount-curDiscountAmount
+			if strStatus=$$$OK {
+				if +curDiscountAmount'=0 {
+					set curTotalTax = 0
+					set intTax      = ""
+					kill arrTax
+					for {
+						set intTax=$order(^FINARInvoiceTax(YM,idCustomer,idInvoice,intTax))
+						quit:intTax=""
+						
+						set objInvoiceTax=$get(^FINARInvoiceTax(YM,idCustomer,idInvoice,intTax,1))
+						set arrTax(intTax,"Account")=$$$FINARInvoiceTaxAccount(objInvoiceTax)
+						set arrTax(intTax,"Amount")=$get(arrTax(intTax,"Amount"))+($$$FINARInvoiceTaxAmount(objInvoiceTax)*curDiscountAmount/curInvoiceAmount)
+						set curTotalTax=curTotalTax+($$$FINARInvoiceTaxAmount(objInvoiceTax)*curDiscountAmount/curInvoiceAmount)
+					}
+					if strStatus=$$$OK set strStatus=$$PostDiscount(pSale,curDiscountAmount-curTotalTax,idAccount,pidBatch,pintBlockNo,pstrSaleID,idCustomer)
+					set intTax=""
+					for {
+						set intTax=$order(arrTax(intTax))
+						quit:intTax=""
+						
+						if strStatus=$$$OK set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNo,arrTax(intTax,"Account"),arrTax(intTax,"Amount"),"TAX","",pstrSaleID,intTax)
+					}
+				}
+			}
+		}
+		
+		if curAmount'=0 {
+			set idInvoice=""
+			if strStatus=$$$OK set strStatus=$$GetUnAllocatedInvoiceNumber^FINARInvoice(idCustomer,.idInvoice)
+			if strStatus=$$$OK {
+				set strRef=idCustomer_","_idInvoice
+			;   if unallocated and Credit set discount to 0
+				if curAmount<0 set $piece(strRef,",",4)=0
+				set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNo,idAccount,curAmount,"ACP",strRef,pstrSaleID,idCustomer)
+			}
+		}
+	}
+	quit strStatus
+	
+PostDiscount(pBank,pcurDiscountAmount,pidControlAccount,pidBatch,pintBlockNo,pstrSource,pidCustomer)
+	;-------------------------------------------------------------------------------
+	;-------------------------------------------------------------------------------
+	new idDiscountAccount,objControlAccount,strStatus
+	
+	set strStatus=$$$OK
+	
+	set objControlAccount=$get(^FINARAccount(YM,pidControlAccount,1))
+	set idDiscountAccount=$$$FINARAccountDiscountAccount(objControlAccount)
+	if (idDiscountAccount'="") {
+		if +pcurDiscountAmount'=0 set strStatus=$$AddLine^FININTBatch(pidBatch,pintBlockNo,idDiscountAccount,pcurDiscountAmount,"SDISC","",pstrSource,pidCustomer)
+	} else {
+		set strStatus=$listbuild("Fin00070",pidControlAccount)  ; Discount account does not exist for customer control account %1
+	}
+	quit strStatus
+	
+PostError
+	; FIXME : This error trap is not set.
+	trollback
+	quit "0~Error in Post "_$ze
+	
+CusShip(Ship)
+    ;-------------------------------------------------------------------------------
+    ; Transaction protect 'CusShip' code.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 05-May-2005	shobby	Created SR11875
+    ;-------------------------------------------------------------------------------
+	new strStatus
+	set strStatus=$$$OK
+	set strStatus=$$Transaction^COMTransaction("CusShipTxn^FININTSaleShipment(.Ship)",0)
+ 
+	if $$$ISOK(strStatus) {
+	} elseif $$$ISERR(strStatus) {
+		set strStatus=$$$NO_Y_$$$Text(strStatus)
+	} else {
+		set strStatus="0~Error in Customer Shipment "_$ze
+	}
+	quit strStatus
+ 
+ 
+ExtractProfile(parrAccts,pSourceLocn,pSourceGroup)
+	;-------------------------------------------------------------------------------
+	; Extract ledger profiles returned from Account Identification Matrices
+	; 
+	; Returns :	Status
+	; 			(ByRef) parrAccts
+	; 			(ByRef) pSourceLocn
+	; 			
+	; History:
+	; 12-May-2005	GRF		SR10478 : GINILocn
+	; 28-Apr-2005	GRF		SR10478 : Created as common code
+	;-------------------------------------------------------------------------------
+	new idx,Profile,Status,SourceLocn
+	
+	set Status = $$$OK
+	
+	set idx=""
+	for {
+		set idx=$order(parrAccts(idx))
+		quit:idx=""
+		
+		set Profile    = parrAccts(idx)
+		set SourceLocn = pSourceLocn(idx)
+		if Profile["{" {
+		;	set Status=$$SALConvert^FINGLProfileConv(.Profile,pSourceLocn,pSourceGroup)
+			set Status=$$SALConvert^FINGLProfileConv(.Profile,SourceLocn,pSourceGroup)
+			if $$$ISOK(Status) set parrAccts(idx)=Profile
+		}
+	}
+	
+	quit Status
+	
+]]></Routine>
+</Export>

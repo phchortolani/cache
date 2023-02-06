@@ -1,0 +1,759 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvDCM" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvDCM
+
+	;-------------------------------------------------------------------------------
+	; History
+	; 05-Nov-2010	shobby	SR17599: Removed ReceiptDelete, ReceiptCanDelete, ReceiptSave.
+	;-------------------------------------------------------------------------------
+
+#include FINConst
+#include INConst
+#include COMSYS
+	
+#define	GetCacheIdFromReceiptKeys(%1) $order(^FINAPInvMatchCaches(0,3,$$^WWWUMLAU(%1,1),""))
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^FINAPInvDCM("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+OrderSave(pidOrder,penumType,pdtePrinted)
+	;-------------------------------------------------------------------------------
+	; Update Order Lines if order changes
+	;
+	; Called by : OnAfterSaveHook^INAUFHooks
+	;             REMOVED >>> DCMEvent INAUFSave : Method FINOrderSave
+	; 
+	; Returns:
+	;
+	; History:
+	; 07-Jun-2005	JW/RW	Created SR12484
+	;-------------------------------------------------------------------------------
+	new idInvMatch,idxLineNo,idxOrderNo,objInvMatch,objOrder,strStatus
+	
+	$$$LogR("OrderSave",$get(pidOrder)_":"_$get(penumType)_":"_$get(pdtePrinted))
+	set strStatus = $$$OK
+	
+	// Only update order lines for Purchase Orders
+	quit:$get(pidOrder)="" strStatus
+	quit:$get(penumType)'=2 strStatus
+	;quit:$get(pdtePrinted)="" strStatus
+	
+	set objOrder = $get(^INAUF(0,pidOrder,1))
+	
+	if objOrder'="" {
+		set idxOrderNo = $$$Index(pidOrder)
+		
+		set idxLineNo=""
+		for {
+			set idxLineNo = $order(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo))
+			quit:idxLineNo=""
+			
+			set idInvMatch = ""
+			for {
+				set idInvMatch = $order(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo,idInvMatch))
+				quit:idInvMatch=""
+				
+				set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+				
+				if '$$$FINAPInvMatchCacheCompleted(objInvMatch) {         ; If not already invoiced
+					set $$$FINAPInvMatchCacheOrderDate(objInvMatch)    = $$$INAUFOrderDate(objOrder)
+					set $$$FINAPInvMatchCacheOrderTime(objInvMatch)    = $$$INAUFOrderTime(objOrder)
+					set $$$FINAPInvMatchCacheOrderProject(objInvMatch) = $$$INAUFProject(objOrder)
+					set $$$FINAPInvMatchCacheSupplier(objInvMatch)	   = $$$INAUFSupplierNumber(objOrder)
+					
+					// Only update location if not receipted
+					if '$$$FINAPInvMatchCacheReceipted(objInvMatch) {
+						set $$$FINAPInvMatchCacheLocation(objInvMatch) = $$$INAUFLocation(objOrder)
+					}
+					
+					set $$$FINAPInvMatchCacheAddedToCache(objInvMatch) = $horolog
+	$$$LogRx("FAIMCSave:OrderSave:"_idInvMatch)
+					set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+					quit:$$$ISERR(strStatus)
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+OrderLineSave(pstrOrderKeys)
+	;-------------------------------------------------------------------------------
+	; Save the Order Lines when Order Line Item is modified
+	;
+	; Called by : OnAfterSaveHook^INAUFPHooks
+	;             PlayDataRecord^WWWRECORDUtils
+	;             REMOVED >>> DCMEvent INAUFPSave : Method FINOrderLineSave
+	; 
+	; Returns:
+	; 
+	; History:
+	; 03-Sep-2012	shobby	SR18022.1 : idInvMatch and objInvMatch are obtained after
+	;							$data test.
+	; 31-May-2011	shobby	SR18022: Update all details that may have changed in the
+	;							order line, if it hasn't been receipted.
+	; 18-Nov-2011	GRF		SR17262: remove 2009 version
+	; 10-Feb-2010	GRF		SR17138: Use new Ordered Unit data
+	; 02-Oct-2009	GRF		SR16361: Implement changed code
+	; 30-Sep-2009	GRF		SR16361: Reverted change for SR16422 - stopping Receipt
+	; 							appearing in COMView list for invoice matching.
+	; 29-Sep-2009	GRF		SR16361: Refactor FAIMC processing on Line Complete or
+	; 							Cancellation; relocate CacheLink to new record;
+	; 							use objNewInvMatch and idNewMatch to distinguish
+	; 							more clearly
+	; 17-Mar-2009	PPP		SR16422: Prevent Cancelled or Closed Order Lines from
+	;							being Receipted
+	; 06-Mar-2007	JW		SR15459: Changed BR014066 unit price addition.
+	; 23-Aug-2006	JW		SR14925: Always save the import number
+	; 25-Jul-2006	Frank	BR014066: Coping across the Unit Price value.
+	; 09-Mar-2006	JW		SR14265: Added +'s as values could be compared
+	; 07-Jun-2005	JW/RW	Created SR12484
+	;-------------------------------------------------------------------------------
+	new blnUpdate,curNewUnitPrice,curOldUnitPrice,diffOrderQty
+	new fltConv,idImport,idOrder,idOrderLine,idInvMatch,idNewMatch
+	new idxLineNo,idxOrderNo,objInvMatch,objNewInvMatch,objOrder,objOrderLine
+	new newOrderQty,oldOrderQty,strStatus
+	
+	$$$LogR("OrderLineSave",$get(pstrOrderKeys))
+	
+    set strStatus = $$$OK
+	
+	quit:$get(pstrOrderKeys)="" strStatus
+	
+	set idOrder     = $$$KEY1(pstrOrderKeys)
+	set idOrderLine = $$$KEY2(pstrOrderKeys)
+	set objOrder    = $get(^INAUF(0,idOrder,1))
+	
+	// Only update order lines for Purchase Orders
+	if ($$$INAUFOrderType(objOrder)=2) {
+		set objOrderLine = $get(^INAUFP(0,idOrder,idOrderLine,1))
+		
+		if '(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(0,0,1)))){
+		;	set newOrderQty     = +$$$INAUFPQuantity(objOrderLine)    ; SR17138
+			set newOrderQty     = +$$$INAUFPOrderedQuantity(objOrderLine)
+		} else {
+			set newOrderQty     = +$$$INAUFPQuantity(objOrderLine)    ; SR17138
+		;	set newOrderQty     = +$$$INAUFPOrderedQuantity(objOrderLine)		
+		}
+		
+		set curNewUnitPrice = $$GetUnitCost^INAUFP(idOrder,idOrderLine)
+		set idImport        = $$GetImportNo^INAUFP(idOrder,idOrderLine)
+		
+		set idxOrderNo = $$$Index(idOrder)
+		set idxLineNo  = $$$Index(idOrderLine)
+		
+		set blnUpdate    = $$$YES
+		set diffOrderQty = newOrderQty
+		
+		;-----------------------------------
+		;	Have FAIMC?
+		;		YES : Require update?
+		;			NO  :                              <END>
+		;			YES : Already receipted?
+		;				NO  : Update existing record   <END>
+		;				YES : Create a new FAIMC entry <END>
+		;		
+		;		NO  : Create a new FAIMC entry         <END>
+		;-----------------------------------
+				
+		; SR18022 vvvvvvvvvvvvvvvv
+		// Check if we already have an order line
+		if $data(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo)) {
+			set idInvMatch  = $order(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo,""),-1)	;SR18022.1
+			set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))						;SR18022.1
+			// Can't update current if receipted
+			if $$$FINAPInvMatchCacheReceipted(objInvMatch) {
+				set blnUpdate = $$$YES
+			} else {
+				set blnUpdate = $$$NO
+	$$$LogRx("OLS:1:"_idInvMatch_"<"_objInvMatch)							
+				set oldOrderQty     = +$$$FINAPInvMatchCacheOrderQuantity(objInvMatch)
+				set curOldUnitPrice =  $$$FINAPInvMatchCacheEach(objInvMatch)
+			
+				set diffOrderQty = newOrderQty - oldOrderQty
+				
+				set $$$FINAPInvMatchCacheItem(objInvMatch)              = $$$INAUFPItemNumber(objOrderLine)
+				set $$$FINAPInvMatchCacheSourceOrder(objInvMatch)       = idOrder
+				set $$$FINAPInvMatchCacheOrderLine(objInvMatch)         = idOrderLine
+				set $$$FINAPInvMatchCacheOrderDate(objInvMatch)         = $$$INAUFOrderDate(objOrder)
+				set $$$FINAPInvMatchCacheOrderTime(objInvMatch)         = $$$INAUFOrderTime(objOrder)
+				set $$$FINAPInvMatchCacheOrderProject(objInvMatch)      = $$$INAUFProject(objOrder)
+				set $$$FINAPInvMatchCacheLocation(objInvMatch)          = $$$INAUFLocation(objOrder)
+				set $$$FINAPInvMatchCacheSupplier(objInvMatch)          = $$$INAUFSupplierNumber(objOrder)
+		
+				set $$$FINAPInvMatchCacheOrderQuantity(objInvMatch)     = newOrderQty
+				set $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)     = diffOrderQty
+				set $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) = diffOrderQty
+		
+				set $$$FINAPInvMatchCacheEach(objInvMatch)              = curNewUnitPrice
+				set $$$FINAPInvMatchCacheImportNumber(objInvMatch)      = idImport
+				set $$$FINAPInvMatchCacheLink(objInvMatch)              = $get(idInvMatch)
+				if $$$INAUFPCancellation(objOrderLine) || ($$$INAUFPPosCompleted(objOrderLine)) {  //SR16422
+					set $$$FINAPInvMatchCacheCompleted(objInvMatch)     = $$$YES
+				}
+				
+				set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+
+	$$$LogRx("OLS:2:"_idInvMatch_"<"_objInvMatch)
+			}
+		}
+		; SR18022 ^^^^^^^^^^^^^^^^^^^
+		
+		if blnUpdate {       ; Create a new Order Line entry
+			set objNewInvMatch=""
+			set $$$FINAPInvMatchCacheItem(objNewInvMatch)              = $$$INAUFPItemNumber(objOrderLine)
+			set $$$FINAPInvMatchCacheSourceOrder(objNewInvMatch)       = idOrder
+			set $$$FINAPInvMatchCacheOrderLine(objNewInvMatch)         = idOrderLine
+			set $$$FINAPInvMatchCacheOrderDate(objNewInvMatch)         = $$$INAUFOrderDate(objOrder)
+			set $$$FINAPInvMatchCacheOrderTime(objNewInvMatch)         = $$$INAUFOrderTime(objOrder)
+			set $$$FINAPInvMatchCacheOrderProject(objNewInvMatch)      = $$$INAUFProject(objOrder)
+			set $$$FINAPInvMatchCacheLocation(objNewInvMatch)          = $$$INAUFLocation(objOrder)
+			set $$$FINAPInvMatchCacheSupplier(objNewInvMatch)          = $$$INAUFSupplierNumber(objOrder)
+			
+			set $$$FINAPInvMatchCacheOrderQuantity(objNewInvMatch)     = newOrderQty
+			set $$$FINAPInvMatchCacheTotalQuantity(objNewInvMatch)     = diffOrderQty
+			set $$$FINAPInvMatchCacheUnmatchedQuantity(objNewInvMatch) = diffOrderQty
+			
+			set $$$FINAPInvMatchCacheEach(objNewInvMatch)              = curNewUnitPrice
+			set $$$FINAPInvMatchCacheImportNumber(objNewInvMatch)      = idImport
+			set $$$FINAPInvMatchCacheCompleted(objNewInvMatch)         = (diffOrderQty <= 0)
+			set $$$FINAPInvMatchCacheLink(objNewInvMatch)              = $get(idInvMatch)
+
+			set idNewMatch = $$^WWWNEXT("FINAPInvMatchCache")
+
+			set $$$FINAPInvMatchCacheAddedToCache(objNewInvMatch) = $horolog
+			set strStatus = $$$Save("FINAPInvMatchCache",idNewMatch,objNewInvMatch,$$$YES)
+	$$$LogRx("OLS:3:"_idNewMatch_"<"_objNewInvMatch)
+		}
+	}
+	quit strStatus
+	
+	
+OrderLineDelete(pstrKeys)
+	;-------------------------------------------------------------------------------
+	; Delete Order Lines if the Order Line is deleted
+	;
+	; Called by : OnBeforeDeleteHook^INAUFPHooks
+	;             REMOVED >>> DCMEvent INAUFPDelete : Method FINOrderLineDelete
+	; 
+	; Returns:
+	;
+	; History:
+	; 16-Jul-2014	shobby	CORE-385.23: Break links to FIN Module
+	; 07-Jul-2009	GRF		SR16662: greater differentiation between variable names
+	; 07-Jun-2005	JW/RW	SR12484: Created
+	;-------------------------------------------------------------------------------
+	new idInvMatch,idOrder,idOrderLine,idxOrderNo,idxLineNo
+	new objInvMatch,objOrder,objOrderLine,strStatus
+	
+	$$$LogR("OrderLineDelete",$get(pstrKeys))
+	
+    set strStatus = $$$OK
+
+	quit:$get(pstrKeys)="" strStatus
+	
+	set idOrder     = $$$KEY1(pstrKeys)
+	set idOrderLine = $$$KEY2(pstrKeys)
+	set objOrder    = $get(^INAUF(0,idOrder,1))
+	
+	// Only update order lines for Purchase Orders.
+	if $$$INAUFOrderType(objOrder)=2 {
+		set objOrderLine = $get(^INAUFP(0,idOrder,idOrderLine,1))
+		
+		set idxOrderNo = $$$Index(idOrder)
+		set idxLineNo  = $$$Index(idOrderLine)
+		
+		if $data(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo)) {
+			set idInvMatch=""
+			for {
+				set idInvMatch = $order(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo,idInvMatch))
+				quit:idInvMatch=""
+				
+	$$$LogRx("OLD:"_idInvMatch)
+				;CORE-385.23 do KILL^FINSYS("FINAPInvMatchCache",idInvMatch)
+				set strStatus=$$KILL^COMUtils("FINAPInvMatchCache",idInvMatch) ;CORE-385.23
+				quit:$$$ISERR(strStatus)									   ;CORE-385.23
+			}
+		}
+	}
+	quit strStatus
+	
+	
+	; FIXME : OrderDelete is being called with penumType="" so not removing FINAPInvMatchCache
+	;         This causes a problem if the order is reused because code treats save to existing
+	;         FAIMC as being only an update of qty/cost.  Later get item mismatch.   <GRF> 
+	
+OrderDelete(pidOrder,penumType)
+	;-------------------------------------------------------------------------------
+	; Delete Order Lines if order is deleted
+	;
+	; Called by : OnBeforeDeleteHook^INAUFHooks
+	;             REMOVED >>> DCMEvent INAUFPDelete : Method FINOrderDelete
+	; 
+	; Returns:
+	;
+	; History:
+	; 16-Jul-2014	shobby	CORE-385.23: Break links to FIN Module
+	; 07-Jun-2005	JW/RW	Created SR12484
+	;-------------------------------------------------------------------------------
+    new idInvMatch,idxLineNo,idxOrderNo,objInvMatch,objOrder,strStatus
+    
+	$$$LogR("OrderDelete",$get(pidOrder)_"<"_$get(penumType))
+	
+	set strStatus = $$$OK
+	
+	quit:$get(penumType)'=2 strStatus
+	quit:$get(pidOrder)="" strStatus
+	
+	set objOrder = $get(^INAUF(0,pidOrder,1))
+	if objOrder'="" {
+		set idxOrderNo = $$$Index(pidOrder)
+		
+	$$$LogRx("OD:1:"_idxOrderNo)
+		set idxLineNo=""
+		for {
+			set idxLineNo = $order(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo))
+			quit:idxLineNo=""
+			
+			set idInvMatch = ""
+			for {
+				set idInvMatch = $order(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo,idInvMatch))
+				quit:idInvMatch=""
+				
+	$$$LogRx("OD:2:"_idInvMatch)
+				;CORE-385.23 do KILL^FINSYS("FINAPInvMatchCache",idInvMatch)
+				set strStatus=$$KILL^COMUtils("FINAPInvMatchCache",idInvMatch) ;CORE-385.23
+				quit:$$$ISERR(strStatus)									   ;CORE-385.23
+			}
+		}
+	}
+	quit strStatus
+	
+	
+ImportNumberSave(pstrKeys,pidImport)
+	;-------------------------------------------------------------------------------
+	; Update Order Lines if import number added
+	;
+	; Called by : DCMEvent INAUFPASave : Method FINImportNumberSave
+	; 
+	; Returns:
+	;
+	; History:
+	; 08-Jun-2005	JW/RW	Created SR12484
+	;-------------------------------------------------------------------------------
+	new idxOrderNo,idxLineNo,idInvMatch,objInvMatch,strStatus
+	
+    set strStatus = $$$OK
+	
+	quit:$get(pstrKeys)="" strStatus
+	
+	set idxOrderNo = $$$Index($$$KEY1(pstrKeys))
+	set idxLineNo  = $$$Index($$$KEY2(pstrKeys))
+	
+	// Check if we already have an order line
+	set idInvMatch=""
+	for {
+		set idInvMatch = $order(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo,idInvMatch))
+		quit:idInvMatch=""
+		
+		set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+		if objInvMatch'="" {
+			if $$$FINAPInvMatchCacheImportNumber(objInvMatch) '= pidImport {
+				set $$$FINAPInvMatchCacheImportNumber(objInvMatch) = pidImport
+				set $$$FINAPInvMatchCacheAddedToCache(objInvMatch) = $horolog
+	$$$LogRx("FAIMCSave:ImportNumberSave:"_idInvMatch)
+				set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+			}
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	
+	quit strStatus
+	
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	;   vvv   MANUAL OPERATION   vvv   DEPRECATED BY REMOVAL OF INWEAUF(VOR) & INWEFREI
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+Update(&pfailed,pdteStart="",pblnRWO=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Allow Orders / Receipts to be invoiced matched
+	; 
+	; Called by : Manual Operation        *** Only do this once! ***
+	; 
+	; Params:	pfailed - (by ref) array of error messages
+	;			pdteStart - earliest date for orders/receipts to be matched
+	;			pblnRWO - whether receipt without orders should be included in this update
+	; 
+	; Returns: status ("Ok" or "Errors")
+	;
+	; History:
+	; 10-Jul-2009	GRF		SR16689: Standardise variables
+	; 01-Dec-2005	JW		Multiple receipts for same order...
+	; 21-Jun-2005	JW		Created SR12484
+	;-------------------------------------------------------------------------------
+	new blnComplete,dteRecvd,idConfirmation,idImport,idLocn,idOrder,idOrderLine,idRWO
+	new idStore,idSupplier,idUser,idxSupplier,intCounter
+	new objINAUFPA,objINWEFREI,objOrder,strStatus,txtStatus,txtOrder,txtImport,txtReceipt
+	
+	$$$LogR("Update",pdteStart_"<"_pblnRWO)
+	
+	if $get(Y)="" do ^WWWVAR
+	
+	kill pfailed
+	
+	set txtStatus  = $$$Text("Fin00753")                   ; "Status"
+	set txtOrder   = $$$Text("Fin00685")                   ; "Order"
+	set txtImport  = $$$StrFINAPInvMatchCacheImportNumber  ; "Import Number"
+	set txtReceipt = $$$Text("Fin00686")                   ; "Receive"
+	
+	set idxSupplier = ""
+	for {
+		set idxSupplier = $order(^INAUFs(0,23,idxSupplier))
+		quit:idxSupplier=""
+		
+		for blnComplete = " ",0 { // Not complete
+			set idOrder = ""
+			for {
+				set idOrder = $order(^INAUFs(0,23,idxSupplier,blnComplete,idOrder))
+				quit:idOrder=""
+				
+				set objOrder = $get(^INAUF(0,idOrder,1))
+				if objOrder'="" {
+					if $$$INAUFOrderDate(objOrder) >= pdteStart {
+						write txtOrder_": "_idOrder,!
+						
+						set idOrderLine = ""
+						for {
+							set idOrderLine = $order(^INAUFP(0,idOrder,idOrderLine))
+							quit:idOrderLine=""
+							
+							set strStatus = $$OrderLineSave(idOrder_","_idOrderLine)
+							write $$$StrFINAPInvMatchCacheOrderLine_": "_idOrderLine_" "_txtStatus_": "_strStatus,!
+							
+							if $$$ISERR(strStatus) {
+								set pfailed($i(intCounter),idOrder,idOrderLine) = txtOrder_": "_strStatus
+							}
+							
+							set idSupplier = $order(^INAUFPA(0,idOrder,idOrderLine,""))
+							if idSupplier'="" {
+								set idConfirmation = $order(^INAUFPA(0,idOrder,idOrderLine,idSupplier,""))
+								if idConfirmation'="" {
+									set objINAUFPA = $get(^INAUFPA(0,idOrder,idOrderLine,idSupplier,idConfirmation,1))
+									set idImport = $$$INAUFPAImportNumber(objINAUFPA)
+									if idImport'="" {
+										set strStatus = $$ImportNumberSave(idOrder_","_idOrderLine,idImport)
+										write txtImport_": "_idImport_" "_txtStatus_": "_strStatus,!
+																				
+										if $$$ISERR(strStatus) {
+											set pfailed($i(intCounter),idOrder,idOrderLine,idImport) = txtImport_" "_strStatus
+										}
+									}
+								}
+							}
+							
+							set idLocn = ""
+							for {
+								set idLocn = $order(^INWEAUF(0,idOrder,idOrderLine,idLocn))
+								quit:idLocn=""
+								
+								set idStore = ""
+								for {
+									set idStore = $order(^INWEAUF(0,idOrder,idOrderLine,idLocn,idStore))
+									quit:idStore=""
+									
+									set dteRecvd = ""
+									for {
+										set dteRecvd = $order(^INWEAUF(0,idOrder,idOrderLine,idLocn,idStore,dteRecvd))
+										quit:dteRecvd=""
+									
+									; FIXME : Tag is DEPRECATED <GRF>
+										;SR17599 set strStatus = $$ReceiptSave(idOrder_","_idOrderLine_","_idLocn_","_idStore_","_dteRecvd)
+									;	FIXME : add _","_pidRec_","_idLine  if based on INRECLine   SR16361 <GRF>
+										write txtReceipt_": "_idLocn_","_idStore_","_dteRecvd_" "_txtStatus_": "_strStatus,!
+										
+										if $$$ISERR(strStatus) {
+											set pfailed($i(intCounter),idOrder,idOrderLine,idLocn,idStore,dteRecvd) = txtReceipt_": "_strStatus
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	if pblnRWO {
+		set idLocn = ""
+		for {
+			set idLocn = $order(^INWEFREI(0,idLocn))
+			quit:idLocn=""
+			
+			set dteRecvd = ""
+			for {
+				set dteRecvd = $order(^INWEFREI(0,idLocn,dteRecvd))
+				quit:dteRecvd=""
+				
+				set idUser = ""
+				for {
+					set idUser = $order(^INWEFREI(0,idLocn,dteRecvd,idUser))
+					quit:idUser=""
+					
+					set idRWO = ""
+					for {
+						set idRWO = $order(^INWEFREI(0,idLocn,dteRecvd,idUser,idRWO))
+						quit:idRWO=""
+						
+						set objINWEFREI = $get(^INWEFREI(0,idLocn,dteRecvd,idUser,idRWO,1))
+						if objINWEFREI'="" {
+							if $$$INWEFREIDate2(objINWEFREI) >= pdteStart {  ; FIXME : Tag is DEPRECATED <GRF>
+								set strStatus = $$ReceiptWithoutOrderSave(idLocn_","_dteRecvd_","_idUser_","_idRWO)
+								write txtReceipt_": "_idLocn_","_dteRecvd_","_idUser_","_idRWO_" "_txtStatus_": "_strStatus,!
+								
+								if $$$ISERR(strStatus) {
+									set pfailed($i(intCounter),idLocn,dteRecvd,idUser,idRWO) = txtReceipt_": "_strStatus
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if $data(pfailed) {
+		set strStatus = "Com00091" ; Errors
+	} else {
+		set strStatus = "Fin00755" ; Ok
+	}
+	quit $$$Text(strStatus)	
+	
+	
+ReceiptReversal(pidxOrderNo,pidxLineNo)
+	; DEPRECATED - with removal of INWEAUF(VOR) SR16361 see CacheReceiptReversal^INRECReceive
+	;-------------------------------------------------------------------------------
+	; Process a receipt reversal
+	;
+	; Params: pidxOrderNo,pidxLineNo - order line keys
+	;
+	; ByRefs:
+	;
+	; Returns: status
+	;
+	; History:
+	; 07-Apr-2006	JW		SR14421: Created - separated code from ReceiptSave
+	;-------------------------------------------------------------------------------
+	new strStatus,idInvMatch,objInvMatch,fltPrevTotal,fltUnmatchedQty
+	
+	$$$LogR("ReceiptReversal",pidxOrderNo_","_pidxLineNo)
+	
+	set strStatus=$$$OK
+	
+	set idInvMatch = ""
+	for {
+		set idInvMatch = $order(^FINAPInvMatchCaches(0,1,pidxOrderNo,pidxLineNo,idInvMatch),-1)
+		quit:idInvMatch=""
+		
+		set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+	$$$LogRx("RR:1:"_idInvMatch_"<"_objInvMatch)
+		
+		// If not already invoiced
+		if '$$$FINAPInvMatchCacheCompleted(objInvMatch) {
+			set $$$FINAPInvMatchCacheAddedToCache(objInvMatch) = $horolog
+				
+				// Reversal - remove (complete) non-receipted record, but store quantities
+			if '$$$FINAPInvMatchCacheReceipted(objInvMatch) {
+				set fltPrevTotal    = $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)      ; D18
+				set fltUnmatchedQty = $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch)  ; D19
+				
+				set $$$FINAPInvMatchCacheCompleted(objInvMatch) = $$$YES
+	$$$LogRx("RR:2:"_idInvMatch_"<"_objInvMatch)
+				set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+				
+				// SR13222: Reversal. If receipted and quantities match (will be the last receipt for this item)
+			} elseif ($$$FINAPInvMatchCachePreviouslyInvoicedValue(objInvMatch)="") {
+				// Remove receipt details and add quantities if necessary
+				if $get(fltPrevTotal) {
+					set $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)		= $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)     + fltPrevTotal
+					set $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch)	= $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) + fltUnmatchedQty
+				}
+	$$$LogRx("RR:3:"_idInvMatch_"<"_objInvMatch)
+				set strStatus = $$ReceiptUpdate(idInvMatch,objInvMatch,$$$NO)
+				quit	// Quit when found and updated line
+			}
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	
+	quit strStatus
+	
+	
+ReceiptUpdate(pidInvMatch,pobjInvMatch,pblnReceipted=$$$YES,ptimeRec="",pstrKeys="",pobjReceipt="")
+	; DEPRECATED - with removal of INWEAUF(VOR) SR16361 see CacheUpdate^INRECReceive
+	;-------------------------------------------------------------------------------
+	; Update the cache line with receipt details
+	; 
+	; Called By:
+	;	ReceiptSave      
+	;	ReceiptReversal  
+	;
+	; Params:	pidInvMatch		- cache id
+	;			pobjInvMatch	- cache object to update
+	;			pblnReceipted	- whether it is being receipted or unreceipted (reversed)
+	;			ptimeRec		- time of receipt - left blank for Reversal
+	;			pstrKeys		- INWEAUF keys    - left blank for Reversal
+	;			pobjReceipt		- INWEAUF record  - left blank for Reversal
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 07-Apr-2006	JW		SR14421: Created (encapsulated functionality)
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	$$$LogR("ReceiptUpdate",$get(pidInvMatch)_":"_pblnReceipted_"<"_pstrKeys)
+	
+	set $$$FINAPInvMatchCacheReceipted(pobjInvMatch)     = pblnReceipted
+	set $$$FINAPInvMatchCacheStockLocation(pobjInvMatch) = $$$KEY4(pstrKeys)
+	set $$$FINAPInvMatchCacheReceiptDate(pobjInvMatch)   = $$$KEY5(pstrKeys)
+	set $$$FINAPInvMatchCacheReceiptTime(pobjInvMatch)   = ptimeRec	; TODO When we fix receipt keys
+	set $$$FINAPInvMatchCacheReceiveKeys(pobjInvMatch)   = pstrKeys
+	
+	set $$$FINAPInvMatchCacheReceiptNumber(pobjInvMatch) = $$$INWEAUFReceivingNumber(pobjReceipt)
+	set $$$FINAPInvMatchCacheReceiptLine(pobjInvMatch)   = $$$INWEAUFIncomingGoodsLine(pobjReceipt)
+	
+	// If receipt - update location and quantity
+	if pblnReceipted {
+		set $$$FINAPInvMatchCacheLocation(pobjInvMatch)      = $$$KEY3(pstrKeys)
+		set $$$FINAPInvMatchCacheTotalQuantity(pobjInvMatch) = +$$$INWEAUFIncomingGoodsQuantity(pobjReceipt)
+	}
+	$$$LogRx("RU:1:"_pobjInvMatch)
+	set strStatus = $$$Save("FINAPInvMatchCache",pidInvMatch,pobjInvMatch,$$$YES)
+	
+	quit strStatus
+	
+	
+SplitCacheLine(pobjInvMatch,pidInvMatch,pfltTotalQty,pblnAlreadyInvoiced=$$$NO,&pidNewInvMatch,&pobjInvNewMatch)
+	; DEPRECATED - with removal of INWEAUF(VOR) SR16361 see CacheSplitLine^INRECReceive
+	;-------------------------------------------------------------------------------
+	; Duplicate a cache line
+	;
+	; Called By: ReceiptSave^FINAPInvDCM
+	;
+	; Params:	pobjInvMatch,pidInvMatch - data and key of current cache record
+	;			pfltTotalQty             - total qty for new line
+	;			pblnAlreadyInvoiced      - whether already invoiced (???)
+	;
+	; ByRefs:	pidNewInvMatch,pobjInvNewMatch - data and key of new cache record
+	;
+	; Returns:	status
+	;
+	; History:
+	; 07-Apr-2006	JW		SR14421: Created (encapsulated functionality)
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	$$$LogR("SplitCacheLine",$get(pidInvMatch)_":"_pblnAlreadyInvoiced_"<"_$get(pfltTotalQty))
+	
+	set pobjInvNewMatch = pobjInvMatch
+	
+	set $$$FINAPInvMatchCacheTotalQuantity(pobjInvNewMatch) = pfltTotalQty
+	
+	// If receipting previously invoiced quantity, unmatched stays the same
+	// Otherwise, it becomes the remaining quantity.
+	if 'pblnAlreadyInvoiced {
+		set $$$FINAPInvMatchCacheUnmatchedQuantity(pobjInvNewMatch) = pfltTotalQty
+		
+	} elseif $$$DEVMODE {
+		do Dump()	// Not sure what above check was trying to do, so have added logging - JW
+	}
+	
+	set $$$FINAPInvMatchCacheLink(pobjInvNewMatch) = pidInvMatch // Save Link
+	set pidNewInvMatch = $$^WWWNEXT("FINAPInvMatchCache")
+	$$$LogRx("SCL:1:"_pidNewInvMatch_"<"_pobjInvNewMatch)
+	set strStatus      = $$$Save("FINAPInvMatchCache",pidNewInvMatch,pobjInvNewMatch,$$$YES)
+	quit strStatus
+	
+	
+Dump() private
+	; DEPRECATED - with removal of INWEAUF(VOR) SR16361 see INRECReceive
+	;-------------------------------------------------------------------------------
+	; History:
+	; 22-Mar-2007	GRF		SR15482: replace to package message in ^WWWSOR
+	;-------------------------------------------------------------------------------
+	new idMessage,strStatus
+	
+	set idMessage = $$Allocate^WWWMAILS()
+	set ^WWWSOR(idMessage,1) = "Check dump folder"
+	set strStatus = $$PackageMail^WWWMAILS(idMessage,"FINAPInvDCM","joseph.windows@disclinc.com","Joe","","DCM")   ; FIXME
+	do Deallocate^WWWMAILS(idMessage)
+	do ##class(Common.Dump).DumpFile("FINAPInvDCM","JOE")
+	
+	/*   Previously
+	new TEXT
+	set TEXT(1) = "Check dump folder"
+	do ^WWWMAILS("mail.disclinc.com","support@disclinc.com","joseph.windows@disclinc.com","FINAPInvDCM",,"DCM","Joe")
+	do ##class(Common.Dump).DumpFile("FINAPInvDCM","JOE")
+	*/
+	
+	quit 
+	
+	
+ReceiptWithoutOrderSave(pstrKeys)
+	; DEPRECATED - with removal of INWEAUF(VOR)/INWEFREI SR16361
+	;-------------------------------------------------------------------------------
+	; Update Order Lines if receipt without order changes
+	;
+	; Called by : DCMEvent INWEFREISave : Method FINReceiptWithoutOrderSave
+	; Returns:
+	;
+	; History:
+	; 07-Jun-2005	JW/RW	Created SR12484
+	;-------------------------------------------------------------------------------
+    new dteCreated,idLocn,idUser,intSeq,objInvMatch,objReceipt,idInvMatch,strStatus
+    
+	$$$LogR("ReceiptWithoutOrderSave",$get(pstrKeys))
+	
+    set strStatus = $$$OK
+	
+	quit:$get(pstrKeys)="" strStatus
+	
+	set idInvMatch = $order(^FINAPInvMatchCaches(0,3,$$$Index(pstrKeys),""))
+	$$$LogRx("RWOS:1:"_idInvMatch)
+	if idInvMatch="" { // Doesn't already exist
+		set idLocn     = $$$KEY1(pstrKeys)
+		set dteCreated = $$$KEY2(pstrKeys)
+		set idUser     = $$$KEY3(pstrKeys)
+		set intSeq     = $$$KEY4(pstrKeys)
+		
+		set objReceipt = $get(^INWEFREI(0,idLocn,dteCreated,idUser,intSeq,1))
+		
+		if objReceipt'="" {
+			set $$$FINAPInvMatchCacheItem(objInvMatch)              = $$$INWEFREIItem(objReceipt)
+			set $$$FINAPInvMatchCacheLocation(objInvMatch)          = $$$INWEFREILocation1(objReceipt)
+			set $$$FINAPInvMatchCacheStockLocation(objInvMatch)     = $$$INWEFREIStockLocation(objReceipt)
+			set $$$FINAPInvMatchCacheReceiptDate(objInvMatch)       = $$$INWEFREIDate2(objReceipt)
+			set $$$FINAPInvMatchCacheReceiptTime(objInvMatch)       = 0	       ; TODO When we fix receipt keys
+			set $$$FINAPInvMatchCacheReceiveKeys(objInvMatch)       = pstrKeys
+			set $$$FINAPInvMatchCacheSupplier(objInvMatch)          = $$$INWEFREISupplier(objReceipt)
+			set $$$FINAPInvMatchCacheReceipted(objInvMatch)         = $$$YES
+			set $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)     = $$$INWEFREIQuantity(objReceipt)
+			set $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) = $$$INWEFREIQuantity(objReceipt)
+			
+			set idInvMatch = $$^WWWNEXT("FINAPInvMatchCache")
+			set $$$FINAPInvMatchCacheAddedToCache(objInvMatch)      = $horolog
+	$$$LogRx("RWOS:2:"_idInvMatch_"<"_objInvMatch)
+				set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+		}
+	}
+	
+	quit strStatus
+]]></Routine>
+</Export>

@@ -1,0 +1,312 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWWDataExchangeClient" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWWDataExchangeClient
+	
+#include WWWConst
+#include COMSYS
+#include COMDebug
+	
+OnAfterFormConstruction(YBBN,YFELD)
+	;-------------------------------------------------------------------------------
+	; Display a warning message if the fields match the current machine/namespace but
+	; are of a different case which will cause the message not to be sent.
+	; eg  Configured as 2003BOX when machine is 2003box
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Mar-2010	shobby		SRAdhoc: Created
+	;-------------------------------------------------------------------------------
+	;
+	if YBBN=2 {
+		if ($zcvt($$$WWWDataExchangeClientMachine(YFELD),"U")=$zcvt($zu(110),"U"))&&($$$WWWDataExchangeClientMachine(YFELD)'=$zu(110)) {
+			write "<FONT color=red>"_$zu(110)
+		}
+	} elseif YBBN=3 {
+		if ($zcvt($$$WWWDataExchangeClientNamespace(YFELD),"U")=$zcvt($zu(5),"U"))&&($$$WWWDataExchangeClientNamespace(YFELD)'=$zu(5)) {
+			write "<FONT color=red>"_$zu(5)
+		}
+	}
+	quit
+
+	
+OnAfterPrimaryKey(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Jan-2010	shobby		SR17100: Created
+	;-------------------------------------------------------------------------------
+	new strName
+	
+	if '$$$NoKey(YKEY) {
+		set strName   = $$WebserviceName(YKEY,YFELD)
+		if '##class(%Dictionary.CompiledClass).%ExistsId(strName) {
+			write "<font color=red><strong>"_$$$Text("WWW00133")_"</strong></font>"  ;Save this record to create the webservice.
+		}
+	}
+	quit
+	
+		
+OnBeforeSave(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Mar-2010	shobby		SR17100: Some basic validation of the 'Interface' field.
+	;-------------------------------------------------------------------------------
+	;
+	new strStatus,strURL,arrComponents
+	
+	set strURL=$$$WWWDataExchangeClientInterface(YFELD)
+	do ##class(%Net.URLParser).Parse(strURL,.arrComponents)
+	
+	set strStatus=$$$MakeStatus("WWW00134")  ;The structure of the Interface field is incorrect and should be of the form http://orion/csp/dev/WSAlphalinc.CN.Server.cls
+	if arrComponents("scheme")'="http" {
+	} elseif '$find(arrComponents("path"),"/") {	
+	} else {
+		set strStatus=$$$OK
+	}
+	
+ 	if $$$ISOK(strStatus) set strStatus =  $$CreateWebservice(YKEY,YFELD)
+ 	quit strStatus
+ 	
+OnBeforeDelete(YKEY)
+	quit $$DeleteWebservice(YFELD)
+	
+DeleteWebservice(&pobjWWWDataExchangeClient="")
+	;-------------------------------------------------------------------------------
+	; Remove webservices that call out to external clients to notify that there is 
+	; data on the data exchange queue.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Jan-2009	shobby	SR17100: Definition may exist but compiled class doesn't
+	; 31-Aug-2009	GRF		SR16846: manage sc rather than strStatus
+	; 19-Aug-2009	DWR		SR16846: only try and delete the compiled class if it
+	; 							exists and don't write to the screen when deleting.
+	; 							causes JS crash. Use strStatus
+	; 21-Apr-2009	shobby	SR16438: Created
+	;-------------------------------------------------------------------------------
+	new errorlog,sc,strName,strStatus
+	
+	set sc        = $$$OK
+	set strStatus = $$$OK
+	set errorlog  = ""
+	set strName   = $$WebserviceName(YKEY,pobjWWWDataExchangeClient)
+	if ##class(%Dictionary.CompiledClass).%ExistsId(strName)||##class(%Dictionary.ClassDefinition).%ExistsId(strName) { ;SR17100
+		set sc = $System.OBJ.Delete(strName,"-d",.errorlog)
+	}
+	;set strName   = $$WebserviceMethod(YKEY,pobjWWWDataExchangeClient)
+	;set strStatus = $System.OBJ.Delete(strName)
+	;quit $$$OK
+	if $$$ISERR(sc) {
+		set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	}
+	quit strStatus
+	
+	
+CreateWebservice(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	; Creates webservices that call out to external clients to notify that there is 
+	; data on the data exchange queue.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Jan-2009	shobby	SR17100: Recreate the webservie on each save as the previous save may have failed.
+	; 							Remove a corrupted webservice definition that has failed to compile.
+	; 08-Jan-2009	SCR		SR16929: Corrected Web Service name call
+	; 04-Nov-2009	SCR		SR16929: Create Web Service client based on WSDL for 'Push Data' clients
+	; 31-Aug-2009	GRF		SR16846: manage sc rather than strStatus
+	; 19-Aug-2009	DWR		SR16846: Check strStatus on return from delete .
+	;							Don't continue if have an error
+	; 30-Apr-2009	shobby	SR16438: Rewrote to be more configurable based on
+	; 							WWWDataExchange class.
+	; 21-Apr-2009	shobby	SR16438: Created
+	;-------------------------------------------------------------------------------
+	new objMethod,objParameter,objWS,strNull
+	new sc,strInvokeName,strLocn,strName,strStatus,strYFELDOLD,strWSDL,prevIO
+	
+	set sc        = $$$OK
+	set strStatus = $$$OK
+ 	
+	set strYFELDOLD = $get(^WWWDataExchangeClient(YM,$$$KEY1(YKEY),1))
+	;if ($$$WWWDataExchangeClientMethod(YFELD)'=$$$WWWDataExchangeClientMethod(strYFELDOLD))||
+	;	($$$WWWDataExchangeClientInterface(YFELD)'=$$$WWWDataExchangeClientInterface(strYFELDOLD))||
+	;	($$$WWWDataExchangeClientServiceName(YFELD)'=$$$WWWDataExchangeClientServiceName(strYFELDOLD))||
+	;	($$$WWWDataExchangeClientWSNamespace(YFELD)'=$$$WWWDataExchangeClientWSNamespace(strYFELDOLD)) {
+ 	;if $$$DevSteveR for i=1:1:100 h 1
+ 	if YFELD'=strYFELDOLD {
+		set strStatus = $$DeleteWebservice(strYFELDOLD)
+ 	}
+ 	if $$$ISOK(strStatus) {		;SR17100
+		set strStatus = $$DeleteWebservice(YFELD)
+		if $$$ISOK(strStatus) {
+			if ($$$WWWDataExchangeClientMethod(YFELD)'="")      &&
+			   ($$$WWWDataExchangeClientInterface(YFELD)'="")   &&
+			   ($$$WWWDataExchangeClientServiceName(YFELD)'="") &&
+			   ($$$WWWDataExchangeClientWSNamespace(YFELD)'="")    {
+				;set strName              = $$WebserviceName(YKEY,YFELD,$$$NO)
+				if $$$WWWDataExchangeClientPushData(YFELD)=1 {  ;SR16929
+					set strName              = $$WebserviceName(YKEY,YFELD,$$$NO)
+					set objWS                = ##class(%SOAP.WSDL.Reader).%New()
+					set strWSDL				 = $$$WWWDataExchangeClientInterface(YFELD)_"?WSDL=1"
+					set prevIO=$IO
+					set strNull=$$NullDevice^COMUtilStr()
+					open strNull:"W"
+					use strNull
+
+					set sc					 = objWS.Process(strWSDL,strName,1)
+					use prevIO
+					close strNull
+				} else {
+					set strName              = $$WebserviceName(YKEY,YFELD)
+					set objWS                = ##class(%Dictionary.ClassDefinition).%OpenId(strName)
+					if objWS="" set objWS    = ##class(%Dictionary.ClassDefinition).%New()
+					set objWS.Name           = strName
+					set objWS.Super          = "%SOAP.WebClient"
+				
+					set strLocn              = $$$WWWDataExchangeClientInterface(YFELD)
+					set objParameter         = ##class(%Dictionary.ParameterDefinition).%New()
+					set objParameter.Name    = "LOCATION"
+					set objParameter.Default = strLocn
+					set sc                   = objWS.Parameters.Insert(objParameter)
+				
+					set objParameter         = ##class(%Dictionary.ParameterDefinition).%New()
+					set objParameter.Name    = "NAMESPACE"
+					set objParameter.Default = $$$WWWDataExchangeClientWSNamespace(YFELD)
+					set sc                   = objWS.Parameters.Insert(objParameter)
+				
+					set objParameter         = ##class(%Dictionary.ParameterDefinition).%New()
+					set objParameter.Name    = "SERVICENAME"
+					set objParameter.Default = $$$WWWDataExchangeClientServiceName(YFELD)
+					set sc                   = objWS.Parameters.Insert(objParameter)
+				
+					set objMethod                  = ##class(%Dictionary.MethodDefinition).%New()
+				;	set objMethod.ClassMethod      = 1
+					set objMethod.Name             = $$$WWWDataExchangeClientMethod(YFELD)
+					set objMethod.WebMethod        = 1
+					set objMethod.ReturnType       = "%String"
+					set objMethod.Final            = 1
+					set objMethod.ProcedureBlock   = 1
+					set objMethod.SoapBindingStyle = "document"
+					set objMethod.SoapBodyUse      = "literal"
+				;	do objMethod.Implementation.Write(" Quit ..WebMethod("""_objMethod.Name_""").Invoke(##this,""Trakcare/Alphalinc.Interface.Start"")")
+				
+					set strInvokeName = $piece($$$WWWDataExchangeClientInterface(YFELD),"/",$length($$$WWWDataExchangeClientInterface(YFELD),"/"))
+					set strInvokeName = $piece(strInvokeName,".",1,$length(strInvokeName,".")-1)
+					do objMethod.Implementation.Write(" Quit ..WebMethod("""_objMethod.Name_""").Invoke(##this,"""_$$$WWWDataExchangeClientWSNamespace(YFELD)_"/"_strInvokeName_"."_objMethod.Name_""")")
+	 			
+					set sc = objWS.Methods.Insert(objMethod)
+				
+					if $$$ISOK(sc) set sc = objWS.%Save()
+					if $$$ISOK(sc) set sc = $System.OBJ.Compile(strName,"-d")
+				}
+			}
+			;do DecomposeStatus^%apiOBJ(strStatus,.err)
+		}
+	}
+	if $$$ISERR(sc) {
+		do DeleteWebservice(YFELD)			;SR17100
+		set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	}
+	quit strStatus
+	
+	
+WebserviceName(YKEY,pobjWWWDataExchangeClient="",pBblnAddServiceName=$$$YES)
+	;-------------------------------------------------------------------------------
+	; The Webservice name.  This may be a parameter one day.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 06-Nov-2009	SCR		SR16929: Added option to exclude service name.
+	; 28-Apr-2009	shobby	SR16438: Created
+	;-------------------------------------------------------------------------------
+	new strName
+	set strName="WSAlphalinc.Poke."_$$$KEY1(YKEY)
+	if pBblnAddServiceName=$$$YES {
+		set strName=strName_"."_$$$WWWDataExchangeClientServiceName(pobjWWWDataExchangeClient)_"Soap"
+	}
+	quit strName
+	;quit "WSAlphalinc.Poke."_$$$KEY1(YKEY)_"."_$$$WWWDataExchangeClientServiceName(pobjWWWDataExchangeClient)_"Soap"
+	
+	
+WebserviceMethod(YKEY,pobjWWWDataExchangeClient="")
+	new strMethod
+	
+	set strMethod = $$WebserviceName(YKEY,pobjWWWDataExchangeClient)_"."_$$$WWWDataExchangeClientMethod(pobjWWWDataExchangeClient)
+	quit strMethod
+	
+	
+ListOfWebservices(pblnDeleteAll=$$$NO)
+	;-------------------------------------------------------------------------------
+	;
+	; Params: pblnDeleteAll
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Aug-2009	GRF		SR16846: manage sc rather than strStatus
+	;-------------------------------------------------------------------------------
+	new blnDelete,idWS,objClassInfo,strName,sc
+	
+	set objClassInfo = ##class(%ResultSet).%New("%ClassDefinition.ClassInfo")
+	if $$$ISOK(objClassInfo.Execute()) {
+		for {
+			quit:'objClassInfo.Next()
+			set blnDelete = $$$NO
+			set strName   = objClassInfo.GetDataByName("Name")
+			
+			if $piece(strName,".",1,2)="WSAlphalinc.Poke" {
+				write !,strName
+				set idWS = $piece(strName,".",3)
+				if pblnDeleteAll {
+					set blnDelete = $$$YES
+				
+				} elseif idWS="" {
+					set blnDelete = $$$YES
+				
+				} elseif '$data(^WWWDataExchangeClient(YM,idWS)) {
+					set blnDelete = $$$YES
+				}
+			}
+			if blnDelete set sc = $System.OBJ.Delete(strName)
+		}
+			
+		;	if ##class(%Dictionary.ClassDefinition).%ExistsId(objClassInfo.GetDataByName("Name")) {
+		;		set objX = ""
+		;		set objX = ##class(%ClassDefinition).%OpenId(objClassInfo.GetDataByName("Name"))
+		;		
+		;		if objX '= "" {
+		;			if 'objX.System {
+		;				if ($find(objX.Name, "User.") = 0) do objClassesA.Insert(objX)
+		;			}
+		;		}
+		;	}
+		;}
+	}	
+	do objClassInfo.%Close()
+	quit
+	
+]]></Routine>
+</Export>

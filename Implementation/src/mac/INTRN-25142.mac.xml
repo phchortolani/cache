@@ -1,0 +1,738 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRN" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRN
+	;              * * * * *   Associated with form INTFR   * * * * *
+	
+#include COMConst
+#include INConst
+#include COMSYS
+	
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+	
+OnBeforeSaveHook(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Brute force approach to try and locate how corruption is happening in transfers.
+	; This simply prevents saving of a transfer to an 'earlier' state.
+	; (Then logs an error that can be examined later).
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Apr-2011	PPP		SR17726:No longer want this implemented, as we need to 
+	;							1. UnFirm and also 2. UnPick
+	; 22-Jul-2008	GRF		SRBR014960: use $i rather than $zincr; don't use & with
+	; 							arguments; use Undefined if YBED not defined.
+	; 09-Jul-2008	shobby	SRBR014960: corrected some variable names.
+	; 30-Jun-2008	shobby	SRBR014960: Created
+	;-------------------------------------------------------------------------------
+	//SR17726
+	quit $$$OK
+	
+	;---------------------------------------
+	
+	new objINTFR,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pYKEY) {
+		set objINTFR = $get(^INTFR(0,pYKEY,1))
+		if objINTFR'="" {
+			if $$$INTFRStatus(pYFELD) < $$$INTFRStatus(objINTFR) {
+				set strStatus = $$$MakeStatus("IN00841",$$$AppEnum("INTFRSTATUS",$$$INTFRStatus(pYFELD)),$$$AppEnum("INTFRSTATUS",$$$INTFRStatus(objINTFR)))
+				set ^INERROR("INTFR",$increment(^INERROR("INTFR")),$horolog,$get(YBED,"Undefined")) = $$DecodeError^COMUtilError(strStatus)
+			} ; "Can't save transfer to a status of '%1' because it is already in a status of '%2'."
+		}
+	}
+	quit strStatus
+	
+	
+OnBeforeFormConstruction(pidField,pidTFR)
+	;-------------------------------------------------------------------------------
+	; Once a record is created the following fields are read only
+	;  Sending Location, Receiving Location
+	;
+	; Params:
+	; pidField - ** Not used **
+	; pidTFR   - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 18-Apr-2006	PO/RPW	SR14427: Created
+	;-------------------------------------------------------------------------------
+	if '$$$NoKey(pidTFR) set YHID=2
+	quit
+	
+	
+OnBlur(pidField,pobjTFR)
+	;-------------------------------------------------------------------------------
+	; Called by the fields Transfer Date, Due Date, Sending Location, Receiving Location & Dispatch
+	;
+	; Params:
+	; pidField - Field id that caused this event to occur
+	; pobjTFR - Record of header
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 21-Oct-2010	GRF		SR17576: cleanup
+	; 18-Mar-2010	shobby	SR15753: Tidy up.
+	; 15-Nov-2006	PO		BR014318: Display message if sending and receiving
+	;							locations are the same
+	; 25-Apr-2006	PO		SR14427: Created
+	;-------------------------------------------------------------------------------
+	new dteTransfer,idSendingLocn,idReceivingLocn,lstDispatch,strStatus
+	
+	if $case(pidField,$$$FldINTFRTransferDate:$$$YES,$$$FldINTFRSendingLocation:$$$YES,$$$FldINTFRReceivingLocation:$$$YES,$$$FldINTFRDispatch:$$$YES,:$$$NO) {
+		set idSendingLocn   = $$$INTFRSendingLocation(pobjTFR)
+		set idReceivingLocn = $$$INTFRReceivingLocation(pobjTFR)
+		
+		if $case(pidField,$$$FldINTFRSendingLocation:$$$YES,$$$FldINTFRReceivingLocation:$$$YES,:$$$NO) {
+			if (idSendingLocn'="") && (idSendingLocn=idReceivingLocn) {
+				$$$Alert("IN00555")
+			} ; "Please note you have set the sending and receiving locations to be the same"
+		}
+		
+		if (idSendingLocn'="") && (idReceivingLocn'="") {
+			set lstDispatch = $$DefaultDispatch^INTRNValidation(idSendingLocn,idReceivingLocn)
+			if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+				if ((pidField '= $$$FldINTFRDispatch) && (lstDispatch '= "")) {
+					set $$$INTFRDispatch(pobjTFR)=$listget(lstDispatch,1)	;SR15753
+				}
+			}
+			else {
+				if pidField '= $$$FldINTFRDispatch set $$$INTFRDispatch(pobjTFR)=$listget(lstDispatch,1) ;SR15753
+			}
+			
+			set dteTransfer = $$$INTFRTransferDate(pobjTFR)
+			if dteTransfer '= "" {
+				set $$$INTFRDueDate(pobjTFR) = dteTransfer + $listget(lstDispatch,2)
+			}
+		}
+		
+	} elseif pidField = $$$FldINTFRDueDate {
+		set strStatus = $$IsDueDateValid^INTRNValidation(pobjTFR)
+		if $$$ISERR(strStatus) {
+			$$$Alert(strStatus)
+		}
+	}
+	quit
+	
+	
+OnBeforeButtonLine(pidForm,pidTFR)
+	;-------------------------------------------------------------------------------
+	; Initialise
+	;  - locks taken out using COMLock
+	;  - errors displayed in the Edit Grids
+	;
+	; Params:
+	; pidForm - Form id that called this function
+	; pidTFR - Key of the record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 08-Jan-2014	shobby	HEVA-1349: YOPTION
+	; 22-Jan-2009	HQN		SR16296: Set YOPTION from YPARA
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	do SetLockingInterest^COMLock(pidForm,pidTFR)
+	if YPARA="REQUISITION" {
+		set YPARA   = ""
+		set YOPTION = 2 ;HEVA-1349.
+	}
+	quit
+	
+	
+OnAfterDataFields(pidForm,pidTFR,pobjTFR)
+	;-------------------------------------------------------------------------------
+	; What needs running after header is drawn
+	;  Remove any old locks, Display open demands table, Load Edit.
+	;
+	; Params:
+	; pidForm - Form id that called this function
+	; pidTFR  - Key of the record
+	; pobjTFR - Header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 08-Jan-2014	shobby	HEVA-1349: Removed previous change
+	; 08-Dec-2013	SCR		SESDF-655: Use INTFRReqLine if TransferType = "Remote"
+	; 21-Oct-2010	GRF		SR17576: display message in red
+	; 23-Jan-2009	HQN		SR16296: Added Req detection
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	
+	;---------------------------------------
+	; Protect referenced @Net variables
+	new YKEY,YFELD
+	set YKEY  = pidTFR
+	set YFELD = pobjTFR
+	;---------------------------------------
+	
+	kill ^CacheTempINTFRSendLoc(YUSER)
+	kill ^CacheTempINTFRRecvLoc(YUSER)
+ 	
+	do RemoveLocksIfRequired^COMLock(pidForm,pidTFR,$$GetRemovalCode(,pidTFR),$$$YES)
+	
+	//Following are used in 'INTFRPickLine' form
+ 	set ^CacheTempINTFRSendLoc(YUSER) = $$$INTFRSendingLocation(pobjTFR)
+ 	set ^CacheTempINTFRRecvLoc(YUSER) = $$$INTFRReceivingLocation(pobjTFR)
+ 	
+	if YSEITE = 1 {
+		if (YOPTION = 2)||($$$INTFRRequisitionNumber(pobjTFR)'="") { ;HEVA-1349
+			do LoadGrid(pidTFR,"INTFRReqLine")
+		} else {
+			do LoadGrid(pidTFR,"INTFRLine")
+		}
+		if $$$NoKey(pidTFR) {
+			if '$$$INVORGHideOpenDemands($$Get^INVORG()) {
+				do OpenDemandsTable^INTFROpenDemands(YLOCATION)
+			}
+		
+		} else {
+			if $$$INTFRReceivingLocation(pobjTFR)'="" {
+				if '$$$INVORGHideAutoReceipts($$Get^INVORG()) ||
+				   '$$$WWW0121AutoReceiptTransferOrders($get(^WWW0121(0,0,$$$INTFRReceivingLocation(pobjTFR),1))) {
+					
+					do ShowReceipts^INTFRInterfaceRec(pidTFR)
+				}
+			}
+			if $data(^INTFRRev(0,pidTFR)) {
+				do ShowReversals^INTFRRev(pidTFR)
+			}
+		}
+		
+	} elseif YSEITE = 2 {
+		if ($$$INTFRStatus(pobjTFR) = $$$EnumINTFRSTATUSFirmed) && '$data(^INTFRPickLine(0,pidTFR)) {
+		;	write "<p style='text-align:center'>"_$$$Text("IN00422")_"</p>"            ; "Picklist needs to be printed"  ; SR17576
+			write "<p style='text-align:center;color:red'>"_$$$Text("IN00422")_"</p>"  ; "Picklist needs to be printed"
+		}
+		do LoadGrid(pidTFR,"INTFRPickLine")
+	}
+	quit
+	
+	
+LockRecord(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Once the Transfer Order is firmed the Transfer Date, Due Date and Dispatch fields
+	; are all locked.
+	;
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing (@Net Manager variable YHID)
+	;
+	; History:
+	; 22-Apr-2006	PO		SR14427: Created
+	;-------------------------------------------------------------------------------
+	if '$$$NoKey(pidTFR) {
+		if $$$INTFRStatus($get(^INTFR(0,pidTFR,1))) '= $$$EnumINTFRSTATUSCreated {
+			set YHID = 2
+		}
+	}
+	quit
+	
+	
+GetRemovalCode(pstrClass="",pidClass="")
+ 	;-------------------------------------------------------------------------------
+	; How to determine whether lock is still required.
+	;
+	; Params:
+	; pstrClass - ** Not used **
+	; pidClass - The key of the header record the index is related to.
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	quit $$$LOCKCODE_"'$data(^INTFRLines(0,1,$$Index^COMUtils(strClassId),"""_pidClass_"""))"
+	
+	
+LoadGrid(pidTFR,pidForm)
+	;-------------------------------------------------------------------------------
+	; Load Edit Grid, run validation for currently editable grid and cause grid to be redrawn.
+	;
+	; Params:
+	; pidTFR - Key of header record
+	; pidForm - Form id that called this function
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 27-Jan-2009	HQN		SR16296: No Req's detected, don't show Reject columns
+	; 05-Dec-2008	GRF		Clarify Enabled test
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new blnEnabled,blnReqFound,idTFRLine,objTFR,objTFRLine,YFORM,YFELD,YKEY
+	
+	set YFORM = pidForm
+	set YFELD = ""
+	set YKEY  = $get(pidTFR)
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 290
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = YFORM
+	
+	kill $$$TempStore("TRNLineErrors")
+	
+	set blnEnabled = $$$OK
+	
+	if '$$$NoKey(pidTFR) {
+		set objTFR = $get(^INTFR(0,pidTFR,1))
+		if (pidForm = "INTFRLine") || (pidForm = "INTFRReqLine") {
+			set blnEnabled = ($$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSCreated)
+		
+		} elseif pidForm = "INTFRPickLine" {
+			set blnEnabled = ( ($$$INTFRPickListPrinted(objTFR)'="") &&
+			                   ($$$INTFRStatus(objTFR)'=$$$EnumINTFRSTATUSSent) )
+		}
+		
+		if blnEnabled {
+			set $$$COMGridEditParameterEnabled(YAUSWAHL) = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+		} else {
+			set $$$COMGridEditParameterEnabled(YAUSWAHL) = blnEnabled
+		}
+	}
+	set $$$COMGridEditParameterContainer(YAUSWAHL) = "INTFR"
+	
+	do ^COMGridEdit31
+	
+	if '$$$NoKey(pidTFR) {
+		set blnReqFound = $$$NO
+		set idTFRLine = ""
+		for {
+			set idTFRLine = $order(^INTFRLine(0,pidTFR,idTFRLine))
+			quit:idTFRLine=""
+			set objTFRLine = $get(^INTFRLine(0,pidTFR,idTFRLine,1))
+			if $$$INTFRLineReference(objTFRLine) '= "" {
+				set blnReqFound = $$$YES
+				quit
+			}
+		}
+		if blnReqFound = $$$NO {
+			$$$StartScript()
+			$$$GRIDHideShowColumns("22;23")      ; F22 RejectRemainder, F23 ReasonRejection
+			$$$EndScript()
+		}
+	}
+	quit
+ 	
+	
+OnBeforeSave(pidTFR,&pobjTFR)
+	;-------------------------------------------------------------------------------
+	; Override saving of record so as to maintain database integrity
+	;  Run validation for currently editable grid so that buttons are approrpiately disabled
+	;
+	; Params:
+	; pidTFR - Key of header record
+	; pobjTFR - Header record
+	;
+	; ByRefs: pobjTFR
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	;---------------------------------------
+	; Protect reference @Net variables
+	new YFELD,YKEY
+	set YFELD = pobjTFR
+	set YKEY  = pidTFR
+	;---------------------------------------
+	if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1))))
+		&& (YFORM = "INTFR"){
+		do OnBeforeSave^VARINTFRReqLine(pidTFR)
+	}
+	set strStatus = $$CheckPickIntegrity(pidTFR)
+
+	if $$$ISOK(strStatus) {
+		set strStatus = $$PreCanSave(pidTFR)
+	}
+	
+	if $$$ISOK(strStatus) {
+		set $$$INTFRFREE4(pobjTFR) = $replace($$$INTFRFREE4(pobjTFR),$char(34),"")		
+		set strStatus = $$Transaction^COMTransaction("SaveTxn^INTRN("""_pidTFR_""","""_pobjTFR_""")")
+	}
+	
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError($listbuild("IN00474",pidTFR,$$$Text(strStatus)))
+		set Q = $$$QDontSave
+	} ; "Save of Transfer Order %1 unsuccessful. Reason: %2"
+	quit
+	
+	
+PreCanSave(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Determine whether Transfer Order can be Saved
+	; before the Order Lines are saved. ie INTFRLine does not exist yet
+	;
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: Status
+	;
+	; Returns: strStatus
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new idLine,objLine,objTFR,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidTFR) {
+		set objTFR = $get(^INTFR(0,pidTFR,1))
+		
+		if $$$ISOK(strStatus) {
+			set strStatus = $$ProductError^INTRNValidation("IN00432")
+		} ; "Please fix all errors before firming."
+	}
+	quit strStatus
+	
+	
+CanSave(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Determine whether Transfer Order can be Saved
+	; after the Lines are Saved ie INTFRLine does not exist
+	; 
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: Status
+	;
+	; Returns: strStatus
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new idLine,objLine,objTFR,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidTFR) {
+		set objTFR = $get(^INTFR(0,pidTFR,1))
+		
+		if $$$ISOK(strStatus) {
+			set strStatus = $$ProductError^INTRNValidation("IN00432")
+			; "Please fix all errors before firming."	
+			
+			set idLine = ""
+			for {
+				quit:$$$ISERR(strStatus)
+				set idLine = $order(^INTFRLine(0,pidTFR,idLine))
+				quit:idLine=""
+				
+				set objLine = $get(^INTFRLine(0,pidTFR,idLine,1))
+				if $$$INTFRLineItem(objLine) = "" {
+					set strStatus = $listbuild("IN00433")
+					; "All lines require an item."
+					
+				} elseif +$$$INTFRLineQuantity(objLine) = 0 {
+					set strStatus = $listbuild("IN00434")
+					; "All lines require a quantity."
+					
+				} elseif +$$$INTFRLineQuantity(objLine) < 0 {
+					set strStatus = $listbuild("IN00456",idLine)
+					; "Negative quantity on line %1"
+					
+				} elseif $$$INTFRLineUnit(objLine) = "" {
+					set strStatus = $listbuild("IN00508")
+					; "All lines require a unit."
+					
+				} elseif $$$INTFRLineBaseQuantity(objLine) = "" {
+					set strStatus = $listbuild("IN00509",idLine)
+				} ; "Line ´%1´ is assigned a unit that is not defined in terms of base unit."
+			}
+		}
+	}
+	quit strStatus
+	
+	
+SaveTxn(pidTFR,pobjTFR)
+	;-------------------------------------------------------------------------------
+	; Perform save of all records associated with the Transfer Order header.
+	;
+	; Params:
+	;	pidTFR - Key of header record
+	;	pobjTFR - Header record
+	;	pdteToday - The date at the time OnBeforeSave is run
+	;
+	; ByRefs: None
+	;
+ 	; Returns: strStatus - $$$OK if all successful, otherwise an error message
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+		
+	set strStatus = $$$GRIDSave(pidTFR)
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$CanSave(pidTFR)
+	}
+	quit strStatus
+	
+	
+OnAfterSave(pidTFR,pobjTFR)
+	;-------------------------------------------------------------------------------
+	; Create transfer lines if location selected in "Open" Demands table then firm and display pick list
+	;
+	; Params:
+	; pidTFR - Transfer Id
+	; pobjTFR - Transfer Record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	
+	//When Pick Lines are saved when the Status = Firmed
+	if ($$$INTFRStatus(pobjTFR) = $$$EnumINTFRSTATUSFirmed) && $data(^INTFRPickLine(0,pidTFR)) {
+		//Update Reservations
+		if $$$ISOK(strStatus) {
+			set strStatus = $$UpdateReservations^INTRNPickLine(pidTFR)
+		}
+	}
+	
+	if $$$INTFRStatus(pobjTFR) = $$$EnumINTFRSTATUSCreated {
+		//This is created by LinesToCreate^INTFROpenDemands	
+		if $data(^CacheTempTFRLinesToCreate(YUSER)) {
+			
+			set strStatus = $$Transaction^COMTransaction("CreateLinesTxn^INTFROpenDemands("""_pidTFR_""")")
+			
+			if $$$ISOK(strStatus) set strStatus = $$Firm^INTRNFirm(pidTFR,$$$NO)
+			
+			if $$$ISOK(strStatus) {
+				set %("%KEY","HYPEREVENT") = $$$YES
+				//	This will cause GoToForm^COMUtilForm to load for in main frame using js,
+				//	if omitted transfer form will appear at the bottom of the page.
+				do PrintPick^INTRNPick(pidTFR)
+			}
+			kill ^CacheTempTFRLinesToCreate(YUSER)
+		}
+	}
+	quit
+	
+	
+OnBeforeCanDelete(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Disallow deleting of Transfer Order once Transfer Order has been sent
+	; ie. when status of Transfer Order is Sent or Received
+	;
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing (@Net Manager variable Q)
+	;
+	; History:
+	; 06-Sep-2012	shobby	SR18107: Disallow deleting of firmed transfers.
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new enumStatus,objTFR
+	
+	quit:$$$NoKey(pidTFR)
+	
+	set objTFR = $get(^INTFR(0,pidTFR,1))
+	set enumStatus = $$$INTFRStatus(objTFR)
+	
+	if (enumStatus = $$$EnumINTFRSTATUSSent) || (enumStatus = $$$EnumINTFRSTATUSReceived) || (enumStatus = $$$EnumINTFRSTATUSFirmed) {
+		set Q = $$$QDontDelete
+	}
+	quit
+	
+	
+OnBeforeDelete(pidForm,pidTFR)
+	;-------------------------------------------------------------------------------
+	; Override deletion process, make sure that all records are removed
+	;
+	; Params:
+	; pidForm - Form id that called this function
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing (@Net Manager variable Q)
+	;
+	; History:
+	; 03-Jun-2011	PPP		SR17776: Return strStatus, as it is called in 
+	;							alREQ.dUReq::ManuallyClose
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$Transaction^COMTransaction("DeleteTxn^INTRN("""_pidTFR_""")")
+	
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError($listbuild("IN00462",pidTFR,$$$Text(strStatus)))
+		set Q = $$$QDontDelete
+	} ; "Delete of Transfer Order %1 unsuccessful. Reason: %2"
+	quit strStatus	//SR17776
+	
+	
+DeleteTxn(pidTFR)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	; pidForm - current form
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message
+	;
+	; History:
+	; 15-Jan-2009	HQN		SR16296: Build list of Req's needed to be updated
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new idLine,idTFRLine,objTFR,objTFRLine,strForm,strStatus,YFELD
+		
+	set strStatus = $$$OK
+	set strForm   = YFORM
+	set objTFR    = $get(^INTFR(0,pidTFR,1))
+	
+	set YFORM = "" // Make sure OnBeforeDelete is not executed.
+	
+	// Not using KILL^COMUtils as this sets YFORM
+	set idLine = ""
+	for {
+		set idLine = $order(^INTFRLine(0,pidTFR,idLine))
+		quit:idLine=""
+		
+		set strStatus = $$ClearDemandForTrnLine^INTRNDemand(pidTFR,idLine)
+		
+		if $$$ISOK(strStatus) {
+		 	set objTFRLine = $get(^INTFRLine(0,pidTFR,idLine,1))
+		 	if $$$INTFRLineReference(objTFRLine) '= "" {
+			 	; Trigger OnBeforeDelete correctly
+			 	set YFORM = "INTFRReqLine"
+			 	if '$data(^CacheTemp(YUSER,"INTFR",+$horolog,$$$INTFRLineReference(objTFRLine))) {
+				 	set ^CacheTemp(YUSER,"INTFR",+$horolog,$$$INTFRLineReference(objTFRLine)) = $get(^INReq(0,$$$KEY1($$$INTFRLineReference(objTFRLine)),1))
+			 	}
+		 	
+		 	} else {
+			 	set YFORM = ""
+		 	}
+			set strStatus = $$^WWWKILL("INTFRLine",pidTFR_$$$COMMA_idLine)
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	
+	//Only if Pick Lines Exist
+	if $$$ISOK(strStatus) && ($$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSFirmed) && $data(^INTFRPickLine(0,pidTFR)) {
+		if $$$ISOK(strStatus) { 
+			for {
+				quit:$$$ISERR(strStatus)
+				set idLine = $order(^INTFRPickLine(0,pidTFR,idLine))
+				quit:idLine=""
+				
+		 		//*** NEED TO REMOVE ALL RESERVED STOCK  alDRP.dPlannedMovement
+				set strStatus = $$OnDelete^INTRNPickLine(pidTFR_$$$COMMA_idLine)
+				
+				if $$$ISOK(strStatus) {
+					set strStatus = $$^WWWKILL("INTFRPickLine",pidTFR_$$$COMMA_idLine)
+				}
+			}
+		}
+	}
+	
+	set YFORM = strForm
+	if $$$ISOK(strStatus) {
+		set strStatus = $$RemoveLocksIfRequired^COMLock(YFORM,pidTFR)
+	}
+	quit strStatus
+	
+	
+OnAfterDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Update References records to reflect applicable Status
+	; 
+	; History:
+	; 15-Apr-2011	PPP		SR17728: Deletion Error due to invalid INReq ID for $$$Save
+	; 21-Oct-2010	GRF		SR17576: dteToday more efficient in loop
+	; 16-Jan-2009	HQN		SR16296: Created
+	;-------------------------------------------------------------------------------
+	new dteToday,idTFRLine,objTFRLine,arrReqs,idReq,objReq,strStatus
+	new idREQ
+	
+	set strStatus = $$$OK
+	
+	quit:$$$NoKey(pYKEY) strStatus
+	
+	set dteToday = +$horolog
+	
+	; Find all Req References
+	set idReq = ""
+	for {
+		set idReq = $order(^CacheTemp(YUSER,"INTFR",dteToday,idReq))
+		quit:idReq=""
+		
+		//SR17728
+		set idREQ = $$$KEY1(idReq)
+		
+		if $$GetActiveTransfer^INReqIssueAsReq(idREQ) = "" {
+			set objReq = $get(^CacheTemp(YUSER,"INTFR",dteToday,idReq))
+			set $$$INReqStatus(objReq) = 2                           ; Firmed
+			
+			set strStatus = $$$Save("INReq",idREQ,objReq,$$$YES)
+			kill ^CacheTemp(YUSER,"INTFR",dteToday,idReq)
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+
+CheckPickIntegrity(pidTFR)
+	new strStatus, objTFRLine, objTFRPick, line
+	
+	set strStatus = $$$OK
+	set line = $order(^INTFRPickLine(YM,pidTFR,""))
+	while ($length(line) > 0) {
+		set objTFRPick = $get(^INTFRPickLine(YM,pidTFR,line,1))
+		if ($length($$$INTFRPickLineSourceline(objTFRPick)) = 0) {
+			;set strStatus = $$$MakeStatus("IN01411")	 ;Warning: integrity error when creating pick list. Please cancel and recreate the pick line again
+			set strStatus = $$$MakeStatus("IN01456")	 ;Error on validating the lines of document. Please contact support!
+			quit
+		}
+		set objTFRLine = $get(^INTFRLine(YM,pidTFR,$$$INTFRPickLineSourceline(objTFRPick),1))
+		if ($$$INTFRPickLineItem(objTFRPick) '= $$$INTFRLineItem(objTFRLine)) {
+			;set strStatus = $$$MakeStatus("IN01411")	 ;Warning: integrity error when creating pick list. Please cancel and recreate the pick line again
+			set strStatus = $$$MakeStatus("IN01456")	 ;Error on validating the lines of document. Please contact support!
+			quit
+		}
+		set line = $order(^INTFRPickLine(YM,pidTFR,line))
+	}
+	
+	quit strStatus
+]]></Routine>
+</Export>

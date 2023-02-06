@@ -1,0 +1,848 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INWEINV" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INWEINV
+#include COMSYS
+#include INConst
+	
+	; 08-Aug-2011	shobby	SR17850 Class/Form changed (Do Not remove comment)
+
+#define LogItem(%L,%S,%T,%E)	if %L'="" if %T'=$h do AddMessage^COMLog(%L,$$$Text(%S),.%E) set %T=$h
+#define LogMessage(%L,%S)		if %L'="" do AddMessage^COMLog(%L,$$$Text(%S))
+	do OnAfterSave()     ; SR17084 - legacy code in case other direct call
+	quit
+	
+	
+OnAfterSave()
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		AUFBEREITEN INVENTURDATEI
+	;
+	; Called By : Form INWEINV : Execute After Save
+	;             Form INWEINVBackup : Execute After Save   (???)
+	;
+	;
+	; ByRef :
+	;	VORG(1)=INVENTURDATUM
+	;	VORG(2)=TEXT
+	;	VORG(3)=1=JE WE ;In 
+	;	VORG(4)=SORTIERUNG
+	;	VORG(5)=AUSWAHL ALLE ODER NUR MIT BESTAND ;Or only by means of 
+	;	VORG(6)=1 = KEINE BESTÄNDE ÜBERTRAGEN ;no transport 
+	;	VORG(7)=1 = EXTRA AUFNAHMEZEILE JE ARTIKEL MIT SN ;extra once item by means of 
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 15-Dec-2009	GRF		SR17084: use specific tag
+	; 17-Aug-2006	GRF		SR14857: Clarify changes
+	; 07-AUG-2006	FAN		SR14857: Stocktake Batch/Update changes 
+	; 01-May-2006	JW&PP	SR14508: Cleaned up, msg log
+	; 11.02.2000	DT		Created
+	;-------------------------------------------------------------------------------
+	new ART,BET,LAP,LAPX,AUF,POS,WED,AUF1,WE,WE1,WG,WGX,CHAR,SOR,DATUM,BEST,ARTB,MENGE,JEWESN
+	new idLog,objStocktake,strStatus,NOBEST,JEWE,idKey
+	
+	set BEST   =  $get(VORG(5))
+	set NOBEST = '$get(VORG(6))
+	if +$get(VORG(1))=0 do ^WWWINFO($$^WWWTEXT(32029)) quit  ;NICHT STARTEN ;Not launching 
+	
+	set SOR = $get(VORG(4))     if SOR="" set SOR = 1        ;SORTIERUNG ;sorting 
+	
+	set JEWE      = '$get(VORG(3))   //SR14508 Checkbox reversed
+	set JEWESN    =  $get(VORG(7))   ;AUFNAHMEZEILE JE ARTIKEL MIT SN ;once item by means of 
+	set DATUM     =  VORG(1)
+	set strStatus =  $$$OK
+	
+	if $data(^INWEINVP(YM,DATUM,1)) {	//SR14508
+		set strStatus = $listbuild("IN00450",$$^WWWDATE(DATUM)) ;Stocktake List already exists for %1
+		
+	} else {
+		set objStocktake = YBED_Y_DATUM_Y_$horolog_Y_VORG(2)_Y_JEWE_Y_SOR_Y_$get(VORG(5))_Y_1
+		set idKey        = $$^WWWNEXT("INWEINVP")
+		set strStatus    = $$$Save("INWEINVP",idKey,objStocktake,$$$YES)
+		
+		if $$$ISOK(strStatus) {
+			do StartLog^COMLog($$$Text("IN00451")_" "_$$^WWWDATE(DATUM)_" ("_$$$INWEINVPRemark(objStocktake)_")",.idLog)	//SR14508 - Generating Stocktake
+				
+			;DO START(YM,DATUM,JEWE,SOR,BEST,YUSER,NOBEST,JEWESN) WRITE "OK" QUIT  ;OHNE JOB (TEST) 
+			//JOB START^INWEINV(YM,DATUM,JEWE,SOR,BEST,YUSER,NOBEST,JEWESN)::1    ;JOB STARTEN ;launching 
+			job START(YM,DATUM,JEWE,SOR,BEST,YUSER,NOBEST,JEWESN,idLog,idKey) //::1    ;SR14508 ; SR14857
+			
+ 			; Ready to goto the Detail form
+			do GoToForm^COMUtilForm("COMMsg",idLog)
+		}
+	}
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError(strStatus)
+	}
+	
+	quit
+	
+	
+START(YMAND,YDATUM,YJEWE,YSOR,YBEST,XUSER,NOBEST,JEWESN,pidLog="",pidKey)   ;STARTEN DER UMSETZUNG ;launching the transferral 
+	;-------------------------------------------------------------------------------
+	; History:
+	; 15-Dec-2009	GRF		SR17084: recover user language within background job
+	; 29-Aug-2006	RPW		SR14857: Do not show end of process message
+	; 07-AUG-2006	FAN		SR14857: Stocktake Batch/Update changes 
+	; 30-May-2006	JW		SR14681: Added reservations
+	; 02-May-2006	JW		SR14508: Logging, removed rubbish code. Reversed checkbox.
+	;-------------------------------------------------------------------------------
+	new (YMAND,YDATUM,YJEWE,YSOR,YBEST,XUSER,NOBEST,JEWESN,pidLog,pidKey)
+	
+	do ^WWWVAR  ;VARIABLEN LADEN ;charge 
+	set YUSER  = XUSER
+	set MITARB = $piece($get(^WWWUSER(0,YUSER,1)),Y,2)
+	
+	; Restore parameters passed from calling session
+	set SPRACHE = $$^WWWLANGU(MITARB)
+	
+	set $ztrap = "^WWWERROR"
+	set ^INWEINVTEMP = ""
+	
+	;***************************************
+	lock +^INWINVTEMP:1 if '$test quit  ;TYBD;14,04,2003; SCHON GESTARTET
+	;***************************************
+	
+	kill ^INWEINVTEMP(YUSER)             ;ZWISCHENDATEI ARTIKEL ;item 
+	
+	if +YDATUM=0 set YDATUM = +$horolog  ;DATUM DER INVENTUR ;Date the stocktaking 
+	set YM     = +$get(YMAND)            ;MANDANTENNUMMER
+	set JEWE   = $get(YJEWE)
+	set JEWESN = $get(JEWESN)
+	set SOR    = $get(YSOR)
+	
+	kill ^WWWSOR($job)
+	kill ^WWWSOR(YUSER)
+ 	
+	set timeLast = ""
+	
+	if JEWE {		// One line for each receipt (INWE) record
+		do WE
+	} else {		
+		do WE1		// Consolidate lines
+	}
+	
+	do AUF          ; AUFBEREITEN AUFTRÄGE
+	do Reserved	    ; reserved stock
+	
+	//SR14508 - This seems to add history for deleted items... Unnecessary code as cannot do this
+	//DO HIST  ;GELÖSCHTE BESTÄNDE WIEDERHOLEN ;retell
+	
+	// SR14508: The following two options have been removed from the form and code as they do not work:
+	// 	ALLE - does not create an item record at all locations (and puts in stock loc 0)
+	// 	WEITER - seems to create extra lines, not limit lines
+	
+	
+	;---------------------------------------
+	; FIXME : re comments ^^^ It appears that the options in ^WWW101(0,"ZAEHLLISTE")
+	;         may have been mis-translated or mis-represented initially.
+	;         Option 2 - After building the SOH list, reasonable to add recently
+	;                    used items that show as zero but could still have unrecorded
+	;                    SOH.  *NOT* reasonable to remove valid SOH just because
+	;                    there hasn't been any recent transactions.   <GRF>
+	; 
+	; 0 = Only Items On Stock                         ; Initial Count from INWE with QOH
+	; 1 = All Items                          (ALLE)   ; Add other items
+	; 2 = Only With Changes Within one Year  (WEITER) ; Add stock with no QOH but with tx in last year
+	;---------------------------------------
+	 	
+	set YBEST = 0
+	if YBEST=1 do ALLE    ;All Items
+	if YBEST=2 do WEITER  ;Only With Changes Within one Year 
+	// // //
+	
+	$$$LogMessage(pidLog,"IN00453") ; "Generating Count List"
+	
+	; FIXME : call to COPY should have pidKey argument <GRF>
+	
+	do COPY  ;BESTAND IN NUMMER KOPIEREN ;within numeral 
+	kill ^WWWSOR(YUSER)
+	kill ^WWWSOR($job)
+	
+	;***************************************
+	lock -^INWINVTEMP:1  ;TYBD;14,04,2003 SCHON GESTARTET
+	;***************************************
+	
+	kill ^INWEINVTEMP(YUSER)   ;ZWISCHENDATEI ARTIKEL ;item 
+	
+	//IF $$$INVORGProcessEndReport($GET(^INVORG(YM,YM,1)))=1 IF MITARB'="" DO MSG^WWW013MSG(MITARB,$$^WWWTEXT(33362),$PIECE($GET(^WWW120(0,"INWEINV",1)),Y,1))  ;INFO-NACHRICHT: PROSEZZ BEENDET // SR14857
+	
+	set objStocktake = $get(^INWEINVP(YM,pidKey,1))          ; Stocktake Batch/Update changes 
+ 	set $$$INWEINVPStatus(objStocktake)=2
+	do Save^COMUtils("INWEINVP",pidKey,objStocktake,$$$YES)  ; Stocktake Batch/Update changes 
+	$$$LogMessage(pidLog,"IN00452")	                         ; "Stocktake Generated"
+	quit
+	
+	
+Store(pintSort,pidLocn,pidItem,pidStore,pidxGroup,pidxDesc,pdte,pidRec,pobj,pidOrder,pidLine)
+	;-------------------------------------------------------------------------------
+	; Encapsulated sorting code and made it better
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-May-2006	JW		SR14681: Added type
+	; 09-May-2006	JW		SR14508: Created
+	;-------------------------------------------------------------------------------
+	new strKeys
+	
+	if $get(pidRec)="" set pidRec = " "
+	if $get(pdte)=""   set pdte   = "00000"
+	
+	// Add sort subscripts
+	if pintSort=1 {
+		set strKeys = pidItem_","_pidStore
+	
+	} elseif pintSort = 2 {
+		set strKeys = pidxGroup_","_pidItem_","_pidStore
+	
+	} elseif pintSort = 3 {
+		set strKeys = pidStore_","_pidItem
+	
+	} elseif pintSort = 4 {
+		set strKeys = pidxDesc_","_pidItem_","_pidStore
+	
+	} else {
+		quit                   ; EARLY EXIT
+	}
+	
+	// Add order details
+	if $get(pidOrder) {
+		set strKeys = strKeys_","_pidOrder_","_pidLine
+	}
+	
+	set idType = $$$INWEINVStockType(pobj)
+	if idType = "" set idType = " "
+	
+	set @("^WWWSOR($job,pidLocn,"_$$^WWWKEYBUILD(strKeys)_",pdte,idType,pidRec)") = pobj
+	quit
+	
+	
+WE ;WARENEINGAGSDATEI NICHT ZUSAMMENGEFASST ;Not 
+	;-------------------------------------------------------------------------------
+	; INWE records
+	; 
+	; Inputs: pidLog, timeLast
+	; 
+	; History:
+	; 11-Jul-2006	RPW		SR14681: Do not take into account the reserved quantity
+	; 							on the INWE record
+	; 02-May-2006	PP&JW	SR14508: Log...
+	;-------------------------------------------------------------------------------
+	new SOR1,YI7,MAX,SN,ART,idLogEntry,fltQty,WG,ARTB,BET,LAP,WE,WE1,CHAR,WED,ART1,YI
+	
+	set WG   = " "
+	set ARTB = " "
+	set ART  = ""
+	for  set ART = $order(^INWE(YM,ART)) quit:ART=""  do
+	. $$$LogItem(pidLog,$listbuild("IN00448",ART),timeLast,idLogEntry)	; "Processing, Item %1"
+	. 
+	. set ART1 = $get(^INART(YM,ART,1))
+	. if SOR=2 set WG   = $$^WWWUMLAU($piece(ART1,Y,30),1) ;Item Group
+	. if SOR=4 set ARTB = $$^WWWUMLAU($piece(ART1,Y,1),1)  ;Item description
+	. 
+	. set BET = ""
+	. for  set BET = $order(^INWE(YM,ART,BET)) quit:BET=""  do   ;BETRIEB
+	. . set LAP = ""
+	. . for  set LAP = $order(^INWE(YM,ART,BET,LAP)) quit:LAP=""  do   ;LAGERPL
+	. . . if $$$INARTItemType(ART1)'=4  do            ;ARTTIKEL ART KLEINE TEIL VON LAGER ;Type part stock location 
+	. . . . set WED = ""
+	. . . . for  set WED = $order(^INWE(YM,ART,BET,LAP,WED)) quit:WED=""  do   ;DATUMSSTAMPMMER
+	. . . . . set WE1 = $get(^INWE(YM,ART,BET,LAP,WED,1))
+	. . . . . quit:$$$INWEConsignment(WE1)'=""  ;ULM;27.03.03;QUIT KOMMISSION;22957
+	. . . . . ;
+	. . . . . set WE   = $piece(WE1,Y,1)          ;WARENEINGANGSNUMMER
+	. . . . . set CHAR = $piece(WE1,Y,2)          ;CHARGEN-NUMMER
+	. . . . . set ^INWEINVTEMP(YUSER,ART,1) = ""  ;ARTIKEL AUSGEWÄHLT ;item select 
+	. . . . . ;
+	. . . . . set $piece(WE1,Y,1)  = ART  ;ARTIKELNUMMMER
+	. . . . . set $piece(WE1,Y,2)  = BET   
+	. . . . . set $piece(WE1,Y,3)  = LAP   
+	. . . . . set $piece(WE1,Y,6)  = WED   
+	. . . . . set $piece(WE1,Y,4)  = $piece(WE1,Y,4)
+	. . . . . set $piece(WE1,Y,30) = WE                ;WENR IN DAS FELD EINTRAGEN WENN VORHANDEN ;within who field when on hand 
+	. . . . . set $piece(WE1,Y,31) = CHAR              ;CHARGENNUMMER WENN VORHANDNE ;when 
+	. . . . . set $piece(WE1,Y,32) = $piece(WE1,Y,38)  ;AUFTRAGSNUMMER WENN VORHANDEN ;when on hand 
+	. . . . . set $piece(WE1,Y,33) = $piece(WE1,Y,39)  ;POSITION
+	. . . . . for YI=34:1:40,98,99 set $piece(WE1,Y,YI) = ""  ;remove transfer and stocktake data
+	. . . . . ;
+	. . . . . // If no SN or shouldn't be, store and quit
+	. . . . . if (JEWESN'=1) || ($$$INARTSerialNumber(ART1)'=1) || ($$$INARTUnitofMeasure(ART1)'=1) || ($$$INWEQuantity(WE1)<1) do  quit
+	. . . . . . do Store(SOR,BET,ART,LAP,WG,ARTB,WED,WE,WE1)
+	. . . . . ;
+	. . . . . set MAX = $$$INWEQuantity(WE1)
+	. . . . . set SN  = ""
+	. . . . . for YI7=1:1:MAX do                                         ;AUFNAHMEZEILE JE ARTIKEL MIT SN ;once item by means of 
+	. . . . . . set $piece(WE1,Y,4)  = 1  ;JE MENGE 1 ;once quantity 
+	. . . . . . set $piece(WE1,Y,31) = CHAR
+	. . . . . . set SN = $order(^INWES(YM,ART,BET,LAP,WED,SN))
+	. . . . . . if SN'="" do
+	. . . . . . . quit:$data(^WWWSOR(YUSER,"YSN",SN))  ;NICHT MEHRFACH SETZEN;FIS;25371;06.12.04
+	. . . . . . . set $piece(WE1,Y,5)         = SN
+	. . . . . . . set ^WWWSOR(YUSER,"YSN",SN) = ""
+	. . . . . . ;
+	. . . . . . do Store(SOR,BET,ART,LAP,WG,ARTB,WED,WE_Y17,WE1)
+	. . . ;
+	. . . if $$$INARTItemType(ART1)=4  do            ;ARTTIKEL ART KLEINE TEIL VON LAGER ;Type part stock location 
+	. . . . set fltQty = 0
+	. . . . set WED    = ""
+	. . . . for  set WED = $order(^INWE(YM,ART,BET,LAP,WED)) quit:WED=""  do   ;DATUMSSTAMPMMER
+	. . . . . set WE1 = $get(^INWE(YM,ART,BET,LAP,WED,1))
+	. . . . . set fltQty = fltQty+$piece(WE1,Y,4)
+	. . . . ;
+	. . . . set ^INWEINVTEMP(YUSER,ART,1) = ""  ;ARTIKEL AUSGEWÄHLT ;item select 
+	. . . . set SOR1 = ""
+	. . . . set $piece(SOR1,Y,1) = ART          ;ARTIKELNUMMMER
+	. . . . set $piece(SOR1,Y,2) = BET   
+	. . . . set $piece(SOR1,Y,3) = LAP   
+	. . . . set $piece(SOR1,Y,4) = fltQty
+	. . . . do Store(SOR,BET,ART,LAP,WG,ARTB,""," ",SOR1)
+ 	
+	quit
+	
+	
+WE1 ;WARENEINGAGSDATEI ZUSAMMENGEFASST
+	;-------------------------------------------------------------------------------
+	; INWE records - consolidate
+	; 
+	; Inputs: pidLog, timeLast
+	; 
+	; History:
+	; 11-Jul-2006	RPW		SR14681: Do not take into account the reserved quantity
+	; 						on the INWE record
+	; 02-May-2006	PP&JW	SR14508: Log...
+	;-------------------------------------------------------------------------------
+	new SOR1,YI7,MAX,SN,ART,fltQty,fltCost,WG,ARTB,BET,LAP,WE,WE1,CHAR,WED,ART1,YI,idLogEntry
+	
+	set WG   = " "
+	set ARTB = " "
+	set ART  = ""
+	for  set ART = $order(^INWE(YM,ART)) quit:ART=""  do
+	. $$$LogItem(pidLog,$listbuild("IN00448",ART),timeLast,idLogEntry)	; "Processing, Item %1"
+	.    
+	. set ART1 = $get(^INART(YM,ART,1))
+	. if SOR=2 set WG   = $$^WWWUMLAU($piece(ART1,Y,30),1) ;WARENGRUPPE
+	. if SOR=4 set ARTB = $$^WWWUMLAU($piece(ART1,Y,1),1)  ;BEZEICHNUNG  ;notation 
+	. set BET = ""
+	. for  set BET = $order(^INWE(YM,ART,BET)) quit:BET=""  do   ;BETRIEB
+	. . set LAP = ""
+	. . for  set LAP = $order(^INWE(YM,ART,BET,LAP)) quit:LAP=""  do   ;LAGERPL
+	. . . ;
+	. . . ;ARTIKEL MIT SN ODER LOS-NR. NICHT ZUSAMMENFASSEN ! ;item by means of Or Not summarize 
+	. . . if ($$$INARTSerialNumber(ART1)=1) || ($$$INARTLotControlled(ART1)=1) do  quit  ;FIS;15.12.04; ' WAR FALSCH;25411
+	. . . . set WED = ""
+	. . . . for  set WED = $order(^INWE(YM,ART,BET,LAP,WED)) quit:WED=""  do   ;DATUMSSTAMPMMER
+	. . . . . set WE1 = $get(^INWE(YM,ART,BET,LAP,WED,1))
+	. . . . . quit:$piece(WE1,Y,60)'=""  ;;ULM;27.03.03;QUIT KOMMISSION;22957
+	. . . . . ;
+	. . . . . set WE   = $piece(WE1,Y,1)
+	. . . . . set CHAR = $piece(WE1,Y,2)              ;CHARGEN-NUMMER
+	. . . . . set ^INWEINVTEMP(YUSER,ART,1) = ""      ;ARTIKEL AUSGEWÄHLT ;item select 
+	. . . . . set $piece(WE1,Y,1)  = ART              ;ARTIKELNUMMMER
+	. . . . . set $piece(WE1,Y,2)  = BET   
+	. . . . . set $piece(WE1,Y,3)  = LAP
+	. . . . . set $piece(WE1,Y,6)  = WED   
+	. . . . . set $piece(WE1,Y,4)  = $piece(WE1,Y,4) // SR14681
+	. . . . . set $piece(WE1,Y,30) = WE  ;WENR IN DAS FELD EINTRAGEN WENN VORHANDEN ;within who field when on hand 
+	. . . . . set $piece(WE1,Y,31) = CHAR  ;CHARGENNUMMER WENN VORHANDNE ;when 
+	. . . . . set $piece(WE1,Y,32) = $piece(WE1,Y,38)  ;AUFTRAGSNUMMER WENN VORHANDEN ;when on hand 
+	. . . . . set $piece(WE1,Y,33) = $piece(WE1,Y,39)  ;POSITION
+	. . . . . ;
+	. . . . . set $$$INWEINVStockType(WE1) = "A"		; Available
+	. . . . . ;
+	. . . . . //FOR YI=34,35,36,37,38,39,40 SET $PIECE(WE1,Y,YI)=""  ;Delete transfer posting data
+	. . . . . for YI=34:1:40,98,99 set $piece(WE1,Y,YI)=""  ;SR14508 - remove transfer and stocktake data
+	. . . . . ;
+	. . . . . // If no SN or shouldn't be, store and quit
+	. . . . . if (JEWESN'=1) || ($$$INARTSerialNumber(ART1)'=1) || ($$$INARTUnitofMeasure(ART1)'=1) || ($$$INWEQuantity(WE1)<1) do  quit
+	. . . . . . do Store(SOR,BET,ART,LAP,WG,ARTB,WED,WE,WE1)
+	. . . . . ;
+	. . . . . set MAX = $piece(WE1,Y,4)
+	. . . . . set SN  = ""
+	. . . . . for YI7=1:1:MAX do                                         ;AUFNAHMEZEILE JE ARTIKEL MIT SN ;once item by means of 
+	. . . . . . set $piece(WE1,Y,4)  = 1  ;JE MENGE 1 ;once quantity 
+	. . . . . . set $piece(WE1,Y,31) = CHAR
+	. . . . . . set SN = $order(^INWES(YM,ART,BET,LAP,WED,SN))
+	. . . . . . if SN'="" do
+	. . . . . . . quit:$data(^WWWSOR(YUSER,"YSN",SN))  ;NICHT MEHRFACH SETZEN;FIS;25371;06.12.04
+	. . . . . . . set $piece(WE1,Y,5)         = SN
+	. . . . . . . set ^WWWSOR(YUSER,"YSN",SN) = ""
+	. . . . . . do Store(SOR,BET,ART,LAP,WG,ARTB,WED,WE_Y17,WE1)
+	. . . ;
+	. . . ;Summarised
+	. . . set fltQty  = 0
+	. . . set fltCost = 0
+	. . . set WED = ""
+	. . . for  set WED = $order(^INWE(YM,ART,BET,LAP,WED)) quit:WED=""  do   ;DATUMSSTAMPMMER
+	. . . . set WE1   = $get(^INWE(YM,ART,BET,LAP,WED,1))
+	. . . . set MENGE = $piece(WE1,Y,4)       ;MENGE GESAMT ;quantity total 
+	. . . . quit:+MENGE=0 
+	. . . . set fltQty  = MENGE+fltQty
+	. . . . set fltCost = (MENGE*$piece(WE1,Y,8))+fltCost
+	. . . ;
+	. . . set ^INWEINVTEMP(YUSER,ART,1) = ""  ;ARTIKEL AUSGEWÄHLT ;item select 
+	. . . set SOR1 = ""
+	. . . set $piece(SOR1,Y,1) = ART  ;ARTIKELNUMMMER
+	. . . set $piece(SOR1,Y,2) = BET   
+	. . . set $piece(SOR1,Y,3) = LAP   
+	. . . set $piece(SOR1,Y,4) = fltQty
+	. . . if +$piece(SOR1,Y,4)'=0 set $piece(SOR1,Y,8) = $justify(fltCost/$piece(SOR1,Y,4),0,2)
+	. . . do Store(SOR,BET,ART,LAP,WG,ARTB,""," ",SOR1)
+ 	
+	quit
+	
+	
+AUF ;AUFTRAGSDATEI WARENEINGANG ;receiving 
+	;-------------------------------------------------------------------------------
+	; Open Orders -> Sourced
+	;
+	; History:
+	; 06-Jul-2011	GRF		Replace order macros
+	; 30-May-2006	JW		SR14681: Replaced code with same lookup as INARTMENGE
+	; 02-May-2006	JW		SR14508: Log...
+	;-------------------------------------------------------------------------------
+	new YI7,MAX,SN,ART,idLogEntry,WG,ARTB,BET,LAP,WE,WE1,CHAR,WED,AUF,POS,ART1,YI
+	new objINAUFP,ABGE1,idxART
+	
+	set WG=" "
+	set ARTB=" "
+	
+	for ABGE1=" ",0 {
+		set idxART = ""
+		for {
+			set idxART = $order(^INAUFPs(YM,5,ABGE1,idxART))		; Printed Orders
+			quit:idxART=""
+			continue:idxART=" "
+			
+			set AUF = ""
+			for {
+				set AUF = $order(^INAUFPs(YM,5,ABGE1,idxART,AUF))
+				quit:AUF=""
+				continue:$piece($get(^INAUF(YM,AUF,1)),"~",2)'=0	; only Customer Orders
+				
+				set POS = ""
+				for {
+					set POS = $order(^INAUFPs(YM,5,ABGE1,idxART,AUF,POS))
+					quit:POS=""
+					
+					set objINAUFP = $get(^INAUFP(YM,AUF,POS,1))
+					continue:$$$INAUFPSource(objINAUFP)=4     ;Service
+					
+					$$$LogItem(pidLog,$listbuild("IN00454",AUF_" / "_POS),timeLast,idLogEntry)	;Processing, Order Receipts %1 //SR14508
+					
+					set ART  = $$$INAUFPItemNumber(objINAUFP)
+					set ART1 = $get(^INART(YM,ART,1))
+					if SOR=2 set WG   = $$^WWWUMLAU($piece(ART1,Y,30),1) ;WARENGRUPPE
+					if SOR=4 set ARTB = $$^WWWUMLAU($piece(ART1,Y,1),1)  ;BEZEICHNUNG ;notation 
+					
+					set BET = ""
+					for {
+						set BET = $order(^INWEAUF(YM,AUF,POS,BET)) 					; Locn
+						quit:BET=""
+						
+						set LAP = ""
+						for {
+							set LAP = $order(^INWEAUF(YM,AUF,POS,BET,LAP)) 			; Storage
+							quit:LAP=""
+							set WED = ""
+							for {
+								set WED = $order(^INWEAUF(YM,AUF,POS,BET,LAP,WED))	; Rec Date
+								quit:WED=""
+								
+								set WE1 = $get(^INWEAUF(YM,AUF,POS,BET,LAP,WED,1))  ;FREIER BESTAND ;free stock 
+								
+								set WE   = $piece(WE1,Y,1)	//SR14508 - removed +
+								set CHAR = $piece(WE1,Y,2)
+								set ^INWEINVTEMP(YUSER,ART,1) = ""  ;ARTIKEL AUSGEWÄHLT ;item select 
+								
+								set $piece(WE1,Y,1)=ART  ;ARTIKELNUMMMER
+								set $piece(WE1,Y,2)=BET  
+								set $piece(WE1,Y,3)=LAP  
+								set $piece(WE1,Y,6)=WED  
+								set $piece(WE1,Y,30)=WE    ;WENR IN DAS FELD EINTRAGEN ;within who field 
+								set $piece(WE1,Y,31)=CHAR  ;CHARGENNUMMER WENN VORHANDNE ;when 
+								set $piece(WE1,Y,32)=AUF   ;AUFTRAGSNUMMER
+								set $piece(WE1,Y,33)=POS   ;POSITION
+								
+								set $$$INWEINVStockType(WE1) = "S"		; Sourced
+								
+								// If no SN or shouldn't be, store and quit
+								if (JEWESN'=1) || ($$$INARTSerialNumber(ART1)'=1) || ($$$INARTUnitofMeasure(ART1)'=1) || ($$$INWEQuantity(WE1)<1) {
+									do Store(SOR,BET,ART,LAP,WG,ARTB,WED,WE,WE1,AUF,POS)
+									
+								} else {
+									set MAX=$piece(WE1,Y,4)  ;MENGE
+									set SN=""
+									set $piece(WE1,Y,4)=1  ;JE MENGE 1 ;once quantity 
+									set $piece(WE1,Y,31)=CHAR
+									
+									for YI7=1:1:MAX {                                         ;AUFNAHMEZEILE JE ARTIKEL MIT SN ;once item by means of 
+										set SN=$order(^INWEAUFS(YM,AUF,POS,BET,LAP,WED,SN))
+										if SN'="" && '$data(^WWWSOR(YUSER,"YSN",SN)) {  ;NICHT MEHRFACH SETZEN;FIS;25371;06.12.04
+											;SET $PIECE(WE1,Y,31)=CHAR_"["_SN_"]"
+											set $piece(WE1,Y,5)=SN
+											set ^WWWSOR(YUSER,"YSN",SN)=""
+										}
+										do Store(SOR,BET,ART,LAP,WG,ARTB,WED,WE,WE1,AUF,POS_Y17)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	quit
+	
+	
+Reserved
+	;-------------------------------------------------------------------------------
+	; Get Reserved stock
+	;
+	; History:
+	; 06-Jul-2011	GRF		Replace order macros
+	; 30-May-2006	JW		SR14681: Created from INARTMENGE lookup
+	;-------------------------------------------------------------------------------
+	new ART,BET,LAP,WED,RES,WEN1,WE1,WG,ARTB,ART1,idLogEntry
+	
+	set WG=" "
+	set ARTB=" "
+	
+	set ART = ""
+	for {
+		set ART = $order(^INWER(YM,ART))
+		quit:ART=""
+		
+		set ART1 = $get(^INART(YM,ART,1))
+		if SOR=2 set WG   = $$^WWWUMLAU($piece(ART1,Y,30),1) ;WARENGRUPPE
+		if SOR=4 set ARTB = $$^WWWUMLAU($piece(ART1,Y,1),1)  ;BEZEICHNUNG ;notation 
+		
+		$$$LogItem(pidLog,$listbuild("IN00487",ART),timeLast,idLogEntry)	; Processing, Reserved Stock for Item %1
+		
+		set BET = ""
+		for {
+			set BET = $order(^INWER(YM,ART,BET))
+			quit:BET=""
+			
+			set LAP = ""
+			for {
+				set LAP = $order(^INWER(YM,ART,BET,LAP))
+				quit:LAP=""
+				
+				set WED = ""
+				for {
+					set WED = $order(^INWER(YM,ART,BET,LAP,WED))
+					quit:WED=""
+					
+					set RES = ""
+					for {
+						set RES = $order(^INWER(YM,ART,BET,LAP,WED,RES))
+						quit:RES=""
+						
+						set WEN1=$get(^INWER(YM,ART,BET,LAP,WED,RES,1))
+						continue:$$$INWERReservationcancledAt(WEN1)'=""
+						continue:$$$INWERHoldUntilDate(WEN1)<$horolog
+						continue:$$$INWEConsignment(WEN1)				// Invalid? INWER does not contain this field
+						
+						set ^INWEINVTEMP(YUSER,ART,1)=""  ;ARTIKEL AUSGEWÄHLT ;item select 
+						
+						set WE1 = ""
+						set $piece(WE1,Y,1)  = ART  ;ARTIKELNUMMMER
+						set $piece(WE1,Y,2)  = BET
+						set $piece(WE1,Y,3)  = LAP
+						set $piece(WE1,Y,4)  = $piece(WEN1,Y,4)
+						set $piece(WE1,Y,6)  = WED
+						set $piece(WE1,Y,32) = RES   ;Reservation Number
+						
+						set $$$INWEINVStockType(WE1) = "R"		; Reserved
+						
+						do Store(SOR,BET,ART,LAP,WG,ARTB,WED,RES,WE1)
+					}
+				}
+			}
+		}
+	}
+	quit
+	
+	
+HIST ;HISTORISCHE ARTIKELLÖSCHUNGEN ZURÜCKHOLEN
+	;-------------------------------------------------------------------------------
+	; JW NOTE:	This routine seems to be adding lines for deleted items (stock removed)
+	; 			This is unnecessary as we cannot delete items.
+	; History:
+	; 02-May-2006	JW		SR14508: Doco, Log
+	;-------------------------------------------------------------------------------
+	new ART,TAG,NUM,SATZ,idLogEntry
+	
+	set ART = ""
+	for  set ART = $order(^INARTHIST(YM,ART)) quit:ART=""  do
+	. ;
+	. quit:$data(^INWEINVTEMP(YUSER,ART))  ;SCHON AUSGEWÄHLT ; Already included when count built ;FIS;16.12.04
+	. ;
+	. if ART'="" set ART1 = $get(^INART(YM,ART,1))
+	. if SOR=2   set WG   = $$^WWWUMLAU($piece(ART1,Y,30),1) ;WARENGRUPPE
+	. if SOR=4   set ARTB = $$^WWWUMLAU($piece(ART1,Y,1),1)  ;BEZEICHNUNG ;notation 
+	. set TAG = YDATUM
+	. for  set TAG = $order(^INARTHIST(YM,ART,TAG)) quit:TAG=""  do  ;NUR DIE DATEN AB DEM INVENTURDATUM BEARBEITEN ;only who Confirm. 
+	. . set NUM = ""
+	. . for  set NUM = $order(^INARTHIST(YM,ART,TAG,NUM)) quit:NUM=""  do 
+	. . . set SATZ  = $get(^INARTHIST(YM,ART,TAG,NUM,1))
+	. . . set MENGE = +$piece(SATZ,Y,5)               ;MENGE ABGANG ;quantity departure 
+	. . . if +MENGE=0 quit:$extract(SATZ)'="-"        ;KEIN ABGANG ;no departure 
+	. . . if +MENGE=0 set MENGE=+$extract(SATZ,2,99)  ;MENGE OHNE - ;quantity without 
+	. . . quit:+MENGE=0                               ;KEINE MENGE ;no quantity 
+	. . . set ^INWEINVTEMP(YUSER,ART,1) = ""          ;ARTIKEL AUSGEWÄHLT ;item select 
+	. . . do 
+	. . . . set WE  = TAG_"/"_NUM
+	. . . . set BET = $piece(SATZ,Y,3)                               if BET="" set BET = 1
+	. . . . set LAP = $piece($get(^INVORGB(YM,YM,YLOCATION,1)),Y,1)  if LAP="" set LAP = 0
+	. . . . set WED  = TAG
+	. . . . set WE1  = ""
+	. . . . set KEY  = " "
+	. . . . set ARTX = $extract("                    "_ART,$length("                    "_ART)-20,$length("                    "_ART))
+	. . . . set WGX  = $extract($get(WG)_"                  ",1,12) if +$get(WG)=$get(WG) set WGX=$justify($get(WG),12,0)       ;TYBD;WENN NUMERISCH;26,11,2004;25231
+	. . . . set LAPX = $extract($get(LAP)_"                  ",1,12) if +$get(LAP)=$get(LAP) set LAPX=$justify($get(LAP),12,0)  ;TYBD;WENN NUMERISCH;26,11,2004;25231
+	. . . . if SOR=1 set KEY = KEY_$extract(BET_"            ",1,12)_" "_ARTX_" "_$extract(LAP_"              ",1,12)_" "_WED
+	. . . . if SOR=3 set KEY = KEY_$extract(BET_"            ",1,12)_$extract(LAPX_"          ",1,12)_" "_ARTX_" "_WED
+	. . . . if SOR=2 set KEY = KEY_$extract(BET_"            ",1,12)_$extract(WGX_"          ",1,12)_" "_ARTX_" "_$extract(LAP_"              ",1,12)_" "_WED
+	. . . . if SOR=4 set KEY = KEY_$extract(BET_"            ",1,12)_$extract(ARTB_"          ",1,12)_" "_ARTX_" "_$extract(LAP_"              ",1,12)_" "_WED
+	. . . . set $piece(WE1,Y,1)  = ART  ;ARTIKELNUMMMER
+	. . . . set $piece(WE1,Y,2)  = BET   
+	. . . . set $piece(WE1,Y,3)  = LAP   
+	. . . . set $piece(WE1,Y,6)  = WED   
+	. . . . set $piece(WE1,Y,4)  = MENGE  ;IST MENGE  ;quantity 
+	. . . . set $piece(WE1,Y,44) = MENGE  ;SOLL MENGE  ;quantity 
+	. . . . set $piece(WE1,Y,9)  = "HISTORY"
+	. . . . set $piece(WE1,Y,30) = ""
+	. . . . set $piece(WE1,Y,31) = ""    
+	. . . . set $piece(WE1,Y,32) = ""   ;$PIECE(WE1,Y,38)  ;AUFTRAGSNUMMER WENN VORHANDEN
+	. . . . set $piece(WE1,Y,33) = ""   ;$PIECE(WE1,Y,39)  ;POSITION
+	. . . . for YI=34:1:40,98,99 set $piece(WE1,Y,YI)=""  ;SR14508 - remove transfer and stocktake data
+	. . . . set ^WWWSOR($job,KEY,WE) = WE1
+	. . . . $$$LogItem(pidLog,"Processing, Item "_ART_", "_BET_", "_LAP,timeLast,idLogEntry)	//SR14508
+	
+	quit
+	
+	
+WEITER ;WEITERE ARTIKEL MIT BEWEGUNG  ;item by means of movement 
+	;-------------------------------------------------------------------------------
+	; JW NOTE: 	This is supposed to limit the stocktake to items with movement in the 
+	; 			past year. However, it seems to just add more lines...
+	;
+	; GRF NOTE: It appears that the options in ^WWW101(0,"ZAEHLLISTE") may have been
+	;           mis-translated.
+	;
+	; History:
+	; 02-May-2006	JW		SR14508: Doco, log
+	;-------------------------------------------------------------------------------
+	new ART,TAG,NUM,SATZ,ART1,INVEINTRAG,UHR,idLogEntry
+	
+	set ART = ""
+	for  set ART = $order(^INARTHIST(YM,ART)) quit:ART=""  do
+	. ;
+	. quit:$data(^INWEINVTEMP(YUSER,ART))  ;SCHON AUSGEWÄHLT ; Already included when count built
+	. ;
+	. set ART1 = $get(^INART(YM,ART,1))
+	. quit:$piece(ART1,Y,26)=2  ;KEINE LEISTUNG ;no performance 
+	. quit:$piece(ART1,Y,26)=5  ;KEINE PHANTOMARTIKEL ;no 
+	. quit:$piece(ART1,Y,26)=6  ;KEINE PAUSCHALE ;no 
+	. quit:$piece(ART1,Y,29)=1  ;KEINE BESTANDSFÜHRUNG ;no 
+	. ;
+	. if SOR=2 set WG   = $$^WWWUMLAU($piece(ART1,Y,30),1) ;WARENGRUPPE
+	. if SOR=4 set ARTB = $$^WWWUMLAU($piece(ART1,Y,1),1)  ;BEZEICHNUNG ;notation 
+	. set TAG = $horolog-366
+	. set TAG = $order(^INARTHIST(YM,ART,TAG))
+	. quit:TAG=""
+	. ;
+	. set INVEINTRAG = 0
+	. set UHR = ""
+	. for  set UHR = $order(^INARTHIST(YM,ART,TAG,UHR)) quit:UHR=""  do
+	. . if $piece($get(^INARTHIST(YM,ART,TAG,UHR,1)),Y,8)=1 set INVEINTRAG=1  ;DURCH INVENTUR GENERIERTER EINTRAG;FIS;23525;26.05.03
+	. ;
+	. quit:INVEINTRAG=1
+	. do  ;NUR DIE DATEN VON EINEM JAHRS  ;only who 
+	. . set ^INWEINVTEMP(YUSER,ART,1) = ""  ;ARTIKEL AUSGEWÄHLT ;item select 
+	. . set WE   = " "
+	. . set BET  = YLOCATION
+	. . set LAP  = $piece($get(^INVORGB(YM,YM,YLOCATION,1)),Y,1)   if LAP="" set LAP=0
+	. . set WED  = YDATUM
+	. . set WE1  = ""
+	. . set KEY  = " "
+	. . set ARTX = $extract("                    "_ART,$length("                    "_ART)-20,$length("                    "_ART))
+	. . set WGX  = $extract($get(WG)_"                  ",1,12) if +$get(WG)=$get(WG) set WGX=$justify($get(WG),12,0)  ;TYBD;WENN NUMERISCH;26,11,2004;25231
+	. . set LAPX = $extract($get(LAP)_"                  ",1,12) if +$get(LAP)=$get(LAP) set LAPX=$justify($get(LAP),12,0)  ;TYBD;WENN NUMERISCH;26,11,2004;25231
+	. . if SOR=1 set KEY=KEY_$extract(BET_"            ",1,12)_" "_ARTX_" "_$extract(LAP_"              ",1,12)_" "_WED
+	. . if SOR=3 set KEY=KEY_$extract(BET_"            ",1,12)_$extract(LAPX_"          ",1,12)_" "_ARTX_" "_WED
+	. . if SOR=2 set KEY=KEY_$extract(BET_"            ",1,12)_$extract(WGX_"          ",1,12)_" "_ARTX_" "_$extract(LAP_"              ",1,12)_" "_WED
+	. . if SOR=4 set KEY=KEY_$extract(BET_"            ",1,12)_$extract(ARTB_"          ",1,12)_" "_ARTX_" "_$extract(LAP_"              ",1,12)_" "_WED
+	. . set $piece(WE1,Y,1)  = ART  ;ARTIKELNUMMMER
+	. . set $piece(WE1,Y,2)  = BET   
+	. . set $piece(WE1,Y,3)  = LAP   
+	. . set $piece(WE1,Y,6)  = WED   
+	. . set $piece(WE1,Y,4)  = 0    ;IST MENGE  ;quantity 
+	. . set $piece(WE1,Y,44) = 0    ;SOLL MENGE  ;quantity 
+	. . set $piece(WE1,Y,9)  = ""
+	. . set $piece(WE1,Y,30) = ""
+	. . set $piece(WE1,Y,31) = ""    
+	. . set $piece(WE1,Y,32) = ""   ;$PIECE(WE1,Y,38)  ;AUFTRAGSNUMMER WENN VORHANDEN
+	. . set $piece(WE1,Y,33) = ""   ;$PIECE(WE1,Y,39)  ;POSITION
+	. . for YI=34:1:40,98,99 set $piece(WE1,Y,YI) = ""  ;remove transfer and stocktake data
+	. . set ^WWWSOR($job,KEY,WE) = WE1
+	. . $$$LogItem(pidLog,"Processing, Item "_ART_", "_BET_", "_LAP,timeLast,idLogEntry)
+	quit
+	
+	
+ALLE ;ALLE ARTIKEL ;item 
+	;-------------------------------------------------------------------------------
+	; JW NOTE: 	This is supposed to create a line for each item that doesn't have quantity.
+	; 			However, it only creates a line at the current location, and puts it in 
+	; 			stock location 0. Other locations do not get a line created.
+	;
+	; GRF NOTE: It appears that the options in ^WWW101(0,"ZAEHLLISTE") may have been
+	;           mis-translated.  Other objections are still valid but this may be
+	;           simply intended to get the item noted on the printout.
+	;
+	; History:
+	; 02-May-2006	JW		SR14508: Doco,log
+	;-------------------------------------------------------------------------------
+	new ART,TAG,NUM,SATZ,ART1,idLogEntry
+	
+	set ART = ""
+	for  set ART = $order(^INART(YM,ART)) quit:ART=""  do
+	. ;
+	. quit:$data(^INWEINVTEMP(YUSER,ART))  ;SCHON AUSGEWÄHLT ; Already included when count built 
+	. ;
+	. set ART1 = $get(^INART(YM,ART,1))
+	. quit:$piece(ART1,Y,26)=2  ;KEINE LEISTUNG ;no performance 
+	. quit:$piece(ART1,Y,26)=5  ;KEINE PHANTOMARTIKEL ;no 
+	. quit:$piece(ART1,Y,26)=6  ;KEINE PAUSCHALE ;no 
+	. quit:$piece(ART1,Y,29)=1  ;KEINE BESTANDSFÜHRUNG ;no 
+	. ;
+	. if SOR=2 set WG   = $$^WWWUMLAU($piece(ART1,Y,30),1) ;WARENGRUPPE
+	. if SOR=4 set ARTB = $$^WWWUMLAU($piece(ART1,Y,1),1)  ;BEZEICHNUNG ;notation 
+	. do  ;ALLE
+	. . set WE=" "
+	. . set ^INWEINVTEMP(YUSER,ART,1)=""  ;ARTIKEL AUSGEWÄHLT ;item select 
+	. . ;
+	. . // <FIXME> This will only produce a 0 record for YLOCATION. 
+	. . // All other locations will not get one.
+	. . set BET=YLOCATION
+	. . ;
+	. . set LAP=0
+	. . set WED=YDATUM
+	. . set WE1=""
+	. . set KEY=" "
+	. . set ARTX=$extract("                    "_ART,$length("                    "_ART)-20,$length("                    "_ART))
+	. . set WGX=$extract($get(WG)_"                  ",1,12) if +$get(WG)=$get(WG) set WGX=$justify($get(WG),12,0)  ;TYBD;WENN NUMERISCH;26,11,2004;25231
+	. . set LAPX=$extract($get(LAP)_"                  ",1,12) if +$get(LAP)=$get(LAP) set LAPX=$justify($get(LAP),12,0)  ;TYBD;WENN NUMERISCH;26,11,2004;25231
+	. . if SOR=1 set KEY=KEY_$extract(BET_"            ",1,12)_" "_ARTX_" "_$extract(LAP_"              ",1,12)_" "_WED
+	. . if SOR=3 set KEY=KEY_$extract(BET_"            ",1,12)_$extract(LAPX_"          ",1,12)_" "_ARTX_" "_WED
+	. . if SOR=2 set KEY=KEY_$extract(BET_"            ",1,12)_$extract(WGX_"          ",1,12)_" "_ARTX_" "_$extract(LAP_"              ",1,12)_" "_WED
+	. . if SOR=4 set KEY=KEY_$extract(BET_"            ",1,12)_$extract(ARTB_"          ",1,12)_" "_ARTX_" "_$extract(LAP_"              ",1,12)_" "_WED
+	. . set $piece(WE1,Y,1)=ART  ;ARTIKELNUMMMER
+	. . set $piece(WE1,Y,2)=BET   
+	. . set $piece(WE1,Y,3)=LAP   
+	. . set $piece(WE1,Y,6)=WED   
+	. . set $piece(WE1,Y,4)=0  ;IST MENGE  ;quantity 
+	. . set $piece(WE1,Y,44)=0  ;SOLL MENGE  ;quantity 
+	. . set $piece(WE1,Y,9)=""
+	. . set $piece(WE1,Y,30)=""
+	. . set $piece(WE1,Y,31)=""    
+	. . set $piece(WE1,Y,32)=""   ;$PIECE(WE1,Y,38)  ;AUFTRAGSNUMMER WENN VORHANDEN
+	. . set $piece(WE1,Y,33)=""   ;$PIECE(WE1,Y,39)  ;POSITION
+	. . for YI=34:1:40,98,99 set $piece(WE1,Y,YI)=""  ;remove transfer and stocktake data
+	. . set ^WWWSOR($job,KEY,WE)=WE1
+	. . $$$LogItem(pidLog,"Processing, Item "_ART_", "_BET_", "_LAP,timeLast,idLogEntry)
+	
+	quit
+	
+	; FIXME : call to COPY should have pidKey argument <GRF>
+	
+COPY ;COPY DER SORTIERDATEI ;the 
+	;-------------------------------------------------------------------------------
+	; History:
+	; 06-Jul-2011	GRF		Replace query macros
+	; 07-AUG-2006	FAN		SR14857: Stocktake Batch/Update changes
+	; 02-May-2006	PP&JW	SR14508: Pass in "" not 0 if not displaying qty. Log
+	;--------]]><![CDATA[-----------------------------------------------------------------------
+	new ART,SATZ,idLogEntry,query,INZ
+	
+	kill ^INWEINV(YM,pidKey)
+	
+	set query = "^WWWSOR("""_$job_""")"
+	set %3    = $qlength(query)
+	set %4    = $name(@query,%3)
+	for {
+		set query = $query(@query)
+		quit:(query="")||($name(@query,%3)'=%4)
+		
+		set SATZ = @query
+		set ART  = $piece(SATZ,Y,1)
+		if ART'="" set $piece(SATZ,Y,80) = $piece($get(^INART(YM,ART,1)),Y,140)
+		set $$$INWEINVTargetQuantity(SATZ) = $$$INWEINVActualQuantity(SATZ)
+		if $get(NOBEST)=1 set $$$INWEINVActualQuantity(SATZ) = ""
+		
+		do Save^COMUtils("INWEINV",pidKey_","_$increment(INZ),SATZ,$$$YES)
+		$$$LogItem(pidLog,$listbuild("IN00448",ART),timeLast,idLogEntry)	; "Processing, Item %1"
+	}
+	kill ^WWWSOR($job)
+	quit
+	
+	
+TEST
+	;-------------------------------------------------------------------------------
+	; Test upon the stocktaking              TEST AUF DER INVENTUR
+	; 
+	; Called By : Form INWEINV : (F1) On Blur
+	;             Form INWEINVBackup : (F1) On Blur   (???)
+	;-------------------------------------------------------------------------------
+	
+	; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK
+	;IF YINHALT'="" DO    ; 07-AUG-2006  FAN     SR14857: Stocktake Batch/Update changes 
+	. set YINHALT1=$$^WWWDATE1(YINHALT)
+	. if YINHALT1="" set %TXT(1)="§"_$$^WWWTEXT(272,,1) quit
+	. if '$data(^INWEINVP(YM,YINHALT1)) if YINHALT1<$horolog set %TXT(1)=%TXT(1)_"#&"_$$^WWWTEXT(32834,,1)  ;Bei einem Inventurdatum in der Vergangenheit findet eine automatische Rückrechnung aufgrund der Artikelhistorie statt!"
+	. if '$data(^INWEINVP(YM,YINHALT1)) if YINHALT1>$horolog set %TXT(1)=%TXT(1)_"#&"_$$^WWWTEXT(32835,,1)  ;Bei einem Inventurdatum in der Zukunft werden nur die aktuellen Bestände berücksichtigt!"
+	. if $data(^INWEINVP(YM,YINHALT1)) set %TXT(1)=%TXT(1)_"#&"_$$^WWWTEXT(32836,,1)  ;Inventur ist schon zu diesem Datum aufbereitet worden. ACHTUNG! Die Inventur wird zu diesem Datum gelöscht und vollständig neu aufgebaut! Bei einem Datum in der Vergangenheit findet eine automatische Rückrechnung statt!"
+	
+	quit
+	
+	
+OnBeforeDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Remove corresponding INWEINVCount when INWEINV is deleted.
+	; 
+	; Called By : Class Hook INWEINV : On Before Delete
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 06-Jul-2011	GRF		Replace order macros
+	; 08-Nov-2007	shobby	SRBR014769: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,intCount,idKey
+	
+	set strStatus = $$$OK
+	set intCount = ""
+	for {
+		set intCount = $order(^INWEINVCount(YM,$$$KEY1(pYKEY),$$$KEY2(pYKEY),intCount))
+		quit:intCount=""
+		
+		set idKey     = pYKEY_$$$COMMA_intCount
+		set strStatus = $$KILL^COMUtils("INWEINVCount",idKey)
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+	
+]]></Routine>
+</Export>

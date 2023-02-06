@@ -1,0 +1,362 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLBank" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLBank
+	;-------------------------------------------------------------------------------
+	; 14-Oct-2009	GRF		SR15632: remove old commented code; YM substitution
+	; 08-Jul-2003	SCR		Bug Fixes from Code Checking
+	;-------------------------------------------------------------------------------
+#include COMSYS
+#include FINConst
+#include COMConst
+#include WWWConst
+	
+#;define Add(%obj)		$select(%obj="":"""""",%obj=+%obj:%obj,1:""""_%obj_"""")  ; SR15632
+	
+OnBeforeDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Checks whether the Bank Account can be deleted.
+	; 
+	; History
+	; 09-Mar-2004	shobby	Used standard check links method.
+	; 06-Jul-2003	shobby	Creation (TR005551)
+	;-------------------------------------------------------------------------------
+	quit $$CheckLinks^FINSYS(pYKEY,$listbuild("FINAPPayment","FINAPChequeBook","FINARBank","FINGLBankRecon"),"FINGLBank")
+	
+	
+OnBeforeSave(pKey,pYFELD="")
+	;-------------------------------------------------------------------------------
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Aug-2006	RPW		SR14867: Sped up the Bank Account Default check. Also
+	;							correctly handle the error if we get one.
+	; 23-Feb-2006	RPW		SR13816: Get the GL Account and if it exists, check if
+	;							it can be posted to.
+	; 14-Sep-2005	RPW		SR13500: Check whether the Bank Acct No is already used.
+	; 15-Mar-2005	SS		Commented
+	;-------------------------------------------------------------------------------
+	new blnDefault,idBankAcct,idGLAccount,strStatus
+	
+	set strStatus  = $$$OK
+	set blnDefault = $$$FINGLBankDefault1(pYFELD)
+	
+	// SR14867
+	if blnDefault {
+		if $data(^FINGLBanks(0,2,1)) {
+			set idBankAcct = $order(^FINGLBanks(0,2,1,""))
+			if idBankAcct'=pKey {
+				set strStatus = $listbuild("Fin00073",idBankAcct)
+			}  ; "There can not be more than one default bank account. Current Default %1."
+		}
+	}
+	
+	if $$$ISOK(strStatus) { // SR14867 this check is needed!
+		set strStatus=$$CheckDuplicateNumber(pKey,pYFELD)
+	}
+	
+	set idGLAccount = $$$FINGLBankGLAccount(pYFELD)
+	
+	if (idGLAccount'="") && ($$$ISOK(strStatus)) set strStatus = $$ValidateAccount^FINGLAccount(idGLAccount)
+	if $$$ISOK(strStatus) set strStatus = $$$GRIDSave(pKey)
+	
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		do ReturnError^COMUtils((strStatus))
+	}
+	quit
+	
+	
+CheckDuplicateNumber(pstrKey,pstrYFELD="") 
+	;-------------------------------------------------------------------------------
+	; This will look through the existing Bank Setups and see if the number setup is
+	; used anywhere.
+	;
+	; Params:
+	; pstrKey  : The key of the bank setup
+	; pstrYFELD: The current data for the setup
+	;
+	; Returns:
+	; strStatus: The status of whether the number is a duplicate
+	;
+	; History:
+	; 14-Sep-2005	RobertW		SR13500: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idAccount,strNumber
+	
+	set strStatus = $$$OK
+	set strNumber = $$$FINGLBankBankAccountNumber(pstrYFELD)
+	if strNumber'="" {
+		set idAccount = $order(^FINGLBanks(0,1,$$$Index(strNumber),""))
+		
+		if (idAccount'=pstrKey) && (idAccount'="") {
+			set strStatus = $listbuild("Fin00889",strNumber,idAccount)
+		} ; "Bank Account Number %1 is in use by Bank Account %2."
+	}
+	quit strStatus
+	
+	
+OnBlur(pstrYKEY,pstrYFELD="",pidField="") 
+	;-------------------------------------------------------------------------------
+	; When a field on the form is blurred come through here with the field number
+	;
+	; Params:
+	; pidField: The field number. (The class number not the form number)
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Jan-2010	shobby	SR15753: Removed redundant code.
+	; 03-Jul-2006	SC		SR14580: Added OnBlur for ChequePrintingCode field.
+	; 14-Sep-2005	RW&JW	SR13500: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	if pidField=$$$FldFINGLBankBankAccountNumber {
+		set strStatus = $$CheckDuplicateNumber($get(pstrYKEY),pstrYFELD)
+		
+		if $$$ISERR(strStatus) {
+			$$$Alert(strStatus)
+		}
+	}
+	quit
+	
+	
+GetDefaultBankAccount(pidBankAcct="")
+	;-------------------------------------------------------------------------------
+	; Get the default bankaccount if the passed in one is null or incorrect.
+	;
+	; Returns:ID (FINGLBank)
+	;
+	; History:
+	; 28-Oct-2004	Paul K	Modified to pass in a possible account.
+	; 15-Mar-2004	shobby	Optional parameter to ignore the specified BankAccount
+	;							and find the next one.
+	;-------------------------------------------------------------------------------
+	if pidBankAcct'="" if '$data(^FINGLBank(0,pidBankAcct,1)) set pidBankAcct=""
+	if pidBankAcct="" set pidBankAcct=$order(^FINGLBanks(0,2,1,""))
+	if pidBankAcct="" set pidBankAcct=$order(^FINGLBank(0,""))
+	quit pidBankAcct
+	
+	
+GetUncleared(pidBankAcct)
+	;-------------------------------------------------------------------------------
+	; Gets the number of uncleared transactions for this bank account.
+	; If too many, just puts a "+" against them.
+	;
+	; Returns: Integer
+	;
+	; History:
+	; 14-Oct-2009	GRF		SR15632: Macro replacement
+	; 26-Jul-2006	JW		SR14880: Rewrote to use global not list
+	; 02-Feb-2006	RPW		SR14103: Get all the reconciliation accounts and the
+	;							transactions for them.
+	; 01-Feb-2006	RPW		SR13710: Pass in intMax
+	; 27-Oct-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new intMax,intCount,listAccounts,idAccount,intLoop
+	
+	set intCount = 0
+	if pidBankAcct'="" {
+		do GetReconAccounts(pidBankAcct)
+		
+		set idAccount = ""
+		for {
+			set idAccount = $order(^CacheTempBankRecon(YUSER,"Accounts",idAccount))
+			quit:idAccount=""
+			
+	;		set intCount = intCount+$$GetNumNodes^COMUtils("^FINGLTranLines("_$$$Add(YM)_",2,"_$$$Add($$$Index(idAccount))_","" """) ; SR15632
+			set intCount = intCount+$$GetNumNodes^COMUtils("^FINGLTranLines(0,2,"_$$$AddQuotes($$$Index(idAccount))_","" """)
+		}
+	}
+	quit intCount
+	
+	
+OnBlurEFTExportFileLocation(pobjFINGLBank)
+	;-------------------------------------------------------------------------------
+	; SR11188
+	;-------------------------------------------------------------------------------
+	new strLocn
+	
+	set strLocn = $$$FINGLBankEFTExportFileLocation(pobjFINGLBank)
+	
+	if (strLocn'="") && ('##Class(%File).DirectoryExists(strLocn)) {
+		set ^CacheTemp(YUSER,YFORM,"EFTExportFileLocation") = strLocn
+		write "if (confirm('"_$$$Text($listbuild("Fin00563",strLocn))_"')) { CallBack('CreateLocation^FINGLBank'); }" ;,'"__"'
+		;`%1` do you want to create this location? If you do not create the location the EFTFile will not be generated. To create location click Ok otherwise Cancel.
+	}
+	
+	quit
+	
+	
+CreateLocation()
+	;-------------------------------------------------------------------------------
+	; SR11188
+	;-------------------------------------------------------------------------------
+	new strLocn
+	
+	set strLocn = $get(^CacheTemp(YUSER,YFORM,"EFTExportFileLocation"))
+	if strLocn'="" {
+		if strLocn = $extract(##Class(%File).NormalizeDirectory(strLocn),1,$length(strLocn)) {
+			if ##class(%File).CreateDirectoryChain(strLocn)=$$$NO {
+				write "alert('"_$$$Text($listbuild("Fin00564",strLocn))_"');"
+				; "Not able to create location `%1`, either the location is invalid or system does not have permission to create location. In the later case you will need to see your system administrator."
+			} else {
+				write "alert('"_$$$Text($listbuild("Fin00622",strLocn))_"');" ; "The location `%1` has been created."
+			}
+		} else {
+			write "alert('"_$$$Text($listbuild("Fin00575",strLocn))_"');"
+		} ; "`%1` does not detail an exact location, you need to provide a precise location for the EFT Export File."
+	} else {
+		write "alert('"_$$$Text($listbuild("Fin00652"))_"');" ;No location passed in.
+	}
+	quit
+	
+	
+GetReconAccounts(pidAccount)
+	;-------------------------------------------------------------------------------
+	; Given a bank account for bank recon -- if it has a parent specified, traverse
+	; the GL Account tree to find all transaction accounts with the same parent.
+	; 
+	; NOTE: Stores accounts in ^CacheTempBankRecon(YUSER,"Accounts",A)
+	; 
+	; Returns:
+	;
+	; History:
+	; 26-Jul-2006	JW		SR14880: Rewrote to use global not list
+	; 17-Mar-2005	SS		Created (SR11761)
+	;-------------------------------------------------------------------------------
+	new idAccount,objBankAccount,idParent,blnTest
+	
+	kill ^CacheTempBankRecon(YUSER,"Accounts")
+	
+	set idAccount = $get(pidAccount)
+	
+	if idAccount'="" {
+		set blnTest = $sortbegin(^CacheTempBankRecon(YUSER,"Accounts"))
+		
+		set objBankAccount = $get(^FINGLBank(0,idAccount,1))	
+		set idParent = $$$FINGLBankBankReconciliationParent(objBankAccount)
+		if idParent'="" {
+			do TraverseAccountTree(idParent)
+		} else {
+			set ^CacheTempBankRecon(YUSER,"Accounts",idAccount) = ""
+		}
+		set blnTest = $sortend(^CacheTempBankRecon(YUSER,"Accounts"))
+	}
+	quit
+	
+	
+TraverseAccountTree(pidParent) private
+	;-------------------------------------------------------------------------------
+	; Recursively traverse the account GL tree to find all transaction accounts.
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Jul-2006	JW			SR14880: Rewrote to use global not list
+	; 17-Mar-2005	Steve S		Created (SR 11761)
+	;-------------------------------------------------------------------------------
+	new idChildAccount,lstChildren,objChildAcct
+	
+	set pidParent      = $$$Index(pidParent)
+	set idChildAccount = ""
+	for {
+		set idChildAccount=$order(^FINGLAccounts(0,50,pidParent,idChildAccount))
+		quit:idChildAccount=""
+		
+		set objChildAcct = $get(^FINGLAccount(0,idChildAccount,1))
+		if $$$FINGLAccountAccountUsage(objChildAcct)=$$$EnumFINGLACCOUNTUSAGETransaction {
+			set ^CacheTempBankRecon(YUSER,"Accounts",idChildAccount) = ""
+		}
+		do TraverseAccountTree(idChildAccount)
+	}
+	quit
+	
+	
+OnBeforeButtonLine(pidAccount="")
+	;-------------------------------------------------------------------------------
+	; Populates the Parent drop down list to only display valid parents.
+	; 
+	; List will contain ancestors of current account, excluding top account.
+	; 
+	; Params: pidAccount - current account id
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Jun-2006	RPW		CodeCheck
+	; 02-Jun-2006	JW&PO	Rewrote for readability/efficiency
+	; 17-Mar-2005	SS		Created
+	;-------------------------------------------------------------------------------
+	new idParent,objAccount
+	
+	kill ^COMTempList(0,YUSER,"ParentAccounts")
+	
+	quit:pidAccount=""
+	
+	set objAccount = $get(^FINGLAccount(0,pidAccount,1))
+	for {
+		set idParent = $$$FINGLAccountParent(objAccount)
+		quit:idParent=""
+		
+		set objAccount=$get(^FINGLAccount(0,idParent,1))
+		quit:$$$FINGLAccountAccountType(objAccount)=$$$EnumFINGLACCOUNTTYPETopAccount
+		
+		set ^COMTempList(0,YUSER,"ParentAccounts",idParent,1) = $$$FINGLAccountDescription(objAccount)
+	}
+	quit
+	
+	
+OnAfterDataFields(pstrYKEY,pstrYFELD,pintYSEITE) 
+	;-------------------------------------------------------------------------------
+	; When the transactions tab is drawn, shown the FINGLBankTran data in a Grid Edit.
+	;
+	; Params:
+	; pstrYKEY  : The keys to the FINGLBank record
+	; pstrYFELD : The data for the FINGLBank record
+	; pintYSEITE: The tab location
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Jan-2010	shobby	SR15753: Removed redundant code.
+	; 03-Jul-2006	SC		SR14580: Disable PromptForPrinter if no PrintCode on load.
+	; 03-Feb-2006	RPW		SR14093: Created
+	;-------------------------------------------------------------------------------
+	if pintYSEITE = 3 {
+		do LoadGrid(pstrYKEY)
+	}
+	quit
+	
+LoadGrid(pidBankAcct="")
+	;-------------------------------------------------------------------------------
+	; Display the Bank Transactions for the Bank Account
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Feb-2006	RPW		SR14093:Created
+	;-------------------------------------------------------------------------------
+	new objInvoice,YFORM,YKEY,YAUSWAHL,YFELD,strData
+	
+	set YFORM = "FINGLBankTran"
+	set YFELD = ""
+	set YKEY  = $get(pidBankAcct)
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)          = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL)       = 500
+	set $$$COMGridEditParameterGridName(YAUSWAHL)            = YFORM
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)             = $$$NO ; ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)           = "FINGLBank"
+	set $$$COMGridEditParameterDontUpdateContainer(YAUSWAHL) = $$$YES
+	
+	do ^COMGridEdit31
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,402 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReceiptLinePost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReceiptLinePost
+	;+++++++++++++++++++++++++++++++++++++++
+	; see INRECDoco
+	;+++++++++++++++++++++++++++++++++++++++
+#include COMSYS
+#include INConst
+#include INWConst
+#include %occInclude
+	
+#;define FORMFldINRECLineLotNo		13
+#;define FORMFldINRECLineExpiryDate	14
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReceiptLinePost("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+ 	
+	;UpdateINAUF(pidClass,pidOrder,pidOrderLine,penumLineType,pfltQtyReceived) 
+UpdateOrderLine(pidOrder,pidOrderLine,penumLineType,pfltQtyReceived) 
+	;-------------------------------------------------------------------------------
+	; Update INAUFP record
+	; TODO: change to INPO when in effect Pending Changeover to INPO
+	; 
+	; Params:  [pidClass        = class to be updated (INAUF)   Removed]
+	; 			pidOrder		= order number
+	; 			pidOrderLine    = Order Line number
+	; 			penumLineType	= Line Type (standard, bonus etc)
+	; 			pfltQtyReceived = Quantity receipted
+	; 			
+	; CalledBy : Receive^INReceiptButtonP
+	;
+	; History:
+	; 10-Feb-2010	GRF		SR17138: Use new Ordered Unit data
+	; 22-May-2009	GRF		SR16363: Name and restrict to INAUFP
+	; 20-May-2009	SH/DWR	SR16526: Removed last parameter from call to UpdateINAUF
+	; 19-May-2009	DWR		SR16526: Improved logic, order number passed in, use this
+	; 							instead of pobjRECLine check
+	; 11-May-2009	DWR		SR16526: Added a check to make sure there is an order to
+	; 							update, else quit.
+	; 21-Apr-2009	DWR 	SR16363: Created
+	;-------------------------------------------------------------------------------
+	new fltQtyReceipted,objINAUFLine,strStatus
+	
+	set strStatus = $$$OK
+ 	if penumLineType = 0 { ; standard
+		if pidOrder'="" {
+			set objINAUFLine = $get(^INAUFP(0,pidOrder,pidOrderLine,1))
+			set fltQtyReceipted = $$$INAUFPIncomingGoodsQuantity(objINAUFLine)
+			set $$$INAUFPIncomingGoodsQuantity(objINAUFLine) = fltQtyReceipted + pfltQtyReceived
+			
+	;		if $$$INAUFPIncomingGoodsQuantity(objINAUFLine) '< $$$INAUFPQuantity(objINAUFLine) {  ; SR17138
+			if $$$INAUFPIncomingGoodsQuantity(objINAUFLine) '< $$$INAUFPOrderedQuantity(objINAUFLine) {
+				set $$$INAUFPPosCompleted(objINAUFLine) = $$$YES
+			}
+			
+			set strStatus = $$$Save("INAUFP",pidOrder_$$$COMMA_pidOrderLine,objINAUFLine,$$$YES)
+		}
+ 	
+ 	} else {
+		; Not implemented
+ 	}
+	quit strStatus
+	
+	
+Receive(pidReceipt,pidRECLine,&parrLineIncSC,pobjRECLine="",&parrRecDate)
+	;-------------------------------------------------------------------------------
+	; Creates a movement record and updates this record
+	; 
+	; Called by: ProcessAllocations^INReceiptButtonP (from PostTxn)
+	; 
+	; Inputs:
+	;	pidReceipt	: \ ^INRECLine keys
+	;	pidRECLine	: / may be "n" or "n.01"
+	;	pobjRECLine	:   ^INRECLine record - YFELD
+	;					If have obtained earlier can pass in otherwise don't
+	;					include in parameter list and will be obtained here.
+	; 
+	; By Refs:
+	; 	(Input) parrLineIncSC [base line] line total cost incSC ~ Qty Received
+	; 	(Input) parrRecDate
+	; 
+	; History:
+	; 26-Feb-2014	SCR		HEVA-1343:Improve Error Checking
+	; 10-Feb-2010	GRF		SR17138: Use new Ordered Unit data
+	; 04-Nov-2009	DWR		SR16377: use language txt 
+	; 08-Sep-2009	GRF		SR16875: set QtyRequired in inventory units; preserve
+	; 							some values for reuse
+	; 03-Aug-2009	PPP		SR16815: Changed $$$INRECLineBaseQuantity to $$$INRECLineOrderQuantity
+	; 05-Jun-2009	GRF		SR16508: Add ReceiptDate & UnitCost to dMovement object
+	; 03-Jun-2009	GRF		SR16547: round ExtendedCost to currency; fltTotalRecQty
+	; 							not totalRecUnit
+	; 22-May-2009	DWR		SR16363: stores Qty receipted from INRECLine into variable
+	; 							this value then used twice. got totalRecUnit to calculate
+	; 							correct value of ExtendedCost. (affects INARTAVG)
+	; 21-May-2009	GRF		SR16363: get idLocn & idStore once
+	; 14-May-2009	DWR		SR16363: call passed in array to calculate unitCost with SC
+	; 07-Apr-2009	GRF		SR16363: split from INReceiptLine
+	; 19-Mar-2009	DavidR	SR16363: corrected spelling of property, causing crash
+	; 03-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new curTotalCost,enumOrderUnit,fltOrderConv,fltQtyRec,fltRequiredQty,fltTotalRecQty
+	new idItem,idLocn,idOrder,idOrderLine,idStore,objINREC,objMove,objOrderLine
+	new objRec15,objarrLineSC,sc,strINWEFREI,strMessage,strStatus
+	
+ 	$$$LogR("Receive",pidReceipt_","_pidRECLine)
+	
+	set strStatus  = $$$OK
+	
+	if $get(YDECIMALLEN)="" set YDECIMALLEN = 2
+	
+	set objINREC = $get(^INREC(0,pidReceipt,1)) 
+	
+	if pobjRECLine="" set pobjRECLine = $get(^INRECLine(0,pidReceipt,pidRECLine,1))
+	
+	set $$$INRECLineReceiptDate(pobjRECLine) = $horolog   ; FIXME : not used, not saved
+	set fltQtyRec = $$$INRECLineQuantity(pobjRECLine)
+	
+	set objarrLineSC 	= $get(parrLineIncSC(pidRECLine\1))
+	set curTotalCost	= +$piece(objarrLineSC,Y,1)              ; extended cost
+	set fltTotalRecQty	= +$piece(objarrLineSC,Y,2)              ; total qty receipted for line
+	kill %objlasterror
+	set sc				= $$$OK				
+	if $$$INRECType(objINREC) = 2 {    ; Only Supplier Receipt
+		set idLocn      = $$$INRECLineLocation(pobjRECLine)
+		set idStore     = $$$INRECLineStockLocation(pobjRECLine)
+		set idItem      = $$$INRECLineItem(pobjRECLine)
+		set idOrder     = $$$INRECLineOrder1(pobjRECLine)
+		set idOrderLine = $$$INRECLineOrderLine(pobjRECLine)
+		
+		set objMove = ##class(alREC.dMovement).%New()
+		set objMove.Item        = ##class(alINV.iUINV).GetItem(idItem)
+		set objMove.FromLocn    = ""
+		set objMove.FromStorage = ""
+		set objMove.ToLocn      = ##class(alLOC.iULOC).GetLocation(idLocn)
+		set objMove.ToStorage   = ##class(alLOC.iULOC).GetStorage(idLocn,idStore)
+		set objMove.OrderNumber = idOrder
+		set objMove.OrderLine   = idOrderLine
+ 
+		; No Order specified, need to build INWEFREI lookalike so it can process
+		if (idOrder = "") && (idOrderLine = "") {
+			set objOrderLine = ""
+			set objMove.OrderNumber = 0          ; setting values to 0 enables use of INARTAVG without an order
+			set objMove.OrderLine   = 0
+	; vvvvvvvvv  FIXME : the below code can be removed when no longer backpopulating INWE record  vvvvvvv
+		
+	; NOTE : This is a dummy structure - there is no actual saving of an INWEFREI record.	
+			set strINWEFREI = ""
+			set $$$INWEFREIBetrieb1(strINWEFREI)      = idLocn       ; FIXME : German Parameter Names <GRF>
+			set $$$INWEFREILagerplatz(strINWEFREI)    = idStore
+			set $$$INWEFREIEingangsdatum(strINWEFREI) = +$horolog
+			set $$$INWEFREIItem(strINWEFREI)          = idItem
+			set $$$INWEFREIMenge(strINWEFREI)         = fltQtyRec
+			set $$$INWEFREIPreis(strINWEFREI)         = $$$INRECLineEach(pobjRECLine)
+			set $$$INWEFREILieferant(strINWEFREI)     = $$$INRECLineSupplier(pobjRECLine)
+			set $$$INWELotNo(strINWEFREI)             = $$$INRECLineLotNumber(pobjRECLine)
+			set $$$INWEUseableUntilDate(strINWEFREI)  = $$$INRECLineExpirationDate(pobjRECLine)
+		;	set $piece(strINWEFREI,"~",9)             = pidReceipt_$$$COMMA_pidRECLine     ; FIXME : D9 is supplier - line appears wrong anyway <GRF>
+			
+			set objMove.RecWithOutOrderData           = strINWEFREI
+		; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+		} else {
+			set objOrderLine = $get(^INAUFP(0,idOrder,idOrderLine,1))
+		}
+		
+	 	set objMove.ExtendedCost = $justify((fltQtyRec/fltTotalRecQty) * curTotalCost,0,YDECIMALLEN)
+		set objMove.UnitCost     = curTotalCost/fltTotalRecQty       ; Includes pro rata charges
+		set objMove.ReceiptDate  = parrRecDate(pidRECLine)
+		
+		set objMove.Reference    = pidReceipt
+		set objMove.LineNumber   = pidRECLine
+		
+		set objMove.QtyPicked    = 0
+		set objMove.QtyReceived  = $$$INRECLineQuantity(pobjRECLine) ; in Inventory Units
+	
+		set fltRequiredQty = $$$INRECLineOrderQuantity(pobjRECLine)  ; in Order Units
+		set enumOrderUnit  = $$$INAUFPOrderedUnit(objOrderLine)
+		if enumOrderUnit'="" {
+			set fltOrderConv   = $$GetUOMConversion^INUOMConversion(idItem,enumOrderUnit)  ; Conversion Order to Inventory
+			set fltRequiredQty = fltRequiredQty*fltOrderConv
+		}
+		set objMove.QtyRequired = fltRequiredQty                     ; in Inventory Units
+		
+		set objMove.Supply      = ""
+		set objMove.Demand      = ""
+		set objMove.Completed   = $$$NO
+	
+		set objRec15 = ##class(alREC.dUReceiptLine).%OpenId("0||"_pidReceipt_"||"_pidRECLine)
+		set objMove.Bundle      = objRec15.Bundle
+		   
+		if objMove.Bundle=$$$NULLOID {
+			set strMessage = $$$Text($listbuild("IN01808",idItem,pidRECLine))  ;Error Creating Bundle for Item %1 on Line %2
+			if $data(%objlasterror) {
+				set strMessage=strMessage_" : "_$$DecodeCacheError^COMUtilError($get(%objlasterror)) ; Append Last Error
+			}
+			set sc =$$$ERROR($$$GeneralError,strMessage)
+		}
+		if $$$ISOK(sc) {
+			set sc = objMove.ChangeState(4)
+		}
+		if $$$ISERR(sc) {
+			set strStatus = $$ISStatusToDLStatusAllMessages^COMUtilError(sc)
+		}
+	
+	} else {
+		set strStatus = $$$MakeStatus("334036")     ;"UNSUPPORTED AT THIS TIME"
+	}
+	quit strStatus
+	
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	;  * * *   DEPRECATED CODE * * *                  vvvvvvvvvv
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+	;Update(pidClass,pidReceipt,pidRecLine,pobjRECLine)   ; SR16508
+	;Update(pidClass,pidReceipt,pidRecLine,pobjRECLine,&parrRecDate) ; SR16689
+Update(pidClass,pidReceipt,pidRecLine,pobjRECLine,pdteRecvd,&parrRecDate) ; DEPRECATED - with removal of INWEAUF(VOR) 
+	;-------------------------------------------------------------------------------
+	; Update INWEAUF(VOR) record
+	;
+	; CalledBy : ProcessAllocations^INReceiptButtonP (from PostTxn)   [was OnAfterSave^INReceiptLine]
+	;
+	; Params:	pidClass	: INWEAUF [deprecated => or INWEAUFVOR depending on whether the receipt is editable]
+	;			pidReceipt	: \ ^INRECLine keys
+	;			pidRecLine	: / may be "n" or "n.01"
+	;			pobjRECLine	: ^INRECLine data
+	;			pdteRecvd   : "date.seq"
+	; 
+	; ByRef:	parrRecDate : override date
+	; 
+	; Returns:	status
+	;
+	; History:
+	; 08-Sep-2009	GRF		SR16875: INWEAUF must use quantity in order units for
+	; 							consistency
+	; 03-Aug-2009	PPP		SR16815	Changed $$$INRECLineQuantity to $$$INRECLineBaseQuantity
+	; 09-Jul-2009	GRF		SR16689: Sequence on INWEAUF is not same as that against
+	; 							INWE - pass "date.seq" in - override array
+	; 10-Jun-2009	GRF		SR16508: incorrect variable fixed : pidRecLine
+	; 05-Jun-2009	GRF		SR16508: Return ReceiptDate from INWECounter in array
+	; 08-Apr-2009	GRF		SR16363: don't continue to make INWEAUF if receipt
+	; 							without order
+	; 07-Apr-2009	GRF		SR16363: split from INReceiptLine; individual keys as
+	; 							parameters
+	; 18-Mar-2009	GRF		specific $$$KEY macros
+	; 18-Oct-2006	JW		SR15134: Look at Kill status
+	; 04-Sep-2006	JW		SR14979: Kill if excluding, fix factor
+	; 31-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new blnExists,dteGoodsIn,enumOrderUnit
+	new fltFactor,fltOrigFactor,fltOrderConv,fltQtyInvUnits
+	new idItem,idOrder,idOrderLine,objINWEAUF,objOrdLine
+	new strNewKeys,strOldKeys,strStatus
+	
+	$$$LogR("Update",pidClass_$$$COMMA_pidReceipt_$$$COMMA_pidRecLine)
+	
+	set strStatus   = $$$OK
+	set idOrder     = $$$INRECLineOrder1(pobjRECLine)
+	set idOrderLine = $$$INRECLineOrderLine(pobjRECLine)
+	
+	quit:(idOrder="")||(idOrderLine="") strStatus
+	
+	set objOrdLine = $get(^INAUFP(0,idOrder,idOrderLine,1))     ; SR16875
+	set strOldKeys = $$GetINWEAUFLink(pidClass,pidReceipt_$$$COMMA_pidRecLine)	;includes quotes
+	;set strNewKeys = $$GetINWEAUFKeys(pobjRECLine)             ; SR16689
+	set strNewKeys = $$GetINWEAUFKeys(pobjRECLine,pdteRecvd)
+	set blnExists  = (strOldKeys'="")
+	
+	if $$$INRECLineInclude(pobjRECLine) {
+		if blnExists {
+			set objINWEAUF = $get(@("^"_pidClass_"(0,"_strOldKeys_",1)"))
+			
+			// Check whether INWEAUF keys have changed (exclude date) and kill if necessary
+			set strOldKeys = $$$DEQUOTE(strOldKeys)
+			if $piece(strOldKeys,",",1,4) '= $piece(strNewKeys,",",1,4) {
+				set strStatus = $$$Kill(pidClass,strOldKeys)          ; see DCMEvent : pidClass_"Kill"
+				set blnExists = $$$NO
+			}
+			
+		} else {
+			// Defaults
+			set objINWEAUF = $$GetDefaults^INWEAUF1(idOrder,idOrderLine,$$$KEY3(strNewKeys),$$$KEY4(strNewKeys),,$$$YES)
+			
+			//Overrides
+			set $$$INWEAUFReceivingNumber(objINWEAUF)   = pidReceipt
+			set $$$INWEAUFIncomingGoodsLine(objINWEAUF) = pidRecLine
+			set $$$INWEAUFVORItem(objINWEAUF)           = $$ARTIKEL^INWEAUFVOR(strNewKeys)
+			set $$$INWEAUFSupplier(objINWEAUF)          = $$$INRECLineSupplier(pobjRECLine)
+		}
+		
+		if $$$ISOK(strStatus) {
+		;	vvv SR16875
+		;	set $$$INWEAUFIncomingGoodsQuantity(objINWEAUF) = +$$$INRECLineQuantity(pobjRECLine)
+			set idItem         = $$$INAUFPItemNumber(objOrdLine)
+			set enumOrderUnit  = $$$INWEAUFQuantityUnit(objINWEAUF)
+			set fltOrderConv   = $$GetUOMConversion^INUOMConversion(idItem,enumOrderUnit)   ; Conversion Order to Inventory
+			set fltQtyInvUnits = $$$INRECLineQuantity(pobjRECLine)                          ; in Inventory Units
+			
+			set $$$INWEAUFIncomingGoodsQuantity(objINWEAUF) = fltQtyInvUnits/fltOrderConv   ; in Order Units
+		;	^^^ SR16875	
+			set $$$INWEAUFIncomingGoodsFlags(objINWEAUF)    = $$$INRECLineFlag(pobjRECLine)
+			set $$$INWEAUFLotNo(objINWEAUF)                 = $$$INRECLineLotNumber(pobjRECLine)
+			set $$$INWEAUFExpirationDate(objINWEAUF)        = $$$INRECLineExpirationDate(pobjRECLine)
+	; FIXME : <GRF> Do we need to save *BOTH* Batch and Lot? see SR15730
+			
+			if blnExists {
+				set strNewKeys = strOldKeys
+				
+			} else {	// Increment date
+				set dteGoodsIn    = $$$KEY5(strNewKeys)
+				set fltOrigFactor = $$GetIncrementFactor^WWWDATE1()
+				set fltFactor     = fltOrigFactor*2	// skip first increment
+				
+				while $data(@("^"_pidClass_"(0,"_$$^WWWKEYBUILD(strNewKeys)_",1)")) {
+					set $$$KEY5(strNewKeys) = $increment(dteGoodsIn,fltFactor)
+					set fltFactor = fltOrigFactor	// revert to normal factor
+				}
+			}
+			// Update record
+			set strStatus = $$$Save(pidClass,strNewKeys,objINWEAUF,1) ; see DCMEvent : pidClass_"Save"
+		}
+	
+	} else {		// If not including, remove INWEAUF record   [DEPRECATED Under INReceiptLine - always Include]
+		if blnExists {
+			set strStatus = $$$Kill(pidClass,strOldKeys)              ; see DCMEvent : pidClass_"Kill"
+		}
+	}
+	set parrRecDate(pidRecLine) = $$$KEY5(strNewKeys)    ; SR16508 10-Jun-2009
+	quit strStatus
+	
+	
+GetINWEAUFLink(pidClass,pstrKeys) ; DEPRECATED - with removal of INWEAUF(VOR) 
+	;-------------------------------------------------------------------------------
+	; Get keys of linking INWEAUF record if exists
+	;
+	; Params:	pidClass - INWEAUF
+	;			pstrKeys - INRECLine keys
+	;
+	; ByRefs:	
+	;
+	; Returns:	keys of INWEAUF(VOR) record
+	;
+	; History:
+	; 07-Apr-2009	GRF		SR16363: split from INReceiptLine
+	; 31-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new idxLine,idxRec,strGlobal,strKeyINWEAUF
+	
+	$$$LogR("GetINWEAUFLink",pidClass_","_pstrKeys)
+	
+	set idxRec  = $$$Index($$$KEY1(pstrKeys))
+	set idxLine = $$$Index($$$KEY2(pstrKeys))
+	
+	set strKeyINWEAUF =""
+	;+++++++++++++++++++++++++++++++++++++++
+	; Keys : OrderNo, OrderLineNo, Locn, Storage, DateIn
+	; Indexed fields
+	;	INWEAUF/INWEAUFVOR
+	;		D1   (Goods Received No)
+	;		D118 (Incoming Goods Line)
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set strGlobal = "^"_pidClass_"s(0,2,idxRec,idxLine)"
+	if $data(@strGlobal) {
+		set strKeyINWEAUF = $piece($piece($query(@strGlobal),",",5,9),")",1)
+	}
+	$$$LogRx(strGlobal_":"_strKeyINWEAUF)
+	
+	quit strKeyINWEAUF
+	
+	
+	;GetINWEAUFKeys(pobjRECLine)  ;SR16689
+GetINWEAUFKeys(pobjRECLine,pdteRecvd) ; DEPRECATED - with removal of INWEAUF(VOR) 
+	;-------------------------------------------------------------------------------
+	; Get the keys of the INWEUAF(VOR) record from the INRECLine
+	;
+	; Params:	pobjRECLine - INRECLine data
+	;
+	; ByRefs:
+	;
+	; Returns:	INWEUAF(VOR) keys
+	;
+	; History:
+	; 09-Jul-2009	GRF		SR16689: pass in "date.seq"
+	; 31-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	$$$LogR("GetINWEAUFKeys",pobjRECLine)
+	
+	; SR16689 vvv
+	if $get(pdteRecvd)="" set pdteRecvd = +$horolog
+	quit $$$INRECLineOrder1(pobjRECLine)_","_$$$INRECLineOrderLine(pobjRECLine)_","_$$$INRECLineLocation(pobjRECLine)_","_$$$INRECLineStockLocation(pobjRECLine)_","_pdteRecvd
+	;quit $$$INRECLineOrder1(pobjRECLine)_","_$$$INRECLineOrderLine(pobjRECLine)_","_$$$INRECLineLocation(pobjRECLine)_","_$$$INRECLineStockLocation(pobjRECLine)_","_(+$horolog)
+	
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	;  * * *   DEPRECATED CODE * * *                  ^^^^^^^^^^
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+]]></Routine>
+</Export>

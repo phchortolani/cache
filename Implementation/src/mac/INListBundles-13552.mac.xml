@@ -1,0 +1,1195 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INListBundles" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INListBundles
+#include COMSYS
+#include INConst
+	
+#def1arg CACHETEMP(%1) ^CacheTempINListBundles(YUCI,YUSER,%1)
+#define enumAverageCost		9
+	
+	;-------------------------------------------------------------------------------
+	; TODO : 
+	;  - Can we hide Lot No, Serial No, Batch No and Useable To if not applicable?
+	;  - Heading descriptions from INWE fields & some hard-coded.  WWW009?
+	;  - Total values don't include Reserved stock so value in a location is low.
+	;  - Optional Value column available
+	;-------------------------------------------------------------------------------
+	
+OnAfterSave()
+	;-------------------------------------------------------------------------------
+	;	Execute After Saving Data Records
+	;	
+	; History:
+	; 15-Jan-2009	FIS		SR16275: Do not store Item + Location in Current Item
+	;							field in INUSER (gets used from different forms)
+	; 02-Sep-2008	GRF		SR15804: Based on KEY^INBESTANZ1; retain Item Number
+	;-------------------------------------------------------------------------------
+	set VORG(1) = $get(VORG(1))                  ; Selection item 
+	set VORG(2) = $get(VORG(2))                  ; Selection Locn 
+	
+	set $piece(^INUSER(0,YBED,1),Y,2) = VORG(1)  ; current Item
+	set $piece(^INUSER(0,YBED,1),Y,5) = VORG(2)  ; current Location
+	set %("VAR","YKEY") = VORG(1)
+	do ^WWWFORM
+	quit
+	
+	
+Refresh()
+	;-------------------------------------------------------------------------------
+	;	Refresh with new item
+	;	
+	; History:
+	; 15-Jan-2009	FIS		SR16275: Do not store Item + Location in Current Item
+	;							field of INUSER
+	; 02-Sep-2008	GRF		SR15804: Based on ART^INBESTANZ1
+	;-------------------------------------------------------------------------------
+	new YFORM,YKEY
+	
+	set YKEY  = $piece($get(^INUSER(0,YBED,1)),Y,2)
+	set YFORM = "INART"
+	
+	set %("VAR","YFORM") = YFORM
+	set %("VAR","YKEY")  = YKEY
+	if $get(YBACK)'="" set %("VAR","YBACK") = YBACK
+	do ^WWWFORM
+	quit
+	
+	
+OnAfterPrimaryKey()
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		Display Stock On Hand details
+	;
+	; Inputs : 
+	;
+	;
+	; ByRef :
+	;	YAUSWAHL
+	;	YPARA
+	;	LAGERANZEIGE	Display Storage?          Usage unknown - retained from
+	;	ARTANZEIGE		Display Item?             prior INBESTANZ1 routine
+	;	SNANZEIGE		Display Serial Number?    Appear to provide indication of source
+	;	
+	; Returns :
+	;
+	;
+	; History :
+	; 15-Jan-2009	FIS		SR16275: Do not mix Item + Location in Current Item
+	;							field of INUSER
+	; 02-Sep-2008	GRF		SR15804: Activate bundle-based Stock on Hand display.
+	; 							Based on INBESTANZ1
+	;-------------------------------------------------------------------------------
+	new idItem,idLocn
+	
+	set idItem = $piece($get(^INUSER(0,YBED,1)),Y,2)  ; current Item
+	set idLocn = $piece($get(^INUSER(0,YBED,1)),Y,5)  ; current Location
+	set VORG(1) = idItem
+	set VORG(2) = idLocn
+	
+	if $get(%(YQUERY,"YARTIKEL"))'="" set idItem = $get(%(YQUERY,"YARTIKEL"))
+	set $piece(^INUSER(0,YBED,1),Y,2) = idItem
+	set $piece(^INUSER(0,YBED,1),Y,5) = idLocn
+	quit:idItem=""
+	
+	set YAUSWAHL=$get(YAUSWAHL)
+	
+	kill LAGERANZEIGE
+	
+	set ARTANZEIGE = 1  ;!-> FÜR RÜCKSPRUNG AUS ARTIKELANZEIGE ! DARF NICHT geNEW't WERDEN !! ;to out of Not will 
+	if $get(YPARA)="SN"   set SNANZEIGE = 1 set YPARA = ""  ;!-> FÜR RÜCKSPRUNG AUS SN-ZUORDNUNG ! DARF NICHT geNEW't WERDEN !! ;FIS;29.12.03;24854
+	if $get(YPARA)="NOSN" kill SNANZEIGE    set YPARA = ""
+	
+	write "<HR>"
+	
+	if '$data(^INART(0,idItem)) {                             ; "Check Please! (Item)"
+		write "<FONT SIZE=2><B>"_$$^WWWTEXT(32292)_" ("_$$^WWWTEXT(32024)_")"_"</B></FONT>"
+	
+	} elseif $piece($get(^INART(0,idItem,1)),Y,26)=5 {        ; "Check Please! (Phantom Item)"
+		write "<FONT SIZE=2><B>"_$$^WWWTEXT(32292)_" ("_$piece($get(^WWW101(0,"ARTIKEL-ART",SPRACHE,5,1)),Y,1)_")"_"</B></FONT>"
+	
+	} else {
+		do DisplayTable^INListBundles(idItem_","_idLocn,YAUSWAHL)       ; Bundles
+	}
+	quit
+	
+	
+DisplayTable(YKEY,YAUSWAHL,YEDIT)
+	;-------------------------------------------------------------------------------
+	; Stock on hand details from Item Master Data (based on INBESTANZ)
+	; 
+	; Collect Stock on Hand and Reservation properties for an item and present in a
+	; table format with links to the following forms :
+	; 
+	; Called by : Item Master Data form INART via routine INBESTANZ1
+	;
+	; Inputs : 
+	;	YKEY			idItem
+	;	YEDIT		bln	Change Permitted : 0 No, 1 Yes    - default 0 No
+	;	YAUSWAHL 		Display Filter   : Available, Closed,.....
+	;
+	; Implicit Variables :
+	; 	YWHR			Currency code
+	; 	YSILVER			zebra stripe dark
+	; 	YWHITE			zebra stripe light
+	; 	FERTIGUNGSNR	Back path operation : Item/Material movement for Production
+	; 	ARTANZEIGE		Back path operation : Display Inventory Per Item
+	; 	LAGERANZEIGE	Back path operation : Display Items at Location
+	;
+	; Returns :			Nothing
+	; 
+	; History:
+	; 04-Sep-2008	GRF		SR15804: Allow column filtering based on ItemPolicy
+	; 02-Sep-2008	GRF		SR15804: Pass in manual location for filtering (replace
+	; 							INBESTANZL)
+	; 30-Jul-2008	GRF		SR15804: Bring into production based on Stock Bundles;
+	; 							Replace link to INWE1 (Goods Relocation) with links
+	; 							to pre-populated forms INADJ and INMOV.
+	;-------------------------------------------------------------------------------
+	new arrTotal,idItem,idLocn,LAP,MINUS,objItem,strFilterLocn,strMultiUnits,strPolicy,YDDSATZ
+	
+	; *** Actual Order is defined in DefineColumnOrder() ***
+	
+	;-------------------------------------------------------------------------------------------------------
+	;Stock (ItemNo) Description                                                                            | (*1*)
+	;-------------------------------------------------------------------------------------------------------
+	;  Site  |Storage |  Created   |Quantity|Serial|Supplier|Unit |  Stock  |Delivery|Version|Source|Batch | (*2*) INWE
+	;Location|        |     On     |        |Number|        |Price|Locn Note|Note No | (Rev) |Order |Number| Descriptions
+	;-------------------------------------------------------------------------------------------------------
+	;  ...   |...     |            |        |      |        |     |         |        |       |      |      | (*3*)
+	;  ...   |...     |            |        |      |        |     |         |        |       |      |      | 
+	;        |        |Subtotal    |        |      |        |     |         |        |       |      |      | (*4*)
+	;-------------------------------------------------------------------------------------------------------
+	;        |        |Total Amount|        |      |        |     |         |        |       |      |      | (*5*)
+	;-------------------------------------------------------------------------------------------------------
+	;Available Stock: qty                                                                                  | (*6*)
+	;Stock Quantity Including Consignment Stock : qty                                                      |
+	;Stock Quantity Excluding Consignment Stock : qty                                                      | 
+	;-------------------------------------------------------------------------------------------------------
+	
+	set YAUSWAHL =  $get(YAUSWAHL)
+	set YEDIT    = +$get(YEDIT)
+	set YWHR     =  $get(YWHR)            ; Currency code
+	set YDDSATZ  =  0
+	
+	set idItem        = $$$KEY1($get(YKEY))
+	set strFilterLocn = $$$KEY2($get(YKEY))
+	quit:idItem=""
+	
+	set objItem = $get(^INART(0,idItem,1))
+	set strPolicy = $$$INARTItemPolicy(objItem)
+	
+	if $$$INARTPriceUnit(objItem)>1 {
+		set strMultiUnits = $$^INARTPE(idItem)
+	} else {
+		set strMultiUnits = ""
+	}
+	set idLocn = ""
+	if +$$$INVORGViewStockFromAllLocations($get(^INVORG(0,0,1)))=$$$NO set idLocn = YLOCATION
+	
+	do OnConstruct(idItem,idLocn,strFilterLocn,.arrTotal,strMultiUnits,strPolicy)
+	
+	do ItemDescription(idItem)                        ; (*1*)
+	do MakeTable(idItem,.arrTotal,YAUSWAHL,YEDIT,YWHR,.YDDSATZ)
+	do Summary(idItem,idLocn)                         ; (*6*)
+	quit
+	
+	;=======================================
+	; PREPARATION
+	;=======================================
+	
+OnConstruct(pidItem,pidLocn,pstrFilterLocn,&arrTotal,pstrMultiUnits,pstrPolicy)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 21-Jan-2009	GRF		SR16317: Pass Serial No flag
+	;-------------------------------------------------------------------------------
+	kill arrTotal
+	
+	set arrTotal("TQty")   = 0
+	set arrTotal("TRes")   = 0
+	set arrTotal("TVal")   = 0
+	set arrTotal("SubQty") = 0
+	set arrTotal("SubRes") = 0
+	set arrTotal("SubVal") = 0
+	
+	do DefineStyles()
+	do DefineColumnOrder(pidItem,pstrPolicy,''$$$INARTSerialNumber($get(^INART(0,pidItem,1))))  ; $$$CACHETEMP("Seq")
+	if $$CanHidePOCosts^COMSecurity() do RemoveCostColumms()
+	do GetHeadings()                             ; $$$CACHETEMP("Head")
+	do BuildList(pidItem,pidLocn,pstrFilterLocn,pstrMultiUnits) ; $$$CACHETEMP("Seq")
+		
+	quit
+	
+	
+DefineStyles()
+	;-------------------------------------------------------------------------------
+	; CSS Definition for this routine
+	; 
+	; By Ref :
+	; YSILVER		Established in WWWVORG
+	; YWHITE		
+	;-------------------------------------------------------------------------------
+	write YCR,"<style type='text/css'>"
+	write YCR,"<!-- "
+	write " .anzString {text-align: left; vertical-align: top; white-space: nowrap;}"
+	write " .anzNumber {text-align: right; vertical-align: top; white-space: nowrap;}"
+	write " .anzCurrency {text-align: right; vertical-align: top; white-space: nowrap;}"
+	write " .anzBlocked {text-decoration: line-through;}"
+	write " .anzClosed {color: orangered;}"
+	write " .anzSubTot {color: darkorange;}"
+	write " .anzTotal {border-top: 2px solid darkorange; color: darkorange;}"
+	write " .anzReserved {color: slategray;}"
+	write " .zebraDark {background-color: "_YSILVER_"; font-size: 10pt;}"
+	write " .zebraLight {background-color: "_YWHITE_"; font-size: 10pt;}"
+	write YCR,"//--></style>",YCR
+	
+	quit
+	
+	
+DefineColumnOrder(pidItem,pstrPolicy,pblnSerialNo=$$$NO) ; TODO : to be changed to be user friendly somehow
+	;-------------------------------------------------------------------------------
+	; Define sequence for display
+	;   D1	id   Data Key
+	;   D2	str  CSS Class
+	;   D3  bln  Show Total Costs
+	;   D4	bln  Hide Costs
+	; 
+	; To resequence, edit list
+	; 
+	; History:
+	; 17-Jul-2009	PPP		SR16764: Check for the new policy atttributes instead of the hard coded ones
+	; 21-Jan-2009	GRF		SR16317: Remove Bundle Column; "Total" texts moved to
+	; 							Created On/Recvd column; renumber for clarity; omit
+	; 							SerialNo column if not required.
+	;-------------------------------------------------------------------------------
+	; Example layout
+	; 
+	;  Site  |Storage|Bundle|Quantity|Serial|Batch |Lot No.|Useable|Version|Supplier|Unit Lot|Source|
+	;Location|       |      |        |Number|Number|       |  To   | (Rev) |        |  Cost  |Order |
+	;-------------------------------------------------------------------------------
+	new blnLotNo, blnUseBy, blnLotUnique, intBrand, intOwner, intProgram
+	
+	; TODO : use alINV.dUItem.(ItemPolicyGet)
+	
+	do GetAttributes^INItemPolicyUtils(pidItem,.blnLotNo,.blnUseBy,.blnLotUnique,.intBrand,.intOwner,.intProgram)
+	
+	kill $$$CACHETEMP("Seq")
+	
+	; Position of "Total Amount" or "Subtotal" Label - column before "Qty"
+	set $$$CACHETEMP("Seq") = 2     ; 2.1 ; SR16317
+		
+	set $$$CACHETEMP("Seq",1.1)     = "Locn~anzString~"   _"0~0"
+	set $$$CACHETEMP("Seq",1.2)     = "Store~anzString~"  _"0~0"
+	set $$$CACHETEMP("Seq",2)       = "Recvd~anzString~"  _"0~0"
+	;et $$$CACHETEMP("Seq",2.1)     = "Bundle~anzString~" _"0~0"    ; "Total" SR16317:
+	set $$$CACHETEMP("Seq",3)       = "Qty~anzNumber~"    _"0~0"    ; +TotalQty
+	if pblnSerialNo {
+		set $$$CACHETEMP("Seq",4.1) = "Serial~anzString~" _"0~0"    ; TODO : Extra tool tip?
+	}
+	set $$$CACHETEMP("Seq",4.2)     = "Batch~anzString~"  _"0~0"
+	if blnLotNo {
+		set $$$CACHETEMP("Seq",4.3) = "LotNo~anzString~"  _"0~0"
+	}
+	if blnUseBy {
+		set $$$CACHETEMP("Seq",4.4) = "UseBy~anzString~"  _"0~0"
+	}
+	if intBrand {
+		set $$$CACHETEMP("Seq",4.5) = "Brand~anzString~"  _"0~0"
+	}
+	if intOwner {
+		set $$$CACHETEMP("Seq",4.6) = "Owner~anzString~"  _"0~0"
+	}
+	if intProgram {
+		set $$$CACHETEMP("Seq",4.7) = "Program~anzString~"_"0~0"
+	}
+
+	set $$$CACHETEMP("Seq",5) = "Vers~anzString~"   _"0~0"
+	set $$$CACHETEMP("Seq",6) = "Supp~anzString~"   _"0~1"
+	set $$$CACHETEMP("Seq",7) = "Cost~anzCurrency~" _"1~1"    ; +TotalValue
+	set $$$CACHETEMP("Seq",8) = "Source~anzString~" _"0~0"
+	;et $$$CACHETEMP("Seq",9) = "Value~anzCurrency~"_"1~1"    ; Line total - not currently used but basis for SubVal/TVal
+	quit
+	
+	
+RemoveCostColumms()
+	;-------------------------------------------------------------------------------
+	; Only called when security requires costs to be hidden.  This removes the
+	; columns from the table and thus avoids the need to display subtotals & totals.
+	;-------------------------------------------------------------------------------
+	new idSeq,objSequence
+	
+	set idSeq = ""
+	for {
+		set idSeq = $order($$$CACHETEMP("Seq",idSeq))
+		quit:idSeq=""
+		
+		set objSequence = $get($$$CACHETEMP("Seq",idSeq))
+		if $piece(objSequence,Y,4) kill $$$CACHETEMP("Seq",idSeq)
+	}
+	quit
+	
+	
+GetHeadings()
+	;-------------------------------------------------------------------------------
+	; Labels for Columns   
+	; 
+	; History:
+	; 17-Jul-2009	PPP		SR16764: Check for the new policy atttributes instead of
+	; 							the hard coded ones
+	; 03-Sep-2008	GRF		SR15804: add language text
+	;-------------------------------------------------------------------------------
+	kill $$$CACHETEMP("Head")
+	
+	set $$$CACHETEMP("Head","Batch")   = $$^WWWFELDNAME("INWE","D",2)    ; "Batch"
+	set $$$CACHETEMP("Head","Bundle")  = $$^WWWTEXT("alISS0006")         ; "Bundle"
+	set $$$CACHETEMP("Head","Cost")    = $$^WWWFELDNAME("INWE","D",8)    ; "Unit Lot Cost"
+	set $$$CACHETEMP("Head","Locn")    = $$^WWWFELDNAME("INWE","P",2)    ; "Site Location"
+	set $$$CACHETEMP("Head","LotNo")   = $$^WWWFELDNAME("INWE","D",19)   ; "Lot Number"
+	set $$$CACHETEMP("Head","Qty")     = $$^WWWTEXT(31407)               ; "Quantity"         ; D4
+	set $$$CACHETEMP("Head","Recvd")   = $$^WWWTEXT("IN00759")           ; "Created On"       ; P4 "Received On"
+	set $$$CACHETEMP("Head","Serial")  = $$^WWWFELDNAME("INWE","D",5)    ; "Serial Number"
+	set $$$CACHETEMP("Head","Source")  = $$^WWWFELDNAME("INWE","D",28)   ; "Source Order"
+	set $$$CACHETEMP("Head","Store")   = $$^WWWTEXT("alISS0003")         ; "Storage" P3
+	set $$$CACHETEMP("Head","Supp")    = $$^WWWFELDNAME("INWE","D",7)    ; "Supplier"
+	set $$$CACHETEMP("Head","UseBy")   = $$^WWWFELDNAME("INWE","D",25)   ; "Useable To"
+	set $$$CACHETEMP("Head","Value")   = $$^WWWTEXT("IN00758")           ; "Line Value"
+	set $$$CACHETEMP("Head","Vers")    = $$^WWWFELDNAME("INWE","D",48)   ; "Version (Rev)"
+	set $$$CACHETEMP("Head","Brand")   = $$^WWWTEXT("AL00321")           ; "Brand"   //SR16764 vvv
+	set $$$CACHETEMP("Head","Owner")   = $$^WWWTEXT("AL00322")           ; "Owner"
+	set $$$CACHETEMP("Head","Program") = $$^WWWTEXT("AL00323")           ; "Program"
+	
+	quit
+	
+	
+BuildList(pidItem,pidSiteLocn,pstrFilterLocn,pstrMultiUnits)
+	;-------------------------------------------------------------------------------
+	; Build list of storages to be displayed - with or without SOH
+	; 
+	; History :
+	; 04-May-2011	GRF		SR17714: Must distinguish between id and str containing
+	;							remarks and physical storage
+	; 11-Nov-2010	PPP		SR17587: Show TSU if it exists
+	; 03-Feb-2010	PPP		SR17152: Show Location Name in Display Inventory Per
+	; 							Item form
+	; 05-Jan-2009	shobby	SR17097: Proposed method of stopping the screen from
+	; 							crashing when there is bad data.  Currently disabled
+	; 28-Oct-2009	GRF		SR16871: INItemCost with location replaces INARTCOST
+	; 12-Oct-2009	GRF		SR16878: Replace call to INARTKOST with INARTCOST
+	; 25-Mar-2009	PPP		SR16448: Stock Subtotals and Totals being converted to
+	; 							decimal place (double conversion, here and when
+	; 							displaying)   1. Removed the conversion
+	; 01-Oct-2008   PPP  	SR15973: Added Reservations
+	; 02-Sep-2008	GRF		SR15804: Pass in manual location for filtering
+	;-------------------------------------------------------------------------------
+	new curAvgCost,curValue,dteRecvd,fltQty,fltResvd,fltUnitQty
+	new idLocn,idBundle,idStore,loop,lstStock,objBundleStock,objResultSet,objStock
+	new sc,strCost,strStore	;SR17714
+	
+	kill $$$CACHETEMP("Locn")
+	
+	;set curAvgCost = $$^INARTKOST(pidItem,,$$$enumAverageCost)       ; SR16878
+	;set curAvgCost = $$GetCost^INARTCOST(pidItem,$$$enumAverageCost) ; SR16871  ; apply to each location below
+	set fltUnitQty = $$^INQTYUNIT(pidItem)
+	
+	set lstStock = ##class(%Library.ListOfObjects).%New()	
+	
+	if $get(pidSiteLocn)'="" {
+		set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetViaLocationOrderByStore")
+		set sc = objResultSet.Execute(pidItem,pidSiteLocn)
+	
+	} else {
+		set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetAllBundles")
+		set sc = objResultSet.Execute(pidItem)
+	}
+	
+	if sc {
+		while objResultSet.Next(.sc) {
+			set objStock = ##class(alSOH.dBundleStock).%OpenId(objResultSet.Data("ID"))
+			do lstStock.Insert(objStock)
+		}
+	}
+	
+	if sc {
+		for loop = 1:1:lstStock.Count() {
+			set objBundleStock = lstStock.GetAt(loop)
+		
+			set idLocn   = objBundleStock.Storage.Location.Code
+			if pstrFilterLocn'="" continue:idLocn'=pstrFilterLocn
+			
+			set idStore  = objBundleStock.Storage.Code	        //SR17587
+		;	set idStore  = objBundleStock.Storage.CodeWithTSU   //SR17714
+			set strStore = objBundleStock.Storage.CodeWithTSU   //SR17714
+		;	continue:objBundleStock.Bundle=$$$NULLOREF		;SR17097
+			set idBundle = objBundleStock.Bundle.%Id()
+			set fltQty   = objBundleStock.QtyOnHand
+			
+	; Reservations?
+	; ^INWER(0,35,1,"1-2-1",60000.00002,"TFR_TFR001",1)="~~~2~99999~~~~~2~"
+	; ^INWER(0,35,1,"1-3-2",60000,      "TFR_TFR001",1)="~~~1~99999~~~~~1~"
+		
+			set fltResvd = $$GetReservedForABundle(pidItem,idLocn,objBundleStock.Storage.%Id(),idBundle)
+			if fltResvd = 0 {
+				set fltResvd = ""
+			} else {
+				set fltResvd = $$^WWWZAHL(fltResvd,0,$length($piece(fltResvd,".",2)))
+			}
+			
+			set curAvgCost = $$GetCost^INItemCost(pidItem,idLocn,$$$enumAverageCost)
+			set curValue   = fltQty * curAvgCost / fltUnitQty  ; Uses rounded values for Qty, preserves AvgCost accuracy
+			
+			//SR17152
+			//set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Locn")      = idLocn
+			set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Locn")      ="("_idLocn_") "_$$$WWW0121LocationName($get(^WWW0121(0,0,idLocn,1)))
+		;	set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Store")     = idStore     ; SR17714
+			set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Store")     = strStore	   ; SR17714
+			set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Bundle")    = $piece(idBundle,"|",1)_" ~ "_$piece(idBundle,"|",3)
+			set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Qty")       = fltQty
+			set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Qty","Res") = fltResvd
+			set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Cost")      = curAvgCost
+			set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Cost","MU") = pstrMultiUnits
+			set $$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Value")     = curValue
+			
+			do AddAttributes(objBundleStock.Bundle,idLocn,idStore,idBundle)
+		}
+	}
+	quit
+	
+	
+AddAttributes(pobjBundle,pidLocn,pidStore,pidBundle) ; private
+	;-------------------------------------------------------------------------------
+	; pobjBundle == ##class(alSOH.dBundle)
+	; 17-Jul-2009	PPP		SR16764: Check for the new policy atttributes instead of the hard coded ones
+	;-------------------------------------------------------------------------------
+	new dteAttrib,idxAttrib,strAttrib,strCreateDate,strRecvd
+	
+	set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Batch")  = ""
+	set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Serial") = ""   ; do SerialNos(pidItem,pidLocn,pidStore,dteRecvd)
+	set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Supp")   = ""
+	set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Source") = ""
+	set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Vers")   = ""
+	
+	; --------------------------------------
+	
+	set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"LotNo")  = ""
+	set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"UseBy")  = ""
+	
+	; --------------------------------------
+	
+	set strCreateDate = pobjBundle.CreationDate
+	if strCreateDate'="" {
+		set strCreateDate = $$^WWWDATE1($piece(strCreateDate," ",1))
+		set strCreateDate = $$^WWWDATE(strCreateDate)
+	}
+	set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Recvd")  = strCreateDate
+	
+	; --------------------------------------
+	
+	set idxAttrib = pobjBundle.Attributes.FindObjectId(pobjBundle.%Id()_"||ReceiveDate")
+	if idxAttrib'="" {
+		set dteAttrib = pobjBundle.Attributes.GetAt(idxAttrib).AttributeValue
+		set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Recvd") = $$^WWWDATE(dteAttrib)
+	}
+	
+	set idxAttrib = pobjBundle.Attributes.FindObjectId(pobjBundle.%Id()_"||ReceiptNo")
+	if idxAttrib'="" {
+		set strAttrib = pobjBundle.Attributes.GetAt(idxAttrib).AttributeValue
+		if strAttrib '= 0 {
+			set strRecvd = $get($$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Recvd"))
+			set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Recvd") = strRecvd_" ("_strAttrib_")"
+		}
+	}
+	
+	set idxAttrib = pobjBundle.Attributes.FindObjectId(pobjBundle.%Id()_"||Use By Date")
+	if idxAttrib'="" {
+		set dteAttrib = pobjBundle.Attributes.GetAt(idxAttrib).AttributeValue
+		set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"UseBy") = $$^WWWDATE(dteAttrib)
+	}
+	
+	set idxAttrib = pobjBundle.Attributes.FindObjectId(pobjBundle.%Id()_"||Lot Number")
+	if idxAttrib'="" {
+		set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"LotNo") = pobjBundle.Attributes.GetAt(idxAttrib).AttributeValue
+	}
+	
+	//SR16764
+	set idxAttrib = pobjBundle.Attributes.FindObjectId(pobjBundle.%Id()_"||Brand")
+	if idxAttrib'="" {
+		set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Brand") = pobjBundle.Attributes.GetAt(idxAttrib).AttributeValue
+	}
+	set idxAttrib = pobjBundle.Attributes.FindObjectId(pobjBundle.%Id()_"||Owner")
+	if idxAttrib'="" {
+		set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Owner") = pobjBundle.Attributes.GetAt(idxAttrib).AttributeValue
+	}
+	set idxAttrib = pobjBundle.Attributes.FindObjectId(pobjBundle.%Id()_"||Program")
+	if idxAttrib'="" {
+		set $$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,"Program") = pobjBundle.Attributes.GetAt(idxAttrib).AttributeValue
+	}
+	quit
+	
+	;=======================================
+	; ROW CONTROLS
+	;=======================================
+	
+ItemDescription(pidItem)
+	;-------------------------------------------------------------------------------
+	;   (*1*) Item Description
+	; Information Prior to Table - Item Number and Description
+	;-------------------------------------------------------------------------------
+	new YBACK
+	
+	write "<A TITLE="_""""_$$^WWWTEXT(374)_""""                 ; "Select Data Record" 
+	write " HREF="_YAKTION_"EP=WWWFORM&YFORM=INART"             ;ARTIKEL BEARBEITEN ;item
+	set YBACK=""                       ; for ^WWWCGI
+	do Link(pidItem)
+	write ">"
+	
+	write "<FONT SIZE=2><B>",$$^WWWTEXT(32020)," "              ; "Stock"
+	write "("_pidItem_")&nbsp;"
+	write $$$INARTSearchName($get(^INART(0,pidItem,1)))       ; D1 ;KURZBEZEICHNUNG ARTIKEL ;item 
+	write "</B></FONT></A>",YCR
+	quit
+	
+	
+MakeTable(pidItem,&arrTotal,YAUSWAHL,YEDIT,YWHR,&YDDSATZ)
+	;-------------------------------------------------------------------------------
+	; Wrapper to preserve variables after used in Link()
+	; 
+	; By Ref :
+	; FERTIGUNGSNR		Manufacturing Number - if present created from Production form
+	; ARTANZEIGE		Display Item         - if present created from List SOH
+	; 
+	; TODO : Check that backarrow works properly.
+	;-------------------------------------------------------------------------------
+	new YBACK,YKEY,YFKEY
+	
+	do ^WWWFRAME(0)
+	do TableHeadings()                                ; (*2*)
+	
+	set YBACK="INART,"                                     ; for ^WWWCGI
+	if $get(FERTIGUNGSNR)'="" set YBACK="INWEFERTUM,"      ; Item / Material Movement For Production
+	if $get(ARTANZEIGE)'=""   set YBACK="INListBundles,"   ; Display Inventory Per Item
+	;if $get(ARTANZEIGE)'=""   set YBACK="INBESTANZ,"      ; Display Inventory Per Item
+	;if $get(LAGERANZEIGE)'="" set YBACK="INBESTANZL,"     ; Display Items at Location
+	
+	do ListForLocn(pidItem,.arrTotal,YAUSWAHL,YEDIT,YWHR,.YDDSATZ)  ; (*3*) & (*4*)
+	do Totals(.arrTotal,YWHR,.YDDSATZ)                              ; (*5*)
+	do ^WWWFRAME(1)
+	quit
+	
+	
+TableHeadings()	
+	;-------------------------------------------------------------------------------
+	;   (*2*) Display Table Headings
+	;	Only show supplier and cost columns if user has access to EK and FIBU modules
+	;-------------------------------------------------------------------------------
+	new idData,idSeq,objSequence,strHead
+	
+	write YCR,"<TR>"
+	set idSeq = ""
+	for {
+		set idSeq = $order($$$CACHETEMP("Seq",idSeq))
+		quit:idSeq=""
+		set objSequence = $get($$$CACHETEMP("Seq",idSeq))
+		
+		set idData  = $piece(objSequence,Y,1)
+		set strHead = $get($$$CACHETEMP("Head",idData))
+		write "<TH ALIGN=CENTER BGCOLOR="_YDARKGRAY_" NOWRAP><FONT SIZE=2>&nbsp;",strHead,"&nbsp;</FONT></TH>"
+	}
+	write "</TR>",YCR
+	quit
+	
+	
+ListForLocn(pidItem,&arrTotal,YAUSWAHL,YEDIT,YWHR,&YDDSATZ)
+	;-------------------------------------------------------------------------------
+	;   (*3*) Get Table Lines from alSOH.dBundleStock
+	;   (*4*) Subtotal
+	;-------------------------------------------------------------------------------
+	new blnShowClock,curCost,curOnHandVal,ColumnNo,dteUsableFrom,dteUsableUntil
+	new fltOnHandQty,fltReservedQty,fltUnitQty,idBundle,idLocn,idStore,objBundle,strQty
+	
+	set fltUnitQty = $$^INQTYUNIT(pidItem)
+	
+	set idLocn = ""
+	for {
+		set idLocn = $order($$$CACHETEMP("Locn",idLocn))
+		quit:idLocn=""
+		
+		set idStore = ""
+		for {
+			set idStore = $order($$$CACHETEMP("Locn",idLocn,idStore))
+			quit:idStore=""
+			
+			set idBundle = ""
+			for {
+				set idBundle = $order($$$CACHETEMP("Locn",idLocn,idStore,idBundle))
+				quit:idBundle=""
+				
+				set fltOnHandQty   = $get($$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Qty"))
+				set fltReservedQty = $get($$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Qty","Res"))
+				set curCost        = $get($$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Cost"))
+				set curOnHandVal   = $get($$$CACHETEMP("Locn",idLocn,idStore,idBundle,"Value"))
+				
+				; FIXME : <GRF>Is calculation different if "Multiple Units"
+				
+				set arrTotal("SubQty") = arrTotal("SubQty") + fltOnHandQty
+				set arrTotal("TQty")   = arrTotal("TQty")   + fltOnHandQty
+				set arrTotal("SubRes") = arrTotal("SubRes") + fltReservedQty
+				set arrTotal("TRes")   = arrTotal("TRes")   + fltReservedQty
+				
+				set curOnHandVal       = (curCost * fltOnHandQty / fltUnitQty)
+				set arrTotal("SubVal") = arrTotal("SubVal") + curOnHandVal
+				set arrTotal("TVal")   = arrTotal("TVal")   + curOnHandVal
+			
+				continue:((fltOnHandQty=0) && (fltReservedQty'>0))
+				
+	; TODO : <GRF> Reservations not yet available in V2
+		;	if objINWE'="" {   ; different test needed 1. Show OnHand with embedded Reservations 2. Show standalone reservations
+				set blnShowClock = ((fltOnHandQty'<0) || (fltReservedQty'<0))
+				do DisplayOnHand(pidItem,idLocn,idStore,idBundle,.arrTotal,(fltOnHandQty<0),blnShowClock,YAUSWAHL,YEDIT,YWHR,.YDDSATZ) ; (*3*)
+		;	} else {	
+		;		do DisplayReservation(pidItem,pidSiteLocn,idStockLocn,dteRecvd,pblnHideCosts,ReservedQty,.arrTotal,.YDDSATZ)
+		;	}
+			}
+		}
+		do Subtotals(.arrTotal,YWHR,.YDDSATZ) ; (*4*)
+		set arrTotal("SubQty") = 0
+		set arrTotal("SubRes") = 0
+		set arrTotal("SubVal") = 0
+	}
+	quit
+	
+	
+DisplayOnHand(pidItem,pidLocn,pidStore,pidBundle,&arrTotal,pblnMinus,pblnShowClock,YAUSWAHL,YEDIT,YWHR,&YDDSATZ)
+	;-------------------------------------------------------------------------------
+	; Display BundleStock records + reservation total
+	; 
+	; pblnMinus		Negative Qty On Hand
+	; 
+	; History:
+	; 10-Nov-2011	PPP		SR17929: User new method to check for Blocked
+	; 03-Feb-2010	PPP		SR17152: Show Location Name in Display Inventory Per Item form
+	; 09-Apr-2009	PP/GRF	SR16478: make wider use of $$DPforInventoryCost^INVORG()
+	; 25-Mar-2009	PPP		SR16448: Stock Subtotals and Totals being converted to
+	; 							decimal place twice (here and when displaying)
+	; 							1.  Add the conversion to the Qty Col
+	; 21-Jan-2009	GRF		SR16317: Add idBundle into developer's tooltips
+	;-------------------------------------------------------------------------------
+	new blnBlockedStore,blnDatePassed,blnFirstCol,blnTooSoon,curOnHandVal,ColumnNo
+	new dteUsableFrom,dteUsableUntil,idData,idLinkKey,idSeq,loop,objBundle,objSequence,objStorage
+	new strBlockedReason,strData,strMultiUnits,strReserved,strRowStyle,strStyle,strTooltip,strLotNumber
+	
+	set objStorage = $get(^INLP(0,pidLocn,pidStore,1))
+	set objBundle  = ##class(alSOH.dBundle).%OpenId(pidBundle)
+	
+	//Get the UseByDate and LotNumber
+	set dteUsableUntil=""
+	set strLotNumber=""
+	for loop = 1:1:objBundle.Attributes.Count() {
+		if objBundle.Attributes.GetAt(loop).AttributeName = "Use By Date" {
+			set dteUsableUntil = objBundle.Attributes.GetAt(loop).AttributeValue
+		}
+		if objBundle.Attributes.GetAt(loop).AttributeName = "Lot Number" {  //SR17331
+			set strLotNumber = objBundle.Attributes.GetAt(loop).AttributeValue
+		}
+	}
+	
+	; Expiration Date Passed? / Already Usable
+	; VERFALLSDATUM ÜBERSCHRITTEN? / BEREITS VERWENDBAR
+	;-----------------------------------
+ 	//set dteUsableUntil  = objBundle.UseByDate
+	set dteUsableFrom   = ""
+	set blnDatePassed   = $$$NO
+	set blnTooSoon      = $$$NO
+	if (dteUsableUntil'="") && (dteUsableUntil<$horolog) set blnDatePassed = $$$YES
+	if (dteUsableFrom'="")  && (dteUsableFrom>$horolog)  set blnTooSoon    = $$$YES
+	
+	; Blocked Storage
+	;-----------------------------------
+	//SR17929
+	//set blnBlockedStore = +$$$INLPStockLocationIsLocked(objStorage)
+	set blnBlockedStore = $$IsStorageBlocked^INLP(pidLocn,pidStore)
+	if (pidStore["*") || pblnMinus set blnBlockedStore = $$$YES
+	
+	;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv  EARLY EXIT
+	
+	;FILTER FÜR GESPERRTE UND VERFÜGBARE, ANSICHT ÜBER LINK AUS INBESTSALES ULM,13.02.03
+	;FILTER FOR CLOSED ONES AND AVAILABLE ONE, OPINION OVER LEFT FROM INBESTSALES
+	quit:(YAUSWAHL'="")&&(pidStore["*")           ;LEIHLAGER MIT * FÜR LEIHLAGERUNG EINES FREMDFERTIGUNGSAUFTRAGES
+	                             ;BORROWING Location WITH * FOR BORROWING STORAGE OF AN ORDER FOR EXTERNAL MANUFACTURE
+	quit:(YAUSWAHL'="")&&(YAUSWAHL'=2)&&(blnBlockedStore&&'pblnMinus)
+	quit:(YAUSWAHL'="")&&(YAUSWAHL'=1)&&('blnBlockedStore||pblnMinus)
+	
+	;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	
+	set idLinkKey = pidItem_","_pidLocn_","_pidStore_","_pidBundle
+	
+	set strBlockedReason = ""
+	if blnBlockedStore      set strBlockedReason = $$$INLPReasonBlocked(objStorage)
+	if strBlockedReason'="" set strBlockedReason = $piece($get(^INPARA(0,"LPSPERRGRUND",SPRACHE,strBlockedReason,1)),Y,1)
+	
+	set strTooltip = $$MakeTooltip(blnBlockedStore,strBlockedReason,dteUsableFrom,dteUsableUntil)
+	if $get(^Development) {   ; SR16317
+		set strTooltip = strTooltip_$CHAR(13)_$$$CACHETEMP("Head","Bundle")_" "_pidBundle
+	}
+	
+	set YDDSATZ     = YDDSATZ+1
+	set strRowStyle = $select(YDDSATZ#2:"zebraDark",1:"zebraLight")
+	write YCR,"<TR class="""_strRowStyle_""">"
+	
+	set blnFirstCol = $$$YES
+	set idSeq = ""
+	for {
+		set idSeq = $order($$$CACHETEMP("Seq",idSeq))
+		quit:idSeq=""
+		set objSequence = $get($$$CACHETEMP("Seq",idSeq))
+		
+		set idData      = $piece(objSequence,Y,1)
+		set strStyle    = $piece(objSequence,Y,2)
+		
+		if pblnMinus || blnDatePassed || blnTooSoon {
+			set strStyle = strStyle_" anzClosed"
+		}
+		if blnBlockedStore || blnDatePassed || blnTooSoon {
+			set strStyle = strStyle_" anzBlocked"
+		}
+		write "<TD class="""_strStyle_""">"
+	    
+		set strData = $get($$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,idData))
+		
+		if idData = "Qty" {
+			set strData = $$^WWWZAHL(strData,0,$length($piece(strData,".",2)))	//16448
+			set strReserved = $get($$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,idData,"Res"))
+			if strReserved'="" {
+				do DisplayResQty(strReserved,pidItem,pidLocn,pidStore,pidBundle)
+			}
+		}
+		
+		; e.g. $ or USD prefix for YWHR = "AUD" and "USD"
+	;	if strStyle [ "anzCurrency" set strData = $$^WWWZAHL(strData,0,2,YWHR)    ; SR16478
+		if strStyle [ "anzCurrency" set strData = $$^WWWZAHL(strData,0,$$DPforInventoryCost^INVORG(),YWHR)
+		
+		if idData = "Cost" {
+			set strMultiUnits = $get($$$CACHETEMP("Locn",pidLocn,pidStore,pidBundle,idData,"MU"))
+			if strMultiUnits'="" set strDat]]><![CDATA[a = strMultiUnits_" "_strData
+		}
+		
+		//Show clock first SR17152
+		;	Display clock link where positive stock on hand or reservation => Reservations
+		if blnFirstCol {
+			set blnFirstCol = $$$NO
+			if pblnShowClock do LinkToReserve(idLinkKey)
+			do LinkToAdjust(idLinkKey)
+			do LinkPrintLabel(pidItem,pidLocn,dteUsableUntil,strLotNumber)  //SR17331
+		}
+
+		do OpenAnchor(strTooltip,pblnMinus,YEDIT,idLinkKey)
+		write "&nbsp;",$extract($translate(strData,"|"," "),1,30),"&nbsp;"
+		write "</A>"
+
+	    write "</TD>"
+	}
+	write "</TR>",YCR
+	
+	
+	quit
+	
+MakeTooltip(pblnBlockedStore,pstrBlockedReason,pdteUsableFrom,pdteUsableUntil)
+	new strTooltip
+	
+	set strTooltip = ""
+	
+	if pblnBlockedStore'=$$$YES {
+		set strTooltip = strTooltip_$$^WWWTEXT(374)        ; "Select Data Record"
+		
+		if pdteUsableFrom'="" {                            ; "Useable From"
+			set strTooltip = strTooltip_$CHAR(13)_$$^WWWTEXT(32657)_": "_$$^WWWDATE(pdteUsableFrom)
+		}
+		
+		if pdteUsableUntil'="" {                           ; "Useable From"
+			set strTooltip = strTooltip_$CHAR(13)_$$^WWWTEXT(32658)_": "_$$^WWWDATE(pdteUsableUntil)
+		}
+ 
+	} else {
+		set strTooltip = strTooltip_$$^WWWTEXT(34342)      ; "Item Blocked"
+	}
+ 
+	if pstrBlockedReason'="" set strTooltip = strTooltip_": "_pstrBlockedReason
+	
+	quit strTooltip
+	
+	
+OpenAnchor(pstrTooltip,pblnMinus,YEDIT,pidLinkKey)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 02-Mar-2009	DavidR	SR16171: Reverted changes SR incorrectly raised.
+	; 04-Feb-2009	DavidR	SR16717: changed the logic to check if the passed in tool
+	; 							tip contains the "item blocked" text. pblnMinus is not
+	; 							relating to items blocked. (possibly being over written
+	; 							in higher code)
+	; 16-Jan-2009	GRF		SR16276: Changed again to specify INART form
+	; 15-Jan-2009	FIS		SR16276: Call INMOVLoad as INListBundles form to go back directly
+	;-------------------------------------------------------------------------------
+	
+	write YCR,"<A TITLE="_$$$DBLQUOTE_pstrTooltip_$$$DBLQUOTE		
+	; Link
+	;-----------------------------------
+	write " HREF="_$$$DBLQUOTE
+	if pblnMinus  {
+		write "#"
+	} else {
+		if YEDIT=1  {
+			write YAKTION_"EP=WWWFORM&YFORM=INWE"
+		} else {
+			write YAKTION_"EP=WWWMANU&YFORM=INART&YEXEC=do|CreateRelocate^INMOVLoad(YKEY)"
+		}
+		do Link(pidLinkKey)
+	}
+	write $$$DBLQUOTE_">"
+	quit
+	
+	
+Subtotals(&arrTotal,YWHR,&YDDSATZ)
+	;-------------------------------------------------------------------------------
+	;   (*4*) Subtotal
+	;-------------------------------------------------------------------------------
+	new blnShowTotal,idData,idLabelCol,idSeq,objSequence,strData,strRowStyle,strStyle
+	
+	set idLabelCol = $get($$$CACHETEMP("Seq"))
+	quit:idLabelCol=""
+	
+	set YDDSATZ     = YDDSATZ+1
+	set strRowStyle = $select(YDDSATZ#2:"zebraDark",1:"zebraLight")
+	write YCR,"<TR class="""_strRowStyle_""">"
+	
+	set idSeq = ""
+	for {
+		set idSeq = $order($$$CACHETEMP("Seq",idSeq))
+		quit:idSeq=""
+		
+		set objSequence = $get($$$CACHETEMP("Seq",idSeq))
+		
+		set idData       = $piece(objSequence,Y,1)
+		set strStyle     = $piece(objSequence,Y,2)
+		set blnShowTotal = $piece(objSequence,Y,3)
+		set strData      = "&nbsp;"
+		
+		if idSeq = idLabelCol {
+			set strStyle = "anzString"
+			set strData  = $$^WWWTEXT(32799)                         ; "Subtotal"
+			if arrTotal("SubRes")'=0 set strData = "<BR/>"_strData
+		}
+		set strStyle = strStyle_" anzSubTot"
+		
+		write "<TD class="""_strStyle_""">"
+	    
+		if idData = "Qty" {
+			set strData = $$^WWWZAHL(arrTotal("SubQty"),0,$length($piece(arrTotal("SubQty"),".",2)))
+			if arrTotal("SubRes")'=0 {
+				do DisplayResQty(arrTotal("SubRes"),"","")
+			}
+		}
+		if blnShowTotal {
+			set strData = $$^WWWZAHL(arrTotal("SubVal"),12,2,YWHR)
+			if arrTotal("SubRes")'=0 set strData = "<BR/>"_strData
+		}
+		write "&nbsp;",$extract($translate(strData,"|"," "),1,30),"&nbsp;"
+	    write "</TD>"
+	}
+	write "</TR>",YCR
+	
+	quit
+	
+	
+Totals(&arrTotal,YWHR,&YDDSATZ)
+	;-------------------------------------------------------------------------------
+	;   (*5*) Footing Announcement - Totals
+	;-------------------------------------------------------------------------------
+	new blnShowTotal,idData,idLabelCol,idSeq,objSequence,strData,strReserved,strRowStyle,strStyle
+	
+	set idLabelCol = $get($$$CACHETEMP("Seq"))
+	quit:idLabelCol=""
+	
+	set YDDSATZ     = YDDSATZ+1
+	set strRowStyle = $select(YDDSATZ#2:"zebraDark",1:"zebraLight")
+	write YCR,"<TR class="""_strRowStyle_""">"
+	
+	set idSeq = ""
+	for {
+		set idSeq = $order($$$CACHETEMP("Seq",idSeq))
+		quit:idSeq=""
+		
+		set objSequence = $get($$$CACHETEMP("Seq",idSeq))
+		
+		set idData       = $piece(objSequence,Y,1)
+		set strStyle     = $piece(objSequence,Y,2)
+		set blnShowTotal = $piece(objSequence,Y,3)
+		set strData      = "&nbsp;"
+		
+		if idSeq = idLabelCol {
+			set strStyle = "anzString"
+			set strData  = $$^WWWTEXT(32868)                 ; "Total Amount"
+			if arrTotal("TRes")'=0 set strData = "<BR/>"_strData
+		}
+		set strStyle = strStyle_" anzTotal"
+			
+		
+		write "<TD class="""_strStyle_""">"
+	    
+		if idData = "Qty" {
+			set strData = $$^WWWZAHL(arrTotal("TQty"),0,$length($piece(arrTotal("TQty"),".",2)))
+			if arrTotal("TRes")'=0 {
+				do DisplayResQty(arrTotal("TRes"),"","")
+			}
+		}
+		if blnShowTotal {
+			set strData = $$^WWWZAHL(arrTotal("TVal"),12,2,YWHR)
+			if arrTotal("TRes")'=0 set strData = "<BR/>"_strData
+		}
+		write "<B>&nbsp;",$extract($translate(strData,"|"," "),1,30),"&nbsp;</B>"
+	    write "</TD>"
+	}
+	write "</TR>",YCR
+	
+	quit
+	
+	
+Summary(pidItem,pidLocn)
+	;-------------------------------------------------------------------------------
+	;   (*6*) Entries following Table
+	;-------------------------------------------------------------------------------
+	new fltQuantity
+	
+	write "<FONT SIZE=2><B>"
+	set fltQuantity=0
+	
+	; Available Stock
+	; ---------------
+	if $$$INVORGStockLocnProductionBlock($get(^INVORG(0,0,1))) = $$$YES {
+		write $$^WWWTEXT(33772)_": "_$$^INARTMENGE(pidItem,,pidLocn)_"<br>"
+	}
+	
+	; Stock Quantity Including/Excluding Consignment Stock
+	; ----------------------------------------------------
+	set fltQuantity=$$^INARTMENGE(pidItem,,pidLocn,,1,1)   ; Incl. Consignment
+	write $$^WWWTEXT(33771)_" "_$$^WWWTEXT(33769)_ ": ",$$^WWWZAHL(fltQuantity,0,$length($piece(fltQuantity,".",2)))_"<br>"
+	
+	set fltQuantity=$$^INARTMENGE(pidItem,,pidLocn,,1,0)   ; Excl. Consignment
+	write $$^WWWTEXT(33771)_" "_$$^WWWTEXT(33770)_ ": ",$$^WWWZAHL(fltQuantity,0,$length($piece(fltQuantity,".",2)))
+	write "</B></FONT>"
+	
+	quit
+	
+	;=======================================
+	
+Link(YKEY)
+	;-------------------------------------------------------------------------------
+	; Wrapper to Isolate YKEY
+	; 
+	; History :
+	; 29-Nov-2006	GRF		SR15232: Original code didn't confine all in NEW commands
+	;-------------------------------------------------------------------------------
+	write $$WWWCGI2^WWWCGI()
+	quit
+	
+	
+LinkToAdjust(YKEY)   ; "Adjustment"
+	;-------------------------------------------------------------------------------
+	; History:
+	; 16-Jan-2009	GRF		SR16276: Changed to specify INART form in place of INADJ
+	; 							for BackArrow return
+	;-------------------------------------------------------------------------------
+	write YCR,"&nbsp;<A HREF="_$$$DBLQUOTE_YAKTION_"EP=WWWMANU&YFORM=INART&YEXEC=do|CreateAdj^INADJLoad(YKEY)"
+	write $$WWWCGI2^WWWCGI()
+	write $$$DBLQUOTE_">"
+	write YCR,"<img src="_YGIF_"adjust.gif width=18 HEIGHT=18 border=0 "
+	write "TITLE="_$$$DBLQUOTE_$$^WWWTEXT("IN00374")_$$$DBLQUOTE_"></A>","&nbsp;",YCR
+	quit
+	
+	
+LinkToReserve(YKEY)   ; "Reservations"
+	;-------------------------------------------------------------------------------
+	; Link to View and Add Manual Reservations
+	;
+	; Returns: -
+	;
+	; History:
+	; 01-Oct-2008   PPP  	SR15973: Added New Reservations Link (INReserve Form)
+	;-------------------------------------------------------------------------------
+	write YCR,"&nbsp;&nbsp;&nbsp;<A HREF="_$$$DBLQUOTE_YAKTION_"EP=WWWFORM&YFORM=INReserve"
+	write $$WWWCGI2^WWWCGI()
+	write $$$DBLQUOTE_">"
+	write YCR,"<img src="_YGIF_"time1.gif width=18 HEIGHT=18 border=0 "
+	write "TITLE="_$$$DBLQUOTE_$$^WWWTEXT(33645)_$$$DBLQUOTE_"></A>","&nbsp;",YCR
+	quit
+	
+	;=======================================
+	
+LinkPrintLabel(pidItem,pidLocn,dteUsableUntil,strLotNumber)
+	;-------------------------------------------------------------------------------
+	; Link to Print Barcode Label
+	;
+	; Returns: -
+	;
+	; History:
+	; 18-May-2010   FIS  	SR17331: Print Barcode Label
+	;-------------------------------------------------------------------------------
+	if ($get(^SysSetup("LabelPrint"))=1) {
+		write YCR,"<A HREF="_$$$DBLQUOTE_"#"_$$$DBLQUOTE
+		write " onclick='qty=prompt("""_$$^WWWTEXT("IN01229")_""", 1); if (qty>0) {retval = EventValue("_""""_YUCI_""""_","_""""_YUSER_""""_","_""""_YFORM_""""_","_""""_"FIX"_""""_","_""""_"CallbackPrintLabel^INListBundles"_""""_",qty,"_""""_"6"_""""_","_""""_$$ESC^WWWENCODE(pidItem_","_pidLocn_","_dteUsableUntil_","_strLotNumber)_""""_");}'"
+		write ">"             ; "Label Quantity"
+		write YCR,"<img src="_YGIF_"print.gif width=18 HEIGHT=18 border=0 "
+		write "TITLE="_$$$DBLQUOTE_$$^WWWTEXT("Com00170")_$$$DBLQUOTE_"></A>","&nbsp;",YCR
+	}                         ; "Print"
+	quit
+	
+	
+CallbackPrintLabel(pintQty,plstVars)
+	;-------------------------------------------------------------------------------
+	; Callback to Print Barcode Label
+	;
+	; Returns: -
+	;
+	; History:
+	; 25-May-2010   FIS  	SR17331: bugfix
+	; 21-May-2010   FIS  	SR17331: return empty string
+	; 18-May-2010   FIS  	SR17331: Print Barcode Label
+	;-------------------------------------------------------------------------------
+	set plstVars = $$UNESC^WWWENCODE(plstVars)
+	if ($get(^SysSetup("LabelPrint"))=1) && (##class(%Dictionary.ClassDefinition).%ExistsId("alBarc.Barcode")) {
+		do ##class(alBarc.Barcode).PrintReceipt($piece(plstVars,",",2),$piece(plstVars,",",1),$piece(plstVars,",",4),$piece(plstVars,",",3),pintQty,pintQty)
+	}
+	quit ""
+	
+	
+DisplayResQty(pstrReservedQty,pidItem="",pidLocn="",pidStore="",pidBundle="")
+	;-------------------------------------------------------------------------------
+	;  Display fainter reservation quantity
+	;
+	;  For totals where reservations list isn't required - pass only Reserved Qty
+	;    (In these cases pidItem will be null)
+	; 
+	; History:
+	; 22-Oct-2008	GRF		SR15973: Disable unnecessary "Go Nowhere" link - may be
+	; 							restored with appropriate link if required later.
+	;-------------------------------------------------------------------------------
+	write "<font class=""anzReserved"""
+	if pidItem'="" {
+		write " title='"_$$ListReservations^INDRPRUN4(pidItem,pidLocn,pidStore,pidBundle)_"'"
+	} else {
+		write " title='"_$$$DBLQUOTE_$$^WWWTEXT(32480)_$$$DBLQUOTE_"'"     ; "Reserved"
+	}
+	write ">"
+	write "("_pstrReservedQty_")</font>"
+	write "<BR>"
+	quit
+	
+	
+	; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv    Currently not used - needs to fit with bundle operation
+	
+DisplayReservation(pidItem,pidLocn,pidStore,pdteRecvd,pReservedQty,&arrTotal,&YDDSATZ)
+	;-------------------------------------------------------------------------------
+	; Display INWER totals where no INWE record
+	; 
+	; History :
+	;-------------------------------------------------------------------------------
+	new ColumnNo,strBGColor,strFontClose,strFontOpen,YTEXT
+	
+	if $piece(YVOR,Y,7)="" {
+		set strFontOpen = ""
+		set strFontClose = ""
+	} else {
+		set strFontOpen = "<FONT SIZE="""_$piece(YVOR,Y,7)_""">"
+		set strFontClose = "</FONT>"
+	}
+	
+	write YCR,"<TR>"
+	set YDDSATZ    = YDDSATZ+1
+	set strBGColor = $select(YDDSATZ#2=1:" BGCOLOR="_YWHITE,1:"")
+	
+	for ColumnNo="02","03","04",4,5,2,25,48,7,8,28 {
+		
+	; Open
+	;-----------------------------------
+		if (ColumnNo=4)||(ColumnNo=8) {
+			write YCR,"<TD ALIGN=RIGHT NOWRAP VALIGN=TOP",strBGColor,">",strFontOpen
+		} else {
+			write YCR,"<TD ALIGN=LEFT NOWRAP VALIGN=TOP",strBGColor,">",strFontOpen
+		}
+		
+	; Build YTEXT, adding to subtotals and totals
+	;-----------------------------------
+		set YTEXT = "&nbsp;"
+		if ColumnNo = "02" {          set YTEXT = pidLocn
+		} elseif ColumnNo = "03" {    set YTEXT = pidStore
+		} elseif ColumnNo = "04" {    set YTEXT = $$^WWWDATE(pdteRecvd)
+		} elseif ColumnNo = 4    {    do DisplayResQty(pReservedQty,pidItem,pidLocn)
+		}
+		
+	; Output YTEXT information
+	;-----------------------------------
+		write $extract($translate(YTEXT,"|"," "),1,30)
+		write "&nbsp;"
+	;		Display clock link where positive stock on hand or reservation => Reservations
+		if ColumnNo="02" {
+			if (pReservedQty'<0) {
+				do LinkToReserve(pidItem_","_pidLocn_","_pidStore_","_pdteRecvd)
+			}
+		}
+		
+	; Close
+	;-----------------------------------
+		write strFontClose,"</TD>",YCR
+	}		
+	write "</TR>",YCR
+	
+	quit				
+	
+	
+GetReservedForABundle(pidItem,pidLocn,pidStore,pidBundle)
+	;-------------------------------------------------------------------------------
+	; Get the Qty for a Bundle at a Storage
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Dec-2008	HQN 	SR16177: Refactored query to do post processing of
+	; 							undesired result, doesn't duplicate SUM operation
+	; 15-Oct-2008	PPP		SR15973: Created
+	;-------------------------------------------------------------------------------
+	new fltQty,SQLCODE
+	
+	&sql(SELECT SUM(QtyRequired) into :fltQty
+			FROM alDRP.dPlannedMovement 
+			WHERE 
+				Item=:pidItem         AND 
+				FromLocn=:pidLocn     AND
+				FromStorage=:pidStore AND
+				Bundle = :pidBundle   AND
+				State->StateId=3
+	)
+	set:(SQLCODE'=0)||(fltQty="") fltQty = 0
+	
+	quit fltQty
+	
+	; TODO : <GRF> Serial Numbers not yet available in V2
+	; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv    Currently not used - V2 currently considers batch/lot with size 1
+	
+SerialNos(pidItem,pidLocn,pidStore,pdteRecvd) ; display up to 10 serial numbers where applicable
+	new count,SN
+	
+	set SN=""
+	for count=1:1:10 {
+		set SN = $order(^INWES(0,pidItem,pidLocn,pidStore,pdteRecvd,SN),-1)
+		quit:SN=""
+		
+		write SN,"&nbsp;"                    ;SERIENNUMMER
+		if $order(^INWES(0,pidItem,pidLocn,pidStore,pdteRecvd,SN),-1)'="" write "<BR>"  ;WEITERE SERIENNUMMERN
+	}
+	if '$data(^INWES(0,pidItem,pidLocn,pidStore,pdteRecvd)) write "&nbsp;"
+	quit
+	
+	; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,939 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReceiptLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReceiptLine
+	;-------------------------------------------------------------------------------
+	; History:
+	; 14-Aug-2009	GRF		SR16829: Split to INReceiptLine2, INReceiptLineForm
+	; 							and INReceiptLineButton
+	;-------------------------------------------------------------------------------
+	;+++++++++++++++++++++++++++++++++++++++
+	; see INRECDoco
+	;+++++++++++++++++++++++++++++++++++++++
+#include COMSYS
+#include INConst
+#include INSYS
+#include %occConstant
+	
+#define FORMFldINRECLineStorage		11	
+#define FORMFldINRECLineLotNo		13
+#define FORMFldINRECLineExpiryDate	14
+#define FORMFldINRECLineBrand		32
+#define FORMFldINRECLineOwner		33
+#define FORMFldINRECLineProgram		34
+	
+	;SR16609
+#define EnumTypeStandard	0
+#define EnumTypeBonus		2
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2)	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReceiptLine("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+	;-------------------------------------------------------------------------------
+	;   INRECSummary contains Item overview (integer ids) and associated charges
+	;        (.01 increments except for overall charges)
+	;        
+	;   INRECLine contains Item allocation to storage where the initial integer ids
+	;        may be copied to split the allocation into different storages.
+	;        These copied lines will also be in .01 increments.
+	;   
+	;   INRECSummary integer ids for items correspond to the INRECLine records with
+	;        the same integer portion.
+	;   INRECSummary fractional ids and integer ids for associated charges have no
+	;        relationship with INRECLine records other than through their items.
+	;-------------------------------------------------------------------------------
+
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	;  COMGridEdit31... Executables
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+OnBeforeDisplayCombo(pstrKeys,pobjReq,pintCol,&pSUCH)
+	;-------------------------------------------------------------------------------
+	; Only display Storages that are not closed. (Unless that Storage has already been
+	; saved on the Receipt Line)
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Aug-2013	SCR		CORE-234: This only appies to the Storage Field (11)
+	; 31-Aug-2011	shobby	SR17889: Use YFELDCONTAINER to find the idLocn.
+	; 15-Jul-2011	GRF		SR17669: Only create array for storage column
+	; 15-Jun-2011	GRF		SR17716: TSU Closed now based on Status
+	; 01-Nov-2010	shobby	SR17591: Created
+	;-------------------------------------------------------------------------------
+	new blnOverride,idLocn,idStorage,objINLP
+	
+	if pintCol'=11 quit $$$NO ; not storage
+	set blnOverride = $$$YES
+	set pSUCH  = "SUCH"
+	;SR17889 set idLocn = @PARA ; SR17889
+	set idLocn=$$$INRECLocation(YFELDCONTAINER) ;SR17889
+	
+	; SR17669 vvv
+	if pintCol = $$$FORMFldINRECLineStorage  {
+		kill pSUCH
+		set pSUCH  = "SUCH"
+		set idStorage = ""
+		for {
+			set idStorage = $order(^INLP(0,idLocn,idStorage))
+			quit:idStorage=""
+		
+			set objINLP = $get(^INLP(0,idLocn,idStorage,1))
+			if $$IsTSUOpen^INLPStatus($$$INLPStatus(objINLP)) {
+				set pSUCH(idStorage) = idStorage
+			}
+		}
+		if $$$INRECLineStockLocation(pobjRec)'="" set pSUCH($$$INRECLineStockLocation(pobjRec)) = $$$INRECLineStockLocation(pobjRec) ; current storage
+		set blnOverride = $$$YES
+	}
+	quit blnOverride
+	/*
+	set blnOverride = $$$YES
+	set pSUCH  = "SUCH"
+	
+	set blnOverride = ""
+	for {
+		set idStorage = $order(^INLP(0,idLocn,idStorage))
+		quit:idStorage=""
+		
+		set objINLP = $get(^INLP(0,idLocn,idStorage,1))
+	;	if '$$$INLPClosed(objINLP) {                            ; SR17716
+		if $$IsTSUOpen^INLPStatus($$$INLPStatus(objINLP)) {
+			set pSUCH(idStorage) = idStorage
+		}
+	}
+	if $$$INRECLineStockLocation(pobjRec)'="" set pSUCH($$$INRECLineStockLocation(pobjRec)) = $$$INRECLineStockLocation(pobjRec)
+	quit $$$YES
+	*/ ; SR17669 ^^^
+	
+	
+OnBeforeCopy(pstrKeys,&pobjRECLine)
+	;-------------------------------------------------------------------------------
+	; Update the qty field with the difference between the receipt qty and what has
+	; already been entered.
+	; 
+	; Called By : COMGridEdit31Events
+	; 
+	; Params:	pstrKeys    - INRECLine keys
+	;
+	; ByRefs:	pobjRECLine - copied line YFELD
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Sep-2009	GRF		SR16361: Use INRECLine D65 rather than D5 for Recvd Unit
+	; 14-Aug-2009	GRF		SR16829: Needed to apply unit conversion
+	; 10-Aug-2009	DWR		SR16829: added the population of the Unit Qty 
+	; 07-May-2009	DWR		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new enumRecvdUnit,fltConv,fltQty,idParent,idReceipt,objSummary
+	
+	$$$LogR("OnBeforeCopy",pstrKeys)
+	
+	quit:pobjRECLine=""
+                       
+    set idReceipt = $$$KEY1(pstrKeys)
+	set idParent  = $$$KEY2(pstrKeys)\1
+	set objSummary = $get(^INRECSummary(0,idReceipt,idParent,1))
+	set fltQty   = $$$INRECSummaryQuantityReceived(objSummary)
+ 
+	set fltQty = fltQty - $$GetQtyEntered(pstrKeys)    ; sum $$$INRECLineQuantity
+	; FIXME : Are we comparing multiple individual qties against total each time? <GRF>
+	if fltQty < 0 set fltQty = 0
+	
+	set $$$INRECLineQuantity(pobjRECLine)     = fltQty
+	;set $$$INRECLineUnitQuantity(pobjRECLine) = fltQty   ;SR16829  ; 14-Aug-2009
+	set enumRecvdUnit = $$$INRECLineReceivedUnit(pobjRECLine)                                      ; SR16361 vvv
+	if enumRecvdUnit="" set enumRecvdUnit = $$$INRECLineUnit(pobjRECLine)
+	;set fltConv = $$GetUOMConversion^INUOMConversion($$$INRECLineItem(pobjRECLine),$$$INRECLineUnit(pobjRECLine))
+	set fltConv = $$GetUOMConversion^INUOMConversion($$$INRECLineItem(pobjRECLine),enumRecvdUnit)  ; SR16361 ^^^
+	set $$$INRECLineUnitQuantity(pobjRECLine) = $$$INRECLineQuantity(pobjRECLine) / fltConv
+	quit
+	
+	
+OnBeforeDisplayLine(pstrKeys,pobjRECLine)
+	;-------------------------------------------------------------------------------
+	; Check whether to display line
+	; If multi-pass, and not the line we want to go to, hide it.
+	;
+	; Called By : COMGridEdit31Events
+	; 
+	; Params:	pstrKeys	- INRECLine key (YKEY)
+	;			pobjRECLine	- INRECLine object (YFELD)
+	;
+	; ByRefs:
+	;
+	; Returns:	boolean
+	;
+	; History:
+	; 04-Sep-2006	JW		SR14979: Created
+	;-------------------------------------------------------------------------------
+	new blnDisplay
+	
+	$$$LogR("OnBeforeDisplayLine",pstrKeys)
+	
+	set blnDisplay = $$$YES
+	if $$$MultiPass($$$INRECLineLocation(pobjRECLine)) && $$Editable^INREC($get(^INREC(0,$$$KEY1(pstrKeys),1))) {	
+		if $$$INRECLineInclude(pobjRECLine) && ($$$KEY2(pstrKeys)'=$get(^CacheTemp(YUSER,"GridLine"))) {
+			
+			set blnDisplay = $$$NO
+		}
+	}
+	quit blnDisplay
+ 
+ 
+OnBeforeFormat(pstrYFIELDNAME,pstrText,pobjRECLine)
+	;-------------------------------------------------------------------------------
+	; Determine whether any special formatting needs to be applied to cells in the grid.
+	;
+	; Called By : COMGridEdit31Events
+	; 
+	; Params:
+	;	pstrYFIELDNAME	- Edit Grid field name	Yrow_col   (or Yrow_col?)
+	;	pstrText		- Not in use
+	;	pobjRECLine		- Supplier Receipt Line record
+	; 
+	; ByRefs:
+	;	YBLUE
+	;	YBACKGROUNDCOLOR
+	;	YTOOLTIP
+	;	YMANDANTCOLOR		(should new?)
+	;	
+	; Returns:
+	;
+	; History:
+	; 15-Jun-2011	GRF		SR17716: TSU Closed now based on Status
+	; 06-May-2011	GRF		SR17753: Check for closed Temporary Storage Unit
+	; 18-Jan-2010	shobby	SR15753: Clean up redundant code.
+	; 06-Jan-2010	PPP		SR17105: Check for Lot unique policy before red highlight
+	; 09-Nov-2009	PPP		SR17015: Disable Brand/Owner/Program if Policy set to 2 (No)
+	; 19-Aug-2009	GRF		SR16671: cleanup
+	; 19-Aug-2009	DWR		SR16671: removed check of INWEMERKER this is done on
+	; 							Summary line, and changed the field to check to be
+	; 							INRECLineUnitQty
+	; 06-Aug-2009	PPP		SR16821 Only check the INRECLine Qty = INRECSummary Qty,
+	; 							not All Receipts
+	; 03-Aug-2009	PPP		SR16815	Changed BaseQuantity macro to OrderQuantity
+	; 03-Aug-2009	DWR		SR16671: Check received qty against the INRECSummary record
+	; 							as it has to have been saved and firmed before you can
+	; 							be looking at Inspection tab.
+	; 17-Jul-2009	PPP		SR16765: Check uniqueness irrespective of the Expiry Date
+	; 13-Jul-2009	GRF		SR16689: idSummRow required to find Summary quantity
+	; 09-Jul-2009	PPP		SR16721: Optional policy definitions
+	; 							(can be 1-Yes, 2-No, 3-Optional)
+	; 25-Jun-2009	GRF		SR16671: warning colour if quantity mismatch; change
+	; 							initial if to quit if not to exit without nesting;
+	; 							Was testing for idItem'=0 twice - set variable and
+	; 							test that.
+	; 17-Jun-2009 	PPP 	SR16510: 1. Updated routine to use INItemPolicy class
+	;							2. Included BRAND, OWNER, PROGRAM as additional
+	;							   parameters for Bundle creation
+	; 31-Mar-2009	DWR		SR16363: Check for a valid Item before continuing with 
+	;							item attributes check.
+	; 20-Mar-2009	GRF		SR16428: Call common code for CellColours
+	; 20-Mar-2009	GRF/DWR	SR16363: changed logic to better check item attributes
+	;							and format the grid appropriately, not jumping
+	;							all over the routine calling the same field numerous
+	;							times.
+	; 19-Mar-2009	DavidR	SR16363: added a check to only go and validate the amount 
+	;							received if there is an order number. If there is NOT
+	;							it is trated as Receive Without Order.
+	; 11-Mar-2009	DavidR	SR16363: Added a check to tell user that the expiry date 
+	;							entered has been exceeded.
+	; 25-Feb-2009	GRF		SR16394: Clarify idClassField rather than idField;
+	;							strRequiredColor rather than YMANDANTCOLOR (& new);
+	;							strWarningColor rather than explicit YRED
+	; 13-Feb-2009	HQN		SR16352: Clear tooltip and reset color for correct 
+	;							Expiration Date
+	; 07-Jan-2008	HQN		SR16268: Corrected algorithm, do bundle match against
+	;							LotNumber then compare against stored ExpirationDate
+	; 06-Jan-2009	HQN		SR16268: Only check if setup in itempolicy
+	; 05-Jan-2009	HQN		SR16268: Added LotNumber Uniqueness check
+	; 23-Dec-2008	HQN		SR16255: Refactor coloring, FieldColorMandatory is not
+	;							always set
+	; 29-Sep-2008	Luke	SR15877: Corrected the background colour to be mandatory
+	;							not red for Expiration Date 
+	; 23-Sep-2008	Luke	SR15877: Add Red background colour on error for
+	;							Expiration Date
+	; 15-Sep-2008	HQN		SR15913: Added zero quantity check
+	; 05-May-2008	Luke	SR15699: added language translations
+	; 28-Mar-2008	HQN		SR15640: Corrected mandatory color for lot numbers
+	; 25-Mar-2008	HQN		SR15640: Attempting to make fields aware of V2 ItemPolicies
+	; 03-Sep-2007	GM		BR014609: Included line in language text IN00514
+	; 03-Aug-2006	PO		SR14854: Created
+	;-------------------------------------------------------------------------------
+	new blnLotNo,blnLotUnique,blnUseByDate,dteExistingBundle
+	new fltReceiveQty,fltSummaryQty
+	new idClassField,idFlag,idItem,idKey,idLocn,idStorage,idSummLine,idSummRow
+	new intBrand,intCol,intExceedsFlag,intOwner,intProgram,intRow,loopPolicyAttr
+	new objBundle,objIncomingGoodsFlag,objResultSet,objStore,objSummRow,objUItem
+	new sc,strDefaultColor,strDisabledColor,strRequiredColor,strQtyField,strWarningColor
+
+	$$$LogR("OnBeforeFormat",pstrYFIELDNAME)
+	
+	quit:'$$Editable^INREC($$$GRIDYFELDContainer,$$$EnumINRECSupplierReceipt)
+	
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pstrYFIELDNAME,intRow,intCol)
+	set idClassField = $$$GetClassField(YFORM,intCol)
+	set idKey        = $$ReferenceKey^COMGridEdit31Interface(YFORM,intRow)           ; SR17753 <<<
+	
+	; F8 : Unit Quantity Field
+	;---------------------------------------
+	if (idClassField = $$$FldINRECLineUnitQuantity) {               ; in Recvd Unit
+	;	set idKey         = $$ReferenceKey^COMGridEdit31Interface(YFORM,intRow)       ; SR17753 ^^^ Moved up
+		set fltReceiveQty = $$GetQtyEntered(idKey)
+		
+		; Receipt Qty cf Inspection Qty
+		;-----------------------------------
+		set idSummLine    = $$$KEY2(idKey)\1
+		set objSummRow    = $get(^INRECSummary(0,$$$KEY1(idKey),idSummLine,1))
+        set fltSummaryQty   = $$$INRECSummaryQuantityReceived(objSummRow)
+		
+		if fltReceiveQty'=fltSummaryQty {
+			set YTOOLTIP = $$$Text($listbuild("IN00930",idSummLine))
+			set YWARNING = $$$YES 
+	;	"Quantities Received on line %1 of the "Receipts" tab must match corresponding line(s) on the "Inspection" tab."
+		}
+		
+		if $$$INRECLineQuantity(pobjRECLine) = 0 {
+			set YTOOLTIP = $$$Text("alREC0005")
+			set YWARNING = $$$YES
+		} ; "Unable to receive zero quantities"
+	}	
+	
+	; F11 : Storage - if a TSU, can't currently be closed     ; SR17753
+	;---------------------------------------
+	set idLocn    	  = $$$INRECLineLocation(pobjRECLine)
+	if (idClassField  = $$$FldINRECLineStockLocation) {
+		set idLocn    = $$$INRECLineLocation(pobjRECLine)
+		set idStorage = $$$INRECLineStockLocation(pobjRECLine)
+		if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) { ;SESPE-117
+			if (idLocn && idStorage) {
+				set objStore  = $get(^INLP(0,idLocn,idStorage,1))
+			;	if $$$INLPTemporaryStorageUnit(objStore) && $$$INLPClosed(objStore) {  ; SR17716
+				if $$$INLPTemporaryStorageUnit(objStore) && $$IsTSUClosed^INLPStatus($$$INLPStatus(objStore)) {
+					set YTOOLTIP = $$$Text($listbuild("IN01297",$$$KEY2(idKey)))
+					set YWARNING = $$$YES 
+				} ; "Can not add stock to a closed Temporary Storage on line %1"
+			}
+		} else {
+			set objStore  = $get(^INLP(0,idLocn,idStorage,1))
+		;	if $$$INLPTemporaryStorageUnit(objStore) && $$$INLPClosed(objStore) {  ; SR17716
+			if $$$INLPTemporaryStorageUnit(objStore) && $$IsTSUClosed^INLPStatus($$$INLPStatus(objStore)) {
+				set YTOOLTIP = $$$Text($listbuild("IN01297",$$$KEY2(idKey)))
+				set YWARNING = $$$YES 
+			} ; "Can not add stock to a closed Temporary Storage on line %1"
+		}
+	}
+	
+	; Only if Item is present     ; FIXME : How can this ever *NOT* be the case? <GRF>
+	;---------------------------------------
+	set idItem = $$$INRECLineItem(pobjRECLine)
+	if idItem'="" {
+		; Check Bundle Attribute Columns
+		;-----------------------------------
+		do GetAttributes^INItemPolicyUtils(idItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,idLocn)
+
+		; Use By Date
+		;-----------------------------------
+		if (idClassField = $$$FldINRECLineExpirationDate) {
+			if blnUseByDate {
+				set YMANDATORY = $$$YES
+				if ($$$INRECLineExpirationDate(pobjRECLine)'="")      &&
+				   ($$$INRECLineExpirationDate(pobjRECLine)<$horolog)   { 
+					set YTOOLTIP = $$$Text($listbuild("33989"))
+					set YWARNING = $$$YES
+				} ; "Attention! Valid Until Date Exceeded "
+				
+			} else {
+				set YENABLED = $$$NO 
+			}					
+			
+			
+		; Lot Number
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineLotNumber) {
+			set YTOOLTIP = ""
+			if blnLotNo {
+				set YMANDATORY = $$$YES
+				if ($$$INRECLineLotNumber(pobjRECLine)'="") {		//Always check for Lot Uniqueness if required
+					if blnLotUnique {
+						if '##class(alSOH.iUItemPolicy).IsLotUnique(idItem, $$$INRECLineLotNumber(pobjRECLine), $$$INRECLineExpirationDate(pobjRECLine)) {
+							set YWARNING = $$$YES
+							set YTOOLTIP = $$$Text("IN00880")
+						} ; "Lot Number must be unique"
+					}
+				}	
+				
+			} else {
+				set YENABLED = $$$NO 
+			}
+		
+		; Brand
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineBrand) {
+			if intBrand=1 set YMANDATORY = $$$YES
+			if intBrand=2 set YENABLED   = $$$NO
+			
+		; Owner
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineOwner) {
+			if intOwner=1 set YMANDATORY = $$$YES
+			if intOwner=2 set YENABLED   = $$$NO
+			
+		; Program
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineProgram1) {
+			if intProgram=1 set YMANDATORY = $$$YES
+			if intProgram=2 set YENABLED   = $$$NO
+			
+		; Inventory Quantity
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineQuantity) {
+			set YENABLED = $$$NO
+		}
+	}
+	quit
+	
+	
+UpdateContainer(pstrFld,&objGrid,&headYFELD,&headYMFELD)
+	;-------------------------------------------------------------------------------
+	; Checks whole grid, if a single record requires lot number or expiry,
+	; show that column
+	;		hide=$$YES or show=$$$NO
+	; 
+	; Called By : UpdateContainer^COMGridEdit31G  (see matching code in LoadGrid^INADJ)
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 10-Sep-2013	SCR		CORE-266: Pass in Location to GetAttributes
+	; 09-Jul-2009	PPP		SR16721: Optional policy definitions
+	; 							(can be 1-Yes, 2-No, 3-Optional)
+	; 22-Jun-2009 	PPP 	SR16510: Updated routine to use INItemPolicy class
+	; 19-Mar-2009	DavidR	SR16363: Copied from INADJLine
+	;-------------------------------------------------------------------------------
+	new blnHideBrand,blnHideExpiry,blnHideLotNo,blnHideOwner,blnHideProgram
+	new intBrand,blnLotNo,blnLotUnique,intOwner,intProgram,blnUseByDate
+	new idItem,objItem,strAdjLine,strLineYKEY,strRecLine
+	new idLoc
+	
+	$$$LogR("UpdateContainer",$get(pstrFld))
+	
+	set blnHideLotNo   = $$$YES
+	set blnHideExpiry  = $$$YES
+	set blnHideBrand   = $$$YES
+	set blnHideOwner   = $$$YES
+	set blnHideProgram = $$$YES
+	set idLoc		   = $$$INRECLocation(headYFELD)
+
+	set strLineYKEY = ""
+	for {
+		set strLineYKEY = $order(objGrid($$$GRIDYKEYContainer,strLineYKEY))
+		quit:(strLineYKEY = "")
+		continue:$data(^WWWDATEN(0,$horolog,YUSER,"INRECLine","V","KILLEDRECORD",strLineYKEY))
+		
+		set strRecLine = $$$GRIDGetYFELD(strLineYKEY)
+		set idItem     = $$$INRECLineItem(strRecLine)          //SR16510 vvv
+		if idItem'="" {
+			//SR16721
+			do GetAttributes^INItemPolicyUtils(idItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,idLoc)
+			if blnLotNo                         {    set blnHideLotNo   = $$$NO  }
+			if blnUseByDate                     {    set blnHideExpiry  = $$$NO  }
+			if (intBrand=1)   || (intBrand=3)   {    set blnHideBrand   = $$$NO  }
+			if (intOwner=1)   || (intOwner=3)   {    set blnHideOwner   = $$$NO  }
+			if (intProgram=1) || (intProgram=3) {    set blnHideProgram = $$$NO  }
+		}
+	}
+	
+	$$$StartScript()
+	
+	$$$GRIDHideShowColumns($$$FORMFldINRECLineLotNo,blnHideLotNo,"INReceiptLine")
+	$$$GRIDHideShowColumns($$$FORMFldINRECLineExpiryDate,blnHideExpiry,"INReceiptLine")
+	$$$GRIDHideShowColumns($$$FORMFldINRECLineBrand,blnHideBrand,"INReceiptLine")
+	$$$GRIDHideShowColumns($$$FORMFldINRECLineOwner,blnHideOwner,"INReceiptLine")
+	$$$GRIDHideShowColumns($$$FORMFldINRECLineProgram,blnHideProgram,"INReceiptLine")
+	
+	$$$EndScript()
+	
+	quit
+	
+	;   Alternative coding
+	; $$$StartScript()
+	; set strColumns  = $$$FORMFldINRECLineLotNo_";"_$$$FORMFldINRECLineExpiryDate_";"_$$$FORMFldINRECLineBrand_";"_$$$FORMFldINRECLineOwner_";"_$$$FORMFldINRECLineProgram
+	; set strSwitches = blnHideLotNumber_";"_blnHideExpiry_";"_blnHideBrand_";"_blnHideOwner_";"_blnHideProgram
+	; $$$GRIDHideShowColumns(strColumns,strSwitches,"INReceiptLine")
+	; $$$EndScript()
+	;
+	
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+GetQtyEntered(pstrKeys)
+	;-------------------------------------------------------------------------------
+	; Get the quantity input on the screen for this line and its children
+	;
+	;	INRECLine may have initial item line (integer id) *AND* copies (.01
+	;	increments) representing split allocation to different storages.
+	;	
+	; Called By: 
+	; 	OnBeforeCopy
+	; 	OnBeforeFormat
+	; 	OnBlur^INReceiptLineForm
+	; 	OnAfterSave^INReceiptLineForm
+	; 	IsReceivable^INReceipt
+	; 
+	;
+	; Params:	pstrKeys - keys of INRECLine
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Jun-2011	shobby	SR17779: Pass in key to GetGridContents
+	; 28-Jun-2011	shobby	SR17779: Got rid of annoying macro.
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than objGrid
+	; 06-Apr-2009	DWR		SR16363: Passed the form name, required because calling
+	; 							from outside the grid
+	; 05-Sep-2006	JW		SR14979: Rewrote below - wasn't finding all
+	; 29-Apr-2006	PO		Fix for Build: Quote nonumeric keys
+	; 20-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,fltQty,idLine,idParent,idReceipt
+	
+	$$$LogR("GetQtyEntered",pstrKeys)
+
+	;$$$GRIDGetContents(.arrGrid) ; SR16363
+ 
+	set fltQty = 0
+	
+	// loop through all the lines for the same receipt.
+	set idReceipt = $$$KEY1(pstrKeys)
+	set idParent  = $$$KEY2(pstrKeys)\1
+ 
+	do GetGridContents^COMGridEdit31G(.arrGrid,"INReceiptLine",,idReceipt)  ;SR17779
+
+	set idLine   = $order(arrGrid(idReceipt,idParent),-1)		// Go back one
+	for {
+		set idLine = $order(arrGrid(idReceipt,idLine))
+		quit:idLine\1'=idParent
+		
+		set fltQty = fltQty + $$$INRECLineQuantity(arrGrid(idReceipt,idLine))  ; Inventory Qty
+	}
+	quit fltQty
+	
+	
+GetHistory(pidReceipt,pidINRECLine)
+	;-------------------------------------------------------------------------------
+	; Retrieves a alSOH.dStockHistory record for this INRECLine if it exists
+	; 
+	; CalledFrom:   Receive^INReceiptButtonP
+	; 
+	; History:
+	; 04-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new idStockHistory,objStockHistory,sc,SQLCODE
+	
+	$$$LogR("GetHistory",pidReceipt_","_pidINRECLine)
+	
+	set SQLCODE = ""
+	set idStockHistory  = ""
+	set objStockHistory = ""
+	
+	&sql(
+		SELECT ID INTO:idStockHistory FROM alSOH.dStockHistory
+		WHERE Reference=:pidReceipt    AND
+		      LineNumber=:pidINRECLine AND
+		      MovementType_MovementTypeId=1
+	)
+	if (SQLCODE = 0) {
+		set objStockHistory = ##class(alSOH.dStockHistory).%OpenId(idStockHistory,,.sc)
+	}
+	quit objStockHistory
+	
+	
+CheckGridLines(pstrKeys)
+	;-------------------------------------------------------------------------------
+	; Checks the grid for any items that requires a unique lot number, and then 
+	; checks for any other lines on the grid with the same item and lot number,
+	; if the expiry dates are diferent it will not save and alert the user.
+	; 
+	; Called By: OnBeforeSave^INReceiptLineForm
+	;
+	; Inputs:
+	;
+	; Returns: strStaus
+	;
+	; History:
+	; 12-Apr-2010	GRF		SR17177: GRID Macros
+	; 27-Nov-2009	DWR		SR17035: If lot unique policy, only check for lines on grid
+	; 							with that lot and that item. unique lot is item based.
+	; 07-Sep-2009	DAVID	SR16870: Created
+	;-------------------------------------------------------------------------------
+	new arrINRECLine,arrTest,idGridLine,idItem,idLine,idLotNo,idPolicy,idREC,objLine
+	new objItem,objPolicy,strDefaultColor,strDisabledColor,strRequiredColor
+	new strStatus,strWarningColor
+	
+	set strDefaultColor = $$CellColours^COMGridEditUtil(.strDisabledColor,.strRequiredColor,.strWarningColor,"","","INReceiptLine")
+	set strStatus = $$$OK
+ 	set idREC     = $$$KEY1(pstrKeys)
+ 	
+ 	$$$GRIDGetContents(.arrINRECLine,"INReceiptLine")
+ 	
+ 	set idLine = ""
+ 	for {
+ 		set idLine = $order(arrINRECLine(idREC,idLine))
+ 		quit:idLine=""
+ 		quit:$$$ISERR(strStatus)
+ 		
+ 		set objLine = $get(arrINRECLine(idREC,idLine))
+ 		set idItem  = $$$INRECLineItem(objLine)
+ 		if idItem'=""{
+	 		set objItem  = $get(^INART(0,idItem,1))
+			set idPolicy = $$$INARTItemPolicy(objItem)
+			
+			if idPolicy'="" {
+				set objPolicy = $get(^INItemPolicy(0,idPolicy,1))
+				
+				if +$$$INItemPolicyIsLotUnique(objPolicy) {
+					set idLotNo = $$$INRECLineLotNumber(objLine)
+						
+					if idLotNo '="" {
+						if $data(arrTest(idLotNo,idItem)) {   
+							set idGridLine = $get(^WWWDATEN(0,+$horolog,YUSER,"INReceiptLine","V","REFERENCEROW",idLine,1))								
+							do UpdateFieldFormat^COMUtils("tdY"_idGridLine_"_"_$$$FORMFldINRECLineLotNo_".style","backgroundColor",strWarningColor)
+								set strStatus = $$$MakeStatus("IN00880") ; "Lot Number must be unique"
+						
+						} else {
+							set arrTest(idLotNo,idItem) = ""
+						}
+					}
+				}
+			}
+ 		}
+ 	}
+	quit strStatus	
+	
+	
+OnBeforeDelete(pidRec)
+	;-------------------------------------------------------------------------------
+	; This routine makes sure you cant delete the lines created through firming of
+	; the INRECSummary Lines. Should always have the matching line in the receipts tab.
+	; CAN delete copied lines.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 06-Nov-2009	DWR		SR16609: Created
+	;-------------------------------------------------------------------------------
+	new idRec,idRecLine,objSummary
+	
+	if '$$$NoKey(pidRec) {
+		set idRec     = $$$KEY1(pidRec)
+		set idRecLine = $$$KEY2(pidRec)
+		
+		set objSummary = $get(^INRECSummary(0,idRec,idRecLine,1))
+		
+		if objSummary'=$$$NULLOREF {
+			if $$$INRECSummaryLineType(objSummary) = $$$EnumTypeStandard || $$$EnumTypeBonus {
+				set Q = $$$QDontDelete_$$$Text("IN01149")
+			} ;"Cannot Delete- Matching Receipt Line exists on Receipts tab"
+		}
+	}
+	quit
+		
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	;   *** DEPRECATED CODE ***         vvvvvvvvvvvvvvvvvvvvvvv
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+Cost(YM,pidReceipt,pidINRECLine,pfltQuantity=1)
+	;-------------------------------------------------------------------------------
+	; 
+	; FIXME : This appears to have been taken from Cost^INRECLine which is used for
+	;         a calculated field on the CLASS.  As such it appears that this version
+	;         is not actually called.  Is there a need for the differences here to
+	;         be applied to INRECLine?  Should this subroutine be removed? <GRF>
+	; 
+	;-------------------------------------------------------------------------------
+	; Calculate the unit/total cost of a line item
+	; Note: quantity factor only applicable when no order ids - may be misplaced
+	;    inside if/else rather than after fltCost is obtained.  Do we ever pass
+	;    fltQuantity in?    FIXME
+	;
+	; ByRef :
+	; 
+	; Notes:	This routine can be called by SQL so, with the exception of the
+	;			parameter YM, don't go using any other global variables such as
+	;			YBED, YLOCATION etc.
+	;
+	; Returns: Unit Cost if pfltQuantity defaults, Total Cost otherwise
+	;
+	; History:
+	; 31-Mar-2009	GRF		SR16363: get order ids once; indices require $$$Index
+	; 10-Mar-2009	HQN		AdHoc: Only continue if the index is actually the
+	;							second one. Could return next index!
+	; 05-Mar-2009	shobby	SR16386: Defined variables.
+	; 24-Feb-2009	shobby	SR16386: Rewrote to get the data from INWEAUF
+	; 23-Feb-2009	shobby	SR16386: Created
+	;-------------------------------------------------------------------------------
+	new fltCost,idDate,idINWEAUF,idLocn,idOrder,idOrderLine,idStorage,idSummaryLine
+	new idxOrdNo,idxOrdLineNo,objINRECLine,objINWEAUF,objRECSummary
+	
+	$$$LogR("Cost",pidReceipt)
+	
+	set fltCost = 0
+	if (pidReceipt'="") && (pidINRECLine'="") {
+		set objINRECLine = $get(^INRECLine(YM,pidReceipt,pidINRECLine,1))
+		set idOrder      = $$$INRECLineOrder1(objINRECLine)
+		set idOrderLine  = $$$INRECLineOrderLine(objINRECLine)
+		
+		
+		; FIXME : Why don't we just get ^INRECSummary(0,pidReceipt,pidINRECLine,1) in all cases? <GRF>
+		
+		if (idOrder'="") && (idOrderLine'="") {
+			set idxOrdNo     = $$$Index(idOrder)
+			set idxOrdLineNo = $$$Index(idOrderLine)
+			
+			; Summary Line : OrderNo/OrderLine will be unique inside a receipt
+			if $data(^INRECSummarys(YM,1,idxOrdNo,idxOrdLineNo,pidReceipt)) {
+				set idSummaryLine = $order(^INRECSummarys(YM,1,idxOrdNo,idxOrdLineNo,pidReceipt,""))
+				set objRECSummary = $get(^INRECSummary(YM,pidReceipt,idSummaryLine,1))
+				if $$$INRECSummaryUnitCost(objRECSummary)'="" set fltCost = $$$INRECSummaryUnitCost(objRECSummary)
+			}
+		
+		} else {
+			set idINWEAUF = $query(^INWEAUFs(YM,2,$$$Index(pidReceipt),$$$Index(pidINRECLine)))
+			if (idINWEAUF'="") && ($qsubscript(idINWEAUF,2) = 2) {
+				set idOrder     = $qsubscript(idINWEAUF,5)
+				set idOrderLine = $qsubscript(idINWEAUF,6)
+				set idLocn      = $qsubscript(idINWEAUF,7)
+				set idStorage   = $qsubscript(idINWEAUF,8)
+				set idDate      = $qsubscript(idINWEAUF,9)
+ 
+				set objINWEAUF  = $get(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStorage,idDate,1))
+				set fltCost     = $$$INWEAUFUnitPrice(objINWEAUF)
+			}
+		}
+		set fltCost = $$$FCMult(fltCost,pfltQuantity)
+	}
+	quit fltCost
+	
+	
+ReceiptQuantities(pobjRECLine,pidReceipt,&pfltCurQty)    ; DEPRECATED - CALCULATIONS NOW USE DATA FROM OTHER SOURCES
+	;-------------------------------------------------------------------------------
+	; Return the quantity currently entered in to Supplier Receipts
+	; 
+	; Called By:		Previously OnBeforeFormat
+	; 
+	; Params:	pobjRECLine	- Supplier Receipt Line record
+	;			pidReceipt	- the current Supplier Receipt Id
+	; 
+	; ByRefs:	pfltCurQty - current receipt's qty for this order/line
+	;
+	; Returns:	flt - other posted receipt's qty for this order/line
+	;
+	; History:
+	; 13-Sep-2006	Steve S	SR14954: Moved functionality to OrderLineReceipts
+	;  5-Sep-2006	JW		SR14979: Exclude to include. Ignore this receipt. Reverse reversals.
+	; 16-Aug-2006	JW		SR14854: Don't include excluded lines
+	; 03-Aug-2006	PO		SR14854: Created
+	;-------------------------------------------------------------------------------
+	new idOrder,idOrderLine
+	
+	$$$LogR("ReceiptQuantities",pidReceipt)
+	
+	set idOrder     = $$$INRECLineOrder1(pobjRECLine)
+	set idOrderLine = $$$INRECLineOrderLine(pobjRECLine)
+	
+	quit $$OrderLineReceipts(idOrder,idOrderLine,pidReceipt,.pfltCurQty)	
+	
+	
+OrderLineReceipts(pidOrder,pidOrderLine,pidRec,&pfltCurQty)    ; DEPRECATED - CALCULATIONS NOW USE DATA FROM OTHER SOURCES
+	;-------------------------------------------------------------------------------
+	; Get qty received for an order line
+	; (Code moved from ReceiptQuantities^INRECLine)
+	;
+	; Called By : ReceiptQuantities^INReceiptLine (Deprecated)
+	; 
+	; Params:	pidOrder		: The order number
+	;			pidOrderLine	: The order line number
+	;			pidRec			: The receipt id to check
+	;
+	; ByRefs:	pfltCurQty		: current receipt's qty for this order/line
+	;
+	; Returns:  fltOtherQty
+	;
+	; History:
+	; 13-Sep-2006	Steve S	SR14954: Created (Code moved from ReceiptQuantities^INRECLine)
+	;-------------------------------------------------------------------------------
+	new blnReverse,fltOtherQty,idReceipt,idReceiptLine,idxOrder,idxOrderLine,objRec,objRecLine
+	
+	$$$LogR("OrderLineReceipts",pidRec_","_pidOrder_","_pidOrderLine)
+	
+	set idxOrder     = $$$Index(pidOrder)
+	set idxOrderLine = $$$Index(pidOrderLine)
+ 
+	set fltOtherQty = 0
+	set pfltCurQty  = 0
+	
+	set idReceipt=""
+	for {
+		set idReceipt=$order(^INRECLines(0,4,idxOrder,idxOrderLine,idReceipt))
+		quit:idReceipt=""
+		
+		set objRec     = $get(^INREC(0,idReceipt,1))
+		set blnReverse = ($$$INRECType(objRec)=$$$EnumINRECSupplierReversal)
+		
+		set idReceiptLine=""
+		for {
+			set idReceiptLine=$order(^INRECLines(0,4,idxOrder,idxOrderLine,idReceipt,idReceiptLine))
+			quit:idReceiptLine=""
+			
+			set objRecLine = $get(^INRECLine(0,idReceipt,idReceiptLine,1))
+			
+			if blnReverse {
+				set fltOtherQty = fltOtherQty - $$$INRECLineQuantity(objRecLine)
+				
+			} elseif $$$INRECLineInclude(objRecLine) {
+				if (idReceipt = $get(pidRec)) {
+					set pfltCurQty = pfltCurQty + $$$INRECLineQuantity(objRecLine)
+					
+				} elseif $$$INRECStatus(objRec) = $$$EnumINSTATUSProcessed {
+					set fltOtherQty = fltOtherQty + $$$INRECLineQuantity(objRecLine)
+				}
+			}
+		}
+	}
+	quit fltOtherQty
+	
+	
+CanCreateViaOrderLine(pstrOrderKeys,pobjOrderLine="")    ; DEPRECATED
+	;-------------------------------------------------------------------------------
+	; Check whether a INRECLine record can be created from this order line
+	; 
+	; Called By : DEPRECATED version of SelectOrder^INReceiptButton
+	; 
+	; Param: 
+	;	pstrOrderKeys	OrderNo,OrderLineNo
+	;	pobjOrderLine	INAUFP record
+	; 
+	; Returns: strStatus
+	; 
+	; History:
+	; 29-Sep-2009	GRF		SR16361: Wrong parameters for message
+	; 02-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	$$$LogR("CanCreateViaOrderLine",pstrOrderKeys)
+	
+	set strStatus = $$$OK
+ 
+	if $$$INAUFPPosCompleted(pobjOrderLine) = $$$YES {
+		set strStatus = $$$MakeStatus("IN00387",pstrOrderKeys) ; "Order %1 is closed."
+	
+	} else {
+		if $$$INAUFPIncomingGoodsQuantity(pobjOrderLine) >= $$$INAUFPQuantity(pobjOrderLine) {
+			set strStatus = $$$MakeStatus("IN00514",$$$KEY2(pstrOrderKeys),$$$INAUFPIncomingGoodsQuantity(pobjOrderLine))
+		} ; "Receipt has exceeded ordered quantity in line '%2'. Other existing receipts account for '%1'.~"
+	}
+	quit strStatus
+	
+	
+CreateViaOrderLine(pstrOrderKeys,pobjOrderLine="")    ; DEPRECATED
+	;-------------------------------------------------------------------------------
+	; Creates a INRECLine record string from the orderline record
+	; FIXME: Create from new INPOLine record when ready
+	; 
+	; Calle]]><![CDATA[d By : DEPRECATED version of SelectOrder^INReceiptButton
+	; 
+	; Param: 
+	;	pstrOrderKeys	OrderNo,OrderLineNo
+	;	pobjOrderLine	INAUFP record
+	; 
+	; Returns: objINRECLine record
+	; 
+	; 03-Aug-2009	PPP		SR16815	Changed $$$INRECLineBaseQuantity to $$$INRECLineOrderQuantity
+	; 02-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new idOrder,idOrderLine,objINRECLine,objOrder
+	
+	$$$LogR("CreateViaOrderLine",pstrOrderKeys)
+	
+	set objINRECLine = ""
+	set idOrder     = $$$KEY1(pstrOrderKeys)
+	set idOrderLine = $$$KEY2(pstrOrderKeys)
+	
+	if pobjOrderLine = "" set pobjOrderLine = $get(^INAUFP(0,idOrder,idOrderLine,1))
+	
+	set objOrder = $get(^INAUF(0,idOrder,1))
+	set $$$INRECLineOrder1(objINRECLine)        = idOrder
+	set $$$INRECLineOrderLine(objINRECLine)     = idOrderLine
+	set $$$INRECLineItem(objINRECLine)          = $$$INAUFPItemNumber(pobjOrderLine)
+	set $$$INRECLineOrderQuantity(objINRECLine) = $$$INAUFPQuantity(pobjOrderLine)
+	set $$$INRECLineUnit(objINRECLine)          = $$$INAUFPQuantityUnit(pobjOrderLine)
+	set $$$INRECLineSupplier(objINRECLine)      = $$$INAUFPSupplier(pobjOrderLine)
+	
+	set $$$INRECLineLocation(objINRECLine)      = $$$INAUFLocation(objOrder)
+	
+	quit objINRECLine
+
+OnBlurFREE2(pYFELD)
+    if ((+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1))))
+    	&& '(+$$$WWWClientParamCoreChangesTCI($get(^WWWClientParam(YM,YM,1))))){
+		if ($$ValidaTemperaturaConferida^VARINReceipt(pYFELD)){
+			$$$Alert("A temperatura conferida não corresponde ao valor adequado para este produto. Favor registrar uma ocorrência para o fornecedor, descrevendo o desvio de temperatura identificado.")
+		}
+	}
+	quit
+
+OnBlurEnderecoArmazenagem(pYFELD)
+	new endereco, local, blOk
+
+	if ((+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) || 
+		(+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+		(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) ||
+		(+$$$WWWClientParamCoreChangesTCI($get(^WWWClientParam(YM,YM,1))))) {
+	
+		set endereco = $$$INRECLineStockLocation(pYFELD)
+		set local 	 = $$$INRECLineLocation(pYFELD)
+		set blOk 	 = $$$NO
+	
+		if (endereco '= "X"){
+			&SQL(
+			  SELECT 
+			  	StockLocation
+		  	  FROM INLP
+		  	  WHERE Company = 0
+		  	  AND StockLocation = :endereco
+		  	  AND LocationName = :local
+		 	)
+ 	
+		 	if ('SQLCODE){
+				set blOk = $$$YES
+			} 
+		}
+	
+		if '(blOk){
+			set $$$INRECLineStockLocation(YFELD) = ""
+			$$$Alert("O endereço de armazenagem '"_endereco_"' não é uma entrada válida")
+		}
+	}
+	
+	quit
+]]></Routine>
+</Export>

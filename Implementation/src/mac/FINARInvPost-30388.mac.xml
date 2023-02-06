@@ -1,0 +1,654 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINARInvPost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINARInvPost
+	;--------------------------------------------------------------------------------------
+	; SR: 11837 - Created as a replacement for FINARRecurringInvoicePost.mac
+	;--------------------------------------------------------------------------------------
+	#Include FIN
+	#Include FINConst
+	#Include COMConst
+	#Include COMSYS
+	#include WWWConst
+ 
+Postable(pidInvoice,pblnReturnBoolean=$$$NO,pblnUsingSchedule=$$$NO,pblnPrePost=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Determines whether or not an invoice record is postable.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 26-Jun-2006	RPW			SR13173: Check if the GL Effective Date is valid
+    ; 06-Jan-2006 	SC			SR13798: Decode wrapper removed. Decode in COMSYS.INC
+    ; 04-Nov-2005	Steve S		SR13796: Use $$$Text on strStatus
+    ; 18-May-2005	SS / JW		SR12340: Prepost - no editable check
+    ; 08-Apr-2005	Steve S		SR11669: Check Repeat dates
+    ;  4-Apr-2005	JW			SR11937: Added ConsistentTax. Cleaned up status usage.
+    ; 10-Jan-2005	Steve S		Created (SR10424)
+    ;-------------------------------------------------------------------------------
+	new strStatus,objInvoice,idInvoice,postStatus,idParent
+	
+	set strStatus=$$$OK
+	set idInvoice=$get(pidInvoice)
+	
+	if '$$$NoKey(idInvoice) { ;Invoice Number exists
+		set objInvoice=$get(^FINARInv(YM,idInvoice,1))
+		set postStatus=$$$FINARInvStatus(objInvoice)
+		set idParent=$$$FINARInvParentInvoice(objInvoice)
+		
+		if '$data(^FINARInvLine(YM,idInvoice)) {
+			set strStatus=$listbuild("Fin00547")  ;Must have invoice lines before posting.
+			
+		} elseif '$$ConsistentTax^FINARInvTax(pidInvoice) {
+			set strStatus = $listbuild("Fin00696")  ;Tax Total must be zero, as no lines are taxable.
+			
+		} else {
+			
+			set strStatus=$$ValidGLEffectiveDate^FINGLEffectiveDate($$$FINARInvTransactionDate(objInvoice),$$$FINARInvTransactionDate(objInvoice),$$$FldFINARInvTransactionDate) // SR13173
+			
+			if $$$ISOK(strStatus) {
+			
+				if 'pblnPrePost {
+					set strStatus=$$Editable^FINSYSReview("FINARInv",postStatus)
+					
+					if $$$ISOK(strStatus) {
+						set strStatus=$$RepeatDatesOkay^FINARInv(idInvoice)	
+					}
+				}
+				
+				if $$$ISOK(strStatus) {
+					set strStatus=$$HasRequiredData(idInvoice)
+				}
+			}
+		}
+	} else { ;No invoice number
+		set strStatus=$listbuild("Fin00089")  ;No Record Selected.
+	}
+ 
+	if $$$ISOK(strStatus) {
+		if 'pblnReturnBoolean set YQ=$$$YQEnable
+	} else {
+		if 'pblnReturnBoolean {
+			set YQ=$$$YQDisable(strStatus) ;SR13798
+			;set YQ=$$$YQDisable($$$Text(strStatus)) ;SR13796 
+		} else {
+			if 'pblnUsingSchedule set strStatus='$$$OK
+		}
+	}
+	
+	quit strStatus
+	
+	
+		
+HasRequiredData(pidInvoice)
+    ;-------------------------------------------------------------------------------
+    ; Checks if an invoice has required data before posting.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 10-Mar-2005		Steve S			SR11844: Added check for Terms
+    ; 02-Feb-2005		Steve S			Created
+    ;-------------------------------------------------------------------------------
+	new idInvoice,strStatus,objInvoice,dteInvoiceDate,dteTransDate,idCustomer
+	new idTerms
+	
+	set idInvoice=$get(pidInvoice)
+	set strStatus=$$$OK
+	
+	if '$$$NoKey(idInvoice) {
+		set objInvoice	   =$get(^FINARInv(YM,idInvoice,1))
+		
+		set dteInvoiceDate =$$$FINARInvInvoiceDate(objInvoice)
+		set dteTransDate   =$$$FINARInvTransactionDate(objInvoice)
+		set idCustomer	   =$$$FINARInvCustomer(objInvoice)
+		set idTerms		   =$$$FINARInvTerms(objInvoice)
+		
+		if (dteInvoiceDate="") {
+			set strStatus=$listbuild("Fin00641")  ;Invoice Date required.
+		} elseif (dteTransDate="") {
+			set strStatus=$listbuild("Fin00642")  ;Transaction Date required. 	
+		} elseif (idCustomer="") {
+			set strStatus=$listbuild("Fin00159")  ;Customer Number Required	
+		} else {
+			set strStatus=$$LinesAreValid^FINARInvLine(idInvoice)
+		}
+	} else {
+		set strStatus=$listbuild("Fin00089")  ;No Record Selected.	
+	}
+	
+	quit strStatus
+	
+ 
+MakeChildInvoice(pidParentInvoice)
+    ;-------------------------------------------------------------------------------
+    ; When posting a repeat (parent) invoice, this will create the 
+    ; child invoice record.
+    ;
+    ; Returns: strStatus (=$$$OK if everything saved ok, $lb(ERROR msg) otherwise)
+    ;
+    ; History:
+    ; 21-Feb-2005	RobertW	SR11273: tcommit needs the $tlevel check, not the trollback
+    ; 19-Jan-2005	Steve S	Created
+    ;-------------------------------------------------------------------------------
+	new objParentInvoice,idChildInvoice,objChildInvoice
+	new idLine,objChildInvoiceLine,strStatus
+	
+	;***************************************
+	tstart
+	;***************************************
+	
+	set strStatus=$$$OK
+	
+	if $get(pidParentInvoice)="" {
+		set strStatus=$lb("Fin00089")  ;No Record Selected.
+	} else {
+		set objParentInvoice=$get(^FINARInv(YM,pidParentInvoice,1))
+		set idChildInvoice=$$$NextKey("FINARInv")
+		set objChildInvoice=objParentInvoice
+		set $$$FINARInvParentInvoice(objChildInvoice)=pidParentInvoice
+		set strStatus=$$$Save("FINARInv",idChildInvoice,objChildInvoice,1)
+	
+		if $$$ISOK(strStatus) {
+			set idLine=""
+			for {
+				set idLine=$order(^FINARInvLine(YM,pidParentInvoice,idLine))
+				quit:(idLine="")||($$$ISERR(strStatus))
+				
+				set objChildInvoiceLine=$get(^FINARInvLine(YM,pidParentInvoice,idLine,1))
+				set strStatus=$$$Save("FINARInvLine",idChildInvoice_","_idLine,objChildInvoiceLine,1)
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) { 
+		if $tlevel>0 tcommit
+		set ^CacheTempRecInvoiceChild(YUSER,pidParentInvoice)=idChildInvoice
+	} else {
+		trollback
+	}
+	
+	quit strStatus
+	
+		
+Post(pidInvoice,blnSinglePost=$$$YES,blnSchedulePost=$$$NO,blnStoreChildren=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Posts an invoice to the interface.
+    ; 
+    ; Parameters: pidInvoice       - the ID of the invoice to post.
+    ; 			  
+    ; 			  blnSinglePost    - $$$YES: A single posting (via the post button or schedular).
+    ; 			  				   - $$$NO:  Posted via the group post.
+    ; 			  				  
+    ; 			  blnSchedulePost  - $$$YES: A posting from the schedular.
+    ; 			  				   - $$$NO:  Posted via the user.
+    ; 			  				  
+    ; 			  blnStoreChildren - $$$YES: Store all the children generated in a temp global
+    ; 			  (for group       - $$$NO:  Do NOT store in the temp global
+    ; 			  posting only)					 
+    ;
+    ; Returns: strStatus ($$$OK if posted ok, $lb(error) otherwise.)
+    ;
+    ; History:
+    ; 02-Nov-2006	Steve S		SR14243: Intercompany support
+    ; 28-Feb-2006	PO			SR14225: Added Drill Down Detail to Allocate
+    ; 01-Nov-2005	PO			SR13776: Store user and department in correct variables
+    ; 28-Sep-2005	JW			SR13156: Use GL Effective Date
+    ; 07-Sep-2005	PO			SR12943: Included Posted By
+    ; 30-Mar-2005	Steve S		SR11937: Use Tax Location
+    ; 24-Mar-2005	JW			SR11958: Use CalculateTaxes^COMTAX
+    ; 21-Feb-2005	JW			Added postable check.
+    ; 21-Feb-2005	RobertW		SR11273: tcommit needs the $tlevel check, not the trollback
+    ; 21-Feb-2005	JW			SR11667: Pass in location to PostInvoiceLine
+    ; 12-Jan-2005	Steve S		Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,Batch,Block,idLine,objInvoice,blnPost,intStatus,blnIC
+	new idChildInvoice,blnIsRepeat,idTaxLocation,blnChildCreated,taxLines
+	new idCustomer,objCustomer,idLocation,idCreator,idDepartment,strForm,strDetail ; SR14225
+	
+	set blnPost=$$$OK
+	set blnChildCreated=$$$NO
+	set intStatus=""
+ 
+	;***************************************
+	tstart
+	;***************************************
+	
+	kill ^CacheTempRecInvoiceChild(YUSER)
+	
+	set strStatus = $$Postable(pidInvoice) ; JW 21-Feb-2005
+	
+	if $$$ISOK(strStatus) {
+		set objInvoice		= $get(^FINARInv(YM,pidInvoice,1))
+		set blnIsRepeat		= +$$$FINARInvRepeat(objInvoice)
+		set blnIC 			= $$$FINARInvInterCompany(objInvoice) //SR14243
+		
+		if (blnIsRepeat)&&($$$FINARInvParentInvoice(objInvoice)="") { 
+			set strStatus=$$MakeChildInvoice(pidInvoice)
+			set blnChildCreated=$$$YES
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		if $data(^CacheTempRecInvoiceChild(YUSER,pidInvoice)) {
+			set idChildInvoice=$get(^CacheTempRecInvoiceChild(YUSER,pidInvoice))
+			kill ^CacheTempRecInvoiceChild(YUSER)
+		} else {
+			set idChildInvoice=pidInvoice
+		}
+	}
+	
+	if $$$ISOK(strStatus) set strStatus=$$UpdateDates(idChildInvoice)
+	if $$$ISOK(strStatus) {
+		set objInvoice=$get(^FINARInv(YM,idChildInvoice,1)) 
+		set strStatus=$$Editable^FINSYSReview("FINARInv",$$$FINARInvStatus(objInvoice),.blnPost,.intStatus)
+	}
+ 
+	; ---MAIN POSTING CODE ---
+	if $$$ISOK(strStatus)&&(blnPost) {
+		;SR11937 - Use Tax Location
+		set idCustomer=$$$FINARInvCustomer(objInvoice)
+		set objCustomer=$get(^FINARCustomer(YM,idCustomer,1))
+		set idTaxLocation = $$$FINARInvTaxLocation(objInvoice)
+		if idTaxLocation="" set idTaxLocation=$$$WWW0121TaxLocation($get(^WWW0121(0,YM,YLOCATION,1)))
+		
+		set idLocation   = $$$FINARInvCreatorsLocation(objInvoice)
+		set idCreator    = $$$FINARInvCreatedBy(objInvoice)
+		set idDepartment = $$$FINARInvCreatorsDepartment(objInvoice)
+		
+		;set strStatus=$$Allocate^FININTBatch(.Batch,.Block,"ARINV",idLocation,+$horolog,,idCreator,idDepartment)
+		; SR14225
+		set strForm = $$CheckForm^FINUtils($get(YFORM),"FINARInv")  ; Get the form using YFORM, with validation
+		set strDetail = "Fin00993,"_idChildInvoice  ;Customer Invoice Number %1
+		
+		;SR14243: Pass in intercompany flag
+		set strStatus=$$Allocate^FININTBatch(.Batch,.Block,"ARINV",idLocation,$$$FINARInvTransactionDate(objInvoice),,idCreator,idDepartment,strForm,idChildInvoice,strDetail,blnIC)
+		//set strStatus=$$Allocate^FININTBatch(.Batch,.Block,"ARINV",idLocation,$$$FINARInvTransactionDate(objInvoice),,idCreator,idDepartment,strForm,idChildInvoice,strDetail)
+		//set strStatus=$$Allocate^FININTBatch(.Batch,.Block,"ARINV",idLocation,$$$FINARInvTransactionDate(objInvoice),,idCreator,idDepartment)		// SR13156
+		
+		if $$$ISOK(strStatus) set strStatus=$$PostInvoiceHeader(idChildInvoice,Batch,Block)
+		
+		set idLine=""
+		for {
+			set idLine=$order(^FINARInvLine(YM,idChildInvoice,idLine))
+			quit:(idLine="")||($$$ISERR(strStatus))
+			
+			set strStatus=$$PostInvoiceLine(idChildInvoice,idLine,Batch,Block,.taxLines)
+		}
+		
+		// SR11958: Post Tax lines
+		if $$$ISOK(strStatus) {
+			set strStatus = $$PostTaxes(Batch,Block,idTaxLocation,idChildInvoice,.taxLines)
+		}
+		
+		if $$$ISOK(strStatus) set strStatus=$$PostBlock^FININTBatch(Batch,Block)	
+		if $$$ISOK(strStatus) {
+			set $$$FINARInvPostedDate(objInvoice)=+$horolog
+			set $$$FINARInvPostedBy(objInvoice)  =$get(YBED,"UNKNOWN")
+		}
+	}
+	; ---END MAIN POSTING CODE ---
+	
+	if $$$ISOK(strStatus) {
+		set $$$FINARInvStatus(objInvoice)=intStatus
+		set strStatus=$$$Save("FINARInv",idChildInvoice,objInvoice,1)
+	}
+	
+	; TODO: Fix up this complex nesting vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+ 
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+		if blnSinglePost { ;SINGLE POSTING
+			if blnIsRepeat&&blnChildCreated { ;IS THIS A REPEAT INVOICE NOW WITH A NEW CHILD?
+				if blnSchedulePost { ;WAS THIS POSTED VIA THE SCHEDULAR?
+					set ^CacheTempRecInvoiceChildren(YUSER,pidInvoice)=idChildInvoice
+				} else {
+					do ^WWWINFO($$$Text($lb("Fin00589",idChildInvoice)))  ;Post successful. New invoice ´%1´ has been created and posted.	
+				}			
+			} else { ;NOT A REPEAT INVOICE - JUST REFRESH THE PAGE
+				do ReloadForm^COMUtilForm()	
+			}
+		} else { ;GROUP POSTING
+			if blnStoreChildren {
+				set ^CacheTempRecInvoiceChildren(YUSER,pidInvoice)=idChildInvoice
+			}	
+		}
+	} else {
+		trollback
+		if blnSinglePost do ^WWWINFO($$$Text(strStatus))
+	} 		
+	
+	quit strStatus
+	
+ 
+PostTaxes(Batch,Block,pLocation,pidInvoice,pTaxLines) private
+    ;-------------------------------------------------------------------------------
+    ; Calculate tax Lines, then loop through and post.
+    ; Note: This is a private routine, so I don't check parameters for null
+    ;
+    ; Params:	Batch,Block,pLocation,pidInvoice - self-explanatory
+    ; 			taxLines - is created for use in CalculateTaxes^COMTAX
+    ;
+    ; Returns: status
+    ;
+    ; History:
+    ; 02-Nov-2006	Steve S	SR14243: Intercompany Support
+    ; 26-Oct-2005	JW		SR13743: COMTAX now has pblnTaxInc param.
+    ; 19-Apr-2005	Steve S	SR11845: Use sign variable for taxes
+    ; 24-Mar-2005	JW		SR11928: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,objInvoice,source,idLine,idTax,objTax,taxType,idAccount,tax,sign
+	new objFINARInvLine,idCompany,idCompanyAcct
+	
+	set objInvoice=$get(^FINARInv(YM,pidInvoice,1))
+	set sign=1
+	if $$$FINARInvCredit(objInvoice) set sign=-1
+	
+	set source = $$$FINARInvCustomer(objInvoice)
+	
+	set strStatus = $$CalculateTaxes^COMTAX(pLocation,$$$FINARInvTransactionDate(objInvoice),.pTaxLines,$$$NO,$$$FINARInvTax(objInvoice),$$$FINARInvLinesIncludeTax(objInvoice))	//SR13743
+	if $$$ISOK(strStatus) {
+		set idLine=""
+		for {
+			set idLine = $order(pTaxLines(idLine))
+			quit:idLine=""
+			
+			//SR14243: Intercompany Support
+			set objFINARInvLine = $get(^FINARInvLine(YM,pidInvoice,idLine,1))
+			set idCompany 		= $$$FINARInvLineCompany1(objFINARInvLine)
+			set idCompanyAcct 	= $$$FINARInvLineCompanyAccount(objFINARInvLine)
+			
+			set idTax = ""
+			for {
+				set idTax = $order(pTaxLines(idLine,idTax))
+				quit:(idTax="")
+				
+				set objTax=$get(pTaxLines(idLine,idTax))
+				
+				set taxType 	= $piece(objTax,Y,1)
+				set idAccount 	= $piece(objTax,Y,3)
+				set tax 		= $piece(objTax,Y,4)
+				
+				set strStatus=$$AddLine^FININTBatch(Batch		,Block					,idAccount			,
+													-sign*tax	,"TAX"					,idTax_" - "_taxType,
+													source		,pidInvoice_","_idLine	,""					,
+													""			,""						,""					,
+													""			,idCompany				,idCompanyAcct		)
+				
+				quit:$$$ISERR(strStatus)
+			}
+			
+			quit:$$$ISERR(strStatus)
+			
+		}
+	
+	}
+	
+	quit strStatus
+ 
+	
+UpdateDates(pidInvoice)
+    ;-------------------------------------------------------------------------------
+    ; Update dates on the invoice before posting.
+    ; (Only used for Repeat Invoices)
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 27-Jan-2005		Steve S			Created
+    ;-------------------------------------------------------------------------------
+	new objInvoice,dteDueDate,idCustomer,idInvoice,strStatus,idCustomerTerms
+	
+	set strStatus=$$$OK
+	set idInvoice=$get(pidInvoice)
+	set objInvoice=$get(^FINARInv(YM,idInvoice,1))
+	
+	if $$$FINARInvRepeat(objInvoice) {
+		set idCustomer=$$$FINARInvCustomer(objInvoice)
+		set idCustomerTerms=$$$FINARInvTerms(objInvoice)
+		set dteDueDate=$$GetDueDate^FINARCustomer(idCustomer,+$H,idCustomerTerms)
+		
+		set $$$FINARInvInvoiceDate(objInvoice)=+$H
+		set $$$FINARInvTransactionDate(objInvoice)=+$H
+		set $$$FINARInvDueDate(objInvoice)=dteDueDate
+		
+		set strStatus=$$$Save("FINARInv",idInvoice,objInvoice,1)
+	}
+	
+	quit strStatus
+	
+	
+PostInvoiceHeader(pidInvoice,Batch,Block)
+    ;-------------------------------------------------------------------------------
+    ; Posts the header information of an invoice.
+    ; 
+    ; Returns:
+    ;
+    ; History:
+    ; 04-Nov-2005		Steve S		SR13796: Clean up status usage
+    ; 10-May-2005		Robert W	SR11845: If we are not posting discounts then
+    ; 								set a breadcrumb in ^CacheTempPostSettlementDiscount, 
+    ; 								to do this just define this for the YUSER variable.
+    ; 10-Mar-2005		Steve S		SR11845: If Invoice is Credit, only post discount
+    ; 								if this setting has been enabled.
+    ; 10-Mar-2005		Steve S		SR11844: Post discount using terms
+    ; 21-Feb-2005		JW			SR11667: Post the total not subtotal
+    ; 13-Jan-2005		Steve S		Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,objInvoiceHeader,fltSubTotal,fltTax,fltTotal
+	new sign,idCustomer,strNotes,dteInvoiceDate,strParams
+	new objCustomer,idControlAccount,dteDueDate,dteTransDate,strDiscount,idTerm
+	new objSettings
+	
+	set strStatus=$$$OK
+	
+	if $$$NoKey(pidInvoice) {
+		set strStatus=$listbuild("Fin00089")  ;No Record Selected.
+	} else {
+		set objInvoiceHeader=$get(^FINARInv(YM,pidInvoice,1))
+		if objInvoiceHeader="" {
+			set strStatus=$listbuild("Fin00565",pidInvoice)  ;No invoice data - Invoice Number '%1'.
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		; CHECK IF CREDIT
+		set sign=1
+		if $$$FINARInvCredit(objInvoiceHeader) set sign=-1
+		
+		; GET TOTALS/AMOUNTS
+		set fltSubTotal		=sign*$$GetSubTotal^FINARInv(pidInvoice)
+		set fltTax			=sign*$$$FINARInvTax(objInvoiceHeader)
+		set fltTotal		=fltSubTotal+fltTax
+		
+		; GET PARAMETER VALUES
+		set idCustomer	   =$$$FINARInvCustomer(objInvoiceHeader)
+		set strNotes	   =$$$FINARInvNotes(objInvoiceHeader)
+		set dteInvoiceDate =$$$FINARInvInvoiceDate(objInvoiceHeader)
+		set dteTransDate   =$$$FINARInvTransactionDate(objInvoiceHeader)
+		set dteDueDate	   =$$$FINARInvDueDate(objInvoiceHeader)
+		set idTerm		   =$$$FINARInvTerms(objInvoiceHeader) ;SR11844
+		if dteDueDate	   ="" set dteDueDate=$$GetDueDate^FINARCustomer(idCustomer,dteTransDate,idTerm)
+		set strDiscount	   =$$GetSettlementDiscount^FINARCustomer(idCustomer,idTerm) ;SR11844
+ 		
+		;SR11845 - If invoice is a credit, only post discount if this setting is on.
+		set objSettings=$get(^FINGeneralSetup(YM,YM,1))
+		if (sign=-1)&&('$$$FINGeneralSetupPostSettlementDiscountwit(objSettings)) {
+			set strDiscount=""
+			; SR11845: Create a Bread Crumb for this YUSER.
+			set ^CacheTempPostSettlementDiscount(YUSER)=""
+		}
+		
+		; CONSTRUCT PARAMETER STRING
+		; <CUSTOMER>,<INVOICE>,<DUE DATE>,<DISCOUNT>,<DATE>,<FREIGHT>,<NOTES/DETAIL>
+		set strParams=idCustomer_","_pidInvoice_","_dteDueDate_","_strDiscount_","_dteInvoiceDate_",,"_strNotes
+	}
+	
+	if $$$ISOK(strStatus) {
+		if $get(idCustomer)="" {
+			set strStatus=$listbuild("Fin00551") ;Must specify a Customer
+		} else {
+			set objCustomer=$get(^FINARCustomer(YM,idCustomer,1))
+			if objCustomer="" {
+				set strStatus=$listbuild("Fin00079",idCustomer)  ; Customer number %1 not Found
+			} else {
+				set idControlAccount=$$$FINARCustomerControlAccount(objCustomer)
+				if idControlAccount="" {
+					set strStatus=$listbuild("Fin00081",idCustomer)  ; Customer Control Account not valid for customer %1
+				} else {
+					;set strStatus=$$AddLine^FININTBatch(Batch,Block,idControlAccount,fltSubTotal,"ACC",strParams,pidInvoice,idCustomer)
+					set strStatus=$$AddLine^FININTBatch(Batch,Block,idControlAccount,fltTotal,"ACC",strParams,pidInvoice,idCustomer) ;SR11667
+					
+				}
+			}
+		}
+	}
+ 
+	quit strStatus
+	
+	
+PostInvoiceLine(Number,Line,Batch,Block,pTaxLines)
+    ;-------------------------------------------------------------------------------
+    ; Posts an invoice line to the interface batch.
+    ; 
+    ; Returns: pTaxLines - by ref
+    ;
+    ; History:
+    ; 02-Nov-2006	Steve S		SR14243: Intercompany support
+    ; 26-Oct-2005	JW			SR13743: COMTAX now has pblnTaxInc param.
+    ; 24-Mar-2005	JW			SR11928: Moved taxes - just store info now (in 5th param)
+    ; 08-Mar-2005	Steve S		(Peer Rev:11667) Use $Get for objTax
+    ; 21-Feb-2005	JW			SR11667: Added Taxes (added location param)
+    ; 							Cleaned up Status usage.
+    ; 12-Jan-2005	Steve S		Created
+    ;-------------------------------------------------------------------------------
+	new Status,objInvoice,objInvoiceLine,sign,strDescription,fltAmount
+	new strGLAccount,strParams,idCustomer,strCustName,objCustomer,source,ref
+	new transDate,taxCode,ratesArray,idCompany,idCompanyAcct
+	
+	set Status=$$$OK
+	
+	if ($get(Number)="")||($get(Line)="") {
+		set Status=$listbuild("Fin00089")  ;No Record Selected.	
+	} else {
+		set objInvoice=$get(^FINARInv(YM,Number,1))
+		set objInvoiceLine=$get(^FINARInvLine(YM,Number,Line,1))	
+	
+		if objInvoice="" {
+			set Status=$listbuild("Fin00565",Number)  ;No invoice data - Invoice Number '%1'.
+		} elseif objInvoiceLine="" {
+			set Status=$listbuild("Fin00566",Number,Line)  ;No invoice line data - Invoice '%1', Line '%2'.
+		} else {
+			set sign=1
+			if $$$FINARInvCredit(objInvoice) set sign=-1
+			set fltAmount 		= sign*$$$FINARInvLineAmountTaxEx(objInvoiceLine)
+			set strGLAccount 	= $$$FINARInvLineGLAccount(objInvoiceLine)
+		
+			set strDescription = $$$FINARInvLineDescription(objInvoiceLine)
+			set strParams	   = strDescription_$$$COMMA_fltAmount
+			set idCustomer	   = $$$FINARInvCustomer(objInvoice)
+			
+			if idCustomer="" {
+				set Status=$listbuild("Fin00159")  ;Customer Number Required	
+			} else {
+				set objCustomer=$get(^FINARCustomer(YM,idCustomer,1))
+				if objCustomer="" {
+					set Status=$listbuild("Fin00079",idCustomer) ;Customer number ´%1´ not Found
+				} else {
+					set strCustName	   =$$$FINARCustomerCustomerName(objCustomer)
+					set source		   = idCustomer_" - "_strCustName
+					set ref			   = Number_","_Line
+					
+					//SR14243: Intercompany support
+					set idCompany 	  = $$$FINARInvLineCompany1(objInvoiceLine)
+					set idCompanyAcct = $$$FINARInvLineCompanyAccount(objInvoiceLine)
+					
+					set Status=$$AddLine^FININTBatch(Batch    ,Block   		,strGLAccount ,
+												    -fltAmount,"SALEGL"		,strParams    ,
+												    source    ,ref     		,			  ,
+												    		  ,		   		,			  ,
+												    		  ,idCompany 	,idCompanyAcct)
+				}
+			}
+		}
+	}
+	
+	if $$$ISOK(Status) { ; SR11667: Taxes
+		set taxCode = $$IsTaxable^COMTAX($$$FINARInvLineTaxCode(objInvoiceLine),$$$FINARInvTaxInvoice(objInvoice),,$$$FINARInvTaxLocation(objInvoice))
+		if taxCode'=0 {
+			// pTaxLines is created for use in CalculateTaxes^COMTAX
+			if $$$FINARInvLinesIncludeTax(objInvoice) {
+				set fltAmount = sign*$$$FINARInvLineAmount(objInvoiceLine)	//SR13743
+			}
+			set pTaxLines(Line) = taxCode_Y_fltAmount
+		}
+	}
+ 
+	quit Status
+		
+	
+PostSchedule(pidInvoice)
+    ;-------------------------------------------------------------------------------
+    ; Post a recurring invoice via the schedular (after validation).
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 22-Nov-2005		Steve S			SR13853: Use KILL^COMSchedule
+    ; 04-Apr-2005		Steve S			SR12020: Don't post more than once a day
+    ; 18-Jan-2005		Steve S			Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,idInvoice,objInvoice,dteStartRepeat,dteEndRepeat,dteToday
+	new idChildInvoice,objSetup,lstPostsToday
+	
+	set strStatus=$$$OK
+	
+	set idInvoice=$get(pidInvoice)
+	set strStatus=$$Postable(idInvoice,$$$NO,$$$YES)
+	
+	if strStatus=$$$OK {
+		set objInvoice=$get(^FINARInv(YM,idInvoice,1))
+		
+		set dteStartRepeat=$$$FINARInvRepeatStartDate(objInvoice)
+		set dteEndRepeat=$$$FINARInvRepeatEndDate(objInvoice)
+		set dteToday=+$horolog
+		
+		if (strStatus=$$$OK)&&(dteEndRepeat'="")&&(dteEndRepeat<dteToday) {
+			set objSetup=$get(^FINGeneralSetup(YM,YM,1))
+			if $$$FINGeneralSetupDeletecompletedscheduleAR(objSetup) {
+				set strStatus=$lb("Fin00579",idInvoice)  ;Repeat End Date for invoice '%1' has elapsed - schedule erased.
+				do KILL^COMSchedule("FINARInv",idInvoice) ;SR13853
+				;do KillSchedules^FINARInvSchedule(idInvoice)
+			} else {
+				set strStatus=$lb("Fin00630",idInvoice) ;Repeat End Date for invoice '%1' has elapsed - posting cancelled.
+			}
+		}
+		
+		if (strStatus=$$$OK)&&(dteStartRepeat'="")&&(dteStartRepeat>dteToday) {
+			set strStatus=$lb("Fin00578",idInvoice)  ;Repeat Start Date for invoice '%1' has not arrived yet.
+		}
+		
+		if (strStatus=$$$OK) { ;SR12020
+			set lstPostsToday=$$GetChildrenPostedToday^FINARInvChild(idInvoice)
+			if $ll(lstPostsToday)'=0 {
+				set strStatus=$listbuild("Fin00724",idInvoice)  ;Invoice '%1' already has children posted today - post aborted.	
+				do KILL^COMSchedule("FINARInv",idInvoice) ;SR13853
+				;do KillSchedules^FINARInvSchedule(idInvoice)
+			}	
+		}
+		
+		if (strStatus=$$$OK) set strStatus=$$Post(idInvoice,$$$YES,$$$YES)
+		
+		if (strStatus=$$$OK) {
+			set idChildInvoice=$get(^CacheTempRecInvoiceChildren(YUSER,pidInvoice))
+			set strStatus=$lb("Fin00589",idChildInvoice) ;Post successful. New invoice ´%1´ has been created and posted.	
+		}
+		
+		kill ^CacheTempRecInvoiceChildren(YUSER)
+	}
+	
+	quit $$$Text(strStatus)
+	
+	
+]]></Routine>
+</Export>

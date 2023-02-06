@@ -1,0 +1,969 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReqRelease" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReqRelease
+	
+#include COMSYS
+#include WWWConst
+#include INConst
+#include COMConst
+#include COMView
+	
+#define ReleaseErrorAndCallBack(%1) "\r\n\r\n"_$$$Text("IN00651")_"')) { CallBackNow('"_%1_"',''); }"
+#; "Continue releasing requisition?"
+#define OrderTypePurchase 2
+	
+OnAfterDataFields()
+	;-------------------------------------------------------------------------------
+	; Start the release screen with its grids and external filters
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-May-2007	RPW		SR15513:  Add external filters for the raise date.
+	; 							Also clear the external filters before we go. 
+	; 							Add horizon processing
+	; 16-Feb-2007	RPW		SR15437: Use the supplier as an external filter for the COMView.
+	; 							and only show the In Form COMView on page 1.
+	; 15-Jan-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+ 	new idSupplier,enumComparitor
+ 	
+	do LoadGrid^INReqCommon(YFORM,YSEITE=2)
+	
+	$$$ClearExternalFilter(YFORM)
+	
+	set idSupplier     = $$$INReqReleaseSupplier(YFELD)
+	set enumComparitor = $select(idSupplier="":$$$EnumCOMVIEWCOMPARATORNotEquals,1:$$$EnumCOMVIEWCOMPARATOREquals)
+	
+	do AddExternalFilter^COMViewFilter(YFORM,"D4",idSupplier,enumComparitor)
+	do AddExternalFilter^COMViewFilter(YFORM,"D28","",$$$EnumCOMVIEWCOMPARATORNotEquals,$$$YES)
+	do AddExternalFilter^COMViewFilter(YFORM,"D28",$h+$$GetHorizon^INReqCommon()+1,$$$EnumCOMVIEWCOMPARATORLessThan,$$$YES)
+	do AddExternalFilter^COMViewFilter(YFORM,"D15",$$$EnumINREQSTATUSSourced,$$$EnumCOMVIEWCOMPARATOREquals,$$$ANNO)
+	
+	do LoadCOMViewGrid^COMViewFilter(YFORM,YFORM_"Line",1)
+	quit
+	
+	
+OnBeforeSave()
+	;-------------------------------------------------------------------------------
+	; Routine to run before saving a data record
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Dec-2006	Steve S	SR15316: Created (Copied from REQUISITIONVAR)
+	;-------------------------------------------------------------------------------
+	do OnBeforeSave^INReqCommon()
+	quit
+	
+	
+CanRelease(pobjData="",pblnQuick=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Determines if we can source this sourcing record.
+	; The current user must have the lock on the line, it must be marked as to be sourced.
+	; The line must also have a Supplier and a quantity > 0.
+	; Finally it must check that if we must have an agreement that we do.
+	;
+	; Called By: Button 1 "Reelease Issues" on form INReqRelease (Execute to Check for Disabled)
+	; 
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; OK if we can source. Otherwise the relevant error and the line it appeared on.
+	;
+	; History:
+	; 18-Oct-2010	GRF		-: distinguish idx variable from idSupplier
+	; 16-May-2007	RPW		SR15513: Fix the handling of the Manual fields.
+	; 16-Feb-2007	RPW		SR15437: Get the current locks and only loop through these
+	; 23-Jan-2007	PO		SR15400: Corrected check, Firsly: need to check whether
+	; 							I have lock AND whether anyone else has the lock
+	; 							Secondly: since no longer limited to records I have
+	; 							locked, need to apply the filters
+	; 16-Jan-2007	PO		SR15365: Ensure a supplier is provided
+	; 27-Dec-2006	Steve S	SR15316: Created (Copied from REQUISITIONVAR)
+	;-------------------------------------------------------------------------------
+	new arrLines,idSupplier,idxSupp,objData,strStatus
+	
+	set strStatus = $$$OK
+	
+	if pobjData'="" {
+		set idSupplier = $$$INReqReleaseSupplier(pobjData)
+	} else {
+		// This should now only get hit the very first time the form is loaded
+		set idSupplier = $get(%("%KEY","YINReqReleaseM1")) // YUCK - Test this because reloading the form does not change things in time
+	}
+	
+	set idxSupp = $$$Index(idSupplier)
+	
+	if (idSupplier'="") {
+		set strStatus = $case(pblnQuick,$$$YES:$$CanReleaseQuick(.arrLines),:$$CanReleaseSlow(idxSupp,.arrLines))
+	}
+	
+	if $$$ISOK(strStatus) {
+		if '$data(arrLines) {
+			set strStatus = "IN00626"  ; "No lines are ready to Release."
+		}
+	}
+	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	
+CanReleaseSlow(pidxSupplier,&parrLines)
+	;-------------------------------------------------------------------------------
+	; Loop through the requisitions index 4 to check for release.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Jun-2011	GRF		SR17732: Replace error message
+	; 16-May-2007	RPW		SR15513: Allow "better" handling of the action button
+	; 							when coming from another form; Complete Rewrite
+	; 19-Feb-2007	RPW		SR15437: Created
+	;-------------------------------------------------------------------------------
+	new idLine,strKeys,strStatus
+	
+	set strStatus = $$$OK
+	
+	do GetLockIds^WWWMultiLock(YFORM,YFORM_"Line",YUSER)
+	
+	if '$data(^CacheTempMultiLockIds(YUSER,YUCI)) {
+		set strStatus = $$$Text("IN00682")  ; "Please click save to enable"
+		
+	} else {
+		set idLine = ""
+		for {
+			set idLine = $order(^INRequisitions(0,5,$$$EnumINREQSTATUSSourced,$$$YES,pidxSupplier,YM,idLine))
+			quit:idLine=""
+			continue:$$$InUseElsewhere(YFORM,YFORM_"Line","0,"_idLine,YBED)
+			
+			set strStatus = $$CanReleaseLine(idLine,.parrLines)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	kill ^CacheTempMultiLockIds(YUSER,YUCI)
+	quit strStatus
+	
+	
+CanReleaseQuick(&parrLines)
+	;-------------------------------------------------------------------------------
+	; Loop through the currently locked entries to check for releasing.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Feb-2007	RPW		SR15437: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,strKeys
+	
+	set strStatus = $$$OK
+	
+	do GetLockIds^WWWMultiLock(YFORM,YFORM_"Line",YUSER)
+	set strKeys = ""
+	for {
+		set strKeys = $order(^CacheTempMultiLockIds(YUSER,YUCI,strKeys))
+		quit:strKeys=""
+		
+		set strStatus = $$CanReleaseLine($$$KEYMAX(strKeys),.parrLines)
+		quit:$$$ISERR(strStatus)
+	}
+	kill ^CacheTempMultiLockIds(YUSER,YUCI)
+	quit strStatus
+	
+	
+CanReleaseLine(pidLine,&parrLines)
+	;-------------------------------------------------------------------------------
+	; Return status of whether the line can be released.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Sep-2010	SCR		SR17309: Check for Item Status allowed to go on a PO
+	; 18-May-2007	RPW		SR15495: Removed unused variables.
+	; 12-Apr-2007	RPW		SR15495: Don't care about quantities here anymore.
+	; 19-Feb-2007	RPW		SR15437: Created
+	;-------------------------------------------------------------------------------
+	new objLine,strStatus
+	
+	set strStatus = $$$OK
+	set objLine   = $get(^INRequisition(0,0,pidLine,1))
+	
+	if $$$INRequisitionRelease(objLine) {
+		set strStatus = $$IsUsable^INARTDataAccess($$$INRequisitionItem(objLine),"INAUF")  ; SR17309
+		if $$$ISOK(strStatus) set parrLines(pidLine)=""          ; SR17309
+	}
+	quit strStatus
+	
+	
+ReleaseButtonHandler(pstrDummy) 
+	;-------------------------------------------------------------------------------
+	; This sub-routine is called from the button. It breaks up two 
+	; different bits of functionality :
+	; The call to the releasing itself, and the decision about where to go next
+	; By separating the two we can start to disentangle the UI from the data-model 
+	; manipulation.
+	; 
+	; If you need to customize where you go after clicking the release button
+	; create a new, custom button which goes to a var version of the ReleaseButtonHandler
+	; and choose an alternative in ReleaseNextForm 
+	; 
+	; Params : pstrDummy - to be passed on to Release, not sure if it's *for* anything
+	; 
+	; Returns : Nothing, but does redirect the browser
+	; 
+	; History :
+	; 26-Sep-2007	PJones	Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$Release(pstrDummy) // Do the releasing
+	do ReleaseNextForm(strStatus)        // Follow through to the next screen
+	quit strStatus
+	
+ 
+ReleaseNextForm(strStatus)
+	;-------------------------------------------------------------------------------
+	; This sub-routine simply goes to the next form after releasing
+	;  
+	; If you need to customize where you go after clicking the release button
+	; create a new, custom button which goes to a var version of ReleaseButtonHandler
+	; and then send the user somewhere else in a var alternative to this routine.
+	; 
+	; Params : strStatus - if the status isn't OK, you can go somewhere else.
+	; 
+	; Returns : Nothing, but does redirect the browser
+	; 
+	; History :
+	; 26-Sep-2007	PJones	BR014640:Created
+	;-------------------------------------------------------------------------------
+	new idOrder
+	
+	; Call Order form with saved order number
+	if $$$ISOK(strStatus) {
+		set idOrder = $get(^CacheTempPOCreatedByReqNext(YUCI,YUSER))
+		kill ^CacheTempPOCreatedByReqNext(YUCI,YUSER)
+		do GoToForm^COMUtilForm("INAUF",idOrder,,,$$$NO)
+	}
+	quit
+	
+	
+Release(pstrDummy)
+	;-------------------------------------------------------------------------------
+	; Perform the releasing
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2007	PJones	Returns strStatus
+	; 25-Sep-2007	PJones  Changed misleading "perform the sourcing" comment to "perform the releasing"
+	; 19-Feb-2007	RPW		SR15362: If not warnings and consolidating, do the release
+	; 23-Jan-2007	RPW		SR15362: Check if we actually can release.
+	; 						Consolidate Requisitions unchecked & one line       : Dialog box
+	;						Consolidate Requisitions unchecked & multiple lines : Grid validation
+	;						Consolidate Requisitions checked & one line         : Dialog box
+	;						Consolidate Requisitions checked & multiple lines   : Dialog Box
+	;						Basically rewritten to handle this
+	; 22-Jan-2007	RPW		SR15365: Show a more detailed message for order creation.
+	; 16-Jan-2007	PO		SR15365: Show id of order created.
+	; 27-Dec-2006	Steve S	SR15316: Created (Copied from REQUISITIONVAR)
+	;-------------------------------------------------------------------------------
+	new blnSingle,fltAmount,fltQuantity,idOrder,intLength,lstErrors
+	new objData,strQtyStatus,strAmtStatus,strStatus
+	
+	set objData = $$$GRIDYMFELDContainer
+		
+	set strStatus = $$CanRelease(objData,$$$YES)
+	
+	if $$$ISOK(strStatus) {
+		set blnSingle = $$LineCount(objData)=1
+		
+		if $$$INVORGConsolidateRequisitions($get(^INVORG(0,0,1))) {
+			// if consolidating and different required dates
+			do SumValues(.fltAmount,.fltQuantity,objData)
+			
+			if '$$ConfirmWarning($$Validate(fltAmount,fltQuantity,objData)) {
+				set strStatus = $$AllowRelease("")
+			}
+		} else {
+			// Create multi purchase orders
+			kill ^CacheTempPOCreatedByReq(YUCI,YUSER)
+			set strStatus = $$ConfirmMultipleWarning($$ValidateLines(objData))
+		}
+	} else {
+		$$$Alert(strStatus)
+	}
+	quit strStatus
+	
+	
+ConfirmMultipleWarning(plstStatus)
+	;-------------------------------------------------------------------------------
+	; If there are errors, let the user know, ie on page 2 and we are looking at page 3
+	; eitherway do the release code.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2007	PJones	Returns strStatus
+	; 23-Jan-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+	new blnIsQtyOk,blnIsAmtOk,blnIsErr,strScript, strStatus
+	
+	do GetStatus(plstStatus,.blnIsQtyOk,.blnIsAmtOk)
+	
+	if ('blnIsQtyOk) || ('blnIsAmtOk) {
+		set strScript = "if (confirm('"_$$$Text("IN00652")_$$$ReleaseErrorAndCallBack("AllowMultipleRelease^INReqRelease")
+		; "There are some requisitions that breach order quantity or order amount requirements"
+		
+		$$$StartScript()
+		write strScript
+		$$$EndScript()
+		set strStatus = $$$OK   ; even though warning since continue regardless
+ 
+	} else {
+		set strStatus = $$AllowMultipleRelease("")
+	}
+	quit strStatus
+	
+	
+GetStatus(plstStatus,&pblnQtyOk,&pblnAmtOk,&pstrQtyStatus,&pstrAmtStatus)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Jan-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+	set pstrQtyStatus = $listget(plstStatus,1)
+	set pstrAmtStatus = $listget(plstStatus,2)
+	
+	set pblnQtyOk = $$$ISOK(pstrQtyStatus)
+	set pblnAmtOk = $$$ISOK(pstrAmtStatus)
+	
+	$$$DecomposeStatus(pstrQtyStatus)
+	$$$DecomposeStatus(pstrAmtStatus)
+	
+	quit
+	
+AllowMultipleRelease(pstrDummy)
+	;-------------------------------------------------------------------------------
+	; Perform the Multiple Order Release.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2007	PJones	Returns strStatus and removed form reload 
+	; 23-Jan-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idOrder,intLength
+ 
+	set strStatus = $$Transaction^COMTransaction("ReleaseToMultiOrder^INReqRelease()",$$$YES)
+	
+	if $$$ISOK(strStatus) {
+		if $data(^CacheTempPOCreatedByReq(YUCI,YUSER)) {
+			set idOrder = $get(^CacheTempPOCreatedByReq(YUCI,YUSER))
+			kill ^CacheTempPOCreatedByReq(YUCI,YUSER)
+			
+			set intLength = $length(idOrder,$$$COMMA)
+			
+			if intLength=1 {
+				$$$Alert($listbuild("IN00643",idOrder))  ; "Created Purchase Order %1"
+				
+			} else {
+				$$$Alert($listbuild("IN00646",intLength,$piece(idOrder,$$$COMMA,1),$piece(idOrder,$$$COMMA,intLength)))
+			} ; "Created %1 Purchases Orders. Ranging from %2 to %3"
+		}
+	}
+	quit strStatus
+	
+	
+ConfirmWarning(plstStatus)
+	;-------------------------------------------------------------------------------
+	; Show any errors to the user.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Feb-2007	RPW		SR15362: Return whether we handled the error or not
+	; 23-Jan-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+	new blnHandled,blnIsAmtOk,blnIsErr,blnIsQtyOk
+	new strAmtStatus,strQtyStatus,strScript
+	
+	do GetStatus(plstStatus,.blnIsQtyOk,.blnIsAmtOk,.strQtyStatus,.strAmtStatus)
+	
+	if 'blnIsQtyOk || 'blnIsAmtOk {
+		set strScript="if (confirm('"
+		
+		if blnIsAmtOk {
+			set strScript = strScript_$$$Text(strQtyStatus)
+		
+		} elseif blnIsQtyOk {
+			set strScript = strScript_$$$Text(strAmtStatus)
+		
+		} else {
+			set strScript = strScript_$$$Text(strQtyStatus)_"\r\n"_$$$Text(strAmtStatus)
+		}
+					
+		set strScript = strScript_$$$ReleaseErrorAndCallBack("AllowRelease^INReqRelease")
+		
+		$$$StartScript()
+		write strScript
+		$$$EndScript()
+		set blnHandled = $$$YES
+	} else {
+		set blnHandled = $$$NO
+	}
+	quit blnHandled
+	
+	
+AllowRelease(pstrDummy)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2007	PJones	Returns strStatus
+	; 23-Jan-2007	RPW		SR13652: Created
+	;-------------------------------------------------------------------------------
+	new objData,strStatus
+ 
+	set objData   = $$$GRIDYMFELDContainer
+	set strStatus = $$ReleaseByEarliestDueDate(objData)
+	quit strStatus
+	
+	
+LineCount(pobjData)
+	;-------------------------------------------------------------------------------
+	; Count the number of lines ready to be released
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Jan-2007	RPW		SR15365: Created
+	;-------------------------------------------------------------------------------
+	new idReqLine,idxSupplier,intCount
+	
+	set idxSupplier = $$$Index($$$INReqReleaseSupplier(pobjData))
+	set intCount    = 0
+	
+	set idReqLine = ""
+	for {
+		set idReqLine = $order(^INRequisitions(0,5,"3",1,idxSupplier,0,idReqLine))
+		quit:idReqLine=""
+		
+		set intCount = intCount+1
+	}
+	quit intCount
+	
+	
+ReleaseByEarliestDueDate(pobjData)
+	;-------------------------------------------------------------------------------
+	; Ask the user if they wish to use the one due date.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2007	PJones	Returns strStatus
+	; 12-Jan-2007	RPW		SR15365: Created
+	;-------------------------------------------------------------------------------
+	new dteDue,strDue,blnOneDate, strStatus
+ 
+ 	set strStatus = $$$OK
+ 
+	// Find earlist date
+	set dteDue = $order(^INRequisitions(0,8,$$$EnumINREQSTATUSSourced,$$$YES,$$$Index($$$INReqReleaseSupplier(pobjData)),""))
+	
+	set blnOneDate = $$$NO
+	
+	if $order(^INRequisitions(0,8,$$$EnumINREQSTATUSSourced,$$$YES,$$$Index($$$INReqReleaseSupplier(pobjData)),dteDue))="" {
+		set blnOneDate = $$$YES
+	}
+	set strDue = $$^WWWDATE(dteDue)
+	
+	if blnOneDate || ($$LineCount(pobjData)=1) {
+		set strStatus = $$HandleRelease^INReqRelease(dteDue)
+	} else {
+		set strStatus = $$HandleRelease^INReqRelease(dteDue)
+	}
+	quit strStatus
+	
+	
+HandleRelease(pdteDate)
+	;-------------------------------------------------------------------------------
+	; The user is consolidating and using the lowest due date, do the release.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2007	PJones	Returns strStatus
+	; 17-Jan-2007	PO		SR15365: Show id of purchase order created
+	; 12-Jan-2007	RPW		SR15365: Created
+	;-------------------------------------------------------------------------------
+	new idOrder,fltAmount,fltQuantity,objReq,strQtyStatus,strAmtStatus,strStatus
+	
+	kill ^CacheTempPOCreatedByReq(YUCI,YUSER)
+	
+	// Now sum each line and get the errors.
+	
+	set fltAmount   = 0
+	set fltQuantity = 0
+	set objReq      = $$$GRIDYMFELDContainer
+		
+	set strStatus = $$Transaction^COMTransaction("ReleaseToOneOrder^INReqRelease("""_pdteDate_""")",$$$YES)
+ 
+	if $$$ISOK(strStatus) {
+		if $data(^CacheTempPOCreatedByReq(YUCI,YUSER)) {
+			set idOrder = $get(^CacheTempPOCreatedByReq(YUCI,YUSER))
+			kill ^CacheTempPOCreatedByReq(YUCI,YUSER)
+			$$$Alert($listbuild("IN00643",idOrder))
+		} ; "Created Purchase Order(s) %1"      ; FIXME : Can only ever be one
+	}
+	quit strStatus
+	
+	
+SumValues(&pfltAmount,&pfltQuantity,pobjReq)
+	;-------------------------------------------------------------------------------
+	; Sum the Total Price and Quantities
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Feb-2007	RPW		SR15362: Do not translate to display format
+	; 19-Feb-2007	RPW		SR15362: Recalculate the total, it may not be there.
+	; 09-Feb-2007	RPW		SR15362: Format the currency a little
+	; 23-Jan-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+	new idSupplier,idxSupplier,idReqLine,objRequisition,strKeys
+ 
+	set idSupplier  = $$$INReqReleaseSupplier(pobjReq)
+	set idxSupplier = $$$Index(idSupplier)
+	
+	set pfltAmount   = 0
+	set pfltQuantity = 0
+	
+	set idReqLine = ""
+	for {
+		set idReqLine = $order(^INRequisitions(0,5,"3",1,idxSupplier,0,idReqLine))
+		quit:idReqLine=""
+		
+		set objRequisition = $get(^INRequisition(0,0,idReqLine,1))
+		set pfltQuantity   = pfltQuantity+$$$INRequisitionQuantity(objRequisition)
+		do CalculateTotalPrice^INReqReleaseLine(.objRequisition)
+		set pfltAmount = pfltAmount+$$$INRequisitionTotalPrice(objRequisition)
+	}
+	quit
+	
+	
+Validate(pfltAmount,pfltQuantity,pobjReq)
+	;-------------------------------------------------------------------------------
+	; Validate the total prices and quantities.
+	;
+	; Params:
+	; pobjReq : The Requisition header object
+	;
+	; Returns:
+	; listbuild of the two statuses
+	;
+	; History:
+	; 20-Feb-2007	RPW		SR15362: Use nice variables
+	; 23-Jan-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+	new strQtyStatus,strAmtStatus,fltMaximumQuantity,fltMinimumQuantity,fltMaximumAmount,fltMinimumAmount,fltAmount
+	
+	set strQtyStatus = $$$OK
+	set strAmtStatus = $$$OK
+ 
+ 	set fltMaximumQuantity = $piece(pobjReq,Y,10)
+ 	set fltMinimumQuantity = $piece(pobjReq,Y,4)
+	if (fltMaximumQuantity>0) && (pfltQuantity>fltMaximumQuantity) {           // Maximum
+		set strQtyStatus = $$$MakeStatus("IN00647",pfltQuantity)
+		; "Order quantity (%1) is greater than the maximum order quantity"
+		
+	} elseif (fltMinimumQuantity>0) && (pfltQuantity<fltMinimumQuantity) {     // Minimum
+		set strQtyStatus = $$$MakeStatus("IN00648",pfltQuantity)
+	} ; "Order quantity (%1) is less than the minimum order quantity"
+	
+	set fltAmount = $$^WWWZAHL(pfltAmount)
+	
+	set fltMaximumAmount = $piece(pobjReq,Y,11)
+	set fltMinimumAmount = $piece(pobjReq,Y,5)
+	if (fltMaximumAmount>0) && (pfltAmount>fltMaximumAmount) {                 // Maximum
+		set strAmtStatus = $$$MakeStatus("IN00649",fltAmount)
+		; "Order value (%1) is greater than the maximum order value"
+		
+	} elseif (fltMinimumAmount>0) && (pfltAmount<fltMinimumAmount) {           // Minimum
+		set strAmtStatus = $$$MakeStatus("IN00650",fltAmount)
+	} ; "Order value (%1) is less than the minimum order value"
+ 
+	quit $listbuild(strQtyStatus,strAmtStatus)
+	
+	
+ValidateLines(pobjReq)
+	;-------------------------------------------------------------------------------
+	; Search through the lines and return the first error found
+	;
+	; Params:
+	; pobjReq : The Requisition header object
+	;
+	; Returns:
+	; listbuild of the two statuses
+	;
+	; History:
+	; 23-Jan-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+	new objReq,idSupplier,idxSupplier,idReqLine,objLine,lstStatus,dteDate,strQtyStatus,strAmtStatus
+	
+	set idSupplier  = $$$INReqReleaseSupplier(pobjReq)
+	set idxSupplier = $$$Index(idSupplier)
+	
+	set lstStatus    = ""
+	set strQtyStatus = $$$OK
+	set strAmtStatus = $$$OK
+	
+	set dteDate = ""
+	for {
+		set dteDate = $order(^INRequisitions(0,8,$$$EnumINREQSTATUSSourced,$$$YES,idxSupplier,dteDate))
+		quit:dteDate=""
+		
+		set idReqLine = ""
+		for {
+			set idReqLine = $order(^INRequisitions(0,8,$$$EnumINREQSTATUSSourced,$$$YES,idxSupplier,dteDate,0,idReqLine))
+			quit:idReqLine=""
+			
+			set objLine   = $get(^INRequisition(0,0,idReqLine,1))
+			set lstStatus = $$Validate($$$INRequisitionTotalPrice(objLine),$$$INRequisitionQuantity(objLine),pobjReq)
+			
+			set strQtyStatus = $listget(lstStatus,1)
+			set strAmtStatus = $listget(lstStatus,2)
+			
+			quit:($$$ISERR(strQtyStatus))||($$$ISERR(strAmtStatus))
+		
+		}
+		quit:($$$ISERR(strQtyStatus))||($$$ISERR(strAmtStatus))
+	}
+	quit lstStatus
+	
+	
+UpdateRequisition(pidReqLine,pstrForm,&plstData)
+	;-------------------------------------------------------------------------------
+	; Update the status, put in a change entry
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Jun-2007	RPW		SR15513: Do not kill or add the object as a history item.
+	; 28-Feb-2007	RPW		SR15465: Get the Requisition Process Number from the Requisition
+	; 22-Jan-2007	RPW		SR15365: Change to not have consolidated lines
+	; 12-Jan-2007	RPW		SR15365: Created
+	;-------------------------------------------------------------------------------
+ 	new objReqLine,strStatus,idAgreement
+	
+	set objReqLine = $get(^INRequisition(0,0,pidReqLine,1))
+				
+	set $$$INRequisitionReleaseDate(objReqLine) = +$horolog
+		
+	set strStatus = $$SetStatus^INReqCommon(pstrForm,pidReqLine,$$$EnumINREQSTATUSSourced,$$$EnumINREQSTATUSReleased,$$$FldINRequisitionRaisedAt)
+	
+	if $$$ISOK(strStatus) {
+		set objReqLine  = $get(^INRequisition(0,0,pidReqLine,1))
+		set idAgreement = $$$INRequisitionAgreement(objReqLine)
+		set plstData = $listbuild($$$INRequisitionItem(objReqLine),
+		                          $$$Coalesce(idAgreement," "),
+		                          $$$INRequisitionQuantity(objReqLine),
+		                          $$$INRequisitionRequisitionProcessNumber(objReqLine))
+	}
+	quit strStatus
+	
+	
+ReleaseToMultiOrder()
+	;-------------------------------------------------------------------------------
+	; Create the supplier orders for the sourced requisition lines.
+	; Note it consolidates like lines.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2007	PJones	BR014640:Put the new PO number in temp global
+	; 							^CacheTempPOCreatedByReqNext(YUCI,YUSER) so we can
+	; 							pick it up, when we decide where to go next in ReleaseFormNext
+	; 01-Jun-2007	RPW		SR15513: Log the order number created against the requisition
+	; 28-Feb-2007	RPW		SR15465: Get the Requisition Process Number from the Requisition
+	; 16-Feb-2007	RPW		SR15437: Rewrite to use the currently locked items.
+	; 22-Jan-2007	RPW		SR15365: Change to not have consolidated lines and do not
+	; 							add spaces to order numbers
+	; 17-Jan-2007	PO		SR15365: Store a copy of the purchase order id
+	; 05-Dec-2006	RPW		SR15359: Added call to change history.
+	; 29-Nov-2006	JW		SR15249: Added history line
+	; 30-Nov-2006	RPW		SR15249: Created
+	;-------------------------------------------------------------------------------
+	new arrLine,dteDate,idAgreement,idItem,idOrder,idReqLine,idSupplier,idxSupplier
+	new lstData,objReq,objRequisition,objReqLine,strForm,strKeys,strOrders,strStatus
+	
+	set strStatus = $$$OK
+	set strForm   = YFORM_"Line"
+	set objReq    = $$$GRIDYMFELDContainer
+	
+	do GetLockIds^WWWMultiLock(YFORM,YFORM_"Line",YUSER)
+	
+	set idSupplier  = $$$INReqReleaseSupplier(objReq)
+	set idxSupplier = $$$Index(idSupplier)    ; FIXME : Not used?
+	
+	set strKeys = ""
+	for {
+		set strKeys = $order(^CacheTempMultiLockIds(YUSER,YUCI,strKeys))
+		quit:strKeys=""
+		
+		set idReqLine      = $$$KEYMAX(strKeys)
+		set objRequisition = $get(^INRequisition(0,0,idReqLine,1))
+		
+		if $$$INRequisitionRelease(objRequisition) {
+			set dteDate = $$$INRequisitionDueDate(objRequisition)
+			kill arrLine
+			
+			set lstData   = ""
+			set strStatus = $$UpdateRequisition(idReqLine,strForm,.lstData)
+			
+			if $$$ISOK(strStatus) {		
+				set arrLine(1,$listget(lstData,1),$listget(lstData,2)) = $listget(lstData,3)_Y_$listget(lstData,4)
+				
+				set strStatus = $$CreateSupplierOrder(idSupplier,.arrLine,dteDate,.idOrder)
+				if $$$ISOK(strStatus) {
+					set ^CacheTempPOCreatedByReq(YUCI,YUSER)     = $get(^CacheTempPOCreatedByReq(YUCI,YUSER))_$$$COMMA_idOrder
+					set ^CacheTempPOCreatedByReqNext(YUCI,YUSER) = ^CacheTempPOCreatedByReq(YUCI,YUSER)
+					do AddEntry^COMChangeHistory(0,"INReqReleaseLine",YBED,"0,"_idReqLine,$$$Text($listbuild("IN00643",idOrder)))
+				} ; "Created Purchase Order %1"
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set strOrders = $get(^CacheTempPOCreatedByReq(YUCI,YUSER))
+		set ^CacheTempPOCreatedByReq(YUCI,YUSER)     = $extract(strOrders,2,$length(strOrders))
+		set ^CacheTempPOCreatedByReqNext(YUCI,YUSER) = ^CacheTempPOCreatedByReq(YUCI,YUSER)
+	}
+	quit strStatus
+	
+	
+ReleaseToOneOrder(pdteDate)
+	;-------------------------------------------------------------------------------
+	; Create the supplier orders for the sourced requisition lines.
+	; Note it consolidates like lines.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Sep-2007	PJones	BR014640:Put the new PO number in temp global
+	; 							^CacheTempPOCreatedByReqNext(YUCI,YUSER)
+	; 26-Sep-2007	PJones	Returns strStatus
+	; 01-Jun-2007	RPW		SR15513: Update the change history on all the
+	; 							requisitions for the order
+	; 28-Feb-2007	RPW		SR15465: Get Requisition Process No from Requisition
+	; 16-Feb-2007	RPW		SR15437: Only loop through the things we actually own.
+	; 22-Jan-2007	RPW		SR15365: Change to not have consolidated lines
+	; 17-Jan-2007	PO		SR15365: Store a copy of the purchase order id
+	; 05-Dec-2006	RPW		SR15359: Added call to change history.
+	; 29-Nov-2006	JW		SR15249: Added history line
+	; 30-Nov-2006	RPW		SR15249: Created
+	;-------------------------------------------------------------------------------
+	new arrLine,arrReq,fltQuantity
+	new idAgreement,idItem,idOrder,idReqLine,idSupplier,idxSupplier
+	new intCount,lstData,objReq,objReqLine,strForm,strKeys,strStatus
+	
+	set strStatus   = $$$OK
+	set strForm     = YFORM_"Line"
+	set idSupplier  = $$$INReqReleaseSupplier($$$GRIDYMFELDContainer)
+	set idxSupplier = $$$Index(idSupplier)    ; FIXME : Not used?
+	set intCount    = 0
+	
+	do GetLockIds^WWWMultiLock(YFORM,YFORM_"Line",YUSER)
+ 
+	set strKeys = ""
+	for {
+		set strKeys = $order(^CacheTempMultiLockIds(YUSER,YUCI,strKeys))
+		quit:strKeys=""
+		
+		set idReqLine = $$$KEYMAX(strKeys)
+ 
+		if $$$INRequisitionRelease($get(^INRequisition(0,0,idReqLine,1))) {
+			set strStatus = $$UpdateRequisition(idReqLine,strForm,.lstData)
+			if $$$ISOK(strStatus) {
+				set arrLine($increment(intCount),$listget(lstData,1),$listget(lstData,2)) = $listget(lstData,3)_Y_$listget(lstData,4)
+				set arrReq(intCount) = idReqLine
+			}
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	
+	kill ^CacheTempMultiLockIds(YUSER,YUCI)
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$CreateSupplierOrder(idSupplier,.arrLine,pdteDate,.idOrder)
+		if $$$ISOK(strStatus) {
+			set ^CacheTempPOCreatedByReq(YUCI,YUSER)     = idOrder
+			set ^CacheTempPOCreatedByReqNext(YUCI,YUSER) = idOrder
+			set intCount = ""
+			for {
+				set intCount = $order(arrReq(intCount))
+				quit:intCount=""
+				
+				do AddEntry^COMChangeHistory(0,"INReqReleaseLine",YBED,"0,"_arrReq(intCount),$$$Text($listbuild("IN00643",idOrder)))
+			} ;	"Created Purchase Order %1"
+		}
+	}
+	quit strStatus
+	
+	
+CreateSupplierOrder(pidSupplier,&parrLine,pdteDate,&pidOrder)
+	;-------------------------------------------------------------------------------
+	; Create the supplier orders for the products/ata numbers.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Feb-2010	PPP		SR17193: Set Qty to be in Purchase Units if it exists
+	; 25-Sep-2007   PJones  BR014640 Changed OrderCompleted to be $$$NO so we can
+	; 							edit it in INAUF
+	; 18-May-2007	RPW		SR15495: Fixed macro usage and value type for the field.
+	; 12-Apr-2007	RPW		SR15495: Do not update the agreement here.
+	; 28-Feb-2007	RPW		SR15465: Get the Requisition Process Number and add it
+	; 							to the PO Line.
+	; 22-Jan-2007	RPW		SR15365: Change to not have consolidated lines
+	; 17-Jan-2007	PO		SR15365: Return id of the purchase order created byRef
+	; 09-Jan-2007	RPW		SR15249: Created
+	;-------------------------------------------------------------------------------
+	new arrLines,arrLocks,arrReqOrders,blnClose,blnCreated,blnPartial
+	new fltDifference,fltConv,fltQuantity,fltReqQuantity
+	new idApproval,idATA,idClass,idItem,idOrder,idLastLine,idLine,idOrderType
+	new idReqLine,idReqOrder,idSupplier,idSupUnit,idUnit,intLoop
+	new objINARTK,objINReqToSup,objLine,objManualFields,objOrderLine,objReq,objReqLine
+	new strClass,strLock,strProcessNumber,strQuery,strStatus
+	new AUF,POS,YAUFTRAG,YATA,YKEY,YPOSITION
+	
+	set idOrderType = $$$OrderTypePurchase ; Order Type 2 = Supplier Order
+	set strStatus   = $$$OK
+	
+	set AUF      = ""
+	set YAUFTRAG = ""
+	set $$$INAUFSupplierNumber(YAUFTRAG) = pidSupplier
+	set $$$INAUFOrderType(YAUFTRAG)      = idOrderType  ;BARVERKAUF
+ 
+    // For SR15495 18-May-2007: This OrderCompleted should be marked as yes
+	// but SR BR014640 25-Sep-2007 asks for this to be marked as no 
+	// so that after creating a PO in the Releasing screen, it can still 
+	// be edited in INAUF
+	// -- PJones
+	set $$$INAUFOrderCompleted(YAUFTRAG)       = $$$NO
+	set $$$INAUFRequiredDeliveryDate(YAUFTRAG) = pdteDate
+	
+	do AUFTRAG^INAUFANLAGE
+	
+	set idLastLine = 0
+	
+	if AUF'="" {
+		set strQuery = "parrLine"
+		for {
+			set strQuery = $query(@strQuery)
+			quit:strQuery=""
+		
+			set YPOSITION        = ""
+			set objLine          = @strQuery
+			set fltQuantity      = $piece(objLine,Y,1)
+			set strProcessNumber = $piece(objLine,Y,2)
+			
+			set idItem = $qsubscript(strQuery,2)
+			set idUnit = $$$INARTUnitofMeasure($get(^INART(0,idItem,1)))
+			
+			//SR17193
+			set $$$INAUFPItemNumber(YPOSITION)      = idItem
+			set $$$INAUFPQuantityUnit(YPOSITION)	= idUnit       ; Inventory Unit
+			set $$$INAUFPQuantity(YPOSITION)		= fltQuantity  ; in Inventory Units
+			set $$$INAUFPOrderedUnit(YPOSITION)		= idUnit
+			set $$$INAUFPOrderedQuantity(YPOSITION)	= fltQuantity
+			
+			set objINARTK = $get(^INARTK(0,idItem,pidSupplier,1))
+			set idSupUnit = $$$INARTKDeliveryQuantityUnit(objINARTK)
+			
+			//SR17193 Set the Qty to be in Purchase Units 
+			;-------------------------------
+			; If require 16 Each and Supplier Unit is box (of 10 Each) then need to order 2 boxes
+			; 
+			; fltQuantity = 16   fltConv = 10   fltQuantity\fltConv = 1   $select = 1
+			; fltQuantity = 20   fltConv = 10   fltQuantity\fltConv = 2   $select = 0
+			;-------------------------------
+			if (idSupUnit'="") && (idUnit'=idSupUnit) {
+				set fltConv = $$GetUOMConversion^INUOMConversion(idItem,idSupUnit)
+				if fltConv {
+					set fltQuantity = (fltQuantity\fltConv) + $select((fltQuantity#fltConv):1,1:0)
+					set $$$INAUFPQuantity(YPOSITION)        = fltQuantity*fltConv
+					set $$$INAUFPOrderedUnit(YPOSITION)		= idSupUnit
+					set $$$INAUFPOrderedQuantity(YPOSITION)	= fltQuantity
+				}
+			}
+			
+			set $$$INAUFPRequisitionProcessNumber(YPOSITION) = strProcessNumber
+			
+			set idATA = $qsubscript(strQuery,3)
+			set YATA  = idATA
+			if YATA=" " set YATA = ""
+			set POS   = ""
+ 
+			do POSITION^INAUFANLAGE
+			
+			if '$data(^INAUFP(0,AUF,$increment(idLastLine))) {
+				set strStatus = "Unable to create Purchase Order Line "_idLastLine
+			;	set strStatus = "IN00628"  ; "Unable to create Purchase Order Line."
+			}
+		}
+	} else {
+		set strStatus = "IN00627"  ; "Unable to create Purchase Order."
+	}
+	set pidOrder = AUF
+	
+	quit strStatus
+	
+]]></Routine>
+</Export>

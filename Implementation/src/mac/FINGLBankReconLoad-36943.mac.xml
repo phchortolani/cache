@@ -1,0 +1,432 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLBankReconLoad" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLBankReconLoad
+	;-------------------------------------------------------------------------------
+	; Routines for loading Bank transaction files.
+	; 
+	; History
+	; 17-Feb-2005	GRF		Use Boolean & QSave Macros; add comments
+	;-------------------------------------------------------------------------------
+#include COMSYS
+#include FINConst
+#include COMConst
+		
+OnAfterDataFields(pidLoad)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 08-Feb-2006	RPW		SR13655: Added check for no key.
+	;------------------------------------------------------------------------------- 
+ 	new lstHeader,strStatus
+ 
+	set lstHeader = ""
+	set lstHeader = lstHeader_$lb($$$Text("Fin00396",0))  ;Bank Account
+	set lstHeader = lstHeader_$lb($$$StrFINGLTranLineDebit)
+	set lstHeader = lstHeader_$lb($$$StrFINGLTranLineCredit)
+	set lstHeader = lstHeader_$lb($$$StrFINGLTranLineReference)
+	set lstHeader = lstHeader_$lb($$$StrFINGLTranLineTransactionDate)
+	set lstHeader = lstHeader_$lb($$$Text("Fin00397",0))      ;Line Status
+	do Start^COMTable(lstHeader,$$$Text("Fin00387",0),1)	;Load Test.
+	
+	if '$$$NoKey(pidLoad) { // SR13655
+		set strStatus=$$LoadBankRecon(pidLoad,$$$YES,$$$NO)
+	
+		if $$$ISERR(strStatus) {
+			do NewLine^COMTable("red")
+			do InsertCell^COMTable($$$Text(strStatus,0),"","","","","",6)
+		} else {
+			do NewLine^COMTable("green")
+			do InsertCell^COMTable($$$Text("Fin00384"),"","","","","",6)  ;Passed.
+		}
+		do Stop^COMTable()
+	}
+	quit
+	
+ 
+	/*------------------------------------------------------------------------------
+	; Is this filename already used in the system?
+	;
+	; Params:
+	; pidLoad: The id of the bank reconciliation file load
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; strStatus: 1 if okay, an error string otherwise
+	;
+	; History:
+	; 08-Feb-2006	RobertW		SR13655: Created
+	;-----------------------------------------------------------------------------*/
+IsUsed(pidLoad)
+	new strStatus,objLoad,strFilename,idxFilename,dteDate,dteTime,idLoad
+	
+	set strStatus=$$$OK
+	
+	set objLoad=$get(^FINGLBankReconLoad(0,pidLoad,1))
+	if objLoad'="" {
+		set strFilename=##class(%Library.File).GetFilename($$$FINGLBankReconLoadImportFilePath(objLoad))
+		set idxFilename=$$$Index(strFilename)
+		if $data(^FINGLBankTrans(0,1,idxFilename)) {
+			if $data(^FINGLBankReconLoads(0,1,idxFilename)) {
+				set idLoad=""
+				for {
+					set idLoad=$order(^FINGLBankReconLoads(0,1,idxFilename,idLoad),-1) // Get the previous one
+					quit:idLoad'=pidLoad
+				}
+				if idLoad'="" {
+					set objLoad=$get(^FINGLBankReconLoad(0,idLoad,1))
+					if objLoad'="" {
+						set dteDate=$$^WWWDATE($$$FINGLBankReconLoadCreatedDate(objLoad))
+						set dteTime=$$^WWWTIME($$$FINGLBankReconLoadCreatedDate(objLoad))
+						set strStatus=$$$Text($listbuild("Fin00969",strFilename,$$$FINGLBankReconLoadCreatedBy(objLoad),dteDate,dteTime))  ;Bank Reconciliation File, %1 already loaded by %2 on %3
+					}
+				}
+			}
+		}
+	}
+	 
+	quit strStatus
+	
+LoadBankRecon(pidLoad,pblnDummy=$$$NO,pblnTest=$$$NO,pblnOverride=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Loads a bank recon file into the system
+	;
+	; History:
+	; 02-Feb-2006	SC		SR14102: don't specify year, get out of file
+	; 13-Sep-2005	RPW		SR13303: Fixed a possible error with resetting $zu(68,40,n)
+	; 10-Aug-2005	JW		Replace SAL with COM help text
+	; 01-Nov-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new strStatus,objBankReconLoad,strFile,intYear,enumMatch,strCurrentIO,blnCurrent
+	
+	kill ^CacheTemp(YUSER,"Bank")
+	
+	set strStatus=$$$OK
+	
+	set:'pblnOverride strStatus=$$IsUsed(pidLoad)
+	
+	if $$$ISOK(strStatus) {
+	
+		set objBankReconLoad=$get(^FINGLBankReconLoad(0,pidLoad,1))
+		set strFile=$$$FINGLBankReconLoadImportFilePath(objBankReconLoad)
+		;set intYear=$$$FINGLBankReconLoadYear1(objBankReconLoad) SR14102
+		set strCurrentIO=$io
+		set blnCurrent=$zutil(68,40)
+		
+		do $ZUTIL(68,40,1)     ; End-Of-File handling for sequential files - No <ENDOFFILE> error
+		if strStatus=$$$OK if strFile="" set strStatus=$$$Text("Fin00383")  ;No File Specified.
+		if strStatus=$$$OK open strFile:"RS":2 else  set strStatus=$listBuild("Com00224",strFile)  ; Cannot open file %1
+		
+		if strStatus=$$$OK {
+			use strFile
+			if $$$FINGLBankReconLoadFormatType(objBankReconLoad)=$$$EnumFINGLBANKFORMATTYPEUSFormat {
+				;set strStatus=$$LoadUSFormat(strFile,intYear,pblnDummy,pblnTest)
+				set strStatus=$$LoadUSFormat(pidLoad,strFile,pblnDummy,pblnTest) ;SR14102
+			}
+			use strCurrentIO
+			close strFile	
+		}
+		
+		do $zutil(68,40,blnCurrent)
+	}
+ 
+	quit strStatus
+ 
+ 
+ ;LoadUSFormat(pstrFile,pintYear,pblnDummy=0,pblnTest=0) SR14102
+LoadUSFormat(pidLoad,pstrFile,pblnDummy=0,pblnTest=0)
+	;-------------------------------------------------------------------------------
+	; Reads the file and either loads the file in or display a sample output
+	; to the screen.
+	;
+	; Returns:Status
+	; 
+	; Example of proper format:
+	; a      ,b ,c                   ,d                        ,    e,         f      
+	; 4019259,CR,DIRECT DEPOSIT      ,SIC MAIN  SWEEP          , 7/26,   7700.00      
+ 	; 0953173,DR,MISC BANK CHARGE    ,                         , 8/27,  15000.00        
+ 	; 
+ 	; where:
+ 	; 	a = Bank Account Number
+ 	; 	b = Credit/Debit Switch
+ 	; 	c = Words for Credit/Debit Switch (Not used)
+ 	; 	d = Reference
+ 	; 	e = Date (year component is passed in)
+ 	; 	f = Amount
+ 	; 
+	; History:
+	; 19-Oct-2006	JW		SR15134: Look at save status.
+	; 21-Feb-2006	RPW		SR14229: Undid SR13304, need full amounts to match transactions.
+	; 						Make 10 equal 10.00 if decimal points = 2
+	; 08-Feb-2006	RPW		SR13655: Store the filename into the data structure
+	; 01-Feb-2006	SC		SR14102: don't specify year, get out of file
+	; 27-Sep-2005	JW		SR13304: + amounts as they are to be indexed.
+	; 22-Sep-2005	JW		SR13500: Use comma delimiter, not fixed width. Cleaned up status usage.
+	; 17-Feb-2005	GRF		Direct call to COMUtilDate; add comments
+	; 21-Oct-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new strLine,strStatus,intLine,idBankAccount,blnWithdraw,curAmount,curDebit,strDate
+	new curCredit,idAccount,strReference,dteDate,intPassed,idException,objException,strFile
+	
+	set strStatus = $$$OK
+	set intLine   = 0
+	set intPassed = 0
+	
+	set strFile=##class(%Library.File).GetFilename(pstrFile) // 13655
+	
+	for {
+		quit:$zeof=-1
+		quit:$$$ISERR(strStatus)
+		
+		set intLine=intLine+1
+		read strLine
+		if strLine'="" {
+ 			set idBankAccount 	=  $piece(strLine,",",1)
+ 			set blnWithdraw 	=  ($zstrip($piece(strLine,",",2),"<>W")="DR")
+ 			
+ 			set strReference 	=  $zstrip($piece(strLine,",",4),"<>W")
+ 			set strDate 		=  $zstrip($piece(strLine,",",5),"<>W")
+ 			set curAmount 		=  $$$RoundToDecimalPoints("USD",$zstrip($piece(strLine,",",6),"<>W")) // 14229
+ 			
+			set curDebit  = $select(blnWithdraw:curAmount,1:0) //14229
+			set curCredit = $select('blnWithdraw:curAmount,1:0) //14229
+			
+			set strStatus=$$ConvertDate^COMUtilDate(strDate,,.dteDate) ;SR14102
+			
+			if $$$ISOK(strStatus) {
+				if idBankAccount="" {
+					set strStatus=$listbuild("Fin00392")  ;No Bank Account
+					
+				} elseif '$data(^FINGLBanks(0,1,$$$Index(idBankAccount))) {
+					set strStatus=$listbuild("Fin00393",idBankAccount)  ;Bank account number '%1' is not defined in bank account setup.
+					
+				} else {
+					set idAccount=$order(^FINGLBanks(0,1,$$$Index(idBankAccount),""))
+					
+					if 'pblnDummy&&'pblnTest {
+						set idException=$order(^FINGLBankTran(0,idAccount,""),-1)+1
+						set objException=""
+						set $$$FINGLBankTranDebitAmount(objException)     = curDebit		//JW //14229
+						set $$$FINGLBankTranCreditAmount(objException)    = curCredit		//JW //14229
+						set $$$FINGLBankTranTransactionDate(objException) = dteDate
+						set $$$FINGLBankTranReference(objException)       = strReference
+						set $$$FINGLBankTranLoadFile(objException)        = strFile
+						set strStatus = $$$Save("FINGLBankTran",idAccount_","_idException,objException,1)		//SR15134
+					}
+				}
+			}
+			if $$$ISERR(strStatus) {
+				set strStatus=$listbuild("Fin00385",intLine,$$$Text(strStatus,0))  ;Line %1 failed. Reason: %2
+				if pblnDummy {
+					if intPassed>0 {
+						do NewLine^COMTable("green")
+						do InsertCell^COMTable($$$Text($listbuild("Fin00398",intPassed),0),"","","","","",6)  ;'%1' lines passed successfully.
+						set intPassed=0
+					}
+					do NewLine^COMTable()
+					do InsertCell^COMTable(idBankAccount)
+					do InsertCell^COMTable(curDebit)
+					do InsertCell^COMTable(curCredit)
+					do InsertCell^COMTable(strReference)
+					do InsertCellDate^COMTable(dteDate)
+					do InsertCell^COMTable("<FONT style='color:red'>"_$$$Text(strStatus,0)_"<FONT>")
+					do EndLine^COMTable()
+				}
+			} else {
+				set intPassed=intPassed+1
+			}
+		}
+	}
+	if pblnDummy&&(intPassed>0) {
+		do NewLine^COMTable("green")
+		do InsertCell^COMTable($$$Text($listbuild("Fin00398",intPassed),0),"","","","","",6)  ;'%1' lines passed successfully.
+		set intPassed=0
+	}
+	
+	quit strStatus
+ 
+	/*------------------------------------------------------------------------------
+	; History:
+	; 08-Feb-2006	RobertW		SR13655: Always allow generation unless we have no key
+	;-----------------------------------------------------------------------------*/
+Generateable(pidLoad)
+	new strStatus
+	
+	quit:$$$NoKey(pidLoad) // SR13655
+	
+	set YQ=$$$QSave
+ 
+	quit
+ 
+	/*------------------------------------------------------------------------------
+	; Prepares to check if this load file is already used
+	;
+	; Params:
+	; a : nothing dummy
+	; b : nothing dummy
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Feb-2006	RobertW		SR1655: Created
+	;-----------------------------------------------------------------------------*/
+HyperEvent(a,b)
+	write "var retval = EventValue("""_YUCI_""","""_YUSER_""","""_YFORM_""",""FIX"",""GetPermission^FINGLBankReconLoad"",document.WWW2.YFINGLBankReconLoadP1.value,""6"","""")"
+	quit ""
+ 
+ 
+	/*------------------------------------------------------------------------------
+	; Determines whether this file has been loaded and if so throw up a message
+	; otherwise just load in the file
+	;
+	; Params:
+	; pidLoad  : The id of the bank reconciliation load
+	; pstrDummy: A dummy variable
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; Empty String
+	;
+	; History:
+	; 08-Feb-2006	RobertW		SR13655: Created
+	;-----------------------------------------------------------------------------*/
+GetPermission(pidLoad,pstrDummy)
+ 
+	new strStatus
+ 
+	set strStatus=$$IsUsed(pidLoad)
+	
+	if $$$ISERR(strStatus) {
+		do VBConfirm^COMConst(strStatus_YCR_YCR_$$$Text("Fin00970"),36,$$$Text("Com00179"))
+	} else {
+		write "var x="_$$$ButtonYes_";"
+	}
+	
+	write "var retval = EventValue("""_YUCI_""","""_YUSER_""","""_YFORM_""",""FIX"",""Generate^FINGLBankReconLoad"","""_pidLoad_""",""6"",x)"
+	
+	quit ""
+	
+ 
+	/*------------------------------------------------------------------------------
+	; This actually performs the generation of the lines if the user clicked the yes
+	; or the system set the yes button click
+	;
+	; Params:
+	; pidLoad    : The id of the bank reconciliation load
+	; penumButton: The id of the button, ButtonYes or ButtonNo
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Feb-2006	RobertW		SR1655: Created
+	;-----------------------------------------------------------------------------*/
+Generate(pidLoad,penumButton)
+	new strStatus
+	
+	if penumButton=$$$ButtonYes {
+		set strStatus=$$GenerateLines(pidLoad)
+	}
+	quit ""
+	
+	
+GenerateLines(pidLoad)
+	;-------------------------------------------------------------------------------
+	; Generates lines and exceptions for a file load. Then shows all un-posted
+	; recons.
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Oct-2006	JW		SR15134: Look at save status. Cleaned up.
+	; 08-Feb-2006	RPW		SR13655: Do not need to handle errors anymore.
+	; 17-Feb-2005	GRF		SR11273: TLEVEL required for TCOMMIT not TROLLBACK
+	; 25-Oct-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new objBankReconLoad,strStatus,lstHeader,strBankAccount,idBankRecon,objBankRecon
+		
+	set strStatus=$$$OK
+		
+	tstart
+	set strStatus=$$LoadBankRecon(pidLoad,$$$NO,$$$NO,$$$YES)
+	if $$$ISOK(strStatus) {
+		set objBankReconLoad=$get(^FINGLBankReconLoad(0,pidLoad,1))
+		set $$$FINGLBankReconLoadFilename(objBankReconLoad)=##class(%Library.File).GetFilename($$$FINGLBankReconLoadImportFilePath(objBankReconLoad))
+		set $$$FINGLBankReconLoadImportFilePath(objBankReconLoad)=""
+		set strStatus = $$$Save("FINGLBankReconLoad",pidLoad,objBankReconLoad,1)		//SR15134
+	}
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+		do RedirectForm^COMUtilForm("FINGLBankReconOutstanding",YBED,YFORM_",",YPARA,YSEITE)
+	} else {
+		trollback
+	}
+	quit strStatus
+	
+	
+CreateDummy(pidAccount="",pstrFilePath="//Galileo/DiscLinc/Test.txt",pstrMaxLines=100)
+	;-------------------------------------------------------------------------------
+	; Create a dummy file for testing purposes. 
+	; 
+	; Example format;
+	; 4019259,CR,DEPOSIT             ,                         , 7/26,  22971.11
+	; 
+	; History:
+	; 25-Oct-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+    new objBankRecon,strIO,idAccount,strAccount,objBankAccount,idBankAccount,dteTransdate
+    new intCount,strRef,idTran,idLine,objTranLine,strStatus,curAmount
+ 
+ 	set strStatus = $$$OK
+ 	set intCount  = 0
+ 	
+	if pidAccount'="" {
+	 	set strIO=$io
+	 	open pstrFilePath:"WNS":2 else  set strStatus=$listBuild("SALCST1002",pstrFilePath)  ; Can not Open File %1
+	 	
+	 	if strStatus=$$$OK {
+		 	use pstrFilePath
+			set strAccount     = $$$Index(pidAccount)
+			set objBankAccount = $get(^FINGLBank(0,pidAccount,1))
+			set idBankAccount  = $extract($$$FINGLBankBankAccountNumber(objBankAccount),1,7)
+			set idTran         = ""
+			
+			for {
+				set idTran=$order(^FINGLTranLines(0,2,strAccount," ",idTran))
+				quit:idTran=""
+				quit:intCount>pstrMaxLines
+				
+				set idLine=""
+				for {
+					set idLine=$order(^FINGLTranLines(0,2,strAccount," ",idTran,idLine))
+					quit:idLine=""
+					quit:intCount>pstrMaxLines
+					
+					set objTranLine=$get(^FINGLTranLine(0,idTran,idLine,1))
+					set curAmount=$zabs($$$FINGLTranLineDebit(objTranLine)-$$$FINGLTranLineCredit(objTranLine))
+					write idBankAccount_","
+					if $$$FINGLTranLineDebit(objTranLine) {
+						write "DR,"
+					} else {
+						write "CR,"
+					}
+					write $justify("",20)_","
+					write $justify($extract($$$FINGLTranLineReference(objTranLine),1,25),25)_","
+					write $justify($piece($zdt($$$FINGLTranLineTransactionDate(objTranLine)),"/",1,2),5)_","
+					write $justify(curAmount,10,2)
+					write !
+					set intCount=intCount+1
+				}
+			}
+			use strIO
+			close pstrFilePath 
+	 	}
+	}
+	quit strStatus
+	
+]]></Routine>
+</Export>

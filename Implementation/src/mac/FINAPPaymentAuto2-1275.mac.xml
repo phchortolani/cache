@@ -1,0 +1,450 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPPaymentAuto2" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPPaymentAuto2
+    ;-------------------------------------------------------------------------------
+    ; FINAPPaymentAuto2 - Routines related to Auto Payment
+    ;-------------------------------------------------------------------------------
+	#include FINConst
+	#include WWWConst
+	#include COMSYS
+	#include FINSYS
+ 
+AutoPayJob(pidPayment)
+	;-------------------------------------------------------------------------------
+	; Create Auto Payment Lines via a back ground job.
+	;
+	; Params:
+	; pidPayment - 
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Aug-2006	PO		SR14869: Moved from AutoPayJob^FINAPPaymentAuto
+	;-------------------------------------------------------------------------------
+    new Log
+	
+	if '$$$NoKey(pidPayment) {
+		if $$$FINAPPaymentStatus($get(^FINAPPayment(YM,pidPayment,1)))'=$$$EnumFINSYSSTATUSUnposted {
+			do ReloadForm^COMUtilForm()
+		} else {
+			do StartLog^COMLog($$$Text($listbuild("Fin00766",pidPayment)),.Log)  ;Creation of Auto Payment Lines for Payment %1.
+			do JobWrapper^COMUtilJob("AutoPay^FINAPPaymentAuto2("""_pidPayment_""","""","""_Log_""")",YUSER)
+			do RedirectForm^COMUtils("COMMsg",Log,"FINAPPayment,","","")
+		}
+	}
+	
+	quit
+ 
+AutoPay(pidPayment,pblnTest=$$$NO,pidLog="")
+	;-------------------------------------------------------------------------------
+	; Either creates an auto paymemt, or tests to see if an auto payment can be created.
+	;
+	; Params:
+	; pidPayment - Supplier Payment Id
+	; pblnTest - Whether this is a test run
+	; pidLog - Log Id
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 08-Nov-2006	JW		SR15200: Don't alert during background job. Look at kill status
+	; 02-Aug-2006	PO		SR14869: Moved from AutoPay^FINAPPaymentAuto
+	;-------------------------------------------------------------------------------
+	new strStatus,arrStatus,objPayment,idAccount,idSupplier,objPaymentLine,ControlLoop,idPayLine
+	new fltAmountDue,blnFoundSupplier,intAdded,intIgnored,idAdded,idIgnored,idDepartment
+	new strAccounts,blnSplitByDepartment,blnNonePaid,idxAccount
+ 
+	set $ztrap="AutoPayError"
+	
+	kill ^CacheTempPaymentLine(YUSER)
+	kill ^CacheTempPaymentInvoice(YUSER)
+ 
+	set strStatus = $$$OK
+	if '$$$NoKey(pidPayment) {
+		set objPayment = $get(^FINAPPayment(YM,pidPayment,1))
+		set $$$FINAPPaymentStoredStatus(objPayment) = $$$FINAPPaymentStatus(objPayment)
+		set $$$FINAPPaymentStatus(objPayment) = $$$EnumFINSYSSTATUSProcessing
+ 
+		set strStatus = $$$Save("FINAPPayment",pidPayment,objPayment,$$$YES)
+ 
+		if $$$ISOK(strStatus) {
+			if 'pblnTest {
+				//do KillLines^FINAPPayment(pidPayment,$$$YES)	//SR15200
+				set strStatus = $$KillLines^FINAPPayment(pidPayment,$$$YES)
+			} else {
+				set strStatus = $$Editable^FINAPPayment(pidPayment)
+				if $$$ISOK(strStatus) {
+					if $$$FINAPPaymentPaymentMethod(objPayment) = $$$EnumFINARBANKLINEMETHODZeroPayment {
+						set strStatus = $listbuild("Fin00730")		;Zero payments must be made manually.
+					} elseif $$$FINAPPaymentPaymentMethod(objPayment) = $$$EnumFINARBANKLINEMETHODCash {
+						 set strStatus = $listbuild("Fin00406")		;Cash payments must be made manually
+					}
+				}
+			}
+		}
+		if $$$ISOK(strStatus) {
+			if $$$FINAPPaymentControlAccounts(objPayment) = "" {
+				set $$$FINAPPaymentControlAccounts(objPayment) = $$GetSupplierControl^FINAPSupplier()
+			}
+ 
+			set blnFoundSupplier = $$$NO
+			set blnSplitByDepartment = $$SplitSupPaysByDepartment^FINGeneralSetup() // SR14869
+ 
+			set strAccounts = $$$FINAPPaymentControlAccounts(objPayment)
+			for ControlLoop = 1:1:$length(strAccounts,";") {
+				set idAccount = $piece(strAccounts,";",ControlLoop)
+				quit:(idAccount="") ; SR11570
+				set idxAccount = $$$Index(idAccount)
+ 
+				if pidLog '= "" {
+					do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00767",idAccount)))	;Processing Suppliers for Control Account %1.
+					set intAdded   = 0
+					set intIgnored = 0
+					set idAdded    = ""
+					set idIgnored  = ""
+				}
+ 
+				$$$Order4(^FINAPSuppliers,YM,2,idxAccount,idSupplier) ; loop through each supplier in the control account
+					if $$GetFCCode^FINAPSupplier(idSupplier) '= "" {
+						if pidLog '= "" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00769",$increment(intIgnored))),.idIgnored)  ;%1 Ignored.
+						continue ; Only base currency suppliers can be auto paid at FINAPPayment level
+					}
+ 					
+					set strStatus = $$AddSupplier(idSupplier,$$$FINAPPaymentPaymentMethod(objPayment),$$$FINAPPaymentDueDate(objPayment),blnSplitByDepartment,$$$FINAPPaymentGroup1(objPayment),$$$FINAPPaymentLocation(objPayment))
+ 					
+					set blnNonePaid = $$$YES
+					if $$$ISOK(strStatus)&&('pblnTest)&&('$data(^FINAPPaymentLines(YM,1,pidPayment,idSupplier))) { // Why is this check of PayLines index here ?
+						$$$Order2(^CacheTempInvoice,YUSER,idDepartment)
+							set fltAmountDue = +$get(^CacheTempInvoice(YUSER,idDepartment))
+							continue:fltAmountDue=0
+ 							
+							set objPaymentLine = ""
+							set $$$FINAPPaymentLineSupplierNumber(objPaymentLine) = idSupplier
+							set $$$FINAPPaymentLineAutoAllocate(objPaymentLine)   = $$$YES
+							set $$$FINAPPaymentLineTotal(objPaymentLine)          = fltAmountDue
+							set $$$FINAPPaymentLineStatus(objPaymentLine)         = $$$EnumFINSYSSTATUSUnposted
+							set idPayLine = $order(^FINAPPaymentLine(YM,pidPayment,""),-1) + 1
+							if idDepartment '= $char(255) {
+								set $$$FINAPPaymentLineDepartment(objPaymentLine) = idDepartment
+							}
+ 
+							set ^CacheTempPaymentLine(YUSER,pidPayment,idPayLine) = objPaymentLine
+							kill ^CacheTempPaymentInvoice(YUSER,pidPayment,idPayLine)
+ 							
+							if $$$ISOK($$CreateAndPayInvoices(pidPayment,idPayLine,idDepartment)) {
+								if pidLog '= "" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00768",$increment(intAdded))),.idAdded)  ;%1 Added.
+ 								
+								do CreateAccounts^FINAPPaymentAccount(pidPayment,idPayLine)
+								set blnNonePaid = $$$NO
+							}
+						$$$End
+						set blnFoundSupplier = $$$YES
+					} else {
+						set arrStatus(strStatus) = $get(arrStatus(strStatus)) + 1
+					}
+					if blnNonePaid {
+						if pidLog '= "" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00769",$increment(intIgnored))),.idIgnored)  ;%1 Ignored.
+					}
+				$$$End
+			}
+		}
+ 
+		if '$data(blnFoundSupplier) {
+			//$$$AlertInScript($$$Text(strStatus))		//SR15200
+			if pidLog '= "" do AddMessage^COMLog(pidLog,$$$Text(strStatus))
+		} elseif 'blnFoundSupplier {
+			if $data(arrStatus) {
+				//set strMessage = $$$Text("Fin00722")_$$$CRLF  	//SR15200
+				if pidLog '= "" do AddMessage^COMLog(pidLog,$$$Text("Fin00722"))  ;Cannot create auto run. Reason(s):
+ 
+				$$$Order1(arrStatus,strStatus)
+					//set strMessage = strMessage_$$$Text(strStatus)_" ("_arrStatus(strStatus)_")"_$$$CRLF				//SR15200
+					if pidLog '= "" do AddMessage^COMLog(pidLog,"- "_$$$Text(strStatus)_" ("_arrStatus(strStatus)_")")
+				$$$End
+			} else {
+				//set strMessage = $$$Text($listbuild("Fin00716",$tr($$$FINAPPaymentControlAccounts(objPayment),";"," ")))  		//SR15200
+				if pidLog '= "" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00716",$tr($$$FINAPPaymentControlAccounts(objPayment),";"," "))))  ;No Suppliers found for Control Accounts: %1.
+			}
+			//$$$AlertInScript(strMessage)		//SR15200
+		}
+ 
+		set $$$FINAPPaymentStatus(objPayment) = $$$FINAPPaymentStoredStatus(objPayment)
+		set $$$FINAPPaymentStoredStatus(objPayment) = ""
+ 
+		set strStatus = $$$Save("FINAPPayment",pidPayment,objPayment,$$$YES)
+	}
+ 
+	kill ^CacheTempInvoice(YUSER)
+	kill ^CacheTempPaymentLine(YUSER)
+	kill ^CacheTempPaymentInvoice(YUSER)
+ 
+	if pidLog="" {
+		do ReloadForm^COMUtilForm()	
+	} else {
+		do AddMessage^COMLog(pidLog,$$$Text("Fin00770"))  ;Auto Create Finished.
+	}
+ 
+	quit
+	
+AutoPayError ; Internal Tag
+ 
+	set $ztrap = ""
+ 
+	if $get(pidPayment) '= "" {
+		set objPayment = $get(^FINAPPayment(YM,pidPayment,1))
+		set $$$FINAPPaymentStatus(objPayment) = $$$FINAPPaymentStoredStatus(objPayment)
+		set $$$FINAPPaymentStoredStatus(objPayment) = $zerror
+ 
+		do Save^FINSYS("FINAPPayment",pidPayment,objPayment,1)
+	}
+ 
+	kill ^CacheTempInvoice(YUSER)
+	kill ^CacheTempPaymentLine(YUSER)
+	kill ^CacheTempPaymentInvoice(YUSER)
+ 
+	quit
+ 
+AddSupplier(pidSupplier,pintMethod="",pdteDueDate="",pblnSplitByDepartment,pidDepartment,pidLocation)
+	;-------------------------------------------------------------------------------
+	; For a given supplier, can they be included in this payment run?
+	;
+	; Params:
+	; pidSupplier - Supplier Id
+	; pintMethod - Payment Method
+	; pdteDueDate - 
+	; blnSplitByDepartment - Whether to split by department (this and the next two added for 14869)
+	; pidDepartment - Department Id
+	; pidLocation - Location Id
+	;
+	; ByRefs: None
+	;
+	; Returns: $$$OK if there is an amount due, otherwise error message
+	;
+	; History:
+	; 19-Mar-2007	JW		SR15453: Check status
+	; 20-Sep-2006	JW		SR14612: Only do EFT/Cheque run for suppliers with that method
+	; 02-Aug-2006	PO		SR14869: Moved from AddSupplier^FINAPPaymentAuto
+	;-------------------------------------------------------------------------------
+	new strStatus,objSupplier,idSuppMethod
+ 	
+	//set strStatus = $$$OK
+ 	set strStatus = $$CanPay^FINDAPSupplier(pidSupplier)	//SR15453
+ 	
+ 	if $$$ISOK(strStatus) {
+		set objSupplier = $get(^FINAPSupplier(YM,pidSupplier,1))
+		//set strBankAcc  = $$$FINAPSupplierBankAccountNumber(objSupplier)
+	 	
+		if $$$FINAPSupplierOnHold(objSupplier) {
+			set strStatus = $listbuild("Fin00718")  ;Supplier On Hold
+			
+		} else {
+			set idSuppMethod = $$$FINAPSupplierMethodofPayment(objSupplier)
+			
+			//if (pintMethod = $$$EnumFINARBANKLINEMETHODCheque) && (strBankAcc '= "") {	SR14612
+			if (pintMethod = $$$EnumFINARBANKLINEMETHODCheque) && (idSuppMethod '= $$$EnumPayByCheque) {		// Cheque
+				set strStatus = $listbuild("Fin00719")  ;Supplier does not use cheque
+				
+			//} elseif (pintMethod = $$$EnumFINARBANKLINEMETHODEFT) && (strBankAcc = "") {	SR14612
+			} elseif (pintMethod = $$$EnumFINARBANKLINEMETHODEFT) && (idSuppMethod '= $$$EnumPayByEFT) {	// EFT
+				set strStatus = $listbuild("Fin00720")  ;Supplier does not use EFT
+				
+			} elseif '$$AmountDue^FINAPSupplier(pidSupplier,pdteDueDate,pblnSplitByDepartment,pidDepartment,pidLocation) {
+				set strStatus = $listbuild("Fin00721")  ;No Payment Required By Due Date.
+			}
+		}
+	}
+	quit strStatus
+ 
+PayInvoice(pidPay,pidPayLine,pidPayInvoice,pcurAmountToPay,pcurAmountDiscount)
+	;-------------------------------------------------------------------------------
+	; Set fields on invoice appropriately for paying
+	;
+	; Params:
+	; pidPay - Supplier Payment Id
+	; pidPayLine - Supplier Payment Line Id
+	; pidPayInvoice - Supplier Payment Invoice Id
+	; pcurAmountToPay - Amount to pay
+	; pcurAmountDiscount - Discount amount
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 02-Aug-2006	PO		SR14869: Moved from PayInvoice^FINAPPaymentInvoice
+	;-------------------------------------------------------------------------------
+	new objPayInvoice,curBalance,blnApplyDiscount
+ 
+	set blnApplyDiscount       = ''pcurAmountDiscount
+	set objPayInvoice          = $get(^CacheTempPaymentInvoice(YUSER,pidPay,pidPayLine,pidPayInvoice))
+	set $$$FINAPPaymentInvoiceDiscountApplied(objPayInvoice) = blnApplyDiscount
+	set $$$FINAPPaymentInvoicePayAmount(objPayInvoice)       = pcurAmountToPay
+	set curBalance = $$$FCSub($$$FINAPPaymentInvoiceAmountOwing(objPayInvoice),$$$FINAPPaymentInvoicePayAmount(objPayInvoice))
+	set $$$FINAPPaymentInvoiceInvoiceBalance(objPayInvoice)  = curBalance
+	set $$$FINAPPaymentInvoicePay(objPayInvoice)             = (pcurAmountToPay'=0)
+ 
+	set ^CacheTempPaymentInvoice(YUSER,pidPay,pidPayLine,pidPayInvoice) = objPayInvoice
+ 
+	quit
+ 
+GetDiscount(pidPay,pidPayLine,pidInvoice) // generalise and pass in payline & payinvoice
+	;-------------------------------------------------------------------------------
+	; Determine whether this settlement discount should be applied in for the payment date
+	;
+	; Params:
+	; pidPay - Supplier Payment Id
+	; pidPayLine - Supplier Payment Line Id
+	; pidInvoice - Supplier Payment Invoice Id
+	;
+	; ByRefs: None
+	;
+	; Returns: Discount amount
+	;
+	; History:
+	; 02-Aug-2006	PO		SR14869: Moved from CreatePaymentInvoices^FINAPPaymentInvoice
+	;-------------------------------------------------------------------------------
+	new objPay,objPayInvoice,dtePayDate,dteDueDate,curDiscount,objPayLine
+ 
+	set objPay        = $get(^FINAPPayment(YM,pidPay,1))
+	set objPayLine    = $get(^CacheTempPaymentLine(YUSER,pidPay,pidPayLine))
+	set objPayInvoice = $get(^CacheTempPaymentInvoice(YUSER,pidPay,pidPayLine,pidInvoice))
+ 
+	set dtePayDate  = $$$FINAPPaymentPaymentDate(objPay)
+	set dteDueDate  = $$$FINAPPaymentInvoiceDueDate(objPayInvoice)
+	set curDiscount = 0
+	if dtePayDate '> dteDueDate {
+		set curDiscount = $$$FINAPPaymentInvoiceDiscount(objPayInvoice)
+	} elseif dtePayDate '> (dteDueDate + $$GetGraceDays^FINAPSupplier($$$FINAPPaymentLineSupplierNumber(objPayLine))) {
+		set curDiscount = $$$FINAPPaymentInvoiceDiscount(objPayInvoice)
+	} else {
+		set curDiscount = 0
+	}
+ 
+	quit curDiscount
+ 
+CreateAndPayInvoices(pidPay="",pidPayLine="",pidDepartment)
+	;-------------------------------------------------------------------------------
+	; Create invoices and flag to be paid if due
+	;
+	; Params:
+	; pidPay - Supplier Payment Id
+	; pidPayLine - Supplier Payment Line Id
+	; pidDepartment - Department Id
+	;
+	; ByRefs: None
+	;
+	; Returns: $$$OK if successfully created and paid an invoice, otherwise $$$NO or error message.
+	;
+	; History:
+	; 02-Aug-2006	PO		SR14869: Moved from CreatePaymentInvoices^FINAPPaymentInvoice
+	;-------------------------------------------------------------------------------
+	new strStatus,idSupplier,idInvoice,dtePayment,intGraceDays,curTotalPayments,curTotalDiscounts
+	new objPayLine,objInvoice,objPayInvoice,dtePayDueDate,dteNewDueDate,blnAdd,blnPay,strLocation
+	new strGroup,objPay,blnAlreadyExists,curAmount,curAmountDiscount,idPayInvoice
+ 
+	set strStatus = $$$NO
+	if pidPay = "" set pidPay = " "
+	if pidPayLine = "" set pidPayLine = " "
+	set objPayLine = $get(^CacheTempPaymentLine(YUSER,pidPay,pidPayLine))
+ 
+	set objPay        = $get(^FINAPPayment(YM,pidPay,1))
+	set strLocation   = $$$FINAPPaymentLocation(objPay)
+	set strGroup      = $$$FINAPPaymentGroup1(objPay)
+	set dtePayDueDate = $$$FINAPPaymentDueDate(objPay)
+ 
+	set dtePayment    = $$$FINAPPaymentPaymentDate(objPay)
+	if dtePayment = "" set dtePayment = +$horolog
+ 
+	set idSupplier   = $$$FINAPPaymentLineSupplierNumber(objPayLine)
+	set intGraceDays = $$GetGraceDays^FINAPSupplier(idSupplier)
+	do RemoveUnusedInvoices^FINAPPaymentInvoice(pidPay,pidPayLine,idSupplier) // Is this in place because Auto Create is allowed to be performed more than once ?
+																			  // IF SO use of cache temps will be a problem
+ 
+	if idSupplier '= "" {
+		set curTotalPayments  = 0
+		set curTotalDiscounts = 0
+ 
+		$$$Order3(^CacheTempInvoice,YUSER,pidDepartment,idInvoice)
+			set objInvoice = $get(^CacheTempInvoice(YUSER,pidDepartment,idInvoice))
+ 
+			if '$data(^FINAPPaymentInvoice(YM,pidPay,pidPayLine,idInvoice)) {  ;if the invoice does not exist yet...
+				set objPayInvoice = ""
+				set $$$FINAPPaymentInvoiceAmountOwing(objPayInvoice) = $$$FINAPInvoiceBalance(objInvoice)
+				set $$$FINAPPaymentInvoiceDueDate(objPayInvoice)     = $$$FINAPInvoiceDueDate(objInvoice)
+				set dteNewDueDate = $$$FINAPPaymentInvoiceDueDate(objPayInvoice) + intGraceDays
+				if dteNewDueDate >= dtePayment {
+					set $$$FINAPPaymentInvoiceDiscountApplied(objPayInvoice) = $$$YES
+				}
+				set $$$FINAPPaymentInvoiceDiscount(objPayInvoice)=$$$FINAPInvoiceSettlementDiscount(objInvoice)
+				set blnAlreadyExists = $$$NO
+			} else {
+				set objPayInvoice = $get(^FINAPPaymentInvoice(YM,pidPay,pidPayLine,idInvoice,1))
+				set blnAlreadyExists = $$$YES
+			}
+			set blnAdd = $$$YES  ; Create flag
+			;if $$$FCZero($$$FINAPInvoiceBalance(objInvoice)) { <- done by AmountDue^FINAPSupplier
+			;	set blnAdd = $$$NO		; if the outstanding amount of the invoice <> 0
+			;} elseif (strLocation '= "") && (strLocation '= $$$FINAPInvoiceLocation(objInvoice)) {
+			;	set blnAdd = $$$NO		; Location Filter
+			;} elseif (strGroup '= "") && (strGroup '= $$$FINAPInvoiceDepartment(objInvoice)) {
+			;	set blnAdd = $$$NO		; Group Filter
+			;} else
+			if $$CheckForUnposted^FINAPPaymentInvoice(pidPay_$$$COMMA_pidPayLine_$$$COMMA_idInvoice,idSupplier) {
+				set blnAdd = $$$NO
+			}
+			if blnAdd {
+				if 'blnAlreadyExists set $$$FINAPPaymentInvoiceInvoiceBalance(objPayInvoice) = $$$FINAPInvoiceBalance(objInvoice)
+				set $$$FINAPPaymentInvoiceInvoiceDate(objPayInvoice)           = $$$FINAPInvoiceInvoiceDate(objInvoice)
+				set $$$FINAPPaymentInvoiceOriginalInvoiceAmount(objPayInvoice) = $$$FINAPInvoiceOriginalInvoiceAmount(objInvoice)
+ 
+				if $$$FINAPPaymentInvoiceAmountOwing(objPayInvoice) < 0 {
+					set $$$FINAPPaymentInvoiceCredit(objPayInvoice) = $$$YES
+					;set blnCreditRun = $$$YES
+					set blnPay = $$$YES
+				} else {
+					;set blnCreditRun = $$$NO
+					set blnPay = ($$$FINAPPaymentInvoiceDueDate(objPayInvoice) <= dtePayDueDate)
+				}
+ 
+				set ^CacheTempPaymentInvoice(YUSER,pidPay,pidPayLine,idInvoice) = objPayInvoice
+ 
+				if blnPay {
+					set curAmountDiscount = $$GetDiscount(pidPay,pidPayLine,idInvoice)
+					set curAmount         = $$$FINAPPaymentInvoiceAmountOwing(objPayInvoice)
+					set curTotalPayments  = $$$FCAdd(curTotalPayments,curAmount)
+					do PayInvoice(pidPay,pidPayLine,idInvoice,curAmount,curAmountDiscount)
+					set curTotalDiscounts = $$$FCSub(curTotalDiscounts,curAmountDiscount)
+				} 
+				;elseif ((curAmount>=0)&&(blnCreditRun))||((curAmount<0)&&('blnCreditRun)) { // Why check for credit run, credit runs are always paid
+				;	do PayInvoice(pidPay,pidPayLine,idInvoice,0,0)
+				;}
+			}
+		$$$End
+ 
+		set curAmount = $$$FCAdd(curTotalPayments,curTotalDiscounts)
+ 
+		if curAmount > 0 {
+			$$$Order4(^CacheTempPaymentInvoice,YUSER,pidPay,pidPayLine,idPayInvoice)
+				set objPayInvoice = ^CacheTempPaymentInvoice(YUSER,pidPay,pidPayLine,idPayInvoice)
+				set strStatus     = $$$Save("FINAPPaymentInvoice",pidPay_$$$COMMA_pidPayLine_$$$COMMA_idPayInvoice,objPayInvoice)
+				quit:$$$ISERR(strStatus)
+			$$$End
+ 
+			if $$$ISOK(strStatus) {
+				set $$$FINAPPaymentLineTotal(objPayLine)        = curAmount
+				set $$$FINAPPaymentLinePrepayment(objPayLine)   = 0
+				set $$$FINAPPaymentLineAutoAllocate(objPayLine) = $$$YES
+ 
+				set strStatus = $$$Save("FINAPPaymentLine",pidPay_$$$COMMA_pidPayLine,objPayLine,$$$YES)
+			}
+		}
+	}
+ 
+	quit strStatus
+]]></Routine>
+</Export>

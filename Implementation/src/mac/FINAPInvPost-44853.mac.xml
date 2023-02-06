@@ -1,0 +1,1024 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvPost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvPost
+	;-------------------------------------------------------------------------------
+	; Posting routines for invoices
+	; 
+	; FIXME : strStatus do not have leading "0 " $$$MakeStatus? <GRF>
+	;-------------------------------------------------------------------------------
+#include COMSYS
+#include INConst
+#include FINConst
+#include WWWConst
+ 
+#define LogR(%1,%2)	;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^FINAPInvPost("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Postable(pidInvoice="",&pblnPost,&pintStatus,pblnCostsOnly=$$$NO,pblnPrePost=$$$NO,pblnBatch=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Determines whether an accounts receivable record can be posted.
+	;
+	; Returns:Status
+	;
+	; History:
+	; 29-Jun-2009	GRF		SR16691: FINAPInvLine with only "Total" is equivalent
+	; 							to '$data
+	; 26-Jun-2006	RPW		SR13173
+	; 09-Aug-2005	JW		SR12410: Added pblnBatch parameter
+	; 12-May-2005	Steve S	SR12250: Added parameter to skip checking charges
+	; 23-Feb-2005	JW		SR11405: Added charges
+	; 14-Feb-2005	JW		Added call to function TotalsMatch
+	; 10-Feb-2005	JW/RW	Cleaned up.
+	; 01-Oct-2004	Paul K	Modified to look at editable routine
+	;-------------------------------------------------------------------------------
+	new curAmount,idLine,objLine,objInvoice,strStatus
+	
+	$$$LogR("Postable",pidInvoice)
+	
+	if $$$NoKey(pidInvoice) { // SR13173
+		set strStatus = $listbuild("Fin00089")               ; "No Record Selected."
+	
+	;} elseif '$data(^FINAPInvLine(YM,pidInvoice)) && '$data(^FINAPInvCharge(YM,pidInvoice)) {    ; SR16691
+	} elseif ('$data(^FINAPInvLine(YM,pidInvoice)) || ($order(^FINAPInvLine(YM,pidInvoice,""))="Total")) &&
+	         '$data(^FINAPInvCharge(YM,pidInvoice))                                                         {
+		set strStatus = $listbuild("Fin00542",pidInvoice)    ; "Invoice Number '%1' must have lines."
+	
+	} else {
+		set objInvoice = $get(^FINAPInv(YM,pidInvoice,1))
+		set strStatus  = $$$OK
+		
+		if 'pblnPrePost {
+			set strStatus = $$Editable^FINSYSReview("FINAPInv",$$$FINAPInvStatus(objInvoice),.pblnPost,.pintStatus)
+		}
+		if $$$ISOK(strStatus) {     ; FIXME : Can have repeated $$$ISOK tests rather than nesting. Only slower if hit a not okay case <GRF>
+			set strStatus = $$ValidGLEffectiveDate^FINGLEffectiveDate($$$FINAPInvGLEffectiveDate(objInvoice),$$$FINAPInvGLEffectiveDate(objInvoice),$$$FldFINAPInvGLEffectiveDate)
+			
+			if $$$ISOK(strStatus) {
+				set strStatus = $$TotalsMatch^FINAPInv2(pidInvoice)
+				if $$$ISOK(strStatus) {
+					if $$$FINAPInvIsVoucher(objInvoice) {
+						set strStatus = $$ValidGLEffectiveDate^FINGLEffectiveDate($$$FINAPInvOnChargeGLEffectiveDate(objInvoice),$$$FINAPInvOnChargeGLEffectiveDate(objInvoice),$$$FldFINAPInvOnChargeGLEffectiveDate) // SR13173
+						
+						if $$$ISOK(strStatus) {
+							if '$$ConsistentTax^FINAPVoucher(pidInvoice) {
+								set strStatus = "Fin00696"  ; "Tax Total must be zero, as no lines are taxable."
+								
+							} else {
+								if 'pblnPrePost {
+									set strStatus = $$ValidRepeatData^FINAPVoucher(pidInvoice)
+								}
+								
+								if $$$ISOK(strStatus) {
+									set idLine = ""
+									for {
+										set idLine = $order(^FINAPInvCharge(YM,pidInvoice,idLine))
+										quit:idLine=""
+										
+										set strStatus = $$PostableCharge(pidInvoice,idLine,pblnPrePost)
+										quit:$$$ISERR(strStatus)
+									}
+								}
+							}
+						}
+					
+					} else { ; Invoice Matching
+						// Check status of cache
+						set strStatus=$$CurrentStatus^FINAPInvMatchCache(pidInvoice)
+						
+						if $$$ISOK(strStatus) {
+							if pblnCostsOnly && $$$FINAPInvCostsPosted(objInvoice) {
+								set strStatus = $listbuild("Fin00637",pidInvoice)
+							; "Costs already updated for Invoice %1."
+								
+							} else {
+								set idLine=""
+								for {
+									set idLine=$order(^FINAPInvLine(YM,pidInvoice,idLine))
+									quit:idLine=""
+									
+									set strStatus = $$PostableLine(pidInvoice,idLine)
+									quit:$$$ISERR(strStatus)
+								}
+							}
+						}
+					}
+					if $$$ISOK(strStatus) && 'pblnCostsOnly && 'pblnBatch && ($$$FINAPInvBatchNumber(objInvoice)'="") && 'pblnPrePost {
+						set strStatus = $listbuild("Fin00861",$$$FINAPInvBatchNumber(objInvoice))
+					}  ; "Cannot manually post. Must be posted via batch number %1."
+				}
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set YQ = $$$QSave
+	} else {
+		set YQ = $$$QDontSave_" "_$$$Text(strStatus)
+	}
+	quit strStatus
+	
+	
+PostableLine(pidInvoice,pidLine)
+	;-------------------------------------------------------------------------------
+	; Determines whether an individual line can be posted.
+	;
+	; Called By: Postable
+	; 
+	; Returns:Status
+	;
+	; History:
+	; 24-Jun-2005	PO			SR12705: Check that FC variances are assigned to a
+	; 								GL Account
+	; 07-Apr-2005	RobertW		SR11836: Modified OpenQuantity to UnmatchedQuantity,
+	; 								removed duplicate line
+	; 10-Feb-2005	JW			Put back UnitOfMeasure test.
+	; 10-Jan-2005	RobertW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new strStatus,objLine,objInvoice
+	
+	$$$LogR("PostableLine",$get(pidInvoice)_","_$get(pidLine))
+	
+	set strStatus = $$$OK
+	
+	if ($get(pidInvoice)'="") && ($get(pidLine)'="") {
+		set objLine    = $get(^FINAPInvLine(YM,pidInvoice,pidLine,1))
+		set objInvoice = $get(^FINAPInv(YM,pidInvoice,1))
+		
+		if $$$FINAPInvLineInvoiceQuantity(objLine) > $$$FINAPInvLineUnmatchedQuantity(objLine) {
+			set strStatus = $listbuild("Fin00629",pidLine)
+		; "Line Number %1´s invoice quantity cannot be greater than its unmatched quantity. Create new receive."
+			
+		} elseif '$$UnitOfMeasureCorrect^FINAPInvLine(objLine) {
+			set strStatus = $listbuild("Fin00606",pidLine)
+		; "Invoice unit of measure must be the same as the Order unit of measure on Line %1."
+ 
+		} elseif $$GetVARFC^FINAPInvLineGet(objLine) && ($$$FINAPInvLineVarianceFCDPost(objLine)="") {
+			set strStatus = $listbuild("Fin00628",pidLine,$$$StrFINAPInvLineVarianceFCDPost)
+		; "Line Number %1 requires a value in field '%2'."
+		
+		} else {
+			if $$$FINAPInvShowTotalVariance(objInvoice) {
+				if $$$FINAPInvLineVariancePosting(objLine)=$$$EnumFINAPVARIANCEPOSTSplit {
+					if '$$VarianceCompleted^FINAPInvLineVariance(pidInvoice,pidLine,"TV") {
+						set strStatus = $listbuild("Fin00546",pidLine)
+					} ; "Split Variances on Line %1 must balance to 0."
+				}
+				
+			} else {
+				if $$$FINAPInvLineVarianceINVQPost(objLine)=$$$EnumFINAPVARIANCEPOSTSplit if '$$VarianceCompleted^FINAPInvLineVariance(pidInvoice,pidLine,"IQ") set strStatus = $listbuild("Fin00546",pidLine)
+				if $$$FINAPInvLineVarianceINVDPost(objLine)=$$$EnumFINAPVARIANCEPOSTSplit if '$$VarianceCompleted^FINAPInvLineVariance(pidInvoice,pidLine,"ID") set strStatus = $listbuild("Fin00546",pidLine)
+				if $$$FINAPInvLineVarianceOTHDPost(objLine)=$$$EnumFINAPVARIANCEPOSTSplit if '$$VarianceCompleted^FINAPInvLineVariance(pidInvoice,pidLine,"OD") set strStatus = $listbuild("Fin00546",pidLine)
+			} ; "Split Variances on Line %1 must balance to 0."
+		}
+	}
+	quit strStatus
+	
+	
+PostableCharge(pidInvoice,pidCharge,pblnInvoiceLinesOnly=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Determines whether an individual charge can be posted.
+	;
+	; Called By: Postable
+	; 
+	; Returns: status
+	;
+	; History:
+	; 12-Aug-2005	JW		SR12410: Use ValidateAccount
+	; 12-May-2005	Steve S	SR12250:Added parameter pblnInvoiceLinesOnly to skip charges
+	; 08-Mar-2005	JW		Added OnCharges
+	; 23-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new idAccount,idARInv,idCustomer,objCharge,objInvoice,strStatus
+	
+	$$$LogR("PostableCharge",$get(pidInvoice)_","_$get(pidCharge))
+	
+	set strStatus = $$$OK
+	
+	if ($get(pidInvoice)'="") && ($get(pidCharge)'="") {
+		set objInvoice = $get(^FINAPInv(YM,pidInvoice,1))
+		set objCharge  = $get(^FINAPInvCharge(YM,pidInvoice,pidCharge,1))
+		set idAccount  = $$$FINAPInvChargeAccount(objCharge)
+		
+			// If On Charge, require customer and account.
+		if $$$FINAPInvChargeIsOnCharge(objCharge) {
+			if ('pblnInvoiceLinesOnly) {
+				set idCustomer = $$$FINAPInvChargeCustomer(objCharge)
+				if (idCustomer="") || (idAccount="") {
+					set strStatus = $listbuild("Fin00691",pidCharge) ; On Charge %1 requires both a customer and an account.
+				
+				} elseif '$data(^FINARCustomer(YM,idCustomer,1)) {
+					set strStatus = $listbuild("Fin00710",idCustomer,pidCharge)  ;Customer ´%1´ on line %2 does not exist
+				
+				} elseif $$$FINAPInvPostOnCharges(objInvoice) {
+					// If posting, create a test ARInv and check if postable
+					set strStatus = $$CreateARFromAPInv^FINARInv(pidInvoice,pidCharge,.idARInv,$$$YES)
+					if $$$ISOK(strStatus) {
+						set strStatus = $$Postable^FINARInvPost(idARInv)
+						do KILL^COMUtils("FINARInv",idARInv)
+					}
+					if $$$ISERR(strStatus) {
+						set strStatus = $listbuild("Fin00712",pidCharge,$$$Text(strStatus))  ;On Charge %1 cannot be posted: %2
+					}
+				}
+			}
+		
+		} else {
+			// Needs either an account or an account group
+			if (idAccount="")&&($$$FINAPInvChargeAccountGroup(objCharge)="") {
+				set strStatus = $listbuild("Fin00684",pidCharge)  ;Line %1 requires either an account group or an account.
+			
+			// If account group, amount needs to be apportioned over group (complete?)
+			} elseif '$$IsComplete^FINAPInvCharge(pidInvoice,pidCharge) {
+				set strStatus = $listbuild("Fin00689",pidCharge)  ;Charge amount has not been completely apportioned for Line %1.
+			}
+		}
+		// If has account, make sure it's valid.
+		if $$$ISOK(strStatus)&&(idAccount'="") {
+			set strStatus= $$ValidateAccount^FINGLAccountTran(idAccount)
+		}
+	}
+	
+	quit strStatus
+	
+	
+AfterDataFields(pYPARA)
+	;-------------------------------------------------------------------------------
+	; Display the results of the post
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Feb-2005	RPW		Changed pidInvoice to idInvoice and newed it.
+	; 14-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new idBatch,idBlock,idInvoice
+	
+	set idInvoice = $piece($get(pYPARA),",",1)
+	
+	if idInvoice'="" {
+		set idBatch = $order(^CacheTemp(YUSER,"FINAPInv","Batch",idInvoice,""))
+		if idBatch'="" {
+			set idBlock=$get(^CacheTemp(YUSER,"FINAPInv","Batch",idInvoice,idBatch))
+			if idBlock'="" {
+				do DisplayResults(idInvoice,idBatch,idBlock)
+			}
+		}
+	}
+	quit
+	
+	
+Post(pidInvoice="",pblnGroupOrSchedule=$$$NO,pblnBatch=$$$NO)
+	;-------------------------------------------------------------------------------
+	; What Post needs to do:
+	;    +   Supplier Control[+/- variance],
+	;    -   Supplier Suspense 
+	;    +/- Additional Charges/Discounts
+	; and for each line:
+	;   [+/- Inventory]
+	;   [+/- Expenses ]
+	; 
+	; Called By :	PostSchedule^FINAPInvPost
+	;				Post^FINAPInvBatch
+	;				PostGroupTxn^FINInvGroupPost
+	;				ProcessSummary^INReceiptButtonP   [also OldPostTxn - Deprecated]
+	;				Form FINAPInv     : Button 5 "Post"
+	;				Form FINAPVoucher : Button 5 "Post"
+	; 
+	; History:
+	; 05-Jul-2006	GRF		SR14471: Add default parameter so explicitly known
+	; 25-May-2006	Steve S	SR14670: Logging for double-posting fix
+	; 25-Jan-2006	RPW		SR13087: Added intercompany details
+	; 06-Nov-2005	SCR		SR13578: Added Drill Down Detail to Allocate
+	; 20-Oct-2005	PO		SR12943: Moved Posted By set to where Posted Date is set
+	; 18-Oct-2005	PO		SR12972: Moved PostCostsNow to routine FINAPInvPostCost
+	; 21-Sep-2005	shobby	SR13213:Save the Batch and Block that were created from this posting.
+	; 20-Sep-2005	shobby	Call to Allocate^FININTBatch was passing an ARINV parameter instead of APINV.
+	; 05-Sep-2005	PO		SR13026: Make sure voucher child invoice being created is actually a voucher
+	; 31-Aug-2005	shobby	SR12823: Call to Update^FINAPInv2
+	; 10-Aug-2005	JW		SR12410: Invoice Match may now also be group posted. Added batch parameter.
+	; 05-Aug-2005	JW & PO	SR13026: Make child invoice if record is to be posted OR pending
+	; 01-Jul-2005	RobertW	SR12230: Instead of Invoice Date, use GL Effective Date
+	; 19-Apr-2005	PK/PO	SR11349 Include FC variance line if applicable
+	; 23-Feb-2005	JW		SR11405: Added charges
+	; 15-Feb-2005	RPW		Moved AddInvoice after AddLines and added curAPCAmount parameter
+	; 						so we can get all the apc's for the batch and sum them into the
+	; 						invoice.
+	; 11-Feb-2005	JW		$data check moved inside populate
+	; 10-Feb-2005	JW/RW	Cleaned Up
+	; 23-Dec-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new blnInterCompany,blnIsVoucher,blnPost,blnRepeat,curAmount,dteTx
+	new idAccount,idBatch,idBlock,idCreator,idDept,idLocn,idParentInvoice,idSupplier
+	new intStatus,objInv,objInvoice,strDetail,strForm,strNumber,strStatus,strSupplier
+	
+	$$$LogR("Post",$get(pidInvoice)_"<"_pblnGroupOrSchedule_"<"_pblnBatch_"<")
+	
+	; TODO : Need to preserve Characteristics for Account Identification Matrix audit
+	;***************************************
+	tstart
+	;***************************************
+	
+	set blnPost   = $$$YES
+	set intStatus = ""
+	set idBatch   = ""
+	set idBlock   = ""
+	set strStatus = $$Postable(pidInvoice,.blnPost,.intStatus,,,pblnBatch)
+	$$$LogRx("P1:"_blnPost_","_intStatus)
+	
+	if $$$ISOK(strStatus) {
+		set objInvoice      = $get(^FINAPInv(YM,pidInvoice,1))
+		set blnIsVoucher    = $$$FINAPInvIsVoucher(objInvoice)
+		set blnInterCompany = ($$$FINAPInvInterCompany(objInvoice) && blnIsVoucher)
+		
+		set blnRepeat = $$$NO
+		if blnIsVoucher && $$$FINAPInvRepeat(objInvoice) {
+			set blnRepeat       = $$$YES
+			set idParentInvoice = pidInvoice
+			set strStatus       = $$MakeChildInvoice^FINAPVoucher(.pidInvoice,.objInvoice)
+		}
+			
+		if blnPost {
+			if 'blnIsVoucher {
+				do Update^FINAPInv2($$$NO,$$$YES,pidInvoice)  ; not enough stock?	; (add default parameter so explicitly known)
+				set strStatus = $$PostCostsNow^FINAPInvPostCost(pidInvoice,.objInvoice,$$$ISOK(strStatus))
+				if $$$ISOK(strStatus) {
+					set strStatus = $$Populate^FINAPInvPrePopulate(pidInvoice)
+				}
+			}
+			
+			if $$$ISOK(strStatus) {
+				set idLocn      = $$$FINAPInvCreatorsLocation(objInvoice)
+				set dteTx       = $$$FINAPInvGLEffectiveDate(objInvoice)
+				set idCreator   = $$$FINAPInvCreatedBy(objInvoice)
+				set idDept      = $$$FINAPInvCreatorsDepartment(objInvoice)
+			; Source Details for Drill Down
+				set curAmount   = $$$FINAPInvActualTotal(objInvoice)				; Get the Invoice Amount, used in the details
+				set curAmount   = $$$FCGetAmountText(curAmount)
+				set strNumber   = $$$FINAPInvSuppliersInvoiceNumber(objInvoice)	; Invoice Number
+				set idSupplier  = $$$FINAPInvInvoiceSupplier(objInvoice)
+				set strSupplier = idSupplier
+				if idSupplier'="" set strSupplier = strSupplier_" "_$$$FINAPSupplierSupplierName($get(^FINAPSupplier(YM,idSupplier,1)))
+				set strForm		= $$CheckForm^FINUtils($get(YFORM),"FINAPInv")	; Get the form using YFORM, with validation
+				set strDetail	= "Fin00929,"_$translate(strSupplier,","," ")_","_strNumber_","_curAmount
+				;                   "Supplier Invoice %1, Number %2, Amount %3"
+				
+				set strStatus = $$Allocate^FININTBatch(.idBatch,.idBlock,"APINV",idLocn,dteTx,,idCreator,idDept,strForm,pidInvoice,strDetail,blnInterCompany)
+				
+				if $$$ISOK(strStatus) {
+				;	set curAPCAmount = 0
+					if blnIsVoucher {
+						set strStatus = $$AddCharges^FINAPInvPostCharge(pidInvoice,idBatch,idBlock)
+						
+					} else {
+						set strStatus = $$AddLines(pidInvoice,idBatch,idBlock) ;,.curAPCAmount
+					}
+					
+					if $$$ISOK(strStatus) {
+						set strStatus = $$AddInvoice(pidInvoice,idBatch,idBlock) ;,.curAPCAmount
+						
+						if $$$ISOK(strStatus) {
+							set strStatus = $$PostBlock^FININTBatch(idBatch,idBlock) ;,curAPCAmount
+							
+							if $$$ISOK(strStatus) {
+								set $$$FINAPInvPostedDate(objInvoice) = +$horolog
+								set $$$FINAPInvPostedBy(objInvoice)   = $get(YBED,"UNKNOWN")
+							}
+						}
+					}
+				}
+			}
+		}
+	
+		if $$$ISOK(strStatus) {
+			set $$$FINAPInvStatus(objInvoice) = intStatus
+			set $$$FINAPInvBatch(objInvoice)  = idBatch
+			set $$$FINAPInvBlock(objInvoice)  = idBlock
+			
+			set strStatus = $$$Save("FINAPInv",pidInvoice,objInvoice,$$$YES)
+			
+			//SR14670: Logging
+			if $$$FINAPInvStatus($get(^FINAPInv(YM,pidInvoice,1)))'=intStatus { // save failed
+				do Dump^COMPatch("SR14670","3WM Header Update Failure")
+				set ^LogFINAPInv(pidInvoice,+$horolog,$piece($horolog,",",2)) = strStatus
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+	;***************************************	
+		if $tlevel>0 tcommit
+	;***************************************	
+		
+		if pblnGroupOrSchedule { // SR12410
+			if blnRepeat {
+				set ^CacheTempRecInvoiceChildren(YUSER,idParentInvoice) = pidInvoice
+			}
+			
+		} elseif 'pblnBatch {
+			if 'blnIsVoucher && ($$$FINAPInvStatus(objInvoice) = $$$EnumFINSYSSTATUSPosted) {
+				; Show Invoice Matching Post details
+				set ^CacheTemp(YUSER,"FINAPInv","Batch",pidInvoice,idBatch) = idBlock
+				do GoToForm^COMUtilForm("FINAPInvPost",pidInvoice,,pidInvoice)
+				
+			} elseif blnRepeat {
+				do ReturnError^COMUtilError($listbuild("Fin00589",pidInvoice)) ;Post successful. New invoice ´%1´ has been created and posted.	
+				
+			} else {
+				do ReloadForm^COMUtilForm()
+			}
+		}
+		
+	} else {
+	;***************************************	
+		trollback
+	;***************************************	
+		if '(pblnGroupOrSchedule || pblnBatch) {
+	;		do ReturnError^COMUtilError(strStatus)           ; << If strStatus   "0 "_$lb(ErrorCode,ErrorParams,...)
+	;		do ^WWWINFO(strStatus)                           ; << if strStatus is expanded text ^^^
+		}
+	}
+	quit strStatus
+	
+	
+NewPost(pidInvoice="",pblnGroupOrSchedule=$$$NO,pblnBatch=$$$NO) ; SR17160 - not yet implemented - rename Post to OldPost and NewPost to Post when ready.
+	;-------------------------------------------------------------------------------
+	; What Post needs to do:
+	;    +   Supplier Control[+/- variance],
+	;    -   Supplier Suspense 
+	;    +/- Additional Charges/Discounts
+	; and for each line:
+	;   [+/- Inventory]
+	;   [+/- Expenses ]
+	; 
+	; Called By :	PostSchedule^FINAPInvPost
+	;				Post^FINAPInvBatch
+	;				PostGroupTxn^FINInvGroupPost
+	;				ProcessSummary^INReceiptButtonP   [also OldPostTxn - Deprecated]
+	;				Form FINAPInv     : Button 5 "Post"
+	;				Form FINAPVoucher : Button 5 "Post"
+	; 
+	; History:
+	; 12-Nov-2010	GRF		SR17160: Review arguments and byRef calling PostTxn
+	; 03-Feb-2010	GRF		SR17160: separate core processing so this is just a
+	; 							wrapper allowing other transaction controlled code
+	; 							to call PostTxn directly.
+	; 05-Jul-2006	GRF		SR14471: Add default parameter so explicitly known
+	; 25-May-2006	Steve S	SR14670: Logging for double-posting fix
+	; 25-Jan-2006	RPW		SR13087: Added intercompany details
+	; 06-Nov-2005	SCR		SR13578: Added Drill Down Detail to Allocate
+	; 20-Oct-2005	PO		SR12943: Moved Posted By set to where Posted Date is set
+	; 18-Oct-2005	PO		SR12972: Moved PostCostsNow to routine FINAPInvPostCost
+	; 21-Sep-2005	shobby	SR13213:Save the Batch and Block that were created from this posting.
+	; 20-Sep-2005	shobby	Call to Allocate^FININTBatch was passing an ARINV parameter instead of APINV.
+	; 05-Sep-2005	PO		SR13026: Make sure voucher child invoice being created is actually a voucher
+	; 31-Aug-2005	shobby	SR12823: Call to Update^FINAPInv2
+	; 10-Aug-2005	JW		SR12410: Invoice Match may now also be group posted. Added batch parameter.
+	; 05-Aug-2005	JW & PO	SR13026: Make child invoice if record is to be posted OR pending
+	; 01-Jul-2005	RobertW	SR12230: Instead of Invoice Date, use GL Effective Date
+	; 19-Apr-2005	PK/PO	SR11349 Include FC variance line if applicable
+	; 23-Feb-2005	JW		SR11405: Added charges
+	; 15-Feb-2005	RPW		Moved AddInvoice after AddLines and added curAPCAmount parameter
+	; 						so we can get all the apc's for the batch and sum them into the
+	; 						invoice.
+	; 11-Feb-2005	JW		$data check moved inside populate
+	; 10-Feb-2005	JW/RW	Cleaned Up
+	; 23-Dec-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new blnIsVoucher,blnRepeat,idBatch,idBlock,idParentInv,objInvoice,strStatus
+	
+	$$$LogR("Post",$get(pidInvoice)_"<"_pblnGroupOrSchedule_"<"_pblnBatch_"<")
+	
+	; TODO : Need to preserve Characteristics for Account Identification Matrix audit
+	;***************************************
+	tstart
+	;***************************************
+	
+	;set strStatus = $$PostTxn(pidInvoice,pblnGroupOrSchedule,pblnBatch,.blnRepeat,.blnIsVoucher)   ; SR17160
+	set strStatus = $$PostTxn(pidInvoice,pblnBatch,.blnRepeat,.blnIsVoucher,.idBatch,.idBlock,.idParentInv)   ; SR17160
+	
+	if $$$ISOK(strStatus) {
+	;***************************************	
+		if $tlevel>0 tcommit
+	;***************************************
+		
+		if pblnGroupOrSchedule { // SR12410
+			if blnRepeat {
+				set ^CacheTempRecInvoiceChildren(YUSER,idParentInv) = pidInvoice
+			}
+			
+		} elseif 'pblnBatch {
+			set objInvoice = $get(^FINAPInv(0,pidInvoice,1))     ; Updated in PostTxn
+			if 'blnIsVoucher && ($$$FINAPInvStatus(objInvoice) = $$$EnumFINSYSSTATUSPosted) {
+				; Show Invoice Matching Post details
+				set ^CacheTemp(YUSER,"FINAPInv","Batch",pidInvoice,idBatch) = idBlock
+				do GoToForm^COMUtilForm("FINAPInvPost",pidInvoice,,pidInvoice)
+				
+			} elseif blnRepeat {
+				do ReturnError^COMUtilError($listbuild("Fin00589",pidInvoice))
+			; "Post successful. New invoice ´%1´ has been created and posted."
+				
+			} else {
+				do ReloadForm^COMUtilForm()
+			}
+		}
+	} else {
+	;***************************************	
+		trollback
+	;***************************************	
+		if '(pblnGroupOrSchedule || pblnBatch) {
+			do ReturnError^COMUtilError(strStatus)           ; << If strStatus   "0 "_$lb(ErrorCode,ErrorParams,...)
+	;		do ^WWWINFO(strStatus)                           ; << if strStatus is expanded text ^^^
+		}
+	}
+	quit strStatus
+	
+	
+	;PostTxn(pidInvoice="",pblnGroupOrSchedule=$$$NO,pblnBatch=$$$NO,&pblnRepeat,&pblnIsVoucher,&pidBatch,&pidBlock)
+PostTxn(pidInvoice="",pblnBatch=$$$NO,&pblnRepeat,&pblnIsVoucher,&pidBatch,&pidBlock,&pidParentInv)
+	;-------------------------------------------------------------------------------
+	; What Post needs to do:
+	;    +   Supplier Control[+/- variance],
+	;    -   Supplier Suspense 
+	;    +/- Additional Charges/Discounts
+	; and for each line:
+	;   [+/- Inventory]
+	;   [+/- Expenses ]
+	;
+	; Returns  : status
+	;   By Ref : pblnRepeat,pblnIsVoucher,pidBatch,pidBlock
+	;
+	; History:
+	; 12-Nov-2010	GRF		SR17160: Review arguments and byRef
+	; 03-Feb-2010	GRF		SR17160: Split from Post
+	;-------------------------------------------------------------------------------
+	new blnInterCompany,blnPost,curAmount,dteTx,idCreator,idDept,idLocn,idSupplier
+	new intStatus,objInvoice,strDetail,strForm,strNumber,strStatus,strSupplier
+	
+	$$$LogR("PostTxn",$get(pidInvoice)_"<"_pblnGroupOrSchedule_"<"_pblnBatch_"<")
+	
+	set blnPost   = $$$YES
+	set intStatus = ""
+	set pidBatch  = ""
+	set pidBlock  = ""
+	set strStatus = $$Postable(pidInvoice,.blnPost,.intStatus,,,pblnBatch)
+	$$$LogRx("P1:"_blnPost_","_intStatus)
+	
+	if $$$ISOK(strStatus) {
+		set objInvoice      = $get(^FINAPInv(0,pidInvoice,1))
+		set pblnIsVoucher   = $$$FINAPInvIsVoucher(objInvoice)
+		set blnInterCompany = ($$$FINAPInvInterCompany(objInvoice) && pblnIsVoucher)
+		
+		set pblnRepeat = $$$NO
+		if pblnIsVoucher && $$$FINAPInvRepeat(objInvoice) {
+			set pblnRepeat   = $$$YES
+			set pidParentInv = pidInvoice
+			set strStatus    = $$MakeChildInvoice^FINAPVoucher(.pidInvoice,.objInvoice)
+		}
+			
+		if blnPost {
+			if 'pblnIsVoucher {
+				do Update^FINAPInv2($$$NO,$$$YES,pidInvoice)  ; not enough stock?	; (add default parameter so explicitly known)
+				set strStatus = $$PostCostsNow^FINAPInvPostCost(pidInvoice,.objInvoice,$$$ISOK(strStatus))
+				if $$$ISOK(strStatus) {
+					set strStatus = $$Populate^FINAPInvPrePopulate(pidInvoice)
+				}
+			}
+			
+			if $$$ISOK(strStatus) {
+				set idLocn      = $$$FINAPInvCreatorsLocation(objInvoice)
+				set dteTx       = $$$FINAPInvGLEffectiveDate(objInvoice)
+				set idCreator   = $$$FINAPInvCreatedBy(objInvoice)
+				set idDept      = $$$FINAPInvCreatorsDepartment(objInvoice)
+			;  Source Details for Drill Down
+				set curAmount   = $$$FINAPInvActualTotal(objInvoice)				; Get the Invoice Amount, used in the details
+				set curAmount   = $$$FCGetAmountText(curAmount)
+				set strNumber   = $$$FINAPInvSuppliersInvoiceNumber(objInvoice)	; Invoice Number
+				set idSupplier  = $$$FINAPInvInvoiceSupplier(objInvoice)
+				set strSupplier = idSupplier
+				if idSupplier'="" set strSupplier = strSupplier_" "_$$$FINAPSupplierSupplierName($get(^FINAPSupplier(0,idSupplier,1)))
+				set strForm     = $$CheckForm^FINUtils($get(YFORM),"FINAPInv")	; Get the form using YFORM, with validation
+				set strDetail   = "Fin00929,"_$translate(strSupplier,","," ")_","_strNumber_","_curAmount
+									; "Supplier Invoice %1, Number %2, Amount %3"
+				
+				set strStatus = $$Allocate^FININTBatch(.pidBatch,.pidBlock,"APINV",idLocn,dteTx,,idCreator,idDept,strForm,pidInvoice,strDetail,blnInterCompany)
+				
+				if $$$ISOK(strStatus) {
+				;	set curAPCAmount = 0
+					if pblnIsVoucher {
+						set strStatus = $$AddCharges^FINAPInvPostCharge(pidInvoice,pidBatch,pidBlock)
+						
+					} else {
+						set strStatus = $$AddLines(pidInvoice,pidBatch,pidBlock) ;,.curAPCAmount
+					}
+					
+					if $$$ISOK(strStatus) {
+						set strStatus = $$AddInvoice(pidInvoice,pidBatch,pidBlock) ;,.curAPCAmount
+						
+						if $$$ISOK(strStatus) {
+							set strStatus = $$PostBlock^FININTBatch(pidBatch,pidBlock) ;,curAPCAmount
+							
+							if $$$ISOK(strStatus) {
+								set $$$FINAPInvPostedDate(objInvoice) = +$horolog
+								set $$$FINAPInvPostedBy(objInvoice)   = $get(YBED,"UNKNOWN")
+							}
+						}
+					}
+				}
+			}
+		}
+	
+		if $$$ISOK(strStatus) {
+			set $$$FINAPInvStatus(objInvoice) = intStatus
+			set $$$FINAPInvBatch(objInvoice)  = pidBatch
+			set $$$FINAPInvBlock(objInvoice)  = pidBlock
+ 			
+			set strStatus = $$$Save("FINAPInv",pidInvoice,objInvoice,$$$YES)
+			
+			//SR14670: Logging
+			if $$$FINAPInvStatus($get(^FINAPInv(0,pidInvoice,1)))'=intStatus { // save failed
+				do Dump^COMPatch("SR14670","3WM Header Update Failure")
+				set ^LogFINAPInv(pidInvoice,+$horolog,$piece($horolog,",",2)) = strStatus
+			}
+		}
+	}
+	quit strStatus
+	
+	
+GetFCAccount(pidAccount,pidSupplier="")
+	;-------------------------------------------------------------------------------
+	; Get the foreign currency conversion account for an invoice.
+	;
+	; Returns:Status
+	;
+	; History:
+	; 19-Apr-2005	PO		SR11349: Created
+	;-------------------------------------------------------------------------------
+    new objSupplier,strStatus
+    
+    set strStatus  = $$$OK
+    set pidAccount = ""
+    
+    if pidSupplier'="" {
+	    set objSupplier = $get(^FINAPSupplier(YM,pidSupplier,1))
+	    if $$$FINAPSupplierControlAccount(objSupplier)'="" {
+		    set pidAccount = $$$FINAPAccountForeignCurrencyFluctuatio($get(^FINAPAccount(YM,$$$FINAPSupplierControlAccount(objSupplier),1)))
+	    }
+    }
+    if pidAccount="" set strStatus = $listbuild("Fin00738",pidSupplier)  ;Foreign Currency Fluctuation Account does not exist for supplier %1.
+    quit strStatus
+	
+	
+AddInvoice(pidInvoice,pidBatch,pidBlock,pblnReversal=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Add an invoice line to the batch.
+	;
+	; Returns:Status
+	;
+	; History:
+	; 31-Jan-2006	Steve S	SR13497: Pass in Disc Amount
+	; 19-Oct-2005	PO		SR13613: pcurAPCAmount nolonger in use
+	; 11-Oct-2005	PO		SR13611: Nolonger summing up total FC variance and
+	; 							adding to Actual Total amount, not supposed to be done
+	; 07-Oct-2005	Steve S	SR13642: Use $$GetSettlementDiscount^FINAPSupplier for
+	; 							settlement discount
+	; 20-Sep-2005	shobby	SR13213: Allow reversal of added invoices.
+	; 19-Sep-2005	RPW		SR13524: Changes to the value need to be passed around
+	; 							after the changes are finalised.
+	; 19-Sep-2005	JW&PO	SR13489: Use $$$FCAdd.
+	; 16-Sep-2005	PO		SR13489: Take base amount discrepancy into account.
+	; 16-Sep-2005	Steve S	SR13508: Do not use FC calculations when in base currency
+	; 08-Sep-2005	RPW		SR13461: Make the FCVar work here as well.
+	; 27-Jul-2005	RPW		SR13097: Handle incorrect calculations of the foreign
+	; 							currency.  Have fixed this by summing the base
+	; 							amounts and if they are different from the converted
+	; 							total, adding the difference if it's less than 10c.
+	; 20-May-2005	PO		SR:12256 Only use $$$FINAPInvActualTotal once
+	; 15-Feb-2005	RobertW	Added pcurAPCAmount parameter so that we can sum the
+	; 							APC lines together
+	; 15-Feb-2005	RobertW	Should be using the Invoice Supplier
+	; 10-Feb-2005	shobby	Included original Invoice Total before variance.
+	; 10-Feb-2005	shobby	Invoice number should be suppliers invoice number not
+	; 						3WM number. (SR10061)
+	; 10-Feb-2005	JW/RW	Cleaned Up
+	; 07-Feb-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new objInv,strParam,strStatus,objSupplier,idSupplier,curAmount,curInvTotal,fltDifference
+	new idLine,curDiscrepancy
+	
+	set strStatus = $$$OK
+	
+	if $get(pidInvoice)'="" {
+		set objInv      = $get(^FINAPInv(YM,pidInvoice,1))
+		set idSupplier  = $$$FINAPInvInvoiceSupplier(objInv)
+		set curInvTotal = $$$FINAPInvActualTotal(objInv)
+		
+		set curDiscrepancy = 0
+		set idLine = ""
+		for {
+			set idLine = $order(^FINAPInvLine(YM,pidInvoice,idLine))
+			quit:idLine=""
+			
+			set curDiscrepancy = curDiscrepancy + $$OrderToInvoiceDiscrepancy^FINAPInvPrePopulate(objInv,$get(^FINAPInvLine(YM,pidInvoice,idLine,1)))
+		}
+		set curInvTotal = $$$FCAdd(curInvTotal,curDiscrepancy)
+		
+		set strParam = ""      ; FIXME : Move inside else block if not used elsewhere <GRF>
+		set $piece(strParam,",",1) = idSupplier
+		set $piece(strParam,",",2) = $$$FINAPInvSuppliersInvoiceNumber(objInv)
+		set $piece(strParam,",",3) = $$$FINAPInvDueDate(objInv)
+		set $piece(strParam,",",4) = $$$FINAPInvDiscountAmount(objInv)    ;SR13497: Pass in Disc Amount
+		set $piece(strParam,",",5) = $$$FINAPInvInvoiceDate(objInv)       ;SR13642: Use $$GetSettlementDiscount^FINAPSupplier
+		set $piece(strParam,",",6) = pidInvoice
+		
+		set objSupplier = $get(^FINAPSupplier(YM,idSupplier,1))
+ 		
+		if $$$FINAPSupplierControlAccount(objSupplier)="" {
+			set strStatus = $listbuild("Fin00198",$$$FINAPInvSupplier(objInv)) ; "Control Required for Supplier ´%1´"
+	
+		} else {
+			set $piece(strParam,",",8) = curInvTotal                           ; SR13524: RPW 19-Sep-2005
+			set $piece(strParam,",",9) = $$$FINAPInvDiscountGLAccount(objInv)  ; SR13497
+			
+			set strStatus=$$AddLine^FININTBatch(pidBatch,
+			                                    pidBlock,
+			                                    $$$FINAPSupplierControlAccount(objSupplier),
+			                                    $$$FCSign(curInvTotal),
+			                                    "APC",
+			                                    strParam,
+			                                    pidInvoice,
+			                                    idSupplier,
+			                                    pblnReversal   )
+		}
+	}
+	quit strStatus
+	
+	
+AddLines(pidInvoice,pidBatch,pidBlock) ; ,pcurAPCAmount=0
+	;-------------------------------------------------------------------------------
+	; Adds accounts and amounts to the batch, populated in FINAPInvPrePost.
+	;
+	; Returns:Status
+	;
+	; History:
+	; 19-Oct-2005	PO		SR13613: pcurAPCAmount nolonger in use
+	; 15-Feb-2005	RobertW	Added pcurAPCAmount parameter so that we can sum the
+	; 							APC lines together
+	; 15-Feb-2005	JW		TODO: Temporarily made Notes field = "" (since reverted)
+	; 14-Feb-2005	RobertW	Make an APC have the Suppliers Invoice Number not the
+	; 							APInv Number.
+	; 08-Feb-2005	shobby	Included the notes field in the list of Parameters
+	; 							(Should end up in the Details field).
+	; 08-Feb-2005	shobby	Removed the notes field from the reference.
+	; 07-Feb-2005	shobby	Added the notes field to the reference.
+	; 07-Feb-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new curAmount,idAccount,idLine,idSupplier,intType,objFINAPInvPrePostTtl
+	new objInvoice,objParameters,objPostLine,strInvoiceNumber,strStatus,strType
+	
+	set strStatus=$$$OK
+	
+	if ($get(pidInvoice)'="") && ($get(pidBatch)'="") && ($get(pidBlock)'="") {
+		set objInvoice = $get(^FINAPInv(YM,pidInvoice,1))
+		set strInvoiceNumber = $$$FINAPInvSuppliersInvoiceNumber(objInvoice)
+		set idSupplier       = $$$FINAPInvInvoiceSupplier(objInvoice)
+		
+		set intType=""
+		for {
+			set intType=$order(^FINAPInvPrePost(YM,pidInvoice,i]]><![CDATA[ntType))
+			quit:intType=""
+			
+			set strType = $$GetType(intType)
+			; shobby TODO - some sort of non-stock check here?
+			set idLine = ""
+			for {
+				set idLine = $order(^FINAPInvPrePost(YM,pidInvoice,intType,idLine))
+				quit:idLine=""
+				
+				set objPostLine = $get(^FINAPInvPrePost(YM,pidInvoice,intType,idLine,1))
+				set curAmount   = $$$FINAPInvPrePostAmount(objPostLine)
+				set idAccount   = $$$FINAPInvPrePostAccount(objPostLine)
+				set $piece(objParameters,",",1) = idSupplier
+				set $piece(objParameters,",",2) = pidInvoice
+				set $piece(objParameters,",",8) = $$$FINAPInvPrePostNotes(objPostLine)
+ 
+				set strStatus=$$AddLine^FININTBatch(pidBatch,
+				                                    pidBlock,
+				                                    idAccount,
+				                                    curAmount,
+				                                    strType,
+				                                    objParameters,
+				                                    pidInvoice,
+				                                    idSupplier   )
+				quit:$$$ISERR(strStatus)
+			}
+			quit:$$$ISERR(strStatus)
+		}
+ 
+		set intType = ""
+		for {
+			set intType = $order(^FINAPInvPrePostTtl(YM,pidInvoice,intType))
+			quit:intType=""
+			
+			set objFINAPInvPrePostTtl = $get(^FINAPInvPrePostTtl(YM,pidInvoice,intType,1))
+			set $piece(objParameters,",",1) = idSupplier
+			set $piece(objParameters,",",2) = pidInvoice
+			set strStatus = $$AddLine^FININTBatch(pidBatch,
+			                                      pidBlock,
+			                                      $$$FINAPInvPrePostTtlAccount(objFINAPInvPrePostTtl),
+			                                      $$$FINAPInvPrePostTtlAmount(objFINAPInvPrePostTtl),
+			                                      "APFCGL",
+			                                      objParameters,
+			                                      pidInvoice,
+			                                      idSupplier   ) ;,pblnReversal
+		}
+	}
+	quit strStatus
+	
+	
+GetType(pintType="")
+	;-------------------------------------------------------------------------------
+	; Get the interface type for a Variance type.
+	;
+	; Returns:String
+	;
+	; History:
+	; 08-Sep-2005	RPW		SR13461: Added FC Variances
+	; 02-Sep-2005	RPW		SR11983: Added discounts/surcharges information
+	; 02-May-2005	Paul K	Set type to tax if "TAX" subscript
+	; 14-Feb-2005	RobertW	If posting to supplier, make it an APC not an APADJ.
+	; 07-Feb-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new strTest,strType
+	
+	set strType = ""
+	if (pintType=$$$EnumFINAPVARIANCEPOSTExpense)   || (pintType=$$$EnumFINAPVARIANCEPOSTFCExpense)   set strType = "APEX"
+	if (pintType=$$$EnumFINAPVARIANCEPOSTInventory) || (pintType=$$$EnumFINAPVARIANCEPOSTFCInventory) set strType = "INADJ"
+	if (pintType=$$$EnumFINAPVARIANCEPOSTSupplier)    set strType = "APC"
+	if (pintType=$$$FldINFIBPARPurchases)             set strType = "INREC"    ;"AccPaySuspense"
+	if $extract(pintType,1,3)="TAX"                   set strType = "TAX"
+	set strTest = $extract(pintType,1,8)
+	if (strTest="LINEDISC")  || (strTest="LINESURC")  set strType = "Discount"
+	set strTest = $extract(pintType,1,9)
+	if (strTest="TOTALDISC") || (strTest="TOTALSURC") set strType = "Discount"
+	if strType=""                                     set strType = pintType
+	
+	quit strType
+	
+	
+CloseOrders(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Close off order line items and the orders themselves if finished.
+	; 
+	; Called By : PostCostsNow^FINAPInvPostCost
+	; 
+	; Returns:Status
+	;
+	; History:
+	; 19-Oct-2006	JW		SR15134: Look at kill status
+	; 09-Jun-2005	GRF		$$$INVORGCompleteSupplierOrderWith - name updated
+	; 07-Feb-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new arrOrders,idLine,idOrder,idOrderLine,objLine,objOrder,objOrderLine,strStatus
+	
+	$$$LogR("CloseOrders",pidInvoice)
+	
+	set strStatus = $$$OK
+	
+	if $find(";"_$$$INVORGCompleteSupplierOrderWith($get(^INVORG(0,0,1)))_";",";7;") {  ;if closing at invoice time...
+		set idLine = ""
+		for {
+			set idLine = $order(^FINAPInvLine(YM,pidInvoice,idLine))
+			quit:idLine=""
+			quit:$$$ISERR(strStatus)
+			
+			set objLine = $get(^FINAPInvLine(YM,pidInvoice,idLine,1))
+			
+			if $$$FINAPInvLineClosed(objLine) {
+				do GetOrderDetails^FINAPInvLineGet(objLine,.idOrder,.idOrderLine)
+				if (idOrder'="") && (idOrderLine'="") {
+					set arrOrders(idOrder) = ""
+				 	set objOrderLine = $get(^INAUFP(YM,idOrder,idOrderLine,1))
+				 	set $$$INAUFPLineItemManualyClosed(objOrderLine) = $$$YES
+				 	set $$$INAUFPEmployee(objOrderLine)              = $get(YBED)
+				 	set $$$INAUFPManualCloseDate(objOrderLine)       = $horolog
+				 	set $$$INAUFPReasonForClosing(objOrderLine)      = $$$Text($listbuild("Fin00631",pidInvoice))  ; "Closed By Invoice Number %1."
+				 	set $$$INAUFPPosCompleted(objOrderLine)          = $$$YES
+				 	
+				 	set strStatus = $$$Save("INAUFP",idOrder_","_idOrderLine,objOrderLine,$$$YES)
+				}   ; NOTE : DCM Event INAUFPSave => OrderLineSave^FINAPInvDCM 
+			}
+		}
+	}
+	
+	set idOrder = ""
+	for {
+		set idOrder = $order(arrOrders(idOrder))
+		quit:idOrder=""
+		quit:$$$ISERR(strStatus)
+		
+		set idLine = ""
+		for {
+			set idLine = $order(^INAUFP(YM,idOrder,idLine))
+			quit:idLine=""
+			quit:'$$$INAUFPPosCompleted($get(^INAUFP(YM,idOrder,idLine,1)))
+		}
+		if idLine="" { ;if looped through all lines without a short cut quit, close order.
+			set objOrder = $get(^INAUF(YM,idOrder,1))
+ 			set $$$INAUFOrderCompleted(objOrder) = $$$YES
+ 			set strStatus = $$$Save("INAUF",idOrder,objOrder,$$$YES)
+ 		    ; FIXME : Probably don't want FAIMC update via OrderSave^FINAPInvDCM <GRF>
+			
+ 			if $$$ISOK(strStatus) set strStatus = $$$Kill("INAUF1",idOrder)		//SR15134
+		}
+	}
+	quit strStatus
+	
+	
+DisplayResults(pidInvoice,pidBatch,pidBlock)
+	;-------------------------------------------------------------------------------
+	; Show the results of posting to the user.
+	;
+	; History:
+	; 14-Feb-2005	JW		Cleaned up.
+	; 07-Feb-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	quit:($get(pidInvoice)="")||($get(pidBatch)="")||($get(pidBlock)="")
+	
+	write !,"<div style='font-size:16;font-weight:bold;border: 2px outset;width:100%;'>",!
+	write $$$Text($listbuild("Fin00621",pidInvoice,pidBatch,pidBlock)),!  ; "Invoice '%1' has been posted to interface batch '%2' (Block %3)."
+	write "</div><br>"
+	write "<div style='border: 2px outset;width:100%;'>",!
+	do Display^FINAPInvPrePostDisplay(pidInvoice)
+	write "</div><br>"
+	write "<div style='border: 2px outset;width:100%;'>",!
+	do Display^FINAPInvPrePostCost(pidInvoice)
+	write "</div>"
+	
+	quit
+	
+	
+PostSchedule(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Post a recurring invoice via the scheduler (after validation).
+	;
+	; Called By: OnAfterDataFields^FINAPVoucher
+	; 
+	; Returns: status text
+	;
+	; History:
+	; 22-Nov-2005	Steve S	SR13853: Use KILL^COMSchedules
+	; 12-Apr-2005	JW		SR12111 - don't allow > 1 per day
+	; 21-Mar-2005	JW		Created (copied from FINARInvPost)
+	;-------------------------------------------------------------------------------
+	new dteEndRepeat,dteStartRepeat,dteToday,idChildInvoice,objInvoice,objSetup,strStatus
+	
+	set strStatus = $$$OK
+	
+	if $get(pidInvoice)'="" {
+		set objInvoice     = $get(^FINAPInv(YM,pidInvoice,1))
+		set dteStartRepeat = $$$FINAPInvRepeatStartDate(objInvoice)
+		set dteEndRepeat   = $$$FINAPInvRepeatEndDate(objInvoice)
+		set dteToday       = +$horolog
+		set strStatus      = $$Postable(pidInvoice)
+		
+		if $$$ISOK(strStatus) {
+			if (dteEndRepeat'="") && (dteEndRepeat<dteToday) {
+				set objSetup = $get(^FINGeneralSetup(YM,YM,1))
+				if $$$FINGeneralSetupDeletecompletedscheduleAP(objSetup) {
+					set strStatus = $listbuild("Fin00579",pidInvoice)
+					do KILL^COMSchedule("FINAPInv",pidInvoice)
+				; "Repeat End Date for invoice '%1' has elapsed - schedule erased."
+					
+				} else {
+					set strStatus = $listbuild("Fin00630",pidInvoice)
+				}  ; "Repeat End Date for invoice '%1' has elapsed - posting cancelled."
+				
+			} elseif (dteStartRepeat'="") && (dteStartRepeat>dteToday) {
+				set strStatus = $listbuild("Fin00578",pidInvoice)
+			; "Repeat Start Date for invoice '%1' has not arrived yet."
+			
+			} else {
+				if $$NumChildrenPostedToday^FINAPVoucher(pidInvoice)>0 {
+					set strStatus = $listbuild("Fin00724",pidInvoice)
+					do KILL^COMSchedule("FINAPInv",pidInvoice)
+				; "Invoice '%1' already has children posted today - post aborted."
+				
+				} else {
+					set strStatus = $$Post(pidInvoice,$$$YES)
+				
+					if $$$ISOK(strStatus) {
+						set idChildInvoice = $get(^CacheTempRecInvoiceChildren(YUSER,pidInvoice))
+						set strStatus      = $listbuild("Fin00589",idChildInvoice)
+					} ; "Post successful. New invoice ´%1´ has been created and posted."
+				}
+			}
+		}
+		kill ^CacheTempRecInvoiceChildren(YUSER)
+	}
+	quit $$$Text(strStatus)
+	
+]]></Routine>
+</Export>

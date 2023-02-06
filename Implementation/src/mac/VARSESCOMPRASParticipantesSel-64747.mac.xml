@@ -1,0 +1,504 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARSESCOMPRASParticipantesSel" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARSESCOMPRASParticipantesSel
+#include COMSYS
+#include COMConst
+ 
+OnAfterSave(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Verifica e atualiza a posição do processo de compra.
+    ;
+    ; History:
+    ; 17-Aug-2009	Gustavo Fiuza	Created
+    ;-------------------------------------------------------------------------------
+    quit:(pYKEY = "")
+    
+	new strStatus, NoProcessoCompra, Posicao
+	
+	set NoProcessoCompra = $$$KEY1(pYKEY)	
+	set Posicao = $$GetPosicao^VARSESCOMPRAS(NoProcessoCompra)
+	
+	set strStatus = $$AtualizaPosicaoParticipante^VARSESCOMPRAS(NoProcessoCompra)
+ 
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError(strStatus)
+	}
+	
+	quit
+ 
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+    ; Verifica se o usuário inseriu o fornecedor mais de uma vez no grid. 
+    ; Salva o grid.
+    ;
+    ; History:
+    ; 30-Sep-2009	Gustavo Fiuza	Changed
+    ; 17-Aug-2009	Gustavo Fiuza	Created
+    ;-------------------------------------------------------------------------------
+	new strStatus, NoCompra, ItemCompra
+	set strStatus = $$$OK
+	set strStatus = $$$GRIDSave(pYKEY)
+	
+	if $$$ISOK(strStatus) {
+		set NoCompra   = $$$KEY1(pYKEY)
+		set ItemCompra = $$$KEY2(pYKEY)
+		
+		//set strStatus = $$SaveParticipantes(NoCompra,ItemCompra)
+		set strStatus = $$Transaction^COMTransaction("SaveParticipantes^VARSESCOMPRASParticipantesSel("""_NoCompra_""","""_ItemCompra_""")",$$$YES)
+	}
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		do ReturnError^COMUtilError(strStatus)
+	} else {
+		set ^VARSESTempDispensaVoltar(YBED) = 3
+	}
+	
+	quit
+ 
+OnAfterDataFields(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Monta o grid para inserção de participantes.
+    ; Carrega a sugestão de fornecedores.
+    ; 
+    ; History:
+    ; 29-Oct-2009	Gustavo Fiuza		Changed
+    ; 16-Aug-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	new NoProcessoCompra, LinhaCompra, Produto
+	
+	set NoProcessoCompra = $$$KEY1(pYKEY)
+	set LinhaCompra		 = $$$KEY2(pYKEY)    
+	
+	set Produto = $piece($get(^VARSESCOMPRASLinha(YM,NoProcessoCompra,LinhaCompra,1)),Y,2)
+	
+	w "	<div style=margin-left:33px;margin-top:10px;margin-bottom:10px;font-size=14px>"
+	w "		<strong>Participantes Selecionados para o Item "_LinhaCompra_"<br />"_Produto_" - "_$extract($$SQLGetDescProduto^VARSQL(Produto),1,100)_"</strong>"
+	w "	</div>"
+	
+	do LoadGrid(pYKEY)
+	do PrintFornecedoresSugeridos(pYKEY,Produto)
+	
+	quit
+ 
+ 
+LoadGrid(pYKEY) 
+ 	;-------------------------------------------------------------------------------
+    ; Carrega o grid.
+    ; 
+    ; History:
+    ; 17-Aug-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------	
+ 	quit:(pYKEY = "")
+ 	
+	new idForm,YAUSWAHL
+	set idForm="VARSESCOMPRASParticipantesLine"
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 220
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($piece(YVOR,Y,23)'=5)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)     = "VARSESCOMPRASParticipantesSel"
+		
+	$$$GRIDStart(idForm,pYKEY)
+	
+	quit
+
+OnBeforeDelete(YKEY)
+	;-------------------------------------------------------------------------------
+    ; Não permite que o usuário delete pelo grid um participante que possua proposta
+    ; cadastrada para pelo menos um item do processo de compra
+    ;
+    ; History:
+    ; 30-Apr-2011	Gustavo Fiuza	Created
+    ;-------------------------------------------------------------------------------
+	quit:(YKEY = "")
+
+	new idFornecedorParticipante, blnPossuiProposta	
+	set idFornecedorParticipante = $$GetFornecedorParticipante^VARSESCOMPRASParticipantes($$$KEY1(YKEY),$$$KEY2(YKEY),$$$KEY3(YKEY))	
+	
+	set blnPossuiProposta = $$isFornecedorComProposta^VARSESCOMPRASProposta($$$KEY1(YKEY),idFornecedorParticipante)	
+	if (blnPossuiProposta = $$$YES) {	
+		set Q = $$$QDontDelete
+ 		do ReturnError^COMUtilError("Não é possível remover este participante pois ele possui proposta cadastrada para um ou mais itens deste processo de compra.")		
+	}
+	
+	quit
+	
+PrintFornecedoresSugeridos(pYKEY,pidItem)
+	;-------------------------------------------------------------------------------
+    ; Apresenta a tabela de fornecedores sugeridos para um determinado item/grupo
+    ; do processo de compra.
+    ;
+    ; History:
+    ; 29-Sep-2009	Gustavo Fiuza	Created
+    ;-------------------------------------------------------------------------------
+	new grupo, formulaData, meuSQL, lstHeader, count, idFornecedor, chave, idModalidade, strUltimaCompra,
+		fltUltimoPreco, dteUltimoPreco, strColunaPreco, blnIncludeFornecedor
+	
+	kill ^VARSESTempDispParticipante(YM,YBED)
+	
+	set grupo = $$SQLGetGrupoItem^VARSQL(pidItem)	
+	set idModalidade = $$GetModalidade^VARSESCOMPRAS($$$KEY1(pYKEY))
+	
+	set formulaData = ##class(%ResultSet).%New()  ;Create Result Set Object 
+	
+	if (idModalidade = 10) { ;10-PDPAS
+	
+		set meuSQL = $$FornecedoresSugeridosPDPAS(grupo)
+		set strColunaPreco = "Preço Última<br/>Compra - PDPAS"		
+
+	} else {
+
+		set meuSQL = $$FornecedoresSugeridosRegular(grupo)		
+		set strColunaPreco = "Preço Última<br/>Compra Regular"
+	}
+
+	do formulaData.Prepare(meuSQL)  ;Prepare Query
+	do formulaData.Execute()  ;Execute Query
+ 	
+	set lstHeader = ""
+  	set lstHeader = lstHeader_$listbuild("","Cód.","Fornecedor","CNPJ",strColunaPreco,"Data Última Compra")
+
+	set beginStyle = "<font style='line-height:22px'>"
+	set endStyle = "</font>"
+	
+	if $$Start^COMTable(lstHeader,"Fornecedores sugeridos para o item:") {
+		
+		set count = 0
+		
+		while (formulaData.Next()) {
+			
+			set idFornecedor = formulaData.GetData(1)
+ 			
+ 			set blnIncludeFornecedor = $$ValidaFornecedor(pYKEY,idFornecedor)
+ 			continue:(blnIncludeFornecedor '= $$$YES)
+ 						
+			set count = $i(count)
+			
+			if (idModalidade = 10) {
+				;Preços das últimas compras - PDPAS
+				set strUltimaCompra = ""
+				set strUltimaCompra = $$getUltimaCompraPDPAS^VARINLIEF(pidItem,idFornecedor)
+			
+				set fltUltimoPreco = +$piece(strUltimaCompra,Y,2)
+				set dteUltimoPreco = $piece(strUltimaCompra,Y,5) 
+			
+			} else {
+				;Preços das últimas compras regular
+				set strUltimaCompra = ""
+				set strUltimaCompra = $$getUltimaCompraRegular^VARINLIEF(pidItem,idFornecedor)
+			
+				set fltUltimoPreco = +$piece(strUltimaCompra,Y,2)
+				set dteUltimoPreco = $piece(strUltimaCompra,Y,5) 
+			}		
+			
+			set chave = pYKEY_","_idFornecedor
+			
+			do NewLine^COMTable()
+			do InsertCellCheckbox^COMTable(chave,"SelecionarSugestao^VARSESCOMPRASParticipantesSel",$$$NO,$$$NO)
+			do InsertCell^COMTable(beginStyle_idFornecedor_endStyle)
+			do InsertCell^COMTable(beginStyle_$$getNomeFornecedor^VARINLIEF(idFornecedor)_endStyle)
+			do InsertCell^COMTable(beginStyle_$$getCNPJ^VARINLIEF(idFornecedor)_endStyle)
+			
+			if (fltUltimoPreco > 0) {
+				do InsertCell^COMTable(beginStyle_$$FormatCurrency^COMTable(fltUltimoPreco)_endStyle,,,,"RIGHT")
+				do InsertCell^COMTable(beginStyle_$zdate(dteUltimoPreco,4)_endStyle,,,,"CENTER")
+			} else {
+				do InsertCell^COMTable("")
+				do InsertCell^COMTable("")
+			}
+			
+			do EndLine^COMTable()
+		}
+		
+		if (count = 0) {
+			do NewLine^COMTable()
+			do InsertCell^COMTable("")
+			do InsertCell^COMTable("Não há nenhuma sugestão, ou todos os fornecedores sugeridos já foram incluídos como participantes do processo de compra.",,,,,,5)
+			do EndLine^COMTable()
+		
+		} else {
+			do NewLine^COMTable("lightsteelblue")
+			do InsertCellCheckbox^COMTable(chave,"SelecionarTudo^VARSESCOMPRASParticipantesSel",$$$NO,$$$NO)
+			do InsertCell^COMTable(beginStyle_"<strong>Selecionar todos os fornecedores sugeridos acima.</strong>"_endStyle,,,,,,5)
+			do EndLine^COMTable()
+		}
+			
+		do Stop^COMTable()
+		do formulaData.Close()
+	}
+		
+	quit
+
+FornecedoresSugeridosPDPAS(pGrupo)
+	quit:(pGrupo = "") ""
+			
+	//SQL para sugerir fornecedores quando a compra for do PDPAS
+	new meuSQL
+	set meuSQL = "SELECT DISTINCT"
+	set meuSQL = meuSQL_" $UPPER(Propostas.Fornecedor),"
+	set meuSQL = meuSQL_" $UPPER(INART.ItemGroup),"
+	set meuSQL = meuSQL_" $$SQLGetDescFornecedor^VARSQL(Propostas.Fornecedor) as DescFornecedor"
+	set meuSQL = meuSQL_" FROM SQLUser.VARSESCOMPRASPropostaLinha as Propostas"
+	set meuSQL = meuSQL_"   INNER JOIN SQLUser.INART as INART on Propostas.Produto = INART.ItemNumber"
+	set meuSQL = meuSQL_" WHERE INART.ItemGroup = '"_grupo_"'"
+	set meuSQL = meuSQL_" ORDER BY DescFornecedor ASC"
+	
+	quit meuSQL
+
+FornecedoresSugeridosRegular(pGrupo)
+	quit:(pGrupo = "") ""
+
+	//SQL para fornecedores sugeridos quando a compra for regular
+	new meuSQL
+	set meuSQL = "SELECT DISTINCT"
+	set meuSQL = meuSQL_" $UPPER(INAUF.SupplierNumber),"
+	set meuSQL = meuSQL_" $UPPER(INART.ItemGroup),"
+	set meuSQL = meuSQL_" $$SQLGetDescFornecedor^VARSQL(INAUF.SupplierNumber) as DescFornecedor"	
+	set meuSQL = meuSQL_" FROM SQLUser.INAUF as INAUF"
+	set meuSQL = meuSQL_"   INNER JOIN SQLUser.INAUFP as INAUFP on INAUFP.OrderNo = INAUF.OrderNumber"
+	set meuSQL = meuSQL_"   INNER JOIN SQLUser.INART as INART on INAUFP.ItemNumber = INART.ItemNumber"
+	set meuSQL = meuSQL_" WHERE INART.ItemGroup ='"_pGrupo_"'"
+	set meuSQL = meuSQL_" ORDER BY DescFornecedor ASC"	
+	
+	quit meuSQL
+
+ValidaFornecedor(pYKEY,pidFornecedor)
+	;-------------------------------------------------------------------------------
+    ; Verifica quais fornecedores devem ser mantidos na lista de sugestão vinda do 
+    ; SQL.
+    ;
+    ; History:
+    ; 02-May-2011	Gustavo Fiuza	Created
+    ;-------------------------------------------------------------------------------
+	quit:( (pYKEY = "") || (pidFornecedor = "") ) ""
+	
+	new blnIncludeFornecedor
+	set blnIncludeFornecedor = $$$YES
+
+	//Não sugere caso o fornecedor esteja inativo 
+	if ($$getStatusFornecedor^VARINLIEF(idFornecedor) '= 1) { ;1-Ativo	
+		set blnIncludeFornecedor = $$$NO
+	}
+			
+	//Não sugere novamente caso o fornecedor já tenha sido inserido no processo
+	elseif ($data(^VARSESCOMPRASParticipantesLines(YM,1,$$$Index($$$KEY1(pYKEY)),idFornecedor,$$$KEY1(pYKEY),$$$KEY2(pYKEY))) > 0) {
+		set blnIncludeFornecedor = $$$NO
+	}
+	
+	quit blnIncludeFornecedor
+
+	
+SelecionarSugestao(pYKEY="",pChecked="")
+	;-------------------------------------------------------------------------------
+    ; Salva a marcação ou desmarcação do usuário no checkbox com a sugestão de 
+    ; fornecedor.
+    ; 
+    ; History:
+    ; 29-Sep-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	new idFornecedor	
+	set idFornecedor = $$$KEY3(pYKEY)
+	
+	if ($piece(pChecked,",",1) = "true") {		
+		set ^VARSESTempDispParticipante(YM,YBED,$$$KEY1(pYKEY),$$$KEY2(pYKEY),idFornecedor,1) = ""
+	
+	} elseif ($piece(pChecked,",",1) = "false") {
+		kill ^VARSESTempDispParticipante(YM,YBED,$$$KEY1(pYKEY),$$$KEY2(pYKEY),idFornecedor)
+	}
+	
+	quit $$$YES
+	
+SelecionarTudo(pYKEY="",pChecked="")
+	;-------------------------------------------------------------------------------
+    ; Salva a marcação ou desmarcação do usuário no checkbox "Todos".
+    ; 
+    ; History:
+    ; 02-May-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	new idItemgrupo, idModalidade, meuSQL, blnIncludeFornecedor
+	
+	set idItem = $$GetCodigoItem^VARSESCOMPRAS($$$KEY1(pYKEY),$$$KEY2(pYKEY))	
+	set grupo  = $$SQLGetGrupoItem^VARSQL(idItem)
+	set idModalidade = $$GetModalidade^VARSESCOMPRAS($$$KEY1(pYKEY))
+	
+	set formulaData = ##class(%ResultSet).%New()  ;Create Result Set Object 
+	
+	if (idModalidade = 10) { ;10-PDPAS	
+		set meuSQL = $$FornecedoresSugeridosPDPAS(grupo)
+
+	} else {
+		set meuSQL = $$FornecedoresSugeridosRegular(grupo)
+	}
+
+	do formulaData.Prepare(meuSQL)  ;Prepare Query
+	do formulaData.Execute()  ;Execute Query
+ 			
+	while (formulaData.Next()) {
+			
+		set idFornecedor = formulaData.GetData(1) 
+ 		set blnIncludeFornecedor = $$ValidaFornecedor(pYKEY,idFornecedor)
+ 		continue:(blnIncludeFornecedor '= $$$YES)
+		
+		;Marca/Desmarca
+		if ($piece(pChecked,",",1) = "true") {		
+			set ^VARSESTempDispParticipante(YM,YBED,$$$KEY1(pYKEY),$$$KEY2(pYKEY),idFornecedor,1) = ""
+	
+		} elseif ($piece(pChecked,",",1) = "false") {
+			kill ^VARSESTempDispParticipante(YM,YBED,$$$KEY1(pYKEY),$$$KEY2(pYKEY),idFornecedor)
+		}
+	}
+	
+	do formulaData.Close()
+	
+	quit $$$YES	
+	
+SaveParticipantes(pNoProcessoCompra,pItemCompra)
+	quit:((pNoProcessoCompra = "") || (pItemCompra = ""))
+	
+	new strStatus, ultimoReg, idFornecedor, objParticipante, chave
+	
+	set strStatus = $$$OK
+	set ultimoReg = ""
+	
+	$$$Order5(^VARSESTempDispParticipante,YM,YBED,pNoProcessoCompra,pItemCompra,idFornecedor)
+		if ultimoReg = "" {
+			set ultimoReg = $order(^VARSESCOMPRASParticipantesLine(YM,pNoProcessoCompra,pItemCompra,ultimoReg),-1) + 1			
+		} else {
+			set ultimoReg = ultimoReg + 1	
+		}		
+		
+		set chave = pNoProcessoCompra_","_pItemCompra_","_ultimoReg
+		set objParticipante = idFornecedor
+		
+		set strStatus = $$$Save("VARSESCOMPRASParticipantesLine",chave,objParticipante,1)
+	$$$End
+	
+	quit strStatus
+	
+	
+GetCNPJParticipante(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Carrega o CNPJ do participante ao abrir a tela de seleção de participantes.
+    ;
+    ; History:
+    ; 27-Aug-2009	Gustavo Fiuza	Created
+    ;-------------------------------------------------------------------------------
+	if pYKEY = "" quit ""	
+	new idFornecedor, CNPJ
+	set idFornecedor = $piece($get(^VARSESCOMPRASParticipantesLine(YM,$$$KEY1(pYKEY),$$$KEY2(pYKEY),$$$KEY3(pYKEY),1)),Y,1)
+	set CNPJ = $$getCNPJ^VARINLIEF(idFornecedor)	
+	
+	quit CNPJ
+	
+LoadUltimaCompra(pYKEY,pCampo="")
+	;-------------------------------------------------------------------------------
+    ; Carrega os dados da última compra do fornecedor. Dependendo da modalidade da
+    ; compra, o dado retornado pode ser da última compra regular ou da última compra
+    ; PDPAS.
+    ;
+    ; History:
+	; 30-May-2011	Gustavo Fiuza	Updated
+    ; 28-Apr-2011	Gustavo Fiuza	Updated
+    ; 20-Apr-2011	Gustavo Fiuza	Created
+    ;-------------------------------------------------------------------------------
+	if pYKEY = "" quit ""	
+	new idItem, idFornecedor, idModalidade, strUltimaCompra
+	
+	set idFornecedor = $piece($get(^VARSESCOMPRASParticipantesLine(YM,$$$KEY1(pYKEY),$$$KEY2(pYKEY),$$$KEY3(pYKEY),1)),Y,1)
+	set idProduto    = $$GetCodigoItem^VARSESCOMPRAS($$$KEY1(pYKEY),$$$KEY2(pYKEY))
+
+	set idModalidade    = $$GetModalidade^VARSESCOMPRAS($$$KEY1(pYKEY))
+	set strUltimaCompra = ""
+	
+	if (idModalidade = 10) { ;10-PDPAS
+		set strUltimaCompra = $$getUltimaCompraPDPAS^VARINLIEF(idProduto,idFornecedor)
+	} else {
+		set strUltimaCompra = $$getUltimaCompraRegular^VARINLIEF(idProduto,idFornecedor)
+	}	
+	
+	if (pCampo '= "") {			
+		if ( (pCampo = 2) || (pCampo = 3) ) {
+			quit $$FormatCurrency^COMTable($piece(strUltimaCompra,Y,pCampo))
+		} else {
+			quit $piece(strUltimaCompra,Y,pCampo)
+		}
+	}
+	
+	quit strUltimaCompra
+	
+OnBlurFrn(pYKEY,pYFELD,pGROW)
+	;-------------------------------------------------------------------------------
+    ; Verifica se o fornecedor está ativo ou não.
+    ;
+    ; History:
+    ; 30-Apr-2011	Gustavo Fiuza	Created
+    ;-------------------------------------------------------------------------------
+	quit:(pYFELD = "")
+	
+	new idFornecedor
+	set idFornecedor = $piece(YFELD,Y,1)
+	
+	if (idFornecedor '= "") {
+		
+		;Verifica o status do fornecedor
+		if ($$getStatusFornecedor^VARINLIEF(idFornecedor) '= 1) { ;1-Ativo
+			w "javascript:alert('O fornecedor "_idFornecedor_" não está ativo e portanto não é possível utilizá-lo. Favor verificar.');"
+			set $piece(YFELD,Y,1) = ""
+		}
+		
+		set strFornecedores = $$FornecedoresJaIncluidos()
+		
+		;Verifica duplicações do mesmo fornecedor em duas linhas
+		for idLine = 1:1:$length(strFornecedores) {
+			
+			continue:(idLine = pGROW)
+
+			if ($piece(strFornecedores,Y,idLine) = idFornecedor) {
+				w "javascript:alert('O fornecedor "_idFornecedor_" já foi incluído como participante em outra linha desta compra (linha "_idLine_").');"
+				set $piece(YFELD,Y,1) = ""
+				quit
+			}
+		}		
+		
+	}
+		
+	quit
+	
+	
+FornecedoresJaIncluidos()
+    ;-------------------------------------------------------------------------------
+    ; Retorna os fornecedores que já foram inseridos no grid, para evitar duplicações
+    ; (utilizando a WWWDATEN)
+    ;
+    ; History:
+    ; 01-May-2011	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	new date, idLine, idField, idSupplier, strFornecedores
+	
+	set strProdutos = ""
+	set date = $piece($h,$$$COMMA,1)
+ 	
+	$$$Order7(^WWWDATEN,YM,date,YUSER,"VARSESCOMPRASParticipantesLine","V","DISPLAYED",idLine) 
+		
+		set idField = "Y"_idLine_"_"_1 ;(1=Coluna Fornecedor)
+		set idSupplier  = $get(^WWWDATEN(0,date,YUSER,"VARSESCOMPRASParticipantesLine","V",idField,1))
+		
+		// If grid line was not deleted, include item code in the list of already included itens:
+		if ($get(^WWWDATEN(0,date,YUSER,"VARSESCOMPRASParticipantesLine","V","KILLEDRECORD",idLine)) '= 1) {
+			set $piece(strFornecedores,Y,idLine) = idSupplier
+		}
+	
+	$$$End
+	
+	quit strFornecedores	
+]]></Routine>
+</Export>

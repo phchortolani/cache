@@ -1,0 +1,1492 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INAUFANZ" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INAUFANZ(YAUF,YLIST,FRAME)
+#include INConst
+#include COMSYS
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		ANZEIGEN AUFTRAGPOSITIONEN ;DISPLAY ORDER POSITIONS
+	;	EINSPRUNG AUS INAUF
+	;
+	; Called By : ^INAUF, SEARCH^INAUFSEARCH
+	; 
+	; Inputs : 
+	;	YAUF		idOrder AUFTRAGSNUMMER
+	;	YLIST		1: AUFLISTUNG IN TABELLENFORM MIT DRUCK UND INFO DES AUFTRAGES
+	;				   IN HEADER ;within by means of printing And within 
+	;	FRAME		1: ANZEIGE INNERHALB FRAME / FRAME AKTUALISIEREN ;Show inside 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 02-Oct-2009	GRF		SR16361: Implement change to use INRECSumamry/INRECLine
+	; 							in place of INWEAUF
+	; 11-Jan-2007	GRF		SR15357: Doco; remove unnecessary DO level; boolean macros;
+	; 						use objOrderSup; naked reference (use idLineGroup)
+	; 15-Nov-2006	JW		SR15205: Renamed from CanHideCosts
+	; 23-Oct-2006	RPW		SR15068: Use $$$IN macros instead of direct referencing
+	; 14-Sep-2006	RPW		SR15037: Use YAUF not YYKEY
+	; 05-Sep-2006	RPW		SR14972: Hide the cost column for Manufacturing Orders
+	; 						and when we are not to show them.
+	; 04-Oct-2005	Steve S	SR13615: Don't use fltCost -- just display the Sales Price
+	; 09-Aug-2005	Steve S	SR13177: Show correct Unit Price
+	; 11-Jul-2005	JW		SR12811: Commented, added macros
+	; 17.07.2001	FAN		Created.  
+	;-------------------------------------------------------------------------------
+	/*
+	;;;IF $GET(YLIST)'=1 IF $GET(FRAME)'=1 DO  QUIT  ;AUFBAU INNERFRAME;FIS;24815;12.12.03  !! ERFORDERT ÄNDERUNGEN IN MOVE UND KILL !!
+	. NEW WIDTH,HEIGHT,POS
+	. SET WIDTH=$PIECE($GET(^WWW120(0,YFORM,1)),Y,90)
+	. IF +WIDTH>100 SET WIDTH=WIDTH_"px"
+	. IF +WIDTH'>100 SET WIDTH="100%"
+	. SET HEIGHT=20
+	. SET POS="" FOR  SET POS=$ORDER(^INAUFP(YM,YAUF,POS)) QUIT:POS=""  SET HEIGHT=HEIGHT+20
+	. IF HEIGHT'>290 SET HEIGHT=290
+	. SET HEIGHT=HEIGHT_"px"
+	. WRITE YCR,YCR,"<DIV ID="_""""_"YLINEITEMS"_""""_" style="_""""_"height:"_HEIGHT_"; width:"_WIDTH_";"_""" tabIndex=-1"_">" // 14853
+	. WRITE YCR,YCR,"<IFRAME name="_""""_"YLINEITEMS"_""""
+	. WRITE " src="_""""_"javascript:window.location='"_YAKTION_"EP=WWWMANU&YEXEC=DO|^INAUFANZ('"_$GET(YAUF)_"','"_$GET(YLIST)_"',1)&YFORM="_YFORM  ;YFORM FÜR LAYOUT ;to 
+	. NEW YFORM
+	. DO ^WWWCGI
+	. WRITE "'"_""""
+	. WRITE YCR," BORDER=0 FRAMEBORDER=0"
+	. ;DO FARBE^WWWTAB
+	. WRITE " FRAMESPACING=0 WIDTH=100% HEIGHT=100% SCROLLING=AUTO"
+	. WRITE ">"
+	. WRITE YCR,"</IFRAME>"
+	. WRITE YCR,"</div>"
+	*/
+	new ANZM,blnCanHide,FREMDWHR,GRUPOS,KOST,idOrderType,objINVORG,POS,POSX
+	new RUEST,STDLOT,SUM,VKANZ,WARE,YAUF1,YDDSATZ,YFELD,YID,YQ,YQP
+	
+	;===============================================================================
+	;  1   2    3       4       5       6         7        8       9      10     11     12     13   14    15    16  17
+	;  *   *                            *                                               *      *          *     *       
+	;+---+---+----+----------+-----+---------+--------+--------+------+--------+----+--------+----+-----+----+-----+---+
+	;|   |   |L.I.|Item Name |Item:|Line Item|Quantity|Quantity|Source|Customer|Text|  Unit  |Cost|Unit |Cost|Setup|Tax|   HEADER
+	;|   |   |    |          |     | Grouping|        |  Unit  |      |  Text  |    |Price FC| FC |Price|    | Time|   |
+	;+---+---+----+----------+-----+---------+--------+--------+------+--------+----+--------+----+-----+----+-----+---+
+	;|   |   | ## | #######  | ##  |   ##    |   ##   |   ##   |      |        |    |        |    | ##  | ## |     |   |   ANZ
+	;+---+---+----+----------+-----+---------+--------+--------+------+--------+----+--------+----+-----+----+-----+---+    - order lines
+	;|   |   | ## | #######  | ##  |   ##    |   ##   |   ##   |      |        |    |        |    | ##  | ## |     |   |
+	;+---+---+----+----------+-----+---------+--------+--------+------+--------+----+--------+----+-----+----+-----+---+
+	;|   |   |    |          |     |         |        |        |      |        |    |        |    |     |    |     |   |   ZEILE
+	;+---+---+----+----------+-----+---------+--------+--------+------+--------+----+--------+----+-----+----+-----+---+    - blank lines
+	;|   |   |    |          |     |         |        |        |      |        |    |        |    |     |    |     |   |
+	;+---+---+----+----------+-----+---------+--------+--------+------+--------+----+--------+----+-----+----+-----+---+
+	;|   |   |    |          |     |         |        |        |      |        |    |        | ## |     | ## |     |   |   SUMME
+	;+---+---+----+----------+-----+---------+--------+--------+------+--------+----+--------+----+-----+----+-----+---+    - totals
+	;                                                          ???                                         RABATT
+	; Columns marked with "*" are conditional & may not appear
+	; *14*   Could be "Unit Sales Price" instead of "Unit Price"
+	; *15*   Could be "Net Sales Price"  instead of "Cost"
+	;===============================================================================
+	
+	SET YLIST    = $GET(YLIST)
+	SET FRAME    = $GET(FRAME)
+	IF FRAME = 1 SET YNOFOOT = 1
+	SET ANZM     = 0
+	SET YDDSATZ  = 0
+	SET SUM(1)   = 0      ;SUMME HERSTELLKOSTEN ;sum 
+	SET SUM(2)   = 0      ;SUMME RÜSTZEIT       ;sum setup time 
+	SET SUM(3)   = 0      ;SUMME EINZELPREISE   ;sum 
+	SET SUM(4)   = 0      ;SUMME EINZELPREISE FREMDWÄHRUNG ;sum 
+	SET YQ       = $$$NO  ;NICHT  ANZEIGE LÖSCHEN UND MOVE SPALTEN ;Not Show Delete And split 
+	SET YQP      = $$$NO  ;NICHT ANZEIGE LÖSCHEN UND MOVE BUTTON   ;Not Show Delete And 
+	SET GRUPOS   = 0      ;KEINE POSITIONSGRUPPEN ;no 
+	SET RUEST    = ""     ;KEINE ANZEIGE WENN KEINE RÜSTZEITEN VORHANDEN ;no Show when no on hand 
+	SET WARE     = 0      ;WENN LAGERBESTELLUNG DANN KEINE ANZEIGE RÜSTZEITEN ;when no Show 
+	SET FREMDWHR = $$$NO  ;FOREIGN CURRENCY;FIS;27.08.04;26316
+	
+	QUIT:$GET(YAUF)=""
+	
+	SET YAUF1=$GET(^INAUF(YM,YAUF,1))
+	
+	set idOrderType = $$$INAUFOrderType(YAUF1)  // SR14972
+	set blnCanHide  = $$$NO                     // SR14972
+	if idOrderType=1 set blnCanHide = $$CanHideMOCosts^COMSecurity(YBED,YLOCATION,YFORM,YAUF) // SR14972, SR15037
+	
+	IF $PIECE(YAUF1,Y,2)=2 IF $PIECE(YAUF1,Y,51)'="" IF $PIECE(YAUF1,Y,51)'=YWHR SET FREMDWHR=$$$YES  ;FOREIGN CURRENCY;FIS;27.08.04;26316 ; 23-Mar-2005	RobertW		Why do this for each line when we are just getting information from the header?
+	
+	SET POS=""
+	FOR  SET POS=$ORDER(^INAUFP(YM,YAUF,POS)) QUIT:POS=""  DO
+	. SET YFELD=$GET(^INAUFP(YM,YAUF,POS,1))
+	. QUIT:YFELD=""
+	. ;
+	. SET ANZM=ANZM+1
+	. IF $PIECE(YFELD,Y,7)="" IF $PIECE(YFELD,Y,97)="" SET YQ=$$$YES        ;ANZEIGE LÖSCHEN UND MOVE SPALTEN WENN EINE POSITION OHNE WARENHERKUNKT ;Show Delete And split when one without 
+	. IF $PIECE(YFELD,Y,247)'="" SET GRUPOS=1  ;ANZEIGE VON GRUPPENPOSITIONEN WENN VORHANDEN; FIS,29.10.2001
+	. IF ($PIECE(YFELD,Y,265)="") && ($PIECE(YFELD,Y,70)'=0) && ($PIECE(YFELD,Y,7)=3) SET RUEST=1  ;WENN RÜSTZEITEN VORHANDEN UND NOCH NICHT ABGESCHLOSSEN  ;when on hand And yet Not 
+	. ;IF $PIECE(YAUF1,Y,2)=2 IF $PIECE(YAUF1,Y,51)'="" IF $PIECE(YAUF1,Y,51)'=YWHR SET FREMDWHR=$$$YES  ;FOREIGN CURRENCY;FIS;27.08.04;26316
+	
+	
+	set objINVORG = $get(^INVORG(YM,YM,1))                        // SR15068
+	if $$$INVORGDoNotDisplaySetupTimeInOr(objINVORG) SET RUEST="" // SR15068
+	
+	SET VKANZ=0
+	// The following actually displays the costs if it's unchecked.
+	if $$$INVORGDisplayPricesInCustOrder(objINVORG)&&($$$INAUFOrderType(YAUF1)=0) set VKANZ=1 // SR15068
+	//IF $PIECE($GET(^INVORG(YM,YM,1)),Y,139)=1 IF $PIECE($GET(^INAUF(YM,YAUF,1)),Y,2)=0 SET VKANZ=1  ;VERKAUFSPREIS IN KUNDENVERTRÄGEN ANZEIGEN ;within display  // SR15068
+	
+	SET YID="oLItems"
+	
+	;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	;DO
+	. NEW YCOLS
+	. SET YCOLS=""
+	. IF YQ=$$$YES SET YCOLS="L,M,"
+	. SET YCOLS=YCOLS_"P,1,4,"
+	. IF GRUPOS=1 SET YCOLS=YCOLS_"0,"
+	. SET YCOLS=YCOLS_"5,40,0,10,14,0,0,"
+	. IF RUEST=1 SET YCOLS=YCOLS_"0,"
+	. SET YCOLS=YCOLS_"0"
+	. WRITE YCR,"<script language=""JavaScript"">"
+	. WRITE YCR,"<!--"
+	. WRITE YCR,"var RowNo=1;"
+	. WRITE YCR
+	. WRITE YCR,"function addLineItems() {"
+	. WRITE YCR,"  retval = EventValue("_""""_YUCI_""""_","_""""_YUSER_""""_","_""""_YFORM_""""_","_""""_"FIX"_""""_","_""""_"INAUFANZS"_""""_","_""""_YID_""""_","_""""_"6"_""""_","_""""_YCOLS_""""_");"
+	. WRITE YCR,"}"
+	. WRITE YCR
+	. WRITE YCR,"function deleteLineItem(ykey) {"
+	. WRITE YCR,"  retval = EventValue("_""""_YUCI_""""_","_""""_YUSER_""""_","_""""_YFORM_""""_","_""""_"FIX"_""""_","_""""_"INAUFANZK"_""""_","_""""_YID_""""_","_""""_"6"_""""_",ykey);"
+	. WRITE YCR,"}"
+	. WRITE YCR
+	. WRITE YCR,"//-->"
+	. WRITE YCR,"</script>"
+	. WRITE YCR
+	;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DISABLED BLOCK END
+	
+	DO  ;TABLE START ;take-off 
+	. IF YAUF'="" IF $DATA(^INAUFP(YM,YAUF)) DO ^WWWFRAME(2,,,YID,1) QUIT  ;TABLE AN  ;11,2,2004;TYBD;HINTERGRUNDFARBE
+	. IF YAUF=""                             DO ^WWWFRAME(0,,,YID,1) QUIT  ;11,2,2004;TYBD;HINTERGRUNDFARBE
+	. IF '$DATA(^INAUFP(YM,YAUF))            DO ^WWWFRAME(0,,,YID,1)       ;TABLE AN  TYBD;6.2.03  ;11,2,2004;TYBD;HINTERGRUNDFARBE
+	
+	DO HEADER
+	DO
+	. WRITE "<TBODY>"
+	. SET POS = ""
+	. FOR  SET POS = $ORDER(^INAUFP(YM,YAUF,POS)) QUIT:POS=""  DO
+	. . SET YFELD = $GET(^INAUFP(YM,YAUF,POS,1))
+	. . QUIT:YFELD=""
+	. . ; vvvvv PO - SR12368: START OF SECTION BELIEVED TO BE CHANGES FOR SR12368
+	. . SET (STDLOT,STDLOT(1))=""                                   ;FIS;SR12368;20/06/05
+	. . IF $PIECE(YAUF1,Y,6)'="" IF $PIECE(YFELD,Y,4)'="" DO        ;FIS;SR12368;20/06/05
+	. . . SET STDLOT   =  $PIECE($GET(^INDRPITEM(YM,$PIECE(YAUF1,Y,6),$PIECE(YFELD,Y,4),1)),Y,24)  ;STANDARD LOTSIZE
+	. . . SET STDLOT(1)= +$PIECE($GET(^INDRPITEM(YM,$PIECE(YAUF1,Y,6),$PIECE(YFELD,Y,4),1)),Y,26)  ;MULTIPLE ?
+	. . IF +STDLOT'=0 DO
+	. . . IF STDLOT(1)'=1 QUIT                                        ;no multiple lot sizes
+	. . . IF $PIECE(YFELD,Y,5)#STDLOT=0 SET STDLOT=$PIECE(YFELD,Y,5)  ;update lotsize if multiple of qty
+	. . IF +STDLOT=0 SET STDLOT=$PIECE(YFELD,Y,5)                     ;update lotsize for check in ANZ
+	. . ; ^^^^^ PO - SR12368: END OF SECTION
+	. . IF $PIECE(YFELD,Y,7)="" IF $PIECE(YFELD,Y,97)="" SET YQP=$$$YES        ;IF +$PIECE(YFELD,Y,5)-$PIECE(YFELD,Y,6)=0 
+	. . DO ANZ
+	. ;
+	. WRITE "</TBODY>"
+	
+	IF (ANZM=0) || (YDDSATZ<10) DO
+	. NEW YBLANKLINE
+	. SET YBLANKLINE = $GET(YDDSATZ)
+	. FOR YBLANKLINE=YBLANKLINE:1:10 DO ZEILE
+	
+	DO SUMME
+	IF VKANZ=1 DO RABATT  ;FIS;28.07.04
+	DO ^WWWFRAME(1)  ;TABLE AUS ;out of 
+	
+	;NEURECHNEN ZUSATZKOSTEN;FIS;10.03.05;27220;27445
+	;	D209	$$$INVORGRecalcAdditionalCosts()
+	;	D215	$$$INVORGCalcAdditionalCostsInLine()
+	IF ($PIECE(objINVORG,Y,209)=$$$YES) || ($PIECE(objINVORG,Y,215)=$$$YES) {
+		DO ZUSATZ^INAUF1()
+	}
+	QUIT
+	
+ANZ
+    ;-------------------------------------------------------------------------------
+    ;		ANZEIGEN POSITIONEN ;display line
+    ;		
+    ; Params:
+    ; 
+    ; ByRef :
+    ;		blnCanHide
+    ; 
+    ; Returns:
+    ;
+    ; History:
+    ; 18-Oct-2010	GRF		SR17309: comment out lines setting piece66
+    ; 09-Aug-2010	SCR		SR17309: Disabled old Hold Reason code / piece66
+    ; 20-May-2010	PPP		SR17313: The Column width for Item Description in P/O form is not a max of 45 characters
+    ; 02-Jan-2010	shobby	SR17138: Removed the 'Text' column.  Added 'Ordered Quantity' and 'Ordered Unit'
+    ; 13-Aug-2009	PPP		SR16837: Update the Unit Cost based on the Sup Cost and
+    ;							Unit for the Order Unit
+	; 09-Apr-2009	PP/GRF	SR16478: make wider use of $$DPforInventoryCost^INVORG()
+    ; 05-Sep-2006	RPW		SR14972: Do not show the value field when there is
+    ; 							no permissions to.
+    ; 16-Aug-2006	JW		SR14827: Fixed.
+	; 03-AUG-2006   FAN    	SR14827: min DRP qty and Supplier Min Qty 
+    ; 23-Jun-2006	Pablo	SRBR014041: Currency symbol must appear on the correct
+    ; 							side of the numeric value
+    ; 31-Aug-2005	JW		SR13300: Show prices/costs before supplier discounts
+    ; 18-Aug-2005	JW		SR11997: Get tax code correctly
+    ; 11-Aug-2005	shobby	SR13175: In the unlikely event that the quantity of an
+    ; 							order line is 0.  Don't allow the screen to crash
+    ; 							with a divide by 0 type error.
+    ; 08-Jul-2005	shobby	SR12474: Updated the 'Edit Order' screen to show the
+    ; 							'Unit Price' when the order is a 'Customer Order'.
+    ;-------------------------------------------------------------------------------
+	; FIXME : mixture of "&nbsp;</a></font>" Aand "</a>&nbsp;</font>"    <GRF>
+	
+	new blnStrikeOut,fltConv,fltCost,idSuppUnit,objOrder,objOrderLine,objSupp,piece66,taxRate
+	
+	; newed in INAUFANZ : blnCanHide
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;	YFELD		objINAUFP		Order Line
+	;+++++++++++++++++++++++++++++++++++++++
+	;	D4		$$$INAUFPItemNumber()
+	;	D9		$$$INAUFPCancellation()
+	;	D30		$$$INAUFPItemGroup()
+	;	D66		$$$INAUFPItemBlocked()			WWW101("SPERRE")	4 : Item Disabled
+	;	D205	$$$INAUFPLineItemBarrier()
+	;---------------------------------------
+	;	D25		$$$INKUNDEKItemGroupDisabled()
+	;	D66		$$$INARTHoldReason()			WWW101("SPERRE")
+	;---------------------------------------
+	set blnStrikeOut = (($piece(YFELD,Y,205)=$$$YES) || ($piece(YFELD,Y,9)=$$$YES))
+	
+	IF $PIECE(YFELD,Y,30)'="" IF $GET(KUNDE)'="" IF $PIECE($GET(^INKUNDEK(YM,KUNDE,$PIECE(YFELD,Y,30),1)),Y,25)=$$$YES SET $PIECE(YFELD,Y,66)=4 ;SET GUELTIG=0 ;TYBD;9,12,2004;WARENGRUPPE NICHT FÜR DEN KUNDEN
+	;set piece66 = $piece(YFELD,Y,66) ;SR17309 vvv
+	;IF $PIECE(YFELD,Y,4)'="" set piece66 = $piece($get(^INART(YM,$PIECE(YFELD,Y,4),1)),Y,66)  ;item master
+	set piece66=0 ;SR17309
+	
+	; (*1*)(*2*) Buttons
+	;---------------------------------------
+	IF YQ=$$$YES IF YQP'=$$$YES DO
+	. DO NL^WWWTAB
+	. FOR YI=1:1:2 DO
+	. . DO NF^WWWTAB
+	. . WRITE "&nbsp;"
+	. . DO EF^WWWTAB
+	. . WRITE YCR
+	
+	IF YQP=$$$YES DO
+	. DO NL^WWWTAB
+	. ;
+	. ; (*1*) Delete Button      ;LÖSCHEN BUTTON
+	. ;-------------------------------------
+	. DO NF^WWWTAB
+	. DO  ;LÖSCHEN ;Delete 
+	. . NEW YKEY,YFORM
+	. . WRITE "<A HREF="_""""
+	. . WRITE "JavaScript:if (confirm('"_" (\'"_YAUF_"\',"_POS_")  "_$$^WWWTEXT(321)_"')) window.location='"
+	. . WRITE YAKTION_"EP=WWWMANU&YEXEC=*D|KILL^INAUFANZ&YFORM=INAUFANZ&YKEY="_YAUF_","_POS  ;LÖSCHEN ;Delete 
+	. . DO ^WWWCGI
+	. . WRITE "'"
+	. . WRITE """"
+	. . WRITE ">"
+	. ;
+	. ;DO  ;LÖSCHEN ;Delete 
+	. ;. NEW YKEY,YFORM
+	. ;. WRITE "<A HREF="_""""_"#"_""""
+	. ;. WRITE " onClick="_""""_"if (confirm('"_" (\'"_YAUF_"\',"_POS_")  "_$$^WWWTEXT(321)_"')) deleteLineItem('"_YAUF_","_POS_"');"_""""
+	. ;. WRITE """"
+	. ;. WRITE ">"
+	. ;
+	. WRITE "<IMG SRC="_""""_YGIF_"del.gif"_""""
+	. WRITE "ALT="_$$^WWWTEXT(50)
+	. WRITE " width=18 height=18 border=0 VSPACE=0>"
+	. WRITE "</A>"
+	. DO EF^WWWTAB
+	. WRITE YCR
+	. ;
+	. ; (*2*) Relocate Button     ;VERSCHIEBEN
+	. ;-------------------------------------
+	. DO NF^WWWTAB
+	. DO  
+	. . NEW YKEY,YFORM
+	. . WRITE "<A HREF="_""""_YAKTION_"EP=WWWMANU&YEXEC=*D|MOVE^INAUFANZ(0)&YFORM=INAUFANZ&YKEY="_YAUF_","_POS  ;HÖHER ;superior 
+	. . DO ^WWWCGI
+	. . WRITE """"
+	. . WRITE ">"
+	. ;
+	. WRITE "<IMG SRC="_""""_YGIF_"scrup.gif"_""""
+	. WRITE "ALT="_$$^WWWTEXT(32015)
+	. WRITE " border=0 VSPACE=0>"
+	. WRITE "</A>"
+	. DO  ;VERSCHIEBEN NACH UNTEN ;defer within underneath 
+	. . NEW YKEY,YFORM
+	. . WRITE "<A HREF="_""""_YAKTION_"EP=WWWMANU&YEXEC=*D|MOVE^INAUFANZ(1)&YFORM=INAUFANZ&YKEY="_YAUF_","_POS  ;TIEFER
+	. . DO ^WWWCGI
+	. . WRITE """"
+	. . WRITE ">"
+	. ;
+	. WRITE "<IMG SRC="_""""_YGIF_"scrdown.gif"_""""
+	. WRITE "ALT="_$$^WWWTEXT(32016)
+	. WRITE " border=0 VSPACE=0>"
+	. WRITE "</A>"
+	. DO EF^WWWTAB
+	. WRITE YCR
+	. ;
+	. DO ZW^WWWTAB
+	
+	IF YQ=$$$NO DO 
+	. ;----------------------------------Order Line----------------------------------------
+	. DO NL^WWWTAB 
+	. WRITE "<TD VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. IF YDDSATZ#2=1 WRITE " BGCOLOR="_YWHITE
+	. WRITE ">"
+	
+	IF YQ=$$$YES IF YQP=$$$NO DO
+	. WRITE "<TD VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. IF YDDSATZ#2=1 WRITE " BGCOLOR="_YWHITE
+	. WRITE ">"
+	
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"
+	. WRITE " TITLE="_""""_$$^WWWTEXT(32558)       ; "Processes Purchase Order Line"
+	. ; "Std. Pack Quantity: ###"
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """"
+	. WRITE ">"
+	
+	if blnStrikeOut WRITE "<STRIKE>"   ;GESPERRT ;DISABLED 
+	IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	WRITE POS                          ; Line
+	if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	WRITE "</font>",YCR
+	
+	DO ZW^WWWTAB
+	; (*4*) Item Description
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"              ; "Processes Purchase Order Line"
+	. IF (piece66="") || (piece66=0) WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. IF (piece66'="") && (piece66'=0) DO
+	. . WRITE " TITLE="_""""_$$^WWWFELDNAME("INART","D",66)_YCR
+	. . //WRITE $PIECE($GET(^WWW101(0,"SPERRE",SPRACHE,piece66,1)),Y,1)
+	. ;
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """"
+	. WRITE ">"
+	
+	if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	IF (piece66'="") && (piece66'=0) WRITE "<FONT COLOR="_YRED_">"  ;ARTIKELSPERRE
+	IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	//SR17313
+	//WRITE $EXTRACT($PIECE(YFELD,Y,1),1,15)  ;ARTIKELBEZEICHNUNG
+	write $extract($piece(YFELD,Y,1),1,45)	//SR17313  Increase the Desc width to 45
+	IF (piece66'="") && (piece66'=0) WRITE "</FONT>"               ;ARTIKELSPERRE
+	if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	WRITE "</font>",YCR
+	
+ 	;SR14827;03.08.06;FAN;29887;MIN QTY DRP 
+ 	
+ 	set objOrder = $GET(^INAUF(YM,YAUF,1))
+ 	IF $$$INAUFOrderType(objOrder)=2 {
+	 	do DisplayWarnings^INAUFSEARCHANZ(objOrder,YFELD)
+ 	}
+	
+	DO ZW^WWWTAB
+	; (*5*)  Item Number
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"              ; "Processes Purchase Order Line"
+	. IF (piece66="") || (piece66=0) WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. IF (piece66'="") && (piece66'=0) DO
+	. . WRITE " TITLE="_""""_$$^WWWFELDNAME("INART","D",66)_YCR
+	. . //WRITE $PIECE($GET(^WWW101(0,"SPERRE",SPRACHE,piece66,1)),Y,1)
+	. ;
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """"
+	. WRITE ">"
+	
+	if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	IF (piece66'="") && (piece66'=0) WRITE "<FONT COLOR="_YRED_">"  ;ARTIKELSPERRE
+	IF STDLOT'=$PIECE(YFELD,Y,5)     WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	WRITE $PIECE(YFELD,Y,4)  ;ARTIKELNUMMER
+	IF (piece66'="") && (piece66'=0) WRITE "</FONT>"               ;ARTIKELSPERRE
+	if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	WRITE "</font>",YCR
+	
+	IF GRUPOS=1 DO
+	. new idLineGroup
+	. DO ZW^WWWTAB
+	. ; (*6*) Line Item Grouping   ;POSITIONSGRUPPE
+	. ;---------------------------------------
+	. set idLineGroup = $PIECE(YFELD,Y,247)           ; SR15357
+	. WRITE "<font size=2>"
+	. DO
+	. . NEW YKEY,YFORM,YBACK
+	. . WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. . DO ^WWWCGI
+	. . WRITE """"           ; "Proceed Offer Item"
+	. . WRITE " TITLE="_""""_$$^WWWTEXT(32552)
+	. . IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. . WRITE """"
+	. . WRITE ">"
+	. ;
+	. if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. ; vvv SR15357
+	. IF idLineGroup'="" DO
+	. . IF $DATA(^INAUFPARA(YM,YAUF,idLineGroup,1)) WRITE $EXTRACT($PIECE(^INAUFPARA(YM,YAUF,idLineGroup,1),Y,1),1,20) QUIT
+	. . WRITE idLineGroup
+	. IF idLineGroup="" WRITE "&nbsp;"
+	. ; ^^^ SR15357
+	. if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	. WRITE "</A>"
+	. WRITE "&nbsp;"
+	. WRITE "</font>",YCR
+	
+	
+	;SR17138 vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+	DO ZWR^WWWTAB
+	; (*7*) Ordered Quantity
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"              ; "Processes Purchase Order Line"
+	. WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. ;IF STDLOT'=$$$INAUFPOrderedQuantity(YFELD) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """"
+	. WRITE ">"
+
+	if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	;IF STDLOT'=$$$INAUFPOrderedQuantity(YFELD) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+
+	;WRITE $EXTRACT(+$PIECE(YFELD,Y,5),1,15)  ;MENGE
+	if +$$$INAUFPOrderedQuantity(YFELD)'=0 {
+		WRITE $$^WWWZAHL($$$INAUFPOrderedQuantity(YFELD),0,$LENGTH($PIECE($$$INAUFPOrderedQuantity(YFELD),".",2)))  ;quantity 
+	}
+	if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	;WRITE "</font>",YCR
+
+	DO ZW^WWWTAB
+	; (*8*) Ordered Unit
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"
+	. WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """"
+	. WRITE ">"
+
+	IF $$$INAUFPOrderedUnit(YFELD)'="" DO
+	. if blnStrikeOut WRITE "<STRIKE>"   ;GESPERRT ;DISABLED 
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE $EXTRACT($$$AppEnum("EINHEIT",$$$INAUFPOrderedUnit(YFELD)),1,15)  ;MENGENEINHEIT
+	. if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+
+	IF $$$INAUFPOrderedUnit(YFELD)="" WRITE "&nbsp;"   ;EINHEIT
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	WRITE "</font>",YCR
+	;SR17138 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	
+	
+	DO ZWR^WWWTAB
+	; (*7*) Quantity
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"              ; "Processes Purchase Order Line"
+	. WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """"
+	. WRITE ">"
+	
+	if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	
+	;WRITE $EXTRACT(+$PIECE(YFELD,Y,5),1,15)  ;MENGE
+	WRITE $$^WWWZAHL($PIECE(YFELD,Y,5),0,$LENGTH($PIECE($PIECE(YFELD,Y,5),".",2)))  ;quantity 
+	if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	WRITE "</font>",YCR
+	
+	DO ZW^WWWTAB
+	; (*8*) Quantity Unit
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"
+	. WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """"
+	. WRITE ">"
+	
+	IF $PIECE(YFELD,Y,40)'="" DO
+	. if blnStrikeOut WRITE "<STRIKE>"   ;GESPERRT ;DISABLED 
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE $EXTRACT($PIECE($GET(^WWW101(0,"EINHEIT",SPRACHE,$PIECE(YFELD,Y,40),1)),Y,1),1,15)  ;MENGENEINHEIT
+	. if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	
+	IF $PIECE(YFELD,Y,40)="" WRITE "&nbsp;"   ;EINHEIT
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	WRITE "</font>",YCR
+	
+	DO ZW^WWWTAB
+	; (*9*) Good Origin / Source
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"
+	. WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """"
+	. WRITE ">"
+	
+	IF $PIECE(YFELD,Y,7)'="" DO
+	. if blnStrikeOut WRITE "<STRIKE>"   ;GESPERRT ;DISABLED 
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE $EXTRACT($PIECE($GET(^WWW101(0,"WARENHERKUNFT",SPRACHE,$PIECE(YFELD,Y,7),1)),Y,1),1,15)  ;WARENHERKUNFT
+	. if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	
+	IF $PIECE(YFELD,Y,7)="" WRITE "&nbsp;"
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	WRITE "</font>",YCR
+	
+	DO ZW^WWWTAB
+	; (*10*) Customer Text
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"
+	. WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """"
+	. WRITE ">"
+	
+	IF $PIECE(YFELD,Y,10)'="" DO
+	. if blnStrikeOut WRITE "<STRIKE>"   ;GESPERRT ;DISABLED 
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE $EXTRACT($PIECE($PIECE(YFELD,Y,10),"|",1),1,15)  ;KUNDENTEXT
+	. if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	
+	IF $TRANSLATE($PIECE(YFELD,Y,10)," ")="" WRITE "&nbsp;"
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	WRITE "</font>",YCR
+	
+	;SR17138 DO ZW^WWWTAB
+	;SR17138 ; (*11*) Text / Note
+	;SR17138 ;---------------------------------------
+	;SR17138 WRITE "<font size=2>"
+	;SR17138 DO
+	;SR17138 . NEW YKEY,YFORM,YBACK
+	;SR17138 . WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	;SR17138 . DO ^WWWCGI
+	;SR17138 . WRITE """"
+	;SR17138 . WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	;SR17138 . IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	;SR17138 . WRITE """"
+	;SR17138 . WRITE ">"
+	
+	;SR17138 IF $PIECE(YFELD,Y,14)'="" DO
+	;SR17138 . if blnStrikeOut WRITE "<STRIKE>"   ;GESPERRT ;DISABLED 
+	;SR17138 . IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	;SR17138 . WRITE $EXTRACT($PIECE($PIECE(YFELD,Y,14),"|",1),1,15)  ;AUSFÜHRUNGSTEXT
+	;SR17138 . if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	
+	;SR17138 WRITE "</A>"
+	;SR17138 IF $TRANSLATE($PIECE(YFELD,Y,14),"|")="" WRITE "&nbsp;"
+	;SR17138 WRITE "&nbsp;"
+	;SR17138WRITE "</font>",YCR
+	
+	IF FREMDWHR=$$$YES IF +$GET(VKANZ)=0 DO                          ;26316;FIS;27.08.04
+	. NEW EINZELEK,WHRF,FORMAT,ORDERMENGE,fltDenominator,objOrderSup
+	. set objOrderSup = $get(^INAUFPK(YM,YAUF,POS,1))                      ; SR15357
+	. SET EINZELEK    = $PIECE(objOrderSup,Y,68)
+	. SET ORDERMENGE  = $PIECE(objOrderSup,Y,16)           ;BEZUGSMENGE;FIS;14.10.04;26544
+	. IF +ORDERMENGE=0 SET ORDERMENGE = $PIECE(YFELD,Y,5)  ;FIS;14.10.04;26544
+	. SET EINZELEK = EINZELEK*ORDERMENGE                   ;GESAMT-EK ANZEIGEN;FIS;14.10.04;26544
+	. SET WHRF     = $PIECE(objOrderSup,Y,78)
+	. ;
+	. ; NEW CODE TO INCLUDE Unit Price Foreign Currency (Unit Price FC) field in the table/grid on the form INAUF SR:12088
+	. ;
+	. do ZWR^WWWTAB
+	. ; (*12*) Unit Price in Foreign Currency
+	. ;-------------------------------------
+	. new YKEY,YFORM,YBACK
+	. write "<font size=2><a href="""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. do ^WWWCGI
+	. write """ title="""_""">"
+	. if +EINZELEK'=0 do
+	. . if blnStrikeOut write "<strike>"
+	. . IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. . set fltDenominator = $piece(YFELD,Y,5) ; Just in case quantity is zero don't produce a divide by zero error
+	. . if +fltDenominator '= 0 write $$^WWWZAHL(EINZELEK/fltDenominator,0,2)_" "_$piece($get(^WWWWAE(0,$piece(YAUF1,Y,51),1)),Y,2)
+	. . if +fltDenominator = 0  write $$^WWWZAHL(0,0,2)_" "_$piece($get(^WWWWAE(0,$piece(YAUF1,Y,51),1)),Y,2)
+	. . if blnStrikeOut write "</strike>"
+	. ;
+	. write "&nbsp;</a></font>",YCR
+	. ;
+	. DO ZWR^WWWTAB
+	. ; (*13*) Cost FC
+	. ;-------------------------------------
+	. ;  FIXME : Something in this next line returns 0.00 for EINZELEK
+	. ;          which stops the total FC from being displayed           <GRF>   SR15371
+	. set EINZELEK=$$Recalculate^INAUFDISC(objOrderSup,$piece(YAUF1,Y,12)) ;shobby SR12088 take into account discounts etc.
+	. ;
+	. WRITE "<font size=2>"
+	. DO
+	. . NEW YKEY,YFORM,YBACK
+	. . WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. . DO ^WWWCGI
+	. . WRITE """"       ; Work with order line item
+	. . WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. . IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. . WRITE """"
+	. . WRITE ">"
+	. ;
+	. IF +EINZELEK'=0 DO
+	. . if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	. . IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. . SET SUM(4)=SUM(4)+EINZELEK
+	. . SET EINZELEK=$$^WWWZAHL(EINZELEK,0,2) ; *** ADD AMOUNT HERE ***
+	. . ;IF +WHRF'=0 WRITE $$^WWWTR(0,12,WHRF)_" x "
+	. . WRITE EINZELEK_" "_$PIECE($GET(^WWWWAE(0,$PIECE(YAUF1,Y,51),1)),Y,2)
+	. . if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	. ;
+	. WRITE "&nbsp;"
+	. WRITE "</A>"
+	. WRITE "</font>",YCR
+	
+	;---WEM;#23753;22.07.2003;Hinzugefügt
+	DO ZWR^WWWTAB
+	; (*14*) Unit Price
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"       ; BEARBEITEN AUFTRAGSPOSITION
+	. WRITE " TITLE="_""""_$$^WWWTEXT(32558)  ;_"""" ; PO - SR12368
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """" ; PO - SR12368
+	. WRITE ">"
+	
+	IF +$GET(VKANZ)=0 DO   ;EINZEL EK ANZEIGEN ;Planned Cost display 
+	. NEW EINZELEK
+	. ;SR13177		// SR13300 - reverted this code
+	. ;set fltQty=$piece($GET(^INAUFPK(YM,YAUF,POS,1)),Y,16)
+	. ;if +fltQty=0 set fltQty=$piece($GET(^INAUFP(YM,YAUF,POS,1)),Y,5)
+	. ;if +fltQty=0 set fltQty=1
+	. ;set fltCost=$piece($GET(^INAUFPK(YM,YAUF,POS,1)),Y,13)/fltQty
+	. ;if fltCost=0 set fltCost=$piece($get(^INAUFP(YM,YAUF,POS,1)),Y,47)/fltQty
+	. ;set fltCost=$justify(fltCost,0,2)
+	. 
+	. ; SHOBBY
+	. ;SET EINZELEK=$PIECE($GET(^INAUFPK(YM,YAUF,POS,1)),Y,12)   ;basispreis
+	. SET EINZELEK=$$$INAUFPKUnitPrice($GET(^INAUFPK(YM,YAUF,POS,1)))  ;einzelek ; tybd:
+	. ;
+	. //SR16837
+	. set objSupp      = $get(^INAUFPK(YM,YAUF,POS,1))
+	. set idSuppUnit   = $$$INAUFPKDeliveryQuantityFullLot(objSupp)
+	. ;SR17138 set fltConv = $$GetUOMConvBetweenUnits^INUOMConversion($$$INAUFPItemNumber(YFELD),$$$INAUFPQuantityUnit(YFELD),idSuppUnit)
+	. set fltConv = $$GetUOMConvBetweenUnits^INUOMConversion($$$INAUFPItemNumber(YFELD),$$$INAUFPOrderedUnit(YFELD),idSuppUnit)	;SR17138
+	. if fltConv do
+	. . set EINZELEK = EINZELEK/fltConv
+	. . ;SR17138 set $$$INAUFPCost(YFELD)=EINZELEK*$$$INAUFPQuantity(YFELD)
+	. . set $$$INAUFPCost(YFELD)=EINZELEK*$$$INAUFPOrderedQuantity(YFELD)	;SR17138
+	. ;
+	. ;if ($$$INAUFOrderType(YAUF1)=2)||($$$INAUFOrderType(YAUF1)=0) DO	// SR13300
+	. if ($$$INAUFOrderType(YAUF1)=0) DO
+	. . if +$$$INAUFPQuantity($GET(^INAUFP(YM,YAUF,PO]]><![CDATA[S,1)))=0 do
+	. . . set EINZELEK=""  ;SR13175
+	. . if +$$$INAUFPQuantity($GET(^INAUFP(YM,YAUF,POS,1)))'=0 do
+	. . . set EINZELEK=$$$INAUFPNetSalesPrice($GET(^INAUFP(YM,YAUF,POS,1)))/$$$INAUFPQuantity($GET(^INAUFP(YM,YAUF,POS,1))) ;SR12474
+	. ;
+	. set fltCost = EINZELEK
+	. IF (($piece($get(^INAUF(YM,YAUF,1)),Y,2)'=2) && (+EINZELEK'=0)) || ($piece($get(^INAUF(YM,YAUF,1)),Y,2)=2) DO  	; &&(fltCost'=0)
+	. . if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	. . IF STDLOT'=$$$INAUFPQuantity(YFELD) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. . SET SUM(3)   = SUM(3)+EINZELEK
+	. .;SET EINZELEK = $$^WWWZAHL(EINZELEK,0,$$^WWWDECIMALLEN("INAUFPK",47),YWHR) ; SR16478
+	. . SET EINZELEK = $$^WWWZAHL(EINZELEK,0,$$DPforInventoryCost^INVORG(),YWHR)
+	. . ;if $piece($get(^INAUF(YM,YAUF,1)),Y,2)=2 do ;SR13177
+	. . ;. write $$FormatCurrency^COMTable(fltCost)
+	. . ;if $piece($get(^INAUF(YM,YAUF,1)),Y,2)'=2 do
+	. . WRITE EINZELEK ;$PIECE(EINZELEK," ",2)_" "_$PIECE(EINZELEK," ",1)		// Unit price
+	. . if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	
+	IF +$GET(VKANZ)'=0 DO   ;EINZEL VK ANZEIGEN ;Sale display 
+	. NEW EINZELVK
+	. IF +$$$INAUFPUnitSalesPrice(YFELD)'=0 DO
+	. . if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	. . IF STDLOT'=$$$INAUFPQuantity(YFELD) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. . SET EINZELVK = $$^WWWZAHL(+$PIECE(YFELD,Y,118),0,$$^WWWDECIMALLEN("INAUFP",118),YWHR)  ;,0,$$^WWWDECIMALLEN("INAUFP",118))  ;TYBD;17,11,2004;26328;NK
+    . . WRITE $PIECE(EINZELVK," ",1)_" "_$PIECE(EINZELVK," ",2) // SRBR014041
+	. . SET SUM(3) = SUM(3)+$PIECE(YFELD,Y,118)
+	. . if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED
+	
+	WRITE "&nbsp;"
+	WRITE "</A>"
+	WRITE "</font>",YCR
+	
+	if 'blnCanHide do   // SR14972
+	. DO ZWR^WWWTAB
+	. ; (*15*) Costs or Sales Price
+	. ;-------------------------------------
+	. WRITE "<font size=2>"
+	. DO
+	. . NEW YKEY,YFORM,YBACK
+	. . WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. . DO ^WWWCGI
+	. . WRITE """"
+	. . WRITE " TITLE="_""""_$$^WWWTEXT(32558)  ;_"""" ; PO - SR12368
+	. . IF STDLOT'=$$$INAUFPQuantity(YFELD) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. . WRITE """" ; PO - SR12368
+	. . WRITE ">"
+	. ;
+	. if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	. IF STDLOT'=$$$INAUFPQuantity(YFELD) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. ;
+	. IF +$GET(VKANZ)=0 DO   ;TYBD;2.5.2003
+	. . //SET KOST=$$^WWWZAHL(+$$$INAUFPCost(YFELD),0,$$^WWWDECIMALLEN("INAUFP",47),YWHR)  ;Manufacturing Costs
+	. . ;SR13177: Cost
+	. . ;write $$FormatCurrency^COMTable($PIECE(YFELD,Y,5)*fltCost)
+	. . write $$FormatCurrency^COMTable($$$INAUFPCost(YFELD))				// SR13300
+	. . ;WRITE $PIECE(KOST," ",2)_" "_$PIECE(KOST," ",1) 
+	. . ;SET SUM(1)=SUM(1)+$PIECE(YFELD,Y,47)
+	. . IF $$$INAUFPCancellation(YFELD)'=1 SET SUM(1)=SUM(1)+$$$INAUFPCost(YFELD)  ;If not cancelled ;FIS;31.01.05
+	. ;
+	. IF +$GET(VKANZ)'=0 DO   ;TYBD;2.5.2003
+	. . //SET KOST=$$^WWWZAHL(+$$$INAUFPNetSalesPrice(YFELD),0,$$^WWWDECIMALLEN("INAUFP",123),YWHR)  ;VKPREIS
+	. . ;SR13177: Cost
+	. . ;SR13615: Don't use fltCost -- just display the Sales Price
+	. . write $$FormatCurrency^COMTable(+$$$INAUFPNetSalesPrice(YFELD))
+	. . ;write $$FormatCurrency^COMTable($PIECE(YFELD,Y,5)*fltCost) ;WRITE $PIECE(KOST," ",2)_" "_$PIECE(KOST," ",1)
+	. . ;SET SUM(1)=SUM(1)+$PIECE(YFELD,Y,123)
+	. . IF $$$INAUFPCancellation(YFELD)'=1 SET SUM(1)=SUM(1)+$$$INAUFPNetSalesPrice(YFELD)  ;If not cancelled ;FIS;31.01.05
+	. ;
+	. if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	. WRITE "</A>"
+	. WRITE "&nbsp;"
+	. WRITE "</font>",YCR
+	
+	IF RUEST=1 DO    ;WENN RÜSTZEITEN VORHANDEN ;when on hand 
+	. DO ZWR^WWWTAB
+	. ; (*16*) Setup Time       ; RÜSTZEITEN
+	. ;-------------------------------------
+	. WRITE "<font size=2>"
+	. IF $PIECE(YFELD,Y,7)'=3 WRITE "&nbsp;" 
+	. IF $PIECE(YFELD,Y,7)'=3 QUIT  ;ANZEIGE FÜR RÜSTKOSTEN nur wenn EIGENFERTIGUNG ;Show to solely when 
+	. IF $PIECE(YAUF1,Y,60)'=1 DO   ;WENN ABGESCHLOSSEN  DANN KEINE RUESTZEITEN MEHR ANZEIGEN ;when no more display 
+	. . DO
+	. . . NEW YKEY,YFORM,YBACK
+	. . . WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. . . DO ^WWWCGI
+	. . . WRITE """"
+	. . . WRITE " TITLE="_""""_$$^WWWTEXT(32558)  ;_"""" ; PO - SR12368
+	. . . IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. . . WRITE """" ; PO - SR12368
+	. . . WRITE ">"
+	. . ;
+	. . IF +$PIECE(YFELD,Y,70)'=0 DO
+	. . . if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	. . . IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. . . WRITE $$^WWWTIME(+$PIECE(YFELD,Y,70))  ;RÜSTZEIT ;setup time 
+	. . . if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	. . . SET SUM(2)=SUM(2)+$PIECE(YFELD,Y,70)
+	. . ;
+	. . WRITE "</A>"
+	. ;
+	. WRITE "&nbsp;"
+	. WRITE "</font>",YCR
+	
+	;---WEM;#23753;22.07.2003
+	DO ZW^WWWTAB
+	; (*17*) Tax          ; UMSATZSTEUER
+	;---------------------------------------
+	WRITE "<font size=2>"
+	DO
+	. NEW YKEY,YFORM,YBACK
+	. WRITE "<A HREF="_""""_YAKTION_"EP=WWWFORM&YFORM=INAUFP&YKEY="_YAUF_","_POS_"&YBACK=INAUFBANZ,INAUF,"
+	. DO ^WWWCGI
+	. WRITE """"
+	. IF (piece66="") || (piece66=0) WRITE " TITLE="_""""_$$^WWWTEXT(32558)
+	. IF (piece66'="") && (piece66'=0) DO
+	. . WRITE " TITLE="_""""_$$^WWWFELDNAME("INART","D",66)_YCR
+	. . //WRITE $PIECE($GET(^WWW101(0,"SPERRE",SPRACHE,piece66,1)),Y,1)
+	. ;
+	. IF STDLOT'=$PIECE(YFELD,Y,5) WRITE YCR,$$^WWWFELDNAME("INDRPITEM","D",24)_": "_STDLOT  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	. WRITE """" ; PO - SR12368
+	. WRITE ">"
+	
+	if blnStrikeOut WRITE "<STRIKE>"  ;GESPERRT ;DISABLED 
+	IF STDLOT'=$PIECE(YFELD,Y,5) WRITE "<FONT COLOR="_YRED_">"  ;QTY DOES NOT FIT STANDARD LOTSIZE  ;FIS;SR12368;20/06/05
+	
+	// SR11997
+	set taxRate = $$OrderLineTaxRate^INTAX(YAUF,POS)
+	if taxRate'="" {
+		write taxRate
+	} else {
+		write "&nbsp;"
+	}
+	
+	/*	
+	;IF $P(YFELD,Y,66)'="" IF $P(YFELD,Y,66)'=0 WRITE "<FONT COLOR="_YRED_">"  ;ARTIKELSPERRE
+	IF $PIECE(YFELD,Y,36)'="" IF $P($G(^WWW101(0,"MWST",SPRACHE,$PIECE(YFELD,Y,36),1)),Y,1)'="" DO
+	. WRITE +$P($G(^WWW101(0,"MWST",SPRACHE,$PIECE(YFELD,Y,36),1)),Y,1)
+	IF $P(YFELD,Y,36)="" WRITE "&nbsp;"
+	;IF $P(YFELD,Y,66)'="" IF $P(YFELD,Y,66)'=0 WRITE "</FONT>"               ;ARTIKELSPERRE
+	*/
+	
+	if blnStrikeOut WRITE "</STRIKE>"  ;GESPERRT ;DISABLED 
+	WRITE "</A>"
+	WRITE "&nbsp;"
+	WRITE "</font>",YCR
+	
+	;-- END 
+	DO EF^WWWTAB
+	DO EL^WWWTAB
+	SET YQP=$$$NO
+	QUIT
+	
+HEADER
+	;-------------------------------------------------------------------------------
+	;	UEBERSCHRIFT
+	;	
+	; History:
+	; 29-Jan-2010	shobby	SR17138: Allowed wrapping of column headers.
+	; 25-Jan-2010	shobby	SR17138: Removed 'Text' column.
+	; 05-Sep-2006	RPW		SR14972: Do not show the value field when there is no permissions to.
+	;-------------------------------------------------------------------------------
+	
+	; FIXME : Do we have a <TR> inconsistency here?  <GRF>
+	
+	;-----+-------+---+---+---+---+---+---+---+---+
+	;     | Order |   |   |   |   |   |   |   |   |
+	;-----+-------+---+---+---+---+---+---+---+---+
+	;  1      2     3   4   5   6   7   8   9   10
+	WRITE "<THEAD"
+	WRITE " STYLE=""height:40px"""			;SR17138
+	WRITE ">"
+	IF YLIST=1 DO
+	. NEW YI
+	. FOR YI=1:1:10 DO
+	. . WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT "
+	. . WRITE " BGCOLOR="_YDARKGRAY
+	. . WRITE ">"
+	. . WRITE "<FONT SIZE=2>"
+	. . IF YI=2 WRITE $$^WWWTEXT(32047)_": "_YAUF  ; "Order"   ;AUFTRAGSNUMMER (32178ANGEBOT)
+	. . ;
+	. . WRITE "&nbsp;"
+	. . WRITE "</TH>",YCR
+	. ;
+	. WRITE "</TR>",YCR
+	. WRITE "<TR>"
+	
+	; (*1*) (*2*)
+	;---------------------------------------
+	IF ANZM'=0 IF YQ=$$$YES DO
+	. WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. WRITE "&nbsp;"
+	. WRITE "</TH>",YCR
+	. ;
+	. WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. WRITE "&nbsp;"
+	. WRITE "</TH>",YCR
+	
+	; (*3*) "L.I."                 ;AUFTRAGPOSITION
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $$^WWWTEXT(32041)
+	WRITE "</TH>",YCR
+	
+	; (*4*) "Item Name"            ;ARTIKELBEZEICHNUNG
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",1),1,15)
+	WRITE "</TH>",YCR
+	
+	; (*5*) "Item:"                ;ARTIKELNUMMER
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $$^WWWTEXT(32110)
+	WRITE "</TH>",YCR
+	
+	; (*6*) "Line Item Grouping"
+	;---------------------------------------
+	IF GRUPOS=1 DO
+	. WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",247),1,15) 
+	. WRITE "</TH>",YCR
+	
+	;SR17138 vvvvvvvvvvvvvvvvvvvvvvv
+	; (*8*) "Ordered Quantity"
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP ALIGN=LEFT width=1px"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",448),1,20)
+	WRITE "</TH>",YCR
+
+	; (*7*) "Ordered Unit"             ; MENGE
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP ALIGN=LEFT width=1px"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",449),1,20)
+	WRITE "</TH>",YCR
+	;SR17138 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+	; (*7*) "Quantity"             ; MENGE
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP ALIGN=LEFT width=1px"			;SR17138
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",5),1,20) ;SR17138
+	WRITE "</TH>",YCR	
+	
+	; (*8*) "Quantity Unit"        ; MENGENEINHEIT
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP ALIGN=LEFT width=1px"			;SR17138
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",40),1,20) ;SR17138
+	WRITE "</TH>",YCR
+	
+	; (*9*) "Source"               ; WARENHERKUNFT
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",7),1,15)
+	WRITE "</TH>",YCR
+	
+	; (*10*) "Customer Text"        ; KUNDENTEXT
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",10),Y,15)
+	WRITE "</TH>",YCR
+	
+	;SR17138 ; (*11*) "Text"                 ; AUSFÜHRUNG
+	;SR17138 ;---------------------------------------
+	;SR17138 WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	;SR17138 WRITE " BGCOLOR="_YDARKGRAY
+	;SR17138 WRITE ">"
+	;SR17138 WRITE "<FONT SIZE=2>"
+	;SR17138 WRITE $$^WWWTEXT(32027)
+	;SR17138 WRITE "</TH>",YCR
+	
+	IF FREMDWHR=$$$YES IF +$GET(VKANZ)=0 DO
+	. ;
+	. ; NEW CODE TO INCLUDE Unit Price Foreign Currency (Unit Price FC) heading in the table/grid on the form INAUF SR:12088
+	. ;
+	. ; (*12*) "Unit Price FC"
+	. ;-------------------------------------
+	. write "<th valign=top nowrap align=left bgcolor="_YDARKGRAY_"><font size=2>"_$$^WWWFELDNAME("INAUFPK","M",55)_"</font></th>",!
+	. ;
+	. ; (*13*) "Cost FC"
+	. ;-------------------------------------
+	. WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. WRITE $EXTRACT($$^WWWFELDNAME("INAUFPK","D",68),Y,25)
+	. WRITE "</TH>",YCR
+	
+	; (*14*) "Unit Price" / "Unit Sales Price"
+	;---------------------------------------
+	;-----WEM;#23753;22.07.2003;Hinzugefügt
+	WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	if +$get(VKANZ)=0  {
+	;	WRITE $$^WWWTEXT(32134)  ;EINZEL-EK  ;ALT->33540 EINZELPREIS
+	;	WRITE $EXTRACT($$^WWWFELDNAME("INAUFPK","D",12),Y,25)
+		WRITE $EXTRACT($$^WWWFELDNAME("INAUFPK","D",47),Y,25)   ;tybd; wenn einzel ek?
+	} else {
+	;	WRITE $$^WWWTEXT(32327)   ;EINZEL-VK  
+		WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",118),Y,15)
+	}
+	WRITE "</TH>",YCR
+	
+	; (*15*) "Cost" / "Net Sales Price"     ;HERSTELLKOSTEN / Verkaufspreis
+	;---------------------------------------
+	if 'blnCanHide do  // SR14972
+	. WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. IF +$GET(VKANZ)=0  WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",47),Y,15)
+	. IF +$GET(VKANZ)'=0 WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",123),Y,15)
+	. IF RUEST=1 DO 
+	. . WRITE "</TH>",YCR
+	. . ;
+	. . ; (*16*) "Setup Time"        ;WENN ABGESCHLOSSEN, DANN KEINE RUESTZEITEN MEHR ANZEIGEN      ;RÜSTZEIT
+	. . ;-----------------------------------
+	. . WRITE "<TH VALIGN=TOP NOWRAP ALIGN=RIGHT"
+	. . WRITE " BGCOLOR="_YDARKGRAY
+	. . WRITE ">"
+	. . WRITE "<FONT SIZE=2>"
+	. . IF $PIECE(YAUF1,Y,60)'=1 WRITE $EXTRACT($$^WWWFELDNAME("INAUFP","D",70),Y,15)
+	. . WRITE "&nbsp;"
+	. . WRITE "</TH>",YCR
+	
+	; (*17*) "Tax"                    ;USt.    ;-----WEM;#23753;22.07.2003;Hinzugefügt
+	;---------------------------------------
+	WRITE "<TH VALIGN=TOP NOWRAP ALIGN=LEFT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE $$^WWWTEXT(33541)
+	WRITE "</TH>"
+	
+	;-----ENDE
+	WRITE "</THEAD>",YCR
+	
+	; FIXME : Do we have a </TR> inconsistency here?  <GRF>
+	
+	QUIT
+	
+ZEILE
+	;-------------------------------------------------------------------------------
+	;	LEERZEILE ;blank line 
+	;	
+	; History:
+	; 28-Jan-2010	shobby	SR17138: Some extra columns in the table
+	; 05-Sep-2006	RPW		SR14972: Do not show the value field when there is no permissions to.
+	;-------------------------------------------------------------------------------
+	NEW YI
+	
+	;YI ANZAHL VON SPALTEN FÜR DIE LEERZEILE ;Number split to who blank line 
+	set YI(1)=11								;SR17138
+	set YI(1)=12								;SR17138
+	set:YQ YI(1)=YI(1)+2						;SR17138
+	set:$get(RUEST) YI(1)=YI(1)+1				;SR17138
+	;SR17138 IF YQ=$$$YES                    SET YI(1)=13  ;WEM;#23753;YI(1)+2
+	;SR17138 IF YQ'=$$$YES                   SET YI(1)=11  ;WEM;#23753;YI(1)+2
+	;SR17138 IF $GET(RUEST)=1                SET YI(1)=14  ;WEM;#23753;YI(1)+2
+	;SR17138 IF $GET(RUEST)=1&(YQ'=$$$YES)   SET YI(1)=12  ;WENN RÜSTZEIT VORHANDEN UND KEINE ICONS ;WEM;#23753;YI(1)+2
+	IF GRUPOS=1                     SET YI(1)=YI(1)+1
+	IF FREMDWHR=$$$YES IF +$GET(VKANZ)=0 SET YI(1)=YI(1)+2 ; Since two FC fields increment by two SR:12088
+	if $get(VKANZ)=0 && blnCanHide  set YI(1)=YI(1)-1  // SR14972
+	WRITE "<TR>"
+	SET YDDSATZ=YDDSATZ+1
+	FOR YI=1:1:YI(1) DO
+	. WRITE "<TD VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. IF YDDSATZ#2'=0 WRITE " BGCOLOR="_YWHITE
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. WRITE "&nbsp;"
+	. WRITE "</TD>",YCR
+	
+	WRITE "</TR>"
+	QUIT
+	
+	
+SUMME
+	;-------------------------------------------------------------------------------
+	;	SUMMENZEILE
+	;	
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Jan-2010	shobby	SR17138: Some extra columns in the table
+	; 05-Sep-2006	RPW		SR14972: Do not show the value field when there is no permissions to.
+	; 23-Jun-2006	Pablo	SRBR014041: Currency symbol must appear on the correct side of the numeric value
+	;-------------------------------------------------------------------------------
+	DO NL^WWWTAB
+	NEW YI,YII,SUMME
+	
+	SET YII=8
+	IF ANZM'=0 IF YQ=$$$YES SET YII=YII+2
+	IF GRUPOS=1 SET YII=YII+1
+	IF FREMDWHR=$$$YES IF +$GET(VKANZ)=0 IF $PIECE(YAUF1,Y,2)'=2 SET YII=YII+1  ;FIS;27.08.04;26316
+	set YII=YII+1			;SR17138
+	FOR YI=1:1:YII DO
+	. WRITE "<TD VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. WRITE "&nbsp;"
+	. WRITE "</TD>",YCR
+	
+	IF FREMDWHR=$$$YES IF +$GET(VKANZ)=0 IF $PIECE(YAUF1,Y,2)=2 DO  ;SUMME FREMDWÄHRUNG;FIS;14.10.04;26544
+	. ;
+	. ; NEW CODE INCLUDED Unit Price Foreign Currency (Unit Price FC) blank field in the table/grid on the form INAUF SR:12088
+	. ;
+	. write "<td valign=top nowrap align=right bgcolor="_YDARKGRAY_"><font>&nbsp;"_"</font></td>",!
+	. ;
+	. WRITE "<TD VALIGN=TOP NOWRAP ALIGN=RIGHT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. WRITE $$^WWWZAHL(SUM(4),0,2)_" "_$PIECE($GET(^WWWWAE(0,$PIECE(YAUF1,Y,51),1)),Y,2)
+	. WRITE "&nbsp;"
+	. WRITE "</TD>",YCR
+	
+	;---WEM;23753;22.07.2003
+	WRITE "<TD VALIGN=TOP NOWRAP ALIGN=RIGHT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	SET SUMME=$$^WWWZAHL(SUM(3),0,2,YWHR)  ;EINZELPREIS
+	;WRITE $PIECE(SUMME," ",2)_" "_$PIECE(SUMME," ",1)   ;KEINE SUMME BEI EINZEL EK/VK
+	
+	;DO  ;INPUT FELD WEGEN NEURECHNUNG;FIS;24815;12.12.03
+	;. WRITE YCR,"<INPUT TYPE="_""""_"TEXT"_""""_" id="_""""_"sum3"_""""_" size=9 maxlength=15"
+	;. WRITE " VALUE="_""""_$PIECE(SUMME," ",2)_""""
+	;. WRITE " style="_""""_"border:none; text-align:right; background-color:"_YSILVER_";"_""""
+	;. WRITE ">"
+	;. WRITE "&nbsp;"
+	;. WRITE $PIECE(SUMME," ",1)  ;WHR-SYMBOL
+	
+	WRITE "&nbsp;"
+	WRITE "</TD>",YCR
+	
+	;---ENDE
+	if 'blnCanHide { // SR14972
+		WRITE "<TD VALIGN=TOP NOWRAP ALIGN=RIGHT"
+		WRITE " BGCOLOR="_YDARKGRAY
+		WRITE ">"
+		WRITE "<FONT SIZE=2>"
+		SET SUMME=$$^WWWZAHL(SUM(1),0,2,YWHR)  ;HERSTELLKOSTEN
+		WRITE $PIECE(SUMME," ",1)_" "_$PIECE(SUMME," ",2) // SRBR014041
+		
+		;DO  ;INPUT FELD WEGEN NEURECHNUNG;FIS;24815;12.12.03
+		;. WRITE YCR,"<INPUT TYPE="_""""_"TEXT"_""""_" id="_""""_"sum1"_""""_" size=9 maxlength=15"
+		;. WRITE " VALUE="_""""_$PIECE(SUMME," ",2)_""""
+		;. WRITE " style="_""""_"border:none; text-align:right; background-color:"_YSILVER_";"_""""
+		;. WRITE ">"
+		;. WRITE "&nbsp;"
+		;. WRITE $PIECE(SUMME," ",1)  ;WHR-SYMBOL
+		
+		WRITE "&nbsp;"
+		WRITE "</TD>",YCR
+	}
+	
+	IF RUEST=1 DO
+	. WRITE "<TD VALIGN=TOP NOWRAP ALIGN=RIGHT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. IF $PIECE(YAUF1,Y,60)'=1 WRITE $$^WWWTIME(SUM(2))  ;ruestzeiten
+	. ;IF $PIECE(YAUF1,Y,60)'=1 DO                       ;INPUT FELD WEGEN NEURECHNUNG;FIS;24815;12.12.03
+	. ;. WRITE YCR,"<INPUT TYPE="_""""_"TEXT"_""""_" id="_""""_"sum2"_""""_" size=6 maxlength=10"
+	. ;. WRITE " VALUE="_""""_$$^WWWTIME(SUM(2))_""""
+	. ;. WRITE " style="_""""_"border:none; text-align:right; background-color:"_YSILVER_";"_""""
+	. ;. WRITE ">"
+	. ;
+	. WRITE "&nbsp;"
+	. WRITE "</TD>",YCR
+	
+	WRITE "<TD VALIGN=TOP NOWRAP ALIGN=LEFT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE "&nbsp;"
+	WRITE "</TD>"
+	DO EL^WWWTAB
+	QUIT
+	
+	
+RABATT ;GESAMTRABATT;FIS;28.07.04;26150
+	NEW YI,YII,SUMME,RABATT
+	
+	SET RABATT=$PIECE($GET(^INAUF(YM,YAUF,1)),Y,71)
+	QUIT:+RABATT=0
+	
+	DO NL^WWWTAB
+	SET YII=8
+	IF ANZM'=0 IF YQ=$$$YES SET YII=YII+2
+	IF GRUPOS=1 SET YII=YII+1
+	FOR YI=1:1:YII DO
+	. WRITE "<TD VALIGN=TOP NOWRAP ALIGN=LEFT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. WRITE "&nbsp;"
+	. WRITE "</TD>",YCR
+	
+	WRITE "<TD VALIGN=TOP NOWRAP ALIGN=RIGHT COLSPAN=2"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE (RABATT*-1)_"% "_$$^WWWTEXT(33939)  ;GESAMTRABATT
+	WRITE " = "
+	SET SUMME=$$^WWWZAHL((SUM(1)-(SUM(1)/100*RABATT)),0,2,YWHR)  ;HERSTELLKOSTEN
+	WRITE $PIECE(SUMME," ",2)_" "_$PIECE(SUMME," ",1)
+	WRITE "&nbsp;"
+	WRITE "</TD>",YCR
+	
+	IF RUEST=1 DO
+	. WRITE "<TD VALIGN=TOP NOWRAP ALIGN=RIGHT"
+	. WRITE " BGCOLOR="_YDARKGRAY
+	. WRITE ">"
+	. WRITE "<FONT SIZE=2>"
+	. WRITE "&nbsp;"
+	. WRITE "</TD>",YCR
+	
+	WRITE "<TD VALIGN=TOP NOWRAP ALIGN=LEFT"
+	WRITE " BGCOLOR="_YDARKGRAY
+	WRITE ">"
+	WRITE "<FONT SIZE=2>"
+	WRITE "&nbsp;"
+	WRITE "</TD>"
+	DO EL^WWWTAB
+	QUIT
+	
+	
+	;-----------------------------------------------------------------------------------------
+	;AB HIER:  EXECUTE DURCH LINK ;Confirm. EXECUTE trans- 
+	
+MOVE(SORT)
+	;-----------------------------------------------------------------------------------------
+	;VERSCHIEBEN AUFTRAGSPOSITION ;defer 
+	; 0 = KLEINERE ZAHL = HACH OBEN  ;numeral upstairs 
+	; 1 = GRÖßERE ZAHL  = NACH UNTEN ;numeral within underneath 
+	;
+	; Called By : ^INAUFANZ - when Relocate Button used to move a line up or down.
+	;-----------------------------------------------------------------------------------------
+	NEW AUF,POS,POSX,POSS
+	
+	SET SORT = +$GET(SORT)
+	IF SORT=0 SET SORT = -1
+	do
+	. write AUF  = $$$KEY1($get(YKEY))     quit:AUF=""
+	. write POS  = $$$KEY2($get(YKEY))     quit:POS=""
+	. write POSS = POS
+	. do SUCHPOSX
+	. ;IF YZ'=1 DO CHANGE
+	. do CHANGE
+	
+	KILL SORT
+	SET YFORM="INAUF"
+	SET %(YQUERY,"YFORM") = YFORM
+	SET %("VAR","YFORM")  = YFORM
+	DO ^WWWFORM
+	QUIT
+	
+	
+SUCHPOSX ;SUCH MIT WECHLE POS TAUSCHEN ? ;by means of barter 
+	if SORT=1  set POSX = POSS+1           if '$data(^INAUFP(YM,AUF,POSX)) quit  ;NEUE NUMMER 
+	if SORT=-1 set POSX = POSS-1 if POSX>0 if '$data(^INAUFP(YM,AUF,POSX)) quit  ;NEUE NUMMER
+	set POSX = $order(^INAUFP(YM,AUF,POSS),SORT)
+	quit:POSX="" 
+	quit:POSS=""
+	
+	if $piece(^INAUFP(YM,AUF,POSX,1),Y,7)'="" {
+		set POSS = POSX
+		do SUCHPOSX
+	}
+	
+	QUIT
+	
+	
+CHANGE     ;TAUSCHEN POSITIONEN ;barter 
+	KILL ^WWWSOR(YUSER)
+	QUIT:POS=""
+	QUIT:POSX=""
+	
+	MERGE ^WWWSOR(YUSER,"INAUFP",AUF,POS)       = ^INAUFP(YM,AUF,POS)
+	DO ^WWWSKILL("INAUFP",AUF_","_POS)
+	MERGE ^WWWSOR(YUSER,"INAUFPK",AUF,POS)      = ^INAUFPK(YM,AUF,POS)
+	DO ^WWWSKILL("INAUFPK",AUF_","_POS)
+	MERGE ^WWWSOR(YUSER,"INAUFPREL",AUF,POS)    = ^INAUFPREL(YM,AUF,POS)
+	DO ^WWWSKILL("INAUFPREL",AUF_","_POS)
+	MERGE ^WWWSOR(YUSER,"INAUFPXL",AUF,POS)     = ^INAUFPXL(YM,AUF,POS)
+	KILL ^INAUFPXL(YM,AUF,POS)
+	MERGE ^WWWSOR(YUSER,"INAUFPT",AUF,POS)      = ^INAUFPT(YM,AUF,POS)
+	KILL ^INAUFPT(YM,AUF,POS)
+	MERGE ^WWWSOR(YUSER,"INAUFPSP",AUF,POS)     = ^INAUFPSP(YM,AUF,POS)
+	KILL ^INAUFPSP(YM,AUF,POS)
+	MERGE ^WWWSOR(YUSER,"INAUFPLA",AUF,POS)     = ^INAUFPLA(YM,AUF,POS)
+	KILL ^INAUFPLA(YM,AUF,POS)
+	MERGE ^WWWSOR(YUSER,"INAUFPIMPACT",AUF,POS) = ^INAUFPIMPACT(YM,AUF,POS)  ;FIS;09.03.05;27445
+	KILL ^INAUFPIMPACT(YM,AUF,POS)
+	
+	MERGE ^INAUFP(YM,AUF,POS)       = ^INAUFP(YM,AUF,POSX)
+	DO ^WWWSKILL("INAUFP",AUF_","_POSX)
+	DO ^WWWSSORT("INAUFP",AUF_","_POS)
+	MERGE ^INAUFPK(YM,AUF,POS)      = ^INAUFPK(YM,AUF,POSX)
+	DO ^WWWSKILL("INAUFPK",AUF_","_POSX)
+	DO ^WWWSSORT("INAUFPK",AUF_","_POS)
+	MERGE ^INAUFPREL(YM,AUF,POS)    = ^INAUFPREL(YM,AUF,POSX)
+	DO ^WWWSKILL("INAUFPREL",AUF_","_POSX)
+	DO ^WWWSSORT("INAUFPREL",AUF_","_POS)
+	MERGE ^INAUFPXL(YM,AUF,POS)     = ^INAUFPXL(YM,AUF,POSX)
+	KILL ^INAUFPXL(YM,AUF,POSX)
+	MERGE ^INAUFPT(YM,AUF,POS)      = ^INAUFPT(YM,AUF,POSX)
+	KILL ^INAUFPT(YM,AUF,POSX)
+	MERGE ^INAUFPSP(YM,AUF,POS)     = ^INAUFPSP(YM,AUF,POSX)
+	KILL ^INAUFPSP(YM,AUF,POSX)
+	MERGE ^INAUFPLA(YM,AUF,POS)     = ^INAUFPLA(YM,AUF,POSX)
+	KILL ^INAUFPLA(YM,AUF,POSX)
+	MERGE ^INAUFPIMPACT(YM,AUF,POS) = ^INAUFPIMPACT(YM,AUF,POSX)
+	KILL ^INAUFPIMPACT(YM,AUF,POSX)
+	
+	MERGE ^INAUFP(YM,AUF,POSX)       = ^WWWSOR(YUSER,"INAUFP",AUF,POS)
+	DO ^WWWSSORT("INAUFP",AUF_","_POSX)
+	MERGE ^INAUFPK(YM,AUF,POSX)      = ^WWWSOR(YUSER,"INAUFPK",AUF,POS)
+	DO ^WWWSSORT("INAUFPK",AUF_","_POSX)
+	MERGE ^INAUFPREL(YM,AUF,POSX)    = ^WWWSOR(YUSER,"INAUFPREL",AUF,POS)
+	DO ^WWWSSORT("INAUFPREL",AUF_","_POSX)
+	MERGE ^INAUFPXL(YM,AUF,POSX)     = ^WWWSOR(YUSER,"INAUFPXL",AUF,POS)
+	MERGE ^INAUFPT(YM,AUF,POSX)      = ^WWWSOR(YUSER,"INAUFPT",AUF,POS)
+	MERGE ^INAUFPSP(YM,AUF,POSX)     = ^WWWSOR(YUSER,"INAUFPSP",AUF,POS)
+	MERGE ^INAUFPLA(YM,AUF,POSX)     = ^WWWSOR(YUSER,"INAUFPLA",AUF,POS)
+	MERGE ^INAUFPIMPACT(YM,AUF,POSX) = ^WWWSOR(YUSER,"INAUFPIMPACT",AUF,POS)
+	
+	KILL ^WWWSOR(YUSER)
+	QUIT
+	
+	
+KILL ;LÖSCHEN AUFTRAGSPOSITION ;Delete 
+	new AUF,POS
+	
+	set AUF = $$$KEY1($get(YKEY))   quit:AUF=""
+	set POS = $$$KEY2($get(YKEY))
+	if POS'="" do ^INAUFKILL(AUF_","_POS)
+	
+	set YFORM             = "INAUF"
+	set %(YQUERY,"YFORM") = YFORM
+	set %("VAR","YFORM")  = YFORM
+	do ^WWWFORM
+	quit
+	
+	
+NEUSORT ;NEUSORTIERUNG POSITIONEN
+	NEW POSALT,POSNEU
+	
+	KILL ^WWWSOR(YUSER)
+	SET POSALT=""
+	FOR  SET POSALT=$ORDER(^INAUFP(YM,AUF,POSALT)) QUIT:POSALT=""  DO
+	. MERGE ^WWWSOR(YUSER,"INAUFP",AUF,POSALT)=^INAUFP(YM,AUF,POSALT)
+	. DO ^WWWSKILL("INAUFP",AUF_","_POSALT)
+	. MERGE ^WWWSOR(YUSER,"INAUFPK",AUF,POSALT)=^INAUFPK(YM,AUF,POSALT)
+	. DO ^WWWSKILL("INAUFPK",AUF_","_POSALT)
+	. MERGE ^WWWSOR(YUSER,"INAUFPREL",AUF,POSALT)=^INAUFPREL(YM,AUF,POSALT)
+	. DO ^WWWSKILL("INAUFPREL",AUF_","_POSALT)
+	. MERGE ^WWWSOR(YUSER,"INAUFPXL",AUF,POSALT)=^INAUFPXL(YM,AUF,POSALT)
+	. KILL ^INAUFPXL(YM,AUF,POSALT)
+	. MERGE ^WWWSOR(YUSER,"INAUFPT",AUF,POSALT)=^INAUFPT(YM,AUF,POSALT)
+	. KILL ^INAUFPT(YM,AUF,POSALT)
+	. MERGE ^WWWSOR(YUSER,"INAUFPSP",AUF,POSALT)=^INAUFPSP(YM,AUF,POSALT)
+	. KILL ^INAUFPSP(YM,AUF,POSALT)
+	. MERGE ^WWWSOR(YUSER,"INAUFPLA",AUF,POSALT)=^INAUFPLA(YM,AUF,POSALT)
+	. KILL ^INAUFPLA(YM,AUF,POSALT)
+	. MERGE ^WWWSOR(YUSER,"INAUFPIMPACT",AUF,POSALT)=^INAUFPIMPACT(YM,AUF,POSALT)  ;FIS;09.03.05;27445
+	. KILL ^INAUFPIMPACT(YM,AUF,POSALT)
+	
+	SET POSNEU=0
+	SET POSALT=""
+	FOR  SET POSALT=$ORDER(^WWWSOR(YUSER,"INAUFP",AUF,POSALT)) QUIT:POSALT=""  DO
+	. SET POSNEU=POSNEU+1
+	. MERGE ^INAUFP(YM,AUF,POSNEU)       = ^WWWSOR(YUSER,"INAUFP",AUF,POSALT)
+	. DO ^WWWSSORT("INAUFP",AUF_","_POSNEU)
+	. MERGE ^INAUFPK(YM,AUF,POSNEU)      = ^WWWSOR(YUSER,"INAUFPK",AUF,POSALT)
+	. DO ^WWWSSORT("INAUFPK",AUF_","_POSNEU)
+	. MERGE ^INAUFPREL(YM,AUF,POSNEU)    = ^WWWSOR(YUSER,"INAUFPREL",AUF,POSALT)
+	. DO ^WWWSSORT("INAUFPREL",AUF_","_POSNEU)
+	. MERGE ^INAUFPXL(YM,AUF,POSNEU)     = ^WWWSOR(YUSER,"INAUFPXL",AUF,POSALT)
+	. MERGE ^INAUFPT(YM,AUF,POSNEU)      = ^WWWSOR(YUSER,"INAUFPT",AUF,POSALT)
+	. MERGE ^INAUFPSP(YM,AUF,POSNEU)     = ^WWWSOR(YUSER,"INAUFPSP",AUF,POSALT)
+	. MERGE ^INAUFPLA(YM,AUF,POSNEU)     = ^WWWSOR(YUSER,"INAUFPLA",AUF,POSALT)
+	. MERGE ^INAUFPIMPACT(YM,AUF,POSNEU) = ^WWWSOR(YUSER,"INAUFPIMPACT",AUF,POSALT)  ;FIS;09.03.05;27445
+	
+	KILL ^WWWSOR(YUSER)
+	QUIT
+	
+	
+NEUSORT1(AUF)
+	;-------------------------------------------------------------------------------
+	;	NEU SORTIEREN - EINSPRUNG AUS INAUF ! ;recent assortment out of 
+	; 
+	; Called By : Form INAUF - Button 24 "Reorganise Item Lines"   [sort.gif]
+	;-------------------------------------------------------------------------------
+	set YQ  = $$$YES
+	set AUF = $get(AUF)
+	if AUF'="" if $piece($get(^INAUF(YM,AUF,1)),Y,83)="" do  ;NICHT WENN BEREITS GEDRUCKT ;Not when yet 
+	. quit:'$data(^INAUF1(YM,AUF))  ;NICHT MEHR OFFEN ;Not more vulnerable 
+	. quit:$data(^INWEAUF(YM,AUF))  ;WE BEREITS ERFOLGT      ; DEPRECATED - with removal of INWEAUF*     SR16361
+	. quit:$data(^INRECSummarys(0,1,$$$Index(AUF)))
+	. quit:$data(^INRECLines(0,4,$$$Index(AUF)))
+	. do NEUSORT
+	. set YQ = $$$NO
+	
+	if YQ=$$$YES do ^WWWINFO($$^WWWTEXT(144))  ;NICHT MÖGLICH ; "Not Possible"
+	if YQ=$$$NO  do ^WWWFORM
+	quit
+	
+]]></Routine>
+</Export>

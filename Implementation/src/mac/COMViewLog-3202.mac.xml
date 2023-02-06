@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMViewLog" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMViewLog    ; Logging of SQL statements, and how long they took.
+    
+#include COMConst
+#include COMSYS
+	
+LogSQL(pstrSQL,pstrExecute,pfltTimeTaken,pblnManual=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Log the history of SQL for this session, and if it took too long,
+    ; log the SQL statement for later tuning.
+    ; 
+    ; Called By: DisplayGrid^COMViewFilter, ReRun^COMViewLog
+    ; 
+    ; Returns:Status
+    ;
+    ; History:
+    ; 01-Oct-2009	SRC		SR16921: Added Last Used
+    ; 20-Dec-2004	PaulK	Created
+    ;-------------------------------------------------------------------------------
+	new idHistory,objConfig,objLog,strStatus,strSQL,idLog
+	
+	set strStatus = $$$OK
+	set objConfig = $get(^COMViewConfig(0,YM,1))
+	
+	if $$$COMViewConfigMinimumSQLLogtime(objConfig)="" set $$$COMViewConfigMinimumSQLLogtime(objConfig) = 0.5
+	
+	set idHistory=$increment(^CacheTempView(YUSER,"History"))
+	if pblnManual set ^CacheTempView(YUSER,"LastSQL") = idHistory
+	
+	set ^CacheTempView(YUSER,"History",idHistory,"Time")   = pfltTimeTaken
+	set ^CacheTempView(YUSER,"History",idHistory,"SQL")    = pstrSQL
+	set ^CacheTempView(YUSER,"History",idHistory,"Params") = pstrExecute
+	;kill ^CacheTempView(YUSER,"History",idHistory-5)  ;remove old items
+ 
+	if pfltTimeTaken>=$$$COMViewConfigMinimumSQLLogtime(objConfig) {
+		set strSQL = $$$Index(pstrSQL)
+		set idLog  = ""
+		for {
+			set idLog = $order(^COMViewLogs(0,1,strSQL,idLog))
+			quit:idLog=""
+			set objLog = $get(^COMViewLog(0,idLog,1))
+			quit:$$$COMViewLogSQLStatement(objLog)=pstrSQL
+		}
+		if idLog="" set idLog = $order(^COMViewLog(0,""),-1)+1
+		
+		set objLog = $get(^COMViewLog(0,idLog,1))
+		set $$$COMViewLogNumberofhits(objLog)     = $$$COMViewLogNumberofhits(objLog)+1
+		set $$$COMViewLogTotalTimeTaken(objLog)   = $$$COMViewLogTotalTimeTaken(objLog)+pfltTimeTaken
+		set $$$COMViewLogAverageTimeTaken(objLog) = $$$COMViewLogTotalTimeTaken(objLog)/$$$COMViewLogNumberofhits(objLog)
+		set $$$COMViewLogLastTimeTaken(objLog)    = pfltTimeTaken
+		set $$$COMViewLogLastParams(objLog)       = pstrExecute
+		set $$$COMViewLogSQLStatement(objLog)     = pstrSQL
+		set $$$COMViewLogClassesUsed(objLog)      = $translate($$GetClass(pstrSQL),",",";")
+		set $$$COMViewLogLastUsed(objLog)         = $horolog  ; SR16921
+		set strStatus = $$$Save("COMViewLog",idLog,objLog)
+	}
+	quit strStatus
+	
+	
+AfterDataFields(pidLog)
+	new objLog
+	
+	if pidLog'="" {
+		set objLog = $get(^COMViewLog(0,pidLog,1))
+		write $$GetPlan^COMViewPlan($$$COMViewLogSQLStatement(objLog))
+	}
+	quit
+	
+	
+Tune(pidClass="",pidLog="")
+	new idClass,ClassLoop,objLog
+	
+	set YNOFOOT = 1
+	if pidLog'="" {
+		set objLog   = $get(^COMViewLog(0,pidLog,1))
+		set pidClass = $$$COMViewLogClassesUsed(objLog)
+	}
+	if pidClass'="" {
+		write "<textarea style='width:100%;height:99%;'>"
+		for ClassLoop=1:1:$length(pidClass,";") {
+			set idClass = $piece(pidClass,";",ClassLoop)
+			do ##Class(%SYSTEM.SQL).TuneTable(idClass,1,1,,1)
+			do ##Class(%SYSTEM.SQL).PurgeForTable(idClass)
+		}
+		write "</textarea>"
+	}
+	quit
+	
+	
+ReRun(pidLog)
+    ;
+    ; History:
+    ; 23-Sep-2013	shobby	UFH-11.24: Change Row to intRow in 2010 the Library.ResultSet may modify the Row variable
+    ;-------------------------------------------------------------------------------
+	new objResult,intRow,strParams,dteStart,strStatus,objLog ;UFH-11
+	
+	if pidLog'="" {
+		set objLog = $get(^COMViewLog(0,pidLog,1))
+		
+		set dteStart  = $ztimestamp
+		set strParams = $$$COMViewLogLastParams(objLog)
+		Set objResult = ##class(%Library.ResultSet).%New()
+		do objResult.Prepare($$$COMViewLogSQLStatement(objLog))
+		xecute "do objResult.Execute("_strParams_")"
+		for intRow=1:1:20 {	;UFH-11
+			quit:'objResult.Next()
+		}
+		set strStatus = $$LogSQL^COMViewLog($$$COMViewLogSQLStatement(objLog),strParams,$$DateDiff^COMUtilDate(dteStart,$zts))
+		if strStatus=$$$OK set strStatus = $listbuild("Com00133",$$DateDiff^COMUtilDate(dteStart,$zts))
+		write $$$Text(strStatus)    ; "Time Taken: %1"
+	}
+	do ^WWWFORM
+	quit
+	
+	
+GetClass(pstrSQL)
+    ;-------------------------------------------------------------------------------
+    ; Get the primary class for an SQL statement.
+    ;
+    ; Returns:ID (WWW001)
+    ;
+    ; History:
+    ; 20-Dec-2004	PaulK	Created
+    ;-------------------------------------------------------------------------------
+    new idClass
+    
+	set idClass = $piece(pstrSQL,"from ",2)
+	set idClass = $piece(idClass," ",1)
+	quit idClass
+ 
+ 
+ClearLogs()
+    ;-------------------------------------------------------------------------------
+    ; Clear the COMView performance logs
+    ;
+    ; Params: None
+    ;
+    ; ByRefs: None
+    ;
+    ; Returns: Nothing
+    ;
+    ; History:
+    ; 18-Oct-2006	JW		SR15134: Look at kill status. Note - not used.
+    ; 31-Jan-2006	PO		SR14252: Created
+    ;-------------------------------------------------------------------------------
+	new idLog,strStatus
+	
+	set idLog = ""
+	for {
+		set idLog = $order(^COMViewLog(0,idLog))
+		quit:idLog=""
+		
+		set strStatus = $$$Kill("COMViewLog",idLog)		//SR15134
+	}
+	
+	do ReloadForm^COMUtilForm()
+	quit
+	
+]]></Routine>
+</Export>

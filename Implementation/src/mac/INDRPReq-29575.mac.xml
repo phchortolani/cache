@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INDRPReq" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INDRPReq
+	
+#include COMSYS
+#include INConst
+#include %occInclude
+	
+CreateDemand(pobjReqLine,pidSupply)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;	Creates a INDRDEMAND record for a requisition line
+	;			
+	; Called By : (alREQ.dUReqLine)::FirmRequisition (with CreateSupply)
+	; 					<=(loop)=  (alREQ.dUReq)::FirmRequisition
+	; 						<=  FirmTxn^INReq
+	; 							<= FirmRequisition^INReq
+	; 								<= Form INReq (& others) [Firm Requisition] Button
+	; Inputs : 
+	;	pobjReqLine
+	;	pidSupply
+	;
+	; ByRef :
+	;	YBED
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 11-Feb-2010	PPP		SR17145 : Corrected Return Status - Cache Status
+	; 							REVERTED and applied to calling method instead
+	; 28-Apr-2009	PPP		SR16497 : Create a new demand No.  Not required to use
+	; 							the same no. as the Supply.  Always create a new Demand #
+	; 06-Dec-2007	PPP		SR15598 : Demand Type updated from 5 - Supplies to
+	; 							7 - Requisitions
+	; 12-Nov-2007	GRF		SR15598 : Coding standards
+	; 17-Oct-2007	HQN		SR15598 : Created
+	;-------------------------------------------------------------------------------
+	new idDemand,objDemand,idDem
+	
+	set objDemand = ""
+	//if (pidSupply = "") {
+	//	set pidSupply = $$^WWWNEXT("INDRPSUPPLY")		//SR16497
+	//}
+	
+	set idDem    = $$^WWWNEXT("INDRPDEMAND")				//SR16497
+	set idDemand = pobjReqLine.FromStockLocn.Location_","_idDem
+	//set idDemand = pobjReqLine.FromStockLocn.Location_","_pidSupply
+	
+	set $$$INDRPDEMANDRequestingLocation(objDemand) = pobjReqLine.Requisition.ToLocn.Location
+	set $$$INDRPDEMANDOrderNo(objDemand)            = pidSupply
+	set $$$INDRPDEMANDCreatedon(objDemand)          = +$horolog
+	set $$$INDRPDEMANDItemNo(objDemand)             = pobjReqLine.Item
+	set $$$INDRPDEMANDQuantity(objDemand)           = pobjReqLine.QtyRequired
+	set $$$INDRPDEMANDDueOnBefore(objDemand)        = pobjReqLine.DueDate
+	set $$$INDRPDEMANDCreatedBy(objDemand)          = YBED
+	set $$$INDRPDEMANDDemandType(objDemand)         = 7 ; Requisition
+	set $$$INDRPDEMANDPriority(objDemand)           = pobjReqLine.Requisition.Priority
+	set $$$INDRPDEMANDStatus(objDemand)             = pobjReqLine.Requisition.Status.StatusCode
+	set $$$INDRPDEMANDReference(objDemand)          = pobjReqLine.LineNumber
+	set $$$INDRPDEMANDSupplyCreated(objDemand)      = $horolog
+	set $$$INDRPDEMANDRequisitionNumber(objDemand)  = pobjReqLine.ReqNumber
+	;et $$$INDRPDEMANDResponsiblePlanner(objDemand) = YBED
+	
+	quit $$Save^COMUtils("INDRPDEMAND",idDemand,objDemand,$$$NO)
+	
+SupplyExists(pidRequisitionNumber,pidReference,pidItem)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;	Check if a Supply already exists.  This replaces an SQL that does the same thing but is slower
+	;   due to not using cache indexes properly
+	;
+	; History :
+	; 24-Mar-2014	shobby	SESPE-643 : Created
+	;-------------------------------------------------------------------------------
+	new blnExists,idLocation,idSupply,idSupplyType,idxRequisitionNumber,idxReference,objSupply
+	
+	set idxRequisitionNumber = $$Index^COMUtils(pidRequisitionNumber)
+	set idxReference         = $$Index^COMUtils(pidReference)
+	
+	set blnExists=$$$NO
+	set idSupplyType="" for { set idSupplyType=$order(^INDRPSUPPLYs(0,9,idSupplyType)) quit:idSupplyType=""
+		quit:blnExists
+		set idLocation="" for { set idLocation=$order(^INDRPSUPPLYs(0,9,idSupplyType,idxRequisitionNumber,idxReference,idLocation)) quit:idLocation=""
+			quit:blnExists
+			set idSupply="" for { set idSupply=$order(^INDRPSUPPLYs(0,9,idSupplyType,idxRequisitionNumber,idxReference,idLocation,idSupply)) quit:idSupply=""
+				quit:blnExists
+				set objSupply=$get(^INDRPSUPPLY(YM,idLocation,idSupply,1))
+				if objSupply'="" {
+					if $$$INDRPSUPPLYItemNo(objSupply)=pidItem {
+						if $$$INDRPSUPPLYClosed(objSupply)'=1 {
+							if $$$INDRPSUPPLYRequisitionNumber(objSupply)=pidRequisitionNumber {
+								set blnExists=$$$YES
+							}
+						}
+					}
+				}
+			}		
+		}
+	}
+	quit blnExists
+	
+		
+CreateSupply(pobjReqLine,&pstrSupplyKey)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;	Creates a INDRPSUPPLY record for a requisition line
+	;	
+	; Called By : (alREQ.dUReqLine)::FirmRequisition (with CreateDemand)
+	; 					<=(loop)=  (alREQ.dUReq)::FirmRequisition
+	; 						<=  FirmTxn^INReq
+	; 							<= FirmRequisition^INReq
+	; 								<= Form INReq (& others) [Firm Requisition] Button
+	;		
+	; Inputs : 
+	;	pobjReqLine   -	Data record of INReqLine
+	;	pstrSupplyKey -	INDRPSUPPLY P2 - returned for xref in INDRPDEMAND
+	;
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 24-Mar-2014	shobby	SESPE-643: Replace the SQL with global access
+	; 11-Feb-2010	PPP		SR17145 : Corrected Return Status - Cache Status
+	; 							REVERTED and applied to calling method instead
+	; 06-Dec-2007	PPP		SR15598 : Supply Type 5 - Supplies => 7 - Requisitions
+	; 12-Nov-2007	GRF		SR15598 : Coding standards
+	; 17-Oct-2007	HQN		SR15598 : Created
+	;-------------------------------------------------------------------------------
+	new idSupply,objResultSet,objSupply
+	
+	set objSupply = ""
+	; check for existing supply record
+	;SESPE-643 set objResultSet = ##class(%Library.ResultSet).%New("%DynamicQuery:SQL")
+	;SESPE-643 do objResultSet.Prepare("SELECT ID FROM INDRPSUPPLY WHERE upper(ItemNo) = ? and upper(closed)<>1 and upper(Reference) = ? AND upper(RequisitionNumber) = ?")
+	;SESPE-643 do objResultSet.Execute(pobjReqLine.Item, pobjReqLine.LineNumber, pobjReqLine.ReqNumber)
+	
+	;SESPE-643 if (objResultSet.Next()) {
+	;SESPE-643 	do objResultSet.%Close()
+	;SESPE-643 	quit $$$MakeStatus("INDRP01")			; "Supply already created"
+	;SESPE-643 }
+	
+	if $$SupplyExists(pobjReqLine.ReqNumber, pobjReqLine.LineNumber, pobjReqLine.Item) {
+		quit $$$MakeStatus("INDRP01")			; "Supply already created"
+	}
+	
+	set pstrSupplyKey = $$^WWWNEXT("INDRPSUPPLY")
+	set idSupply = pobjReqLine.Requisition.ToLocn.Location_","_pstrSupplyKey
+	
+	set $$$INDRPSUPPLYLocation1(objSupply)         = pobjReqLine.FromStockLocn.Location
+	set $$$INDRPSUPPLYDate1(objSupply)             = +$horolog
+	set $$$INDRPSUPPLYItemNo(objSupply)            = pobjReqLine.Item
+	set $$$INDRPSUPPLYQuantity(objSupply)          = pobjReqLine.QtyRequired
+	set $$$INDRPSUPPLYDueOnBefore(objSupply)       = pobjReqLine.DueDate
+	set $$$INDRPSUPPLYDisabled(objSupply)          = $$$NO
+	set $$$INDRPSUPPLYSupplyType(objSupply)        = 7 ; Requisition
+	set $$$INDRPSUPPLYPriority(objSupply)          = pobjReqLine.Requisition.Priority
+	set $$$INDRPSUPPLYStatus(objSupply)            = pobjReqLine.Requisition.Status.StatusCode
+	set $$$INDRPSUPPLYReference(objSupply)         = pobjReqLine.LineNumber
+	set $$$INDRPSUPPLYRequisitionNumber(objSupply) = pobjReqLine.ReqNumber
+	
+	quit $$Save^COMUtils("INDRPSUPPLY",idSupply,objSupply,$$$NO)
+	
+	
+UpdateDemand(pobjReqLine)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;	Updates the INDRDEMAND record for a requisition line
+	;			
+	; Called By : (alREQ.dUReqLine)::FirmRequisition (with CreateSupply)
+	; 					<=(loop)=  (alREQ.dUReq)::FirmRequisition
+	; 						<=  FirmTxn^INReq
+	; 							<= FirmRequisition^INReq
+	; 								<= Form INReq (& others) [Firm Requisition] Button
+	; Inputs : 
+	;	pobjReqLine   -	Data record of INReqLine
+	;
+	; ByRef :
+	;	YBED
+	;
+	; Returns :
+	; History :
+	; 11-Feb-2010	PPP		SR17145/1: Returns a Cache Error as opposed to ANM error
+	; 							REVERTED and applied to calling method instead
+    ; 27-Jan-2010	PPP		SR17145: Created (Update INDRPDEMAND on Firm)
+	;-------------------------------------------------------------------------------
+	new idDemand,idLocn,idOrder,idRecLocn,idROrder,objDemand,objSupply,strStatus
+	
+	set strStatus = $$$OK
+	set idDemand  = %this.DemandLoaded
+	
+	if idDemand'="" {
+	 	set idLocn  = $$$KEY1(idDemand)
+		set idOrder = $$$KEY2(idDemand)
+		
+		set objDemand = $get(^INDRPDEMAND(YM,idLocn,idOrder,1))
+		set $$$INDRPDEMANDDemandType(objDemand)        = 7 ; Requisition
+		set $$$INDRPDEMANDReference(objDemand)         = pobjReqLine.LineNumber
+		set $$$INDRPDEMANDSupplyCreated(objDemand)     = $horolog
+		set $$$INDRPDEMANDRequisitionNumber(objDemand) = pobjReqLine.ReqNumber
+		set strStatus = $$Save^COMUtils("INDRPDEMAND",idDemand,objDemand,$$$YES)
+		
+		if $$$ISOK(strStatus) {
+		 	set idRecLocn = $$$INDRPDEMANDRequestingLocation(objDemand)
+			set idROrder  = $$$INDRPDEMANDOrderNo(objDemand)	
+			
+			if (idRecLocn'="") && (idROrder'="") {
+				set objSupply = $get(^INDRPSUPPLY(YM,idRecLocn,idROrder,1))
+				
+				if objSupply'="" {
+					set $$$INDRPSUPPLYSupplyType(objSupply)        = 7 ; Requisition
+					set $$$INDRPSUPPLYStatus(objSupply)            = pobjReqLine.Requisition.Status.StatusCode
+					set $$$INDRPSUPPLYReference(objSupply)         = pobjReqLine.LineNumber
+					set $$$INDRPSUPPLYRequisitionNumber(objSupply) = pobjReqLine.ReqNumber
+			
+					set strStatus = $$Save^COMUtils("INDRPSUPPLY",idRecLocn_","_idROrder,objSupply,$$$YES)
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+ResetDemand(pobjReqLine)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;	Updates the INDRDEMAND record for a requisition line when Manually Closing
+	;			
+	; Called By : (alREQ.dUReqLine)::ManualClose
+	; 					<=(loop)=  (alREQ.dUReq)::ManualClose
+	; Inputs : 
+	;	pobjReqLine   -	Data record of INReqLine
+	;
+	; ByRef :
+	;	YBED
+	;
+	; Returns :
+	; History :
+	; 11-Feb-2010	PPP		SR17145/1: Returns a Cache Error as opposed to ANM error
+    ; 27-Jan-2010	PPP		SR17145: Created (Update INDRPDEMAND on Firm)
+	;-------------------------------------------------------------------------------
+	new idDemand,idLocn,idOrder,idRecLocn,idROrder,objDemand,objSupply,strStatus
+	new sc
+	
+	set sc        = $$$OK
+	set strStatus = $$$OK
+	set idDemand  = %this.DemandLoaded
+	
+	if idDemand'="" {
+	 	set idLocn  = $$$KEY1(idDemand)
+		set idOrder = $$$KEY2(idDemand)
+		
+		set objDemand = $get(^INDRPDEMAND(YM,idLocn,idOrder,1))
+		//Clear Values
+		set $$$INDRPDEMANDDemandType(objDemand)         = 3 ; Transfer Order
+		set $$$INDRPDEMANDReference(objDemand)          = ""
+		set $$$INDRPDEMANDSupplyCreated(objDemand)      = ""
+		set $$$INDRPDEMANDRequisitionNumber(objDemand)  = ""
+		set strStatus = $$Save^COMUtils("INDRPDEMAND",idDemand,objDemand,$$$YES)
+		
+		if $$$ISOK(strStatus) {
+		 	set idRecLocn = $$$INDRPDEMANDRequestingLocation(objDemand)
+			set idROrder  = $$$INDRPDEMANDOrderNo(objDemand)
+			
+			if (idRecLocn'="") && (idROrder'="") {
+				set objSupply = $get(^INDRPSUPPLY(YM,idRecLocn,idROrder,1))
+				set $$$INDRPSUPPLYSupplyType(objSupply)        = 3
+				set $$$INDRPSUPPLYStatus(objSupply)            = ""
+				set $$$INDRPSUPPLYReference(objSupply)         = ""
+				set $$$INDRPSUPPLYRequisitionNumber(objSupply) = ""
+			
+				set strStatus = $$Save^COMUtils("INDRPSUPPLY",idRecLocn_","_idROrder,objSupply,$$$YES)
+			}
+		}
+	}
+	
+	//Remove any COMLock records if present
+	do RemoveLocksIfRequired^COMLock("INREQ",pobjReqLine.ReqNumber)
+
+	//SR17145/1
+	if $$$ISERR(strStatus){
+		set strMessage = $$DecodeError^COMUtilError(strStatus)
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+	}
+	
+	quit sc
+	
+]]></Routine>
+</Export>

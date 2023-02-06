@@ -1,0 +1,309 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDPresTable" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDPresTable
+	
+#include COMSYS
+#include INConst
+#include MEDConst
+#include %occInclude
+	
+#define FORMFldINIssueLineLotNo   5
+	
+ShowItems(pidEvent,pidParameters)
+	;-------------------------------------------------------------------------------
+	; Description : Builds the dynamic table data for Prescription Dispense
+	;			
+	; Called By :
+	; Custom Code (FORM: MedPrescriptionDispense) Dyn. Table
+	; 
+	; Inputs : 
+	;
+	; Params:
+	;
+	; Returns: Ok
+	;
+	; History:
+	; 14-Sep-2010	PPP		SR16642: Check the Corrrect FORM (IsEditable)
+	; 01-Dec-2009	GRF		SR17007: separate tags for multi-lock operations
+	; 04-Nov-2009	GRF		SR17007: Pass keys to GetLock^WWWMultiLock not records
+	; 30-Jul-2009	DavidR	SR16642 copied / modified from INDispenseToPatientTable
+	;-------------------------------------------------------------------------------
+	new idGrid,idItem,lstColTypes,lstHeaders,idKey,idKeyLine,idRelocate
+	new objItem,objItemPolicy,objLocn,objMov,objMovLine,strFunction,strStatus
+	 
+	set strStatus = $$$OK
+	set idGrid    = $$$DYNTABLEGridLineFocusGrid(pidParameters)            
+	
+	kill ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle")
+ 
+	set idKey      = $$ReferenceKey^COMGridEdit31Interface(idGrid,$$$DYNTABLEGridLineFocusRow(pidParameters))
+	set idRelocate = $$$KEY1(idKey)
+	set idKeyLine    = $$$KEY2(idKey)
+	
+	//SR16642
+	if '$$Editable^MEDPrescriptionIssue(idRelocate) quit           ; *** EARLY EXIT ***
+	                      
+	set objMov     = $$$GRIDYFELDContainer
+	set objMovLine = $$$GRIDGetYFELD(idKeyLine)
+	
+	;set strRelocate     = $$$GRIDYFELDContainer
+	;set strRelocateLine = $$$GRIDGetYFELD(idLine)
+	;set strStatus       = $$GetLock^WWWMultiLock("MEDPrescriptionDispense",idGrid,strRelocate_$$$COMMA_strRelocateLine,$$$NO)  ; SR17007
+	set strStatus  = $$GetLock^WWWMultiLock("MEDPrescriptionDispense",idGrid,idRelocate_$$$COMMA_idKeyLine)
+  
+	set objLocn = ##class(alLOC.dLocation).%OpenId($$$INIssueFromLocn(objMov))
+	set idItem  = $$$INIssueLineItem(objMovLine)
+	set objItem = ##class(alINV.dItem).%OpenId(idItem,0)
+	
+	if objItem'=$$$NULLOREF {
+		set objItemPolicy = objItem.ItemPolicy
+	
+		if objItemPolicy=$$$NULLOREF {     
+			set strStatus = $$$MakeStatus("alINV0100",idItem) ; "Can not access Item Policy for item : %1"
+			do DrawTable^WWW120DynTable($listbuild($$$Text(strStatus)),"dStockBundle",$listbuild($listbuild("left","display")),pidParameters,"",pidEvent)
+		}                                      
+		
+		; Build Table below Dispense To Patient (Issue) grid lines (allows selection)
+		;-----------------------------------   e.g.
+		;  Stock Bundle              Storage         Lot Number
+		;  ABC00123||5||A||2||86     A               1234567
+		
+		if $$$ISOK(strStatus) {      
+			set strFunction = "FillLine"
+			set strStatus   = $$BuildDynTableHeader(objItemPolicy,.lstHeaders,.lstColTypes)
+			do BuildDynTableRows(objItem.%Id(),objLocn.Code,$$$INIssueLineFromStorage(objMovLine))
+			
+			if $$$ISERR(strStatus) {                                 ; setup JS Callback
+				write "function "_strFunction_"() {"
+				write "alert('"_$$$JSText($$$Text(strStatus))_"');"
+				write "}"
+			} else {
+				write "function "_strFunction_"() {"
+				write "CallBack(""SelectBundle^MEDPresTable"", getRowNum(getFocusField()), this.DiscData[0]);"
+				write "}"
+			}
+ 
+			//SR16599
+			//The last parameter (after pidEvent) needs to be set for the RowClick event, will be used by RowClick^WWW120DynTable
+			//	e.g. "WarehouseLine^INReqTable"
+			//	will be called with the following parameters
+			//	1. Row ID
+			//	2. Each entry in ^CacheTempDynamicTable(...,data) separated by "~" will be a new parameter
+			//			in this routines case : do WarehouseLine^INReqTable(pidRow,idLocn) will be executed on Row click
+			do DrawTable^WWW120DynTable(lstHeaders,"dStockBundle",lstColTypes,pidParameters,strFunction,pidEvent,"SelectBundle^MEDPresTable")
+		}
+	
+	} else {         ; Clear table
+		do DrawTable^WWW120DynTable($listbuild("No Item Selected"),
+		                            "dStockBundle",
+		                            $listbuild($listbuild("left","display")),
+		                            pidParameters,
+		                            "",
+		                            pidEvent)
+	}
+	quit $$$OK
+	
+	
+SelectBundle(pidRow,pidKey)
+	;-------------------------------------------------------------------------------
+	; Populates grid lines on click of selected dynamic grid line
+	;
+	; Inputs :
+	;
+	; Params:
+	; pidRow - row of grid
+	; pidKey - row key
+	;
+	; Returns: Nothing
+	; 
+	; History:
+	; 09-Nov-2010	PPP		SR17600: New variables and set values for both
+	; 16-Feb-2010	shobby	SR15753: Removed redundant code.
+	; 30-Jul-2009	DavidR	SR16642: copied / modified from INDispenseToPatientTable
+	;-------------------------------------------------------------------------------
+	new idBundle,idStore,objBundleStock,objIssue,sc
+	new IssuedFrom,IssueTo
+
+	set sc = $$$OK
+	set objIssue   = $$$GRIDYFELDContainer
+
+	//SR17600
+	; Explicitly set the stored variables (IssuedFrom,IssueTo) from the INIssue Form, 
+	; this is a HyperEvent call and it isn't set ; DisplayData+60^COMGridEdit31F1 error
+	; property for INLP relation
+	set IssuedFrom 	= $$$INIssueFromLocn(objIssue) 
+	set IssueTo 	= $$$INIssueToLocn(objIssue) 
+	; WARNING : "IssuedFrom" & "IssueTo" are required for relationship check
+	;           for D4 & D3 respectively of Class INIssueLine on form INDispenseToPatientLine
+	;           ReferenceKey^COMGridEdit31Interface in SetRecord^COMGridEdit31S1
+	
+	set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(pidKey,0,.sc)
+	
+	if $$$ISOK(sc) {
+		set idStore  = objBundleStock.Storage.Code
+		set idBundle = objBundleStock.Bundle.%Id()
+
+		do SetRecord^COMGridEdit31S1("INIssueLine",pidRow,$$$FldINIssueLineFromStorage_$$$COMMA_idStore)
+		do SetRecord^COMGridEdit31S1("INIssueLine",pidRow,$$$FldINIssueLineBundle_$$$COMMA_idBundle)
+	}
+	quit
+	
+	
+BuildDynTableHeader(pobjItemPolicy,&plstHeaders,&plstColTypes)
+	;-------------------------------------------------------------------------------
+	; Setup Table Headers
+	; StockBundleId, BundleAttribute(s), QoH
+	;         (1)               (2)                  (3)
+	;     "Storage"     Attribute Headings       "QtyOnHand"
+	;                   (e.g. "Lot Number")       
+	; 
+	; History:
+	; 30-Jul-2009	DavidR	SR16642 copied / modified from INDispenseToPatientTable
+	;-------------------------------------------------------------------------------
+	new idAttrKey,objAttr,strAttrName
+	
+	;---------------------------------------  1
+	
+	set plstHeaders  = $listbuild($$$Text("alISS0003"))       ; "Storage"
+	set plstColTypes = $listbuild($listbuild("left","link"))
+	
+	;---------------------------------------  2
+	
+	set idAttrKey = ""
+	for {
+		set objAttr = pobjItemPolicy.Attributes.GetNext(.idAttrKey)
+		quit:(idAttrKey = "")
+		continue:(objAttr.Attribute.Name="ReceiptNo")
+		
+		set strAttrName =  ##class(alINV.uiPolicyAttrTrans).GetText(objAttr.Attribute.Name,SPRACHE)
+		set plstHeaders  = plstHeaders_$listbuild(strAttrName)
+		set plstColTypes = plstColTypes_$listbuild($listbuild("left","link"))
+	}
+	
+	;---------------------------------------  3     Append QOH Header
+	
+	set plstHeaders  = plstHeaders_$listbuild($$$Text("alISS0005"))          ; "QtyOnHand"
+ 	set plstColTypes = plstColTypes_$listbuild($listbuild("right","link"))
+ 	
+	quit $$$OK
+	
+	
+BuildDynTableRows(pidItem,pidLocn,pidStore)
+	;-------------------------------------------------------------------------------
+	; Build an array "^CacheTempDynamicTable" which contains the lines corresponding
+	; to the headings in BuildDynTableHeader
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Nov-2014	SCR		ALPHAUP-395: Pass Loctation to BundleAttributes2^INBundleUtils
+	; 18-Apr-2013	shobby	HEVA-154.1: Display descriptions in Dynatable
+	; 30-Jul-2009	DavidR	SR16642 copied / modified from INDispenseToPatientTable
+	;-------------------------------------------------------------------------------
+	new arrBundleStock,dteUseBy,idBundleStock,idLine,idKey,idPolicyAttr
+	new objAttr,objBundleStock,objINIssueLine,objItem,objLocn,objItemPolicy
+	new objPolicyAttr,objResultSet,objStore,strAttrValues,fltQtyAvailable
+	
+	set objItem  = ##class(alINV.iUINV).GetItem(pidItem)
+	set objLocn  = ##class(alLOC.iULOC).GetLocation(pidLocn)
+	;set objStore = ##class(alLOC.iLOC).GetStorage(pidLocn,pidStore)
+	
+	if (objItem '= $$$NULLOREF) && (objLocn '= $$$NULLOREF) {
+		kill ^CacheTempDynamicTable(YUCI,YUSER,"dBundleStock")
+		set objItemPolicy = objItem.ItemPolicy
+		
+ 		; Find and merge dBundleStock entries on screen
+ 		set idLine = ""
+ 		kill arrBundleStock
+ 		for {
+	 		set idLine = $order(^WWWDATEN(YM,+$horolog,YUSER,"MEDPresDispLine","V","REFERENCEROW",idLine))
+	 		quit:(idLine = "")
+	 		
+	 		set objINIssueLine = $$$GRIDGetYFELD(idLine)
+	 		continue:($$$INIssueLineItem(objINIssueLine) = "")
+	 		continue:($$$INIssueLineFromStorage(objINIssueLine) = "")
+	 		continue:($$$INIssueLineBundle(objINIssueLine) = "")
+	 		continue:($data(^WWWDATEN(YM,+$horolog,YUSER,"MEDPresDispLine","V","KILLEDRECORD",idLine))) ; Ignore values inside killed records
+	 		
+	 		set idBundleStock = $$$INIssueLineItem(objINIssueLine)_"||"_$$$INIssueFromLocn($$$GRIDYFELDContainer)_"||"_$$$INIssueLineFromStorage(objINIssueLine)_"||"_$$$INIssueLineBundle(objINIssueLine)
+	 		set arrBundleStock(idBundleStock) = $get(arrBundleStock(idBundleStock)) + $$$INIssueLineQtyRequired(objINIssueLine)
+ 		}
+ 		
+ 		; FIXME: HQN Should this actually show sourcing sequence?
+		; Retrieve Records
+		set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetViaLocation")
+		if objResultSet.Execute(objItem.%Id(),objLocn.%Id()) {
+			set idLine = 0
+			while objResultSet.Next() {
+				set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(objResultSet.Data("ID"))
+				set dteUseBy = objBundleStock.Bundle.UseByDate
+				if dteUseBy'="" {
+					continue:(dteUseBy<$horolog)	//SR16540
+				}
+				continue:($get(arrBundleStock(objBundleStock.%Id())) >= objBundleStock.QtyOnHand)
+				set fltQtyAvailable = objBundleStock.QtyOnHand-$$GetQtyPlanned(objBundleStock.Item.%Id(),objBundleStock.Storage.Location.%Id(),objBundleStock.Storage.%Id(),objBundleStock.Bundle.%Id())
+				continue:(fltQtyAvailable<=0)
+				
+				set ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",$increment(idLine),"data") = objBundleStock.%Id()
+			
+			;-------------------------------  1
+			
+			;	set strAttrValues = objBundleStock.%Id()_Y_objBundleStock.Storage.Code_Y  ; SR16317
+			if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+				if ($$GetNomePaciente^VARMEDPatient($$getFarmaciaAcoesJudiciais^VARParametroCliente(0),
+					objBundleStock.Storage.Code) '= "") {
+					set strAttrValues = objBundleStock.Storage.Code_" - "_$$GetNomePaciente^VARMEDPatient($$getFarmaciaAcoesJudiciais^VARParametroCliente(0),
+																	objBundleStock.Storage.Code)_Y	
+				} else {
+					set strAttrValues = objBundleStock.Storage.Code_Y
+				}
+            } else {
+	            set strAttrValues = objBundleStock.Storage.Code_Y
+            }
+			
+			;-------------------------------  2
+				set strAttrValues=strAttrValues_$$BundleAttributes2^INBundleUtils(objBundleStock,pidLocn) ;HEVA-154.1
+			;-------------------------------  3
+			
+				set strAttrValues = strAttrValues_fltQtyAvailable
+				set ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idLine) = strAttrValues
+			}
+		}
+	}
+	quit
+	
+ 
+GetQtyPlanned(pidItem,pidLocn,pidStore,pidBundle)
+	;-------------------------------------------------------------------------------
+	; Arguments:
+	; 	pidItem		dItem.%Id()
+	; 	pidLocn		dLocation.%Id()
+	; 	pidStore	dStorage.%Id()
+	; 	pidBundle	dBundle.%Id()
+	;
+	; Returns: 
+	; 	Quantity planned for this dBundleStock
+	; 
+	; NOTES: DIRECT ACCESS INTO alDRP tables...consider refactor into iDRP
+	; 
+	; History:
+	; 30-Jul-2009	DavidR	SR16642 copied / modified from INDispenseToPatientTable
+	;-------------------------------------------------------------------------------
+	new fltQtyPlanned,SQLCODE
+	
+	set fltQtyPlanned = 0
+	&sql(SELECT SUM(IFNULL(QtyRequired,0,QtyRequired)) into :fltQtyPlanned 
+		FROM alDRP.dPlannedMovement
+		WHERE
+			Item=:pidItem                  AND
+			FromStorage->Location=:pidLocn AND
+			FromStorage=:pidStore          AND
+			Bundle=:pidBundle
+	)
+	quit fltQtyPlanned
+	
+]]></Routine>
+</Export>

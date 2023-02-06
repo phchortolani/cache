@@ -1,0 +1,491 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Class name="VAR.infra.cache.net.WebClient">
+<Description><![CDATA[Classe SOAP Web Client com uma pequena correção.]]></Description>
+<Abstract>1</Abstract>
+<ClassType/>
+<Import>VAR.infra.util</Import>
+<IncludeCode>VARErros</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%SOAP.WebClient</Super>
+
+<Method name="InvokeClient">
+<Description><![CDATA[Execute the Web Method represented by the descriptor class on
+the server.  If an error is detected, a ztrap "SOAP" will be issued with
+%objlasterror containing the error %Status.  If is the responsibilty of the
+caller of the proxy method to set an error trap and test for $ZE["&lt;ZSOAP&gt;".
+Note that if a SOAP fault is received, then the error is $$$SOAPFaultReceived.
+
+If MethodName argument is "", then this is an internal call to send the XML body.
+In this case proxy is the character stream containing the body.
+
+This method is used internally by Cach&eacute;. You should not make direct
+use of it within your applications. There is no guarantee made about either
+the behavior or future operation of this method.]]></Description>
+<Internal>1</Internal>
+<FormalSpec>proxy:%SOAP.ProxyDescriptor,MethodName:%String,Action:%String,OneWay:%Boolean=0</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<ServerOnly>1</ServerOnly>
+<Implementation><![CDATA[	#; Initialize to no SOAP fault received.
+	Set ..SoapFault=""
+	Set sc=$$$OK,error=0
+
+	#; Get transport if supplied.
+	Set transport=..Transport
+	
+	#; Get list of SOAP Headers
+	Set ..SoapHeaders=..#SOAPHEADERS
+	
+	#; Handle Cache proprietary binary SOAP protocol
+	If ..SoapBinary {
+		Set charset=$$GetCharset^%SYS.NLS()
+		Set asUTF8=((charset="") || (charset'=..SoapBinaryCharset))
+		Set binwriter=..GetBinaryWriter(proxy,1,asUTF8)
+		If +..HTTPVersion>1.0 {
+			// Chunked output for HTTP/1.1
+			Set stream=binwriter
+		} Else {
+			Set io=$io
+			Set stream=##class(%FileBinaryStream).%New()
+			Set sc=stream.Write("") ; force stream's file to open
+			If $$$ISERR(sc) Goto SOAPError
+			Set file=stream.Filename ; get filename and make current device
+			Use file
+			$$$SETIO("RAW")
+			Set binwriter.Chunked=0
+			Do binwriter.OutputStream()
+			Close file
+			Use io
+			kill binwriter
+			If $$$ISERR(sc) Goto SOAPError
+		}
+	
+		#; Use transport to get response.
+		If transport="" {
+			Set transport=##this
+			// Try to use string for response if our built-in transport
+			Set responseStream="string"
+		} Else {
+			Set responseStream=##class(%GlobalBinaryStream).%New()
+		}
+	
+		#; If no action specified, use the method name from the proxy class.
+		If $tr(Action,"""","")="" Set Action=$$$ClassShortName($zobjclass(proxy))
+		
+		#; Always use the same %Net.HttpRequest to maintain a session if
+		#; the session  cookie is returned for SOAPSESSION=1
+		If ..HttpRequest="" Set ..HttpRequest=##class(%Net.HttpRequest).%New()
+		
+		#; Make the request
+		Set sc=transport.DoSOAPRequest(##this,Action,OneWay,stream,.responseStream)
+	
+		#; Log the response
+		Do ##class(%SOAP.Binary).LogMessage(0,Action,responseStream,sc)
+
+		If $$$ISERR(sc) Goto SOAPError
+	
+		#; If one-way, check for empty response
+		If OneWay {
+			If $isobject(responseStream) {
+				Do responseStream.Rewind()
+				Set len=1
+				Set data=responseStream.Read(.len)
+				Do responseStream.Rewind()
+				If len<=0 Set sc=$$$OK Goto SOAPExit
+			} Else {
+				If responseStream="" Set sc=$$$OK Goto SOAPExit
+			}
+		}
+	
+		If 'OneWay {
+			#; Reset any INOUT properties
+			Do proxy.Reset()
+			#; Import the SOAP response.
+			#; Deserialize the message class
+			if '$isobject(responseStream) {
+				set responseStream=##class(%SOAP.BufferedStream).%New(responseStream)
+			}
+			Set sc=..ReadBinaryMessage(proxy,.asUTF8,.sessionFlag,responseStream)
+			If $$$ISERR(sc) Goto SOAPError
+			If 'sessionFlag Set ..HttpRequest=""
+		}
+		Goto SOAPExit
+	}
+	
+	#; Test the specified Http Requester
+	Set requester=$zcvt(..HttpRequester,"U")
+	If $case(requester,"SAX":0,"CACHE":0,"":0,:1) {
+		Set sc=$$$ERROR($$$SOAPInvalidRequester,..HttpRequester)
+		Goto SOAPError
+	}
+	
+	#; Create WS-Security header with UsernameToken, if neeeded
+	If ..Username'="" Do ..MakeSecurityHeader()
+	
+	#; If in a SOAP session then add the SOAP session header
+	If ..SessionCookie'="" {
+		Set sessionHeader=##class(%SOAP.SessionHeader).%New()
+		Set sessionHeader.SessionCookie=..SessionCookie
+		Do ..HeadersOut.SetAt(sessionHeader,"CSPCHD")
+	}
+	
+	#; Setup WS-Addressing if required.
+	If (..AddressingOut="") && ($zcvt(..#WSADDRESSING,"U")="AUTO") {
+		Set ..AddressingOut=##class(%SOAP.Addressing.Properties).GetDefaultRequestProperties(..Location,Action)
+	}
+	
+	#; Initialize any WS-Security operations.
+	If $isobject(i%SecurityOut) {
+		// WSRequired is true if any signing or encryption is to be done.
+		Set ..WSRequired=i%SecurityOut.Initialize(##this,.sc)
+		If $$$ISERR(sc) Goto SOAPError
+	} Else {
+		Set ..WSRequired=0
+	}
+	
+	#; Create the headers and attachments for the SOAP request
+	Set numAttachments=..Attachments.Count()
+	If $case(..SoapVersion,"":0,"1.1":0,"1.2":0,:1) {
+		Set sc=$$$ERROR($$$SOAPBadVersion,..SoapVersion)
+		Goto SOAPError
+	}
+	Set allowedVersion=..#SOAPVERSION
+	If allowedVersion="" {
+		If ..SoapVersion="" Set ..SoapVersion="1.1"
+	} ElseIf ..SoapVersion="" {
+		Set ..SoapVersion=allowedVersion
+	} Else {
+		If allowedVersion'=..SoapVersion {
+			Set sc=$$$ERROR($$$SOAPBadVersion,..SoapVersion) 
+			Goto SOAPError
+		}
+	}
+	Set soap12=(..SoapVersion="1.2")
+	Set soaptype=$select(soap12:"application/soap+xml",1:"text/xml")
+	If (numAttachments>0) || ..MTOMRequired {
+		Set mimeAttachments=##class(%Net.MIMEPart).%New()
+		For i=1:1:numAttachments Do mimeAttachments.Parts.Insert(..Attachments.GetAt(i))
+		Set startContentId=..ContentId
+		If ..MTOMRequired {
+			If startContentId="" {
+				Set mimeAttachments.ContentId=$tr($system.Util.CreateGUID(),"-",".")
+				Set startContentId="0."_mimeAttachments.ContentId
+			} Else {
+				Set mimeAttachments.ContentId=startContentId
+			}
+			Set ..ContentType=
+				"multipart/related; type=""application/xop+xml""; boundary="_mimeAttachments.Boundary_
+				"; start=""<"_startContentId_">""; start-info="""_soaptype_""""
+			If soap12 Set ..ContentType=..ContentType_"; action="""_Action_""""
+		} Else {
+			Set ..ContentType="multipart/related; type="""_soaptype_"""; boundary="_mimeAttachments.Boundary
+			If startContentId'="" Set ..ContentType=..ContentType_"; start=<"_startContentId_">"
+		}
+		Set mimeAttachments.ContentType=..ContentType
+	} Else {
+		Set mimeAttachments=""
+		Set ..ContentType=""_soaptype_"; charset=UTF-8"
+		If soap12 Set ..ContentType=..ContentType_"; action="""_Action_""""
+	}
+	Set responseAttachments=""
+
+	#; Get an XML content handler that parses message into XML DOM 
+	Set tHandler=##Class(%XML.Document).%New()
+	If '$isObject(tHandler) Set sc=$$$ERROR($$$CannotCreateObject,"%XML.Document") Goto SOAPError
+	Set tHandler.KeepWhitespace=1 // Need whitespace for XMLImport
+
+	If (requester="SAX") && 'OneWay && (transport="") && 
+			(mimeAttachments="") && '..WSRequired &&
+			(..HttpFollowRedirect="") && (..HttpProxyAuthorization="") &&
+			(..HttpProxyServer="") && (..HttpProxyPort="") && (..HttpProxyHTTPS="") &&
+			(..HttpRequestHeaderCharset="") && (..HttpUsername="") && (..HttpPassword="") &&
+			(..HttpRequest="") {
+
+		#; Create SOAP request
+		Set io=$io
+		
+		#; Open and use the xdevice
+		Set tXDEV="|XDEV|"_$JOB
+		Open tXDEV:($ZF(-6,$$$SaxLibrary,7):"":"S":/HOSTNAME="DUMMY") 
+		Use tXDEV
+		
+		$$$SETIO("UTF8")
+		Set sc=..WriteSOAPMessage(proxy,proxy.%RequestName,0,"")
+		Use io
+		
+		#; When using default transport, let SAX do the entire request.
+	
+		Set tHeaders="Connection: Close"_$char(13,10)
+		If 'soap12 Set tHeaders=tHeaders_"SOAPAction: "_Action_$char(13,10)
+		Set tHeaders=tHeaders_"User-Agent: Mozilla/4.0 (compatible; Cache;)"_$char(13,10)
+ 		Set tHeaders=tHeaders_"Content-Type: "_soaptype_"; charset=UTF-8"
+		If soap12 Set tHeaders=tHeaders_"; action="""_Action_""""
+		Set tHeaders=tHeaders_$char(13,10)
+
+		For i=1:1:$get(i%HttpHeaders,0) {
+			Set header=i%HttpHeaders(i)
+			Set tHeaders=tHeaders_$list(header,1)_": "_$list(header,2)_$char(13,10)
+		}
+
+		#; Do the call
+		Set tRetval=$ZF(-6,$$$HANDLE,$$$ParseURL,"",$ListBuild(..Location,$$$objOrefToInt(tHandler),,..SAXFlags,,),$$$IntHandler,tHeaders,$select(..Timeout="":30,1:..Timeout))
+
+		#; Test for error condition
+		If $List(tRetval,1)'=0 {
+            Set errorText=$List(tRetval,2)
+            Set sc=$$$ERROR($$$SAXError,errorText)
+			If errorText["HTTP Error" {
+				Set status=+$zstrip($piece(errorText,"Status:",2),"<W")
+				If status'=0 {
+					If (errorText["Unexpected Status:") && (status=500) {
+						Set sc=$$$OK
+					}
+				}
+			}
+		}
+
+		Close tXDEV
+
+ 		#; Call OnPostParse callback if no error
+ 		If $$$ISOK(sc) Set sc=tHandler.OnPostParse()
+
+	} Else {
+		#; Create SOAP request
+		Set io=$io
+		Set stream=##class(%FileBinaryStream).%New()
+		Set sc=stream.Write("") ; force stream's file to open
+		If $$$ISERR(sc) Goto SOAPError
+		If ..WSRequired Set ..WSStream=stream
+		Set file=stream.Filename ; get filename and make current device
+		Use file
+		If mimeAttachments'="" {
+			Write "--"_mimeAttachments.Boundary,!
+			If ..MTOMRequired {
+				Write "Content-Type: application/xop+xml; type="""_soaptype_"""; charset=""UTF-8"""
+				If soap12 Write "; action="""_Action_""""
+				Write !
+			} Else {
+				Write "Content-Type: "_soaptype_"; charset=""UTF-8""",!
+			}
+			Write "Content-Transfer-Encoding: 8bit",!
+			If startContentId'="" Write "Content-Id: <"_startContentId_">",!
+			If ..ContentLocation'="" Write "Content-Location: "_..ContentLocation,!
+			Write !
+		}
+		$$$SETIO("UTF8")
+		Set sc=..WriteSOAPMessage(proxy,proxy.%RequestName,0,mimeAttachments)
+		If $$$ISOK(sc) && (mimeAttachments'="") {
+			$$$SETIO("RAW")
+			Set writer=##class(%Net.MIMEWriter).%New()
+			Set sc=writer.WriteMIMEBody(mimeAttachments)
+		}
+		Close file
+		Use io
+		If $$$ISERR(sc) Goto SOAPError
+		
+		#; If signing or encryption needed, then add these security elements 
+		#; to the WS-Security header.
+		If ..WSRequired {
+			Set messageStream=stream
+			Set stream=##class(%FileBinaryStream).%New()
+			Set sc=stream.Write("") ; force stream's file to open
+			If $$$ISERR(sc) Goto SOAPError
+			Set file=stream.Filename ; get filename and make current device
+			Set io=$io
+			Use file
+			$$$SETIO("RAW")
+			
+			Set sc=i%SecurityOut.InsertSecurityElements(messageStream,..WSEndPosition)
+			Close file
+			Use io
+			If $$$ISERR(sc) Goto SOAPError
+		}
+	
+		#; Use transport to get response.
+		If transport="" {
+			Set transport=##this
+			// Try to use string for response if our built-in transport
+			Set responseStream="string"
+		} Else {
+			Set responseStream=##class(%GlobalBinaryStream).%New()
+		}
+	
+		Set sc=transport.DoSOAPRequest(##this,Action,OneWay,stream,.responseStream)
+	
+		#; Log the response
+		Do ..LogInput(0,Action,responseStream,sc)
+	
+		#; Return error if detected
+		If $$$ISERR(sc) Goto SOAPError
+	
+		#; If one-way, check for empty response
+		If $isobject(responseStream) {
+			Do responseStream.Rewind()
+			If OneWay {
+				Set len=1
+				Set data=responseStream.Read(.len)
+				Do responseStream.Rewind()
+				If len<=0 Set sc=$$$OK Goto SOAPExit
+			}
+		} Else {
+			If responseStream="" Set sc=$$$OK Goto SOAPExit
+		}
+	
+		#; Get an entity resolver
+		Set tResolver=##Class(%XML.SAX.EntityResolver).%New()
+		If '$isObject(tResolver) Set sc=$$$ERROR($$$CannotCreateObject,"%XML.SAX.EntityResolver") Goto SOAPError
+		#; Parse the message into XML DOM
+		if '$isobject(responseStream) {
+			set responseStream=##class(%SOAP.BufferedStream).%New(responseStream)
+		}
+
+		// Process response with content-type=multipart/related
+		Set ..IsMTOM=0
+		Set response=..HttpResponse
+		If $isobject(response) && ($zcvt($piece(response.ContentType,";",1),"L")="multipart/related") {
+			If ##class(%Net.HttpRequest).ParseContent(response.ContentInfo,.tmparray) {
+				Set sc=$$$ERROR($$$CSPInvalidContentType,response.ContentType)
+				Goto SOAPError
+			}
+			If $case($get(tmparray("type")),"text/xml":0,"application/soap+xml":0,"application/xop+xml":0,:1) {
+				Set sc=$$$ERROR($$$SOAPBadMultipart,response.ContentType)
+				Goto SOAPError
+			}
+
+			If tmparray("type")="application/xop+xml" {
+				Set ..IsMTOM=1
+				Set responseAttachments=..ResponseAttachments
+				Set start=##class(%Net.MIMEPart).NormalizeContentId(tmparray("start"))
+				Set startindex=$select(start="":1,1:0)
+			} Else {
+				Set start=""
+				Set startindex=1
+			}
+	
+			Set msg=##class(%Net.MIMEPart).%New()
+			do msg.SetHeader("Content-Type",response.ContentType)
+			Set reader=##class(%Net.MIMEReader).%New()
+			Set sc=reader.OpenStream(responseStream)
+			If $$$ISERR(sc) Goto SOAPError
+			Set sc=reader.ReadMIMEBody(msg)
+			If $$$ISERR(sc) Goto SOAPError
+			If msg.Parts.Count()<1 {
+				Set sc=$$$ERROR($$$SOAPBadMultipart,response.ContentType)
+				Goto SOAPError
+			}
+
+			For index=1:1:msg.Parts.Count() {
+				Set part=msg.Parts.GetAt(index)
+				Do ..ResponseAttachments.Insert(part)
+				If (startindex=0) && (start=part.ContentId) {
+					Set startindex=index
+				}
+			}
+
+			If startindex=0 {
+				Set sc=$$$ERROR($$$SOAPBadMultipart,response.ContentType)
+				Goto SOAPError
+			}
+
+			Set part=msg.Parts.GetAt(startindex)
+			If ..IsMTOM {
+				If $zcvt($piece(part.ContentType,";",1),"L")'="application/xop+xml" {
+					Set sc=$$$ERROR($$$SOAPBadMultipart,response.ContentType)
+					Goto SOAPError
+				}
+			} Else {
+				If ($zcvt($piece(part.ContentType,";",1),"L")'="text/xml") &&
+				   (zcvt($piece(part.ContentType,";",1),"L")'="application/soap+xml") {
+					Set sc=$$$ERROR($$$SOAPBadMultipart,response.ContentType)
+					Goto SOAPError
+				}
+			}
+			Set responseStream=part.Body
+			Set ..ResponseContentId=part.ContentId
+			Set ..ResponseContentLocation=part.ContentLocation
+			Do ..ResponseAttachments.RemoveAt(startindex)
+		}
+		Set sc=##Class(%XML.SAX.Parser).ParseStream(responseStream,tHandler,tResolver,..SAXFlags)
+	}
+
+	If $$$ISERR(sc) Goto SOAPError
+
+	#; Make sure to process session and security headers
+	Set headers=..SoapHeaders
+	If headers="" {
+		Set headers="Security:%SOAP.Security.Header,CSPCHD:%SOAP.SessionHeader"
+	} Else {
+		Set headers=","_headers
+		If headers'[",Security:" Set headers=headers_",Security:%SOAP.Security.Header"
+		If headers'[",CSPCHD:" Set headers=headers_",CSPCHD:%SOAP.SessionHeader"
+		Set headers=$extract(headers,2,*)
+	}
+	Set ..SoapHeaders=headers
+	$$$SOAPLogSecurity($c(13,10)_"Security action="_Action_", MethodName="_MethodName)
+
+	#; Validate the SOAP envelope. 
+	Do ..HeadersIn.Clear()
+	Set sc=..ProcessSOAPEnvelope(tHandler,OneWay,.message,.versionMismatch)
+	If $$$ISERR(sc) Goto SOAPError
+	
+	#; Save the WS-Security header
+	Set header=..HeadersIn.GetAt("Security")
+	If (header'="") && ($zobjclass(header)="%SOAP.Security.Header") {
+		Set ..SecurityIn=header
+		Set ..SecurityNamespace=header.Namespace
+	} Else {
+		If $zcvt(..#SECURITYIN,"L")="require" {
+			Set sc=$$$ERROR($$$SOAPWSSECURITYRequired)
+			Goto SOAPError
+		}
+		Set ..SecurityIn=""
+		Set ..SecurityNamespace=""
+	}
+	
+	#; Process session header	
+	Set header=..HeadersIn.GetAt("CSPCHD")
+	If (header'="") && ($zobjclass(header)="%SOAP.SessionHeader") {
+		Set sc=header.ProcessClient(##this)
+		If $$$ISERR(sc) Goto SOAPError
+	}
+	
+	#; Import SOAP body.
+	If 'OneWay {
+		If MethodName'="" {
+			#; Reset any INOUT properties
+			Do proxy.Reset()
+			#; Import the SOAP response.
+			Set sc=proxy.ImportSOAPMessage(MethodName_"Response",MethodName_"Result",tHandler,message,responseAttachments)
+			If $$$ISERR(sc) Goto SOAPError
+		} Else {
+			Set sc=proxy.ReturnResponse(tHandler,message)
+		}
+	}
+
+SOAPExit
+	Do ..HeadersOut.Clear()
+	Set ..AddressingOut=""
+	If ..Username'="" {
+		Set (..Username,..Password)=""
+		If $isobject(i%SecurityOut) {
+			Do i%SecurityOut.RemoveElement("UsernameToken")
+		}
+	}
+	Set ..ContentType=""
+	If error {
+	    Set %objlasterror=sc 
+	    //***
+	    //if MethodName'="" Ztrap "SOAP"
+	    //set $ecode = ##class(Errors).GetErrorFromErrorStatus(sc)
+	    //set $ecode = sc
+	    $$$THROW(sc)
+	    //***
+	}
+	Quit sc
+
+SOAPError 
+	Set error=1
+	Goto SOAPExit]]></Implementation>
+</Method>
+</Class>
+</Export>

@@ -1,0 +1,753 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLBankRecon" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLBankRecon
+	; ---------------------------------------------------------------------------
+	; History
+	; 14-Oct-2009	GRF		SR15632: remove definition - not used
+	; 07-Jul-2003	SCR		Bug Fixes from Code Check
+	; ---------------------------------------------------------------------------
+	
+#include COMConst
+#include FINConst
+#include COMSYS
+#include FINSYS
+	
+AfterDataFields(pidBankRecon,plngPage)
+	; ------------------------------------------------------------------------------
+	; Start point for methods to run before After Data Fields
+	; 
+	; History
+	; 19-Mar-2010	shobby	SR15753: Removed redundant code.
+	; 14-Aug-2006	PO		SR14331: Use includes bank lines field for SR14687
+	; 25-Jul-2006	PO		SR14687: Corrected logic for hiding Edit Grid, also
+	;							hiding the Grid on completed page
+	; 14-Jul-2006	PO		SR14687: Don't display grid in the Manual Match tab when
+	; 							there are no bank lines loaded.
+	; 09-Mar-2006	RPW		SR13305: Do not call LoadGrid on FINGLBankReconManualMatch
+	;							as it's no longer required.
+	; 03-Mar-2006	JW		SR13305: Added FINGLBankReconCompleted
+	; 16-Feb-2006	RPW		SR13675: Always get the new grid data. On Page 6 show the edit grid.
+	; 07-Feb-2006	SC		SR14121: Display FileLoadVerification table
+	; 09-Jan-2005	SC		SR14155: Always display plngPage=3(Charges/Inte.),
+	;							previously only display if editable=true.
+	; 19-Oct-2005	JW		SR13581: Delete grid After Delete not after data fields.
+	; 10-Oct-2005	JW		SR13641: Don't populate temps
+	; 26-Sep-2005	Steve S	SR13308: ToggleReadOnly for Opening Date
+	; 26-Sep-2005	RPW		SR13304: If we have come in fresh, then repopulate the data structures.
+	; 20-Sep-2005	JW		SR13309: Added Pre Cleared grid
+	; 06-Jan-2005	PO & JW	SR11425 Added call to delete ^CacheTemp
+	; 23-Nov-2004	Steve S	Added code for Grid Edit (SR:10539)
+	; 03-May-2004	shobby	Don't show Transactions or Charges if the BankRecon is posted.
+	; 02-mar-2004	lwaugh	Added $get around YPARA usage
+	; 09-Apr-2003	Paul K	Modified to not reference globals
+	; 07-Mar-2003	shobby	Added call to Statement on Tab 4
+	; ??-Mar-2003	shobby	Creation
+	; ------------------------------------------------------------------------------
+	new blnShowAll,strPARA,Query,strForm,objGLBankRecon,idAccount,strStatus
+	
+	if '$$$NoKey(pidBankRecon) {
+		do ShowBalances^FINGLBankReconDisplay(pidBankRecon)
+		
+		set objGLBankRecon = $get(^FINGLBankRecon(0,pidBankRecon,1))
+		
+		set strStatus = $$Editable^FINSYSReview("FINGLBankRecon",$$$FINGLBankReconStatus(objGLBankRecon))
+ 		if $$$ISOK(strStatus) {
+			do LoadGridData^FINGLBankReconDisplay(pidBankRecon)
+			do LoadGridData^FINGLBankReconManualMatch(pidBankRecon)
+			
+			if plngPage=2 {
+				do LoadGrid(pidBankRecon,"FINGLBankReconMatched")
+				
+			} elseif plngPage=6 {
+				do ShowFileLoadVerification^FINGLBankReconDisplay()
+				do ShowMatchValues^FINGLBankTranShow(pidBankRecon)
+				do ShowMatchValueTransactions^FINGLBankTranShow(pidBankRecon,$get(YPARA))
+			}
+ 		}
+		if plngPage=4 {
+			// Only show the Edit Grid on the manual match page if the status is not posted and either their are bank lines
+			if $$$FINGLBankReconIncludesBankLines(objGLBankRecon) {
+				do LoadGrid(pidBankRecon,"FINGLBankReconMatchCache")
+			
+			} else {
+				write "<p style='text-align:center;color:red;font-weight:bold;'>"_$$$Text("Fin01065")_"</p>"
+			} ; "There are no bank lines loaded."
+			
+		} elseif plngPage=7 {
+			do LoadGrid(pidBankRecon,"FINGLBankReconPreCleared")
+			do PopulateFromGrid(pidBankRecon,"FINGLBankReconPreCleared",$$$FldFINGLBankReconPreClearedDebit,$$$FldFINGLBankReconPreClearedCredit)
+			
+		} elseif plngPage=3 {
+			do LoadGrid(pidBankRecon,"FINGLBankReconLine") ;  moved outside if editable.
+			do PopulateFromGrid(pidBankRecon,"FINGLBankReconLine",$$$FldFINGLBankReconLineDebit,$$$FldFINGLBankReconLineCredit)
+			
+		} elseif plngPage=8 {
+			// Only show the Edit Grid on the complete page if the status is not posted and either their are bank lines
+			if $$$FINGLBankReconIncludesBankLines(objGLBankRecon) {
+				do LoadGrid(pidBankRecon,"FINGLBankReconCompleted")
+			} else {
+				write "<p style='text-align:center;color:red;font-weight:bold;'>"_$$$Text("Fin01065")_"</p>"
+			} ; "There are no bank lines loaded."
+		}
+	}
+	quit
+	
+	
+LoadGrid(pidBankRecon,psubForm,pstrClear="")
+    ;-------------------------------------------------------------------------------
+    ; Called by AfterDataFields to display Charges/Interest in an Edit Grid.
+    ; 
+    ; Params:	pidBankRecon - Bank Recon Id
+    ; 			psubForm - the child form in the grid
+    ; 
+    ; Returns:
+    ;
+    ; History:
+	; 05-Dec-2008	GRF		Clarify Enabled test
+    ; 12-Oct-2006	SteveS	SR15116: Reverted disabling if Multi Only
+    ; 15-Aug-2006	RPW		SR14332: Make PreCleared work like GL Adj.
+    ; 14-Aug-2006	RPW		SR14332: Put simplest check first.
+    ; 11-Aug-2006 	SC		SR14332: Disable grid if AllowMultiOnly.
+    ; 15-Sep-2005	JW		SR13309: Added param psubForm. Changed function name
+    ; 04-Apr-2005	JW		SR11915: Added clear fields parameter
+    ; 10-Dec-2004	shobby	Removed null YKEY test (SR11175)
+    ; 24-Nov-2004	SteveS	Created (SR:10539)
+    ;-------------------------------------------------------------------------------
+	new YFORM,YKEY,YAUSWAHL,YFELD,objFINGLBankRecon,idBankAccount,blnMultiOnly
+	
+	set YFORM = psubForm
+	set YKEY  = $get(pidBankRecon)
+	set YFELD = ""
+ 
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)          = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL)       = 500
+	set $$$COMGridEditParameterGridName(YAUSWAHL)            = YFORM
+	set $$$COMGridEditParameterClearFields(YAUSWAHL)         = pstrClear  // Same for both sub forms
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)             = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)           = "FINGLBankRecon"
+	set $$$COMGridEditParameterDontUpdateContainer(YAUSWAHL) = $$$YES
+	
+	do ^COMGridEdit31
+	quit
+	
+	
+SetCleared(pidBankRecon)
+	; -----------------------------------------------------------------------------
+	; Set the cleared property of Transactions posted with this Bank Reconciliation
+	; so that they do not get posted again
+	; 
+	; Use Index 1 on the FINGLBankReconMatched as the records are now kept.
+	; 
+	; History
+	; 16-Feb-2006	RPW		SR13675: Find the Matched entries which are cleared and
+	; 							update the transaction.  Entirely rewrote.
+	; 20-Dec-2005	RPW		SR14068: Only handle the cleared transactions.
+	; 05-Dec-2005	RPW		SR13813: Use the first index to loop through.
+	; -----------------------------------------------------------------------------
+	new strStatus,objBankRecon,idLine,objBankReconMatched,idTran,idTranLine,objTranLine
+	new YFORM,YVOR
+	
+	set strStatus    = $$$OK
+	set objBankRecon = $get(^FINGLBankRecon(0,pidBankRecon,1))
+	
+	set idLine = ""
+	for {
+		set idLine = $order(^FINGLBankReconMatcheds(0,1,$$$YES,pidBankRecon,idLine))
+		quit:idLine=""
+		
+		set objBankReconMatched = $get(^FINGLBankReconMatched(0,pidBankRecon,idLine,1))
+		set idTran     = $$$FINGLBankReconMatchedTransaction1(objBankReconMatched)
+		set idTranLine = $$$FINGLBankReconMatchedTransactionLine(objBankReconMatched)
+		
+		set objTranLine = $get(^FINGLTranLine(0,idTran,idTranLine,1))
+		set $$$FINGLTranLineCleared(objTranLine) = pidBankRecon
+		set strStatus = $$$Save("FINGLTranLine",idTran_","_idTranLine,objTranLine,$$$YES)
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+	
+Post(pidBankRecon,pblnReturnStatus=$$$NO)
+	; -----------------------------------------------------------------------------
+	; Post the Bank Reconciliation
+	; 
+	; History:
+	; 19-Oct-2006	JW		SR15134: Look at kill status
+	; 13-Jun-2006	RPW		SR14642: Call the new CreateBatch code to create
+    ; 						a batch instead of going directly to the ledger accounts.
+	; 02-May-2006	RPW		SR14600: Always kill the bank trans, leave no records.
+	; 22-Dec-2005	Steve S	SR14082: Use GL Eff Date
+	; 26-Sep-2005	RPW		SR13304: Remove all the FINGLBankTran records.
+	; 20-Sep-2005	JW		SR13309: Added call to set Pre Cleared
+	; 05-Oct-2004	Paul K	Added pending status stuff.
+	; 24-Mar-2003	shobby	Removed the time component of the Posted date.
+	; 11-Mar-2003	shobby	Creation (Copied from FINGLJournal)
+	; -----------------------------------------------------------------------------
+	new curCredit,curDebit,dtePosted,dtePostedDate,dteTransDate,idAccount,idTran
+	new intLineNumber,objBankRecon,objJournal,objJournalLine,strReference,strStatus
+	new blnPost,intStatus,idBankAccount,idBankTran,dteGLEffective,objBankTran
+	
+	set blnPost   = $$$YES
+	set intStatus = ""
+	
+	set strStatus = $$Postable(pidBankRecon)
+	
+	if $$$ISOK(strStatus) {
+		set objBankRecon = $get(^FINGLBankRecon(0,pidBankRecon,1))
+		set strStatus    = $$Editable^FINSYSReview("FINGLBankRecon",$$$FINGLBankReconStatus(objBankRecon),.blnPost,.intStatus)	
+	}
+	
+	;***************************************
+	tstart
+	;***************************************
+	
+	if $$$ISOK(strStatus) && blnPost {
+		set dtePosted = $horolog
+		set $$$FINGLBankReconPosted(objBankRecon) = dtePosted
+		
+		; Use GL Effective Date
+		set dteGLEffective = $$$FINGLBankReconEntered(objBankRecon)
+		if dteGLEffective="" set dteGLEffective = +$horolog
+		
+		if strStatus=$$$OK set strStatus = $$CreateBatch^FINGLBankReconPost(pidBankRecon,dteGLEffective)
+		if strStatus=$$$OK set strStatus = $$SetCleared(pidBankRecon)
+		if strStatus=$$$OK set strStatus = $$SetCleared^FINGLBankReconPreCleared(pidBankRecon)
+		
+		; Kill the FINGLBankTran lines
+		if $$$ISOK(strStatus) {
+			set idBankAccount = $$$FINGLBankReconBankAccount(objBankRecon)
+			set idBankTran    = ""
+			for {
+				set idBankTran = $order(^FINGLBankTran(0,idBankAccount,idBankTran))
+				quit:idBankTran=""
+				
+				set objBankTran = $get(^FINGLBankTran(0,idBankAccount,idBankTran,1))
+				set strStatus = $$$Kill("FINGLBankTran",idBankAccount_","_idBankTran)
+				quit:$$$ISERR(strStatus)
+			}
+		}
+	}
+	
+	if strStatus=$$$OK {
+		set $$$FINGLBankReconStatus(objBankRecon) = intStatus
+		set strStatus = $$$Save("FINGLBankRecon",pidBankRecon,objBankRecon,$$$YES)
+	}
+	
+	;***************************************
+	if strStatus=$$$OK {
+		if $tlevel>0 tcommit 
+		if 'pblnReturnStatus do ReloadForm^COMUtilForm()
+	} else {
+		trollback
+		if 'pblnReturnStatus do ReturnError^COMUtilError(strStatus)
+	}
+	;***************************************
+	quit strStatus
+	
+	
+Postable(pidBankRecon)
+	; -----------------------------------------------------------------------------
+	; Find if the Bank Reconciliation can be posted.
+	; 
+	; History
+	; 01-Feb-2005	SteveS	SR11515: Added check to ensure accounts have been specified.
+	; 05-Oct-2004	PaulK	Added pending status stuff.
+	; 12-Mar-2003	shobby	Test that 'Unallocated' is zero before posting
+	; 11-Mar-2003	shobby	Creation (Copied from FINGLJournal)
+	; -----------------------------------------------------------------------------
+	new objBankRecon,strStatus
+	new strJournalType
+	new intJournalHist,objJournalHistory,objTran
+	
+	set strStatus = $$$OK
+	
+	if $$$ISOK(strStatus) if $get(pidBankRecon)="" set strStatus = $listbuild("Fin00089")   ; "No Record Selected."
+	if $$$ISOK(strStatus) set strStatus=$$Editable^FINSYSReview("FINGLBankRecon",$$$FINGLBankReconStatus($get(^FINGLBankRecon(0,pidBankRecon,1))))
+	if $$$ISOK(strStatus) if $$GetUnallocated^FINGLBankReconGet(pidBankRecon)'=0 set strStatus = $listbuild("Fin00090")
+					; "Unallocated amount must be zero before posting."
+	if $$$ISOK(strStatus) set strStatus=$$AccountsSpecified(pidBankRecon)
+	
+	if $$$ISOK(strStatus) {
+		if $$$KEY2($$$GetActiveParent(pidBankRecon))'="" set strStatus = "There is an incomplete match in progress"
+	}
+	
+	if $$$ISOK(strStatus) {
+		set YQ=0
+	} else {
+		set YQ="1 "_$$$Text(strStatus)
+	}
+	quit strStatus
+	
+	
+AccountsSpecified(pidBankRecon)
+    ;-------------------------------------------------------------------------------
+    ; Routine to make sure all charges/interest lines have an account specified.
+    ;
+    ; Returns: strStatus=$$$OK (if all lines have an account)
+    ; 					=$lb() (error message containing lines with no account)
+    ;
+    ; History:
+    ; 01-Feb-2005	SteveS	Created (SR: 11515)
+    ;-------------------------------------------------------------------------------
+ 	new strErrorLines,strStatus,idLine,objLine,idGLAccount
+ 
+	set strErrorLines = ""
+	set strStatus     = $$$OK
+	
+	if '$$$NoKey(pidBankRecon) {
+		set idLine = ""
+		for {
+			set idLine = $order(^FINGLBankReconLine(0,pidBankRecon,idLine))
+			quit:(idLine="")
+			
+			set objLine     = $get(^FINGLBankReconLine(0,pidBankRecon,idLine,1))
+			set idGLAccount = $$$FINGLBankReconLineAccount(objLine)
+			if idGLAccount="" set strErrorLines=strErrorLines_idLine_","
+		}
+	}		
+	
+	if strErrorLines'="" {
+		set strErrorLines = $extract(strErrorLines,1,$length(strErrorLines)-1) ;remove last comma
+		set strStatus     = $listbuild("Fin00635",strErrorLines)
+	}  ; "Account required for Line Number: ´%1´"
+	quit strStatus
+	
+	
+CanUnMatch(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Perform disable checking for UnMatch ("U") button on FINGLBankReconMatched grid.
+	;
+	; Params: pYKEY - YKEY from FINGLBankReconMatched.
+	;
+	; ByRefs: none
+	;
+	; Returns: none
+	;
+	; History:
+	; 14-Aug-2006	RPW		SR14332: CodeCheck fixes
+	; 11-Aug-2006	SC		SR14332: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idBankRecNo,idBankAccount
+	
+	set strStatus = $$CanUnmatch^FINGLBankReconUtilities(pYKEY)
+	if $$$ISOK(strStatus) {	
+		set idBankRecNo   = $$$KEY1(pYKEY)
+		set idBankAccount = $$$FINGLBankBankAccountNumber($get(^FINGLBankRecon(0,idBankRecNo,1)))
+		if $$$AllowMultiOnly(idBankAccount) set YQ = $$$YQDisable($listbuild("Fin01071",idBankAccount))
+	} ; "Only Multi-Matching allowed for GL Account: %1"
+	quit
+ 
+ 
+UnPost(pidBankRecon)
+	; -----------------------------------------------------------------------------
+	; Roll back a posting.  Used for Test purposes
+	; 
+	; History
+	; 12-Mar-2003	shobby		Creation
+	; -----------------------------------------------------------------------------
+	new objBankRecon,strStatus
+	
+	set objBankRecon = $get(^FINGLBankRecon(0,pidBankRecon,1))
+	set $$$FINGLBankReconPosted(objBankRecon) = ""
+	set strStatus = $$$Save("FINGLBankRecon",pidBankRecon,objBankRecon,$$$YES)
+	quit strStatus
+	
+	
+UpdateCleared(pidBankRecon,pidLinkedBankRecon,pidTran,pidTranLine,pblnCleared,pblnManual=$$$NO,
+			  pstrRef="",pdteTransaction="",pidBankLine="",pstrType="",pblnUpdate=$$$YES,
+			  pblnUpdateHeader=$$$YES)
+	; -----------------------------------------------------------------------------
+	; toggles the cleared flag when the cleared cell is clicked.
+	;
+	; History
+	; 16-Feb-2006	RPW		SR13675: Call the new method UpdateMatched to update the matched entries.
+	; 05-Dec-2005	RPW		SR13813: Do not delete the data, change the cleared to $$$NO, leave the Manual.
+	; 14-Sep-2005	JW		SR13307: Set manual field
+	; 13-Sep-2005	RPW		SR13306: Use the CacheTemp global as this faster and we
+	; 						only calculate the data for the single line.
+	; 20-Jun-2005	shobby	Use KILL^COMUtils (SR12632)
+	; 18-Jun-2003	shobby	Check for Invalid pidBankRecon (TrackRecord 005402)
+	; 08-Apr-2003	Paul K	Modified to toggle rather than set
+	; 04-Mar-2003	shobby	Creation
+	; -----------------------------------------------------------------------------
+	new blnCleared,objBankRecon,curWithdrawal,curDeposit
+	
+	set objBankRecon = $get(^FINGLBankRecon(0,pidBankRecon,1))
+	if objBankRecon'="" {
+		if pidLinkedBankRecon=pidBankRecon {
+			if $$Editable^FINSYSReview("FINGLBankRecon",$$$FINGLBankReconStatus(objBankRecon)) {
+				set curWithdrawal = $$GetWithdrawal^FINGLBankReconGet(pidBankRecon,pidTran,pidTranLine)
+				set curDeposit    = $$GetDeposit^FINGLBankReconGet(pidBankRecon,pidTran,pidTranLine)
+				if pblnCleared {
+					; kill the property. saves space, not really!
+					if pblnUpdateHeader {
+						set ^CacheTempBankRecon(YUSER,"TW") = $get(^CacheTempBankRecon(YUSER,"TW"))-curWithdrawal
+						set ^CacheTempBankRecon(YUSER,"TD") = $get(^CacheTempBankRecon(YUSER,"TD"))-curDeposit
+						set ^CacheTempBankRecon(YUSER,"UN") = $$GetUnallocatedFast^FINGLBankReconGet(pidBankRecon)
+					}
+					if pblnUpdate {
+						do ResetMatched^FINGLBankTran(pidBankRecon,pidTran,pidTranLine,curWithdrawal,curDeposit)
+						do UpdateMatched^FINGLBankReconMatched(pidBankRecon,pidTran,pidTranLine,$$$NO,$$$NO,
+															pstrRef,pdteTransaction,pidBankLine,pstrType)
+					}
+					
+				} else {
+					if pblnUpdateHeader {
+						set ^CacheTempBankRecon(YUSER,"TW") = $get(^CacheTempBankRecon(YUSER,"TW"))+curWithdrawal
+						set ^CacheTempBankRecon(YUSER,"TD") = $get(^CacheTempBankRecon(YUSER,"TD"))+curDeposit
+						set ^CacheTempBankRecon(YUSER,"UN") = $$GetUnallocatedFast^FINGLBankReconGet(pidBankRecon)
+					}
+					if pblnUpdate {
+						do UpdateMatched^FINGLBankReconMatched(pidBankRecon,pidTran,pidTranLine,$$$YES,pblnManual,
+															pstrRef,pdteTransaction,pidBankLine,pstrType)
+					}
+				}
+			}
+		}
+	}
+	quit
+	
+	
+AfterPrimaryKey(pYKEY="",pYFELD)
+    ;-------------------------------------------------------------------------------
+    ; Code to run after the primary key is loaded.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 20-Feb-2006	RPW		SR14229: Removed CacheTempTransaction
+    ; 27-Oct-2005	JW		SR13754: Don't set here, set on blur / default value
+    ;  5-Oct-2005	JW		SR13617: Also kill data if different record
+    ; 26-Sep-2005	RPW		SR13304: Kill any existing data for this session for this user.
+    ; 10-Mar-2004	shobby	Created
+    ;-------------------------------------------------------------------------------
+	if pYKEY'=$get(^CacheTempBankRecon(YUSER)) {
+		kill ^CacheTempMatched(YUSER)
+		kill ^CacheTempBankReconCD(YUSER)
+		set ^CacheTempBankRecon(YUSER) = pYKEY
+	}
+	quit
+	
+	
+OnBeforeSave(pYKEY,&pYFELD)
+    ;-------------------------------------------------------------------------------
+    ; Code to run after the primary key is loaded.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ;  7-Mar-2006	JW		SR13305: Only save current grid
+    ; 01-Feb-2006	SC		SR14158: Check statement date > opening date.
+    ; 25-Oct-2005	JW&SS	Send account to AnyUnposted
+    ; 26-Sep-2005	SteveS	SR13308: Validate Opening Date
+    ; 14-Sep-2005	JW		SR13496: Check whether editable first.
+    ; 12-Aug-2005	SteveS	Validation BEFORE submission
+    ; 05-Oct-2004	PaulK	AnyUnposted now returns a status.
+    ; 30-Mar-2004	shobby	Passed in YFELD as well.
+    ; 10-Mar-2004	shobby	Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,strGridForm
+	
+	if $$Editable^FINSYSReview("FINGLBankRecon",$$$FINGLBankReconStatus($get(pYFELD))) {
+		if $$$FINGLBankReconOpeningDate(pYFELD)="" {
+			set strStatus=$listbuild("Fin00902",$$$FINGLBankReconBankAccount(pYFELD))  ; "Opening Date required for bank account %1"
+			
+		} elseif ($$$FINGLBankReconClosingDate(pYFELD) < $$$FINGLBankReconOpeningDate(pYFELD)){
+			set strStatus=$listbuild("Fin00964",$$$FINGLBankReconBankAccount(pYFELD))  ; "Statement Date must not be less than Opening Date."
+			
+		} else {
+			set strStatus=$$AnyUnposted(pYKEY,$$$FINGLBankReconBankAccount(pYFELD))
+		
+			if $$$ISOK(strStatus) {
+				
+				set strGridForm = $$$GRIDName		// Only save current grid
+				if strGridForm'="" {
+					set strStatus = $$$GRIDSave(pYKEY,strGridForm)
+				}
+			}
+		}
+		if $$$ISERR(strStatus) {
+			set Q=$$$QDontSave
+			do ReturnError^COMUtilError(strStatus)
+		}
+	}
+	quit
+	
+	
+OnBeforeButtonLine(pidBankRecon="",pobjBankRecon="")
+    ;-------------------------------------------------------------------------------
+    ; Code to run before button line.
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+    ; 14-Aug-2006	PO		SR14331: Set includes bank lines field if there are bank lines
+    ; 22-Feb-2006	Steve S	SR14110: Clear filters on a new form
+    ; 26-Sep-2005	RPW		SR13302: Do not load the reference list.
+    ; 05-Oct-2004	Paul K	Added editable routine call, test for "+"
+    ; 10-Mar-2004	shobby	Created
+    ;-------------------------------------------------------------------------------
+    new strStatus,objBankRecon,strTmpStatus,blnLines
+    
+    if $$$NoKey(pidBankRecon) {
+	    kill ^CacheTempFilter(YUSER)
+    	kill ^CacheTempPCFilter(YUSER)
+    }
+    
+    set strStatus    = $$$OK
+    set pidBankRecon = $$$KEY1(pidBankRecon)
+    
+    if '$$$NoKey(pidBankRecon) {
+		set objBankRecon = $get(^FINGLBankRecon(0,pidBankRecon,1))
+		set strStatus    = $$Editable^FINSYSReview("FINGLBankRecon",$$$FINGLBankReconStatus(objBankRecon))
+ 
+		if $$$ISOK(strStatus) {
+			set blnLines = $data(^FINGLBankTran(0,$$$FINGLBankReconBankAccount(objBankRecon)))
+			if '$$$FINGLBankReconIncludesBankLines(objBankRecon) '= 'blnLines {
+				set $$$FINGLBankReconIncludesBankLines(objBankRecon) = blnLines
+				set strTmpStatus = $$$Save("FINGLBankRecon",pidBankRecon,objBankRecon,$$$YES)
+			}
+		}
+    }
+    if strStatus'=$$$OK {
+    	set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+	}
+	quit strStatus
+	
+	
+AnyUnposted(pidFINGLBankRecon="",pidBankAccount="")
+    ;-------------------------------------------------------------------------------
+    ; Checks to find in there are any unposted reconciliations for this bank account
+    ; (apart from itself of course)
+    ;
+    ; Returns:Status
+    ; 
+    ; Notes:
+    ; 		Assumes valid data, ie maximum of one UnPosted BankRecon
+    ;
+    ; History:
+    ; 25-Oct-2005	JW		Pass in BankAccount
+    ; 05-Oct-2004	Paul K	Pass back status instead of boolean
+    ; 15-Mar-2004	shobby	Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,idLastBankRecon
+	
+	set strStatus=$$$OK
+	set idLastBankRecon = $order(^FINGLBankRecons(0,2,$$$Index(pidBankAccount)," ",""))
+	
+	if idLastBankRecon'="" {
+		if pidFINGLBankRecon'=idLastBankRecon {
+			set strStatus = $lb("Fin00299",pidBankAccount,idLastBankRecon)
+		} ; "Unable to save. Can´t have two unposted Bank Reconciliation numbers for Bank Account ´%1´. (Record ´%2´ unposted)"
+	}
+	quit strStatus
+	
+	
+OnAfterDelete(pidBankRecon,pYFELD)
+    ;-------------------------------------------------------------------------------
+    ; Code to run after a record has been delete
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 23-Oct-2006	JW		SR15134: Look at kill status.
+    ; 09-Mar-2006	RPW		SR13305: Make sure we delete manual matches and match cache entries
+    ; 19-Oct-2005	JW		SR13581: Delete grid here not after data fields.
+    ; 10-Oct-2005	JW		SR13641: Unmatch Bank Trans
+    ; 15-Mar-2004	shobby	Created
+    ;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$DeleteCleared(pidBankRecon)
+	if $$$ISOK(strStatus) set strStatus = $$DeleteManual(pidBankRecon)
+	if $$$ISOK(strStatus) set strStatus = $$DeleteMatchCache(pidBankRecon)
+ 	
+	if $$$ISOK(strStatus) set strStatus = $$UnmatchBankTrans^FINGLBankTran($$$FINGLBankReconBankAccount(pYFELD),$$$YES)
+	
+	if $$$ISOK(strStatus) {
+		do DELETE^COMGridEdit31Interface()
+	} else {
+		set Q = $$$QDontDelete
+	}
+	quit
+	
+	
+DeleteCleared(pidBankRecon)
+    ;-------------------------------------------------------------------------------
+    ; Delete the ^FINGLBankReconMatched that correspond to this Bank Recon.
+    ; 
+	; Notes: (Do not remove the following notes, used by 'Structure')
+	; 		**Delete Check** FINGLBankReconMatched - Removed in OnAfterDelete.
+	; 		
+    ; 		The delete subforms does not remove this data so has had to be coded.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 23-Oct-2006	JW		SR15134: Look at kill status. Return status.
+    ; 16-Feb-2006	RPW		SR13675: Rewrote to use FINBLBankReconMatched
+    ; 26-Oct-2004	Paul K	Also remove exceptions.
+    ; 03-May-2004   Shobby  Replaced YKOMMA with ","
+    ; 15-Mar-2004	shobby	Created
+    ;-------------------------------------------------------------------------------
+	new idLine,strStatus
+	
+    set strStatus = $$$OK
+	if $get(pidBankRecon)'="" {
+		set idLine = ""
+		for {
+			set idLine = $order(^FINGLBankReconMatched(0,pidBankRecon,idLine))
+			quit:idLine=""
+			
+			set strStatus = $$$Kill("FINGLBankReconMatched",pidBankRecon_","_idLine)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	quit strStatus
+	
+	
+DeleteMatchCache(pidBankRecon)
+    ;-------------------------------------------------------------------------------
+    ; Delete the ^FINGLBankReconMatched that correspond to this Bank Recon.
+    ; 
+	; Notes: (Do not remove the following notes, used by 'Structure')
+	; 		**Delete Check** FINGLBankReconMatched - Removed in OnAfterDelete.
+	; 		
+    ; 		The delete subforms does not remove this data so has had to be coded.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 27-Feb-2006	RPW		SR13305: Rewrote to use FINGLBankReconMatchCache
+    ;-------------------------------------------------------------------------------
+	new idLine,strStatus
+	
+    set strStatus = $$$OK
+    
+	if $get(pidBankRecon)'="" {
+		set idLine = ""
+		for {
+			set idLine = $order(^FINGLBankReconMatchCache(0,pidBankRecon,idLine))
+			quit:idLine=""
+			
+			set strStatus = $$$Kill("FINGLBankReconMatchCache",pidBankRecon_","_idLine)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	quit strStatus
+	
+	
+DeleteManual(pidBankRecon)
+    ;-------------------------------------------------------------------------------
+    ; Delete the ^FINGLBankReconMatched that correspond to this Bank Recon.
+    ; 
+	; Notes: (Do not remove the following notes, used by 'Structure')
+	; 		**Delete Check** FINGLBankReconMatched - Removed in OnAfterDelete.
+	; 		
+    ; 		The delete subforms does not remove this data so has had to be coded.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 27-Feb-2006	RPW		SR13305: Rewrote to use FINGLBankReconManualMatch
+    ;-------------------------------------------------------------------------------
+	new idLine,strStatus
+	
+    set strStatus = $$$OK
+    
+	if $get(pidBankRecon)'="" {
+		set idLine = ""
+		for {
+			set idLine = $order(^FINGLBankReconManualMatch(0,pidBankRecon,idLine))
+			quit:idLine=""
+			
+			set strStatus = $$$Kill("FINGLBankReconManualMatch",pidBankRecon_","_idLine)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	quit strStatus
+	
+	
+OnBlur(pYLFN,pYFELD)
+    ;-------------------------------------------------------------------------------
+    ; Code to run on blur of a control
+    ;
+    ; Returns:
+    ; 
+    ; History:
+    ; 18-Mar-2010	shobby	SR15753: Simplified.
+    ; 26-Sep-2005	Steve S	SR13308: Call SetOpeningDate	
+    ; 22-Sep-2005	JW		Changed params
+    ; 19-Mar-2004	shobby	Created (TR007244)
+    ;-------------------------------------------------------------------------------
+	if pYLFN = $$$FldFINGLBankReconBankAccount {
+		set $$$FINGLBankReconOpeningBalance(pYFELD) = $$GetOpeningBalance^FINGLBankReconGet(YKEY,pYFELD)
+		set $$$FINGLBankReconOpeningDate(pYFELD)    = $$^WWWDATE($$GetOpenDate^FINGLBankReconGet(pYFELD))
+	}
+	quit
+	
+	
+LoadBankRecon(pidBankAcct="")
+    ;-------------------------------------------------------------------------------
+    ; Called from Bank Setup to load the latest unposted bank recon
+    ; for that account.
+    ;
+    ; History:
+    ; 28-Oct-2004	PaulK	Created
+    ;-------------------------------------------------------------------------------
+	new idBankRecon
+	
+	set idBankRecon    = ""
+	set pidBankAcct = $$GetDefaultBankAccount^FINGLBank(pidBankAcct)
+	if pidBankAcct'="" {
+		set idBankRecon = $order(^FINGLBankRecons(0,2,$$$Index(pidBankAcct)," ",""))
+	}
+	do RedirectForm^COMUtils("FINGLBankRecon",idBankRecon,YFORM_",",pidBankAcct,1)
+	quit
+	
+ 
+OnAfterSave(pKEY,pYFELD="")
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 21-Sep-2006	JW		SR15062: Fix for tab changing save.
+    ; 26-Feb-2006	SteveS	SR14126: Call to UpdatePreCleared
+    ; 20-Sep-2005	JW		SR13309: Created
+    ;-------------------------------------------------------------------------------
+	quit:$get(pKEY)=""
+	
+	if $$Editable^FINSYSReview("FINGLBankRecon",$$$FINGLBankReconStatus(pYFELD)) {
+		do GetPreCleared^FINGLBankReconPreCleared(pKEY,pYFELD)
+		do UpdatePreCleared^FINGLBankReconPreCleared(pKEY) ;SR14126
+	}
+	quit
+	
+	
+PopulateFromGrid(pidBankRecon,pstrGrid,pfldDeposit,pfldWithdrawal)
+    ;-------------------------------------------------------------------------------
+    ; History:
+	; 10-Apr-2010	GRF		SR17177: arrGrid rather than objGrid; GRID Macros
+    ;-------------------------------------------------------------------------------
+	new YFORM,arrGrid,idLine
+	
+	set YFORM = pstrGrid
+	
+	$$$GRIDGetContents(.arrGrid)
+	
+	set idLine = ""
+	for {
+		set idLine = $order(arrGrid(pidBankRecon,idLine))
+		quit:idLine=""
+		
+		set ^CacheTempBankReconCD(YUSER,pstrGrid,idLine,pfldDeposit)    = $piece(arrGrid(pidBankRecon,idLine),Y,pfldDeposit)
+		set ^CacheTempBankReconCD(YUSER,pstrGrid,idLine,pfldWithdrawal) = $piece(arrGrid(pidBankRecon,idLine),Y,pfldWithdrawal)
+	}
+	quit
+	
+]]></Routine>
+</Export>

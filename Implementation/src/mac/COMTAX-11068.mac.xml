@@ -1,0 +1,431 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMTAX" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMTAX
+	;-------------------------------------------------------------------------------
+	; Routines for Interfacing with the TAX Component
+	; 
+	; History:
+	; 29-Jul-2009	GRF		SR16667: standardise variables; move definition
+	; 15-Mar-2005	GRF		Boolean Macros
+	;-------------------------------------------------------------------------------
+ 
+#include COMSYS
+#include COMConst
+#include WWWConst
+	
+#define LineTax(%1) $piece(%1,Y,4)
+	
+DefaultTaxCode(pidTaxLocn="")
+    ;-------------------------------------------------------------------------------
+    ; Returns default tax code for a location.
+    ;
+    ; Returns: Default tax code.  [^WWW101(0,"MWST",SPRACHE,1)]
+    ;
+    ; History:
+    ; 11-Apr-2005	PaulK	Modified to slightly more reliably get the default tax code
+    ; 17-Mar-2005	JW		Created
+    ;-------------------------------------------------------------------------------
+    new enumTaxCode
+    
+    set enumTaxCode=""
+    
+    if pidTaxLocn="" {
+	    if $get(YLOCATION)'="" {
+		    set pidTaxLocn = $$$WWW0121TaxLocation($get(^WWW0121(0,YM,YLOCATION,1)))
+	    }
+    }
+    if pidTaxLocn'="" {
+	    set enumTaxCode = $$$COMTAXLocationDefaultTaxCode($get(^COMTAXLocation(YM,pidTaxLocn,1)))
+        if (enumTaxCode="") set enumTaxCode = $order(^COMTAXTable(YM,pidTaxLocn,""))
+    }
+    
+    if enumTaxCode="" set enumTaxCode = 0
+    
+	quit enumTaxCode
+	
+	
+IsTaxable(ItemTaxCode="",CustomerTaxCode="",&ReasonString,pidTaxLocn="")
+	;-------------------------------------------------------------------------------
+	; Routine for determining if Tax is applicable
+	;
+	; Where	
+	; 	ItemTaxCode     is the tax code from the Item record     (^INART)
+	;	CustomerTaxCode is the tax code from the Customer record (^INKUNDE)
+	;	ReasonString    is the reason the Tax code was selected (should be called by reference)
+	;	The return value will be the Tax code appropriate (0 indicates NOT Taxable)
+    ;
+    ; Returns: Enum ^WWW101(0,"MWST")   e.g.^WWW101(0,"MWST","EN",3,1)="15.00~~"
+    ;          FIXME : Should this be User Parameter rather than Application? How used? <GRF>
+    ;
+    ; History:
+    ; 17-Mar-2005	JW		Default.
+    ; 08-Mar-2004	PaulK	Change to $$$Text macro usage
+    ; 12-Jul-2004   PaulK 	Return the product tax code only (as long as customer taxed)
+    ;-------------------------------------------------------------------------------
+	new enumTaxCode
+	
+	if (CustomerTaxCode=0) {
+		set enumTaxCode  = 0
+		set ReasonString = $$$Text("Com00097")             ; "Customer is tax free"
+	
+	} elseif (ItemTaxCode=0) {
+		set enumTaxCode  = 0
+		set ReasonString = $$$Text("Com00098")             ; "Product is tax free"
+	
+	} elseif (ItemTaxCode'="") {  ; Use Items Tax Code
+		set enumTaxCode  = ItemTaxCode
+		set ReasonString = $$$Text("Com00100")             ; "Product tax type"
+	
+	} else {  ; Default to taxable
+		set enumTaxCode  = $$DefaultTaxCode(pidTaxLocn)
+		set ReasonString = $$$Text("Com00101")             ; "Default tax type"
+	}
+	quit enumTaxCode
+	
+	
+CombinedTaxRate(penumTaxCode="",pidTaxLocn="",pdteTrans="",pblnBuy=0)
+    ;-------------------------------------------------------------------------------
+	; Routine for determining the Tax rates applicable
+	;
+	; Inputs:
+	;	penumTaxCode is the Tax code appropriate for the transaction - default is retrieved if null
+	;	pidTaxLocn   is the Tax Location associated with Store location or Customer ship-to-address - mandatory field
+	;	pdteTrans    is the date of the transaction - default to today
+	;	The return value will be the Combined Tax Rate
+    ;
+    ; Returns:Float
+    ;
+    ; History:
+	; 29-Jul-2009	GRF		SR16667: RatesArray => arrRates
+	; 14-Apr-2005	JW		Default
+    ; ???			Lionel	Created
+    ;-------------------------------------------------------------------------------
+	new arrRates,Line,TotalTax
+	
+	if penumTaxCode="" set penumTaxCode = $$DefaultTaxCode(pidTaxLocn) ; FIXME : These lines appear in TaxRates - are they necessary here? <GRF>
+	if pdteTrans=""    set pdteTrans    = +$horolog
+	
+	do TaxRates(penumTaxCode,pidTaxLocn,pdteTrans,.arrRates,pblnBuy)
+	set TotalTax = 0
+	set Line     = ""
+	for {
+		set Line = $order(arrRates(Line))
+		quit:(Line="")
+		
+		set TotalTax = TotalTax+$piece(arrRates(Line),Y,2)
+	}
+	quit TotalTax
+	; TaxLocation, TransactionDate
+	
+	
+TaxRates(penumTaxCode="",pidTaxLocn="",pdteTrans="",&parrRates,pblnBuy=0)
+    ;-------------------------------------------------------------------------------
+	; Routine for determining the Tax rates applicable
+	;
+	; Inputs
+	;	penumTaxCode is the Tax code appropriate for the transaction - default is 1
+	;	pidTaxLocn   is the Tax Location associated with Store location or Customer ship-to-address - mandatory field
+	;	pdteTrans    is the date of the transaction - default to today
+	;	parrRates   must be passed in by reference and will be updated to contain a node for every tax line that must be applied. 
+	;	Each node contains the Tax reason, Tax rate (%), and Tax GL Account. E.g.
+	;		parrRates(1) = State Sales Tax~4~01.2334.2323
+	;		parrRates(2) = County Sales Tax~4.25~01.2334.3423
+	;		parrRates(3) = County Transit Sales Tax~0.25~01.2334.5645
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+    ; 29-Jul-2009	GRF		SR16667: RatesArray => &parrRates
+    ; 24-Mar-2005	JW		TaxCode was always being set to 1
+    ; 08-Mar-2004	Paul K	Added Buy tax option and pass bay strStatus
+    ; ???			Lionel	Created
+    ;-------------------------------------------------------------------------------
+	new TempLoc,ProcessedLoc,strStatus
+	
+	kill parrRates
+	
+	set strStatus = $$$OK
+	if penumTaxCode="" set penumTaxCode = $$DefaultTaxCode(pidTaxLocn)
+	if pdteTrans=""    set pdteTrans    = +$horolog
+	
+	if pidTaxLocn'="" {
+		set ProcessedLoc = ""
+		set TempLoc      = pidTaxLocn
+		for {
+			set strStatus    = $$GetLocTaxRates(penumTaxCode,TempLoc,pdteTrans,.parrRates,pblnBuy)
+			set ProcessedLoc = ProcessedLoc_Y_TempLoc_Y
+			; Now prepare to process Parent
+			set TempLoc      = $$$COMTAXLocationParentTaxLocation($get(^COMTAXLocation(YM,TempLoc,1)))
+			quit:(TempLoc="")
+			quit:strStatus'=$$$OK
+			quit:$find(ProcessedLoc,Y_TempLoc_Y)		; stop endless loops
+		}
+	}
+	quit strStatus
+	
+	
+GetLocTaxRates(penumTaxCode,pidTaxLocn,pdteTrans,&parrRates,pblnBuy=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Gets the rate array for a location.
+    ;
+    ; Returns:Status (parrRates is passed in by reference)
+    ;
+    ; History:
+    ; 29-Jul-2009	GRF		SR16667: RatesArray => &parrRates
+    ; 23-Mar-2005	JW		SR11958: Change RatesArray index to Tax Type
+    ; 12-May-2004   Paul K	Changed Macro Usage.
+    ;-------------------------------------------------------------------------------
+	new TaxType,NearestDate,NewLine,objTable,Rate,strStatus
+	
+	set strStatus = $$$OK
+	set TaxType   = ""
+	for {
+		set TaxType = $order(^COMTAXTable(YM,pidTaxLocn,penumTaxCode,TaxType))
+		quit:(TaxType="")
+		
+		set NearestDate = $order(^COMTAXTable(YM,pidTaxLocn,penumTaxCode,TaxType,pdteTrans+1),-1)
+		quit:(NearestDate="")
+		
+		set objTable=$get(^COMTAXTable(YM,pidTaxLocn,penumTaxCode,TaxType,NearestDate,1))
+		
+		if pblnBuy && (+$$$COMTAXTableBuyRate(objTable)'=0) {
+			set NewLine=""
+			set $piece(NewLine,Y,1) = $$$AppEnum("COMTAXTYPE",TaxType)
+			set $piece(NewLine,Y,2) = $$$COMTAXTableBuyRate(objTable)
+			set $piece(NewLine,Y,3) = $$$COMTAXTableBuyGLAccount(objTable)
+			if $piece(NewLine,Y,3)="" set $piece(NewLine,Y,3) = $$$COMTAXLocationBuyingGLAccount($get(^COMTAXLocation(YM,pidTaxLocn,1)))
+			if $piece(NewLine,Y,3)="" set strStatus = $listbuild("Com00173",pidTaxLocn)  ; "No Buy Tax GL Account defined at Tax Location %1."
+			set parrRates(TaxType) = NewLine
+		}
+		if 'pblnBuy && (+$$$COMTAXTableSellRate(objTable)'=0) {
+			set NewLine=""
+			set $piece(NewLine,Y,1) = $$$AppEnum("COMTAXTYPE",TaxType)
+			set $piece(NewLine,Y,2) = $$$COMTAXTableSellRate(objTable)
+			set $piece(NewLine,Y,3) = $$$COMTAXTableSellGLAccount(objTable)
+			if $piece(NewLine,Y,3)="" set $piece(NewLine,Y,3) = $$$COMTAXLocationSellingGLAccount($get(^COMTAXLocation(YM,pidTaxLocn,1)))
+			if $piece(NewLine,Y,3)="" set strStatus = $listbuild("Com00174",pidTaxLocn)  ; "No Sell Tax GL Account defined at Tax Location %1"
+			set parrRates(TaxType)  = NewLine
+		}
+		quit:strStatus'=$$$OK
+	}
+	
+	quit strStatus
+	
+	
+CalculateTaxes(pidTaxLocn,pdteTrans,&parrTaxLines,pblnBuy=$$$NO,pTaxTotal,pblnTaxInc=$$$NO)
+    ;-------------------------------------------------------------------------------
+	; Calculate taxes for a set of item amounts.
+	; 
+	; This calculation will handle all rounding problems:
+	; 
+	; (1) If two lines worth $1.50 with same tax code: combined rate 10% - 2 local rates of 5%:
+	; 		Combined tax is $0.15			-> $0.30
+	; 		Sum taxes is $0.08*2 = $0.16	-> $0.32
+	; 	  Make sure total is same as sum - and use virtual rounding
+	; 	  	Line 1, tax 1 -> $0.08
+	; 	  	Line 1, tax 2 -> $0.07
+	;		Line 2, tax 1 -> $0.07
+	; 	  	Line 2, tax 2 -> $0.08			-> total $0.30, $0.15 for each tax type
+	;
+	; (2) If two lines worth $1.04 have tax rate 10%, and tax is defined on total
+	;		Defined tax on total -> $0.21
+	;		Sum taxes is $0.10*2 -> $0.20
+	;	 Difference is added to the last line item.
+	;
+	; Params:	pidTaxLocn,pdteTrans,pblnBuy - as defined in TaxRates function above
+	;			parrTaxLines - Array reference of lines in form: "TaxCode~Amount" where
+	;						TaxCode - as defined in TaxRates function
+	;						Amount - amount to be taxed. (tax ex or inc depending on pblnTaxInc)
+	;				eg	parrTaxLines(1) = "1~400" (pblnTaxInc=$$$NO)
+	;				   - It will be updated with tax data in form:
+	;					  "Reason~Rate~Account~Tax" - 1st three as defined in TaxRates
+	;				eg	parrTaxLines(1,1) = State Sales Tax~4~01.2334.2323~16
+	;					parrTaxLines(1,2) = County Sales Tax~4.25~01.2334.3423~17
+	;					parrTaxLines(1,3) = County Transit Sales Tax~0.25~01.2334.5645~1
+	;			pTaxTotal - (optional) if the tax is specified on the total, pass it in here
+	;						the difference between the total and the sum of the tax lines will
+	;						be factored in.
+	;			pblnTaxInc - whether amounts are tax ex or tax inc
+	;					
+    ; Returns: Status
+    ;
+    ; History:
+    ; 29-Jul-2009	GRF		SR16667: pTaxLines => &parrTaxLines, ratesArray => arrRates
+    ; 12-Apr-2006	JW		SR14347: Actually remove those lines from array that have 0 rate.
+    ; 28-Dec-2005	PO		SR14095: Skip pTaxLines that have a combined tax rate of zero.
+    ; 26-Oct-2005	JW		SR13743: Added pblnTaxInc param. 
+    ; 23-Mar-2005	JW		SR11958: Created
+    ;-------------------------------------------------------------------------------
+	new arrRates,taxSum,idTaxLine,idTaxCode,curAmount,strStatus,idTaxType,objTax
+	new taxRate,taxUnrounded,taxRemainders,tax,taxDiff,totalLineTax,sumLineTax,combinedRate
+	new taxDiffLeft,minRemainder,maxRemainder
+	
+	set strStatus = $$$OK
+	
+	set taxSum = 0
+	set idTaxLine = ""
+	for {
+		set idTaxLine = $order(parrTaxLines(idTaxLine))
+		quit:idTaxLine=""
+		
+		set idTaxCode = $piece(parrTaxLines(idTaxLine),Y,1)
+		set curAmount = $piece(parrTaxLines(idTaxLine),Y,2)
+		
+		set strStatus = $$TaxRates(idTaxCode,pidTaxLocn,pdteTrans,.arrRates,pblnBuy) ; Why use a full proc ref
+		quit:$$$ISERR(strStatus)	
+		
+		set combinedRate = $$SumTaxRates(.arrRates)
+		if combinedRate=0 {
+			kill parrTaxLines(idTaxLine)	// SR14347: Remove line if not taxed
+			
+		} else {
+			set combinedRate(idTaxLine) = combinedRate	// SR14347: Store for use later
+			
+			set totalLineTax = $$$FCRound($$$FCMult(curAmount,combinedRate/100))
+			
+			if pblnTaxInc {			// SR13743
+				set totalLineTax = $$$FCDivd(curAmount,(100/combinedRate)+1)
+			} else {
+				set totalLineTax = $$$FCMult(curAmount,combinedRate/100)
+			}
+			set totalLineTax = $$$FCRound(totalLineTax)
+			
+			set sumLineTax = 0
+			
+			set minRemainder=""
+			set maxRemainder=""
+			
+			set idTaxType = ""
+			for {
+	 			set idTaxType = $order(arrRates(idTaxType))
+	 			quit:idTaxType=""
+	 			
+	 			// Calculate tax
+				set taxRate = $piece(arrRates(idTaxType),Y,2)
+				set taxUnrounded = $$$FCMult(totalLineTax,taxRate/combinedRate)
+				
+				if $$$FCZero(taxUnrounded-$$$FCRound(taxUnrounded)) {
+					set tax = taxUnrounded
+				} else {
+					// Add previous roundings - virtual rounding
+					set taxUnrounded = $$$FCAdd(taxUnrounded,$get(taxRemainders(idTaxCode,idTaxType)))
+					set tax = $$$FCRound(taxUnrounded)
+					
+					// Store the new difference
+					set taxDiff = $$$FCSub(taxUnrounded,tax)
+					set taxRemainders(idTaxCode,idTaxType) = taxDiff
+					
+					// Store if max/min remainder
+					if taxDiff <= $piece(minRemainder,Y,1) set minRemainder=taxDiff_Y_idTaxType
+					if taxDiff >= $piece(maxRemainder,Y,1) set maxRemainder=taxDiff_Y_idTaxType
+				}
+				// Update array
+				set $$$LineTax(arrRates(idTaxType)) = tax
+				
+				// Add to sum
+				set sumLineTax = $$$FCAdd(sumLineTax,tax)
+			}
+			// If there's a difference between total and sum, add line with the max or min remainder
+			// depending on the sign of the difference. Update rounding remainders.
+			set taxDiff = $$$FCSub(totalLineTax,sumLineTax)
+			if '$$$FCZero(taxDiff) {
+				set idTaxType = $piece( $select(taxDiff>0:maxRemainder, 1:minRemainder) ,Y,2)
+				
+				set $$$LineTax(arrRates(idTaxType))    = $$$FCAdd($$$LineTax(arrRates(idTaxType)),taxDiff)
+				set taxRemainders(idTaxCode,idTaxType) = $$$FCSub(taxRemainders(idTaxCode,idTaxType),taxDiff)
+			}
+			set taxSum = $$$FCAdd(taxSum,totalLineTax)
+			merge parrTaxLines(idTaxLine) = arrRates
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		
+		if $get(pTaxTotal)'="" { // If there was a predefined total tax
+			
+			// If there's a difference, add it to last line item's tax lines
+			set taxDiff = $$$FCSub($$$FCRound(pTaxTotal),taxSum)
+			if '$$$FCZero(taxDiff) {
+			
+				set idTaxLine = $order(parrTaxLines(""),-1)
+				if idTaxLine="" { // No Lines!!
+					set strStatus = "Fin00696"  ;Tax Total must be zero, as no lines are taxable.
+				} else {
+					// NOTE: combinedRate(idTaxLine) is stored.
+					
+					set taxDiffLeft=taxDiff
+					for { // Add % of tax diff to each line
+						set idTaxType = $order(parrTaxLines(idTaxLine,idTaxType))
+						quit:idTaxType=""
+						
+						set objTax = parrTaxLines(idTaxLine,idTaxType)
+					//	set tax = $$$FCRound($$$FCMult(taxDiff,($piece(objTax,Y,2)/combinedRate))) // calculate piece
+						set tax = $$$FCRound($$$FCMult(taxDiff,($piece(objTax,Y,2)/combinedRate(idTaxLine)))) // calculate piece SR14347
+						set $$$LineTax(objTax) = $$$FCAdd($$$LineTax(objTax),tax) // add piece
+						set parrTaxLines(idTaxLine,idTaxType) = objTax // update array
+						set taxDiffLeft = $$$FCSub(taxDiffLeft,tax)
+						
+						quit:$$$FCZero(taxDiffLeft)
+					}
+					
+					if '$$$FCZero(taxDiffLeft) {
+						// If still a rounding difference, add to last tax line
+						set idTaxType = $order(parrTaxLines(idTaxLine,""),-1)
+						if idTaxType="" set idTaxType=" " // Should never happen, but just in case
+						
+						set $$$LineTax(parrTaxLines(idTaxLine,idTaxType)) = $$$FCAdd($$$LineTax($get(parrTaxLines(idTaxLine,idTaxType))),taxDiffLeft)
+					}
+				}
+			}
+		}
+	}
+	
+	quit strStatus
+	
+	
+SumTaxRates(&parrRates)
+    ;-------------------------------------------------------------------------------
+    ; Same as CombinedTaxRate but you pass in the rates Array created in TaxRates 
+    ; instead of recalculating it.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 29-Jul-2009	GRF		SR16667: parrRates => &parrRates
+    ; 24-Mar-2005	JW		SR11958: Created
+    ;-------------------------------------------------------------------------------
+	new intCombinedRate,idTaxType,objTax
+	
+	set intCombinedRate	= 0
+	set idTaxType		= ""
+	for {
+		set idTaxType = $order(parrRates(idTaxType))
+		quit:idTaxType=""
+		
+		set intCombinedRate = intCombinedRate + $piece(parrRates(idTaxType),Y,2)
+	}
+	quit intCombinedRate
+	
+	
+ValidTaxCode(pidTaxCode,pidLocn)
+    ;-------------------------------------------------------------------------------
+    ; Checks if a tax code exists for a location.
+    ;
+    ; Returns: whether valid
+    ;
+    ; History:
+    ; 29-Jul-2009	GRF		SR16667: use '' for $data
+    ; 11-Aug-2005	JW		SR12410: Created
+    ;-------------------------------------------------------------------------------
+	new blnValid
+	
+	set blnValid = $$$YES
+	if $get(pidTaxCode)'="" {
+		if $get(pidLocn)="" set pidLocn = YLOCATION
+		set blnValid = ''$data(^COMTAXTable(YM,pidLocn,pidTaxCode))
+	}
+	quit blnValid
+	
+]]></Routine>
+</Export>

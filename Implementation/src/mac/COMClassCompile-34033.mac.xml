@@ -1,0 +1,509 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMClassCompile" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMClassCompile
+	;-------------------------------------------------------------------------------
+	; History:
+	; 14-Dec-2005	GRF		Boolean Macros Again
+	; 15-Mar-2005	GRF		Boolean Macros
+	;-------------------------------------------------------------------------------
+#include COMConst
+#include WWWConst
+#include COMSYS
+#include %occInclude
+	;do Check("FINGLAccount")
+	
+Difference()
+    ;-------------------------------------------------------------------------------
+    ; Check all Classes and Compile/Index/Tune when Diferent (Form Interface)
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 29-Mar-2006	SC		SR13942: Use JobWrapper^COMUtilJob.
+    ; 22-Feb-2006	JW		SR13942: Rolled back change
+    ; 20-Dec-2005	RPW		SR13942: Pass the current environment through to the job.
+    ; 13-Apr-2005	SCR		Created SR12040
+    ;-------------------------------------------------------------------------------
+	new Log
+	
+	do StartLog^COMLog("Check all Classes",.Log) 
+	;job CheckAll^COMClassCompile($$$YES,$$$YES,Log,YUSER,YBED) //:(:1::)    ; Environment created for new job NFA SR13942
+	do JobWrapper^COMUtilJob("CheckAll^COMClassCompile("_$$$YES_","_$$$YES_","""_Log_""")",YUSER) ;SR13942
+ 
+	hang 2 ;wait for the process to start up
+ 
+	; Ready to goto the Detail form
+	do RedirectForm^COMUtils("COMMsg",Log,",","","")
+ 
+	quit
+	
+CheckAll(Update=$$$NO,Compile=$$$NO,Log="",pblnVerbose=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Check All Classes
+    ;
+    ; Update 	= Update Saved Class
+    ; Compile 	= Compile Flag
+    ; Use WWW001Save, WWW002Save & WWW003Save
+    ;
+    ; History:
+	; 08-Dec-2013	SCR		SESDF-655: Added Verbose option
+    ; 03-Nov-2008	PPP		SR16113:Check if need to Re-Index for V2 Classes
+    ; 20-Nov-2006	RPW		SR15173: List the output here just like the above does
+    ; 							to the terminal, so we know what changed
+    ; 29-Mar-2006	SC		SR13942: No longer need YUSER and YBED parameter for
+    ; 							background processes. Use JobWrapper^COMUtilsJob.
+    ; 20-Jun-2005	SCR		SR12696	Added 'Dirty' message
+    ; 08-Apr-2005	SCR		SR12040	If System Class Always Re-Index
+    ; 04-Apr-2005	SCR/PK	SR12015 Pass in Log No, Removed Exclusive New & WWWVAR
+    ; 15-Mar-2005	Paul K	Added macro usage
+    ; 24-Feb-2005	Paul K	Due to WWW001O not newing anything, new everything here.
+    ; 11-Jan-2005	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Class,Count,List,ReIndex,Resp,intStarTime
+	
+	if $get(Log)="" {
+		do StartLog^COMLog("Class Change Checking",.Log) 
+	}
+ 	set intStarTime	= $zh
+	set Class=""
+	for {
+		set Class = $order(^WWW001(0,Class))
+		quit:Class=""
+		
+		set Resp=$$Check(Class,Update,Compile,.List,.ReIndex)
+		if ($io["|TNT|") || ($io["/dev/pts/") || pblnVerbose && Resp {
+			write !,Class," = Changed ",$select(ReIndex:"ReIndex Required",1:"")
+			for Count=1:1:List {
+				write !,List(0,Count)
+			}
+		}
+		if Resp && (Log'="") {
+			do AddMessage^COMLog(Log,"Class "_Class_" Changed "_$$$WWW001ClassDescription($get(^WWW001(0,Class,1)))_" ("_$select(ReIndex=1:"ReIndex Required",ReIndex=2:"ReIndex Required [Dirty]",1:"")_")")
+			
+			// SR15173: List the output here just like the above does to the terminal, so we know what changed
+			
+			for Count=1:1:List {
+				do AddMessage^COMLog(Log,List(0,Count))
+			}
+		}
+		if ReIndex do ReIndex^COMIndex(Class,$$$YES,Log)
+	}
+ 
+	//Check if need to Re-Index for V2 Classes	//SR16113
+	do CheckAllV2Classes^COMClassChecks($$$YES,Log)
+ 
+	if Log'="" {
+		do AddMessage^COMLog(Log,"Class Change Checking Complete") 
+	}
+	write !!,$zh-intStarTime," Seconds"
+	quit
+	
+	
+	
+Check(Class,Update=$$$NO,Compile=$$$NO,List,IndexChanged)
+    ;-------------------------------------------------------------------------------
+    ; Check a Class for changes
+    ; 
+    ; Inputs:
+    ;         Class 	    = @NM Class 
+    ;         Update 	    = bln - Update Saved Class
+    ;         Compile    	= bln - Compile Flag
+    ; ByRef : List		    = Pass back list of changes
+    ; ByRef : IndexChanged	= Index Changed pass back Status ; 0 = Not Required, 1 = Required, 2 = Dirty
+    ; Use WWW001Save, WWW002Save & WWW003Save
+    ;
+    ; Returns: 0 = No Change, 1 = Changed
+    ;
+    ; History:
+    ; 22-Jun-2005	SCR		SR12755 Added Checking of Class WWW003Calc
+    ; 19-Jun-2005	SCR		SR12696 Check for Index Dirty, Changed IndexChanged from a Flag to a Status 0,1,2
+    ; 07-Apr-2005	SCR		SR120404 Added NoForm Flag to Compile
+    ; 15-Mar-2005	Paul K	Added Macro usage
+    ; 22-Feb-2005	Paul K	Reduce incidence of calling WWWVAR
+    ; 10-Jan-2005	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Changed,Key,Field,Index,Last,NewIndex,OldIndex,Rec
+	
+	kill List
+	set List=0
+	if $get(Y)="" do ^WWWVAR
+	
+	set Changed      = $$$NO ; Assume no change
+	set IndexChanged = $$$NO
+	if Class="" set Class=" "
+	
+	; Check Header
+	if $get(^WWW001(0,Class,1))'=$get(^WWW001Save(0,Class,1)) {
+		set Changed      = $$$YES
+		set List         = List+1
+		set List(0,List) = "Header Changed"
+	}
+	
+	; Check Keys
+	set Key=""
+	for {
+		set Key=$order(^WWW002(0,Class,Key))
+		; Check for Deleted Keys
+		set Last=$order(^WWW002Save(0,Class,Key),-1)
+		if ($order(^WWW002(0,Class,Key),-1)'=Last) && (Last'="") {
+			if '$data(^WWW002(0,Class,Last)) && (Key'="") {
+				set Changed     = $$$YES
+				set List        = List+1
+				set List(0,List)= "Key "_$order(^WWW002Save(0,Class,Key),-1)_" Deleted "
+				if $$$WWW002IndexKey($get(^WWW002Save(0,Class,Key,1)))'="" set IndexChanged=$$$YES
+			}
+		}
+		quit:Key=""
+		
+		; Check for key change
+		if $get(^WWW002(0,Class,Key,1))'=$get(^WWW002Save(0,Class,Key,1)) {
+			set Changed     = $$$YES
+			set List        = List+1
+			set List(0,List)= "Key "_Key_" Changed ("_$$$WWW002PropertyDescription($get(^WWW002(0,Class,Key,1)))_")"
+			if $$$WWW002IndexKey($get(^WWW002(0,Class,Key,1)))'=$$$WWW002IndexKey($get(^WWW002Save(0,Class,Key,1))) set IndexChanged=$$$YES
+		}
+	}
+	
+	; Check Fields
+	set Field=""
+	for {
+		set Field=$order(^WWW003(0,Class,Field))
+		; Check for Deleted Fields
+		set Last=$order(^WWW003Save(0,Class,Field),-1)
+		if ($order(^WWW003(0,Class,Field),-1)'=Last) && (Last'="") {
+			if '$data(^WWW003(0,Class,Last)) && (Field'="") {
+				set Changed     = $$$YES
+				set List        = List+1
+				set List(0,List)= "Field "_$order(^WWW003Save(0,Class,Field),-1)_" Deleted "
+				if $$$WWW003IndexKey($get(^WWW003Save(0,Class,Field,1)))'="" set IndexChanged=1
+			}
+		}
+		quit:Field=""
+		
+		; Check for field change
+		if $get(^WWW003(0,Class,Field,1))'=$get(^WWW003Save(0,Class,Field,1)) {
+			set Changed     = $$$YES
+			set List        = List+1
+			set List(0,List)= "Field "_Field_" "_$select($data(^WWW003Save(0,Class,Field,1)):"Changed",1:"New")_" ("_$$$WWW003PropertyDescription($get(^WWW003(0,Class,Field,1)))_")"
+			if $$$WWW003IndexKey($get(^WWW003(0,Class,Field,1)))'=$$$WWW003IndexKey($get(^WWW003Save(0,Class,Field,1))) set IndexChanged=1
+		}
+	}
+	; Check Calc Fields
+	set Field=""
+	for {
+		set Field=$order(^WWW003Calc(0,Class,Field))
+		; Check for Deleted Fields
+		set Last=$order(^WWW003CalcSave(0,Class,Field),-1)
+		if ($order(^WWW003Calc(0,Class,Field),-1)'=Last) && (Last'="") {
+			if '$data(^WWW003Calc(0,Class,Last)) && (Field'="") {
+				set Changed     = $$$YES
+				set List        = List+1
+				set List(0,List)= "Calc Field "_$order(^WWW003CalcSave(0,Class,Field),-1)_" Deleted "
+			}
+		}
+		quit:Field=""
+		
+		; Check for field change
+		if $get(^WWW003Calc(0,Class,Field,1))'=$get(^WWW003CalcSave(0,Class,Field,1)) {
+			set Changed     = $$$YES
+			set List        = List+1
+			set List(0,List)= "Calc Field "_Field_" "_$select($data(^WWW003SaveCalc(0,Class,Field,1)):"Changed",1:"New")_" ("_$$$WWW003CalcFieldName($get(^WWW003Calc(0,Class,Field,1)))_")"
+			if $$$WWW003IndexKey($get(^WWW003Calc(0,Class,Field,1)))'=$$$WWW003IndexKey($get(^WWW003CalcSave(0,Class,Field,1))) set IndexChanged=1
+		}
+	}
+	
+	; Check Index Dirty  
+	set Rec = $get(^COMIndex(YM,Class,1))
+	if $$$COMIndexIndexDirty(Rec) set IndexChanged=2 ; SR12696
+	
+	if Changed {
+		if Update {
+			; Save previous version of saved class
+			set Index=$order(^WWW001Save(1,Class,""),-1)+1
+			set ^WWW001Save(1,Class,Index)=$zdt($h)
+ 
+			merge ^WWW001Save(1,Class,Index)     = ^WWW001Save(0,Class)
+			merge ^WWW002Save(1,Class,Index)     = ^WWW002Save(0,Class)
+			merge ^WWW003Save(1,Class,Index)     = ^WWW003Save(0,Class)
+			merge ^WWW003CalcSave(1,Class,Index) = ^WWW003CalcSave(0,Class)
+			
+			kill ^WWW001Save(0,Class)
+			kill ^WWW002Save(0,Class)
+			kill ^WWW003Save(0,Class)
+			kill ^WWW003CalcSave(0,Class)
+			
+			merge ^WWW001Save(0,Class)=^WWW001(0,Class)
+			merge ^WWW002Save(0,Class)=^WWW002(0,Class)
+			merge ^WWW003Save(0,Class)=^WWW003(0,Class)
+			merge ^WWW003CalcSave(0,Class)=^WWW003Calc(0,Class)
+		}
+		if Compile {
+			set VORG(1)=Class
+			do CompileClass(Class) ; Compile Class
+		}
+	}
+	quit Changed
+	
+	
+TuneTableForm(Class="")
+    ;-------------------------------------------------------------------------------
+    ; Tune a Class (Form Interface)
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 29-Mar-2006	SC		SR13942: Use Job Wrapper.
+    ; 22-Feb-2006	JW		SR13942: Rolled back change
+    ; 20-Dec-2005	RPW		SR13942: Pass the current environment through to the job.
+    ; 13-Apr-2005	SCR		Created SR12040
+    ;-------------------------------------------------------------------------------
+	new Log
+	
+	if Class'="" do TuneTable(Class),^WWWFORM quit  ; Single Class
+	; Do All Classes
+	do StartLog^COMLog("Tune all Classes",.Log) 
+	;job TuneAllTables^COMClassCompile($$$NO,Log,YUSER,YBED) //:(:1::)    ; Environment created for new job NFA SR13942
+	do JobWrapper^COMUtilJob("TuneAllTables^COMClassCompile("_$$$NO_","""_Log_""")",YUSER) ;SR13942
+	
+	hang 2 ;wait for the process to start up
+ 
+	; Ready to goto the Detail form
+	do RedirectForm^COMUtils("COMMsg",Log,",","","")
+ 
+	quit
+ 
+TuneAllTables(Verbose=$$$NO,Log=0) ;SR13942
+    ;-------------------------------------------------------------------------------
+    ; Tune all Classes
+    ; 
+    ; Verbose   = Show output
+    ; Log		= Log Number for logging
+    ; User		= YBED User
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 29-Mar-2006	SC		SR13942: No longer need YUSER and YBED parameter for background
+    ; 						processes. Use JobWrapper^COMUtilsJob instead.
+    ; 06-Apr-2005	SCR		Created SR12040
+    ;-------------------------------------------------------------------------------
+	new Class,Desc,Line
+	
+	; FIXME : Should default for Log be null rather than 0? (See other use above) <GRF>
+	
+	set Class=""
+	for {
+		set Class=$order(^WWW001(0,Class))
+		quit:Class=""
+		
+		if Verbose write !,Class
+		
+		set Desc=$$$WWW001ClassDescription($get(^WWW001(0,Class,1)))
+		set Line=""
+		if Log'="" {
+			do AddMessage^COMLog(Log,"Class "_Class_" "_Desc_" Tune Started ",.Line) 
+		}
+		do TuneTable(Class)
+		if Log'="" {
+			do AddMessage^COMLog(Log,"Class "_Class_" "_Desc_" Tune Complete ",.Line) 
+		}
+		
+	}
+	do AddMessage^COMLog(Log,"All Classes Tuned ") 
+	quit
+	
+	
+TuneTable(Class="")
+    ;-------------------------------------------------------------------------------
+    ; Tune a Class
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 13-Apr-2005	SCR		SR12040: Created
+    ;-------------------------------------------------------------------------------
+	new HistRec,StartTime,Duration,Entry,Rec
+ 
+	set StartTime = $horolog
+	set Duration  = $zh
+	set HistRec   = ""
+	set $$$COMIndexHistStartTime(HistRec)         = StartTime
+	set $$$COMIndexHistDurationInSeconds(HistRec) = Duration
+	set $$$COMIndexHistUser1(HistRec)             = $get(YBED)
+	set $$$COMIndexHistType(HistRec)              = "Tune"
+	set $$$COMIndexHistStatus(HistRec)            = "Tune Started"
+	set Entry = $order(^COMIndexHist(YM,Class,""),-1)+1
+	set ^COMIndexHist(YM,Class,Entry,1) = HistRec
+ 
+	set Rec = $get(^COMIndex(YM,Class,1))
+	set $$$COMIndexStatus(Rec) = "Tune Started"
+	set ^COMIndex(YM,Class,1)  = Rec
+	
+	do ##Class(%SYSTEM.SQL).TuneTable(Class,1,,,1)
+	do ##Class(%SYSTEM.SQL).PurgeForTable(Class)
+	
+	set $$$COMIndexTuned(Rec)  = $horolog  ; Update Compiled Date / Time
+	set $$$COMIndexStatus(Rec) = "Complete"
+	set ^COMIndex(YM,Class,1)  = Rec
+ 
+	set Duration=+$justify($zh-Duration,0,2)
+	set $$$COMIndexHistEndTime(HistRec)           = $horolog
+	set $$$COMIndexHistDurationInSeconds(HistRec) = Duration
+	set $$$COMIndexHistUser1(HistRec)             = $get(YBED)
+	set $$$COMIndexHistStatus(HistRec)            = "Complete"
+	set ^COMIndexHist(YM,Class,Entry,1)           = HistRec
+	quit
+	
+		
+CompileClassForm(Class="")
+    ;-------------------------------------------------------------------------------
+    ; Compile a Class (Form Interface)
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 29-Mar-2006	SC		SR13942: Use JobWrapper^COMUtilJob.
+    ; 22-Feb-2006	JW		SR13942: Rolled back change
+    ; 20-Dec-2005	RPW		SR13942: Pass the current environment through to the job.
+    ; 18-Apr-2005	SCR		Created SR12040
+    ;-------------------------------------------------------------------------------
+	new Log
+	
+	if Class'="" do CompileClass(Class),^WWWFORM quit  ; Single Class
+	 
+	; Do All Classes
+	
+	do StartLog^COMLog("Compile all Classes",.Log) 
+	;job CompileAllClasses^COMClassCompile($$$NO,Log,YUSER,YBED) //:(:1::)    ; Environment created for new job NFA SR13942
+	do JobWrapper^COMUtilJob("CompileAllClasses^COMClassCompile("_$$$NO_","""_Log_""")",YUSER) ;SR13942
+ 
+	hang 2 ;wait for the process to start up
+ 
+	; Ready to goto the Detail form
+	do RedirectForm^COMUtils("COMMsg",Log,",","","")
+ 
+	quit
+	
+ 
+CompileAllClasses(Verbose=$$$NO,Log=0,YUSER="",User="")
+    ;-------------------------------------------------------------------------------
+    ; Tune all Classes
+    ; 
+    ; Verbose   = Show output
+    ; Log		= Log Number for logging
+    ; User		= YBED User
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 29-Mar-2006	SC		SR13942: No longer need YUSER and YBED parameter for
+    ; 							background processes. Use JobWrapper^COMUtilsJob.
+    ; 06-Apr-2005	SCR		Created SR12040
+    ;-------------------------------------------------------------------------------
+	new Class,Desc,Line
+	
+	; FIXME : Should default for Log be null rather than 0? (See other use above) <GRF>
+	
+	set Class=""
+	for {
+		set Class=$order(^WWW001(0,Class))
+		quit:Class=""
+		
+		if Verbose write !,Class
+		
+		set Desc=$$$WWW001ClassDescription($get(^WWW001(0,Class,1)))
+		set Line=""
+		if Log'="" {
+			do AddMessage^COMLog(Log,"Class "_Class_" "_Desc_" Compile Started ",.Line) 
+		}
+		do CompileClass(Class)
+		if Log'="" {
+			do AddMessage^COMLog(Log,"Class "_Class_" "_Desc_" Compile Complete ",.Line) 
+		}
+		
+	}
+	do AddMessage^COMLog(Log,"All Classes Compiles ") 
+	quit
+ 
+CompileClass(Class="")
+    ;-------------------------------------------------------------------------------
+    ; Class a Class (Form Interface)
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 13-Apr-2005	SCR		SR12040: Created
+    ;-------------------------------------------------------------------------------
+	new HistRec,StartTime,Duration,Entry,Rec
+ 
+	set StartTime = $horolog
+	set Duration  = $zh
+	set HistRec   = ""
+	set $$$COMIndexHistStartTime(HistRec) = StartTime
+	set $$$COMIndexHistUser1(HistRec)     = $get(YBED)
+	set $$$COMIndexHistType(HistRec)      = "Compile"
+	set $$$COMIndexHistStatus(HistRec)    = "Compile Started"
+	set Entry=$order(^COMIndexHist(YM,Class,""),-1)+1
+	set ^COMIndexHist(YM,Class,Entry,1)   = HistRec
+ 
+	set Rec                    = $get(^COMIndex(YM,Class,1))
+	set $$$COMIndexStatus(Rec) = "Compile Started"
+	set ^COMIndex(YM,Class,1)  = Rec
+ 
+	do COMPILE^WWW001O(Class,1)
+	
+	set $$$COMIndexCompiled(Rec) = $horolog  ; Update Compiled Date / Time
+	set $$$COMIndexStatus(Rec)   = "Complete"
+	set ^COMIndex(YM,Class,1)    = Rec
+	
+	set Duration = +$justify($zh-Duration,0,2)
+	set $$$COMIndexHistEndTime(HistRec)           = $horolog
+	set $$$COMIndexHistDurationInSeconds(HistRec) = Duration
+	set $$$COMIndexHistUser1(HistRec)             = $get(YBED)
+	set $$$COMIndexHistStatus(HistRec)            = "Complete"
+	set ^COMIndexHist(YM,Class,Entry,1)           = HistRec
+	quit
+	
+
+ClearDeletedANMClasses(pidLog="")
+    ;-------------------------------------------------------------------------------
+    ; Clear any User classes with relate to @NM classes that have been deleted
+    ;
+    ; Use WWW001Save
+    ;
+    ; History:
+    ; 22-Jul-2009	PPP		SR16757:Created
+    ;-------------------------------------------------------------------------------
+	new idClass,idObjClass,sc
+	
+	if $get(pidLog)'="" {
+		do AddMessage^COMLog(pidLog,"Check for deleted @NM Classes ") 
+	}
+ 
+	set idClass=""
+	for {
+		set idClass = $order(^WWW001Save(0,idClass))
+		quit:idClass=""
+		
+		if '$data(^WWW001(0,idClass)) {
+			set idObjClass = "User."_idClass
+
+			if ##class(%Library.ClassDefinition).%ExistsId(idObjClass) {
+				set sc=$SYSTEM.OBJ.Delete(idObjClass)
+
+				if pidLog '="" {
+					do AddMessage^COMLog(pidLog,"Class "_idObjClass_" Deleted : "_sc) 
+				}
+			}
+		}
+	}
+
+	if pidLog '="" {
+		do AddMessage^COMLog(pidLog,"Completed Check for deleted @NM Classes") 
+	}
+	
+	quit
+		
+]]></Routine>
+</Export>

@@ -1,0 +1,1405 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="CSPX.EnsMsgTraceSVG">
+<Description><![CDATA[
+Ensemble Message Trace diagram]]></Description>
+<ClassType/>
+<IncludeCode>Ensemble,EnsUI</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%CSP.Page</Super>
+<System>3</System>
+
+<Parameter name="DOMAIN">
+<Description><![CDATA[
+Use our own domain for localization]]></Description>
+<Default>Ensemble</Default>
+</Parameter>
+
+
+<Parameter name="CONTENTTYPE">
+<Default>image/svg-xml</Default>
+</Parameter>
+
+
+<Parameter name="MSGPERPAGE">
+<Description><![CDATA[
+Number of messages displayed on a page]]></Description>
+<Default>100</Default>
+</Parameter>
+
+
+<Parameter name="CACHETIMEOUT">
+<Description><![CDATA[
+Number of seconds that the cached Trace Temp File is valid]]></Description>
+<Default>5</Default>
+</Parameter>
+
+
+<Parameter name="INCLUDEEVENTS">
+<Description><![CDATA[
+Enable inclusion of Event Log entries]]></Description>
+<Default>1</Default>
+</Parameter>
+
+
+<Parameter name="EVENTSWINDOW">
+<Description><![CDATA[
+Additional time in seconds after processed time of last message in trace to scan for events]]></Description>
+<Default>30</Default>
+</Parameter>
+
+
+<Parameter name="EVENTSMAXROWS">
+<Description><![CDATA[
+Maximum number of event log entries to be scanned to look for events]]></Description>
+<Default>1000</Default>
+</Parameter>
+
+
+<Method name="MessagesPerPage">
+<ClassMethod>1</ClassMethod>
+<CodeMode>expression</CodeMode>
+<Implementation><![CDATA[..#MSGPERPAGE
+]]></Implementation>
+</Method>
+
+<Method name="IncludeEvents">
+<ClassMethod>1</ClassMethod>
+<CodeMode>expression</CodeMode>
+<Implementation><![CDATA[$G(%session.Data("EnsMsgTraceFilterForm","IncludeEvents"), ..#INCLUDEEVENTS)
+]]></Implementation>
+</Method>
+
+<Method name="EventsWindow">
+<ClassMethod>1</ClassMethod>
+<CodeMode>expression</CodeMode>
+<Implementation><![CDATA[$G(%session.Data("EnsMsgTraceFilterForm","EventsWindow"), ..#EVENTSWINDOW)
+]]></Implementation>
+</Method>
+
+<Method name="EventsMaxRows">
+<ClassMethod>1</ClassMethod>
+<CodeMode>expression</CodeMode>
+<Implementation><![CDATA[$G(%session.Data("EnsMsgTraceFilterForm","EventsMaxRows"), ..#EVENTSMAXROWS)
+]]></Implementation>
+</Method>
+
+<Method name="OnPreHTTP">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Boolean</ReturnType>
+<ServerOnly>1</ServerOnly>
+<Implementation><![CDATA[
+	// Avoid IE HTTP 1.1 bugs
+	Set %response.HTTPVersion = "HTTP/1.0"
+
+	// Workaround for HTTPS
+	If (%request.Secure) {
+		Do %response.SetHeader("Cache-Control","private")
+	}
+
+	// force output to be UTF-8
+	Set %response.CharSet="UTF-8"
+
+	// prevent session blocking
+	Do %session.Unlock()
+
+	Quit 1
+]]></Implementation>
+</Method>
+
+<Method name="OnPage">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	Set sessionId = $G(%request.Data("SESSIONID",1))
+	Set startTime = $G(%request.Data("STARTTIME",1))
+	Set endTime = $G(%request.Data("ENDTIME",1))
+	Set startId = $G(%request.Data("STARTID",1))
+	Set endId = $G(%request.Data("ENDID",1))
+	Set currPage = $G(%request.Data("PAGE",1))
+
+	Set canvasHeight = $G(%request.Data("HEIGHT",1))
+	Set canvasWidth = $G(%request.Data("WIDTH",1))
+	Set hostWidth = 170 // width of each host column (should match Container.cls)
+	Set hostLineWidth = 16 // width of line within a host column
+
+	Write "<?xml version=""1.0"" ?>",!
+	&html<<svg zoomAndPan="disable" width="#(canvasWidth)#" height="#(canvasHeight)#" onload="Initialize()" viewBox="0 0 #(canvasWidth)# #(canvasHeight)#" > >
+	
+	&html<<!-- #(currPage)# -->>
+	
+	// draw header & stylesheet
+	Do ..DrawHeader()
+
+	// canvas	
+	&html<<rect class="canvas" x="0" y="0" width="#(canvasWidth)#" height="#(canvasHeight)#" onmousedown="clickCanvas(evt);"/>>
+			
+	// build trace info
+	Set n = ..BuildTraceInfo(sessionId,startTime,endTime,startId,endId)
+	Merge cls = ^CacheTempMsgTrace(%session.SessionId,0,"clsinfo")
+	Kill clsInv // HCR035
+
+	If (n = 0) || ($O(cls(""))="") {
+		// nothing to show
+		&html<
+			<text class="LaneTitle" x="10" y="36" text-anchor="start">
+			#($$$TextHTML("No messages selected for tracing."))#
+			</text></svg>
+		>
+		Quit $$$OK
+	}
+
+	Set laneTitle(1) = "Services"
+	Set laneTitle(2) = "Processes"
+	Set laneTitle(3) = "Operations"
+
+	// find the size of each of the lanes
+	// build index of columns by time
+	For lane = 1:1:3 {
+		Kill colTime
+		Set colCount(lane) = 0
+
+		// build index of columns by initial msg id
+		Set k = $O(cls(lane,""))
+		While (k '= "") {
+			Set colTime(cls(lane,k)) = k
+			Set colCount(lane) = colCount(lane) + 1
+			Set k = $O(cls(lane,k))
+		}
+		
+		// make list of cols by msg id (time), assign # to cls index
+		Set c = 0
+		Set t = $O(colTime(""))
+		While (t '= "") {
+			Set c = c + 1
+			// col# --> classname
+			Set colOrder(lane,c) = colTime(t)
+			Set cls(lane,colTime(t)) = c
+			Set t = $O(colTime(t))
+		}
+		
+		// calculate size/pos of lane
+		Set laneWidth(lane) = colCount(lane) * hostWidth
+		Set laneX(lane) = $G(laneX(lane-1),0) + $G(laneWidth(lane-1),0)
+	}
+
+	// background (lanes and titles)
+	&html<
+		<rect class="TitleRect" x="0" y="0" width="#(canvasWidth)#" height="40" />
+		<line class="SepLine" x1="#(laneX(2))#" y1="0" x2="#(laneX(2))#" y2="#(canvasHeight)#" />
+		<line class="SepLine" x1="#(laneX(3))#" y1="0" x2="#(laneX(3))#" y2="#(canvasHeight)#" />
+	>
+
+	For lane = 1:1:3 {
+		if (colCount(lane) > 0) {
+			&html<
+				<text class="LaneTitle" x="#(laneX(lane)+10)#" y="34" text-anchor="start">#(laneTitle(lane))#</text>
+				<rect class="LaneRect#(lane)#" x="#(laneX(lane))#" y="40" width="#(laneWidth(lane))#" height="#(canvasHeight)#" onmousedown="clickCanvas(evt);" />
+			>
+			
+			// draw each host within the lane
+			Set c = $O(colOrder(lane,""))
+			Set x = laneX(lane)
+			While (c '= "") {
+				Set k = colOrder(lane,c)
+				Set pkgName = $P(k,".",1,$L(k,".")-1)
+				Set clsName = $P(k,".",$L(k,"."))
+				Set xm = x + (hostWidth / 2)
+	
+				&html<
+				 	<clipPath id="cliphost_#(k)#">
+						<rect x="#(x+5)#" y="40" width="#(hostWidth-6)#" height="30" style="fill:white; stroke:blue;" />
+			  		</clipPath>
+
+					<rect class="HostLine" id="host_#(k)#_line" x="#(xm-(hostLineWidth/2))#" y="69" width="#(hostLineWidth)#" height="#(canvasHeight-70)#" />
+					<rect class="HostRect" id="host_#(k)#" x="#(x+2)#" y="40" width="#(hostWidth-4)#" height="30" rx="2" onmousedown="clickHost(evt);" />
+					<text class="HostTitle" x="#(xm)#" y="52" clip-path="url(#cliphost_#(k)#)" text-anchor="middle">#(pkgName)#</text>
+					<text class="HostTitle" x="#(xm)#" y="65" clip-path="url(#cliphost_#(k)#)" text-anchor="middle">#(clsName)#</text>
+				>
+
+				// draw helper text along the host rect (going down)
+				Set yt = 400
+				While (yt < (canvasHeight - 75)) {
+					&html<
+						<text class="HostRectLabel" x="#(xm)#" y="#(yt)#" text-anchor="middle" writing-mode="tb" >
+						#(clsName)#</text>
+					>
+					
+					Set yt = yt + 400
+				}
+
+				Set x = x + hostWidth
+				Set c = $O(colOrder(lane,c))
+			}
+		}
+	}
+	
+	// draw time line (going down)
+	Set yt = 300
+	While (yt < (canvasHeight - 75)) {
+	
+		&html<
+			<line class="Time" x1="20" y1="#(yt-200)#" x2="20" y2="#(yt)#" />
+			<line class="Time" x1="15" y1="#(yt-5)#" x2="20" y2="#(yt)#" />
+			<line class="Time" x1="25" y1="#(yt-5)#" x2="20" y2="#(yt)#" />
+			<text class="HostRectLabel" x="13" y="#(yt-100)#" text-anchor="middle" writing-mode="tb" >
+				Time</text>
+		>
+		Set yt = yt + 400
+	}
+
+	// draw messages
+	Set topY = 100
+	Set y = topY
+	Set deltaY = 40
+	
+	Set msgcount = 0
+	Set n = ((currPage-1) * ..#MSGPERPAGE) + 1
+	While ((n '= "") && (msgcount < ..#MSGPERPAGE)) {
+		If $G(^CacheTempMsgTrace(%session.SessionId,n,"event")) {
+			// draw event marker
+			Set hostname=^CacheTempMsgTrace(%session.SessionId,n,"sourceClass")
+			If ""'=hostname {
+				// HCR035 - Get the host type from clsInv(); build it if it doesn't exist
+				// (The host type for events is obtained from their corresponding config item names on the diagram)
+				If '$D(clsInv) {
+					Set t = ""
+					For {
+						Set t = $O(cls(t))
+						Quit:t=""
+						Set h = ""
+						For {
+							Set h = $O(cls(t,h))
+							Quit:h=""
+							Set clsInv(h) = t
+						}
+					}
+				}
+				Set laneStart = $G(clsInv(hostname))
+				If ""'=laneStart {
+					Set colStart = $G(cls(laneStart,hostname))
+					If ""'=colStart {
+						Set xStart = laneX(laneStart) + ((colStart-1) * hostWidth) + (hostWidth / 2)
+						Set eventId = ^CacheTempMsgTrace(%session.SessionId,n,"id")
+						Set eventType = ^CacheTempMsgTrace(%session.SessionId,n,"type")
+			
+						Set eventStyle = "eventMarkerBack"
+						&html<<rect class="#(eventStyle)#" x="#(xStart-6)#" y="#(y-6)#" width="12" height="12"/>>
+			
+						Set eventStyle = "eventMarker"_eventType
+						Set path =  "M " _(xStart-5)_" "_y_" L "_xStart_" "_(y+5)_" "_(xStart+5)_" "_y_" "_xStart_" "_(y-5)_" z"
+						&html<<path class="#(eventStyle)#" d="#(path)#" onmousedown="clickEvent(evt,'#(eventId)#');"/>>
+			
+						&html<<text class="MsgLabel" x="#(xStart - 12)#" y="#(y+2)#" text-anchor="end">[#(n)#]</text>>
+			
+						Set y = y + deltaY	
+					}
+				}
+			}
+		}
+		Else {
+			Set laneStart = ^CacheTempMsgTrace(%session.SessionId,n,"orType")
+			Set laneEnd = ^CacheTempMsgTrace(%session.SessionId,n,"destType")
+	
+			Set colStart = cls(laneStart,^CacheTempMsgTrace(%session.SessionId,n,"sourceClass"))
+			Set colEnd = cls(laneEnd,^CacheTempMsgTrace(%session.SessionId,n,"targetClass"))
+	
+			Set xStart = laneX(laneStart) + ((colStart-1) * hostWidth) + (hostWidth / 2)
+			Set xEnd = laneX(laneEnd) + ((colEnd-1) * hostWidth) + (hostWidth / 2)
+	
+			// draw message line
+			Set msgId = ^CacheTempMsgTrace(%session.SessionId,n,"id")
+			Set msgTime = ^CacheTempMsgTrace(%session.SessionId,n,"time")
+			Set msgClass = ^CacheTempMsgTrace(%session.SessionId,n,"msgClass")
+			Set callType = ^CacheTempMsgTrace(%session.SessionId,n,"callType")
+			Set msgType = ^CacheTempMsgTrace(%session.SessionId,n,"msgType")
+			Set respNo = $G(^CacheTempMsgTrace(%session.SessionId,n,"respNo"))
+			Set backLink = $G(^CacheTempMsgTrace(%session.SessionId,n,"back"))
+			
+			Set startStyle = "MsgStart" _ callType
+			
+			// test for queued/discarded messages
+			// queued = 2, discarded = 4
+			
+			Set s = ^CacheTempMsgTrace(%session.SessionId,n,"status")
+			If (s = 2) {
+				Set endStyle = "MsgTermQueued"
+			}
+			ElseIf (s = 4) {
+				Set endStyle = "MsgTermDiscarded"
+			}
+			Else {
+				Set endStyle = "MsgTerm" _ callType
+			}
+			
+			If ($e(msgClass,1,7)="EnsLib.")||($e(msgClass,1,4)="Ens.") {
+				Set msgClass = $P(msgClass,".",2,$L(msgClass,"."))
+			} Else {
+				Set msgClass = $P(msgClass,".",$L(msgClass,"."))
+			}
+	
+			If (xStart < xEnd) {
+				Set off = -(hostLineWidth\2)
+				Set a = -5
+				Set anchor1 = "start"
+				Set anchor2 = "end"
+				Set xSel = xStart - 10
+				Set xSelWid = xEnd - xStart + 20
+			}
+			Else {
+				Set off = hostLineWidth\2
+				Set a = 5
+				Set anchor1 = "end"
+				Set anchor2 = "start"
+				Set xSel = xEnd - 10
+				Set xSelWid = xStart - xEnd + 20
+			}
+	
+			// message line
+			&html<<g id="#(msgId)#" onmousedown="clickMsg(evt,'#(backLink)#');">>
+	
+			// link to response
+			If ((respNo '= "") && ((callType = "Sync") || (callType = "Async"))) {
+				// draw fancy response lines
+				Set rh = (respNo - n) * deltaY
+				
+				// prevent overlap using advanced heuristics
+				Set rc = ($R(10) + 1)
+				
+				&html<<polyline id="respLine_#(msgId)#" class="LinkLine" points="#(xEnd-off)# #(y)#, #(xEnd-off-(rc*a))# #(y)#, #(xEnd-off-(rc*a))# #(y+rh)#, #(xEnd-off)# #(y+rh)#" />>
+			}
+	
+			// selection box
+			&html<<rect id="msg_#(msgId)#" class="MsgOutline" x="#(xSel)#" y="#(y-12)#" width="#(xSelWid)#" height="24" rx="3" />>
+	
+			// terminator
+			&html<<rect class="#(endStyle)#" x="#(xEnd-((hostLineWidth-2)/2))#" y="#(y-9)#" width="#(hostLineWidth-2)#" height="18" rx="2"/>>
+	
+			// line
+			&html<<line class="MsgLine#(msgType)#" x1="#(xStart)#" y1="#(y)#" x2="#(xEnd+off)#" y2="#(y)#" />>
+			
+			// start circle
+			If ((callType = "SyncResponse") || (callType = "AsyncResponse")) {
+				&html<<circle class="#(startStyle)#" cx="#(xStart)#" cy="#(y)#" r="#((hostLineWidth\2)-2)#"/>>
+			}
+			Else {
+				&html<<circle class="#(startStyle)#" cx="#(xStart)#" cy="#(y)#" r="#(hostLineWidth\2)#"/>>
+			}
+	
+			// arrow
+			
+			If (endStyle = "MsgTermDiscarded") {
+				// discarded indicator
+				// noresponse indicator
+				&html<<circle class="Discarded" cx="#(xEnd+off+a)#" cy="#(y)#" r="5" />>
+			}
+			Else {
+				If (callType = "NoResponse") {
+					// noresponse indicator
+					&html<<line class="MsgLine#(msgType)#" x1="#(xEnd+off+a)#" y1="#(y-6)#" x2="#(xEnd+off+a)#" y2="#(y+6)#" />>
+				}
+				Else {
+					&html<<line class="MsgLine#(msgType)#" x1="#(xEnd+off+a)#" y1="#(y-5)#" x2="#(xEnd+off)#" y2="#(y)#" />>
+					&html<<line class="MsgLine#(msgType)#" x1="#(xEnd+off+a)#" y1="#(y+5)#" x2="#(xEnd+off)#" y2="#(y)#" />>
+				}
+		
+				If ((callType = "Async") || (callType = "AsyncResponse") || (callType = "NoResponse")) {
+					// extra arrows
+					&html<<line class="MsgLine#(msgType)#" x1="#(xEnd+off+(2*a))#" y1="#(y-5)#" x2="#(xEnd+off+a)#" y2="#(y)#" />>
+					&html<<line class="MsgLine#(msgType)#" x1="#(xEnd+off+(2*a))#" y1="#(y+5)#" x2="#(xEnd+off+a)#" y2="#(y)#" />>
+				}
+			}
+	
+			// labels
+			&html<<text class="MsgLabel" x="#(xStart - off - (1*a))#" y="#(y-2)#" text-anchor="#(anchor1)#">#(msgTime)#</text>>
+			&html<<text class="MsgLabel" x="#(xStart - off - (1*a))#" y="#(y+10)#" text-anchor="#(anchor1)#">#(msgClass)#</text>>
+			&html<<text class="MsgLabel" x="#(xSel - 2)#" y="#(y+2)#" text-anchor="end">[#(n)#]</text>>
+			
+			&html<</g>>
+
+			Set y = y + deltaY	
+		}
+
+		// next message
+		Set n = $O(^CacheTempMsgTrace(%session.SessionId,n))
+		Set msgcount = msgcount + 1
+	}
+
+	&html<</svg>>
+	
+	Quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="DrawHeader">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	Set showId = $G(%request.Data("SHOW",1))
+
+	// find svg font from localization file
+	Set tFont = $$$LocalizeText("Ensemble","FontFamily","tahoma,verdana")
+
+	// style
+	Write "<style type=""text/css""><![CDATA[",!
+	&html<
+
+.canvas {
+	fill: #CCCCEE;
+	stroke : gray;
+	stroke-width : 1;
+}
+
+rect.TitleRect {
+	fill: #FFEEDD;
+	stroke : black;
+	stroke-width : 1;
+}
+
+rect.HostRect {
+	fill: #EEDDFF;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+rect.HostRectSelect {
+	fill: yellow;
+	stroke : green;
+	stroke-width : 2;
+}
+
+rect.LaneRect1 {
+	fill: none;
+	stroke : none;
+}
+
+rect.LaneRect2 {
+	fill: white;
+	stroke : none;
+}
+
+rect.LaneRect3 {
+	fill: none;
+	stroke : none;
+}
+
+text.LaneTitle {
+  font-size : 20;
+  stroke : none;
+  fill: black;
+}
+
+text.HostTitle {
+  font-size : 11;
+  font-weight: bold;
+  stroke : none;
+  fill: black;
+}
+
+text.MsgLabel {
+  font-size : 11;
+  stroke : none;
+  fill: blue;
+}
+
+line.SepLine {
+	stroke : gray;
+	stroke-width : 1;
+}
+
+line.Time {
+	stroke : gray;
+	stroke-width : 2;
+	stroke-linecap: round;
+}
+
+rect.HostLine {
+	fill: #E0E0E0;
+	stroke : gray;
+	stroke-width : 1;
+}
+
+rect.HostLineSelect {
+	fill: yellow;
+	stroke : green;
+	stroke-width : 2;
+}
+
+rect.MsgOutline {
+	fill: yellow;
+	stroke : green;
+	stroke-width : 1;
+	opacity: 0.3;
+}
+
+rect.MsgOutlineSelect {
+	fill: yellow;
+	stroke : green;
+	stroke-width : 2;
+	opacity: 0.7;
+	filter: url(#dropShadow);
+}
+
+line.MsgLineRequest {
+	stroke : blue;
+	stroke-width : 2;
+	stroke-linecap: round;
+	opacity: 0.8;
+}
+
+line.MsgLineResponse {
+	stroke : green;
+	stroke-width : 2;
+	stroke-linecap: round;
+	opacity: 0.8;
+}
+
+line.MsgLineError {
+	stroke : red;
+	stroke-width : 2;
+	stroke-linecap: round;
+	opacity: 0.8;
+}
+
+.LinkLine {
+	stroke : plum;
+	stroke-width : 2;
+	stroke-linejoin: round;
+	fill: none;
+	opacity: 0.8;
+}
+
+.LinkLineSelect {
+	stroke : green;
+	stroke-width : 3;
+	stroke-linejoin: round;
+	fill: none;
+	opacity: 0.8;
+}
+
+rect.MsgTerm {
+	fill: gray;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+rect.MsgTermQueued {
+	fill: gray;
+	stroke : black;
+	stroke-width : 1;
+}
+
+rect.MsgTermDiscarded {
+	fill: silver;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+rect.MsgTermNoResponse {
+	fill: orange;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+rect.MsgTermResponse {
+	fill: plum;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+rect.MsgTermAsyncResponse {
+	fill: plum;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+rect.MsgTermSyncResponse {
+	fill: lightblue;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+rect.MsgTermAsync {
+	fill: plum;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+rect.MsgTermSync {
+	fill: lightblue;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+circle.Discarded {
+	fill: silver;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+circle.MsgStart {
+	fill: yellow;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+circle.MsgStartNoResponse {
+	fill: orange;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+circle.MsgStartSyncResponse {
+	fill: lightblue;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+circle.MsgStartResponse {
+	fill: plum;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+circle.MsgStartSync {
+	fill: lightblue;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+circle.MsgStartAsync {
+	fill: plum;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+circle.MsgStartAsyncResponse {
+	fill: plum;
+	stroke : blue;
+	stroke-width : 1;
+}
+
+.eventMarkerBack {
+	fill: white;
+	stroke: blue;
+	stroke-width: 1;
+	opacity: 0.9;
+}
+
+/* Assert,Error,Warning,Info,Trace,Alert */
+.eventMarker1 {
+	fill: red;
+	stroke: black;
+	stroke-width: 2;
+}
+
+.eventMarker2 {
+	fill: red;
+	stroke: black;
+	stroke-width: 1;
+}
+
+.eventMarker3 {
+	fill: orange;
+	stroke: black;
+	stroke-width: 1;
+}
+
+.eventMarker4,.eventMarker5,.eventMarker6 {
+	fill: yellow;
+	stroke: black;
+	stroke-width: 1;
+}
+
+text, tspan {
+	font-family: #(tFont)#;
+}
+
+>
+	Write "]]]]><![CDATA[></style>>"
+	
+	// script
+	Write "<script language=""text/javascript""><![CDATA[",!
+	&js<
+	
+function Initialize()
+{
+	var showId='#(showId)#';
+
+	// replace context menu
+	var newMenuRoot = parseXML(printNode(document.getElementById('CanvasMenu')), contextMenu);
+	contextMenu.replaceChild( newMenuRoot, contextMenu.firstChild );
+
+	// find loading div in outer html
+	var loadingDiv = self.document.getElementById("loading");
+	if (loadingDiv) {
+		loadingDiv.style.display = 'none';
+	}
+
+	setZoom(getCookie('tracezoom',100));
+	
+	if (showId != '') {
+		selectItem(showId);
+	}
+}	
+
+// set the option for the given menu item
+function setMenuItemOption(pOption, pItemId, pSubMenuId, value)
+{
+	var menuItems = contextMenu.childNodes.item(0).childNodes;
+	var tItem;
+      
+	for (i = 0; i != menuItems.length - 1; i++) {
+		if (menuItems.item(i).nodeType == 1) {
+			tItem = menuItems.item(i);
+			if (!pSubMenuId) {
+				// top-level menu item
+				if (tItem.getAttribute('id') == pItemId) {
+					tItem.setAttribute(pOption,value ? 'yes' : 'no');
+				}
+			}
+            else if ((tItem.nodeName == 'menu') && (tItem.getAttribute('id') == pSubMenuId)) {
+				// submenu
+
+				// loop over items in submenu
+				var submenuItems = tItem.childNodes;
+               
+				for (j = 0; j != submenuItems.length - 1; j++) {
+					tSubItem = submenuItems.item(j)
+					if (tSubItem.nodeType == 1) {
+						if (tSubItem.getAttribute('id') == pItemId) {
+							tSubItem.setAttribute(pOption,value ? 'yes' : 'no');
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+var currZoom = 100;
+
+// Set the zoom level
+function setZoom(zoom)
+{
+	if (zoom == currZoom) return;
+
+	var svgWidth = #($G(%request.Data("WIDTH",1),1000))#;
+	var svgHeight = #($G(%request.Data("HEIGHT",1),1000))#;
+	
+	var oldzoom = currZoom;
+	currZoom = zoom;
+
+	var embed = self.document.getElementById("SVGEmbed");
+	embed.height = svgHeight * (zoom / 100);
+	embed.width = svgWidth * (zoom / 100);
+
+ 	// update context menu
+ 	setMenuItemOption("checked","menu_zoom_" + oldzoom, "menu_zoom", false);
+ 	setMenuItemOption("checked","menu_zoom_" + zoom, "menu_zoom", true);
+
+ 	self.document.cookie = 'tracezoom=' + currZoom;
+}
+
+ function getCookie(name,def)
+ {
+	var value = def; // default value
+ 	var cookies = self.document.cookie;
+ 	var pos = cookies.indexOf(name + '=');
+ 	if (pos != -1) {
+	 	var start = pos + 1 + name.length;
+	 	var end = cookies.indexOf(';',start);
+	 	if (end == -1) end = cookies.length;
+	 	var value = unescape(cookies.substring(start,end));
+ 	}
+ 	
+ 	return value;
+ }
+
+// id of current selected message
+var currMsgId = null;
+
+function clickCanvas(evt)
+{
+	evt.stopPropagation();
+
+	selectItem(null);
+	selectHost(null);
+}
+
+function clickMsg(evt, back)
+{
+	var el = evt.getTarget();
+	evt.stopPropagation();
+	
+	selectItem(el.parentNode.id, back);
+}
+
+function clickHost(evt)
+{
+	var el = evt.getTarget();
+	evt.stopPropagation();
+	
+	selectHost(el.id);
+}
+
+function clickEvent(evt, eventId)
+{
+	evt.stopPropagation();
+	selectItem(null);
+	selectHost(null);
+
+	self.showDetails(eventId,'event');
+	currMsgId = -1;
+}
+
+// id of current selected host
+var currHostId = null;
+
+// what to view when user clicks on trace item
+var defaultView = "details";
+
+/// Select a host (to hilite)
+function selectHost(id)
+{
+	var el;
+	
+	if (id != currHostId) {
+		if (currHostId) {
+			el = document.getElementById(currHostId);
+			if (el) {
+				el.setAttribute("class","HostRect");
+			}
+			el = document.getElementById(currHostId + "_line");
+			if (el) {
+				el.setAttribute("class","HostLine");
+			}
+		}
+		
+		currHostId = id;
+		if (currHostId) {
+			el = document.getElementById(currHostId);
+			if (el) {
+				el.setAttribute("class","HostRectSelect");
+			}
+			el = document.getElementById(currHostId + "_line");
+			if (el) {
+				el.setAttribute("class","HostLineSelect");
+			}
+		}
+	}
+}
+
+var currRespLine = null;
+
+/// Select a new item
+function selectItem(id,back)
+{
+	var rect,line;
+	
+	if (id == currMsgId) {
+		return;
+	}
+	
+	// unhighlight old message
+	if (currMsgId && currMsgId != -1) {
+		rect = document.getElementById('msg_' + currMsgId);
+		if (rect) {
+			rect.setAttribute("class","MsgOutline");
+		}
+		
+		// unhighlight response lines (if any)
+		if (currRespLine) {
+			currRespLine.setAttribute("class","LinkLine");
+			currRespLine = null;
+		}
+	}
+	
+	currMsgId = id;
+
+	// highlight new message
+	if (currMsgId) {
+		rect = document.getElementById('msg_' + currMsgId);
+		if (rect) {
+			rect.setAttribute("class","MsgOutlineSelect");
+		}
+		
+		// highlight response lines (if any)
+		line = document.getElementById("respLine_" + currMsgId);
+		if (line) {
+			line.setAttribute("class","LinkLineSelect");
+			currRespLine = line;
+		}
+		else if (back && back != '') {
+			// try back link
+			line = document.getElementById("respLine_" + back);
+			if (line) {
+				line.setAttribute("class","LinkLineSelect");
+				currRespLine = line;
+			}
+		}
+	}
+
+	// update info sheet
+	if (("details" == defaultView) || (!currMsgId)) {
+		self.showDetails(currMsgId);
+	}
+	else {
+		self.showContents(currMsgId);
+	}
+	
+	// update menu
+	setMenuItemOption("enabled","details", null, currMsgId != null);
+	setMenuItemOption("enabled","contents", null, currMsgId != null);
+}
+
+
+function showMsgDetails()
+{
+	if (currMsgId) {
+		// update info sheet
+		self.showDetails(currMsgId);
+		
+		// set default operation
+		defaultView = "details";
+		setMenuItemOption("checked","details", null, true);
+		setMenuItemOption("checked","contents", null, false);
+	}
+}
+
+function showMsgContents()
+{
+	if (currMsgId) {
+		// update info sheet
+		self.showContents(currMsgId);
+
+		// set default operation
+		defaultView = "contents";
+		setMenuItemOption("checked","details", null, false);
+		setMenuItemOption("checked","contents", null, true);
+	}
+}
+
+	>
+
+
+	Write "]]]]><![CDATA[></script>>"
+
+
+	// defs
+	&html<
+<!-- defs -->
+
+<defs>
+<menu id="CanvasMenu" xmlns="http://mynamepsace.com/">
+    <header>Ensemble Configuration Menu</header>
+    <menu id="menu_zoom">
+	 <header>Zoom</header>
+	 <item id="menu_zoom_33" onactivate="setZoom(33);">33%</item>
+	 <item id="menu_zoom_50" onactivate="setZoom(50);">50%</item>
+	 <item id="menu_zoom_75" onactivate="setZoom(75);">75%</item>
+	 <item id="menu_zoom_88" onactivate="setZoom(88);">88%</item>
+	 <item checked="yes" id="menu_zoom_100" onactivate="setZoom(100);">100%</item>
+	 <item id="menu_zoom_110" onactivate="setZoom(110);">110%</item>
+	 <item id="menu_zoom_125" onactivate="setZoom(125);">125%</item>
+	 <item id="menu_zoom_150" onactivate="setZoom(150);">150%</item>
+	 <item id="menu_zoom_200" onactivate="setZoom(200);">200%</item>
+    </menu>
+    <separator/>
+	<item id="search" onactivate="selectItem(null);">Search</item>
+    <separator/>
+	<item action="Copy" id="Copy">Copy</item>
+	<item action="Find" id="Find">Find...</item>
+	<item action="FindAgain" id="FindAgain">Find Again</item>
+    <separator/>
+	<item enabled="no" checked="yes" id="details" onactivate="showMsgDetails();">Show Details</item>
+	<item enabled="no" id="contents" onactivate="showMsgContents();">Show Contents</item>
+    <separator/>
+	<item id="legend" onactivate="showLegend();">Legend...</item>
+    <separator/>
+    <item action="ViewSource">View Source</item>
+    <item action="About">A&amp;bout SVG Viewer...</item>
+</menu>
+
+<!-- filters -->
+<filter id="dropShadow" x="-2%" y="-2%" height="120%" width="120%">
+<feGaussianBlur in="SourceAlpha" stdDeviation="3" />
+<feOffset dx="4px" dy="4px" result="offsetBlur" />
+<feMerge>
+	<feMergeNode in="offsetBlur"/>
+	<feMergeNode in="SourceGraphic"/>
+</feMerge>
+</filter>
+
+</defs>
+	
+	>
+]]></Implementation>
+</Method>
+
+<Method name="ClearTraceData">
+<ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[	Kill ^CacheTempMsgTrace(%session.SessionId)
+]]></Implementation>
+</Method>
+
+<Method name="BuildTraceInfo">
+<Description><![CDATA[
+Construct arrays containing the trace info for this message session:<br>
+<var>^CacheTempMsgTrace(%session.SessionId)</var> contains info about each message.<br>
+<var>cls</var> contains info about the Business classes used.<br>]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>sessionId:%String,startTime:%String,endTime:%String,startId:%Integer,endId:%Integer,&amp;showId="&quot;</FormalSpec>
+<ReturnType>%Integer</ReturnType>
+<Implementation><![CDATA[
+	// Note: there are 3 lanes encoded as follows:
+	// 1 = Service
+	// 2 = Process
+	// 3 = Operation
+
+	// there are 3 types of filter: session, time, and id
+	Set filter = "session"
+	If ((startTime '= "") || (endTime '= "")) {
+		Set filter = "time"
+	}
+	If ((startId '= "") || (endId '= "")) {
+		Set filter = "id"
+	}
+
+	// HCR076 - Constants for inclusion of event log entries in the message trace
+	Set IncludeEvents = ..IncludeEvents()
+	Set EventsWindow = ..EventsWindow()
+	Set EventsMaxRows = ..EventsMaxRows()
+
+	// build spec for this query and
+	// test to see if temp data matches it
+
+	Set tmc = $P($H,",",2)
+	Set spec = filter _ "^" _ sessionId _
+						"^" _ startTime _
+						"^" _ endTime _
+						"^" _ startId _
+						"^" _ endId _
+						"^" _ IncludeEvents _
+						"^" _ EventsWindow _
+						"^" _ EventsMaxRows
+
+	Set tShow=showId, showId=""
+
+	// check if our temp data is for this request
+	Lock +^CacheTempMsgTrace(%session.SessionId)
+	If (spec = $G(^CacheTempMsgTrace(%session.SessionId,0,"spec"))) {
+		Set oldtmc = +$G(^CacheTempMsgTrace(%session.SessionId,0,"tmc"))
+		
+		// only reuse temp file within a specific time window
+		If ((tmc>=oldtmc) && ((tmc-oldtmc)<=..#CACHETIMEOUT)) {
+			// reuse
+			Lock -^CacheTempMsgTrace(%session.SessionId)
+			Quit +$G(^CacheTempMsgTrace(%session.SessionId,0,"count"))
+		}
+	}
+
+	// kill temp data
+	Do ..ClearTraceData()
+	Set ^CacheTempMsgTrace(%session.SessionId,0,"spec") = spec
+	Set ^CacheTempMsgTrace(%session.SessionId,0,"tmc") = tmc
+
+	// HCR076 - Discover session boundaries
+	Set SessionStartTime = ""
+	Set SessionEndTime = ""
+	Set SessionStartId = ""
+	Set SessionEndId = ""
+	&sql(DECLARE sqlSESSIONLIMITS CURSOR FOR 
+		SELECT %ID, TimeCreated, TimeProcessed 
+		INTO :id, :ctime, :ptime 
+		FROM Ens.MessageHeader
+		WHERE SessionId = :sessionId
+	)
+	&sql(OPEN sqlSESSIONLIMITS)
+	Set id = "", ctime = "", ptime = ""
+	&sql(FETCH sqlSESSIONLIMITS)
+	While (SQLCODE=0) {
+		If (id'="") && ((SessionStartId="") || (SessionStartId>id)) Set SessionStartId = id
+		If (id'="") && ((SessionEndId="") || (SessionEndId<id)) Set SessionEndId = id
+		If (ctime'="") && ((SessionStartTime="") || (SessionStartTime]ctime)) Set SessionStartTime = ctime
+		If (ptime'="") && ((SessionEndTime="") || (SessionEndTime']ptime)) Set SessionEndTime = ptime
+		&sql(FETCH sqlSESSIONLIMITS)
+	}
+	&sql(CLOSE sqlSESSIONLIMITS)
+	// Convert search parameters startTime and endTime to UTC
+	If startTime = "" Set startTime1 = startTime
+	Else  Set startTime1 = $$$timeLocaltoUTC(startTime)
+	If endTime = "" Set endTime1 = endTime
+	Else  Set endTime1 = $$$timeLocaltoUTC(endTime)
+	// Adjust search parameters based on session boundaries
+	If (startId>SessionStartId) Set startId2 = startId
+	Else  Set startId2 = SessionStartId
+	If (endId'="") && (endId<SessionEndId) Set endId2 = endId
+	Else  Set endId2 = SessionEndId
+	If (startTime1]SessionStartTime) Set startTime2 = startTime1
+	Else  Set startTime2 = SessionStartTime
+	If (endTime1'="") && (endTime1']SessionEndTime) Set endTime2 = endTime1
+	Else  Set endTime2 = SessionEndTime
+	If (startId2>endId2) || (startTime2]endTime2) Quit 0 // Nothing will be retrieved!
+	/*
+	If (filter = "time") {
+		// convert dates to correct values...
+		// Do ##class(EnsMsgPane).ProcessDates(.startTime,.endTime)
+	}
+	ElseIf (filter = "id") {
+		If (startId = "") { Set startId = 1 }
+		If (endId = "") { Set endId = 9999999999 }
+	}
+	*/
+
+	// query for responses
+	&sql(DECLARE sqlSESSION CURSOR FOR 
+		SELECT %ID, TimeCreated, SourceConfigName, 
+			TargetConfigName, BusinessProcessId, Type, 
+			MessageBodyClassName, MessageBodyId, ReturnQueueName, CorrespondingMessageId,
+			Status, IsError, SourceBusinessType, TargetBusinessType
+		INTO :id, :ctime, :sourceClass, :targetClass, 
+			:bprocid, :msgtype, :classname, :body, :returnQueue, :reqID,
+			:status, :iserr, :ortype, :desttype
+		FROM Ens.MessageHeader
+		WHERE SessionId = :sessionId
+		ORDER BY %ID
+		)
+
+	// HCR076 - New query on time and id
+	&sql(DECLARE sqlTIMEID CURSOR FOR 
+		SELECT %ID, TimeCreated, SourceConfigName, 
+			TargetConfigName, BusinessProcessId, Type, 
+			MessageBodyClassName, MessageBodyId, ReturnQueueName, CorrespondingMessageId,
+			Status, IsError, SourceBusinessType, TargetBusinessType
+		INTO :id, :ctime, :sourceClass, :targetClass, 
+			:bprocid, :msgtype, :classname, :body, :returnQueue, :reqID,
+			:status, :iserr, :ortype, :desttype
+		FROM Ens.MessageHeader
+		WHERE SessionId = :sessionId AND TimeCreated >= :startTime2 AND TimeCreated <= :endTime2 AND
+			%ID >= :startId2 AND %ID <= :endId2
+		ORDER BY %ID
+		)
+
+	&sql(DECLARE sqlTIME CURSOR FOR 
+		SELECT %ID, TimeCreated, SourceConfigName, 
+			TargetConfigName, BusinessProcessId, Type, 
+			MessageBodyClassName, MessageBodyId, ReturnQueueName, CorrespondingMessageId,
+			Status, IsError, SourceBusinessType, TargetBusinessType
+		INTO :id, :ctime, :sourceClass, :targetClass, 
+			:bprocid, :msgtype, :classname, :body, :returnQueue, :reqID,
+			:status, :iserr, :ortype, :desttype
+		FROM Ens.MessageHeader
+		WHERE SessionId = :sessionId AND TimeCreated >= :startTime2 AND TimeCreated <= :endTime2
+		ORDER BY %ID
+		)
+
+	&sql(DECLARE sqlID CURSOR FOR 
+		SELECT %ID, TimeCreated, SourceConfigName, 
+			TargetConfigName, BusinessProcessId, Type, 
+			MessageBodyClassName, MessageBodyId, ReturnQueueName, CorrespondingMessageId,
+			Status, IsError, SourceBusinessType, TargetBusinessType
+		INTO :id, :ctime, :sourceClass, :targetClass, 
+			:bprocid, :msgtype, :classname, :body, :returnQueue, :reqID,
+			:status, :iserr, :ortype, :desttype
+		FROM Ens.MessageHeader
+		WHERE SessionId = :sessionId AND %ID >= :startId2 AND %ID <= :endId2
+		ORDER BY %ID
+		)
+
+	// queries for events
+	&sql(DECLARE sqlEVENTTIME CURSOR FOR 
+		SELECT %ID, SessionId, TimeLogged, ConfigName, Type, MessageId
+		INTO :eventId, :sesId, :eventTime, :eventHost, :eventType, :eventMsg
+		FROM Ens_Util.Log
+		WHERE TimeLogged >= :startTime2 AND TimeLogged <= :endEventTime
+		ORDER BY TimeLogged
+		)
+
+	Kill tEvents
+	If IncludeEvents && (EventsMaxRows>0) {
+		// get events and sort by time
+
+		// HCR076 - Calculate latest time for events based on last processed time (or search EndTime) plus EventsWindow
+		Set fs = $P(endTime2,".",2), endEventTime = $P(endTime2,".",1)
+		Set dt = $ZDTH(endEventTime,3,1,,,,,,,-1)
+			If dt'=-1 {
+				Set t = $P(dt,",",2)+EventsWindow
+				If t<86400 Set $p(dt,",",2) = t
+				Else  Set $P(dt,",",1) = $P(dt,",",1)+1, $P(dt,",",2) = t-86400
+				Set endEventTime = $ZDT(dt,3,1)_"."_fs // Put back the fractional part
+			}
+
+		// HCR076 - And limit the number of Event Log rows that are scanned to EventsMaxRows
+		Set k = 0
+		&sql(OPEN sqlEVENTTIME)
+		&sql(FETCH sqlEVENTTIME)
+		While (SQLCODE = 0) {
+			Set k = k+1 If k>EventsMaxRows Quit  // Reached EventsMaxRows
+			Set:sesId=sessionId tEvents(eventTime_"#"_eventMsg,eventId) = $LB(eventHost, eventType) // Event generated by the session
+			&sql(FETCH sqlEVENTTIME)
+		}
+		&sql(CLOSE sqlEVENTTIME)
+	}
+
+	Set tEventTime = $O(tEvents(""))
+
+	// figure out types of origin etc.
+	Set n = 0
+	If (filter = "time") || (filter = "id") {
+		&sql(OPEN sqlTIMEID)
+		&sql(FETCH sqlTIMEID)
+	}
+	Else {
+		&sql(OPEN sqlSESSION)
+		&sql(FETCH sqlSESSION)
+	}
+
+	While (SQLCODE = 0) {
+		Do InjectEvents()
+
+		Set n = n + 1
+		Set ortype=+ortype
+		Set desttype=+desttype
+		
+		// TODO: Joe will change the page to support 0 as the "Unknown" column
+		If ortype=0 Set ortype=2
+		If desttype=0 Set desttype=2
+
+		// set msg array
+		Set msgIndex(id) = n
+		
+		Set:tShow=id showId=id
+		Set ^CacheTempMsgTrace(%session.SessionId,n,"id") = id
+		Set ^CacheTempMsgTrace(%session.SessionId,n,"time") = $$$timeUTCtoLocal(ctime)
+		Set ^CacheTempMsgTrace(%session.SessionId,n,"orType") = ortype
+		Set ^CacheTempMsgTrace(%session.SessionId,n,"destType") = desttype
+		
+		If classname="" {
+			Set ^CacheTempMsgTrace(%session.SessionId,n,"msgClass") = "NULL"
+		} else {
+			Set mb = $zobjclassmethod(classname,"%OpenId",body)
+			If ($IsObject(mb)) {
+				Set ^CacheTempMsgTrace(%session.SessionId,n,"msgClass") = mb.%ClassName(1)
+			}
+			Else {
+				// ain't got no body...
+				Set ^CacheTempMsgTrace(%session.SessionId,n,"msgClass") = "N/A"
+			}
+		}
+		Set ^CacheTempMsgTrace(%session.SessionId,n,"sourceClass") = sourceClass
+		Set ^CacheTempMsgTrace(%session.SessionId,n,"targetClass") = targetClass
+		Set ^CacheTempMsgTrace(%session.SessionId,n,"callType") = ""
+		Set ^CacheTempMsgTrace(%session.SessionId,n,"msgType") = "Request"
+		Set ^CacheTempMsgTrace(%session.SessionId,n,"status") = status
+		
+		If (msgtype = 2) {
+			Set ^CacheTempMsgTrace(%session.SessionId,n,"msgType") = "Response"
+			Set ^CacheTempMsgTrace(%session.SessionId,n,"callType") = "Response"
+			Set ^CacheTempMsgTrace(%session.SessionId,n,"back") = reqID
+		}
+		Else {
+			If (returnQueue = "") {
+				// fire / forget
+				Set ^CacheTempMsgTrace(%session.SessionId,n,"callType") = "NoResponse"
+			}
+			ElseIf (returnQueue = +returnQueue) {
+				// private
+				Set ^CacheTempMsgTrace(%session.SessionId,n,"callType") = "Sync"
+			}
+			Else {
+				// async
+				Set ^CacheTempMsgTrace(%session.SessionId,n,"callType") = "Async"
+			}
+		}
+
+		If ((reqID '= "") && ($D(msgIndex(reqID)))) {
+			// point our request to us
+			Set ^CacheTempMsgTrace(%session.SessionId,msgIndex(reqID),"respNo") = n
+			If (^CacheTempMsgTrace(%session.SessionId,msgIndex(reqID),"callType") = "Sync") {
+				Set ^CacheTempMsgTrace(%session.SessionId,n,"callType") = "SyncResponse"
+			}
+			Else {
+				Set ^CacheTempMsgTrace(%session.SessionId,n,"callType") = "AsyncResponse"
+			}
+		}
+		
+		// test for messages with errors
+		If (iserr) {
+			Set ^CacheTempMsgTrace(%session.SessionId,n,"msgType") = "Error"
+		}
+
+		// cls array (remember earliest time (msgid) for each class)
+		Set t = $G(cls(ortype,sourceClass))
+		If ((t="") || (t>id)) {
+			Set cls(ortype,sourceClass) = id _ ".1"
+		}
+
+		Set t = $G(cls(desttype,targetClass))
+		If ((t="") || (t>id)) {
+			Set cls(desttype,targetClass) = id _ ".2"
+		}
+
+		If (filter = "time") || (filter = "id") {
+			&sql(FETCH sqlTIMEID)
+		}
+		Else {
+			&sql(FETCH sqlSESSION)
+		}
+	}
+
+	If (filter = "time") || (filter = "id") {
+		&sql(CLOSE sqlTIMEID)
+	}
+	Else {
+		&sql(CLOSE sqlSESSION)
+	}
+
+	// get remaining events
+	Set ctime = "9999"
+	Do InjectEvents()
+
+	// put meta data in 0 node
+	Set ^CacheTempMsgTrace(%session.SessionId,0,"count") = n
+	Merge ^CacheTempMsgTrace(%session.SessionId,0,"clsinfo") = cls
+
+	// count number of columns
+	Set cc = 0
+	For lane = 1:1:3 {
+		Set k = $O(cls(lane,""))
+		While (k '= "") {
+			Set cc = cc + 1
+			Set k = $O(cls(lane,k))
+		}
+	}
+
+	Set ^CacheTempMsgTrace(%session.SessionId,0,"columns") = cc
+	Lock -^CacheTempMsgTrace(%session.SessionId)
+
+	// return number of messages found
+	Set:n>..#MSGPERPAGE showId="" // don't go to id, leave search pane showing
+	Quit n
+
+InjectEvents()
+	// HCR076 - Skip the event if it's the first thing on the diagram (may not have related clsinfo)
+	Quit:'n
+	// event time is "time#msgId"
+	While ((tEventTime'="") && (tEventTime '] (ctime_"#"_id)) && (tEventTime '= (ctime_"#"_id))) {
+		// inject events into list
+		Set tEventId = $O(tEvents(tEventTime,""))
+		While (tEventId'="") {
+			Set n = n + 1
+			Set ^CacheTempMsgTrace(%session.SessionId,n,"event") = 1
+			Set ^CacheTempMsgTrace(%session.SessionId,n,"id") = tEventId
+			Set ^CacheTempMsgTrace(%session.SessionId,n,"sourceClass") = $LG(tEvents(tEventTime,tEventId),1)
+			Set ^CacheTempMsgTrace(%session.SessionId,n,"type") = $LG(tEvents(tEventTime,tEventId),2)
+
+			Set tEventId = $O(tEvents(tEventTime,tEventId))
+		}
+		Set tEventTime = $O(tEvents(tEventTime))
+	}
+	Quit
+]]></Implementation>
+</Method>
+</Class>
+</Export>

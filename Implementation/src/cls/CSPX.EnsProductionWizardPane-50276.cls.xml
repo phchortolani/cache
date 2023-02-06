@@ -1,0 +1,430 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="CSPX.EnsProductionWizardPane">
+<Description><![CDATA[
+Production Wizard pane.
+This is the first step in creating a Production.
+This page lets the user decide what type of production
+as well as its name.]]></Description>
+<ClassType/>
+<IncludeCode>Ensemble,EnsUI</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%CSP.Util.Pane</Super>
+<System>3</System>
+
+<Parameter name="DOMAIN">
+<Description><![CDATA[
+Use our own domain for localization]]></Description>
+<Default>Ensemble</Default>
+</Parameter>
+
+
+<Method name="Submit">
+<Description><![CDATA[
+Override submit behavior for this page]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pRequest:%CSP.Request,pSubmit:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<ServerOnly>1</ServerOnly>
+<Implementation><![CDATA[
+	// get ID values from request
+	If ($IsObject($G(pRequest))) {
+		Set n = 1
+		While ($D(pRequest.Data("$ID"_n,1))) {
+			Set tID(n) = pRequest.Data("$ID"_n,1)
+			Set n = n + 1
+		}
+	}
+	
+	Set ret = ..OnSubmit(.tID,pSubmit)	
+	Quit ret
+]]></Implementation>
+</Method>
+
+<Method name="OnSubmit">
+<Description><![CDATA[
+This callback is called when this form is submitted.]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;pID:%String,pSubmit:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	Set tOptionId = $G(%request.Data("$OptionId",1))
+	Set tSC = $$$OK
+
+	If (pSubmit = "$AUTOFORM_SAVE") {
+		Do {
+			Set tPackage = $G(%request.Data("Package",1))
+			Set tName = $G(%request.Data("Name",1))
+			Set tType = $G(%request.Data("Type",1)) // HL7 | Generic
+			Set tDescription = $G(%request.Data("Description",1))
+			Set tProdClass = tPackage _ "." _ tName
+
+			If ('$ZNAME(tProdClass,4)) {
+				// bad class name
+				Set tmsg = $$$FormatText($$$Text("Invalid class or package name: %1 "), tProdClass)
+				Set tSC = $$$ERROR($$$GeneralError,tmsg)
+				Quit
+			}
+
+			// create empty production class
+			Set tClsDef = ##class(%Dictionary.ClassDefinition).%New()
+			Set tClsDef.Name = tProdClass
+			Set tClsDef.Super = "Ens.Production"
+			Set tClsDef.ProcedureBlock = 1
+
+			Set tXData = ##class(%Dictionary.XDataDefinition).%New()
+			Set tXData.Name = "ProductionDefinition"
+			Do tXData.Data.WriteLine("<Production Name="""_tProdClass_"""/>")
+			Do tClsDef.XDatas.Insert(tXData)
+
+			Set tSC = tClsDef.%Save()
+			Set tClsDef = ""
+			Set tXData = ""
+			
+			If $$$ISERR(tSC) Quit
+			
+			// now compile the class
+			Set tSC = $System.OBJ.Compile(tProdClass,"-d")
+			If $$$ISERR(tSC) Quit
+	
+			// fill in production:
+			Set tProduction = ##class(Ens.Config.Production).%OpenId(tProdClass)
+			If '$IsObject(tProduction) {
+				Set tmsg = $$$FormatText($$$Text("Unable to open new production: %1 "), tProdClass)
+				Set tSC = $$$ERROR($$$GeneralError,tmsg)
+				Quit
+			}
+			Set tProduction.Name = tProdClass
+			Set tProduction.Description = tDescription
+			Set tProduction.ActorPoolSize = 2
+	
+			// create contents of production
+			If (tType = "HL7") {
+				Set tSC = ..ConfigureHL7Production(tName,tProduction,tPackage)
+				If $$$ISERR(tSC) Quit
+			}
+
+			// save production
+			Set tSC = tProduction.%Save()
+			If $$$ISERR(tSC) Quit
+	
+			// update production class
+			Set tSC = tProduction.SaveToClass()
+		
+			// tell this window to close
+			Set %response.Context("$CLOSEWINDOW") = 1
+			Set %response.Context("$ID1") = tProdClass
+		} While(0)
+
+		If $$$ISERR(tSC) {
+			Do $System.Status.DecomposeStatus(tSC,.err)
+			Set %response.Context("$ERROR") = $G(err(1))
+			Set %response.Context("Name") = tName
+			Set %response.Context("Package") = tPackage
+		}
+	}
+	
+	Quit tSC
+]]></Implementation>
+</Method>
+
+<Method name="ConfigureHL7Production">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pName:%String,pProduction:Ens.Config.Production,pPackage:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	Set tSC = $$$OK
+	Do {
+		// put some HL7 stuff in here
+		Set tMsgRuleName = "RoutingRule"
+		Set tAlertRule = "AlertRule"
+
+		// router
+		Set tItem = ##class(Ens.Config.Item).%New()
+		Set tItem.Name = "MsgRouter"
+		Set tItem.Comment = $$$Text("This handles message routing logic.")
+		Set tItem.ClassName = "EnsLib.HL7.MsgRouter.RoutingEngine"
+
+		Set tSetting = ##class(Ens.Config.Setting).%New()
+		Set tSetting.Target = "Host"
+		Set tSetting.Name = "BusinessRuleName"
+		Set tSetting.Value = pPackage_"."_tMsgRuleName
+		Do tItem.Settings.Insert(tSetting)
+
+		Do pProduction.Items.Insert(tItem)
+
+		// alert handler
+		Set tItem = ##class(Ens.Config.Item).%New()
+		Set tItem.Name = "Ens.Alert"
+		Set tItem.Comment = $$$Text("This handles Alert routing logic.")
+		Set tItem.ClassName = "EnsLib.MsgRouter.RoutingEngine"
+
+		Set tSetting = ##class(Ens.Config.Setting).%New()
+		Set tSetting.Target = "Host"
+		Set tSetting.Name = "BusinessRuleName"
+		Set tSetting.Value = pPackage_"."_tAlertRule
+		Do tItem.Settings.Insert(tSetting)
+
+		Do pProduction.Items.Insert(tItem)
+
+		// email alert
+		Set tItem = ##class(Ens.Config.Item).%New()
+		Set tItem.Name = "EMailAlert"
+		Set tItem.Comment = $$$Text("This sends alerts via e-mail.")
+		Set tItem.ClassName = "EnsLib.EMail.AlertOperation"
+		Set tItem.Enabled = 0
+		Do pProduction.Items.Insert(tItem)
+
+		// pager alert
+		Set tItem = ##class(Ens.Config.Item).%New()
+		Set tItem.Name = "PagerAlert"
+		Set tItem.Comment = $$$Text("This sends alerts to a pager via e-mail.")
+		Set tItem.ClassName = "EnsLib.EMail.AlertOperation"
+		Set tItem.Enabled = 0
+		Do pProduction.Items.Insert(tItem)
+
+		// bad message handler
+		Set tItem = ##class(Ens.Config.Item).%New()
+		Set tItem.Name = "BadMessageHandler"
+		Set tItem.Comment = $$$Text("Bad messages are sent to this operation.")
+		Set tItem.ClassName = "EnsLib.HL7.Operation.FileOperation"
+		Set tItem.Enabled = 0
+		Do pProduction.Items.Insert(tItem)
+
+		// sample input
+		Set tItem = ##class(Ens.Config.Item).%New()
+		Set tItem.Name = "HL7FileService"
+		Set tItem.ClassName = "EnsLib.HL7.Service.FileService"
+		Set tItem.Comment = $$$Text("This is a default HL7 File Service.")
+		Set tItem.Enabled = 0
+
+		Set tSetting = ##class(Ens.Config.Setting).%New()
+		Set tSetting.Target = "Host"
+		Set tSetting.Name = "TargetConfigNames"
+		Set tSetting.Value = "MsgRouter"
+		Do tItem.Settings.Insert(tSetting)
+
+		Do pProduction.Items.Insert(tItem)
+
+		// sample output
+		Set tItem = ##class(Ens.Config.Item).%New()
+		Set tItem.Name = "HL7FileOperation"
+		Set tItem.ClassName = "EnsLib.HL7.Operation.FileOperation"
+		Set tItem.Comment = $$$Text("This is a default HL7 File Operation.")
+		Set tItem.Enabled = 0
+
+		Do pProduction.Items.Insert(tItem)
+		
+		// create new routing rules
+
+		// msg routing rule
+		Set tRoutingRule = ##class(Ens.Rule.Router.RoutingRule).%New()
+		Set tRoutingRule.HostClass = pPackage
+		Set tRoutingRule.Name = tMsgRuleName
+		Set tRoutingRule.ContextClass = "EnsLib.HL7.MsgRouter.RoutingEngine"
+		Set tRoutingRule.Source = "HL7FileService"
+		Set tRoutingRule.MsgClass = "EnsLib.HL7.Message"
+
+		// default rule to send message to output
+		Set tRule = ##class(Ens.Rule.Router.Rule).%New()
+		Set tAction = ##class(Ens.Rule.Router.Action).%New()
+		Set tAction.Type = "send"
+		Set tAction.Target = "HL7FileOperation"
+		Do tRule.Actions.Insert(tAction)
+		Do tRoutingRule.Rules.Insert(tRule)
+
+		Set tSC = tRoutingRule.%Save()
+		If $$$ISERR(tSC) Quit
+
+		// alert routing rule
+		Set tRoutingRule = ##class(Ens.Rule.Router.RoutingRule).%New()
+		Set tRoutingRule.HostClass = pPackage
+		Set tRoutingRule.Name = tAlertRule
+		Set tRoutingRule.ContextClass = "EnsLib.MsgRouter.RoutingEngine"
+		Set tSC = tRoutingRule.%Save()
+		If $$$ISERR(tSC) Quit
+
+	} While(0)
+
+	Quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="DrawHEAD">
+<FormalSpec>pInstance:%CSP.Util.PageInstance</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// override table style
+	&html<
+<style>
+
+table.LayoutMain td.LayoutContentCol {
+	background: #CCCCEE;
+	width: 100%;
+	margin: 0px;
+	margin-right: 0px;
+}
+
+.label {
+	font-weight: bold;
+	text-align: right;
+	white-space: nowrap;
+}
+
+.Text {
+}
+
+.Error {
+	border: 1px solid black;
+	background: white;
+	color: red;
+	white-space: nowrap;
+	padding: 3px;
+}
+
+.TypeLabel {
+	font-weight: bold;
+}
+
+.TextM {
+	font-size: 1.0em;
+	line-height: 120%;
+	margin-bottom: 5px;
+	padding: 2px;
+}
+
+</style>>
+	Set msg1 = $$$TextJS("Please provide a package name for the new Production.")
+	Set msg2 = $$$TextJS("Please provide a name for the new Production.")
+	&html<
+	
+<script language="javascript">
+
+function selectType(type)
+{
+	// update radio button to match text user clicked on
+	var btn = self.document.getElementById(type);
+	if (btn) {
+		btn.checked = true;
+	}
+}
+
+function btnOK()
+{
+	var form = self.document.getElementById('form');
+
+	if (form.Package.value == '') {
+		alert('#(msg1)#');
+		return false;
+	}
+
+	if (form.Name.value == '') {
+		alert('#(msg2)#');
+		return false;
+	}
+
+	form.submit();
+	return true;
+}
+
+function btnCancel()
+{
+	// go back
+	self.document.location = 'UtilEnsProductions.csp';
+	return true;
+}
+
+</script>
+	>
+	
+	Quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="DrawBODY">
+<Description><![CDATA[
+  Draw the BODY of the wizard pane]]></Description>
+<FormalSpec>pInstance:%CSP.Util.PageInstance</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// test if we should jump to the next window
+	If $G(%request.Data("$CLOSEWINDOW",1)) {
+	&html<<script language="javascript">
+	self.document.location = 'UtilEnsProductionModel.csp?$ID1=#($G(%request.Data("$ID1",1)))#';
+	</script></body></html>>
+		Quit $$$OK
+	}
+
+	// get page ID values
+	Merge tID = pInstance.IDValues
+	Set tTitle1 = $$$TextHTML("The Ensemble Production Wizard lets you create a new production: a set of components that work together to solve a specific integration problem.")
+	Set tTitle2 = $$$TextHTML("The first step in this process is to choose a package and name for the new production:")
+	&html<<div style="width: 600px; margin-left: 40px;"><br>>
+	&html<<div class="TextM">#(tTitle1)#<br>#(tTitle2)#</div>>
+
+	// see if there were errors
+	Set tError = $G(%request.Data("$ERROR",1)) 
+	If (tError '= "") {
+		&html<<div class="text">#($$$TextHTML("There were errors encountered when creating this new production:"))#</div>>
+
+		// see if we know what error this is!!!
+		If ($E(tError,1,11) = "ERROR #5805") {
+			Set tError = $$$TextHTML("ERROR: There is already a production with this name.")
+		}
+		ElseIf ($E(tError,1,11) = "ERROR #5802") {
+			Set tError = $$$TextHTML("ERROR: The class or package name you have entered is not valid.")
+		}
+		&html<<div class="Error">
+		#($ZCVT(tError,"O","HTML"))#</div>>
+		
+	}
+
+	// make sure submit comes back to this class as a Save
+	&html<<form id="form">
+	<input type="hidden" name="$CLASS" value="#(..%ClassName(1))#">
+	<input type="hidden" name="$AUTOFORM_SAVE" value="1">
+	<table>
+	<tr><td class="label">#($$$TextHTML("Package Name"))#:</td><td><input type="text" name="Package" value="#($G(%request.Data("Package",1),"MyPackage"))#" size="50"></td></tr>
+
+	<tr><td class="label">#($$$TextHTML("Production Name"))#:</td><td><input type="text" name="Name" value="#($G(%request.Data("Name",1),"NewProduction"))#" size="50"></td></tr>
+
+	<tr><td class="label">#($$$TextHTML("Description"))#:</td><td><textarea name="Description" cols="50" rows="5">#($G(%request.Data("Description",1),"NewProduction"))#</textarea></td></tr>
+
+	<tr><td colspan="2"><br>
+	<div class="Text">#($$$TextHTML("Next, select what type of production the Wizard should create (you can modify the results of this later)"))#:</div></td></tr>
+
+	<tr><td class="label"><input type="radio" name="Type" id="HL7" value="HL7"></td>
+		<td><span class="TypeLabel" onclick="selectType('HL7');">#($$$TextHTML("HL7 Messaging"))#</span><br>
+		#($$$TextHTML("Create an HL7 Message Routing production."))#
+		</td></tr>
+
+	<tr><td class="label"><input type="radio" checked name="Type" id="Generic" value="Generic"></td>
+		<td><span class="TypeLabel" onclick="selectType('Generic');">Generic</span><br>
+		#($$$TextHTML("Create a generic production that can be further configured."))#
+		</td></tr>
+
+
+	</table>
+
+	<hr>
+	<div style="margin-left: 25%;">
+	<input type="button" value='#($$$Text(" OK "))#' onclick="btnOK();">&nbsp;
+	<input type="button" value='#($$$Text("Cancel"))#' onclick="btnCancel();">
+	</div>
+
+	</form>
+	</div>
+	>
+	Quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="EscapeHTML">
+<ClassMethod>1</ClassMethod>
+<CodeMode>expression</CodeMode>
+<FormalSpec>text</FormalSpec>
+<Implementation><![CDATA[$ZCVT(text,"O","HTML")
+]]></Implementation>
+</Method>
+</Class>
+</Export>

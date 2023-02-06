@@ -1,0 +1,577 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDDispensePickList" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDDispensePickList
+	quit
+	
+#include WWWConst
+#include COMConst
+#include INConst
+#include COMGridEdit31
+#include MEDConst
+
+
+CanPrintPickList(pidDispense,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Description : Determines if Button should be enabled
+	;			
+	; Called By : MEDDispense FORMSPEC - Button(3) PickList
+	;
+	; Inputs : pidDispense
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 23-Oct-2012	shobby	SR18130.2: Check for an active admission.
+	; 24-Jul-2012	PPP		SR18067: Added Prescription Suspended check
+	; 04-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	new idLine
+	new blnOK
+	new objLine
+	new idStatus
+	new strDispenseStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidDispense) {
+		set strStatus=$$CheckAdmitted^MEDPatient(pidDispense) ;SR18130.2
+		//SR18067
+		if $$$ISOK(strStatus) {
+			if $$IsPresSuspended^MEDDispense(pidDispense,$$$MEDDispensePrescription(pYFELD)) {  ;SR18067
+				set strStatus = $$$MakeStatus("MED00424")  ;Cannot perform current operation as Prescription is suspended
+			}
+		}
+	
+ 		set idLine = ""
+		set blnOK = $$$NO
+		
+		for {
+			quit:blnOK=$$$YES
+			
+			set idLine = $order(^MEDDispenseLine(0,pidDispense,idLine))
+			quit:idLine=""
+			
+			set objLine = $get(^MEDDispenseLine(0,pidDispense,idLine,1))
+			
+			if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(0,0,1)))){			
+				if (($$$MEDDispenseLineValidatedStatus(objLine) = "accept.gif") 
+					|| ($$$MEDDispenseLineValidatedStatus(objLine) = "refuse.gif")) {
+					set blnOK = $$$YES
+				}
+			}
+			else {
+				if $$$MEDDispenseLineValidatedStatus(objLine) = "accept.gif" {
+					set blnOK = $$$YES
+				}
+			}
+		}
+		
+		if 'blnOK {
+		 	set strStatus = $$$MakeStatus("MED00401")   ; //"Aleast one line needs to be Validated"
+		}
+
+
+	}
+
+	
+	if $$$ISOK(strStatus) {
+		set idStatus = $$$MEDDispenseStatus(pYFELD)
+		if (idStatus > 2) {  ; Processed 	
+			set strDispenseStatus = $$GetDescription^WWWStatus("MEDDispense",idStatus,$get(SPRACHE))
+	 		set strStatus = $$$MakeStatus("MED00398",strDispenseStatus)   //Invalid Status (%) for current operation
+		}
+	}
+	
+	$$$YQHandler(strStatus)
+	
+	quit
+
+PickList(pidDispense)
+	;-------------------------------------------------------------------------------	
+	; Creation of the Dispense PickList
+	;
+	; Params:	pidDispense	- Dispense
+	;
+	; Returns:	
+	;
+	; History:
+	; 26-Oct-2012	shobby	SR18130.2:	Check for active admission.
+	; 03-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------	
+	new strStatus
+	new objDispense
+	
+	set strStatus = $$$OK
+	 	
+	//set strStatus = $$Transaction^COMTransaction("CreatePickTxn^MEDDispensePickList("""_pidDispense_""")",$$$YES)
+		
+	set strStatus=$$CheckAdmitted^MEDPatient(pidDispense) ;SR18130.2
+	
+	if $$$ISERR(strStatus) {
+		$$$Alert(strStatus)														;SR18130.2
+		do ReloadForm^COMUtilForm()												;SR18130.2
+	} else {
+		//Print the PickList Report
+		//If Pick Lines exist only print the Pick List Report
+		if '$data(^MEDDispensePickLine(0,pidDispense)) {
+		
+			set objDispense = $get(^MEDDispense(0,pidDispense,1))
+			do CanPrintPickList(pidDispense, objDispense)
+		 
+			if YQ = $$$YQEnable {
+				set strStatus = $$Transaction^COMTransaction("CreatePickTxn^MEDDispensePickList("""_pidDispense_""")",$$$YES)
+			
+				if $$$ISOK(strStatus) {  //If a Scanning Form then clearout IssueQty
+					if $$IsScanReq^WWW120Scan("MEDDispensePickLine") {
+						set strStatus = $$Transaction^COMTransaction("ClearIssueQty^MEDDispensePickLine("""_pidDispense_""")",1)
+					}
+	 			
+					if $$$ISOK(strStatus) {  ; Print the PickList Report (HTML)	
+						set strStatus = $$PrintPickList^MEDDispensePickList(pidDispense)
+					}
+				}
+	 		
+			} else {
+				do ReturnError^COMUtils($$$YQMessage)
+			}
+		
+		} else {     ; Print the PickList Report
+			set strStatus = $$PrintPickList^MEDDispensePickList(pidDispense)
+		}
+
+		if $$$ISOK(strStatus)&&('+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+				do GoToForm^COMUtilForm("MEDDispense",pidDispense,2)		//Go to Tab 2 (Pick)
+		}
+	}
+	quit strStatus
+
+
+CreatePickTxn(pidDispense,pidRevLine="")
+	;-------------------------------------------------------------------------------
+	; Create the Pick Lines for the Dispense
+	;
+	;
+	; Inputs: pidDispense - Dispense ID
+	;		  pidRevLine - Remove Diluents for Review line and rebuild for any other line that has the same diluent (optional)
+	;
+	; Returns:
+	;
+	; History:
+	; 29-May-2013	SCR		HEVA-953: Reset Diluent for single line review
+	; 28-May-2013	SCR		CORE-94: Add Reservations
+	; 21-Mar-2013	SCR		HEVA-908: Ensue that Diluent line start with whole numbers
+	; 20-Mar-2013	SCR		HEVA-908: Diluent lines must greater the Rx lines
+	; 30-Oct-2012	SCR		SR18132: Use Validated QTY & UOM
+	; 19-Oct-2012	SCR		SR18137: Exclude UDO Diluent from the Dispense Doucument
+	; 17-Oct-2012	SCR		SR18156: Use Inv UOM when an Item does not have a Pick Unit
+	; 16-Oct-2012	SCR		SR18132: Pick unit on Diluent
+	; 11-Oct-2012	SCR		SR18137: Exclude UDO from the Dispense Doucument
+	; 05-Oct-2012	SCR		SR18132: Pick Unit
+	; 31-Jul-2012	PPP		SR18067: Ensure Dileunt Pick line is identified
+	; 27-Jul-2012	PPP		SR18067: Has to be a Validated Dispense Line
+	; 18-Jul-2012	SCR		SR18002: Dont update Prescription Status (It is checked via UpdateStatus^MEDispense)
+	; 13-Jun-2012	PPP		SR18002.4: Added Diluent Pick Line
+	; 08-Jun-2012	PPP		SR18002.3: Update the Pick Printed Date/Time on the Prescription
+	; 05-Jun-2012	PPP		SR18002.2: Update the Pick Printed Date/Time
+	; 18-May-2012	PPP		SR18002.1: Updated the Prescription Status
+	; 09-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+#dim strStatus,idLine,objLine As  %String	
+	new strStatus,idLine,objLine,idPrescription,objDispLine,idLocn,idToLocn,idItem,idUnit,fltUnitQty
+	new idBaseUnit,fltQtyReq,lstAvailableIssues,blnNotFirst,objStorage,objBundle,fltOutstanding
+	new loopStock,fltQtyIssued,idLn,objDispense,objPres,arrDiluent,fltQty,idPickUnit,fltPickQty
+	new fltPickReqQty,idPPickUOM,objSetup,idIssueType,fltPickQtyReq,idDilUOM,idDilKey,idRxLastLine
+	new idToStorage,idToStorage,objItem
+	new idRevDilKey,idDilLine
+	
+	set objDispense 	= $get(^MEDDispense(0,pidDispense,1))
+	set idPrescription 	= $$$MEDDispensePrescription(objDispense)
+	set idLocn			= $$$MEDDispenseSupplyingLocation(objDispense)
+ 	set idToLocn		= $$$MEDDispenseDestinationLocation(objDispense)
+ 	set idRevDilKey		= "" ; HEVA-953
+	
+ 	set strStatus		= $$$OK
+	; SR18132 vvvv
+ 	set objSetup=$get(^MEDPrescriptionSetup(0,YM,1)) 
+ 	set idIssueType= $$$MEDPrescriptionSetupIssueType(objSetup)
+ 	set:idIssueType="" idIssueType="I"
+	; SR18132 ^^^^
+	 
+	;if (idPrescription '= "") && ('$data(^MEDDispensePickLine(0,pidDispense))) { 
+	if (idPrescription '= "") && (('$data(^MEDDispensePickLine(0,pidDispense))) || ( pidRevLine'="")) { ; HEVA-953
+
+		set idLine = "" 
+	
+		for {
+		
+			set idLine = $order(^MEDDispenseLine(0,pidDispense,idLine))
+			quit:idLine=""
+			quit:pidRevLine'="" ; HEVA-953
+			set idLn=0
+		 	set blnNotFirst    	= $$$NO
+
+			set objDispLine=$get(^MEDDispenseLine(0,pidDispense,idLine,1))
+		
+			//Has to be a Validated Dispense Line
+			continue:$$$MEDDispenseLineValidatedStatus(objDispLine)'="accept.gif"
+			continue:$$$MEDDispenseLineUDO(objDispLine)=$$$YES ; SR18137
+
+			set idItem      = $$$MEDPrescriptionLineItem(objDispLine)
+			//if $$$MEDDispenseLineDiluentUOM(objDispLine)'="" {
+			//	set idUnit = $$$MEDDispenseLineDiluentUOM(objDispLine)
+			//	} else {
+			set idUnit = $$$MEDDispenseLineIssueUOM(objDispLine)
+			//}
+			
+			//if $$$MEDDispenseLineDiluentQty(objDispLine) '="" {
+			//	set fltUnitQty = $$$MEDDispenseLineDiluentQty(objDispLine)
+			//}
+			
+			set fltUnitQty = $$$MEDDispenseLineIssueQuantity(objDispLine)
+			
+			set idBaseUnit = $$$INARTUnitofMeasure($get(^INART(0,idItem,1)))
+			set fltQtyReq  = $$CalcInventoryQty^INUOMConversion(idItem,idUnit,fltUnitQty)
+ 			set fltOutstanding 	= fltQtyReq
+
+			; set idPPickUOM      = $$GetPickUOM^INUOMConversion(idItem,idIssueType,.strStatus) 					; SR18132
+			;set idPPickUOM      = $$GetPickUOM^INUOMConversion(idItem,idIssueType,.strStatus, $$$YES) ; SR18156					; SR18132
+			set idPPickUOM		= $$$MEDDispenseLineIssueUOM(objDispLine)		; SR18132
+			set fltPickQtyReq	=  $$$MEDDispenseLineIssueQuantity(objDispLine) ; SR18132
+			;set fltPickQtyReq	= $$Convert^INUOMConversion(idItem,fltQtyReq,idBaseUnit,idPPickUOM,   $$$YES) 	; SR18132
+			set lstAvailableIssues = ##class(alDRP.iDRP).SourceIssue(idItem,idLocn,fltQtyReq)
+ 	
+			if lstAvailableIssues.Count() > 0 {
+				for loopStock=1:1:lstAvailableIssues.Count() {
+					set objStorage   = lstAvailableIssues.GetAt(loopStock).Storage
+					set objBundle    = lstAvailableIssues.GetAt(loopStock).Bundle
+					set fltQtyIssued = lstAvailableIssues.GetAt(loopStock).QtyToIssue
+					; CORE-94 vvvv
+					set objItem      = lstAvailableIssues.GetAt(loopStock).Item
+					set idToStorage	 = ""
+					set objToStorage = ""
+					if idToLocn'="" {
+						set idToStorage = $$GetStorage^INIssueAuto(idItem,idToLocn,,.idToStorage)
+					}
+			
+					if blnNotFirst = $$$YES {
+						set idLn    = $increment(idLn)
+						set idLine = (idLine\1)_"."_idLn
+					} else {
+						set blnNotFirst = $$$YES
+					}
+					set sc = $$$OK
+					;set objReservation = ##class(alDRP.dPlannedMovement).%New()
+					;set objReservation.MovementType = ##class(alDRP.dMovementType.MediacalDispense).%New()
+					;set objReservation.Item         = objItem
+					;set objReservation.FromLocn     = objStorage.Location
+					;set objReservation.FromStorage  = objStorage
+					;set objReservation.ToLocn       = idToLocn
+					;set objReservation.ToStorage    = idToStorage
+					;set objReservation.Bundle       = objBundle
+					;set objReservation.QtyRequired  = fltQtyIssued
+					;set objReservation.Reference    = pidDispense
+					;set objReservation.LineNumber   = idLine
+			
+					;set sc = objReservation.ChangeState(3)
+					
+					if $$$ISOK(sc) {
+						set objLine = ""			
+						set $$$MEDDispensePickLineItem(objLine)				= idItem
+						;set $$$MEDDispensePickLineRequestedQty(objLine)	= fltQtyReq
+						set $$$MEDDispensePickLineRequestedQty(objLine)		= fltPickQtyReq ; SR18132
+						set $$$MEDDispensePickLineIssueQty(objLine)			= fltQtyIssued
+						set $$$MEDDispensePickLineIssueUOM(objLine)			= idBaseUnit
+						set $$$MEDDispensePickLineFromStorage(objLine) 		= objStorage.Code
+						set $$$MEDDispensePickLineBundle(objLine)      		= objBundle.%Id()
+						set $$$MEDDispensePickLinePickUOM(objLine)			= idPPickUOM 		; SR18132
+						set $$$MEDDispensePickLinePickQty(objLine)			= fltPickQtyReq 	; SR18132
+						set $$$MEDDispensePickLineToStorage(objLine)		= idToStorage
+						;if idToLocn'="" {
+						;	set $$$MEDDispensePickLineToStorage(objLine) = $$GetStorage^INIssueAuto(idItem,idToLocn)
+						;}
+			
+					} else {
+						set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+					}
+					if $$$ISOK(strStatus) {
+						set strStatus = $$$Save("MEDDispensePickLine",pidDispense_","_idLine,objLine,1)			
+					
+						set fltOutstanding = fltOutstanding - fltQtyIssued
+					}
+					; CORE-94 ^^^^
+					quit:$$$ISERR(strStatus)
+					
+				}
+			}
+			
+			//Remaining Quantity not accounted for
+			if $$$ISOK(strStatus) && (fltOutstanding>0) {
+				set objLine = ""			
+				set $$$MEDDispensePickLineItem(objLine)				= idItem
+				;set $$$MEDDispensePickLineRequestedQty(objLine)	= fltQtyReq
+				set $$$MEDDispensePickLineRequestedQty(objLine)		= fltPickQtyReq ; SR18132
+				set $$$MEDDispensePickLineIssueQty(objLine)			= fltOutstanding
+				set $$$MEDDispensePickLineIssueUOM(objLine)			= idBaseUnit
+				set $$$MEDDispensePickLinePickUOM(objLine)			= idPPickUOM 		; SR18132
+				set $$$MEDDispensePickLinePickQty(objLine)			= fltOutstanding 	; SR18132
+				//following will not exist
+				//set $$$MEDDispensePickLineFromStorage(objLine) 		= objStorage.Code
+				//set $$$MEDDispensePickLineBundle(objLine)      		= objBundle.%Id()
+				if idToLocn'="" {
+					set $$$MEDDispensePickLineToStorage(objLine) = $$GetStorage^INIssueAuto(idItem,idToLocn)
+				}
+		
+				if blnNotFirst = $$$YES {
+					set idLn    = $increment(idLn)
+					set idLine = (idLine\1)_"."_idLn
+				} else {
+					set blnNotFirst = $$$YES
+				}
+				set strStatus = $$$Save("MEDDispensePickLine",pidDispense_","_idLine,objLine,1)			
+			}
+			
+		}	
+
+		
+		// **********SR18002.4 Diluent Item
+		if $$$ISOK(strStatus) {
+
+			set idRxLastLine = $order(^MEDPrescriptionLine(YM,idPrescription,""),-1) ; HEVA-908
+			kill arrDiluent
+			set idLine=""
+			for {
+		
+				set idLine = $order(^MEDDispenseLine(0,pidDispense,idLine))
+				quit:idLine=""
+
+				set objDispLine=$get(^MEDDispenseLine(0,pidDispense,idLine,1))
+				continue:$$$MEDDispenseLineDiluent(objDispLine)=""
+			
+				//SR18067:Has to be a Validated Dispense Line
+				continue:$$$MEDDispenseLineValidatedStatus(objDispLine)'="accept.gif"
+				continue:$$$MEDDispenseLineUDO(objDispLine)=$$$YES ; SR18137
+				
+				set fltUnitQty 	= $$$MEDDispenseLineDiluentQty(objDispLine)
+				set idItem 		= $$$MEDDispenseLineDiluent(objDispLine)
+				//set idUnit 		= $$$MEDDispenseLineDiluentUOM(objDispLine)
+				//set fltQty  	= $$CalcInventoryQty^INUOMConversion(idItem,idUnit,fltUnitQty)
+				set fltQty		= $$$MEDDispenseLineDiluentQty(objDispLine)
+				; SR18132 vvvv
+				set idDilUOM	= $$$MEDDispenseLineDiluentUOM(objDispLine) 
+				set idDilKey	= idItem_Y_idDilUOM
+				; HEVA-953 vvv
+				;set arrDiluent(idDilKey)=$get(arrDiluent(idDilKey))+ fltQty	
+				;set arrDiluent(idItem)=$get(arrDiluent(idItem))+ fltQty	
+				; Clear any diluent line that was used by the reviewed line
+				if (pidRevLine'="")&&(pidRevLine= idLine) {
+					set idRevDilKey = idDilKey
+					set idDilLine	= idRxLastLine
+					for {
+						set idDilLine = $order(^MEDDispensePickLine(0,pidDispense,idDilLine))
+						quit:idDilLine=""
+						set objLine = $get(^MEDDispensePickLine(0,pidDispense,idDilLine,1))
+						if idItem = $$$MEDDispensePickLineItem(objLine) && (idDilUOM = $$$MEDDispensePickLinePickUOM(objLine)) {
+							do ^WWWSKILL("MEDDispensePickLine",pidDispense_$$$COMMA_idDilLine)
+							do ClearReservation^INReservation(pidDispense,61,,idDilLine) 
+
+						}
+					}
+					
+				} else {
+					set arrDiluent(idDilKey)=$get(arrDiluent(idDilKey))+ fltQty
+				}
+				; HEVA-953 ^^^
+				
+				
+			}
+	
+			//Start Diluent Array
+			;set idItem = ""
+			;for	{
+			;	set idItem = $order(arrDiluent(idItem))
+			;	quit:idItem=""
+			;			
+			;	set idLn=0
+			;	//Get the Next Pick Line
+			;	set idLine=+$order(^MEDDispensePickLine(0,pidDispense,""),-1)+1
+			;	
+		 	;	set blnNotFirst    	= $$$NO
+			;	set fltQtyReq 	= $get(arrDiluent(idItem))
+			 
+			set idDilKey = ""
+			for	{
+				set idDilKey = $order(arrDiluent(idDilKey))
+				quit:idDilKey=""
+				; HEVA-953 vvv
+				if pidRevLine'="" && (idRevDilKey'=idDilKey) {
+					continue  ; If review line only do lines with same diluent
+				}
+				; HEVA-953 ^^^
+				set idItem 		= $piece(idDilKey,Y,1)
+				set idDilUOM	= $piece(idDilKey,Y,2)
+				set idLn=0
+				//Get the Next Pick Line
+				; HEVA-908 vvvv Ensure the diluent lines are greater than the last Rx line
+				;set idLine=+$order(^MEDDispensePickLine(0,pidDispense,""),-1)+1
+				set idLine=+$order(^MEDDispensePickLine(0,pidDispense,""),-1)+1\1
+				if (idLine'>idRxLastLine) {
+					set idLine	= idRxLastLine+1
+				}
+				; HEVA-908 ^^^^
+		 		set blnNotFirst    	= $$$NO
+				set fltQtyReq 	= $get(arrDiluent(idDilKey))
+				; SR18132 ^^^^
+				set idBaseUnit 	= $$$INARTUnitofMeasure($get(^INART(0,idItem,1)))
+				; set idPPickUOM      = $$GetPickUOM^INUOMConversion(idItem,idIssueType,.strStatus) 					; SR18132
+				set idPPickUOM      = idDilUOM ; SR18132
+				;set idPPickUOM      = $$GetPickUOM^INUOMConversion(idItem,idIssueType,.strStatus, $$$YES) ; SR18156					; SR18132
+				set fltPickQtyReq	=   fltQtyReq	; SR18132
+				;set fltPickQtyReq	= $$Convert^INUOMConversion(idItem,fltQtyReq,idBaseUnit,idPPickUOM,   $$$NO) 	; SR18132
+				
+				if fltQtyReq {
+					set fltOutstanding = $$CalcInventoryQty^INUOMConversion(idItem,idPPickUOM,fltQtyReq)
+					set lstAvailableIssues = ##class(alDRP.iDRP).SourceIssue(idItem,idLocn,fltQtyReq)
+				
+				////////////
+					for loopStock=1:1:lstAvailableIssues.Count() {
+						set objStorage   = lstAvailableIssues.GetAt(loopStock).Storage
+						set objBundle    = lstAvailableIssues.GetAt(loopStock).Bundle
+						set fltQtyIssued = lstAvailableIssues.GetAt(loopStock).QtyToIssue
+					; CORE-94 vvvv
+					set objItem      = lstAvailableIssues.GetAt(loopStock).Item
+					set idToStorage	 = ""
+					set objToStorage = ""
+					if idToLocn'="" {
+						set idToStorage = $$GetStorage^INIssueAuto(idItem,idToLocn,,.idToStorage)
+					}
+			
+					if blnNotFirst = $$$YES {
+						set idLn    = $increment(idLn)
+						set idLine = (idLine\1)_"."_idLn
+					} else {
+						set blnNotFirst = $$$YES
+					}
+					set sc=$$$OK
+					;set objReservation = ##class(alDRP.dPlannedMovement).%New()
+					;set objReservation.MovementType = ##class(alDRP.dMovementType.MediacalDispense).%New()
+					;set objReservation.Item         = objItem
+					;set objReservation.FromLocn     = objStorage.Location
+					;set objReservation.FromStorage  = objStorage
+					;set objReservation.ToLocn       = idToLocn
+					;set objReservation.ToStorage    = idToStorage
+					;set objReservation.Bundle       = objBundle
+					;set objReservation.QtyRequired  = fltQtyIssued
+					;set objReservation.Reference    = pidDispense
+					;set objReservation.LineNumber   = idLine
+			
+					;set sc = objReservation.ChangeState(3)
+					
+					if $$$ISOK(sc) {
+			
+						set objLine = ""			
+						set $$$MEDDispensePickLineItem(objLine)				= idItem
+						set $$$MEDDispensePickLineIsDiluent(objLine)		= $$$YES		//SR18067
+						;set $$$MEDDispensePickLineRequestedQty(objLine)	= fltQtyReq
+						set $$$MEDDispensePickLineRequestedQty(objLine)		= fltQtyReq ; SR18132
+						set $$$MEDDispensePickLineIssueQty(objLine)			= fltQtyIssued
+						set $$$MEDDispensePickLineIssueUOM(objLine)			= idBaseUnit
+						set $$$MEDDispensePickLineFromStorage(objLine) 		= objStorage.Code
+						set $$$MEDDispensePickLineBundle(objLine)      		= objBundle.%Id()
+						set $$$MEDDispensePickLinePickUOM(objLine)			= idPPickUOM 	; SR18132
+						;set $$$MEDDispensePickLinePickQty(objLine)			= fltQtyIssued 	; HEVA-953
+						set $$$MEDDispensePickLineToStorage(objLine)		= idToStorage
+			
+						} else {
+							set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+						}
+						if $$$ISOK(strStatus) {
+							set strStatus = $$$Save("MEDDispensePickLine",pidDispense_","_idLine,objLine,1)			
+						
+							set fltOutstanding = fltOutstanding - fltQtyIssued
+						}
+						; CORE-94 ^^^^
+						quit:$$$ISERR(strStatus)
+					
+					}
+									
+			
+					//Remaining Quantity not accounted for
+					if $$$ISOK(strStatus) && (fltOutstanding>0) {
+						set objLine = ""			
+						set $$$MEDDispensePickLineItem(objLine)				= idItem
+						set $$$MEDDispensePickLineIsDiluent(objLine)		= $$$YES		//SR18067
+						;set $$$MEDDispensePickLineRequestedQty(objLine)	= fltQtyReq
+						set $$$MEDDispensePickLineRequestedQty(objLine)		= fltPickQtyReq ; SR18132
+						set $$$MEDDispensePickLineIssueQty(objLine)			= fltOutstanding
+						set $$$MEDDispensePickLineIssueUOM(objLine)			= idBaseUnit
+						set $$$MEDDispensePickLinePickUOM(objLine)			= idPPickUOM 		; SR18132
+						set $$$MEDDispensePickLinePickQty(objLine)			= fltOutstanding 	; SR18132
+						//following will not exist
+						//set $$$MEDDispensePickLineFromStorage(objLine) 		= objStorage.Code
+						//set $$$MEDDispensePickLineBundle(objLine)      		= objBundle.%Id()
+						if idToLocn'="" {
+							set $$$MEDDispensePickLineToStorage(objLine) = $$GetStorage^INIssueAuto(idItem,idToLocn)
+						}
+		
+						if blnNotFirst = $$$YES {
+							set idLn    = $increment(idLn)
+							set idLine = (idLine\1)_"."_idLn
+						} else {
+							set blnNotFirst = $$$YES
+						}
+						set strStatus = $$$Save("MEDDispensePickLine",pidDispense_","_idLine,objLine,1)			
+
+					} //End Remaining
+				
+				
+				} //if fltQtyReq
+		
+			}	//End Diluent Array
+	
+		} //$$$ISOK(strStatus)
+		
+		// ********** Diluent Item
+		 
+		//SR18002.1			
+		if $$$ISOK(strStatus) {
+			set objPres = $get(^MEDPrescription(0,idPrescription,1))
+			;set $$$MEDPrescriptionStatus(objPres) 			= 2		//Awaiting Dispensing
+			set $$$MEDPrescriptionPickPrinted(objPres) 		= $horolog	//SR18002.3
+			set strStatus = $$$Save("MEDPrescription",idPrescription,objPres,$$$YES)
+		}
+
+	}
+
+	//SR18004.2
+ 	if $$$ISOK(strStatus) {	
+		set $$$MEDDispensePickListPrinted(objDispense) = $horolog
+		set strStatus = $$$Save("MEDDispense",pidDispense,objDispense,$$$YES)
+	}
+	
+	quit strStatus
+
+
+PrintPickList(pidDispense)
+	;-------------------------------------------------------------------------------	
+	; Print the Dispense PickList
+	;
+	; Params:	pidDispense	- Dispense
+	;
+	; Returns:	
+	;
+	; History:
+	; 10-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------	
+	new strStatus
+	
+	set strStatus = $$$OK
+	if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+		do RunReportListaSeparacaoDispensacao^VARJasperRunReport(pidDispense)
+	}
+	quit strStatus
+]]></Routine>
+</Export>

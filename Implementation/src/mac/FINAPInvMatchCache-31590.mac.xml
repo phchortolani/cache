@@ -1,0 +1,384 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvMatchCache" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvMatchCache
+	
+#include COMSYS
+#include FINConst
+#include INConst
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^FINAPInvMatchCache("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1) 		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+IsCurrent(pobjLine="")
+	;-------------------------------------------------------------------------------
+	; Check whether cache has been updated since this line was added to 3WM
+	;
+	; Returns: bln - if current
+	;
+	; History:
+	; 17-Jun-2005	shobby	Code Check.
+	; 17-Jun-2005	JW		Created SR12484
+	;-------------------------------------------------------------------------------
+	new blnCurrent,idInvMatch
+	
+	set blnCurrent = $$$YES
+	
+	set idInvMatch = $$$FINAPInvLineCacheLink(pobjLine)
+	if idInvMatch'="" {
+		if $$$FINAPInvLineAddedFromCache(pobjLine) '= $$$FINAPInvMatchCacheAddedToCache($get(^FINAPInvMatchCache(0,idInvMatch,1))) {
+			set blnCurrent = $$$NO
+		}
+	}
+	quit blnCurrent
+	
+	
+CurrentStatus(pidInvoice="")
+	;-------------------------------------------------------------------------------
+	; Check whether cache has been updated since lines have been added to 3WM
+	;
+	; Returns: status
+	;
+	; History:
+	; 05-Aug-2009	GRF		Clarify strLineList is not a $lb value
+	; 20-Sep-2006	GRF		Consolidate NEW
+	; 09-Jun-2005	JW/RW	Created SR12484
+	;-------------------------------------------------------------------------------
+	new idInvMatch,idLineNo,strLineList,objLine,strStatus
+	
+	set strStatus = $$$OK
+	
+	quit:pidInvoice="" strStatus
+	quit:$$$FINAPInvCostsPosted($get(^FINAPInv(0,pidInvoice,1))) strStatus
+	
+	set strLineList = ""
+	set idLineNo      = ""
+	for {
+		set idLineNo = $order(^FINAPInvLine(0,pidInvoice,idLineNo))
+		quit:idLineNo=""
+		
+		set objLine = $get(^FINAPInvLine(0,pidInvoice,idLineNo,1))
+		if objLine'="" {
+			if '$$IsCurrent(objLine) {
+				set strLineList = strLineList_", "_idLineNo
+			}
+		}
+	}
+	if strLineList'="" {
+		set $extract(strLineList,1,2) = ""
+		set strStatus = $listbuild("Fin00796",strLineList)
+	} ; "The source data for line(s) %1 has been modified. Delete and re-add the line(s) before continuing."
+	quit strStatus
+	
+	
+Post(pidInvoice="")
+	;-------------------------------------------------------------------------------
+	; Update the invoice match cache global
+	;
+	; Called By: PostCostsNow^FINAPInvPostCost
+	;
+	; Returns:
+	;
+	; History:
+	; 20-May-2010	GRF		SR17311: Confusion between IU and OU in FINAPInvLine;
+	; 							variable prefixes
+	; 20-Sep-2006	GRF		Consolidate NEW
+	; 09-Mar-2006	JW		SR14265: Added +'s as values could be compared
+	; 08-Jun-2005	JW/RW	Created SR12484
+	;-------------------------------------------------------------------------------
+	new curInvoiced,fltConvFactor,fltInvQty,fltUnmatchedQty
+	new idInvLine,idInvMatch,idLineNo,idNewInvMatch
+	new objInvMatch,objLine,objNewInvMatch,tmsNow,strStatus
+	
+	$$$LogR("Post",pidInvoice)
+	
+	set strStatus = $$$OK
+	quit:pidInvoice="" strStatus
+	
+	set idLineNo = ""
+	for {
+		set idLineNo = $order(^FINAPInvLine(0,pidInvoice,idLineNo))
+		quit:idLineNo=""
+		
+		set objLine = $get(^FINAPInvLine(0,pidInvoice,idLineNo,1))
+		if objLine'="" {
+			set idInvMatch = $$$FINAPInvLineCacheLink(objLine)
+	$$$LogRx("P1:"_idInvMatch)
+			
+			if idInvMatch'="" {
+				set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+				
+				set tmsNow = $horolog
+				set $$$FINAPInvMatchCacheAddedToCache(objInvMatch) = tmsNow
+				
+				set fltUnmatchedQty = +$$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) ; IU
+				set fltInvQty       = +$$$FINAPInvLineInvoiceQuantity(objLine)             ; OU
+				
+				set fltConvFactor = $$GetUOMConversion^INUOMConversion($$$FINAPInvLineItem(objLine),$$$FINAPInvLineOrderUnit(objLine)) ; SR17311
+				set fltInvQty     = fltInvQty * fltConvFactor           ; Conversion Order to Inventory ; SR17311
+				
+		; ***** Partial Invoicing - create new FINAPInvMatchCache entry for balance
+		;-----------------------------------
+				if '$$$FINAPInvLineClosed(objLine) && (fltInvQty'=fltUnmatchedQty) {
+					set objNewInvMatch = objInvMatch
+					
+					set $$$FINAPInvMatchCacheLink(objNewInvMatch)              = idInvMatch // Save Link
+					set $$$FINAPInvMatchCacheUnmatchedQuantity(objNewInvMatch) = fltUnmatchedQty - fltInvQty
+					
+					set curInvoiced = $$$FCMult($$GetAllocatedVarianceCost^FINAPInvPrePostCost(pidInvoice,idLineNo),fltInvQty)
+					set $$$FINAPInvMatchCachePreviouslyInvoicedValue(objNewInvMatch) = $$$FCAdd(curInvoiced,$$$FINAPInvMatchCachePreviouslyInvoicedValue(objInvMatch))
+					
+					set idNewInvMatch = $$^WWWNEXT("FINAPInvMatchCache")
+	$$$LogRx("P2:"_idNewInvMatch_"<"_objNewInvMatch)
+					set strStatus = $$$Save("FINAPInvMatchCache",idNewInvMatch,objNewInvMatch,$$$YES)
+				}
+				
+		; Update current FINAPInvMatchCache line & timestamp FINAPInvLine
+		;-----------------------------------
+				if $$$ISOK(strStatus) {
+					set idInvLine = pidInvoice_","_idLineNo
+					
+					set $$$FINAPInvMatchCacheInvoiceNumber(objInvMatch)     = idInvLine
+					set $$$FINAPInvMatchCacheCompleted(objInvMatch)         = $$$YES
+					set $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) = 0
+					
+	$$$LogRx("P3:"_idInvMatch_"<"_objInvMatch)
+					set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+					
+					if $$$ISOK(strStatus) {
+						set $$$FINAPInvLineAddedFromCache(objLine) = tmsNow
+						set strStatus = $$$Save("FINAPInvLine",idInvLine,objLine,1)
+					}
+				}
+				quit:$$$ISERR(strStatus)
+			}
+		}
+	}
+	quit strStatus
+	
+	
+ClosedDefault(&pobjInvLine) 
+	;-------------------------------------------------------------------------------
+	; Set the default of the closed checkbox
+	; 
+	; Called By: AddLine^FINAPInvSearch                        (form FINAPInv : "Match Invoices" button)
+	;            UpdateForQuantityChange^FINAPInvLineEvents2   (form FINAPInvLine : OnBlur)
+	; Params:
+	;
+	; ByRefs: pobjInvLine - FINAPInvLine record - closed is updated
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Mar-2006	JW		SR14265: Created
+	;-------------------------------------------------------------------------------
+	new idOrder,idxOrder,idxLine,idCache,idInvoice,objInvLine,fltInvQty
+	
+	set idOrder = $$$FINAPInvLineOrderNumber(pobjInvLine)
+	
+	$$$LogR("ClosedDefault",idOrder)
+	
+	set idxOrder = $$$Index($$$KEY1(idOrder))
+	set idxLine  = $$$Index($$$KEY2(idOrder))
+	
+	set fltInvQty = +$$$FINAPInvLineInvoiceQuantity(pobjInvLine)
+	
+	set idCache=""
+	for {
+		set idCache=$order(^FINAPInvMatchCaches(0,1,idxOrder,idxLine,idCache))
+		quit:idCache=""
+		
+		set idInvoice = $$$FINAPInvMatchCacheInvoiceNumber($get(^FINAPInvMatchCache(0,idCache,1)))
+		
+		if idInvoice'="" {
+			set objInvLine = $get(^FINAPInvLine(0,$$$KEY1(idInvoice),$$$KEY2(idInvoice),1))
+			set fltInvQty  = fltInvQty + $$$FINAPInvLineInvoiceQuantity(objInvLine)
+		}
+	}
+	set $$$FINAPInvLineClosed(pobjInvLine) = (+$$$FINAPInvLineOrderQuantity(pobjInvLine)=fltInvQty)
+	quit
+	
+	
+UpdatePrice(pidOrder="",pidOrderLine="",pfltRecPrice,pidReceipt,pidSummary,pidRecUnit) 
+	;-------------------------------------------------------------------------------
+	; Update the FINAPInvMatchCache record with any change in price from original order
+	; 
+	; Receipt Price converted to equivalent price in Order Unit for update in FAIMC
+	; 
+	; Called by : Receive^INReceiptButtonP (from PostTxn^INReceiptButtonP)
+	;                - only for standard or bonus line types
+	; 
+	; History:
+	; 10-Feb-2010	GRF		SR17138: Use new Ordered Unit data 
+	; 24-Aug-2009	PPP		SR16837/1: Added Error Status is idInvMatch not found
+	; 13-Aug-2009	PPP		SR16837: Need to update the Order Cost based on the REC
+	; 							Unit Cost; Get the correct FINAPInvMatchCache ID
+	; 							based on Rec/Line
+	; 26-Jun-2009	DWR		SR16602: change the record updating to the last record.
+	; 17-Jun-2009	DWR		SR16602: don't update the unmatched qty here, just the price.
+	; 							removed unneeded parameter. added one.
+	; 17-Apr-2009	DWR		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,fltUnmatchedQty,idInvMatch,idItem,idOrdUnit,idxOrder,idxOrderLine
+	new idxRec,idxRecLine,objInvMatch,objOrderLine,strStatus
+	
+	$$$LogR("UpdatePrice",$get(pidReceipt)_","_$get(pidSummary)_"<"_pidOrder_","_pidOrderLine_":"_$get(pfltRecPrice))
+	
+	set strStatus = $$$OK
+	if pidOrder'="" {	
+		set idxOrder     = $$$Index(pidOrder)
+		set idxOrderLine = $$$Index(pidOrderLine)
+ 		set idxRec       = $$$Index(pidReceipt)
+		set idxRecLine   = $$$Index(pidSummary)
+		
+		set idInvMatch = $order(^FINAPInvMatchCaches(0,6,idxRec,idxRecLine,""),-1)            ; Last Entry - Based on ReceiptSummary/Line
+	$$$LogRx("UP1:"_idInvMatch)
+	
+		if idInvMatch="" {
+			set idInvMatch = $order(^FINAPInvMatchCaches(0,1,idxOrder,idxOrderLine,""),-1)    ; Last Entry - Based on Order/Line
+	$$$LogRx("UP2:"_idInvMatch)
+		}
+		
+		if idInvMatch'="" {
+			set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+			
+			set objOrderLine = $$GetObjOrderLine^INRECSummaryUtil(pidOrder,pidOrderLine)
+			set idItem       = $$GetOrderLineItem^INRECSummaryUtil(objOrderLine)
+		;	set idOrdUnit    = $$QtyUnit^INRECSummaryUtil(objOrderLine)  ; SR17138
+			set idOrdUnit    = $$OrderUnit^INRECSummaryUtil(objOrderLine)
+			set fltConv      = $$GetUOMConvBetweenUnits^INUOMConversion(idItem,idOrdUnit,pidRecUnit)
+			if fltConv {
+				set $$$FINAPInvMatchCacheEach(objInvMatch) = +$justify(pfltRecPrice/fltConv,0,$$DPforInventoryCost^INVORG())
+			}
+	$$$LogRx("UP3:"_idInvMatch_"<"_objInvMatch)
+			set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+		
+		} else {
+			set strStatus = $$$MakeStatus("Fin00870")    ; "No invoice data was found." 
+		}
+	}
+ 	quit strStatus
+ 	
+ 	
+GetUnitCost(pidOrder="",pidOrderLine="")
+	;-------------------------------------------------------------------------------
+	; Set the correct unit cost to the INRECSummary Record to avoid variances at 
+	; posting of the receipt / invoice one step
+	; 
+	; Called by: CreateViaOrderLine^INRECSummary
+	; 
+	; ByRefs: 	pidOrder     - Order number 
+	; 			pidOrderLine - Order Line number
+	; 			
+	; Returns:  fltUnitCost - unit cost as per the FINAPInvMatchCache record based
+	;                         on order unit
+	;			NOTE : order unit in INAUFP record has been moved from D40 to D449
+	;			       with SR17138
+	;
+	; History:
+	; 01-May-2009	DWR		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new fltUnitCost,idMatch,objMatch
+	
+	set fltUnitCost = ""
+	set idMatch = $order(^FINAPInvMatchCaches(0,1,$$$Index(pidOrder),$$$Index(pidOrderLine),""),-1)
+	if idMatch'="" {
+		set objMatch = $get(^FINAPInvMatchCache(0,idMatch,1))
+		if objMatch'="" {
+			set fltUnitCost = $$$FINAPInvMatchCacheEach(objMatch)
+		}
+	}
+	quit fltUnitCost
+	
+	
+CreateInvoice(pidReceipt,pidRecLine,pidItem,pidLocn,pidStore,pdteReceipt,pidSupp,pfltRecvdQtyOU,pfltCostOU)
+	;-------------------------------------------------------------------------------
+	; Create a FINAPInvMatchCache Record, if there is no order (Receipt without order)
+	; 
+	; Called by: ProcessAllocations^INReceiptButtonP
+	;           [PostInvoice^INReceiptInvoice - cancelled]
+	; 
+	; ByRefs:	pidReceipt     - Receipt Number
+	; 			pidRecLine     - Receipt Line Number
+	; 			pidItem        - Item No.
+	; 			pidLocn        - Receiving Location
+	; 			pidStore       - Receipt Storage
+	; 			pdteReceipt    - Date[.seq]           SR16361 => +$h without .seq
+	; 			pidSupp        - Supplier 
+	; 			pfltRecvdQtyOU - Qty Receipted
+	; 			pfltCostOU     - Item Unit Cost (in Order Units)
+	; 			
+	; Returns: 	strStatus
+	;
+	; History:
+	; 30-Oct-2009	GRF		SR17000: move NextKey next to save
+	; 06-Oct-2009	GRF		SR16928: Split receipt date and time
+	; 08-Jul-2009	GRF		SR16689: Add missing data - Posting Receipt w/o Order
+	; 							sets record as "Receipted"
+	; 13-May-2009	DWR		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new idMatchCache,objMatch,strStatus
+	
+	$$$LogR("CreateInvoice",pidReceipt_","_pidRecLine_","_pidItem_","_pidLocn_","_pidSupp_","_pfltRecvdQtyOU_","_pfltCostOU)
+	$$$LogRx("Date:"_pdteReceipt)
+	
+	set strStatus = $$$OK
+	
+	set objMatch=""
+	set $$$FINAPInvMatchCacheItem(objMatch)              = pidItem
+	;et $$$FINAPInvMatchCacheSourceOrder()               = 0?
+	;et $$$FINAPInvMatchCacheOrderLine()                 = 0?
+	set $$$FINAPInvMatchCacheOrderDate(objMatch)         = +$horolog
+	set $$$FINAPInvMatchCacheOrderTime(objMatch)         = $piece($horolog,",",2)
+	
+	;et $$$FINAPInvMatchCacheOrderProject()
+	set $$$FINAPInvMatchCacheLocation(objMatch)          = pidLocn
+	set $$$FINAPInvMatchCacheStockLocation(objMatch)     = pidStore       ;  From INRECLine not INRECSummary
+	set $$$FINAPInvMatchCacheReceiptDate(objMatch)       = +pdteReceipt
+	set $$$FINAPInvMatchCacheReceiptTime(objMatch)       = $piece(pdteReceipt,",",2)
+	
+	;et $$$FINAPInvMatchCacheImportNumber()
+	set $$$FINAPInvMatchCacheReceiveKeys(objMatch)       = "0,0,"_pidLocn_","_pidStore_","_pdteReceipt  ; From INRECLine not INRECSummary
+	set $$$FINAPInvMatchCacheSupplier(objMatch)          = pidSupp
+	set $$$FINAPInvMatchCacheReceipted(objMatch)         = $$$YES
+	set $$$FINAPInvMatchCacheCompleted(objMatch)         = $$$NO
+	
+	;et $$$FINAPInvMatchCacheInvoiceNumber()
+	set $$$FINAPInvMatchCacheOrderQuantity(objMatch)     = pfltRecvdQtyOU
+	set $$$FINAPInvMatchCacheTotalQuantity(objMatch)     = pfltRecvdQtyOU
+	set $$$FINAPInvMatchCacheUnmatchedQuantity(objMatch) = pfltRecvdQtyOU
+	set $$$FINAPInvMatchCacheAddedToCache(objMatch)      = $horolog
+	
+	;et $$$FINAPInvMatchCachePreviouslyInvoicedValue()
+	;et $$$FINAPInvMatchCacheLink()
+	set $$$FINAPInvMatchCacheReceiptNumber(objMatch)     = pidReceipt
+	set $$$FINAPInvMatchCacheReceiptLine(objMatch)       = pidRecLine
+	set $$$FINAPInvMatchCacheEach(objMatch)              = pfltCostOU
+	
+	set idMatchCache = $$$NextKey("FINAPInvMatchCache")
+	$$$LogRx("CI:"_idMatchCache_"<"_objMatch)
+	set strStatus = $$$Save("FINAPInvMatchCache",idMatchCache,objMatch,$$$YES)
+	
+	quit strStatus
+	
+	; from GetItemToolTip^FINAPInvLineDisplay  -  Reload 3WM invoice for entry generated for GRw/oO
+	; and GetUnitCost^FINAPInvSearch
+	;   matches keys from INWEFREI
+	; 
+	;			set strKeys = $$$FINAPInvMatchCacheReceiveKeys($get(^FINAPInvMatchCache(0,idInvMatch,1)))
+	;			
+	;			set idLocation	= $$$KEY1(strKeys)
+	;			set dteCreated	= $$$KEY2(strKeys)
+	;			set idUser		= $$$KEY3(strKeys)
+	;			set counter		= $$$KEY4(strKeys)
+	;			
+	;			set objINWEFREI = $get(^INWEFREI(0,idLocation,dteCreated,idUser,counter,1))
+	
+	; In other cases (INSHIPINFOCOSTSAllocn) matches keys in INWEAUF
+	
+]]></Routine>
+</Export>

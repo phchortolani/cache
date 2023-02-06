@@ -1,0 +1,1527 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INAUF" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INAUF
+#include INConst
+#include INAConst
+#include COMSYS
+#include %occInclude
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		ANZEIGE ARTIKEL
+	;
+	; ANZEIGE DER ARTIKEL ZUR AUSWAHL  ;Show the item Selection 
+	; DIE AUSWAHL DES ARTIKELS ERFOLGT, WENN EINE MENGE EINGETRAGEN WIRD
+	; WENN EINE MENGE AUSGEWÄHLT WURDE SPEICHERN DER ARTIKEL IN EINER POSITION
+	; ;when one quantity select were Save the item within unit 
+	;
+	; ggf. Änderungen in ^INANG DURCHFÜHREN
+	;
+	; Inputs : 
+	;	Manueller aufruf auch möglich mit 
+	;	YSEITE   = 2,
+	;	YKEY     = auftragsnummer,
+	;	YFKEY    = YKEY,
+	;	YAUSWAHL = #artikelnummer+menge+gesamtmenge (oder preis und währung bei LF) DO ^INAUF
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 26-May-2010	PPP		SR17309: Cannot Order Item - based on Item Status
+	; 09-Feb-2010	shobby	SR17171: Get the supplier from the INAUF record as it may not exist in the
+	; 							LIEF variable obtained from INARTK.
+	; 11-Feb-2010	GRF		SR17138: restore INAUFPK save in "2:Purchase Order" block
+	; 21-Jan-2010	shobby	SR17138: Allow entry of data in the units drop down.
+	; 04-Aug-2009	shobby	SR16808: Save of INAUF record in this routine must have pblnLock flag as $$$NO
+	; 							as we are saving to the record currently opened in this form.
+	; 28-Jun-2007	GRF		SR15473: macro replacement; new strStatus & intItemQty;
+	; 						naked references; quits
+	; 25-Jun-2007	RPW		SR15473: Do not do justification, it's done later anyway,
+	; 						and this is the wrong place to do it.
+	; 26-Sep-2006	PO		SR14924: Only auto source if order is set to immediately source
+	; 30-Aug-2006	GRF		SR12027: INARTK D1=>D8; naked references; objINVORG;
+	; 						sequences in FOR loops; use idSupplier
+	; 07-Aug-2006	RPW		SR14853: Make all anchors non-tabbable
+	; 28-Jul-2006	GRF		Doco; remove superfluous "+" in ">" test; use OrderLineItem;
+	; 						Move ART definition earlier to cut number of extractions;
+	; 						Unnecessary loop accessing same data repeatedly; Naked
+	; 						Reference; Boolean Macros
+	; 10-May-2006	RPW		SR14420: Do not source Requisition Orders
+	; 02-May-2006	GRF		Doco
+    ; 20-Mar-2006	SC		SR14335: Check if allowed to source from other locations.
+	; 09-Mar-2006	Steve S	SR14311: Disallow auto-sourcing when order is blocked
+	; 01-Nov-2005	PO		SR13780: Include WWWUMLAU retrieved since used on check
+	; 14-Oct-2005	Frank	SR13505 : Creating another order item with the same item number
+	; 						is now possible. The warning message is still being shown.
+	; 05-Oct-2005	PO		SR13591: Corrected SR13517 work so that amount calculated
+	; 						from FC OR Base amounts
+	; 26-Sep-2005	PO		SR13517 : Fixed discrepency in amounts posted to G/L
+	;  1-Sep-2005	JW		SR13151 : Apply reduced price correctly. Fixed exchange rate error.
+	;  								  Reverted SR12609 changes, as works without them.
+	; 10-Aug-2005	BEC		SR13151 : CHANGES REDUCTION PRICE(INARTKR VALUE)
+	; 13-Jul-2005	RobertW	SR12658 : Check the products, and if they are in the
+	; 						process of ^*INART*, then do not allow them to be added
+	; 						to the order
+	; 11-Jul-2005	JW		SR12811 : Added comments
+	; 14-Jun-2005	Steve S	SR12609 : Process cost override
+	; 30-May-2005	RobertW	SR12056 : Attempt at Performance Increase
+	; 24-May-2005	shobby	SR12353 : Included some more listLimit checks.
+	;						Previously would not attempt a subsequent strategy if
+	;						ANZ>10... should be listLimit.
+	; 08.02.2000	DT		Created
+	;-------------------------------------------------------------------------------
+	//new supplier,idxSupplier ; SR12052
+	;SET KUNDE=$GET(KUNDE)  ;AUSGESCHALTET DA NEU AUS DATENSATZ;FIS;12.12.03
+	
+	;---------------------------------------
+	; ARTZ1		objINARTZUS
+	; KOND1		objINKOND
+	; KOND1		objINLIEFK
+	; KOND1		objINAUFPK
+	; KUNDE1	objINKUNDE
+	; KUNDEK	objINKUNDEK
+	; KUNDELIEF	objINKUNDELIEF
+	; POSP1		objINAUFP		Order Line
+	; RABATT1	objINARTKR
+	; RABATT1	objINARTR
+	; RAHMEN1	objINRAHMENGROUP
+	; SATZ		objINAUFP		Order Line
+	; SATZ		objINAUFPXL		Order Line BOM
+	; SATZ1		objINART		Item Master Data
+	; YFELD		objINAUF		Order Header
+	; YFELD		objINAUFP		Order Line
+	; YFELD		objINAUFPK		
+	;---------------------------------------
+	
+	new idType,OrderLineItem,blnSourceOrder,strStatus,intItemQty
+	new idUnit,blnSupplierOrder  ;SR17138
+
+	SET %("VAR","YKEY") =$PIECE($TRANSLATE(YKEY,""""),",",1)
+	SET %("VAR","YFKEY")=$PIECE($TRANSLATE(YFKEY,""""),",",1)
+	
+	SET YAUFTRAG = $PIECE($TRANSLATE(YKEY,""""),",",1)
+	IF YAUFTRAG=""                   QUIT     ; no order 
+	IF '$DATA(^INAUF(YM,YAUFTRAG,1)) QUIT     ; no order 
+ 
+	//set supplier=""	; SR12052
+	//set idxSupplier=""
+	SET KUNDE=""
+	IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0 {
+	 SET KUNDE=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,1)
+	}	 
+	//} elseif $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=2 {
+	//	 set supplier=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,12)
+	//	 set idxSupplier = $$^WWWUMLAU(supplier,1)
+	//}
+	
+	SET ARTIKEL=""  ;LÖSCHEN VARIABLE ARTIKEL, DA AUS ARTIKELANLAGE (SUCHFUNKTION)
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	; Variables initialised AFTER use of YKEY and YFKEY
+	new ANZM,ART,ART1,AUF,AUFDAT,AUFMG,GUEDAT,GUELTIG,I,idLoc,KATALOG,MENGE,NAME
+	new objINVORG,POSP,POSP1,POPSP1,Q,SATZ,strCatalog,SUCH,UNITPRICE,WAGR
+	new YA,YFKEY,YGM,YKEY,YMNG,YPOS,YPOSMANU,YPREISFIX,YREBUILD,YSONDEXEC,YVOR
+	new idItem
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set objINVORG = $get(^INVORG(YM,YM,1))          ; 30-Aug-2006
+	
+	;set fltCostOverride=+$get(^CacheTempCostOverride(YUSER)) ;SR12609	//SR13151
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	; Processing Options for "Item No. or Search Name" entry on form INAUF
+	;    YAUSWAHL  *SEARCH*  VORG(9)
+	; then
+	;    YAUSWAHL  #  YPOSMANU              Item String # Order Line Number   ?
+	; then
+	;    YAUSWAHL  +  YMNG  +  YGM			idItem + Qty + TotalQty
+	;+++++++++++++++++++++++++++++++++++++++
+	IF $FIND($EXTRACT(YAUSWAHL,2,99),"*SEARCH*") DO              ;SUCHSTRATEGIE;FAN;26348;03.09.04
+	. SET VORG(10)=$PIECE(YAUSWAHL,"*SEARCH*",2)
+	. SET YAUSWAHL=$PIECE(YAUSWAHL,"*SEARCH*",1)
+	
+	IF $FIND($extract(YAUSWAHL,2,99),"#") DO  ;SCHNELLERFASSUNG MIT + UND #; TYBD;12,10,2004;
+	. QUIT:$PIECE($extract(YAUSWAHL,2,99),"#",1)=""
+	. QUIT:+$PIECE($extract(YAUSWAHL,2,99),"#",2)=0
+	. SET YPOSMANU=+$PIECE($EXTRACT(YAUSWAHL,2,99),"#",2)
+	. SET YAUSWAHL=$extract(YAUSWAHL)_$PIECE($extract(YAUSWAHL,2,99),"#",1)
+	
+	IF $FIND($EXTRACT(YAUSWAHL,2,99),"+") DO  ;SCHNELLERFASSUNG MIT + ;by means of 
+	. //SR17309 VVV
+	. ; INART Index 3 : UPC Code D2
+	. set idItem = $PIECE($EXTRACT(YAUSWAHL,2,99),"+",1)
+	. quit:idItem=""
+	. //QUIT:$PIECE($EXTRACT(YAUSWAHL,2,99),"+",1)=""
+	. //IF $ORDER(^INARTs(YM,3,$$^WWWUMLAU($PIECE($EXTRACT(YAUSWAHL,2,99),"+",1),1),""))'="" do
+	. . //SET $PIECE(YAUSWAHL,"+",1) = "#"_$ORDER(^INARTs(YM,3,$$^WWWUMLAU($PIECE($EXTRACT(YAUSWAHL,2,99),"+",1),1),"")) ; SR13780
+	. IF $ORDER(^INARTs(YM,3,$$^WWWUMLAU(idItem,1),""))'="" do
+	. . SET $PIECE(YAUSWAHL,"+",1) = "#"_$ORDER(^INARTs(YM,3,$$^WWWUMLAU(idItem,1),"")) ; SR13780
+	. ;
+	. //SR17309: Cannot Order Item - based on Item Status
+	. if $$$INAUFOrderType($get(^INAUF(YM,YAUFTRAG,1)))=2 quit:'$$IsUsable^INARTDataAccess(idItem,$get(YFORM))
+	. ;
+	. //QUIT:'$DATA(^INART(YM,$PIECE($EXTRACT(YAUSWAHL,2,99),"+",1)))
+	. QUIT:'$DATA(^INART(YM,idItem))
+	. //SR17309 ^^^
+	. //QUIT:(supplier'="")&&'$DATA(^INARTKs(YM,1,idxSupplier,$PIECE($EXTRACT(YAUSWAHL,2,99),"+",1))) ;SR12052 - No supplier terms
+	. ;
+	. QUIT:+$PIECE($EXTRACT(YAUSWAHL,2,99),"+",2)=0
+	. SET YMNG="YMNG"
+	. FOR  SET YMNG=$ORDER(%(YQUERY,YMNG)) QUIT:$EXTRACT(YMNG,1,4)'="YMNG"  KILL %(YQUERY,YMNG)  ;LÖSCHEN DER ALTEN EINTRÄGE ;Delete the 
+	. SET %(YQUERY,"YMNG"_$PIECE($EXTRACT(YAUSWAHL,2,99),"+",1)) = $PIECE($EXTRACT(YAUSWAHL,2,99),"+",2)
+	. SET %(YQUERY,"YGM"_$PIECE($EXTRACT(YAUSWAHL,2,99),"+",1))  = $PIECE($EXTRACT(YAUSWAHL,2,99),"+",3)
+	. SET YAUSWAHL=""  ;KEINE SUCHE MEHR ;no search more 
+
+	
+	
+	IF $GET(%(YQUERY,"ITEMS"))'="" DO  ;SONDERFELDER AUS WWW2 ;out of 
+	. SET %(YQUERY,"YMNG"_$GET(%(YQUERY,"ITEMS")))   = $GET(%(YQUERY,"ITEMSQ"))
+	. SET %(YQUERY,"YSERI"_$GET(%(YQUERY,"ITEMSE"))) = $GET(%(YQUERY,"ITEMSEQ"))
+	. SET %(YQUERY,"YGM"_$GET(%(YQUERY,"ITEMSG")))   = $GET(%(YQUERY,"ITEMSGQ"))
+	
+	;ARTIKELAUSWAHL / ANLEGEN DER POSITIONEN
+	;Item selection / Order line creation     "AB1+23" => %(YQUERY,"YMNGAB1") = 23
+	;=======================================
+	SET YMNG = "YMNG"
+	FOR  SET YMNG = $ORDER(%(YQUERY,YMNG)) QUIT:$EXTRACT(YMNG,1,4)'="YMNG"  DO   ;ALLE MENGENFELDER LESEN ;read 
+	. set blnSupplierOrder = $$$NO     ;SR17138
+	. NEW YFORM,YFERT
+	. SET YFORM="INAUFP"  ;POSITIONEN
+	. QUIT:$TRANSLATE($GET(%(YQUERY,YMNG)),",. ")=""        ;KEINE MENGE EINGETRAGEN ;no quantity regd. 
+	. FOR YPOS=1:1 QUIT:'$DATA(^INAUFP(YM,YAUFTRAG,YPOS))   ;NÄCHSTE POSITIONSNUMMER ;next line number - skip if used
+	. IF +$GET(YPOSMANU)'=0 SET YPOS = YPOSMANU             ;TYBD;12,10,2004
+	. IF YPOS=""            SET YPOS = 1
+	. IF $DATA(^INAUFP(YM,YAUFTRAG,YPOS)) SET YPOS = $$^WWWNEXT1("INAUFP",YAUFTRAG,2)
+	. ;
+	. ;PRUEFEN FALSCHE POSITION (DOPPEL SAVE ODER RELOAD) ;Check wrong line (Save duplication or reload)
+	. ;-------------------------------------
+	. ; FIXME : ? we check every line in the order and then only put up a warning
+	. ;         if we are dealing with the line before. (uncertain how YTRAKT is
+	. ;         defined or why skipping two in the sequence range)
+	. ;         If we have an increasing number of lines on an order, there are
+	. ;         more and more entries to be unnecessarily checked.
+	. ;         It may be necessary to loop through them all for the YFERT variable
+	. ;         but the subsequent tests could possibly be performed on only the
+	. ;         last (?) order line - need to check procedure.                         <GRF>
+	. ;         If the user does something else it seems to break the sequence so
+	. ;         we can have consecutive entries without getting the warning.           <GRF>
+	. ;
+	. SET Q=0
+	. SET YFERT=0  ;ANZAHL DER ARTIKEL BEI FERTIGUNGSAUFTRAG ;Number the item next to 
+	. SET POSP=""
+	. FOR  SET POSP=$ORDER(^INAUFP(YM,YAUFTRAG,POSP)) QUIT:POSP=""  DO  QUIT:Q=1
+	. . SET POSP1=$GET(^INAUFP(YM,YAUFTRAG,POSP,1))
+	. . set OrderLineItem = $piece(POSP1,Y,4)                      ; 28-Jul-2006
+	. . SET ART           = $EXTRACT(YMNG,5,99)      ; idItem      ; 28-Jul-2006
+	. . ;
+	. . ; NUR EIN FERTIGUNGSARTIKEL BEI EIGENFERTIGUNG;ULM, 16.10.2002 GOEBEL
+	. . ;   D2      $$$INAUFOrderType()   
+	. . ;   D26     $$$INARTItemType()    0: Make or Buy, 3: Make
+	. . ;
+	. . ; A Manufacturing Order can only have one MAKE item on it
+	. . IF $$$INVORGOnlyOneProductiononceOrde(objINVORG)=$$$YES DO      ; D109
+	. . . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=1 DO      ; Manufacturing Order 
+	. . . . IF ($PIECE($GET(^INART(YM,OrderLineItem,1)),Y,26)=0) || ($PIECE($GET(^INART(YM,OrderLineItem,1)),Y,26)=3) DO  ;EIGENFERTIG
+	. . . . . IF ($PIECE($GET(^INART(YM,ART,1)),Y,26)=3) || ($PIECE($GET(^INART(YM,ART,1)),Y,26)=0) DO
+	. . . . . . SET YFERT=1  ;EIGENFERTIGUNGSAUFTRAG, EIGENFERTIGUNGSARTIKEL, KEINE UNTERTEILE (WERKZEUGE-GOEBEL)
+	. . ;
+	. . SET POSP1(1) = OrderLineItem          ; idItem from OrderLine  (replace POSP1(1) if not used elsewhere)
+	. . QUIT:ART'=POSP1(1)                    ; item mismatch          ; ARTIKEL NICHT GLEICH 
+	. . QUIT:+$PIECE(POSP1,Y,22)'=+$HOROLOG   ; Not created today      ; ANDERER TAG
+	. . NEW TRAKT
+	. . SET TRAKT = $PIECE(POSP1,Y,21)        ; TxNo. (Seq/YUSER)      ; transaktionsnummer
+	. . QUIT:+TRAKT=0
+	. . IF YUSER'=$PIECE(TRAKT,"/",2) QUIT    ; Different User         ; ANDERER USER
+	. . ;
+	. . IF YTRAKT'>(TRAKT+2) DO               ; Only check the line before?
+	. . . ;SET Q=1 ;SR13505  ;DOPPELSAVE FALSCH  (DURCH RELOAD) ;wrong 
+	. . . ; 33909 : "Possibly Line Item Exists On Prior Line Item"       möglicherweise bereits angelegt
+	. . . WRITE "<script language="_""""_"JavaScript"_""""_">alert('"_$$^WWWTEXT(33909,,1)_"');</script>" 
+	. ;
+	. ;-------------------------------------
+	. ; Is the item currently being updated? ;25779;FIS;17.06.04
+	. IF Q'=1 DO
+	. . NEW JOBNR,arrProducts,idProduct,idJobProduct,blnFound
+	. . SET JOBNR=""
+	. . ; 13-Jul-2005	RPW		SR12658: We need to get all the products that this product touches either as a part or it contains them
+	. . do GetProducts($EXTRACT(YMNG,5,99),.arrProducts)
+	. . FOR  SET JOBNR=$ORDER(^INARTJOB(YM,JOBNR)) QUIT:JOBNR=""  DO  QUIT:Q=1  ;PRÜFEN ARTIKELAUFBEREITUNG IM HINTERGRUND ;sift foil 
+	. . . SET JOBTYPE=$GET(^INARTJOB(YM,JOBNR,1))
+	. . . IF JOBTYPE'="" IF $FIND(JOBTYPE,"INART") DO
+	. . . . ; 13-Jul-2005	RPW		SR12658:Get the product id
+	. . . . set idJobProduct=$translate($piece($piece(JOBTYPE,"(",2),",",1),$char(34))
+	. . . . ; Does this item consist of parts?
+	. . . . ; 13-Jul-2005	RPW		SR12658: If there is no product, assume ALL products
+	. . . . set blnFound=(idJobProduct="")
+	. . . . ; 13-Jul-2005	RPW		SR12658: Otherwise loop through the array of products
+	. . . . if 'blnFound do
+	. . . . . set idProduct=""
+	. . . . . for  set idProduct=$order(arrProducts(idProduct)) quit:(idProduct="")||blnFound  do
+	. . . . . . if idProduct=idJobProduct do ;ARTIKEL ;item 
+	. . . . . . . set blnFound=$$$YES
+	. . . . ; 13-Jul-2005	RPW		SR12658: If a match was found, show the error message
+	. . . . if blnFound
+	. . . . . SET Q=1
+	. . . . . ;DO MSG^WWW013MSG(YBED,$$^WWWTEXT(33720),)   ;NICHT MÖGLICH, DA ARTIKELAUFBEREITUNG (INARTXL,INARTNEU,...) IM HINTERGRUND
+	. . . . . ; 33720 : "It was not possible to save this action due to the background job that updates the item"
+	. . . . . WRITE "<script language="_""""_"JavaScript"_""""_">alert('"_$$^WWWTEXT(33720,,1)_"');</script>"
+	. ;
+	. QUIT:Q=1
+	. ;
+	. IF YFERT=1 WRITE "<FONT COLOR="_YRED_">"_$$^WWWTEXT(33223) QUIT   ;Only one Manufacturing per Order allowed
+	. ;
+	. SET MENGE=+$TRANSLATE($GET(%(YQUERY,YMNG)),",",".")  ;ZAHLENFORMAT
+	. SET ART=$EXTRACT(YMNG,5,99)       ;ARTIKELNUMMER BESTANDTEIL DER YMNG VARIABEL ;ingredient the 
+	. QUIT:ART=""
+	. QUIT:'$DATA(^INART(YM,ART,1))     ;ARTIKEL NICHT VORHANDEN ;item Not on hand 
+	. ;
+	. ;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv Create new record - SATZ (objINAUFP + objINAUFPXL)
+	. ;
+	. SET SATZ1=$GET(^INART(YM,ART,1))  ;ARTIKELDATEN
+	. SET SATZ=""
+	. ;
+	. ;SR17138 vvvvvv
+	. set $$$INAUFPOrderedQuantity(SATZ) = MENGE
+	. set idUnit = $get(%(YQUERY,"YUNITMNG"_$piece(YMNG,"YMNG",2)))
+	. if idUnit="" set idUnit = $$DefaultUnit^INARTK(ART,$$$INAUFSupplierNumber($get(^INAUF(YM,YAUFTRAG,1))))	;SR17171
+	. ;if idUnit'="" do
+	. set $$$INAUFPOrderedUnit(SATZ) = idUnit
+	. ;. set MENGE=MENGE*$$GetUOMConversion^INUOMConversion(ART,idUnit)
+	. set MENGE = MENGE*$$GetUOMConversion^INUOMConversion(ART,idUnit)
+	. ;if idUnit="" do
+	. ;. set $$$INAUFPOrderedUnit(SATZ)=$$$INARTUnitofMeasure(SATZ1)
+	. ;SR17138 ^^^^^^^
+	. ;
+	. ;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	. ;   D26     $$$INARTItemType()    5: Phantom Item, 7: Item to Configure
+	. ;
+	. IF $PIECE(SATZ1,Y,26)=5  QUIT     ;PHANTOMARTIKEL
+	. IF $PIECE(SATZ1,Y,26)=7  QUIT     ;KONFIGURATIONSARTIKEL
+	. ;
+	. ;DATEN VON ARTIKEL IN AUFTRAG   ;ULM:16.10.2002 - ERWEITERUNG DER DATENFELDER DURCH FREE-FELDER ;item within order 
+	. ;DATEN AUS ARTIKEL ÜBERTRAGEN   ;TYBD;7,10,2003;24370  ;BEC;24591;FELD 210,211 ERGÄNTZT ;BEC;25600;FELD 356 ERGÄNTZT 
+	. ; Copy INART data
+	. ; FIXME : D158 is used in neither INART nor INAUFP <GRF>
+	. FOR YA=1,2,3,10,12,14:1:17,26,30,31,32,33,36,37,38,40:1:45,47:1:50,53,54,55 SET $PIECE(SATZ,Y,YA)=$PIECE(SATZ1,Y,YA)
+	. FOR YA=57,58,59,62,66,68,70,71,73,74,75,126,130,131,132,134,136,138,158     SET $PIECE(SATZ,Y,YA)=$PIECE(SATZ1,Y,YA)
+	. FOR YA=166,171,172,174,191,192,208,210,211,273:1:301,309,336:1:345,356,381  SET $PIECE(SATZ,Y,YA)=$PIECE(SATZ1,Y,YA)
+	. ;
+	. ;  YFELD (8 pieces)
+	. ;     D3  Field Name                      or [211] Description          or Cost Code
+	. ;     D4  curValue   (Item Master Data)      [211] curSpecialSurcharge
+	. ;     D8                                                                   code 1-4
+	. ;  
+	. DO
+	. . ;ZUSATZKOSTEN JE POSITION;FIS;07.03.05;27445
+	. . IF $$$INVORGAdditionalCostsByItem(objINVORG)=$$$YES DO  QUIT     ; 214
+	. . . ; FIXME : ? D178-185 are used by INART but not by INAUFP <GRF>
+	. . . FOR YA=178:1:185,210,211 SET $PIECE(SATZ,Y,YA)=""  ;KEINE ZUSATZKOSTEN IM AUFTRAG
+	. . . ;
+	. . . FOR YA=182:1:185,211 DO     ;PAUSCHAL BETRÄGE  ; curValue Check
+	. . . . IF +$PIECE(SATZ1,Y,YA)=0 QUIT   ;KEIN BETRAG
+	. . . . NEW YKEY,YFELD
+	. . . . SET YKEY=YAUFTRAG_","_YPOS_","_($ORDER(^INAUFPIMPACT(YM,YAUFTRAG,YPOS,""),-1)+1)
+	. . . . IF YA'=211 SET YFELD=Y_Y_$$^WWWFELDNAME("INART","D",YA)_Y_+$PIECE(SATZ1,Y,YA)  ;TEXT ...KOSTEN PAUSCHAL
+	. . . . IF YA=211  SET YFELD=Y_Y_$PIECE(SATZ1,Y,210)_Y_+$PIECE(SATZ1,Y,YA)             ;TEXT SPEZIALZUSCHLAG
+	. . . . DO ^INAUFPIMPACT                ;RECHNEN UND SPEICHERN
+	. . . ;
+	. . . ; (Packing, Freight, Insurance, Distance)
+	. . . FOR YA=178:1:181 DO              ;AUTOMATISCHE BERECHNUNG
+	. . . . IF +$PIECE(SATZ1,Y,YA)'=$$$YES QUIT  ;KEIN BERECHNUNG
+	. . . . NEW YKEY,YFELD
+	. . . . SET YKEY=YAUFTRAG_","_YPOS_","_($ORDER(^INAUFPIMPACT(YM,YAUFTRAG,YPOS,""),-1)+1)
+	. . . . SET YFELD=Y_Y_$PIECE($GET(^WWW101(0,"ZUSATZKOSTEN",SPRACHE,(YA-177),1)),Y,1)_Y_Y_Y_Y_Y_(YA-177)  ;TEXT BERECHNUNG
+	. . . . DO ^INAUFPIMPACT                ;RECHNEN UND SPEICHERN
+	. . ;
+	. . ; FIXME : INAUF1 D178-181 are text not boolean; D182 is text
+	. . ;         not currency; doesn't have D183-185 defined               <GRF>
+	. . ; 
+	. . ; FIXME : If there are multiple items with Packing, Freight, etc.
+	. . ;         only the first item added to the order will have it's
+	. . ;         value recorded.  ($2 then $50 => $2; $50 then $2 => $50)  <GRF>
+	. . ;
+	. . ;FOR YA=178:1:181 IF $PIECE(SATZ1,Y,YA)=$$$YES SET $PIECE(^INAUF1(YM,YAUFTRAG,1),Y,YA)=1   ;NEU BERECHNEN IN ZWISCHESPEICHER ;recent calculate within //SR15144
+	. . ;FOR YA=182:1:185 IF +$PIECE(SATZ1,Y,YA)'=0    DO                 ; 28-Jul-2006 add do level for clarity //SR15144
+	. . . ;SET $PIECE(^INAUF1(YM,YAUFTRAG,1),Y,YA)=$PIECE(SATZ1,Y,YA) //SR15144
+	. . . ;set $PIECE(^INAUF(YM,YAUFTRAG,1),Y,YA) =$PIECE(SATZ1,Y,YA)  //SR15144  ;ÜBERTRAGEN PAUSCHALEBETRÄGE IN ZWISCHESPEICHER ;transport within
+	. . DO //SR15144
+	. . . NEW YFELDAUF,YFELDAUF1 //SR15144
+	. . . SET YFELDAUF  = $GET(^INAUF(YM,YAUFTRAG,1)) //SR15144
+	. . . SET YFELDAUF1 = $GET(^INAUF1(YM,YAUFTRAG,1)) //SR15144
+	. . . FOR YA=178:1:181 IF $PIECE(SATZ1,Y,YA)=$$$YES SET $PIECE(YFELDAUF1,Y,YA)=1  ; Inter-Locations //SR15144
+	. . . FOR YA=182:1:185 IF +$PIECE(SATZ1,Y,YA)'=0   DO //SR15144
+	. . . . SET $PIECE(YFELDAUF1,Y,YA)=$PIECE(SATZ1,Y,YA) //SR15144
+	. . . . SET $PIECE(YFELDAUF,Y,YA)=$PIECE(SATZ1,Y,YA) //SR15144
+	. . . ;
+	. . . set strStatus = $$$Save("INAUF",YAUFTRAG,YFELDAUF,$$$NO)    // SR15144  ;SR16808
+	. . . set strStatus = $$$Save("INAUF1",YAUFTRAG,YFELDAUF1,$$$YES) // SR15144
+	. ;
+	. SET $PIECE(SATZ,Y,253)=$PIECE(SATZ1,Y,203)   ;VERSION NACH AUFTRAG ÜBERTRAGEN  ;within order transport 
+	. ;
+	. IF $PIECE(^INAUF(YM,YAUFTRAG,1),Y,169)=1 SET $PIECE(SATZ,Y,169)=1            ; Complaint/ Spare Part Order   ;REKLA POSITION;FAN
+	. ;IF $PIECE(^INAUF(YM,YAUFTRAG,1),Y,38)=$$$YES SET $PIECE(SATZ,Y,205)=$$$YES  ; Blocked   ;SPEER POSITION;FAN
+	. IF $PIECE(SATZ,Y,193)="" SET $PIECE(SATZ,Y,193)=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,4)  ;AUFTRAGSDATUM
+	. ;
+	. ;SET EINHEIT=""
+	. ;IF $PIECE(SATZ,Y,26)'="" SET EINHEIT=$PIECE($GET(^WWW101(0,"EINHEIT",SPRACHE,$PIECE(SATZ,Y,26),1)),Y,1)
+	. ;IF $PIECE(SATZ,Y,40)'="" SET EINHEIT=$PIECE($GET(^WWW101(0,"EINHEIT",SPRACHE,$PIECE(SATZ,Y,40),1)),Y,1)  ;AUS, DA NOCH NIE FUNKTIONIERT (SIEHE 1 ZEILE DRÜBER) ;FIS;03.02.05
+	. IF $PIECE(SATZ1,Y,46)'="" SET $PIECE(SATZ,Y,40)=$PIECE(SATZ1,Y,46)  ; $$$INAUFPQuantityUnit() = $$$INARTSalesUnit()  ;ANDERE VERKAUFSEINHEIT ALS EINHEIT
+	. SET $PIECE(SATZ,Y,5)   = MENGE
+	. SET $PIECE(SATZ,Y,39)  = MENGE
+	. SET $PIECE(SATZ,Y,4)   = ART
+	. ; Multiply unit production cost from INART by quantity to give total value
+	. SET $PIECE(SATZ,Y,47)  = $PIECE(SATZ,Y,47)*(MENGE/$$^INQTYUNIT(ART))         ;+$P(SATZ,Y,71)  ;HERSTELLKOSTEN+RUESTPREIS  ;FIS;PREISEINHEIT;28.02.05;27123
+	. SET $PIECE(SATZ,Y,74)  = $PIECE(SATZ,Y,74)*$$^INPROLOS(ART,MENGE)   ;WERKZEUGKOSTEN 
+	. SET $PIECE(SATZ,Y,75)  = $PIECE(SATZ,Y,75)*$$^INPROLOS(ART,MENGE)   ;SONSTIGEKOSTEN
+	. SET $PIECE(SATZ,Y,322) = MENGE   ;SPEICHERN URSPRÜNGLICHE MENGE;FIS;25.06.03;23781;BESTELLMENGE IN LIEFERSCHEIN
+	. SET $PIECE(SATZ,Y,323) = 0       ;SPEICHERN URSPRÜNGLICHE MENGE;FIS;25.06.03;23781;BESTELLMENGE IN LIEFERSCHEIN
+	. ;  
+	. IF MENGE<0 DO  ;REKLA VORGABEN
+	. . ;BEC;23117;15.05.03;LAGERPLATZ BETRIBSABHÄNGIG
+	. . IF +$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0 IF $GET(YLOCATION)'="" SET $PIECE(SATZ,Y,223)=$PIECE($GET(^INVORGB(YM,YM,YLOCATION,1)),Y,2)  ;vorgabe lagerplatz AUS BETRIBSPARAMETERN   ;WEM;24673;25.11.2003;NOCH EIN YM HINZUGEFÜGT
+	. . ;vorgabe lagerplatz,ALTE WERTE WEGEN SERVICEFALL 23117
+	. . IF $PIECE(SATZ,Y,223)="" SET $PIECE(SATZ,Y,223)=$$$INVORGStandardLocationForReturn(objINVORG)  ; D115
+	. . ;SET $PIECE(SATZ,Y,223)=$PIECE(objINVORG,Y,115)
+	. . SET $PIECE(SATZ,Y,224)=0
+	. . IF +$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0 IF $PIECE(SATZ,Y,223)'="" SET $PIECE(SATZ,Y,224)=$$$YES  ; customer order ;zurueck  
+	. . SET $PIECE(SATZ,Y,226)=0
+	. . SET $PIECE(SATZ,Y,228)=0
+	. . SET $PIECE(SATZ,Y,230)=0
+	. . SET $PIECE(SATZ,Y,232)=0
+	. ;
+	. ; Line Item Grouping : May copy from prior order line (ignore "Item To Configure")
+	. ;POSITIONSGRUPPE AUS VORHERIGER POS ÜBERNEHMEN
+	. IF YPOS>1 DO
+	. . NEW POSX,YQ,ARTX,ARTXX
+	. . SET POSX = $ORDER(^INAUFP(YM,YAUFTRAG,YPOS),-1)
+	. . IF (POSX="") || (POSX=YPOS) QUIT
+	. . IF $PIECE($GET(^INAUFP(YM,YAUFTRAG,POSX,1)),Y,26)=7 QUIT  ;NICHT WENN KONFIGURATIONSARTIKEL;FIS;23996;18.07.03
+	. . SET YQ=0
+	. . SET ARTX = $PIECE($GET(^INAUFP(YM,YAUFTRAG,POSX,1)),Y,4)
+	. . IF ARTX'="" IF $PIECE($GET(^INART(YM,ARTX,1)),Y,26)=7 QUIT  ;NICHT WENN KONFIGURATIONSARTIKEL;FIS ;Not when 
+	. . IF ARTX'="" IF $DATA(^INARTTs(YM,1,ARTX)) DO
+	. . . SET ARTXX=$ORDER(^INARTTs(YM,1,ARTX,""))
+	. . . IF ARTXX'="" IF $PIECE($GET(^INART(YM,ARTXX,1)),Y,26)=7 SET YQ=1  ;NICHT WENN KONFIGURATIONSARTIKEL;FIS ;Not when 
+	. . ;
+	. . QUIT:YQ=1
+	. . SET $PIECE(SATZ,Y,247) = $PIECE($GET(^INAUFP(YM,YAUFTRAG,POSX,1)),Y,247)
+	. ;
+	. ;POSITIONSGRUPPE AUS ARTIKELKONFIGURATION ;out of 
+	. IF $DATA(%(YQUERY,"YPOSGRUP"_ART)) DO  ;FIS;01.04.03;23155;KONFIGURATIONSARTIKEL
+	. . NEW GRP
+	. . SET GRP=$GET(%(YQUERY,"YPOSGRUP"_ART))
+	. . IF GRP'="" SET GRP=GRP_" "_$PIECE($GET(^INART(YM,GRP,1)),Y,1)
+	. . SET $PIECE(SATZ,Y,247)=GRP
+	. ;
+	. DO  ;RAHMENVERTRAGSNUMMER SETZEN;24892;FIS;08.01.04
+	. . SET ADR=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,1)              ; idCustomer
+	. . IF ADR="" SET ADR=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,12)   ; idSupplier
+	. . QUIT:ADR=""
+	. . IF '$DATA(^INRAHMEN(YM,ADR)) IF '$DATA(^INRAHMENK(YM,ADR)) QUIT
+	. . NEW RV
+	. . SET RV=$$^INARTRAHMEN(ADR,1)
+	. . SET $PIECE(SATZ,Y,320)=$GET(^WWWSOR(YUSER,"RAHMEN",ART))
+	. . KILL ^WWWSOR(YUSER,"RAHMEN")
+	. ;
+	. ;BEARBEITUNG ;adaptation 
+	. ;  D137		$$$INVORGBlockedLayAwayReason()
+	. IF $GET(%(YQUERY,"YPBEARB"))'="" DO  ;FIS;23466;15.04.03
+	. . SET $PIECE(SATZ,Y,169)=$GET(%(YQUERY,"YPBEARB"))
+	. . ;  5:"LayAway Item" 
+	. . IF $PIECE(SATZ,Y,169)=5 SET $PIECE(SATZ,Y,205)=$$$YES SET $PIECE(SATZ,Y,204)=$$$INVORGBlockedLayAwayReason(objINVORG)  ; D137 ;SPERRE ;suspension 
+	. ;
+	. ;TYBD;1,12,2004;GEM PARAMETER IMMER BESTELLEN
+	. IF $$$INVORGRecordGoodsOriginPurchase(objINVORG)=$$$YES  DO   ; D199
+	. . QUIT:$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)'=0    ;Bei Kundenaufträgen
+	. . NEW LIEF
+	. . SET LIEF = $ORDER(^INARTK(YM,ART,""))
+	. . QUIT:LIEF'=$ORDER(^INARTK(YM,ART,""),-1)       ;MORE THAN ONE SUPPLIER;TYBD;18,12,2004
+	. . QUIT:LIEF=""                                   ;KEIN LIEFERANT
+	. . QUIT:$$^INARTMENGE(ART,,)'<$PIECE(SATZ,Y,5)    ;wenn ausreichend in Bestand.  ;when within 
+	. . SET $PIECE(SATZ,Y,7) = 1                       ;bestellen; order
+	. . SET $PIECE(SATZ,Y,6) = $PIECE(SATZ,Y,5)        ;MENGE OK ;quantity 
+	. . IF LIEF'="" SET $PIECE(SATZ,Y,12) = LIEF
+	. . ;IF LIEF'="" SET ^INAUFPK(YM,YAUFTRAG,YPOS,1)=$GET(^INARTK(YM,ART,LIEF,1))
+	. . IF LIEF'="" do GetItemSupplierData^INAUFDISC(LIEF,YAUFTRAG,YPOS,ART)  ;shobby SR12008
+	. ;
+	. IF $GET(%(YQUERY,"YBEST"_ART))=1 DO  ;BESTELLVORGABE
+	. . SET $PIECE(SATZ,Y,7)=1             ;BESTELLEN ; 1:"Order"
+	. . NEW LIEF
+	. . SET LIEF=$ORDER(^INARTK(YM,ART,""))
+	. . ;IF LIEF'="" SET ^INAUFPK(YM,YAUFTRAG,YPOS,1)=$GET(^INARTK(YM,ART,LIEF,1))
+	. . IF LIEF'="" do GetItemSupplierData^INAUFDISC(LIEF,YAUFTRAG,YPOS,ART)  ;shobby SR12008
+	. ;
+	. IF $EXTRACT($GET(%(YQUERY,"YSERI"_ART)))="+" SET %(YQUERY,"YSERI"_ART)=$$^WWWNEXT("SERIENNR")              ;SERIENNUMMER NEU
+	. IF $GET(%(YQUERY,"YSERI"_ART))'="" SET $PIECE(SATZ,Y,56)=$TRANSLATE($GET(%(YQUERY,"YSERI"_ART)),",",";")   ;SERIENNUMMER
+	. ;
+	. SET KATALOG=0  ;1=KATALOGARTIKEL DANN IMMER BESTELLEN ;constantly book 
+	. ;IF $$^WWWUPER($TRANSLATE($PIECE(SATZ1,Y,1,14),Y_",.- 1234567890_#'+*`?=)(/&%$§!"))="KATALOGARTIKEL" SET KATALOG=1  ;SET $PIECE(SATZ,Y,1)=""
+	. ;IF $$^WWWUPER($TRANSLATE($PIECE(SATZ1,Y,1,14),Y_",.- 1234567890_#'+*`?=)(/&%$§!"))="CATALOGITEM" SET KATALOG=1  ;SET $PIECE(SATZ,Y,1)=""
+	. ;IF $$^WWWUPER($TRANSLATE($PIECE(SATZ1,Y,1,14),Y_",.- 1234567890_#'+*`?=)(/&%$§!"))="CATALOGARTICLE" SET KATALOG=1  ;SET $PIECE(SATZ,Y,1)=""
+	. set strCatalog=$zconvert($TRANSLATE($PIECE(SATZ1,Y,1,14),Y_",.- 1234567890_#'+*`?=)(/&%$§!"),"U")
+	. IF (strCatalog="KATALOGARTIKEL")||(strCatalog="CATALOGITEM")||(strCatalog="CATALOGARTICLE") SET KATALOG=1  ;SET $PIECE(SATZ,Y,1)=""
+	. ;
+	. ; 2:"Purchase Order"
+	. ;-------------------------------------
+	. IF ($PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=2)||(KATALOG=1)||($PIECE(SATZ,Y,7)=1) DO   ;BESTELLUNGSAUFTRAG  // SR15143 vvv Purchase Order line creation
+	. . NEW YFELD
+	. . SET $PIECE(SATZ,Y,7)=1  ;BESTELLEN ;book 
+	. . IF ($PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=2)||($PIECE(SATZ,Y,12)="") SET $PIECE(SATZ,Y,12)=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,12)  ;BEI LIEFERANT ;next to supplier 
+	. . NEW LIEF
+	. . SET LIEF=$PIECE(SATZ,Y,12)   ;KONDITIONEN FÜR BESTELLUNG ;terms of payment to sales order 
+	. . ;
+	. . ;IF LIEF'="" IF $DATA(^INARTK(YM,ART,LIEF,1)) SET ^INAUFPK(YM,YAUFTRAG,YPOS,1)=$GET(^INARTK(YM,ART,LIEF,1))    //SR15144
+	. . IF LIEF'="" IF $DATA(^INARTK(YM,ART,LIEF,1)) DO
+	. . . NEW SATZ
+	. . . set blnSupplierOrder = $$$YES	;SR17138  ; 11-Feb-2009 SR17138 restore INAUFPK save
+	. . . SET SATZ      = $GET(^INARTK(YM,ART,LIEF,1))
+	. . . SET strStatus = $$$Save("INAUFPK",YAUFTRAG_","_YPOS,SATZ,$$$YES) // SR15144
+	. . . ;SR17138 ???????????  ^^^^^^^^
+	. . ;
+	. . ;IF LIEF'="" IF $DATA(^INARTK(YM,ART,LIEF,1)) do GetItemSupplierData^INAUFDISC(LIEF,YAUFTRAG,YPOS,ART)  ;shobby SR12008	// reverted SR13151
+	. . IF LIEF'="" IF '$DATA(^INARTK(YM,ART,LIEF,1)) DO  ;KONDITION AUS LIEFERANTENSTAMM ;out of 
+	. . . NEW KOND,KOND1
+	. . . SET KOND=$PIECE($GET(^INLIEF(YM,LIEF,1)),Y,56)  ;LIEFERANTENKONDITION
+	. . . QUIT:KOND=""
+	. . . SET KOND1=$GET(^INKOND(YM,KOND,1))
+	. . . ;SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,7) =$PIECE(KOND,Y,3)   // SR15144;SKONTO
+	. . . ;SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,9) =$PIECE(KOND,Y,2)   // SR15144;TAGE
+	. . . ;SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,10)=$PIECE(KOND,Y,4)   // SR15144;NETTO
+	. . . DO
+	. . . . NEW SATZ
+	. . . . SET SATZ=$GET(^INAUFPK(YM,YAUFTRAG,YPOS,1))
+	. . . . SET $PIECE(SATZ,Y,7) =$PIECE(KOND,Y,3)   // SR15144;SKONTO
+	. . . . SET $PIECE(SATZ,Y,9) =$PIECE(KOND,Y,2)   // SR15144;TAGE
+	. . . . SET $PIECE(SATZ,Y,10)=$PIECE(KOND,Y,4)   // SR15144;NETTO
+	. . . . SET strStatus = $$$Save("INAUFPK",YAUFTRAG_","_YPOS,SATZ,$$$YES) // SR15144
+	. . ;
+	. . NEW WG,YI
+	. . SET WG=$PIECE($GET(^INART(YM,ART,1)),Y,30)  ;WARENGRUPPE
+	. . ;
+	. . IF LIEF'="" IF WG'="" IF '$DATA(^INARTK(YM,ART,LIEF)) IF $DATA(^INLIEFK(YM,LIEF,WG,1)) DO   ;KONDITION  AUS LIEFERANT ;out of supplier 
+	. . . SET KOND1=$GET(^INLIEFK(YM,LIEF,WG,1))
+	. . . ;FOR YI=2:1:6,51,52,53 SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,YI)=$PIECE(KOND1,Y,YI)    ;RABATTE // SR15144
+	. . . ;SET KOND=$PIECE(KOND1,Y,7) // SR15144
+	. . . ;QUIT:KOND="" // SR15144
+	. . . ;SET KOND1=$GET(^INKOND(YM,KOND,1)) // SR15144
+	. . . ;SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,7) =$PIECE(KOND1,Y,3)   ;SKONTO // SR15144
+	. . . ;SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,9) =$PIECE(KOND1,Y,2)   ;TAGE   // SR15144
+	. . . ;SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,10)=$PIECE(KOND1,Y,4)   ;NETTO  // SR15144
+	. . ;
+	. . . DO // SR15144
+	. . . . NEW SATZ // SR15144
+	. . . . SET SATZ=$GET(^INAUFPK(YM,YAUFTRAG,YPOS,1)) // SR15144
+	. . . . FOR YI=2:1:6,51,52,53 SET $PIECE(SATZ,Y,YI)=$PIECE(KOND1,Y,YI)    // SR15144 ;RABATTE
+	. . . . SET KOND=$PIECE(KOND1,Y,7)
+	. . . . IF KOND'="" DO
+	. . . . . SET KOND1=$GET(^INKOND(YM,KOND,1)) // SR15144
+	. . . . . SET $PIECE(SATZ,Y,7) =$PIECE(KOND1,Y,3)   ;SKONTO // SR15144
+	. . . . . SET $PIECE(SATZ,Y,9) =$PIECE(KOND1,Y,2)   ;TAGE   // SR15144
+	. . . . . SET $PIECE(SATZ,Y,10)=$PIECE(KOND1,Y,4)   ;NETTO  // SR15144
+	. . . . ;
+	. . . . SET strStatus=$$$Save("INAUFPK",YAUFTRAG_","_YPOS,SATZ,$$$YES) // SR15144
+	. . ;
+	. . IF LIEF'="" IF $GET(KUNDE)'="" DO  // SR15143 vvv What is this for
+	. . . ;VK=EK INKL. ÜBERNAHME DER RABATTE;FIS;29.02.05;27351
+	. . . IF $$$INVORGSaleCost(objINVORG)=$$$YES IF $$$INVORGApplyInvDiscountsToOrder(objINVORG)=$$$YES DO     ; D202, D213
+	. . . . SET KOND1=$GET(^INAUFPK(YM,YAUFTRAG,YPOS,1))
+	. . . . QUIT:KOND1=""
+	. . . . SET YPREISFIX=$PIECE(KOND1,Y,47)  ;FIXER VERKAUFSPREIS
+	. . . . ;FOR YI=2:1:6,51,52,53 DO   ; 28-Jul-2006 loop not required
+	. . . . IF +$PIECE(KOND1,Y,2)'=0  SET $PIECE(SATZ,Y,122)=$PIECE(KOND1,Y,2)   ;RABATT 1
+	. . . . IF +$PIECE(KOND1,Y,3)'=0  SET $PIECE(SATZ,Y,128)=$PIECE(KOND1,Y,3)   ;RABATT 2
+	. . . . IF +$PIECE(KOND1,Y,4)'=0  SET $PIECE(SATZ,Y,212)=$PIECE(KOND1,Y,4)   ;RABATT 3 ;TYBD;19.2,2005;27277;GEM
+	. . . . IF +$PIECE(KOND1,Y,5)'=0  SET $PIECE(SATZ,Y,214)=$PIECE(KOND1,Y,5)   ;AUF/ABSCHLAG % ;TYBD;19.2,2005;27277;GEM
+	. . . . IF +$PIECE(KOND1,Y,6)'=0  SET $PIECE(SATZ,Y,211)=$PIECE(KOND1,Y,6)   ;AUF/ABSCHLAG BETRAG
+	. . . . IF $PIECE(KOND1,Y,51)'="" SET $PIECE(SATZ,Y,125)=$PIECE(KOND1,Y,51)  ;TEXT RABATT 1
+	. . . . IF $PIECE(KOND1,Y,52)'="" SET $PIECE(SATZ,Y,129)=$PIECE(KOND1,Y,52)  ;TEXT RABATT 2
+	. . . . IF $PIECE(KOND1,Y,53)'="" SET $PIECE(SATZ,Y,213)=$PIECE(KOND1,Y,53)  ;TEXT RABATT 3  ;FIS;28.02.05
+	. . . . ; end 28-Jul-2006
+	. . . ;
+	. . . NEW KUNDELIEF,RAHMEN,RAHMEN1,WG
+	. . . ;
+	. . . SET KUNDELIEF=$GET(^INKUNDELIEF(YM,KUNDE,LIEF,1))
+	. . . QUIT:KUNDELIEF=""
+	. . . SET RAHMEN=$PIECE(KUNDELIEF,Y,34)
+	. . . QUIT:RAHMEN=""
+	. . . ;
+	. . . SET RAHMEN1=""
+	. . . SET WG=$$$INARTKSuppliersCatalogGroup($GET(^INARTK(YM,ART,LIEF,1)))
+	. . . IF WG=""  SET RAHMEN1 = $get(^INRAHMENGROUP(YM,LIEF,RAHMEN,0,1))
+	. . . IF WG'="" SET RAHMEN1 = $get(^INRAHMENGROUP(YM,LIEF,RAHMEN,WG,1))
+	. . . IF RAHMEN1="" DO
+	. . . . SET RAHMEN(1) = $ORDER(^INRAHMENGROUP(YM,LIEF,RAHMEN,"")) 
+	. . . . IF RAHMEN(1)'="" SET RAHMEN1 = $get(^INRAHMENGROUP(YM,LIEF,RAHMEN,RAHMEN(1),1))
+	. . . ;
+	. . . QUIT:RAHMEN1=""
+	. . . ;
+	. . . FOR YI=2:1:6,51,52,53 IF +$PIECE(RAHMEN1,Y,YI)'="" SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,YI)=$PIECE(RAHMEN1,Y,YI)   ;RABATTE
+	. . . ;
+	. . . ;  Sale = Cost      ;EK=VK;TYBD;2,1,2005
+	. . . IF $$$INVORGSaleCost(objINVORG)=$$$YES DO           ;D202
+	. . . . IF +$PIECE(RAHMEN1,Y,2)'=0  SET $PIECE(SATZ,Y,122)=$PIECE(RAHMEN1,Y,2)   ;RABATT 1
+	. . . . IF +$PIECE(RAHMEN1,Y,3)'=0  SET $PIECE(SATZ,Y,128)=$PIECE(RAHMEN1,Y,3)   ;RABATT 2
+	. . . . IF +$PIECE(RAHMEN1,Y,4)'=0  SET $PIECE(SATZ,Y,212)=$PIECE(RAHMEN1,Y,4)   ;RABATT 3 TYBD;19.2,2005;27277;GEM
+	. . . . IF +$PIECE(RAHMEN1,Y,5)'=0  SET $PIECE(SATZ,Y,214)=$PIECE(RAHMEN1,Y,5)   ;AUF/ABSCHLAG % TYBD;19.2,2005;27277;GEM
+	. . . . IF +$PIECE(RAHMEN1,Y,6)'=0  SET $PIECE(SATZ,Y,211)=$PIECE(RAHMEN1,Y,6)   ;AUF/ABSCHLAG BETRAG
+	. . . . IF $PIECE(RAHMEN1,Y,51)'="" SET $PIECE(SATZ,Y,125)=$PIECE(RAHMEN1,Y,51)  ;TEXT RABATT 1
+	. . . . IF $PIECE(RAHMEN1,Y,52)'="" SET $PIECE(SATZ,Y,129)=$PIECE(RAHMEN1,Y,52)  ;TEXT RABATT 2
+	. . . . IF $PIECE(RAHMEN1,Y,53)'="" SET $PIECE(SATZ,Y,213)=$PIECE(RAHMEN1,Y,53)  ;TEXT RABATT 3  ;FIS;28.02.05
+	. . . ;
+	. . . SET KOND=$PIECE(RAHMEN1,Y,7)
+	. . . QUIT:KOND=""
+	. . . SET KOND1=$GET(^INKOND(YM,KOND,1))
+	. . . SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,7) =$PIECE(KOND1,Y,3)   ;SKONTO
+	. . . SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,9) =$PIECE(KOND1,Y,2)   ;TAGE
+	. . . SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,10)=$PIECE(KOND1,Y,4)   ;NETTO  // SR15143 ^^^ What is this for
+	. . ;
+	. . ; 2:"Purchase Order"
+	. . ;-------------------------------------
+	. . IF LIEF'="" IF $GET(KUNDE)="" IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1))]]><![CDATA[,Y,2)=2 DO
+	. . . NEW RAHMEN,RAHMEN1,WG
+	. . . SET RAHMEN=$ORDER(^INRAHMENGROUP(YM,LIEF,""),-1)
+	. . . QUIT:RAHMEN=""
+	. . . ;
+	. . . SET RAHMEN1=""
+	. . . SET WG=$$$INARTKSuppliersCatalogGroup($GET(^INARTK(YM,ART,LIEF,1)))
+	. . . IF WG=""  SET RAHMEN1 = $get(^INRAHMENGROUP(YM,LIEF,RAHMEN,0,1))
+	. . . IF WG'="" SET RAHMEN1 = $get(^INRAHMENGROUP(YM,LIEF,RAHMEN,WG,1))
+	. . . IF RAHMEN1="" DO
+	. . . . SET RAHMEN(1) = $ORDER(^INRAHMENGROUP(YM,LIEF,RAHMEN,"")) 
+	. . . . IF RAHMEN(1)'="" SET RAHMEN1 = $get(^INRAHMENGROUP(YM,LIEF,RAHMEN,RAHMEN(1),1))
+	. . . ;
+	. . . QUIT:RAHMEN1=""
+	. . . ;
+	. . . FOR YI=2:1:6,51,52,53 IF $PIECE(RAHMEN1,Y,YI)'="" SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,YI)=$PIECE(RAHMEN1,Y,YI)   ;RABATTE
+	. . . SET KOND=$PIECE(RAHMEN1,Y,7)
+	. . . QUIT:KOND=""
+	. . . SET KOND1=$GET(^INKOND(YM,KOND,1))
+	. . . SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,7) =$PIECE(KOND1,Y,3)    ;SKONTO
+	. . . SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,9) =$PIECE(KOND1,Y,2)    ;TAGE
+	. . . SET $PIECE(^INAUFPK(YM,YAUFTRAG,YPOS,1),Y,10)=$PIECE(KOND1,Y,4)    ;NETTO
+	. . ;
+	. . IF LIEF'="" IF ART'="" IF $DATA(^INARTKR(YM,ART,LIEF)) DO            ;MENGENRABATTE EINKAUF
+	. . . NEW RABATT,RABATT1
+	. . . SET RABATT1=""
+	. . . SET RABATT1=$GET(^INARTKR(YM,ART,LIEF,+MENGE,1))                   ;GENAUE MENGEN ;shuffle 
+	. . . IF RABATT1'="" SET RABATT=+MENGE
+	. . . IF RABATT1=""  SET RABATT=$ORDER(^INARTKR(YM,ART,LIEF,+MENGE),-1)  ;VORIGE STUFE ;step 
+	. . . IF RABATT'=""  SET RABATT1=$GET(^INARTKR(YM,ART,LIEF,RABATT,1))
+	. . . QUIT:RABATT1=""  ;KEIN RABATT ;no deduction 
+	. . . IF $PIECE(RABATT1,Y,2)'="" QUIT:$PIECE(RABATT1,Y,2)>$HOROLOG       ;AB GÜLTIG ;Confirm. valuable 
+	. . . IF $PIECE(RABATT1,Y,3)'="" QUIT:$PIECE(RABATT1,Y,3)<$HOROLOG       ;BIS GÜLTIG ;until valuable 
+	. . . IF +$PIECE(RABATT1,Y,1)'=0 SET $$$INAUFPKDiscount3(^INAUFPK(YM,YAUFTRAG,YPOS,1))=$PIECE(RABATT1,Y,1)  ;3.RABATT=MENGENRABATT
+	. . . SET $$$INAUFPKDiscountName2(^INAUFPK(YM,YAUFTRAG,YPOS,1))=$$^WWWTEXT(32223)  ;3.RABATT=MENGENRABATT
+	. . . ;IF +$PIECE(RABATT1,Y,4)'=0 SET $$$INAUFPKUnitPrice(^INAUFPK(YM,YAUFTRAG,YPOS,1))=$PIECE(RABATT1,Y,4)  ;when Sum when deduction;BEC;10.Aug.05;13151;CHANGES REDUCTION PRICE 
+	. . . ;IF +$PIECE(RABATT1,Y,4)'=0 SET $$$INAUFPKBasisOriginalPrice(^INAUFPK(YM,YAUFTRAG,YPOS,1))=$PIECE(RABATT1,Y,4)  ;WENN BETRAG ALS RABATT ;when Sum when deduction 
+	. . . ;
+	. . . //SR13151 - This "discount" is like the cost override, So use the same variable.
+	. . . IF +$PIECE(RABATT1,Y,4)'=0 IF $GET(%(YQUERY,"YGM"_ART))="" set %(YQUERY,"YGM"_ART)=$$$INARTKRAmount(RABATT1)
+	. . ;
+	. . ;SR12008 Not working yet.  (SR13151)--------------
+	. . ;SET YFELD=$GET(^INAUFPK(YM,YAUFTRAG,YPOS,1)) ;SR12008
+	. . ;do UpdateExchangeRate^INAUFDISC(YAUFTRAG,YPOS,SATZ,.YFELD)  ;SR12008  ;Removed SR13151 - doesn't work properly yet
+	. . ;set ^INAUFPK(YM,YAUFTRAG,YPOS,1)=YFELD  ;SR12008
+	. . ;-------------------------------------------------
+	. . ;
+	. . IF $GET(%(YQUERY,"YGM"_ART))'="" DO        ;FIS;18.08.04;26293 ;25.08.04;26316 With Foreign Currency
+	. . . NEW PRICE,WHR,WHRF,NKOMMA
+	. . . SET PRICE=$$^WWWTR(1,12,$PIECE($GET(%(YQUERY,"YGM"_ART)),"@",1))  ;UNIT PRICE
+	. . . ;if fltCostOverride'=0 set PRICE=fltCostOverride ;SR12609
+	. . . SET WHRF=$$^WWWTR(1,12,$PIECE($GET(%(YQUERY,"YGM"_ART)),"@",2))   ;EXCHANGE RATE ;instalment 
+	. . . SET WHR=""
+	. . . IF LIEF'="" SET WHR=$$$INLIEFCurrency($GET(^INLIEF(YM,LIEF,1)))
+	. . . SET NKOMMA=$PIECE($GET(^INAUFPK(YM,YAUFTRAG,YPOS,1)),Y,25)
+	. . . IF (+NKOMMA=0)||(NKOMMA>9) SET NKOMMA=2
+	. . . IF WHR="" DO  ;OHNE FREMDWÄHRUNG ;without 
+	. . . . SET $$$INAUFPKBasisOriginalPrice(^INAUFPK(YM,YAUFTRAG,YPOS,1))=$JUSTIFY(PRICE,0,NKOMMA)
+	. . . . SET $$$INAUFPKUnitPrice(^INAUFPK(YM,YAUFTRAG,YPOS,1))=$JUSTIFY(PRICE,0,NKOMMA)
+	. . . ;
+	. . . IF WHR'="" DO  ;MIT FREMDWÄHRUNG ;by means of
+	. . . . ;IF WHRF="" SET WHRF=$PIECE(RABATT1,Y,78)
+	. . . . ;if WHRF="" set WHRF=$$$INAUFExchangeRate($get(^INAUF(YM,YAUFTRAG,1)))	//JW - this should be done for SR12008
+	. . . . IF WHRF="" SET WHRF=$PIECE($GET(^WWWWAE(0,WHR,1)),Y,5)
+	. . . . IF WHRF="" SET WHRF=1
+	. . . .;SET $$$INAUFPKCostFC(^INAUFPK(YM,YAUFTRAG,YPOS,1))                    = $JUSTIFY(PRICE/WHRF,0,NKOMMA)
+	. . . . SET $$$INAUFPKCostFC(^INAUFPK(YM,YAUFTRAG,YPOS,1))                    = $JUSTIFY(PRICE,0,NKOMMA)		//SR13151
+	. . . . SET $$$INAUFPKBasisOriginalPrice(^INAUFPK(YM,YAUFTRAG,YPOS,1))        = $JUSTIFY((PRICE*WHRF),0,NKOMMA)
+	. . . . SET $$$INAUFPKUnitPrice(^INAUFPK(YM,YAUFTRAG,YPOS,1))                 = $JUSTIFY((PRICE*WHRF),0,NKOMMA)
+	. . . . SET $$$INAUFPKExchangeRate(^INAUFPK(YM,YAUFTRAG,YPOS,1))              = WHRF
+	. . . . SET $$$INAUFPKExchangeRateEffectivityDa(^INAUFPK(YM,YAUFTRAG,YPOS,1)) = +$HOROLOG
+	. . . ;
+	. . . SET %(YQUERY,"YGM"_ART)=""
+	. . ;
+	. . ;SR12609 -- if an override has been passed in, use it to create the INAUFPK record.	// SR13151
+	. . ;if fltCostOverride'=0 set $PIECE(YFELD,Y,12)=fltCostOverride
+	. . ;if (fltCostOverride'=0)&&(+$PIECE(YFELD,Y,78)'=0) set $PIECE(YFELD,Y,68)=fltCostOverride/$PIECE(YFELD,Y,78)
+	. . ;
+	. . SET YFELD=$GET(^INAUFPK(YM,YAUFTRAG,YPOS,1))
+	. . if $$$INAUFPKDeliveryQuantityFullLot(YFELD)="" set $$$INAUFPKDeliveryQuantityFullLot(YFELD)=$$DefaultUnit^INARTK(ART,LIEF)  ; OrderUnit ;SR17138
+	. . SET $$$INAUFPKUnitPrice(YFELD)=$$$INAUFPKBasisOriginalPrice(YFELD)   ;EINZELEK IN SELBSTKOSTENFELD ;within 
+	. . SET $$$INAUFPKPurchaseQuantity(YFELD)=MENGE  ;STANDARDMENGE
+	. . IF +$$$INAUFPKConversionFactorQuantity(YFELD)'=0 SET $$$INAUFPKPurchaseQuantity(YFELD)=MENGE*$$$INAUFPKConversionFactorQuantity(YFELD)   ;UMRECNUNGSFAKTOR ;TYBD;9.5.2003 // SR15473: Removed justification
+	. . new SuppliersFCCode ; SR13591
+	. . set SuppliersFCCode = $$GetFCCode^INLIEF(LIEF)
+	. . if SuppliersFCCode '= "" do
+	. . . SET $$$INAUFPKBasisOriginalPrice(YFELD) = $JUSTIFY($$$INAUFPKCostFC(YFELD)*$$$INAUFPKExchangeRate(YFELD)*$$$INAUFPKPurchaseQuantity(YFELD)/$$^INQTYUNIT(ART),0,2)  ;SR13517
+	. . if SuppliersFCCode = "" do
+	. . . SET $$$INAUFPKBasisOriginalPrice(YFELD) = $JUSTIFY($$$INAUFPKUnitPrice(YFELD)*$$$INAUFPKPurchaseQuantity(YFELD)/$$^INQTYUNIT(ART),0,2)  ;SR13517  ;FIS;20.06.03;23804
+	. . SET $$$INAUFPKNetOriginalPrice(YFELD)=$$^INNETTO(YFELD)  ;NETTOPREIS ERRECHNE
+	. . ;SET ^INAUFPK(YM,YAUFTRAG,YPOS,1)=YFELD   ;SPEICHERN PREISE ;Save  // SR15143 ^^^ Purchase Order line creation  // SR15144
+	. . SET strStatus = $$$Save("INAUFPK",YAUFTRAG_","_YPOS,YFELD,$$$YES) // SR15144
+	. ;
+	. ;-------------------------------------
+	. ;
+	. IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=1 DO   ;EIGENAUFTRAG ZU FERTIGUNG ;within 
+	. . SET $PIECE(SATZ,Y,7) = 3  ;FERTIGEN
+	. ;
+	. IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0 DO   ;KUNDENAUFTRAG;FIS;09.07.04;25940
+	. . SET $PIECE(SATZ,Y,360)=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,1)  ;KUNDENNUMMER
+	. ;
+	. IF $PIECE(SATZ,Y,26)=2 DO          ;DIENSTLEISTUNG
+	. . SET $PIECE(SATZ,Y,7)  = 4        ;WENN LEISTUNG DANN DIENSTLEISTUNG UND LEISTUNGSFÄHIG ;when performance And efficient 
+	. . SET $PIECE(SATZ,Y,90) = $$$YES   ;WARE AUSLIEFERUNGSFÄHIG ;wares 
+	. ;
+	. ;KEINE AUTOMATISCHE HERKUNFT WENN = 3  -> KÖNNTE AUCH LAGERBESTAND BZW. SEPARATE FERTIGUNG MIT EIGENAUFTRAG (EUREC) ;no provenance when too resp. by means of 
+	. ;IF $PIECE(SATZ,Y,26)=3 DO   ;EIGENBAU
+	. ;.IF '$DATA(^INWE(YM,ART)) SET $PIECE(SATZ,Y,7)=3  ;WENN EIGENFERTIGUNG DANN EIGENFERTIGUNG (AUSSER BEI LAGERBESTAND)
+	. ;.IF $DATA(^INWE(YM,ART)) IF $$^INARTMENGE(ART)'>MENGE SET $PIECE(SATZ,Y,7)=3
+	. ;
+	. IF $PIECE(SATZ,Y,26)=6 DO         ;PAUSCHALELEISUNG
+	. . SET $PIECE(SATZ,Y,7)  = 4
+	. . SET $PIECE(SATZ,Y,90) = $$$YES  ;WARE AUSLIEFERUNGSFÄHIG ;wares 
+	. ;
+	. set idType=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)
+	. IF (idType'=2)&&(idType'=5) IF KATALOG'=1 IF $PIECE(SATZ,Y,26)=4 DO  ;KLEINTEILE ; SR14420: 5 is Requisition Order
+	. . SET $PIECE(SATZ,Y,7)  = 2       ;KLEINTEILE AUS LAGER ;out of stock location 
+	. . SET $PIECE(SATZ,Y,90) = $$$YES  ;WARE AUSLIEFERUNGSFÄHIG ;wares 
+	. . NEW BET,LAP,WED,WEN 
+	. . SET REST=$PIECE(SATZ,Y,5)              ;MENGE ;quantity 
+	. . SET $PIECE(SATZ,Y,6)=$PIECE(SATZ,Y,5)  ;MENGE OK ;quantity 
+	. . SET YSONDEXEC="SET YOK=$$^INARTMINUS("_""""_YAUFTRAG_""""_","_""""_YPOS_""""_","_""""_ART_""""_","_""""_REST_""""_")"  ;EXECUTE LATER, AFTER SAVE;FIS;25.04.08
+	. ;
+	. ;SR14311: Only auto-source if order is not blocked
+	. ;FAN;16.09.04;26392; soll die WH autom. von Lager festegelgt werden, (Ablaufparameter "Warenherkunft Lager automatisch festlegen")
+	. ;IF ('$piece($GET(^INAUF(YM,YAUFTRAG,1)),Y,38))&&($$$INVORGAutomaticSourcing(objINVORG)) DO   ; D191 // SR14924
+	. set blnSourceOrder = $$$NO // SR14924
+	. if ('$$$INAUFBlockPurchaseOrder($get(^INAUF(YM,YAUFTRAG,1)))) do  // SR14924
+	. . if ($$$INAUFSourcingMethod(^INAUF(YM,YAUFTRAG,1))=$$$EnumINAUFSOURCINGImmediate) set blnSourceOrder = $$$YES   ; AutomaticSourcing // All the rest of this routine reads directly from ^INAUF // SR14924
+	. . if ($$$INVORGAutomaticSourcing(objINVORG)) && ($$$INAUFSourcingMethod(^INAUF(YM,YAUFTRAG,1)) = "") set blnSourceOrder = $$$YES // SR14924
+	. if blnSourceOrder do  // SR14924
+	. . QUIT:$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)'=0   ;Bei Kundenaufträgen
+	. . ;
+	. . //SR14335
+	. . set idLoc=""
+	. . if '$$$INVORGAccessOtherItemLocns(objINVORG) set idLoc=$$$INAUFLocation($get(^INAUF(YM,YAUFTRAG,1)))
+	. . set intItemQty = $$^INARTMENGE(ART,,idLoc,,,,1)      ;all locations 
+	. .	//QUIT:$PIECE(SATZ,Y,5)>$$^INARTMENGE(ART,,,,,,1)    ;wenn ausreichend in Bestand. ;Quit:Order Qty > Item Qty On Hand
+	. . QUIT:$PIECE(SATZ,Y,5)>intItemQty    ;wenn ausreichend in Bestand. ;Quit:Order Qty > Item Qty On Hand
+	. . ;
+	. . SET $PIECE(SATZ,Y,7)  = 2        ; AUS LAGER ;out of stock location 
+	. . SET $PIECE(SATZ,Y,90) = $$$YES   ; WARE AUSLIEFERUNGSFÄHIG ;wares 
+	. . NEW BET,LAP,WED,WEN 
+	. . SET REST=$PIECE(SATZ,Y,5)                       ;MENGE ;quantity 
+	. . SET $PIECE(SATZ,Y,6)=$PIECE(SATZ,Y,5)           ;MENGE OK ;quantity 
+	. . ;SET YOK=$$^INARTMINUS(YAUFTRAG,YPOS,ART,REST)  ;BESTAND UMBUCHEN
+	. . SET YSONDEXEC="SET YOK=$$^INARTMINUS("_""""_YAUFTRAG_""""_","_""""_YPOS_""""_","_""""_ART_""""_","_""""_REST_""""_",,,,,,,,,,,,,1)"  
+	. ;
+	. IF MENGE<0 IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)'=1 DO   ;MINUSMENGE ;FIS;15.01.04;22891;AUSSER EIGENFERTIGUNG
+	. . ;Q:$P(SATZ,Y,26)=2  ;ALTE VERSION
+	. . IF $PIECE(SATZ,Y,26)=2 SET $PIECE(SATZ,Y,90) = $$$YES SET $PIECE(SATZ,Y,7) = 4 QUIT   ;LEISTUNG        ;TYBD;25520;8,4,2004
+	. . IF $PIECE(SATZ,Y,26)=6 SET $PIECE(SATZ,Y,90) = $$$YES SET $PIECE(SATZ,Y,7) = 4 QUIT   ;PAUSCHALLEISTUNG;TYBD;25519;8,4,2004
+	. . SET $PIECE(SATZ,Y,7)  = 2       ;WENN -MENGE=LAGER ;when 
+	. . SET $PIECE(SATZ,Y,6)  = MENGE   ;MENGE OK ;quantity 
+	. . SET $PIECE(SATZ,Y,90) = $$$YES  ;WARE AUSLIEFERUNGSFÄHIG ;wares 
+	. . SET $PIECE(SATZ,Y,47) = 0       ;HERSTELLKOSTEN AUF 0 SETZTEN ;upon 
+	. ;
+	. ; Creation Stamps
+	. ;-------------------------------------
+	. SET $PIECE(SATZ,Y,22) = $HOROLOG                 ;ERFASST
+	. SET $PIECE(SATZ,Y,21) = $GET(YTRAKT)_"/"_YUSER   ;TRANSAKTIONSNUMMER UND USER ;And 
+	. SET $PIECE(SATZ,Y,23) = YBED                     ;ERFASST
+	. SET $PIECE(SATZ,Y,24) = ""                       ;ÄNDERUNG ;alteration 
+	. SET $PIECE(SATZ,Y,25) = ""                       ;MITARB
+	. ;
+	. ; LOCATION DEFAULT ON THE LINE PP;2004-09-07
+	. if $piece($get(^INAUF(YM,YAUFTRAG,1)),Y,6)'="" do
+	. . quit:$piece(SATZ,Y,363)'=""
+	. . set $piece(SATZ,Y,363)=$piece($get(^INAUF(YM,YAUFTRAG,1)),Y,6)
+	. ;
+	. ;SET $PIECE(SATZ,Y,116)=$PIECE(SATZ1,Y,86)  ;AUFSCHLAG
+	. ;SET $PIECE(SATZ,Y,118)=$PIECE(SATZ1,Y,88)  ;VK
+	. ;SET $PIECE(SATZ,Y,120)=$PIECE(SATZ1,Y,90)  ;PREISKZ
+	. ;SET $PIECE(SATZ,Y,124)=$PIECE(SATZ1,Y,92)  ;PROV
+	. ;
+	. ;DO  ;BETRIEBSABHÄNGIGE PREISE
+	. ;. NEW BETRIEB,PREISE
+	. ;. SET BETRIEB=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,6)
+	. ;. QUIT:BETRIEB=""
+	. ;. SET PREISE=$GET(^INARTPREIS(YM,ART,BETRIEB,1))
+	. ;. QUIT:PREISE=""
+	. ;. SET $PIECE(SATZ,Y,116)=$PIECE(PREISE,Y,3)  ;AUFSCHLAG
+	. ;. SET $PIECE(SATZ,Y,118)=$PIECE(PREISE,Y,1)  ;VK
+	. ;. SET $PIECE(SATZ,Y,120)=$PIECE(PREISE,Y,2)  ;PREISKZ
+	. ;
+	. ;IF KUNDE'="" IF $DATA(^INKUNDEP(YM,KUNDE,ART)) DO  ;KUNDENPREISE
+	. ;. NEW KUNDEP,ABDATUM
+	. ;. SET ABDATUM=$ORDER(^INKUNDEP(YM,KUNDE,ART,+$H+1),-1)   ;TYBD;12.04.2003;ABDATUM
+	. ;. QUIT:ABDATUM<10000
+	. ;. SET KUNDEP=^INKUNDEP(YM,KUNDE,ART,ABDATUM,1)
+	. ;. SET $PIECE(KUNDEP,Y,2)=ABDATUM
+	. ;. IF $PIECE(KUNDEP,Y,2)'="" QUIT:$PIECE(KUNDEP,Y,2)>$HOROLOG   ;AB GÜLTIG
+	. ;. IF $PIECE(KUNDEP,Y,3)'="" QUIT:$PIECE(KUNDEP,Y,3)<$HOROLOG   ;BIS GÜLTIG
+	. ;. IF +$PIECE(KUNDEP,Y,1)'=0 SET $PIECE(SATZ,Y,118)=$PIECE(KUNDEP,Y,1)  ;KUNDENPREIS VORGEBEN
+	. ;
+	. DO  ;FIS;03.06.03;23477;PREISE AUS INSALESPRICE
+	. . SET $PIECE(SATZ,Y,116)=$PIECE(SATZ1,Y,86)  ;AUFSCHLAG ;overcharge 
+	. . SET $PIECE(SATZ,Y,120)=$PIECE(SATZ1,Y,90)  ;PREISKZ
+	. . IF $GET(KUNDE)'="" IF $PIECE($GET(^INKUNDE(YM,KUNDE,1)),Y,221)'="" SET $PIECE(SATZ,Y,120)=$PIECE(^INKUNDE(YM,KUNDE,1),Y,221)   ;PREISKZ DES KUNDEN;FIS;24405;04.11.03
+	. . IF $GET(KUNDE)'="" IF $PIECE($GET(^INKUNDE(YM,KUNDE,1)),Y,73)'="" DO
+	. . . SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,210)                       = $PIECE($GET(^INKUNDE(YM,KUNDE,1)),Y,73) 
+	. . . SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,"INAUF","D",1),Y,210) = $PIECE($GET(^INKUNDE(YM,KUNDE,1)),Y,73)
+	. . . SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,303)                       = $$$YES   ;SPEZIALZUSCHLAG FÜR KUNDE;TYBD;27,11,2004;26791;
+	. . . SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,"INAUF","D",1),Y,303) = $$$YES
+	. . ;
+	. . ;IF $GET(KUNDE)'="" IF $PIECE(SATZ,Y,12)'="" IF $PIECE($GET(^INKUNDELIEF(YM,KUNDE,$PIECE(SATZ,Y,12),1)),Y,31)'="" SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,210)=$PIECE(^ (1),Y,31) SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,303)=1  ;SPEZIALZUSCHLAG FÜR KUNDE;TYBD;27,11,2004;26791;
+	. . ;IF $GET(KUNDE)'="" IF $PIECE(SATZ,Y,12)'="" IF $PIECE($GET(^INKUNDELIEF(YM,KUNDE,$PIECE(SATZ,Y,12),1)),Y,32)=1 SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,210)="" SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,303)=""  ;SPEZIALZUSCHLAG FÜR KUNDE NICHT BERECHNEN;TYBD;27,11,2004;26791;
+	. . IF $GET(KUNDE)'="" IF $PIECE($GET(^INKUNDE(YM,KUNDE,1)),Y,228)=$$$YES DO
+	. . . SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,215)                       = $$$YES 
+	. . . SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,"INAUF","D",1),Y,215) = $$$YES
+	. . . SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,228)                       = $$$YES   ;LIEFERANSCHRIFT IST KUNDE;TYBD;3,12,2004;26930
+	. . . SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,"INAUF","D",1),Y,228) = $$$YES
+	. . ;
+	. . SET $PIECE(SATZ,Y,124)=$PIECE(SATZ1,Y,92)  ;PROV
+	. . IF +$GET(YPREISFIX)'=0 SET $PIECE(SATZ,Y,118)=YPREISFIX QUIT    ;FIXER VK AUS VK=EK INKL. RABATTE;FIS;01.03.05;27351
+	. . SET $PIECE(SATZ,Y,118)=$JUSTIFY($$^INSALESPRICE($PIECE(SATZ,Y,4),MENGE,$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,6),$PIECE(SATZ,Y,120),KUNDE,+$HOROLOG),0,$$^WWWDECIMALLEN("INAUFP",118))  ;TYBD;17,11,2004;26328;NK
+	. ;
+	. ;  Routine INAUFTO1 updates the existing order lines (INAUFP) and INAUFPXL
+	. ;  Requires VORG(1) = 1  (from F104 in form INAUF)
+	. ;
+	. ;  D74	$$$INVORGTransferDeliveryDate   [In Tracking Plan]
+	. IF $$$INVORGTransferDeliveryDate(objINVORG)=$$$YES IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0 DO  ;IF $PIECE(SATZ,Y,19)'=""  DO  ;LIEFERTERMIN IN DIE VERSANDPLANUNG ÜBERTRAGEN
+	. . IF $PIECE(SATZ,Y,19)="" SET $PIECE(SATZ,Y,19)=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,19)  ;LIEFERTERMIN ;time of delivery 
+	. . QUIT:$PIECE(SATZ,Y,76)'=""  ;VERSAND BEREITS GEPLANT ;shipping yet 
+	. . SET $PIECE(SATZ,Y,76)=$PIECE(SATZ,Y,19)
+	. . DO
+	. . . NEW YKEY
+	. . . SET YKEY=YAUFTRAG_","_YPOS
+	. . . DO ^INAUFTO1  ;SPEICHERN TOUR-PLANUNG ;Save 
+	. ;
+	. DO  ;HISTORY
+	. . NEW BETRIEB
+	. . SET BETRIEB=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,6)
+	. . IF BETRIEB="" SET BETRIEB=$GET(YLOCATION)
+	. .; DO ^INARTHIST(ART,"Test if here",BETRIEB)  ;Neue Auftragsposition ; "New Order" 
+	. . DO ^INARTHIST(ART,$$^WWWTEXT(32507)_" "_YAUFTRAG_"-"_YPOS,BETRIEB)  ;Neue Auftragsposition ; "New Order" 
+	. ;
+	. IF $PIECE(SATZ,Y,56)'="" DO  ;NEUE SERIENNUMMERN
+	. . NEW YI
+	. . SET $PIECE(SATZ,Y,56)=$TRANSLATE($PIECE(SATZ,Y,56),",",";")
+	. . FOR YI=1:1  QUIT:$PIECE($PIECE(SATZ,Y,56),";",YI,999)=""  DO
+	. . . QUIT:$PIECE($PIECE(SATZ,Y,56),";",YI)=""
+	. . . ; "New / Order"
+	. . . DO HIST^INSNHIST($PIECE($PIECE(SATZ,Y,56),";",YI),$$^WWWTEXT(58)_" / "_$$^WWWTEXT(32047)_" "_YAUFTRAG_"-"_YPOS,ART,YAUFTRAG,YPOS)  ;NEUE SN ANGELEGT
+	. ;
+	. ; 121 Customer Discount         ;KUNDENRABATTE
+	. ; 122 Line Discount             ;POSITIONSRABATT
+	. ;-------------------------------------
+	. IF KUNDE'="" IF $DATA(^INKUNDE(YM,KUNDE,1)) DO
+	. . NEW KUNDE1
+	. . SET KUNDE1=^INKUNDE(YM,KUNDE,1)
+	. . SET $PIECE(SATZ,Y,121)=$PIECE(KUNDE1,Y,71) 
+	. . IF +$PIECE(KUNDE1,Y,70)'=0 SET $PIECE(SATZ,Y,122)=$PIECE(KUNDE1,Y,70)  ;TYBD;NUR WENN (!GGF RAHMENVERTRAG)
+	. ;
+	. ; Item Group-based Customer settings
+	. ; 384 Accounts Customer         ;KUNDENKONTO
+	. ; 385 Cost Centre Customer      ;KUNDENKOSTENSTELLE
+	. ; 121 Customer Discount         ;WARENGRUPPEN RABATT
+	. ;-------------------------------------
+	. SET WAGR=$PIECE(SATZ1,Y,30)
+	. IF WAGR'="" IF KUNDE'="" IF $DATA(^INKUNDEK(YM,KUNDE,WAGR,1)) DO   ;WARENGRUPPEN KUNDENKONDITIONEN
+	. . NEW KUNDEK
+	. . SET KUNDEK=^INKUNDEK(YM,KUNDE,WAGR,1)
+	. . ;
+	. . ;KUNDENKONDITION WARENGRUPPE;26932;TYBD;4,12,2004
+	. . SET $PIECE(SATZ,Y,384)=$PIECE(KUNDEK,Y,26)
+	. . IF +$PIECE(KUNDEK,Y,27)'="" SET $PIECE(SATZ,Y,385)=$PIECE(KUNDEK,Y,27)
+	. . ;
+	. . IF $PIECE(KUNDEK,Y,11)'="" QUIT:$PIECE(KUNDEK,Y,11)<$HOROLOG   ;BIS GÜLTIG ;until valuable 
+	. . SET $PIECE(SATZ,Y,121)=$PIECE(KUNDEK,Y,2) 
+	. ;
+	. ; Customer-Supplier settings
+	. ; (NOTE : Resets Order fields for each Order Line when applicable)
+	. ;-------------------------------------
+	. IF $GET(KUNDE)'="" IF $PIECE(SATZ,Y,12)'="" DO
+	. . NEW KUNDELIEF
+	. . SET KUNDELIEF=$GET(^INKUNDELIEF(YM,KUNDE,$PIECE(SATZ,Y,12),1))
+	. . QUIT:KUNDELIEF=""
+	. . IF $PIECE(KUNDELIEF,Y,26)'="" SET $PIECE(SATZ,Y,384)=$PIECE(KUNDELIEF,Y,26)  ;KUNDENKONTO
+	. . IF $PIECE(KUNDELIEF,Y,27)'="" SET $PIECE(SATZ,Y,385)=$PIECE(KUNDELIEF,Y,27)  ;KUNDENKOSTENSTELLE
+	. . IF $PIECE(KUNDELIEF,Y,31)'="" DO
+	. . . SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,210)=$PIECE(KUNDELIEF,Y,31) 
+	. . . SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,"INAUF","D",1),Y,210)=$PIECE(KUNDELIEF,Y,31) 
+	. . . SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,303)=1  ;SPEZIALZUSCHLAG FÜR KUNDE;TYBD;27,11,2004;26791;
+	. . . SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,"INAUF","D",1),Y,303)=1
+	. . ;
+	. . IF $PIECE(KUNDELIEF,Y,32)=1 DO  ;NICHT BERECHNEN
+	. . . SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,210)=""  
+	. . . SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,"INAUF","D",1),Y,210)=""
+	. . . SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,303)=""  ;SPEZIALZUSCHLAG FÜR KUNDE NICHT BERECHNEN;TYBD;27,11,2004;26791;
+	. . . SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,"INAUF","D",1),Y,303)=""
+	. ;
+	. ; Cost Centre Customer Partner    ;KOSTENSTELLE KUNDEN ANSPRECHPARTNER;TYBD;4,1,2005
+	. ;-------------------------------------
+	. IF KUNDE'="" DO
+	. . NEW YPARTN,YNAME
+	. . SET YPARTN=$PIECE(^INAUF(YM,YAUFTRAG,1),Y,317)  ;ANSPRECHPARTNER NUMMER;FIS;27046;16.02.05
+	. . IF YPARTN="" IF $PIECE(^INAUF(YM,YAUFTRAG,1),Y,305)'="" DO
+	. . . SET YPARTN=$PIECE(^INAUF(YM,YAUFTRAG,1),Y,305)
+	. . . SET YPARTN(1)=YPARTN
+	. . . SET YNAME=$PIECE(YPARTN(1)," ",3)
+	. . . IF YNAME="" SET YNAME=$PIECE(YPARTN(1)," ",2)
+	. . . IF YNAME="" SET YNAME=$PIECE(YPARTN(1)," ",1)
+	. . . IF $PIECE(YPARTN," ",4)'="" SET YNAME=$PIECE(YPARTN(1)," ",3,5)
+	. . . QUIT:YNAME=""
+	. . . SET YPARTN=$ORDER(^INPARTNs(YM,1,$$^WWWUMLAU(YNAME,1),KUNDE,""))
+	. . . QUIT:YPARTN'=""  ;=OK
+	. . . IF YPARTN="" IF $PIECE(YPARTN(1)," ",3)'="" SET YNAME=$PIECE(YPARTN(1)," ",2,3)  ;WENN HERR VAN HÖFEL ;TYBD;14,3,2005;27103
+	. . . QUIT:YNAME=""
+	. . . SET YPARTN=$ORDER(^INPARTNs(YM,1,$$^WWWUMLAU(YNAME,1),KUNDE,""))
+	. . . QUIT:YPARTN'=""
+	. . . IF YPARTN="" IF $PIECE(YPARTN(1)," ",3)'="" SET YNAME=$PIECE(YPARTN(1)," ",1,2)  ;WENN VAN HÖFEL ;TYBD;14,3,2005;27103
+	. . . QUIT:YNAME=""
+	. . . SET YPARTN=$ORDER(^INPARTNs(YM,1,$$^WWWUMLAU(YNAME,1),KUNDE,""))
+	. . . QUIT:YPARTN'=""
+	. . ;
+	. . IF YPARTN'="" IF $PIECE($GET(^INPARTN(YM,KUNDE,YPARTN,1)),Y,61)'="" SET $PIECE(SATZ,Y,385)=$PIECE(^INPARTN(YM,KUNDE,YPARTN,1),Y,61)  ; SR15473  Naked Ref
+	. ;
+	. ; Quantity Discounts      ;MENGENRABATTE  FAN 14.01.2002
+	. ;-------------------------------------
+	. IF ART'="" IF $DATA(^INARTR(YM,ART)) DO
+	. . NEW RABATT,RABATT1,AB,BIS,PMENGE
+	. . SET PMENGE=+MENGE
+	. . IF PMENGE<0 SET PMENGE=PMENGE*(-1)       ;WENN GUTSCHRIFT  ;when credit note
+	. . SET YGM=+$TRANSLATE($GET(%(YQUERY,"YGM"_ART)),",",".")  ;ZAHLENFORMAT
+	. . IF YGM<0 SET YGM=YGM*(-1)
+	. . IF PMENGE>YGM SET YGM=PMENGE
+	. . SET RABATT1=""
+	. . SET RABATT=""
+	. . FOR  SET RABATT=$ORDER(^INARTR(YM,ART,RABATT)) QUIT:YGM<RABATT  QUIT:RABATT=""  DO
+	. . . SET AB=""
+	. . . FOR  SET AB=$ORDER(^INARTR(YM,ART,RABATT,AB))  QUIT:AB>$HOROLOG  QUIT:AB=""  DO
+	. . . . SET RABATT1=$GET(^INARTR(YM,ART,RABATT,AB,1))
+	. . . . QUIT:RABATT1=""
+	. . . . IF $PIECE(RABATT1,Y,3)'="" IF $PIECE(RABATT1,Y,3)<$HOROLOG  SET RABATT1="" QUIT        ;BIS DATUM ;until Date 
+	. . ;
+	. . QUIT:RABATT1=""
+	. . IF +$PIECE(RABATT1,Y,1)=0 IF +$PIECE(RABATT1,Y,4)=0 QUIT
+	. . IF +$PIECE(RABATT1,Y,1)'=0 SET $PIECE(SATZ,Y,128)=$PIECE(RABATT1,Y,1)  ; Line Discount         POSITIONSRABATT
+	. . SET $PIECE(SATZ,Y,129)=$$^WWWTEXT(32223)                               ; "Quantity Discount"   3.RABATT=MENGENRABATT
+	. . IF +$PIECE(RABATT1,Y,1)=0 IF +$PIECE(RABATT1,Y,4)'=0 SET $PIECE(SATZ,Y,118)=$PIECE(RABATT1,Y,4)  ;WENN BETRAG ALS RABATT ;when Sum when deduction 
+	. ;
+	. ; 119 Total Sales Price (from Unit Sales Price)
+	. ;-------------------------------------
+	. SET $PIECE(SATZ,Y,119) = $JUSTIFY($PIECE(SATZ,Y,118)*MENGE/$$^INQTYUNIT(ART),0,$$^WWWDECIMALLEN("INAUFP",119))  ;TYBD;17,11,2004;26328;NK  ;VK*MENGE
+	. ;
+	. SET YM1=""
+	. SET YM2=""
+	. SET KEY=YAUFTRAG_","_YPOS
+	. DO  ;SETZEN UMSATZ ZEITRAUM;27153;FIS;17.01.05
+	. . NEW YFELD,YKEY,YI
+	. . SET YKEY=KEY
+	. . SET YFELD=SATZ
+	. . FOR YI=386:1:389,398:1:401 SET $PIECE(YFELD,Y,YI)=""
+	. . DO ^INAUFPVALDATE
+	. . SET SATZ=YFELD
+	. ;
+	. ; Save Order Line record   ;SPEICHERN DATENSATZ
+	. ;-------------------------------------
+	. SET OK=$$^WWWSPEI("INAUFP",KEY,SATZ,1) // SR15143 Order line creation
+	. if OK && blnSupplierOrder do
+	. . do ^INAUFPKNEU($$$KEY1(KEY),$$$KEY2(KEY),1)			;SR17138
+	. ;
+	. ;IF $$$INVORGDRPOnlyForNetChange(objINVORG)=$$$YES SET ^INDRPNETCHANGE(YM,ART,1)=""  ; // SR15144 D217 ;FIS;29.04.05;SR12200
+	. IF $$$INVORGDRPOnlyForNetChange(objINVORG)=$$$YES DO
+	. . SET strStatus=$$$Save("INDRPNETCHANGE",ART,"",$$$YES) // SR15144
+	. ;
+	. ;DO ^INAUFPKNEU(YAUFTRAG,YPOS,1)  ;TYBD;27007;29,12,2004;RABATTE RECHNEN;HERRAUS AM 31,12,2004
+	. ;
+	. ;FIS;SONDER EXECUTE (LAGERABBUCHUNG NACH SPEICHERUNG);25.08.04 ;EXECUTE within 
+	. IF $GET(YSONDEXEC)'="" NEW YOK XECUTE YSONDEXEC
+	. ;
+	. IF $$$INVORGCreateAutomServiceOrderF(objINVORG)=$$$YES DO     ; D113
+	. . IF ($ORDER(^INAUFP(YM,YAUFTRAG,YPOS))'="")||($ORDER(^INAUFP(YM,YAUFTRAG,YPOS),-1)'="") QUIT  ;NUR WENN ERSTE POSITION ;only when premier 
+	. . NEW YKEYX,FORM,YKEY,YFELD,KUNDE
+	. . SET YKEYX=YAUFTRAG_","_YPOS
+	. . SET KUNDE=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,1)
+	. . DO CALL^INAUFNEU1(KUNDE,YKEYX,1)  ;SERVICE AUTOMATISCH ANLEGEN ;automatic put onto 
+	. ;
+	. ;ANLEGEN ZUSATZARTIKEL  (OHNE UNTERTEILE) ;put onto 
+	. IF $DATA(^INARTZUS(YM,ART)) DO
+	. . KILL ^WWWSOR("ARTZ",YUSER,"ARTZ")
+	. . NEW ARTZ,MENGEP,MENGEZ,PREISZ,YPOSZ,WHZ,KEY,SOR,MENSATZ,ARTZ1,ANZ,KUNDETEXT
+	. . SET SOR=1
+	. . IF +MENGE<0 SET SOR=-1
+	. . SET ARTZ=""
+	. . FOR  SET ARTZ=$ORDER(^INARTZUS(YM,ART,ARTZ)) QUIT:ARTZ=""  DO
+	. . . SET ARTZ1=$GET(^INARTZUS(YM,ART,ARTZ,1))
+	. . . IF $PIECE(ARTZ1,Y,2)'=1 QUIT  ;KEINE AUTOMATISCHE ANLAGE ;no layout 
+	. . . IF +$PIECE(ARTZ1,Y,8)'=0 IF $PIECE(ARTZ1,Y,8)>$HOROLOG QUIT  ;GÜLTIG VON  ;FIS:10.10.2003 ;valuable from
+	. . . IF +$PIECE(ARTZ1,Y,9)'=0 IF $PIECE(ARTZ1,Y,9)<$HOROLOG QUIT  ;GÜLTIG BIS  ;FIS:10.10.2003 ;valuable until 
+	. . . SET MENGEZ    = $PIECE(ARTZ1,Y,5)        ;MENGE  ;FAN;04.03.04;25200
+	. . . SET KUNDETEXT = $PIECE(ARTZ1,Y,10)       ;alternativer Kundentext   ;FAN;13.04.04;25518
+	. . . SET PREISZ=""  ;VK ;Sale 
+	. . . IF $DATA(^INARTZUS1(YM,ART,ARTZ)) DO     ;VERKAUFSSTAFFEL
+	. . . . SET MENGEP=MENGE*SOR
+	. . . . IF '$DATA(^INARTZUS1(YM,ART,ARTZ,MENGEP)) SET MENGEP=$ORDER(^INARTZUS1(YM,ART,ARTZ,MENGEP),-1)
+	. . . . QUIT:MENGEP=""
+	. . . . SET MENSATZ=$GET(^INARTZUS1(YM,ART,ARTZ,MENGEP,1))
+	. . . . QUIT:MENSATZ=""
+	. . . . IF +$PIECE(MENSATZ,Y,3)'=0 IF $PIECE(MENSATZ,Y,3)>$HOROLOG QUIT  ;GÜLTIG VON  ;ULM:16.10.2002 ;valuable from
+	. . . . IF +$PIECE(MENSATZ,Y,4)'=0 IF $PIECE(MENSATZ,Y,4)<$HOROLOG QUIT  ;GÜLTIG BIS  ;ULM:16.10.2002 ;valuable until 
+	. . . . SET MENGEZ=$PIECE(MENSATZ,Y,1)
+	. . . . IF +$PIECE(MENSATZ,Y,5)=1 SET MENGEZ = MENGE*MENGEZ  ;ULM 01.11.2002
+	. . . . SET PREISZ=$PIECE(MENSATZ,Y,2)
+	. . . ;
+	. . . ;IF +MENGEZ=0 SET MENGEZ=1  ;MINDESTENS 1 STÜCK;FIS;AUCH NULL ERLAUBEN;24239;05.09.03
+	. . . SET MENGEZ=MENGEZ*SOR
+	. . . SET ANZ=$PIECE(ARTZ1,Y,7)
+	. . . IF ANZ="" SET ANZ=999
+	. . . SET ^WWWSOR("ARTZ",YUSER,"ARTZ",ANZ,ARTZ)=MENGEZ_Y_PREISZ_Y_KUNDETEXT         ;FAN; REINFOLG; FAN;04.03.04;25218
+	. . ;
+	. . SET ANZ=""
+	. . FOR  SET ANZ=$ORDER(^WWWSOR("ARTZ",YUSER,"ARTZ",ANZ))  QUIT:ANZ=""  DO
+	. . . SET ARTZ=""
+	. . . FOR  SET ARTZ=$ORDER(^WWWSOR("ARTZ",YUSER,"ARTZ",ANZ,ARTZ))  QUIT:ARTZ=""  DO
+	. . . . SET MENGEZ    = $PIECE($GET(^WWWSOR("ARTZ",YUSER,"ARTZ",ANZ,ARTZ)),Y,1)
+	. . . . SET PREISZ    = $PIECE($GET(^WWWSOR("ARTZ",YUSER,"ARTZ",ANZ,ARTZ)),Y,2)
+	. . . . SET KUNDETEXT = $PIECE($GET(^WWWSOR("ARTZ",YUSER,"ARTZ",ANZ,ARTZ)),Y,3)   ;alternativer Kundentext   ;FAN;13.04.04;25518
+	. . . . SET YPOSZ=$$^INAUFPOS(YAUFTRAG,ARTZ,MENGEZ,,PREISZ,KUNDETEXT)  ;ANLEGEN POSITION ;put onto 
+	. . ;
+	. . KILL ^WWWSOR("ARTZ",YUSER,"ANTZ")
+	. ;
+	. IF $GET(KUNDE)'=""  DO
+	. . ;
+	. . ;ANLEGEN SPEZIALZUSCHLAG;FIS;27445;04.03.05
+	. . IF $PIECE($GET(^INKUNDE(YM,KUNDE,1)),Y,260)'="" DO  ;EXTRA ZUSATZKOSTEN
+	. . . NEW YKEY,YFELD
+	. . . SET YKEY=YAUFTRAG_","_YPOS_","_($ORDER(^INAUFPIMPACT(YM,YAUFTRAG,YPOS,""),-1)+1)
+	. . . SET YFELD=$PIECE($GET(^INKUNDE(YM,KUNDE,1)),Y,260)_Y_$PIECE($GET(^INKUNDE(YM,KUNDE,1)),Y,261)  ;ZUSCHLAG Y BERECHNUNGSGRUNDLAGE
+	. . . SET $PIECE(YFELD,Y,3)=$PIECE(YFELD,Y,1)  ;TEXT
+	. . . DO ^INAUFPIMPACT  ;RECHNEN UND SPEICHERN
+	. . ;
+	. . NEW KUNDELIEF,LIEF
+	. . SET LIEF=$PIECE(SATZ,Y,12)
+	. . IF LIEF="" SET LIEF=$ORDER(^INARTK(YM,ART,""))
+	. . ;QUIT:LIEF=""
+	. . SET KUNDELIEF=""
+	. . IF LIEF'="" SET KUNDELIEF=$GET(^INKUNDELIEF(YM,KUNDE,LIEF,1))
+	. . ;
+	. . ; Create Auxilliary Lines      ; ANLEGEN ZUSATZPOSITIONEN
+	. . ;	D256		INAUFP : Purchase Order Reference
+	. . ;-------------------------------------
+	. . IF $PIECE(KUNDELIEF,Y,30)="" IF $PIECE(KUNDELIEF,Y,32)=1 QUIT  ;NICHT BERECHNEN WENN NICHT EXTRA EIN ARTIKEL ANGEGEBEN IST. WENN NUR IM KUNDENSTAMM ERFASST DANN KEINE;TYBD;3,1,2004
+	. . IF $PIECE(KUNDELIEF,Y,30)="" SET $PIECE(KUNDELIEF,Y,30)=$PIECE($GET(^INKUNDE(YM,KUNDE,1)),Y,227)  ;TYBD;29,12,2004
+	. . QUIT:KUNDELIEF=""
+	. . IF $PIECE(KUNDELIEF,Y,30)'="" DO  ;EXTRA POSITION ANLEGEN
+	. . . NEW PREIS,BEZ,PROZ,POS
+	. . . DO EH1^INBRUTTONETTO    ; Updates SATZ ByRef
+	. . . SET BEZ   = $PIECE($GET(^INART(YM,$PIECE(KUNDELIEF,Y,30),1)),Y,1)
+	. . . SET PROZ  = $TRANSLATE($REVERSE($PIECE($REVERSE($PIECE(BEZ,"%",1))," ",1)),",",".")
+	. . . SET PREIS = $JUSTIFY(($PIECE(SATZ,Y,123))/100*PROZ,0,2)
+	. . . IF +PROZ=0 SET PREIS=""
+	. . . SET POS=$$^INAUFPOS(YAUFTRAG,$PIECE(KUNDELIEF,Y,30),1,4,PREIS)  ;ANLEGEN POSITION ;put onto
+	. . . IF +POS'=0 DO  ;VERBINDUNG ZUR URSPRUNGSPOSITION IN BESTELLREFERENZ SPEICHERN;FIS;02.03.05;27043
+	. . . . NEW YFORM,YVOR,YOK,YFELD
+	. . . . SET YFELD=$GET(^INAUFP(YM,YAUFTRAG,POS,1))
+	. . . . SET $PIECE(YFELD,Y,256)="#"_YPOS
+	. . . . SET YOK=$$^WWWSPEI("INAUFP",YAUFTRAG_","_POS,YFELD,1)
+	. . . . IF $PIECE(YFELD,Y,4)'="" IF $$$INVORGDRPOnlyForNetChange(objINVORG)=$$$YES do      ; D217
+	. . . . . ;SET ^INDRPNETCHANGE(YM,$PIECE(YFELD,Y,4),1)=""    ;FIS;29.04.05;SR12200 // SR15144
+	. . . . . SET strStatus=$$$Save("INDRPNETCHANGE",$PIECE(YFELD,Y,4),"",$$$YES) // SR15144
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ; ^INAUFPT and ^INAUFPXL are created within this block
+	. ;		D69			$$$INVORGDoNotKillComponents()   [Do Not Kill Item Parts When Ordered; Process With or Without Sub-Parts]
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ;
+	. IF YAUFTRAG'="" DO
+	. . IF MENGE<0 IF $$$INVORGDoNotKillComponents(objINVORG)'=$$$YES QUIT:$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0  ; D69 ;NICHT BEI RÜCKNAHMEN;FIS;15.01.04;22891
+	. . IF $$$INVORGDoNotKillComponents(objINVORG)'=$$$YES QUIT:$PIECE(SATZ,Y,7)=1  ; D69 ;NICHT BEI BESTELLWARE ;Not next to 
+	. . ;-----------------------------------
+	. . MERGE ^INAUFPSP(YM,YAUFTRAG,YPOS)=^INARTSP(YM,ART)  ;ARTIKELSPRACHE IN POSITIONEN    ; Language Text within Order Line
+	. . MERGE ^INAUFPXL(YM,YAUFTRAG,YPOS)=^INARTXL(YM,ART)  ;KOPIEREN DES ARTIKELTEILEBAUMES ; Copy the Item Parts List
+	. . SET ^INAUFPXL(YM,YAUFTRAG,YPOS)=SATZ
+	. . ;-----------------------------------
+	. . ; 1.  LÖSCHEN UNTERTEILE WENN NUR BESTELLWARE AUS INAUFPXL (VOR INDRPPRODU !!!)
+	. . ;     DELETE LOWER PARTS IF ONLY ORDER COMMODITY OUT INAUFPXL (FOR INDRPPRODU)
+	. . ;     (possibly) Delete sub-assy BOM if component is "BUY" or "Master Schedule Item"
+	. . ; 2.  New parts structure                ;TEILESTRUKTUR NEU AUFBAUEN                 ; <<<<<   Creates ^INAUFPT
+	. . ; 3.  RE-CALCULATE MANUFACTURING COSTS   ; NEURECHNEN HERSTELLKOSTEN;21.12.04;FIS;26268 (IM HINTERGRUND)
+	. . DO ^INAUFPXLDEL
+	. . DO ^INAUFTEILE(YAUFTRAG,YPOS)
+	. . DO ^INAUFHKNEU(YAUFTRAG,YPOS,1)
+	. . ;-----------------------------------
+	. . ;  D7 Source    Enum 3 : Production
+	. . ;-----------------------------------
+	. . ;IF $PIECE(SATZ,Y,7)=3 IF $PIECE(objINVORG,Y,70)=1 DO
+	. . IF $PIECE(SATZ,Y,7)=3 DO  ;FIS;25899;INAUF1SEL IMMER AUSFÜHREN;17.06.04
+	. . . IF $$$INVORGDRPActivated(objINVORG)=$$$YES DO START^INDRPPRODU(YAUFTRAG,YPOS)  ; D70 ;JOB STARTEN ;start DRP job
+	. . . ;DO ^INAUF1SEL()        ;NEUER AUFTRAG IN ZWISCHENDATEI  ; ULM IN INAUF1, NACH ANLEGEN
+	. . . SET YREBUILD=1          ;BEC;25899;20.07.04;NEUAUFBAU DER INAUF1SEL
+	. . ;
+	. . ;NEURECHNEN ZUSATZKOSTEN IM AUFTRAG;FIS;02.02.05;27220
+	. . IF $$$INVORGRecalcAdditionalCosts(objINVORG)=$$$YES DO      ; D209
+	. . . NEW YFELD
+	. . . SET YFELD=$GET(^INAUF(YM,YAUFTRAG,1))
+	. . . DO ZUSATZ^INAUF1()
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++
+	. ;
+	. IF MENGE'<0 DO
+	. . NEW HK
+	. . SET HK=+$$^INAUFKOST(YAUFTRAG,YPOS)
+	. . IF HK'=0 SET $PIECE(^INAUFP(YM,YAUFTRAG,YPOS,1),Y,47)=HK
+	. . IF HK'=0 DO  ;NEURECHNEN VK PREISE;09.02.05;FIS;27283
+	. . . NEW SELBSTKOST,AUFTRAG,POSITION,MENGE,YFELD
+	. . . SET AUFTRAG    = YAUFTRAG
+	. . . SET POSITION   = YPOS
+	. . . SET YFELD      = SATZ
+	. . . SET SELBSTKOST = HK
+	. . . SET MENGE      = +$PIECE(YFELD,Y,5)
+	. . . DO KALK^INAUFKOST
+	. ;
+	. SET NETTO=$$^INAUFPNETTO(YAUFTRAG,YPOS)  ;NEURECHNEN POSITIONS-EK
+	. ;IF '$DATA(^INAUFPT(YM,YAUFTRAG,YPOS)) DO  ;ERRECHNEN GEWICHT WENN KEINE TEILE;FIS;02.07.04;25762;FIS;21.09.04;26400;GEWICHT NICHT RECHNEN
+	. IF ('$DATA(^INAUFPT(YM,YAUFTRAG,YPOS)))||($PIECE($GET(^INART(YM,ART,1)),Y,255)=1) DO  ;FIS;21.09.04;26400;GEWICHT NICHT AUS TEILEN RECHNEN
+	. . SET $PIECE(^INAUFP(YM,YAUFTRAG,YPOS,1),Y,43)=$PIECE(SATZ,Y,43)*MENGE  ;GEWICHT ;wt. 
+	. ;
+	. ;FIS;24891;08.01.04;RESERVIERUNG/WH AUTOM. FESTLEGEN
+	. IF $GET(%(YQUERY,"YPRESERV"))'="" DO
+	. . NEW RENR,RENRX,ABGE,MENGEX,MENGE,BET,LAP,WED,BGJOB,YI,OK
+	. . SET RENRX=$TRANSLATE($GET(%(YQUERY,"YPRESERV")),",",";")
+	. . SET MENGE=$PIECE(SATZ,Y,5)
+	. . FOR YI=1:1  QUIT:$PIECE(RENRX,";",YI,99)=""  SET RENR=$PIECE(RENRX,";",YI) DO  ;EVTL. MEHRERE RES. NUMMERN
+	. . . ;
+	. . . FOR ABGE=$$^WWWUMLAU(" ",1),$$^WWWUMLAU(0,1) IF $DATA(^INWERs(YM,8,ABGE,ART))  DO  ;WH LAGERBESTAND
+	. . . . SET BET=""
+	. . . . FOR  SET BET=$ORDER(^INWERs(YM,8,ABGE,ART,BET)) QUIT:BET=""  DO
+	. . . . . ;ZUGRIFF AUF BESTÄNDE ANDERER BETRIEBE NICHT ERLAUBT ! ;upon other Not permissive 
+	. . . . . IF $$$INVORGAccessOtherItemLocns(objINVORG)'=$$$YES QUIT:BET'=YLOCATION   ; D67
+	. . . . . SET LAP=""
+	. . . . . FOR  SET LAP=$ORDER(^INWERs(YM,8,ABGE,ART,BET,LAP)) QUIT:LAP=""  DO
+	. . . . . . SET WED=""
+	. . . . . . FOR  SET WED=$ORDER(^INWERs(YM,8,ABGE,ART,BET,LAP,WED)) QUIT:WED=""  DO
+	. . . . . . . IF $DATA(^INWER(YM,ART,BET,LAP,WED,RENR)) DO
+	. . . . . . . . SET MENGEX=$PIECE($GET(^INWER(YM,ART,BET,LAP,WED,RENR,1)),Y,4)
+	. . . . . . . . IF MENGE<MENGEX SET MENGEX=MENGE  ;MAX. MENGE ;quantity 
+	. . . . . . . . SET BGJOB=1
+	. . . . . . . . IF MENGE'=0 SET (%(YQUERY,"YFUNCT"))=2_";"_ART_";"_BET_";"_LAP_";"_WED_";"_RENR_";"_1
+	. . . . . . . . IF MENGE=0]]><![CDATA[  SET (%(YQUERY,"YFUNCT"))=2_";"_ART_";"_BET_";"_LAP_";"_WED_";"_RENR
+	. . . . . . . . DO ^INAUFWH(YAUFTRAG_","_YPOS)  ;EINDEUTIGE RESERVIERUNG AUFLÖSEN UND WH FESTLEGEN ;undo And 
+	. . . . . . . . SET MENGE=MENGE-MENGEX
+	. . . ;
+	. . . IF MENGE=$PIECE(SATZ,Y,5) DO  ;WH NOCH OFFEN ;yet vulnerable 
+	. . . . SET OK=$$RELOCATE^INRESERVIERT(YAUFTRAG,YPOS,RENR)  ;WH LAGERBESTELLUNG
+	
+	;===============================================================
+	quit:YAUFTRAG=""   ; no order
+	
+	set VORG(1) = $extract(YAUSWAHL,2,99)   ;SUCHVORGABE VOLLTEXT ODER NUMMER ;full text Or numeral 
+	set VORG(1) = $zstrip(VORG(1),">W")     ; Remove trailing white space
+	
+	;COPY EINER BEREITS BESTEHENDEN POSITION ÜBERNAHME AUFTRAG ;unit yet assumption order 
+	SET YQ=0
+	IF $PIECE(VORG(1),"-",1)'="" IF $PIECE(VORG(1),"-",2)'="" DO
+	. IF $PIECE(VORG(1),"-",2)'=0 QUIT:'$DATA(^INAUFP(YM,$PIECE(VORG(1),"-",1),$PIECE(VORG(1),"-",2)))
+	. IF $PIECE(VORG(1),"-",3)'="" IF $PIECE(VORG(1),"-",3)'="S" IF $PIECE(VORG(1),"-",3)'="s" QUIT  ;für storno ;to 
+	. NEW YI,YA,SATZ,KEY,YFORM,YAUFX,YPOSX,STORNO
+	. SET YAUFX  = $PIECE(VORG(1),"-",1)           QUIT:YAUFTRAG=YAUFX
+	. SET YPOSX  = $PIECE(VORG(1),"-",2)
+	. SET STORNO = $PIECE(VORG(1),"-",3)
+	. ;IF YPOSX=0 IF +$PIECE($GET(^INAUF(YM,YAUFX,1)),Y,71)'=0 DO  ;FIS;26306;23.08.04;KOPIEREN GESAMTRABATT
+	. IF +$PIECE($GET(^INAUF(YM,YAUFX,1)),Y,71)'=0 DO  ;FIS;26306;23.08.04;KOPIEREN GESAMTRABATT
+	. . QUIT:$PIECE(YFELD,Y,71)'=""
+	. . SET $PIECE(YFELD,Y,71)                                       = $PIECE($GET(^INAUF(YM,YAUFX,1)),Y,71)
+	. . SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,71)                       = $PIECE(YFELD,Y,71)
+	. . SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,"INAUF","D",1),Y,71) = $PIECE(YFELD,Y,71)  ;DA FORM BEREITS DA. ;yonder shape yet 
+	. ;
+	. MERGE ^INAUFPARA(YM,YAUFTRAG) = ^INAUFPARA(YM,YAUFX)  ;POSITIONSGRUPPEN ÜBERNEHMEN ;assume 
+	. ;
+	. DO  IF YPOSX=0 FOR  SET YPOSX=$ORDER(^INAUFP(YM,YAUFX,YPOSX)) QUIT:YPOSX=""  DO  ;EINZEL UND ALLE WENN =0  ;And when 
+	. . QUIT:YPOSX=0
+	. . SET YFORM="INAUFP"
+	. . SET SATZ=$GET(^INAUFP(YM,YAUFX,YPOSX,1))
+	. . QUIT:SATZ=""
+	. . FOR YPOS=1:1 QUIT:'$DATA(^INAUFP(YM,YAUFTRAG,YPOS))   ;NÄCHSTE POSITIONSNUMMER  ;next 
+	. . IF YPOS="" SET YPOS=1
+	. . IF $DATA(^INAUFP(YM,YAUFTRAG,YPOS)) SET YPOS=$$^WWWNEXT1("INAUFP",YAUFTRAG,2)
+	. . SET KEY=YAUFTRAG_","_YPOS
+	. . ;
+	. . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)'=2 DO 
+	. . . for YI=6,7,9,11,19,22:1:25,51,52,56,60,76:1:105,109,127,134,136            SET $PIECE(SATZ,Y,YI)=""  ;LÖSCHEN BEWEGUNGSDATEN        ;TYBD;12.06.2003;23194;RABATTE NICHT LÖSCHEN
+	. . . for YI=140,141,145,146,148,160,161,163:1:166,168:1:170,188:1:190,193:1:198 SET $PIECE(SATZ,Y,YI)=""
+	. . . for YI=200:1:202,204:1:207,215:1:218,220:1:238,240:1:245,248,254:1:267     SET $PIECE(SATZ,Y,YI)=""  ;LÖSCHEN WEITERE BEWEGUNGSDATEN;FIS;07.01.2004;24885
+	. . . for YI=302:1:306,317,319,322,323,382:1:389,398:1:401                       SET $PIECE(SATZ,Y,YI)=""
+	. . . ;
+	. . . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0 SET $PIECE(SATZ,Y,6)=""  ;WH BEI KUNDENAUFTRAG;FIS;06.01.04 ;next to customer´s order 
+	. . . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=1 SET $PIECE(SATZ,Y,7)=3   ;EIGENFERTIGUNG
+	. . . SET $PIECE(SATZ,Y,193)=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,4)        ;AUFTRAGSDATUM
+	. . . MERGE ^INAUFPK(YM,YAUFTRAG,YPOS)=^INAUFPK(YM,YAUFX,YPOSX)             ;KONDITIONEN ;terms of payment 
+	. . ;
+	. . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=2 DO 
+	. . . FOR YI=9,11,19,22,23,24,25,51,52,56,60,76:1:105,109,121,122,123,125,127,134,136  SET $PIECE(SATZ,Y,YI)=""
+	. . . FOR YI=140,141,145,146,148,160,163,164,165,166,168,169,170,188,189,190           SET $PIECE(SATZ,Y,YI)=""  ;LÖSCHEN BEWEGUNGSDATEN ;Delete transaction data 
+	. . . FOR YI=193:1:198,200,201,202,204,205,206,207,215,216,217,218,220:1:238,240:1:245 SET $PIECE(SATZ,Y,YI)=""
+	. . . FOR YI=248,254:1:267,302,303,304,305,317,319,322,323,382:1:389,398:1:401         SET $PIECE(SATZ,Y,YI)=""  ;LÖSCHEN WEITERE BEWEGUNGSDATEN;FIS;07.01.2004;24885
+	. . . ;
+	. . . MERGE ^INAUFPK(YM,YAUFTRAG,YPOS)=^INAUFPK(YM,YAUFX,YPOSX)  ;KONDITIONEN ;terms of payment 
+	. . ;
+	. . ;STORNO-AUFTRÄGE
+	. . IF ($EXTRACT(STORNO)="S") || ($EXTRACT(STORNO)="s") DO
+	. . . SET $PIECE(SATZ,Y,5)   = -$PIECE(SATZ,Y,5)         ;STORNO
+	. . .;SET $PIECE(SATZ,Y,118) = -$PIECE(SATZ,Y,118)       ;STORNO
+	. . . SET $PIECE(SATZ,Y,119) = -$PIECE(SATZ,Y,119)       ;STORNO
+	. . . SET $PIECE(SATZ,Y,123) = -$PIECE(SATZ,Y,123)       ;STORNO
+	. . . SET $PIECE(SATZ,Y,47)  = -$PIECE(SATZ,Y,47)        ;STORNO
+	. . . SET $PIECE(SATZ,Y,7)   = 2                         ;LAGERBESTAND
+	. . . IF $PIECE(SATZ,Y,26)=2 SET $PIECE(SATZ,Y,7) = 4    ;DIENSTLEISTUNG
+	. . . IF $PIECE(SATZ,Y,26)=6 SET $PIECE(SATZ,Y,7) = 4    ;DIENSTLEISTUNG;TYBD;1.8.2003
+	. . . IF +$$$INVORGStoreOldOrderAsOriginalOr(objINVORG)=$$$YES SET $PIECE(SATZ,Y,237)=YAUFX,$PIECE(SATZ,Y,238)=YPOSX  ;URSPRUNGSAUFTRAG;FIS;29.06.04;26006
+	. . . ;
+	. . . ; vvv DEPRECATED - with removal of INWEAUF* SR16361
+	. . . IF $DATA(^INWEAUFALTS(YM,YAUFX,YPOSX)) DO  ;ZURÜCKHOLEN SERIENNUMMER
+	. . . . NEW BETX,LAPX,WEDX,SNX
+	. . . . SET BETX=""
+	. . . . FOR  SET BETX=$ORDER(^INWEAUFALTS(YM,YAUFX,YPOSX,BETX)) QUIT:BETX=""  DO
+	. . . . . SET LAPX=""
+	. . . . . FOR  SET LAPX=$ORDER(^INWEAUFALTS(YM,YAUFX,YPOSX,BETX,LAPX)) QUIT:LAPX=""  DO
+	. . . . . . SET WEDX=""
+	. . . . . . FOR  SET WEDX=$ORDER(^INWEAUFALTS(YM,YAUFX,YPOSX,BETX,LAPX,WEDX)) QUIT:WEDX=""  DO
+	. . . . . . . SET SNX=""
+	. . . . . . . FOR  SET SNX=$ORDER(^INWEAUFALTS(YM,YAUFX,YPOSX,BETX,LAPX,WEDX,SNX)) QUIT:SNX=""  DO
+	. . . . . . . . IF $PIECE(SATZ,Y,56)="" SET $PIECE(SATZ,Y,56)=SNX QUIT
+	. . . . . . . . IF '$FIND(";"_$PIECE(SATZ,Y,56)_";",";"_SNX_";") SET $PIECE(SATZ,Y,56)=$PIECE(SATZ,Y,56)_";"_SNX
+	. . ;
+	. . ;	D7		$$$INAUFPSource()				4 : Service
+	. . ;	D26		$$$INAUFPItemType()				2 : Service, 6 : Phantom Item
+	. . ;	D90		$$$INAUFPReadyForDelivery()		bln
+	. . ;
+	. . IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=2 SET $PIECE(SATZ,Y,12)=$PIECE(^INAUF(YM,YAUFTRAG,1),Y,12)        ;FAN 30.10.2001 ; SR15473 Naked Ref
+	. . IF $PIECE(SATZ,Y,26)=2 SET $PIECE(SATZ,Y,7)=4 SET $PIECE(SATZ,Y,90)=1   ;DIENSTLEISTUNG
+	. . IF $PIECE(SATZ,Y,26)=6 SET $PIECE(SATZ,Y,7)=4 SET $PIECE(SATZ,Y,90)=1   ;DIENSTLEISTUNG
+	. . ;IF $PIECE(SATZ,Y,26)=4 SET $PIECE(SATZ,Y,7)=2 SET $PIECE(SATZ,Y,90)=1  ;KLEINTEILE LAGER
+	. . ;
+	. . ;	D5		$$$INAUFPQuantity()
+	. . ;
+	. . IF $PIECE(SATZ,Y,5)<0 DO  ;REKLA VORGABEN
+	. . . ;BEC;23117;15.05.03;LAGERPLATZ BETRIBSABHÄNGIG
+	. . . IF +$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0 IF $GET(YLOCATION)'="" SET $PIECE(SATZ,Y,223)=$PIECE($GET(^INVORGB(YM,YM,YLOCATION,1)),Y,2)  ;vorgabe lagerplatz AUS BETRIBSPARAMETERN  ;WEM;24673;27.11.2003;YM HINZUGEFÜGT
+	. . . IF $PIECE(SATZ,Y,223)="" SET $PIECE(SATZ,Y,223)=$$$INVORGStandardLocationForReturn(objINVORG)  ; D115 ;vorgabe lagerplatz,ALTE WERTE WEGEN SERVICEFALL 23117
+	. . . SET $PIECE(SATZ,Y,224) = 0
+	. . . IF +$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0 SET $PIECE(POS1,Y,224) = $$$YES    ;WEM;24673;27.11.2003;WENN KUNDENAUFTRAG UND STORNO; RÜCKGABE AN KUNDEN AUF JA SETZEN
+	. . . IF $PIECE(SATZ,Y,223)'="" SET $PIECE(SATZ,Y,224) = $$$YES  ;zurueck
+	. . . SET $PIECE(SATZ,Y,226) = 0
+	. . . SET $PIECE(SATZ,Y,228) = 0
+	. . . SET $PIECE(SATZ,Y,230) = 0
+	. . . SET $PIECE(SATZ,Y,232) = 0
+	. . ;
+	. . DO  ;SETZEN UMSATZ ZEITRAUM;27153;FIS;17.01.05
+	. . . NEW YFELD,YKEY,YI
+	. . . SET YKEY  = KEY
+	. . . SET YFELD = SATZ
+	. . . FOR YI = 386,387,388,389,398,399,400,401 SET $PIECE(YFELD,Y,YI)=""
+	. . . DO ^INAUFPVALDATE
+	. . . SET SATZ = YFELD
+	. . ;
+	. . ;
+	. . SET OK=$$^WWWSPEI("INAUFP",KEY,SATZ,1)   ;SPEICHERN DATENSATZ ;Save data record 
+	. . ;
+	. . ;
+	. . ;IF $PIECE(SATZ,Y,4)'="" IF $$$INVORGDRPOnlyForNetChange(objINVORG)=$$$YES SET ^INDRPNETCHANGE(YM,$PIECE(SATZ,Y,4),1)=""  ; D217 ;FIS;29.04.05;SR12200 // SR15144
+	. . IF $PIECE(SATZ,Y,4)'="" IF $$$INVORGDRPOnlyForNetChange(objINVORG)=$$$YES SET strStatus=$$$Save("INDRPNETCHANGE",$PIECE(SATZ,Y,4),"",$$$YES) // SR15144
+	. . IF $PIECE(SATZ,Y,5)'<0 DO
+	. . . NEW HK
+	. . . SET HK = $$^INAUFKOST(YAUFTRAG,YPOS)
+	. . . ;
+	. . . ; FIXME : 1. What if we are now getting the items for free? <GRF>
+	. . . ;         2. Why not perform test once?  Is there a reason to distinguish between +'=0 and '=0?
+	. . . ;         3. Use parameters for KALK?
+	. . . ;
+	. . . IF +HK'=0 SET $PIECE(^INAUFP(YM,YAUFTRAG,YPOS,1),Y,47) = HK     ; $$$INAUFPCost()
+	. . . IF HK'=0 DO  ;NEURECHNEN VK PREISE;09.02.05;FIS;27283
+	. . . . NEW SELBSTKOST,AUFTRAG,POSITION,MENGE,YFELD
+	. . . . SET AUFTRAG	   = YAUFTRAG
+	. . . . SET POSITION   = YPOS
+	. . . . SET YFELD	   = SATZ
+	. . . . SET SELBSTKOST = HK
+	. . . . SET MENGE	   = +$PIECE(YFELD,Y,5)                           ; $$$INAUFPQuantity()
+	. . . . DO KALK^INAUFKOST
+	. . ;
+	. . SET YQ=1
+	. . MERGE ^INAUFPSP(YM,YAUFTRAG,YPOS)=^INAUFPSP(YM,YAUFX,YPOSX)  ;ARTIKELSPRACHE
+	. . MERGE ^INAUFPIMPACT(YM,YAUFTRAG,YPOS)=^INAUFPIMPACT(YM,YAUFX,YPOSX)  ;ZUSATZKOSTEN POSITION;FIS;14.03.05;27445
+	. . IF $DATA(^INAUFPIMPACT(YM,YAUFTRAG,YPOS)) DO
+	. . . NEW YKEY,YFELD,LFN
+	. . . SET LFN = ""
+	. . . FOR  SET LFN = $ORDER(^INAUFPIMPACT(YM,YAUFTRAG,YPOS,LFN)) QUIT:LFN=""  DO
+	. . . . SET YKEY  = YAUFTRAG_","_YPOS_","_LFN
+	. . . . SET YFELD = $GET(^INAUFPIMPACT(YM,YAUFTRAG,YPOS,LFN,1))
+	. . . . SET $PIECE(^INAUFPIMPACT(YM,YAUFTRAG,YPOS,LFN,1),Y,7) = ""
+	. . . . IF $PIECE(YFELD,Y,4)'="" IF ($EXTRACT(STORNO)="S") || ($EXTRACT(STORNO)="s") SET $PIECE(YFELD,Y,4) = -$PIECE(YFELD,Y,4)
+	. . . . SET $PIECE(YFELD,Y,6) = ""
+	. . . . SET $PIECE(YFELD,Y,7) = ""
+	. . . . DO ^INAUFPIMPACT
+	. . ;
+	. . DO    ;ARTIKEL HISTORY    ;13.01.04;FAN;24868     ; FIXME : DEPRECATED?
+	. . . NEW BETRIEB
+	. . . SET BETRIEB = $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,6)
+	. . . IF BETRIEB="" SET BETRIEB = $GET(YLOCATION)
+	. . . IF ($EXTRACT(STORNO)="S") || ($EXTRACT(STORNO)="s") DO ^INARTHIST($PIECE($GET(^INAUFP(YM,YAUFTRAG,YPOS,1)),Y,4),$$^WWWTEXT(32507)_" "_YAUFTRAG_"-"_YPOS_" "_$$^WWWTEXT(32515)_" "_$$^WWWTEXT(33487)_" "_YAUFX_"-"_YPOSX_" ("_$$^WWWTEXT(32514)_")",BETRIEB) QUIT    ;Neue AUFTRAGSPISITION XXX-X AUS AUFTRAGSPOSITION XXXXX-X ;out of 
+	. . . DO ^INARTHIST($PIECE($GET(^INAUFP(YM,YAUFTRAG,YPOS,1)),Y,4),$$^WWWTEXT(32507)_" "_YAUFTRAG_"-"_YPOS_" "_$$^WWWTEXT(32515)_" "_$$^WWWTEXT(33487)_" "_YAUFX_"-"_YPOSX,BETRIEB) QUIT    ;Neue AUFTRAGSPISITION XXX-X AUS AUFTRAGSPOSITION XXXXX-X ;out of 
+	. . ;
+	. . ;KOPIE TEILE BEI EIGENFERTIGUNG UND KUNDENAUFTRAG MIT LÖSCHEN DER BEWEGUNGSDATEN, ULM,20.01.03
+	. . IF ($PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=1)||($PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,2)=0) DO  ;KUNDEN- ODER EIGENFERTIGUNGSAUFTRAG ;Or 
+	. . . NEW SUCH,SUCH1,YI,YYI
+	. . . SET ^INAUFPXL(YM,YAUFTRAG,YPOS) = SATZ
+	. . . SET SUCH="^INAUFPXL("_""""_YM_""""_","_""""_YAUFX_""""_","_YPOSX_")"
+	. . . FOR  DO  QUIT:SUCH=""
+	. . . . SET SUCH=$QUERY(@SUCH)
+	. . . . IF $TRANSLATE($PIECE(SUCH,",",2),"""")'=YAUFX SET SUCH="" QUIT  ;21.06.04;FAN;25794; WENN alphanumerischen Auftragsnummern SOLL DATEN AUCH AUFBAUEN.
+	. . . . ;IF $PIECE(SUCH,",",2)'=YAUFX SET SUCH="" QUIT  ;21.06.04;FAN;25794;  ;FALSCHER AUFTRAG
+	. . . . IF $PIECE(SUCH,",",3)>YPOSX SET SUCH="" QUIT
+	. . . . IF $PIECE(SUCH,",",3)=YPOSX DO
+	. . . . . SET SUCH1=@SUCH
+	. . . . . SET SUCH(1)=$PIECE($PIECE(SUCH,")",1),",",4,99)
+	. . . . . ;SET SUCH(4)="^INAUFPXL("_YM_","_YAUFTRAG_","_YPOS_","_SUCH(1)_")"        ;24.06.04;FAN;25794;alphanumerischen UMSETZTEN
+	. . . . . SET SUCH(4)="^INAUFPXL("_""""_YM_""""_","_""""_YAUFTRAG_""""_","_YPOS_","_SUCH(1)_")"        ;24.06.04;FAN;25794;alphanumerischen
+	. . . . . IF SUCH(1)'="" IF $FIND(SUCH(1),".") KILL @SUCH QUIT
+	. . . . . SET SUCH(0)=$LENGTH(SUCH(1),",")  ;ANZAHL DER ,
+	. . . . . SET SUCH(5)=$TRANSLATE(SUCH(1),",",".")_"."
+	. . . . . ; 30-Aug-2006
+	. . . . . ;  TYBD;12.06.2003;23194;RABATTE NICHT LÖSCHEN
+	. . . . . ;FOR YI=7,9,11,19,22,23,24,25,51,52,53,56,60,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,109,110,127,136,140,141,145,146,148,160,161,163,164,165,166,168,169,170,188,189,193,194,197,198,199,200,201,202,204,205,206,207,215,126,217,218,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,240,241,242,243,244,245,247,248,250,253,254,255,256,257,258,259,260,263,264,265,266,267,269,270,271,272,301,306 SET $PIECE(SUCH1,Y,YI)=""      ;TYBD;12.06.2003;23194;RABATTE NICHT LÖSCHEN
+	. . . . . FOR YI=7,9,11,19,22,23,24,25,51,52,53,56,60,76:1:105,109,110,127,136     SET $PIECE(SUCH1,Y,YI)=""
+	. . . . . FOR YI=140,141,145,146,148,160,161,163,164,165,166,168,169,170,188,189   SET $PIECE(SUCH1,Y,YI)=""
+	. . . . . FOR YI=193,194,197:1:202,204:1:207,215:1:218,220:1:238,240:1:245,247,248 SET $PIECE(SUCH1,Y,YI)=""
+	. . . . . FOR YI=250,253:1:260,263:1:267,269:1:272,301,306                         SET $PIECE(SUCH1,Y,YI)=""
+	. . . . . SET @SUCH(4)=SUCH1  ;SETZEN INAUFPXL ;typeset 
+	. . . ;
+	. . . DO ^INAUFTEILE(YAUFTRAG,YPOS)  ;ULM27.01.03 AUSGESCHALTET, WEIL INAUFPT GESETZT WIRD ;EINGESCHALTET TYBD;27.1.03
+	. . . IF $$$INVORGDRPActivated(objINVORG)=$$$YES DO START^INDRPPRODU(YAUFTRAG,YPOS)  ; D70 ;JOB STARTEN ;launching 
+	. . . ;DO ^INAUF1SEL()     ;NEUER AUFTRAG IN ZWISCHENDATEI  ;
+	. . . SET YREBUILD=1       ;BEC;25899;20.07.04;NEUAUFBAU DER INAUF1SEL 
+	. . . ;NEURECHNEN ZUSATZKOSTEN IM AUFTRAG;FIS;02.02.05;27220
+	. . . IF $$$INVORGRecalcAdditionalCosts(objINVORG)=$$$YES DO    ; D209
+	. . . . NEW YFELD
+	. . . . SET YFELD=$GET(^INAUF(YM,YAUFTRAG,1))
+	. . . . DO ZUSATZ^INAUF1()
+	. ;
+	. ;IF ($EXTRACT(STORNO)="S")||($EXTRACT(STORNO)="s") DO
+	. ;.F YI=182,183,184,210  SET $PIECE(^INAUF(YM,YAUFTRAG,1),Y,YI)=$PIECE(^INAUF(YM,YAUFX,1),Y,YI)*-1  ;STORNO  ;ZUSATZKOSTEN
+	. DO ^INAUFANZ(YAUFTRAG)
+ 
+	IF $GET(YREBUILD)=1 DO ^INAUF1SEL()     ;BEC;25899;20.07.04;NEUAUFBAU DER INAUF1SEL 
+	QUIT:YQ=1
+	
+	;HINWEIS AUF RAHMENVERTRÄGE
+	;GESAMTBETRAG ANZEIGEN ;display 
+	DO ^INAUFHINWEISE      ;UMGEBAUT, WEIL ^INAUF ZU GROSSE IST.  ;FAN;16.01.2004;24868
+	DO ^INKUNDESALDO($PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,1))     ;FAN;SALDO INFO ANZEIGEN AB;06.07.04;26045
+	
+	;AUSWAHL DER ARTIKEL ;Selection the item ; Text vor Auflistung
+	; vvv
+	;IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,60)'=1 IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,92)'="" WRITE YCR,"<BR><FONT COLOR="_YRED_">"_$$^WWWTEXT(32154)_"</FONT><BR>"   ;AUFTRAG GESCHLOSSEN DA LIEFERSCHEIN GEDRUCKT ;order thick yonder packing slip 
+	;IF $PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,60)=$$$YES WRITE YCR,"<BR><FONT COLOR="_YRED_">"_$$^WWWTEXT(32098)_"</FONT><BR>" DO ^INAUFANZ(YAUFTRAG) QUIT  ;AUFTRAG GESCHLOSSEN DA RECHNUNG          GEDRUCKT ;order thick yonder tab 
+	
+	if $$$INAUFOrderCompleted($get(^INAUF(YM,YAUFTRAG,1))) {
+		; AUFTRAG GESCHLOSSEN DA RECHNUNG          GEDRUCKT ;order thick yonder tab 
+		write YCR,"<BR><FONT COLOR="_YRED_">"_$$^WWWTEXT(32098)_"</FONT><BR>"
+		do ^INAUFANZ(YAUFTRAG)
+		quit                                                         ; EARLY EXIT
+	 ;	"Line Item Is Closed"
+	  
+	} else {
+		; AUFTRAG GESCHLOSSEN DA LIEFERSCHEIN GEDRUCKT ;order thick yonder packing slip
+		if $$$INAUFDeliveryNotePrintedDate($get(^INAUF(YM,YAUFTRAG,1)))'="" {
+			write YCR,"<BR><FONT COLOR="_YRED_">"_$$^WWWTEXT(32154)_"</FONT><BR>"
+		} ; "Only New Line Items Possible"
+	}
+	; ^^^
+	
+	
+	DO  ;LIMIT ERREICHT;TYBD; 7.5.2003
+	. NEW DEBIT,INSALDO,KUNDE,KUNDE1,SPERRE
+	. SET SPERRE=""
+	. SET KUNDE=$PIECE($GET(^INAUF(YM,YAUFTRAG,1)),Y,1)
+	. IF KUNDE'="" SET KUNDE1=$GET(^INKUNDE(YM,KUNDE,1))       ; objCustomer D33 = $$$INKUNDECreditLimit()
+	. IF $GET(KUNDE1)'="" DO
+	. . IF $$$INKUNDECreditEntity(KUNDE1)="" DO  QUIT  ;OHNEN KREDITGRUPPE
+	. . . ;                                                 0 : Unlimited Credit   1 : No Credit
+	. . . IF +$PIECE(KUNDE1,Y,33)=0 IF +$$$INVORGBlankCreditLimitMeans(objINVORG)=1 SET SPERRE=$$^WWWTEXT(32217) QUIT   ; "Customer Does Not Have A Credit Limit!" 
+	. . . IF +$PIECE(KUNDE1,Y,33)=0 IF +$$$INVORGBlankCreditLimitMeans(objINVORG)=0 SET SPERRE=""                QUIT   ; KEIN KREDITLIMIT ; unlimited credit
+	. . . IF $PIECE(KUNDE1,Y,33)<$GET(GESAMT)   SET SPERRE = $$^WWWTEXT(32086) QUIT      ;KREDITLIMIT ÜBERZOGEN   ; "Attn. LIMIT!"
+	. . . SET DEBIT=$$$INKUNDEDebtorNumber(KUNDE1)
+	. . . QUIT:DEBIT="" 
+	. . . set INSALDO=$$^INSALDO(DEBIT) // SR14853
+	. . . IF $FIND(INSALDO,"S")||$FIND(INSALDO,"D") IF $PIECE(KUNDE1,Y,33)<(INSALDO+$GET(GESAMT)) SET SPERRE=$$^WWWTEXT(32086) QUIT  ;KREDILIMIT ÜBERZOGEN // SR14853
+	. ;
+	. IF SPERRE'="" DO
+	. . WRITE "<FONT COLOR="_YRED_">"_SPERRE_"</FONT>"  ;DRUCKEN SPERR TEXT ;print Text 
+	
+	;-------------------------------------------
+	;MANUELLE SUCHFUNKTION DER ARTIKELPOSITIONEN ;the 
+	IF YSEITE<2 IF VORG(1)="" DO ^INAUFANZ(YAUFTRAG)
+	IF YSEITE>1 WRITE "<BR>"
+	;-------------------------------------------
+
+	DO SEARCH^INAUFSEARCH
+	QUIT:VORG(1)=""         ;KEINE AUSWAHL ;no Selection 
+	DO ^INAUFANZ(YAUFTRAG)  ;MANUELLE SUCHFUNKTION DER ARTIKELPOSITIONEN
+	QUIT
+	
+	
+SEARCH
+	;-------------------------------------------------------------------------------
+	;	SUCHFENSTER;FIS;04.07.03;23902  EINSPRUNG AUS INAUFARTSUCH !!
+	; This subroutine may now be obsolete if there are no external entry points.
+	; 
+	; History:
+	; 02-Oct-2006	GRF		SR14471: Split as INAUFSEARCH due to size of this routine.
+	; 07-Aug-2006	RPW		SR14853: Make all anchors non-tabable
+	;-------------------------------------------------------------------------------
+	do SEARCH^INAUFSEARCH
+	quit
+	
+ANZ
+	;-------------------------------------------------------------------------------
+	; With split of SEARCH to SEARCH^INAUFSEARCH, calls to ANZ have been made
+	; directly to ^INAUFSEARCHANZ.
+	; This subroutine may now be obsolete if there are no external entry points.
+	;-------------------------------------------------------------------------------
+	DO ^INAUFSEARCHANZ  ;AUSGELAGERT, DA INAUF ZU GROSS;FIS;27.09.04;26406
+	QUIT
+	
+HIDDEN ;NEU HIDDENFELDER ;recent 
+	QUIT:$GET(YHTMFORM)'="WWW2"
+	
+	WRITE YCR,"<INPUT TYPE=HIDDEN NAME="_""""_"ITEMS"_""""_" VALUE="_""""_""""_">"
+	WRITE YCR,"<INPUT TYPE=HIDDEN NAME="_""""_"ITEMSQ"_""""_" VALUE="_""""_""""_">"
+	WRITE YCR,"<INPUT TYPE=HIDDEN NAME="_""""_"ITEMSG"_""""_" VALUE="_""""_""""_">"
+	WRITE YCR,"<INPUT TYPE=HIDDEN NAME="_""""_"ITEMSGQ"_""""_" VALUE="_""""_""""_">"
+	WRITE YCR,"<INPUT TYPE=HIDDEN NAME="_""""_"ITEMSE"_""""_" VALUE="_""""_""""_">"
+	WRITE YCR,"<INPUT TYPE=HIDDEN NAME="_""""_"ITEMSEQ"_""""_" VALUE="_""""_""""_">"
+	QUIT
+ 
+OnBeforeDCM(YKEY="",YFELD="")
+    ;-------------------------------------------------------------------------------
+    ; Check for specific conditions under which this item will not be placed on the
+    ; DCM queue.
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 30-Jun-2005	shobby	SR12578 Created
+    ;-------------------------------------------------------------------------------
+	quit ($$$INAUFOrderType(YFELD)=2)&&($$$INAUFBlockPurchaseOrder(YFELD)'=1)
+	
+GetProducts(pidProduct, parrProducts)
+    ;-------------------------------------------------------------------------------
+    ; Find all the products/parts that this item is on or made up of
+    ;
+    ; Params:
+    ; pidProduct  : The product id to start searching on
+    ; parrProducts: The array of id's returned by reference.
+    ;
+    ; Returns:
+    ;
+    ; History:
+	; 28-Jun-2007	GRF		SR15473: new variables
+    ; 13-Jul-2005	RobertW	SR12658: Created
+    ;-------------------------------------------------------------------------------
+	new idPartNo,objPart
+	
+	quit:pidProduct=""
+	quit:$data(parrProducts(pidProduct))
+	
+	set parrProducts(pidProduct)=""
+	
+	if $data(^INARTT(YM,pidProduct)) {
+		set idPartNo=""
+		
+		for {
+			set idPartNo=$order(^INARTT(YM,pidProduct,idPartNo))
+			quit:idPartNo=""
+			
+			set objPart=$get(^INARTT(YM,pidProduct,idPartNo,1))
+			if objPart'="" {
+				do GetProducts($piece(objPart,Y,1),.parrProducts)
+			}
+		}
+	}
+	
+	if $data(^INARTTs(YM,1,pidProduct)) {
+		do GetProducts($order(^INARTTs(YM,1,pidProduct,"")),.parrProducts)
+	}
+	
+	quit
+ 
+IsDeletable(pYM,pYFORM,pstrKey,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Description : Determins if the delete button should be disabled
+	;			
+	; Called By :  FORMSPEC
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	;-------------------------------------------------------------------------------
+	new blnStatus
+	
+	set blnStatus = $$$NO
+	
+	
+	set idLine = "" 
+	if pYFELD '= $$$NULLOREF {
+		set custOrder = $$$INAUFCustomernumber(pYFELD)
+		for {
+			set idLine = $Order(^INAUFP(0,custOrder,idLine,1))
+			
+		}
+		
+	}
+	$$$YQHandler(blnStatus)
+	quit
+ 
+	
+OnBeforeButtonLine(YFELD)
+	;-------------------------------------------------------------------------------
+	; Set YOPTION variable
+	; 
+	; Params: YKEY, YFELD
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Oct-2006	Steve S	BR014293: Redirect done at @net manager level
+	; 19-Sep-2006	Steve S	SR12374: If no key, go to Create New Orders screen
+	; 09-Mar-2006	SC		SR14349: Created
+	;-------------------------------------------------------------------------------
+	//existing code, moved from form definition. setting YOPTION to OrderType. used elsewhere in form def.
+	if $get(YFELD)'="" set YOPTION=$piece(YFELD,Y,2)
+	//BR014293: Commented
+	//if $$$NoKey(YKEY) do RedirectForm^COMUtilForm("INAUFNEU","","","","") //SR12374
+	quit
+	
+]]></Routine>
+</Export>

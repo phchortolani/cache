@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alDRP.dMovementType.Relocate">
+<ClassType>serial</ClassType>
+<Super>alDRP.dMovementType</Super>
+
+<Property name="MovementTypeId">
+<Description><![CDATA[
+Source of transaction
+Based On : ^WWW101(0,"UMSATZART1",SPRACHE,Class,1)   ; TODO]]></Description>
+<Type>alSYS.dt.dtInteger</Type>
+<Final>1</Final>
+<InitialExpression>"5&quot;</InitialExpression>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="AL00474"/>
+</Property>
+
+
+<Method name="Validate">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Check that the quantity being issued is available
+	; (i.e. doesn't exceed the QOH less any other allocations)
+	; 
+	; History:
+	; 13-Jan-2010	GRF		SR17111: Compare against the Picked Qty rather than the
+	; 							Requested Qty (which may have been sourced from
+	; 							several bundles/storages); provide clearer error
+	; 							messages
+	; 04-Nov-2008	HQN		SR16011: dBundleStock may not exist due to other process
+	;						reducing stock to zero, hence removing it.
+	; 30-Oct-2008	HQN		SR16101: Validate quantities
+	; 07-Mar-2008   Luke	Created
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+	if pobjMove.Completed {
+		set strMessage = $$$Text("IN00711")      ; "This movement is already completed."
+		set sc =$$$ERROR($$$GeneralError,strMessage)
+	}
+
+	; SR16101 vvvv
+	if $$$ISOK(sc) {
+		set objResultSet = ##class(%Library.ResultSet).%New("alDRP.dPlannedMovement:GetReservedForBundleStore")
+		set sc = objResultSet.Execute(pobjMove.Item.%Id(),pobjMove.FromLocn.%Id(),pobjMove.FromStorage.Code,pobjMove.Bundle.%Id())
+		if $$$ISOK(sc) {
+			set fltQtyPlanned = 0
+			while objResultSet.Next(.sc) {
+				set fltQtyPlanned = fltQtyPlanned + objResultSet.Data("QtyRequired")
+			}
+			set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(pobjMove.Item.%Id()_"||"_pobjMove.FromStorage.%Id()_"||"_pobjMove.Bundle.%Id(),,.sc)
+			;if (pobjMove.QtyRequired > (objBundleStock.QtyOnHand - fltQtyPlanned)) {
+		; SR17111 vvv
+		;	if (objBundleStock = $$$NULLOREF) || (pobjMove.QtyRequired > (objBundleStock.QtyOnHand - fltQtyPlanned)) {
+		;		set sc = $$$ERROR($$$GeneralError,$$$Text("alSOH0002")) ; "Error Processing Movement"
+		;	}
+			if (objBundleStock = $$$NULLOREF) {
+				set sc = $$$ERROR($$$GeneralError,$$$Text("alSOH0002")) ; "Error Processing Movement"
+			
+			} elseif (pobjMove.QtyPicked > (objBundleStock.QtyOnHand - fltQtyPlanned)) {
+				set strMessage = $$$Text($listbuild("alSOH0008",pobjMove.QtyPicked,pobjMove.Item,(objBundleStock.QtyOnHand - fltQtyPlanned),pobjMove.LineNumber))
+				set sc = $$$ERROR($$$GeneralError,strMessage)
+			} ; "Require %1 of item %2 but only have %3 available in line %4"
+		; SR17111 ^^^
+		}
+	}
+	; SR16101 ^^^^
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="Confirm">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+#define enumAverageCost		9
+	;-------------------------------------------------------------------------------
+	; Movement of stock between Storages within a Location
+	; 
+	; History
+	; 11-Aug-2010	SCR		SR17387: Added Source Details
+	; 19-Nov-2009	GRF		SR16471: Change scope of lock by making it a global
+	; 11-Nov-2009	GRF		SR16871: relocate unlock to cover data being updated
+	; 02-Nov-2009	GRF		SR16871: INItemCost with location replaces INARTKOST;
+	; 							Remove ConfirmMovement
+	; 21-Oct-2009	GRF		SR16875: TxnValue should be extended cost
+	; 21-Sep-2009	GRF		SR16361: ConfirmMovement returns strStatus
+	; 14-Sep-2009	DWR		SR16880: call to new alSFI.dStockFin class
+	; 18-Mar-2009	DavidR	SR16406: added $listbuild to error
+	; 29-Sep-2008	Luke	SR15818: Added Lock Checks 
+	; 27-Aug-2008	Luke	SR15691: Corrected the calculation of fltCost
+	; 19-Aug-2008	HQN		SR15801: Added dPeriodBalance update
+	; 12-Aug-2008	Luke    SR15691: Added external calls for costings 
+	; 12-Aug-2008	Luke	SR15813: added transaction types to processing 
+	; 09-May-2008	HQN		SR15721: Pass bundle to ConfirmMovement^INStockMovement()
+	; 06-May-2008	Luke	SR15713: Uncommented back population 
+	; 10-Apr-2008	GRF		SR15660: Comment out back population of INWE
+	; 07-Mar-2008   Luke	Created
+	;-------------------------------------------------------------------------------
+	set sc     = $$$OK
+	set idItem = pobjMove.Item.ItemId
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	LOCK +^alSOHProcessing(idItem):2
+	if '$test {
+		set strMessage = $$$Text($listbuild("IN00853",idItem))
+		set sc = $$$ERROR($$$GeneralError,strMessage)  
+	;	"Can not acquire a lock for Item: (%1) please try again"
+	;+++++++++++++++++++++++++++++++++++++++
+		
+	} else {
+	; SR16871 vvv
+	;	LOCK -^alSOHProcessing(idItem)
+	;;	set fltCost = $$GetCostV2^INARTKOST(idItem) ; SR16871
+	;	set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+	;}
+	
+	;if $$$ISOK(sc) {
+		set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+	; SR16871 ^^^
+	
+	; Relocate : Stock History & Period Balance
+	;---------------------------------------
+		set objTransType   = ##class(alSOH.dTransactionType).%OpenId(7)
+		set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove,
+													   pobjMove.FromLocn,
+													   pobjMove.FromStorage,
+													  -pobjMove.QtyPicked,
+													   fltCost,
+													   objTransType,
+													   .sc)
+		set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist)
+	}
+    if $$$ISOK(sc) {
+		set objTransType = ##class(alSOH.dTransactionType).%OpenId(8)
+		
+		set objToStkHist = ##class(alSOH.piSOH).Post(pobjMove,
+													 pobjMove.ToLocn,
+													 pobjMove.ToStorage,
+													 pobjMove.QtyPicked,
+													 fltCost,
+													 objTransType,
+													 .sc)
+		
+		set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objToStkHist)
+	;+++++++++++++++++++++++++++++++++++++++ ; SR16871
+		LOCK -^alSOHProcessing(idItem)
+	;+++++++++++++++++++++++++++++++++++++++
+    }
+    		
+	; Stock to Finance Interface            ; SR16880
+	;---------------------------------------
+	if $$$ISOK(sc) {
+		set objStockFin = ##class(alSFI.dStockFin).%New()
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "MVI"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.Relocate"
+		set objStockFin.TxnInformation = "Stock Move"
+		
+		set objStockFin.Item           = pobjMove.Item
+		set objStockFin.Quantity       = pobjMove.QtyPicked
+	;	set objStockFin.TxnValue       = fltCost                  ; SR16875
+		set objStockFin.TxnValue       = fltCost * pobjMove.QtyPicked
+		
+		set objStockFin.FromLocn       = pobjMove.FromLocn
+		set objStockFin.FromStorage    = pobjMove.FromStorage
+		set objStockFin.ToLocn         = pobjMove.FromLocn
+		set objStockFin.ToStorage      = pobjMove.ToStorage
+		
+		set objStockFin.SourceRec	   = pobjMove.Reference		; SR17387
+		set objStockFin.SourceForm	   = "INMOV"		        ; SR17387
+		set objStockFin.SourceDetail   = "IN01241,"_pobjMove.Reference_","_pobjMove.LineNumber ; SR17387
+		;                                "Stock Move %1 Line %2"
+		
+		set sc = objStockFin.StockToFin()
+		
+		set YUSER =%("%KEY","YUSER") 
+		set:YUSER="" YUSER=" "
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		set:$$$ISOK(sc) ^CacheTemp(YUSER,"FIBURecord") = $$$YES
+	}
+	
+	/* ; SR16871 vvv
+	; Back Populate V1
+	;---------------------------------------
+	if $get(^SysSetup("KeepOldStockHistory")) && $$$ISOK(sc) {
+		set strStatus = $$ConfirmMovement^INStockMovement(idItem,
+												          pobjMove.Bundle,
+												          pobjMove.QtyPicked,
+												          pobjMove.FromLocn.Code,
+												          pobjMove.FromStorage.Code,
+												          pobjMove.ToLocn.Code,
+												          pobjMove.ToStorage.Code,
+												          pobjMove.MovementType.MovementTypeId,
+												          pobjMove.Reference,
+												          pobjMove.LineNumber)
+	
+		set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"Error Back Populating INWE") ///$$$Text("IN00711"))
+	}
+	*/ ; SR16871 ^^^
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="Default">
+<Type>%Library.CacheSerialState</Type>
+</Storage>
+</Class>
+</Export>

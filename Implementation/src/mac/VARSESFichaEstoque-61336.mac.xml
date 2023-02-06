@@ -1,0 +1,992 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARSESFichaEstoque" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+#include VARSESFichaEstoque
+ 
+#include COMSYS
+#include INConst
+#include WWWConst
+#include VARSESFichaEstoque
+ 
+VARSESFichaEstoque
+	;------------------------------------------------------------------------
+	; This mac file handles the generation of the report "Ficha de Estoque"
+	;
+	;
+	;-------------------------------------------------------------------------
+ 
+	quit
+ 
+onAposSalvar
+	SET DataI = $$SQLGetFormatDate3^VARTRKSQL(VORG(2))
+	SET DataF = $$SQLGetFormatDate3^VARTRKSQL(VORG(3))
+	SET DTICORRETA = $$SQLGetFormatDate^VARTRKSQL(VORG(2))
+	SET DTFCORRETA = $$SQLGetFormatDate^VARTRKSQL(VORG(3))
+	
+	//S ^zzJONATDEBUG(1)=VORG(1)_" - "_DataI_" - "_DataF
+	do RunReportFichaEstoque^VARSESJasperRunReport(VORG(1),DataI,DataF,VORG(4),DTICORRETA,DTFCORRETA)
+	quit
+	
+ClearCache(showMessage=1)
+	; -----------------------------------------------------
+	; This routine will erase the current cache. On use it will be rebuilt.
+	; -----------------------------------------------------
+	
+	kill ^VARSESCacheFichaEstoque
+	kill ^VARSESCacheFichaEstoqueDatas
+	if (showMessage) {
+		w !,"Caches: ^VARSESCacheFichaEstoque and ^VARSESCacheFichaEstoqueDatas were successfully cleared!"
+	}
+	quit	
+	
+BuildFichaEstoque(itemCode,locationCode,initialDate,finalDate)
+	;------------------------------------------------------------
+	; This routine builds the table Ficha de Estoque (VARSESCacheFichaEstoque)
+	; to be used by the reports. It builds the table in an incremental way. Only
+	; missing records to fullfill the query are inserted in the table.
+	; 
+	; Parameters:
+	; 
+	; codItem - item number
+	; codLocal - location number
+	; dataInicial - date to start the search (horolog format with only
+	;  the day,month and year).
+	; dataFinal - end date of events (horolog format with only
+	;  the day,month and year)
+	;  
+	;  Example: 
+	;   We want every event related to an item between 2008-Apr-01 00:00 and
+	;   2008-Aprl-30 23:59.
+	;   
+	;   1) initialDate = $zdateh("2008-04-01",3), finalDate= $zdateh("2008-04-030",3)
+	;   
+	;    do buildFichaEstoque^VARSESFichaEstoque("0001-81","5", initialDate, finalDate)
+	;   
+	;   Please observe that you cannot specify the hour. it will always be considered 00:00 for the beginning
+	;   date and 23:59:59 for the end date.
+	;   
+	;   2) select * from SQLUser.VARSESCacheFichaEstoque where
+	;      item="0001-81" and local="5" and data >= 61087 and data < (61116+1) 
+	;   
+	; History
+	;  
+	; 2008-May-05	Soeiro	Created
+	new cachedInitialDate,cachedFinalDate,obj,partAInitialDate,partAFinalDate
+	new partBInitialDate,partBFinalDate,updated, today
+	new strStatus
+	
+	set strStatus=$$$OK
+ 
+	//Verify if we have good parameters
+	//quit:($get(itemCode)="") "0~itemCode is undefined"
+	//quit:($get(locationCode)="") "0~locationCode is undefined"
+	//quit:($get(initialDate)="") "0~initialDate is undefined"
+	//quit:($get(finalDate)="") "0~finalDate is undefined"
+ 
+	quit:($get(itemCode)="") "0~"_$$$Text("MED00181")  ;itemCode is undefined
+	quit:($get(locationCode)="") "0~"_$$$Text("MED00182")  ;locationCode is undefined
+	quit:($get(initialDate)="") "0~"_$$$Text("MED00183")  ;initialDate is undefined
+	quit:($get(finalDate)="") "0~"_$$$Text("MED00184")  ;finalDate is undefined
+ 
+ 
+	//Find out what will need to be fetched
+	set partAInitialDate=""
+	set partAFinalDate=""
+	set partBInitialDate=""
+	set partBFinalDate=""
+	set today=$piece($horolog,",",1)
+	
+	//Adjust dates
+	if (initialDate>today) {
+		set initialDate=today
+	}
+ 
+	//Adjust dates
+	if (finalDate>today) {
+		set finalDate=today
+	}
+	
+ 
+	//debug 
+	//for i=1:1:100 hang 10
+ 
+	do CalculateIntervals(itemCode,locationCode,.partAInitialDate,.partAFinalDate,.partBInitialDate,.partBFinalDate,.initialDate,.finalDate)
+ 
+	set updated=0
+		
+	//Fetch interval A
+	if (partAInitialDate'="") {
+		set strStatus=$$BuildCacheFichaEstoque(itemCode,locationCode,partAInitialDate,partAFinalDate)
+		if ($$$ISERR(strStatus)) {
+			quit strStatus
+		} else  {
+			set updated=1
+		}
+	}
+ 
+	//Fetch interval B	
+	if (partBInitialDate'="") {
+		set strStatus=$$BuildCacheFichaEstoque(itemCode,locationCode,partBInitialDate,partAFinalDate)
+		if ($$$ISERR(strStatus)) {
+			quit strStatus
+		} else  {
+			set updated=1
+		}
+	}
+ 
+ 	//If the cache was correclty updated, updated the indexes
+ 	//There is no harm done if only one part gets updated and the other fails. As long as the indexes
+ 	//are not updated, the next time everything will be overwritten.
+	if (updated) {
+		do UpdateCacheIndex(itemCode,locationCode,today,initialDate,finalDate)
+	}
+	
+	quit strStatus
+ 
+CalculateIntervals(itemCode,locationCode,&partAInitialDate,&partAFinalDate,&partBInitialDate,&partBFinalDate,&initialDate,&finalDate)
+	; --------------------------------
+	; Calculate what new intervals will be needed based on what is already available
+	; in the cache.
+	;---------------------------------
+	new cachedInitialDate,cachedFinalDate,obj, updated, temp
+	new completeFinalDate, completeInitialDate, newCompleteFinalDate, newCompleteInitialDate
+	
+	//Verify and make sure that the dates are not inverted
+	if (initialDate>finalDate) {
+		set temp=initialDate
+		set initialDate=finalDate
+		set finalDate=temp
+	}
+	
+	//Get our previous window of dates for this location and item
+	set obj=$get(^VARSESCacheFichaEstoqueDatas(itemCode,locationCode))
+	set cachedInitialDate=""
+	set cachedFinalDate=""
+	set completeInitialDate=""
+	set completeFinalDate=""
+	set newCompleteInitialDate=""
+	set newCompleteFinalDate=""
+ 
+	//Debug
+	//for i=1:1:100 hang 1
+	//w !,"CalculateIntervals()> obj="_$get(obj)
+ 
+	if (obj'="") {
+		set cachedInitialDate=$piece(obj,"~",1)
+		set cachedFinalDate=$piece(obj,"~",2)
+		
+		//A date maybe incomplete if it is TODAY (new events may happen afterwards)
+		set completeInitialDate=$piece(obj,"~",3)
+		set completeFinalDate=$piece(obj,"~",4)
+		
+		//We must have both values. If we don't have, erase everything
+		if ((cachedInitialDate="") || (cachedFinalDate="")) {
+			set cachedInitialDate=""
+			set cachedFinalDate=""
+			kill ^VARSESCacheFichaEstoqueDatas(itemCode,locationCode)
+			set obj=""
+		} 
+	}		
+		
+	if (obj'="") {
+		//Extended the initial date because the stored date is too late
+		if (initialDate<cachedInitialDate) {
+			set partAInitialDate=initialDate
+			
+			//Check for a previoulsy incomplete stored first date
+			if (completeInitialDate) {
+				//The cached date was complete, we can use one day before it
+				set partAFinalDate=(cachedInitialDate-1)
+			} else {
+				//Since it was incomplete, recalculate it (use the same day)
+				set partAFinalDate=cachedInitialDate
+			}
+		} elseif (initialDate>cachedInitialDate) {
+			//We must adjust initialDate to match the cachedDate
+			set initialDate=cachedInitialDate
+		} else { //when initialDate=cachedInitialDate
+			//Check if the initial date needs fixing
+			if ('completeInitialDate) {
+				//Reculculate it, because there might be other events
+				set partAInitialDate=initialDate
+				//This value might be set again later. If not, it will have this current value
+				set partAFinalDate=initialDate
+			}
+		}
+		
+		//Extended the final date because the stored date is too early
+		if (finalDate>cachedFinalDate) {
+			set partBFinalDate=finalDate
+			
+			//Check the old final date
+			if (completeFinalDate) {
+				set partBInitialDate=(cachedFinalDate+1)
+			} else {
+				//Recalculate the final cached date
+				set partBInitialDate=cachedFinalDate
+			}
+			
+		} elseif (finalDate<cachedFinalDate) {
+			//We must adjust FinalDate to match the cachedDate
+			set finalDate=cachedFinalDate
+		} else { //when finalDate=cachedFinalDate
+			//Check if the final date needs fixing
+			if ('completeFinalDate) {
+				set partBFinalDate=finalDate
+				//Make it a valid interval
+				set partBInitialDate=finalDate
+			}
+		}
+ 
+	} else {
+		//Since there was no cached dates, the whole interval must be stored
+		//By convention, we use partA
+		set partAInitialDate=initialDate
+		set partAFinalDate=finalDate
+		}
+	
+	quit
+	
+UpdateCacheIndex(itemCode,itemLocation,today,initialDate,finalDate)
+	new obj
+	
+	if ($get(today)="") {
+		set today=$piece($horolog,",",1)
+	}
+	
+	//Prepare to update the cache object
+	set $piece(obj,"~",1)=initialDate
+	set $piece(obj,"~",2)=finalDate
+ 
+	//Is the date today?
+	if (initialDate>=today) {
+		//Incomplete
+		set $piece(obj,"~",3)=""
+	} else {
+		//Complete
+		set $piece(obj,"~",3)="1"
+	}
+ 
+	//Is the date today?
+	if (finalDate>=today) {
+		//Incomplete
+		set $piece(obj,"~",4)=""
+	} else {
+		//Complete
+		set $piece(obj,"~",4)="1"
+	}
+	
+	//Update the cache index
+	set ^VARSESCacheFichaEstoqueDatas(itemCode,locationCode)=obj
+ 
+	quit	
+	
+BuildCacheFichaEstoque(itemCode="",locationCode="",initialDate="",finalDate="")
+	;----------------------------------------------------------
+	; Fetches all records that fall within the given interval and put them in the cache.
+	; A regular SQL query will read them later, indexing item location and date.
+	; 
+	; The global "VARSESCacheFichaEstoque" will be updated
+	; 
+	; ^VARSESCacheFichaEstoque(
+	;   0,
+	; 	itemCode,
+	; 	locationCode,
+	; 	date, ($horolog format)
+	; 	hour, ($horolog format)
+	; 	sequence, (if both date and hour clash)
+	; 	1 )
+	; 	
+	; 	 = 
+	; 	
+	;	pieces:
+	; 	tipoMovimento (String)
+	; 	numeroDocumento (String)
+	; 	codigoLocalRelacionado
+	; 	descricaoLocalRelacionado
+	; 	descricaoProduto
+	; 	quantidadeEntrada
+	; 	quantidadeSaida
+	; 	unidadeMedida (descrição)
+	; 	custoMedio
+	; 	
+	; 
+	; Parameters:
+	; 
+	; itemCode:		number (identification) of item
+	; locationCode:	identification of the location
+	; initialDate	initial date (first part of horolog) of the search interval
+	; finalDate		End date of the search interval
+	; 
+	; Histórico:
+	; 2008-Amy-08	Soeiro	Rewritten. Now we will not use INARTHISTL anymore.
+	; 2008-May-06	Soeiro	Rewritten (now called by main routine instead of directly)
+	; 2008-abr-07	Soeiro	Criação
+	;----------------------------------------------------------
+	new updated, preCache, strStatus
+	
+	set strStatus=$$$OK
+	
+	//Quick chack of parameters
+	if ((itemCode="") ||(locationCode="") || (initialDate="") || (finalDate="")) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque: one or more parameters are empty.")
+	}
+	
+	//Search everywhere for events that fall within the interval and are
+	//relevant to "Ficha de Estoque"
+	
+	set strStatus=$$UpdateEntrada(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdateEntrada")		
+	}
+ 
+	set strStatus=$$UpdateMovimentacao(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdateMovimentacao")		
+	}
+ 
+	set strStatus=$$UpdateTrfSaida(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdateTrfSaida")		
+	}
+ 
+	set strStatus=$$UpdateConsumo(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdateConsumo")		
+	}
+	
+	set strStatus=$$UpdatePaciente(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdatePaciente")		
+	}
+ 
+	set strStatus=$$UpdateRecebimento(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdateRecebimento")		
+	}
+ 
+	set strStatus=$$UpdateTrfAceite(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdateTrfAceite")		
+	}
+ 
+	set strStatus=$$UpdateDevolucao(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdateDevolucao")		
+	}
+ 
+	set strStatus=$$UpdateEstornoTrf(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdateEstornoTrf")		
+	}
+ 
+	set strStatus=$$UpdateEstornoRec(itemCode,locationCode,initialDate,finalDate)
+	if ($$$ISERR(strStatus)) {
+		quit $$MakeErrorStatus(strStatus,"BuildCacheFichaEstoque -> UpdateEstornoRec")		
+	}
+ 
+	//Regenerates all indexes
+	do ^WWWVAR
+	set VORG(1)="VARSESCacheFichaEstoque"
+	do ^WWWSORT
+	
+	quit strStatus
+	
+ 
+MakeStackTrace(oldMessage="",newMessage="",place="")
+	;-----------------------
+	;Builds a poor man kind of stack trace
+	;
+	;Parameters:
+	;  oldMessage - Some previous error returned by called function. It is the cause of thue current error
+	;  newMessage - The current described error
+	;  place - name of the current routine
+	;-------------------------------------
+	if (oldMessage="") {
+		quit "0 "_"Error(s) found in routine '"_place_"'. "_$get(newMessage)	
+	} else {
+		quit "0 "_"Error(s) found in routine '"_place_"'. "_$get(newMessage)_" Caused by: "_oldMessage
+	}
+	
+	//This is only for aesthetcs
+	quit ""
+ 
+GetStringFromStatus(status)
+	; -------------------
+	; Extract oll messages from the error array into a string
+	; -------------------
+	new str,err
+	set str=""
+	set err=""
+	
+	if ($get(status)'="") {
+		do DecomposeStatus^%apiOBJ(status,.err,"-d")
+		for i=1:1:err {
+			if (str="") {
+				set str=err(i)
+			} else {
+				set str=_str_"; "_err(i)
+			}
+		}
+	}
+	
+	quit str
+	
+MakeErrorStatus(oldMessage="", newMessage="")
+	;-----------------------
+	; Builds an error status with an attached message
+	; ----------------------
+	
+	if (oldMessage="") {
+		quit "0 "_"Error(s) found. "_$get(newMessage)	
+	} else {
+		quit oldMessage_", "_$get(newMessage)	
+	}
+	
+	//This is only for aesthetcs
+	quit ""
+	 
+InsertRecord(itemCode,locationCode,date,time,objFichaEstoque)
+	;-----------------------------------------------
+	; Inserts a new record in the global ^VARSESCacheFichaEstoque
+	; 
+	; Parameters
+	; 
+	; itemCode - internal code for the item
+	; locationCode - interbal code for the location
+	; date - date (YYYY/MM/DD) in HOROLOG format
+	; time - HH:MM:SS in HOROLOG format
+	; seq - integer that gets incremented when item,location,date and hour clash. If
+	;       it is left blank, the system will increment it when necessary
+	; 
+	; objFichaEstoque - record to be inserted
+	;	pieces:
+	; 	tipoMovimento (String)
+	; 	numeroDocumento (String)
+	; 	codigoLocalRelacionado
+	; 	descricaoLocalRelacionado
+	; 	quantidadeEntrada
+	; 	quantidadeSaida
+	; 	custoMedio
+	; 
+	; Returns 0 on error 
+	;         1 on OK
+	; ----------------------------------
+	new strStatus,id
+	set strStatus=""
+	
+	//Verification. All errors are shown at the same time
+	if ('$data(itemCode)) {
+		//set strStatus=$$AddString(strStatus,"itemCode undefined")
+		set strStatus=$$AddString(strStatus,$$$Text("MED00181"))
+	} elseif (itemCode="") {
+		set strStatus=$$AddString(strStatus,"itemCode=""""")
+	}
+	
+	if ('$data(locationCode)) {
+		//set strStatus=$$AddString(strStatus,"locationCode undefined")
+		set strStatus=$$AddString(strStatus,$$$Text("MED00182"))
+	} elseif (locationCode="") {
+		set strStatus=$$AddString(strStatus,"locationCode=""""")
+	}
+ 
+	if ('$data(date)) {
+		//set strStatus=$$AddString(strStatus,"date undefined")
+		set strStatus=$$AddString(strStatus,$$$Text("MED00176"))
+	} elseif (date="") {
+		set strStatus=$$AddString(strStatus,"date=""""")
+	}
+ 
+	if ('$data(time)) {
+		//set strStatus=$$AddString(strStatus,"time undefined")
+		set strStatus=$$AddString(strStatus,$$$Text("MED00185"))
+	} elseif (time="") {
+		set strStatus=$$AddString(strStatus,"time=""""")
+	}
+ 
+	if ('$data(objFichaEstoque)) {
+		set strStatus=$$AddString(strStatus,"objFichaEstoque undefined")
+	} elseif (objFichaEstoque="") {
+		set strStatus=$$AddString(strStatus,"objFichaEstoque=""""")
+	}
+ 
+ 	//Now, try to insert the record if everything is OK
+ 	if (strStatus="") {
+	 	set strStatus=$$$OK
+		set seq=$$GetNextSequenceNumber(itemCode,locationCode,date,time)
+		set ^VARSESCacheFichaEstoque(0,itemCode,locationCode,date,time,seq,1)=objFichaEstoque
+ 	} else {
+	 	set strStatus=$$MakeStackTrace("",". Error(s) found in validation: "_strStatus,
+	 	"InsertRecord^VARSESFichaEstoque(itemCode="_$get(itemCode)_",locationCode="_$get(locationCode)_
+	 	",date="_$get(date)_",time="_$get(time)_",objFichaEstoque="_$get(obj)_")")
+ 	} ;ALPHAUP-180
+ 
+ 	quit strStatus
+ 
+AddString(pOldString,pNewString,pSeparator=",")
+	; Adds a new string to a String sequence prepending the pSeparator
+	; if the pOldString is either not "" or undefined.
+	; 
+	; History:
+	; 2008-Mar-06	Soeiro:	created
+	new result
+	
+	if (('$DATA(pNewString)) || (pNewString="")) {
+		quit ""
+	}
+ 
+	if ('$DATA(pSeparator)) {
+		set pSeparator=""
+	}
+	
+	if ('$DATA(pOldString) || (pOldString="")) {
+		set result=pNewString
+	} else {
+		set result=pOldString_pSeparator_pNewString
+	}
+	
+	quit result	
+ 	
+GetNextSequenceNumber(itemCode,locationCode,date,time)
+	;------------
+	; Gets the next available sequence number. The search starts at "seq", but
+	; if seq ="", it searches from the beggining.
+	; Probably it will be just zero
+	; -----------
+	new id,oldId
+	
+	set id=""
+	set oldId=id
+		
+	for {
+		set id=$order(^VARSESCacheFichaEstoque(0,itemCode,locationCode,date,time,id))
+		quit:(id="")
+		
+		set oldId=id
+	}
+	
+	//Nothing was found so let's begin counting
+	if (oldId="") {
+		set id=0
+	} else {
+		//Something was found so last start from there
+		set id=(oldId+1)
+	}
+	
+	quit id
+ 
+RunSql(sql,itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	; This routine uses SQL. You have to MAKE SURE that you don't change
+	; the column names used to create the sql query.
+	; 
+	//FEtipoMovimento(%s)
+	//FEnumeroDocumento(%s)
+	//FEcodigoLocalRelacionado(%s)
+	//FEdescricaoLocalRelacionado(%s)
+	//FEquantidadeEntrada(%s)
+	//FEquantidadeSaida(%s)
+	//FEcustoMedio(%s)
+	;----------------------------------------------
+	new obj,rs,strStatus,status,timestamp,date,time,cod,type
+ 
+	set obj=""	
+	set strStatus=$$$OK
+	set nRecords=0
+ 
+	set rs = ##class(%Library.ResultSet).%New()
+	set type=""
+	
+	//Prepare and put the correct values
+	set status=rs.Prepare(sql)
+	if ($SYSTEM.Status.IsOK(status)) {
+ 		set status=rs.Execute(locationCode,itemCode,initialDate,finalDate)
+ 		
+ 		if ($SYSTEM.Status.IsOK(status)) {
+ 
+			//Fetch all records
+		 	while (rs.Next(.status) && ($SYSTEM.Status.IsOK(status))) {
+				
+		   		set $$$FEtipoMovimento(obj)=$get(rs.Data("TipoDeMovimento"))
+		   		set timestamp=$get(rs.Data("Data"))
+		   		set date=$piece(timestamp,",",1)
+		   		set time=$piece(timestamp,",",2)
+		   		
+		   		set $$$FEnumeroDocumento(obj)=$get(rs.Data("NumeroDoc"))
+		   		
+		   		//This is likely WRONG!
+				set $$$FEcodigoLocalRelacionado(obj)=$get(rs.Data("Local"))
+				
+				set $$$FEdescricaoLocalRelacionado(obj)=$get(rs.Data("LocalRecebedor"))
+				
+				set $$$FEquantidadeEntrada(obj)=$get(rs.Data("QtdEntrada"))
+				set $$$FEquantidadeSaida(obj)=$get(rs.Data("QtdSaida"))
+				set $$$FEcustoUnitario(obj)=$get(rs.Data("CustoUnitario"))
+		 
+				//Insert the record
+				if ($SYSTEM.Status.IsOK(status)) {
+					set strStatus=$$InsertRecord(itemCode,locationCode,date,time,obj)
+				}
+				
+		    }
+ 		}
+	} 		
+ 
+	//Let's prepare a nice error message
+	if $SYSTEM.Status.IsError(status) {
+		set strStatus=$$MakeStackTrace($$GetStringFromStatus(status),"",
+		"RunSql(itemCode="_itemCode_",locationCode="_locationCode_",initialDate="_initialDate_",finalDate="_finalDate_") TYPE="_type)
+	}
+ 
+	quit strStatus
+ 
+ 	
+UpdateEntrada(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+	
+	//Original sql
+	set sql="SELECT 'ENTRADA' AS TipoDeMovimento, "_
+	" CAST(VARSESEntrada.DateChanged AS TIMESTAMP) AS Data, "_
+	" VARSESEntrada.NumeroDaEntrada||'-'||VARSESEntradaLinha.ID1 AS NumeroDoc, "_
+	" VARSESEntrada.LocalRecebedor AS Local, "_
+	" VARSESEntrada.LocalAbastecedor AS LocalAbastecedor, "_
+	" $$SQLGetDescProduto^VARTRKINART(VARSESEntradaLinha.CodigoDoProduto) AS DescProduto, "_
+	" VARSESEntradaLinha.Quantidade AS QtdEntrada, "_
+	" '' AS QtdSaida, "_
+	" $$GetCostAsAtDateAndTime^VARTRKSQL(VARSESEntrada.Company,VARSESEntradaLinha.CodigoDoProduto,VARSESEntrada.DateChanged) AS CustoUnitario "_
+	"FROM "_
+	" SQLUser.VARSESEntrada JOIN SQLUser.VARSESEntradaLinha "_
+	" ON VARSESEntrada.NumeroDaEntrada = VARSESEntradaLinha.NumeroDaEntrada "_
+	" AND VARSESEntrada.Company = VARSESEntradaLinha.Company "_
+	"WHERE "_
+	" VARSESEntrada.Company = 0 "_
+	" AND UPPER(VARSESEntrada.Firmado) = 1 "_
+	" AND UPPER(VARSESEntrada.LocalRecebedor) = ? "_
+	" AND UPPER(VARSESEntradaLinha.CodigoDoProduto) = ? "_
+	" AND VARSESEntradaLinha.Quantidade > 0 "_
+	" AND (DATEDIFF('dd',VARSESEntrada.DateChanged,?) <=0 )"_
+	" AND (DATEDIFF('dd',VARSESEntrada.DateChanged,?) >=0 )"
+ 
+	quit $$RunSql(sql,itemCode,locationCode,initialDate,finalDate)
+ 	
+UpdateMovimentacao(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+ 	set sql="SELECT                "_
+		"    'MOVIMENTACAO' AS TipoDeMovimento,            "_
+		"    CAST(INADJ.ModifiedDate AS TIMESTAMP) AS Data,            "_
+		"    INADJ.StockAdjustmentNumber||'-'||INADJLine.Number AS NumeroDoc,            "_
+		"    INADJ.SiteLocation AS Local,            "_
+		"    $$SQLGetLocationName^VARTRKSQL(INADJ.SiteLocation) AS LocalRecebedor,            "_
+		"    '' AS LocalAbastecedor,            "_
+		"    CASE            "_
+		"                WHEN INADJLine.Quantity >= 0 THEN INADJLine.Quantity"_
+		"                ELSE ''"_
+		"    END AS QtdEntrada,            "_
+		"    CASE            "_
+		"                WHEN INADJLine.Quantity < 0 THEN -INADJLine.Quantity"_
+		"                ELSE ''"_
+		"    END AS QtdSaida,            "_
+		"    $$GetCostAsAtDateAndTime^VARTRKSQL(INADJ.Company,INADJLine.Item,INADJ.ModifiedDate) AS CustoUnitario "_
+		"                    "_
+		"FROM                "_
+		"    SQLUser.INADJ JOIN SQLUser.INADJLine            "_
+		"    ON INADJ.StockAdjustmentNumber = INADJLine.StockAdjustmentNumber            "_
+		"    AND INADJ.Company = INADJLine.Company            "_
+		"WHERE                "_
+		"    INADJ.Company = 0            "_
+		"    AND UPPER(INADJ.Status) = 1            "_
+		"    AND (INADJ.FREE2 = '' OR INADJ.FREE2 IS NULL)            "_
+		"    AND UPPER(INADJ.SiteLocation) = ? "_
+		"    AND UPPER(INADJLine.Item) = ?"_
+		"    AND INADJLine.Quantity <> 0            "_
+		"    AND (DATEDIFF('dd',INADJ.ModifiedDate,?) <=0 )            "_
+		"    AND (DATEDIFF('dd',INADJ.ModifiedDate,?) >=0 )            "
+ 
+	quit $$RunSql(sql,itemCode,locationCode,initialDate,finalDate) 
+ 	
+UpdateTrfSaida(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+ 	set sql="SELECT                "_
+		"    'TRF-SAIDA' AS TipoDeMovimento,            "_ 	
+		"    CAST(INTFR.Shipped AS TIMESTAMP) AS Data,            "_
+		"    INTFR.TransferNumber||'-'||INTFRLine.TransferLineNumber AS NumeroDoc,            "_
+		"    INTFR.SendingLocation AS Local,            "_
+		"    $$SQLGetLocationName^VARTRKSQL(INTFR.ReceivingLocation) AS LocalRecebedor,            "_
+		"    INTFR.SendingLocation AS LocalAbastecedor,            "_
+		"    '' AS QtdEntrada,            "_
+		"    INTFRLine.Quantity As QtdSaida,            "_
+		"    $$GetCostAsAtDateAndTime^VARTRKSQL(INTFR.Company,INTFRLine.Item,INTFR.Shipped) AS CustoUnitario "_
+		"                    "_
+		"FROM                "_
+		"    SQLUser.INTFR JOIN SQLUser.INTFRLine            "_
+		"    ON INTFR.TransferNumber = INTFRLine.TransferNumber            "_
+		"    AND INTFR.Company = INTFRLine.Company            "_
+		"                    "_
+		"WHERE                "_
+		"    INTFR.Company = 0 "_
+		"    AND UPPER(INTFR.Status) > 0            "_
+		"    AND UPPER(INTFR.Free1) = 'TRANSFERENCIA'            "_
+		"    AND UPPER(INTFR.SendingLocation) = ? "_
+		"    AND UPPER(INTFRLine.Item) = ? "_
+		"    AND INTFRLine.Quantity > 0            "_
+		"    AND (DATEDIFF('dd',INTFR.Shipped,?) <=0 )            "_
+		"    AND (DATEDIFF('dd',INTFR.Shipped,?) >=0 )            "
+ 
+	quit $$RunSql(sql,itemCode,locationCode,initialDate,finalDate) 
+	
+UpdateConsumo(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+	set sql="SELECT                "_
+		"    'CONSUMO' AS TipoDeMovimento,            "_
+		"    CAST(INTFR.Shipped AS TIMESTAMP) AS Data,            "_
+		"    INTFR.TransferNumber||'-'||INTFRLine.TransferLineNumber AS NumeroDoc,            "_
+		"    INTFR.SendingLocation AS Local,            "_
+		"    $$SQLGetLocationName^VARTRKSQL(INTFR.ReceivingLocation) AS LocalRecebedor,            "_
+		"    INTFR.SendingLocation AS LocalAbastecedor,            "_
+		"    '' AS QtdEntrada,            "_
+		"    INTFRLine.Quantity As QtdSaida,            "_
+		"    $$GetCostAsAtDateAndTime^VARTRKSQL(INTFR.Company,INTFRLine.Item,INTFR.Shipped) AS CustoUnitario "_
+		"                    "_
+		"FROM                "_
+		"    SQLUser.INTFR JOIN SQLUser.INTFRLine            "_
+		"    ON INTFR.TransferNumber = INTFRLine.TransferNumber            "_
+		"    AND INTFR.Company = INTFRLine.Company            "_
+		"                    "_
+		"WHERE                "_
+		"    INTFR.Company = 0 "_
+		"    AND UPPER(INTFR.Status) > 0            "_
+		"    AND UPPER(INTFR.Free1) LIKE 'CONSUMO%'            "_
+		"    AND UPPER(INTFR.SendingLocation) = ? "_
+		"    AND UPPER(INTFRLine.Item) = ? "_
+		"    AND INTFRLine.Quantity > 0            "_
+		"    AND (DATEDIFF('dd',INTFR.Shipped,?) <=0 )            "_
+		"    AND (DATEDIFF('dd',INTFR.Shipped,?) >=0 )            "
+ 
+	quit $$RunSql(sql,itemCode,locationCode,initialDate,finalDate) 
+	
+UpdatePaciente(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+	set sql="SELECT                "_
+		"    'PACIENTE' AS TipoDeMovimento,            "_
+		"    CAST(INADJ.ModifiedDate AS TIMESTAMP) AS Data,            "_
+		"    INADJ.StockAdjustmentNumber||'-'||INADJLine.Number AS NumeroDoc,            "_
+		"    INADJ.SiteLocation AS Local,            "_
+		"    $$SQLGetLocationName^VARTRKSQL(INADJ.SiteLocation) AS LocalRecebedor,            "_
+		"    '' AS LocalAbastecedor,            "_
+		"    CASE            "_
+		"                WHEN INADJLine.Quantity >= 0 THEN INADJLine.Quantity"_
+		"                ELSE ''"_
+		"    END AS QtdEntrada,            "_
+		"    CASE            "_
+		"                WHEN INADJLine.Quantity < 0 THEN -INADJLine.Quantity"_
+		"                ELSE ''"_
+		"    END AS QtdSaida,            "_
+		"    $$GetCostAsAtDateAndTime^VARTRKSQL(INADJ.Company,INADJLine.Item,INADJ.ModifiedDate) AS CustoUnitario "_
+		"                    "_
+		"FROM                "_
+		"    SQLUser.INADJ JOIN SQLUser.INADJLine            "_
+		"    ON INADJ.StockAdjustmentNumber = INADJLine.StockAdjustmentNumber            "_
+		"    AND INADJ.Company = INADJLine.Company            "_
+		"                    "_
+		"WHERE                "_
+		"    INADJ.Company = 0            "_
+		"    AND UPPER(INADJ.Status) = 1            "_
+		"    AND UPPER(INADJ.SiteLocation) = ? "_
+		"    AND INADJ.FREE2 <> ''            "_
+		"    AND UPPER(INADJLine.Item) = ? "_
+		"    AND INADJLine.Quantity <> 0            "_
+		"    AND (DATEDIFF('dd',INADJ.ModifiedDate,?) <=0 )            "_
+		"    AND (DATEDIFF('dd',INADJ.ModifiedDate,?) >=0 )            "
+ 
+	quit $$RunSql(sql,itemCode,locationCode,initialDate,finalDate) 
+	 
+UpdateRecebimento(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+	set sql="SELECT                 "_
+		"    'RECEBIMENTO' AS TipoDeMovimento,            "_
+		"    CAST(INREC.ProcessedDate AS TIMESTAMP) AS Data,            "_
+		"    INREC.ReceiptNumber||'-'||INRECLine.LineNumber AS NumeroDoc,            "_
+		"    INREC.Location As Local,            "_
+		"    $$SQLGetLocationName^VARTRKSQL(INREC.Location) AS LocalRecebedor,            "_
+		"    '' AS LocalAbastecedor,            "_
+		"    INRECLine.Quantity As QtdEntrada,            "_
+		"    '' AS QtdSaida,            "_
+		"    $$GetCostAsAtDateAndTime^VARTRKSQL(INREC.Company,INRECLine.Item,INREC.ProcessedDate) AS CustoUnitario "_
+		"                    "_
+		"FROM                 "_
+		"    SQLUser.INREC INREC INNER JOIN SQLUser.INRECLine INRECLine              "_
+		"    ON  INREC.Company = INRECLine.Company            "_
+		"    AND INREC.ReceiptNumber = INRECLine.ReceiptNumber            "_
+		"                    "_
+		"WHERE                 "_
+		"    INREC.Company = 0            "_
+		"    AND UPPER(INREC.Type) = 2            "_
+		"    AND UPPER(INREC.Location) = ? "_
+		"    AND UPPER(INREC.Status) = 1            "_
+		"    AND INREC.FREE1 <> 5             "_
+		"    AND INREC.FREE1 <> 6             "_
+		"    AND UPPER(INRECLine.Item) = ? "_
+		"    AND INRECLine.Quantity > 0            "_
+		"    AND (DATEDIFF('dd', INREC.ProcessedDate,?) <=0)            "_
+		"    AND (DATEDIFF('dd', INREC.ProcessedDate,?) >=0)            "
+ 
+	quit $$RunSql(sql,itemCode,locationCode,initialDate,finalDate) 
+	
+UpdateTrfAceite(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+	set sql="SELECT                 "_
+		"    'TRF-ACEITE' AS TipoDeMovimento,            "_
+		"    CAST(INREC.ProcessedDate AS TIMESTAMP) AS Data,            "_
+		"    INREC.ReceiptNumber||'-'||INRECLine.LineNumber AS NumeroDoc,            "_
+		"    INTFR.ReceivingLocation As Local,            "_
+		"    $$SQLGetLocationName^VARTRKSQL(INTFR.ReceivingLocation) AS LocalRecebedor,            "_
+		"    INTFR.SendingLocation AS LocalAbastecedor,            "_
+		"    INRECLine.Quantity As QtdEntrada,            "_
+		"    '' AS QtdSaida,            "_
+		"    $$GetCostAsAtDateAndTime^VARTRKSQL(INREC.Company,INRECLine.Item,INREC.ProcessedDate) AS CustoUnitario "_
+		"                    "_
+		"FROM                 "_
+		"    SQLUser.INREC INREC INNER JOIN SQLUser.INRECLine INRECLine              "_
+		"    ON  INREC.Company = INRECLine.Company            "_
+		"    AND INREC.ReceiptNumber = INRECLine.ReceiptNumber            "_
+		"                    "_
+		"    JOIN SQLUser.INTFR INTFR            "_
+		"    ON  INREC.Company = INTFR.Company            "_
+		"    AND INREC.TransferNumbers = INTFR.TransferNumber            "_
+		"                    "_
+		"WHERE                 "_
+		"    UPPER(INREC.Type) = 3            "_
+		"    AND UPPER(INREC.Status) = 1            "_
+		"    AND UPPER(INTFR.ReceivingLocation) = ? "_
+		"    AND UPPER(INRECLine.Item) = ? "_
+		"    AND INRECLine.Quantity > 0  "_
+		"    AND (DATEDIFF('dd', INREC.ProcessedDate,?) <=0)            "_
+		"    AND (DATEDIFF('dd', INREC.ProcessedDate,?) >=0)            "
+ 
+	quit $$RunSql(sql,itemCode,locationCode,initialDate,finalDate) 	
+	
+UpdateDevolucao(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+	
+	//The date field is not complete as it lacks the time. So we get it from VARSESRetornoAoEstoqueLinha.CriadoEm
+	set sql="SELECT                "_
+		"    'DEVOLUCAO' AS TipoDeMovimento,            "_
+		"    CAST(VARSESRetornoAoEstoque.DateChanged AS TIMESTAMP) AS Data,                "_
+		"    VARSESRetornoAoEstoque.NoDocumento||'-'||VARSESRetornoAoEstoqueLinha.ID1 AS NumeroDoc,            "_
+		"    VARSESRetornoAoEstoque.LocalAbastecedor AS Local,            "_
+		"    $$SQLGetLocationName^VARTRKSQL(VARSESRetornoAoEstoque.LocalAbastecedor ) AS LocalRecebedor,            "_
+		"    VARSESRetornoAoEstoque.LocalSolicitante AS LocalAbastecedor,            "_
+		"    VARSESRetornoAoEstoqueLinha.QuantidadeDevolvida AS QtdEntrada,            "_
+		"    '' AS QtdSaida,            "_
+		"    $$GetCostAsAtDateAndTime^VARTRKSQL(VARSESRetornoAoEstoque.Company,VARSESRetornoAoEstoqueLinha.CodigoDoProduto,VARSESRetornoAoEstoque.DateChanged) AS CustoUnitario "_
+		"                    "_
+		"FROM                "_
+		"    SQLUser.VARSE]]><![CDATA[SRetornoAoEstoque JOIN SQLUser.VARSESRetornoAoEstoqueLinha            "_
+		"    ON VARSESRetornoAoEstoque.NoDocumento = VARSESRetornoAoEstoqueLinha.NoDocumento            "_
+		"    AND VARSESRetornoAoEstoque.Company = VARSESRetornoAoEstoqueLinha.Company            "_
+		"                    "_
+		"WHERE                "_
+		"    UPPER(VARSESRetornoAoEstoque.Firmado) = 1            "_
+		"    AND UPPER(VARSESRetornoAoEstoque.LocalAbastecedor) = ?"_
+		"    AND UPPER(VARSESRetornoAoEstoqueLinha.CodigoDoProduto) = ? "_
+		"    AND VARSESRetornoAoEstoqueLinha.QuantidadeDevolvida > 0            "_
+		"    AND (DATEDIFF('dd',VARSESRetornoAoEstoque.DateChanged,?) <=0 )            "_
+		"    AND (DATEDIFF('dd',VARSESRetornoAoEstoque.DateChanged,?) >=0 )            "
+ 
+	quit $$RunSql(sql, itemCode,locationCode,initialDate,finalDate) 		
+	
+UpdateEstornoTrf(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+	set sql="SELECT                "_
+		"    'ESTORNO-TRF' AS TipoDeMovimento,            "_
+		"    CAST(INTFRRev.Reversed AS TIMESTAMP) AS Data,            "_
+		"    INTFRRev.TransferNumber||'-'||INTFRRev.ReversalSequence||'-'||INTFRRevLine.TransferLineNumber AS NumeroDoc,            "_
+		"    INTFRRev.SendingLocation AS Local,            "_
+		"    $$SQLGetLocationName^VARTRKSQL(INTFRRev.ReceivingLocation) AS LocalRecebedor,            "_
+		"    INTFRRev.SendingLocation AS LocalAbastecedor,            "_
+		"    INTFRRevLine.ReversalQuantity AS QtdEntrada,            "_
+		"    '' As QtdSaida,            "_
+		"    $$GetCostAsAtDateAndTime^VARTRKSQL(INTFRRev.Company,INTFRRevLine.Item,INTFRRev.Reversed) AS CustoUnitario "_
+		"                    "_
+		"FROM                "_
+		"    SQLUser.INTFRRev JOIN SQLUser.INTFRRevLine            "_
+		"    ON INTFRRev.Company = INTFRRevLine.Company            "_
+		"    AND INTFRRev.TransferNumber = INTFRRevLine.TransferNumber            "_
+		"    AND INTFRRev.ReversalSequence = INTFRRevLine.ReversalSequence            "_
+		"                    "_
+		"WHERE                "_
+		"    INTFRRev.Company = 0 "_
+		"    AND UPPER(INTFRRev.Status) > 0            "_
+		"    AND UPPER(INTFRRev.Reversed) IS NOT NULL            "_
+		"    AND UPPER(INTFRRev.SendingLocation) = ? "_
+		"    AND UPPER(INTFRRevLine.Item) = ? "_
+		"    AND INTFRRevLine.ReversalQuantity > 0            "_
+		"    AND (DATEDIFF('dd',INTFRRev.Reversed,?) <=0 )            "_
+		"    AND (DATEDIFF('dd',INTFRRev.Reversed,?) >=0 )            "
+ 
+	quit $$RunSql(sql,itemCode,locationCode,initialDate,finalDate)
+ 
+UpdateEstornoRec(itemCode,locationCode,initialDate,finalDate)
+	;----------------------------------------------
+	; Fetches all data related to all receiving events in the interval.
+	;----------------------------------------------
+	new sql
+	set sql="SELECT                "_
+		"    'ESTORNO-REC' AS TipoDeMovimento,            "_
+		"    CAST(INREC.ProcessedDate AS TIMESTAMP) AS Data,            "_
+		"    $$SQLGetFormatDate^VARTRKSQL(INREC.ProcessedDate) AS DATA1,            "_
+		"    INREC.ReceiptNumber||'-'||INRECLine.LineNumber AS NumeroDoc,            "_
+		"    INREC.Location As Local,            "_
+		"    $$SQLGetLocationName^VARTRKSQL(INREC.Location) AS LocalRecebedor,            "_
+		"    '' AS LocalAbastecedor,            "_
+		"    '' As QtdEntrada,            "_
+		"    INRECLine.Quantity AS QtdSaida,            "_
+		"    $$GetCostAsAtDateAndTime^VARTRKSQL(INREC.Company,INRECLine.Item,INREC.ProcessedDate) AS CustoUnitario            "_
+		"                    "_
+		"FROM                 "_
+		"    SQLUser.INREC INREC INNER JOIN SQLUser.INRECLine INRECLine              "_
+		"    ON  INREC.Company = INRECLine.Company            "_
+		"    AND INREC.ReceiptNumber = INRECLine.ReceiptNumber            "_
+		"                    "_
+		"WHERE                 "_
+		"    INREC.Company = 0            "_
+		"    AND UPPER(INREC.Type) = 5            "_
+		"    AND UPPER(INREC.Location) = ? "_
+		"    AND UPPER(INREC.Status) = 1            "_
+		"    AND UPPER(INRECLine.Item) = ? "_
+		"    AND INRECLine.Quantity > 0            "_
+		"    AND (DATEDIFF('dd', INREC.ProcessedDate,?) <=0)            "_
+		"    AND (DATEDIFF('dd', INREC.ProcessedDate,?) >=0)          "
+		
+	quit $$RunSql(sql,itemCode,locationCode,initialDate,finalDate)
+	
+]]></Routine>
+</Export>

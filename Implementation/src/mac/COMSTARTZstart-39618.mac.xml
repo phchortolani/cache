@@ -1,0 +1,432 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMSTARTZstart" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+%ZSTART ; User startup routine. Must be installed in %SYS to operate
+ 	;=========================================================================
+	; WARNING - Any modifications to this routine when it is installed in %SYS
+	; 			will be OVER-WRITTEN with the next upgrade of COM.
+	; 			All required changes should be made in COM.
+	;=========================================================================
+	; MS	8-Jul-2005 	SR12933 Add quit:strNameSpace="", prevent infinite loop
+	;-------------------------------------------------------------------------------
+	#define ME						"ZSTART"
+	#define BgnSet					"Start"
+	#define Empty					""
+	#define OprLog					1
+
+	#include COMSYS
+	#include %syPidtab
+
+	#define WEBACCESSTYPE			"WEB"
+	#define SERVICEACCESSTYPE		"SERVICE"
+	#define WEBSERVICEACCESSTYPE	"WEBSERVICE"
+	#define REPORTACCESSTYPE		"REPORT"
+	#define MOBILEACCESSTYPE		"MOBILE"
+	#define STUDIOACCESSTYPE		"STUDIO"
+	#define TERMINALACCESSTYPE		"TERMINAL"
+    quit
+
+IDENT ;;COMSTARTZstart
+	; this identity ensures only COMSTARTZstart routines are replaced
+	quit
+
+SYSTEM
+    ;-------------------------------------------------------------------------------
+    ;Cache starting
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 27-May-2014	shobby	CORE-385: Loosen dependence on VAR Code
+    ; 25-Feb-2008	shobby	SRBR014903: Don't try and start the scheduler on ECP
+    ; 							linked namespaces.
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSTARTUtils and start scheduler
+	; 							per namespace.
+    ; 30-Jun-2006	shobby	SRBR014097:	Find namespace that has the most recent
+    ; 							version of the scheduler.
+    ; 29-Jun-2006	shobby	SRBR014097:	Checking of global ^ROUTINE("COMSchedule").
+    ; 							Could error and therefore scheduler would fail to start.
+    ; 08-Jul-2005	MS/shobby SR12933 : Prevent continuous looping through namespaces.
+    ;-------------------------------------------------------------------------------
+    new EntryPoint, strCurrentNamespace, Items, intCount, strNameSpace, arrNameSpace
+
+	set $ztrap = "SYSTEMExit"
+	set EntryPoint = "SYSTEM"
+	set strCurrentNamespace = $zutil(5)
+
+	do configLicenseUserIdentification()
+
+    ; record the fact we got started in the console log
+    do WriteConsole(EntryPoint_"^%"_$$$ME_" called @ "_$zdatetime($horolog, 3))
+
+    ; log the data accumulate results
+    set Items = $listbuild($$$BgnSet, $zdatetime($horolog, 3), "Job", $job,
+		"Computer", $zutil(110), "Version", $zversion,
+		"StdIO", $principal, "Namespace", $zutil(5),
+		"CurDirPath", $zutil(12), "CurNSPath", $zutil(12, ""),
+		"CurDevName", $zutil(67, 7, $job), "JobType", $zutil(67, 10, $job),
+		"JobStatus", $zhex($zjob), "StackFrames", $stack,
+		"AvailStorage", $storage, "UserName", $zutil(67, 11, $job))
+
+	; Startup scheduler (if required)
+	for intCount = 1:1:$zutil(90, 0) {
+		set strNameSpace = $Zutil(90, 2, 0, intCount)
+		if ($length(strNameSpace) = 0) quit
+
+		set arrNameSpace(strNameSpace) = ""
+	}
+
+	set strNameSpace = $order(arrNameSpace(""))
+	while ($length(strNameSpace) > 0) {
+		if ($$defsys^%GLO(strNameSpace) '= "") {  ;BR014903
+			;Don't start scheduler on ECP namespaces. ;BR014903
+			do WriteConsole(EntryPoint_"^%"_$$$ME_" scheduler ignored for ECP namespace "_strNameSpace)
+		}
+		else {
+			do $zutil(5, strNameSpace)
+
+			if ($zutil(5) = strNameSpace) {
+				if ##class(%Dictionary.CompiledClass).%ExistsId("VAR.infra.services.PrimaryServicesMonitor") do ##class(VAR.infra.services.PrimaryServicesMonitor).VerifyAndStartService() ;CORE-385
+				if ##class(%Dictionary.CompiledClass).%ExistsId("VAR.infra.services.SecondaryServicesMonitor") do ##class(VAR.infra.services.SecondaryServicesMonitor).VerifyAndStartService() ;CORE-385
+
+				if ($$CheckForError()) {
+					if ($get(^COMScheduler("Start"))) {
+						do WriteConsole(EntryPoint_"^%"_$$$ME_" started scheduler from "_strNameSpace)
+						do Start^COMSchedule
+					}
+				}
+			}
+		}
+
+		set strNameSpace = $order(arrNameSpace(strNameSpace))
+	}
+
+SYSTEMExit ;Internal Tag
+    set $ztrap = ""
+	do $zutil(5, strCurrentNamespace)
+    quit
+ 
+ 
+CheckForError()
+	;-------------------------------------------------------------------------------
+	; Check whether the test for the routine existence fails.  Error occurs when
+	; finding an unmounted database
+	; 
+	; History:
+	; 31-Jul-2007	shobby	SRBR014652:  Do the check on rOBJ because ^ROUTINE won't
+	; 							exist when source code has been removed.
+	; 01-Jul-2006	shobby	SRBR014097:  Created
+	;-------------------------------------------------------------------------------
+	new blnResult
+	
+	set blnResult = 0
+	set $ztrap = "ErrorCheckForError"
+	set blnResult = $data(^rOBJ("COMSchedule"))
+
+ErrorCheckForError ; Internal Tag ;Goto point. Not start of a new routine.
+	set $ztrap = ""
+
+	quit blnResult
+ 
+ 
+DateDiff(pdteFirst="",pdteSecond="")
+	;-------------------------------------------------------------------------------
+	; Determine the number of seconds difference between two $horolog dates
+	; 
+	; NOTE: This is not taking leap seconds into consideration.
+	; 
+	; History:
+	; 01-Jul-2006	shobby	SRBR014097:	Copied from COMDateUtils (to remove
+	; 							dependency of this routine on that routine)
+    ; 05-Nov-2004	GRF		Add parameter defaults
+	; 28-Mar-2003	PaulK	Created(Commented)
+	;-------------------------------------------------------------------------------
+	new plngFirst,plngSecond
+	
+	set plngFirst  = $piece(pdteFirst ,",",1)*86400+$piece(pdteFirst ,",",2)
+	set plngSecond = $piece(pdteSecond,",",1)*86400+$piece(pdteSecond,",",2)
+	quit plngSecond-plngFirst
+ 
+ 
+LOGIN
+	;-------------------------------------------------------------------------------
+    ; a user logs into Cache (user account or telnet)
+	;-------------------------------------------------------------------------------
+	if ($$isExplicitLicenseUserIdentification() && $$isTerminal()) {
+		do allocTerminalLicense($$getLicenseUserIdFromIpAddress($$getIpAddress()))
+	}
+
+    quit
+
+JOB
+	;-------------------------------------------------------------------------------
+    ; JOB'd process begins
+	;-------------------------------------------------------------------------------
+	if ($$isExplicitLicenseUserIdentification() && $$isStudio()) {
+		do allocStudioLicense($$getLicenseUserIdFromIpAddress($$getIpAddress()))
+	}
+
+    quit
+
+CALLIN
+	;-------------------------------------------------------------------------------
+    ; a process enters via CALLIN interface
+	;-------------------------------------------------------------------------------
+    quit
+
+setLicenseUserIdentification(pblnExplicitIdentification)
+	set ^|"%SYS"|SYS("UserIdentification") = pblnExplicitIdentification
+	do configLicenseUserIdentification()
+	quit
+
+configLicenseUserIdentification()
+	do $System.License.DeferUserIdentification($$isExplicitLicenseUserIdentification())
+	quit
+
+isExplicitLicenseUserIdentification()
+	quit +$get(^|"%SYS"|SYS("UserIdentification"))
+
+setDefaultLicenseUserIds(pstrDefaultLicenseUserIds)
+	set ^|"%SYS"|SYS("DefaultLicenseUserIds") = pstrDefaultLicenseUserIds
+	quit
+
+getAvailableDefaultLicenseUserId()
+	new strLicenseUserId, strDefaultLicenseUserIds, i, strCurrentLicenseUserId
+
+	set strLicenseUserId = ""
+	set strDefaultLicenseUserIds = $get(^|"%SYS"|SYS("DefaultLicenseUserIds"))
+	for i = 1:1:$length(strDefaultLicenseUserIds, ";") {
+		set strCurrentLicenseUserId = $piece(strDefaultLicenseUserIds, ";", i)
+
+		if ($length(strCurrentLicenseUserId) = 0) continue
+
+	 	if ($System.License.ConnectionCount(strCurrentLicenseUserId) <
+	 			$System.License.MaxConnections()) {
+		 	set strLicenseUserId = strCurrentLicenseUserId
+		 	quit
+	 	}
+	}
+
+	quit strLicenseUserId
+
+isTerminal()
+	new job, isTerminal
+
+	set $ztrap = "exceptionIsTerminal"
+
+	if ($SYSTEM.Version.GetNumber() > 2008.1) {
+		set job = ##class(%SYS.ProcessQuery).%OpenId($job)
+	}
+	else {
+		set job = ##class(%SYSTEM.Process).%OpenId($job)
+	}
+
+	set isTerminal = (('job.IsGhost) &&
+					  (job.JobType = $$$FOREJOB) &&
+					  ($length(job.CSPSessionID) = 0) &&
+					  ($length(job.ClientExecutableName) = 0) &&
+					  ($extract(job.CurrentDevice, 1, $length("|TNT|")) = "|TNT|"))
+	goto finallyIsTerminal
+
+exceptionIsTerminal
+	set $ztrap = ""
+	goto finallyIsTerminal
+
+finallyIsTerminal
+	quit isTerminal
+
+isStudio()
+	new job, isStudio
+
+	set $ztrap = "exceptionIsStudio"
+
+	if ($SYSTEM.Version.GetNumber() > 2008.1) {
+		set job = ##class(%SYS.ProcessQuery).%OpenId($job)
+	}
+	else {
+		set job = ##class(%SYSTEM.Process).%OpenId($job)
+	}
+
+	set isStudio = (('job.IsGhost) &&
+					(job.JobType = $$$ODBCSRV) &&
+					($length(job.CSPSessionID) = 0) &&
+					(job.ClientExecutableName = "CSTUDIO.EXE"))
+	goto finallyIsStudio
+
+exceptionIsStudio
+	set $ztrap = ""
+	goto finallyIsStudio
+
+finallyIsStudio
+	quit isStudio
+
+getIpAddress()
+	new job, ip
+
+	set $ztrap = "exceptionGetIpAddress"
+
+	if ($SYSTEM.Version.GetNumber() > 2008.1) {
+		set job = ##class(%SYS.ProcessQuery).%OpenId($job)
+	}
+	else {
+		set job = ##class(%SYSTEM.Process).%OpenId($job)
+	}
+
+	set ip = job.ClientIPAddress
+	goto finallyGetIpAddress
+
+exceptionGetIpAddress
+	set $ztrap = ""
+	goto finallyGetIpAddress
+
+finallyGetIpAddress
+	quit ip
+
+clearIpMaskToLicenseUserIdMap()
+	kill ^|"%SYS"|SYS("IpMaskToLicenseUserIdMap")
+	quit
+
+setIpMaskToLicenseUserIdMap(pstrIpMask, pstrLicenseUserId)
+	set ^|"%SYS"|SYS("IpMaskToLicenseUserIdMap", pstrIpMask) = pstrLicenseUserId
+	quit
+
+getLicenseUserIdFromIpAddress(pstrIpAddress)
+	new strLicenseUserId, intLevelMatch, strIpMask
+
+	set strLicenseUserId = ""
+
+	set intLevelMatch = 0
+	set strIpMask = $order(^|"%SYS"|SYS("IpMaskToLicenseUserIdMap", ""))
+	while ($length(strIpMask) > 0) {
+		if ($$isMatchIpMask(pstrIpAddress, strIpMask) > intLevelMatch) {
+			set strLicenseUserId = ^|"%SYS"|SYS("IpMaskToLicenseUserIdMap", strIpMask)
+			set intLevelMatch = $$isMatchIpMask(pstrIpAddress, strIpMask)
+		}
+
+		set strIpMask = $order(^|"%SYS"|SYS("IpMaskToLicenseUserIdMap", strIpMask))
+	}
+
+	quit strLicenseUserId
+
+isMatchIpMask(pstrIpAddress, pstrIpMask)
+	if ($extract(pstrIpAddress, 1, $length(pstrIpMask)) = pstrIpMask) {
+		quit $length(pstrIpMask)
+	}
+
+	quit 0
+
+allocWebLicense(pstrLicenseUserId)
+ 	quit $$allocLicense($$$WEBACCESSTYPE, pstrLicenseUserId)
+
+allocServiceLicense(pstrLicenseUserId)
+	quit $$allocLicense($$$SERVICEACCESSTYPE, pstrLicenseUserId)
+
+allocWebServiceLicense(pstrLicenseUserId)
+	quit $$allocLicense($$$WEBSERVICEACCESSTYPE, pstrLicenseUserId)
+
+allocReportLicense(pstrLicenseUserId)
+	quit $$allocLicense($$$REPORTACCESSTYPE, pstrLicenseUserId)
+
+allocMobileLicense(pstrLicenseUserId)
+	quit $$allocLicense($$$MOBILEACCESSTYPE, pstrLicenseUserId)
+
+allocStudioLicense(pstrLicenseUserId)
+	quit $$allocLicense($$$STUDIOACCESSTYPE, pstrLicenseUserId)
+
+allocTerminalLicense(pstrLicenseUserId)
+	quit $$allocLicense($$$TERMINALACCESSTYPE, pstrLicenseUserId)
+
+allocLicense(pstrAccessType, pstrLicenseUserId)
+    ; 27-May-2014	shobby	CORE-385: Loosen dependence on VAR Code
+
+	new intOldLicCount, intOldConnCount, strRemoteAddrBkp, strStatus,
+		intNewLicCount, intNewConnCount, strMsg
+
+	if ($length(pstrLicenseUserId) = 0) {
+		set pstrLicenseUserId = $$getAvailableDefaultLicenseUserId()
+	}
+	if ($length(pstrLicenseUserId) = 0) {
+		quit 0
+	}
+	if ($System.License.GetUserId() = pstrLicenseUserId) {
+		quit 1
+	}
+
+	set intOldLicCount = $System.License.LUConsumed()
+	set intOldConnCount = $System.License.ConnectionCount(pstrLicenseUserId)
+
+	if ($isObject($get(%session))) {
+		set strRemoteAddrBkp = %request.CgiEnvs("REMOTE_ADDR")
+		set %request.CgiEnvs("REMOTE_ADDR") = "127.0.0.1"
+
+	 	set strStatus = %session.Login(pstrLicenseUserId, "", 1)
+	 	if ($$$ISOK(strStatus) && ($System.License.GetUserId() '= pstrLicenseUserId)) {
+		 	set strStatus = $System.License.Login(pstrLicenseUserId)
+	 	}
+
+		set %request.CgiEnvs("REMOTE_ADDR") = strRemoteAddrBkp
+ 	}
+ 	else {
+	 	set strStatus = $System.License.Login(pstrLicenseUserId)
+	}
+ 	if ($$$ISOK(strStatus)) {
+		set intNewLicCount = $System.License.LUConsumed()
+		set intNewConnCount = $System.License.ConnectionCount(pstrLicenseUserId)
+
+		set ^WWWLicenseAllocationLog($piece($horolog, ",", 1),
+			$piece($horolog, ",", 2), pstrLicenseUserId, pstrAccessType, $$$UPPER($znspace)) =
+			intNewLicCount_"~"_(intNewLicCount - intOldLicCount)_"~"_
+			intNewConnCount_"~"_(intNewConnCount - intOldConnCount)_"~"_$job
+
+		if (##class(%Dictionary.ClassDefinition).%ExistsId("VAR.infra.log.Logger")) {
+			set strMsg = "License allocated: userId="_pstrLicenseUserId_", "_
+				"accessType="_pstrAccessType_", namespace="_$$$UPPER($znspace)_", "_
+				"licCount="_intNewLicCount_", licDiff="_(intNewLicCount - intOldLicCount)_", "_
+				"connCount="_intNewConnCount_", connDiff="_(intNewConnCount - intOldConnCount)
+			do ##class(VAR.infra.log.Logger).LogInfo($zutil(67,5,$job),$piece($piece($stack($stack(-1),"place")," +",1),"^",1),strMsg,0) ;CORE-385
+ 		}
+ 	}
+
+	quit strStatus
+
+unallocLicense(){
+	do $System.License.Login($char(0))
+}
+
+WriteConsole(LineText) PUBLIC
+	;-------------------------------------------------------------------------------
+    ; write the line to the console log
+    ; by default the file cconsole.log in the MGR directory
+	; 
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Copied from COMSTARTUtils
+	;-------------------------------------------------------------------------------
+    new SaveIO
+
+    ; save the current device and open the operator console
+    ; set up error handling to cope with errors
+    ; there is little to do if an error happens
+    set SaveIO = $io
+    set $ztrap = "WriteConsoleExit"
+    open $$$OprLog
+    use $$$OprLog
+    ; we do not need an "!" for line termination
+    ; each WRITE becomes its own console record
+    write LineText
+    ; restore the previous io device
+    close $$$OprLog
+    ; pick up here in case of an error
+
+WriteConsoleExit ;Internal Tag
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Copied from COMSTARTUtils
+	;-------------------------------------------------------------------------------
+    set $ztrap = ""
+    use SaveIO
+    quit
+
+]]></Routine>
+</Export>

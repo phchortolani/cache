@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReqReleaseLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReqReleaseLine
+	
+#include INConst
+#include COMSYS
+#include COMGridEdit31
+	
+#define FORMFldINReqReleaseLineTotalPrice 28
+	
+OnBeforeDisplayLine(pYKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Dec-2009	GRF		SR17007: separate tags for multi-lock operations
+	; 16-Feb-2007	RPW		SR15437: DataAccess is no longer used.
+	; 24-Jan-2007	PO		SR15400: If not showing line based on status or supplier
+	; 							then don't lock
+	; 23-Jan-2007	PO		SR15400: Pass in Release form names to GetLock instead
+	; 							of Source.
+	; 05-Jan-2007	shobby	SR15365: Check Planner as well if specified.
+	; 05-Jan-2007	RPW		SR15249: Need to get the parent YMFELD so that we
+	; 							can check the supplier.
+	; 05-Jan-2007	shobby	SR15365: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,blnShow
+	
+	set strStatus = $$LockSet^WWWMultiLock("INReqRelease","INReqReleaseLine",pYKEY)
+	
+	if $$$ISERR(strStatus) {
+		set ^CacheTempLocked(YUSER,pYKEY) = strStatus
+	}
+	quit $$$YES
+	
+	
+OnBeforeFormat(pYFIELDNAME,strText,YFELD)
+	;-------------------------------------------------------------------------------
+	; Before formatting a field check what is should have.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Jan-2010	shobby	SR15753: Removed redundant code.
+	; 24-Feb-2009	GRF		SR16356: idField to idClassField, clrError to enumErrorColour
+	; 23-Feb-2009	HQN		SR16356: Use UpdateManualField to set the value instead
+	; 							of setting the "In Memory" record value
+	; 18-May-2007	RPW		SR15495: Removed unused variables
+	; 12-Apr-2007	RPW		SR15495: Don't care about quantities here anymore.
+	; 20-Feb-2007	RPW		SR15362: Calculate the Total Price
+	; 23-Jan-2007	RPW		SR15362: Use darkorange (note this is is temp, so ignore clrError)
+	; 23-Jan-2007	PO		SR15400: Display tool tip if 'I' don't have lock
+	; 23-Jan-2007	RPW		SR15362: Check if we actually can release.
+	; 						Consolidate Reqns unchecked & one line Dialog box
+	;						Consolidate Reqns unchecked & multiple lines Grid validation
+	;						Consolidate Reqns checked & one line Dialog box
+	;						Consolidate Reqns checked & multiple lines Dialog Box
+	;						Basically rewritten to handle this
+	; 30-Nov-2006	RPW		SR15249: Created
+	;-------------------------------------------------------------------------------
+	new idClassField,idCol,idRow,lstStatus,objRequisition
+	new strAmtStatus,strQtyStatus,strStatus
+	
+	quit:($get(YUSER)="")||($get(YKEY)="")
+	
+	if $data(^CacheTempLocked(YUSER,YKEY)) {
+		set strStatus = $get(^CacheTempLocked(YUSER,YKEY))
+		set YTOOLTIP  = $$$Text(strStatus)
+	
+	} else {
+		$$$GRIDSplitKey(pYFIELDNAME,idRow,idCol)
+		set idClassField = $$$GetClassField(YFORM,idCol)
+
+		if (idClassField = $$$FldINRequisitionItem) {
+			if $$$INRequisitionRelease(YFELD) {
+				if '$$$INVORGConsolidateRequisitions($get(^INVORG(0,0,1))) {
+					do CalculateTotalPrice(.YFELD)
+					
+					set lstStatus = $$Validate^INReqRelease($$$INRequisitionTotalPrice(YFELD),$$$INRequisitionQuantity(YFELD),$$$GRIDYMFELDContainer)
+					
+					set strQtyStatus = $listget(lstStatus,1)
+					set strAmtStatus = $listget(lstStatus,2)
+					
+					$$$DecomposeStatus(strQtyStatus)
+					$$$DecomposeStatus(strAmtStatus)
+						
+					if $$$ISERR(strQtyStatus) && $$$ISERR(strAmtStatus) {
+						set YWARNING = $$$YES 
+						set YTOOLTIP = $$$Text(strQtyStatus)_YCR_$$$Text(strAmtStatus)
+					
+					} elseif $$$ISOK(strQtyStatus) && $$$ISERR(strAmtStatus) {
+						set YWARNING = $$$YES 
+						set YTOOLTIP = $$$Text(strAmtStatus)
+					
+					} elseif $$$ISERR(strQtyStatus) && $$$ISOK(strAmtStatus) {
+						set YWARNING = $$$YES 
+						set YTOOLTIP = $$$Text(strQtyStatus)
+					}
+				}
+			}
+		} elseif idClassField = $$$FldINRequisitionTotalPrice { 
+			do CalculateTotalPrice(.YFELD)
+			do UpdateManualField^COMGridEdit31Interface(idRow,idCol,$$$INRequisitionTotalPrice(YFELD))
+		}
+	}
+	quit
+	
+	
+GetPlanner(pobjLine)
+	;-------------------------------------------------------------------------------
+	; Get all planners if no planner is selected, otherwise just get this planner.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Jan-2007	RPW		SR15365: Created
+	;-------------------------------------------------------------------------------
+	new idItem,idPlanners,intLength,strNames,strName,idPlannerFilter
+	new intCommas,loop,idPlanner
+	
+	set idItem=$$$INRequisitionItem(pobjLine)
+	
+	set idPlannerFilter = $piece($$$GRIDYMFELDContainer,Y,2)
+	set idPlanners      = $$GetFieldFromDRP^INDRPITEM(YLOCATION,idItem,$$$FldINDRPITEMPlanner)
+	
+	set strNames = ""
+	if idPlanners'="" {
+		set intLength = $length(idPlanners,";")
+		set intCommas = $select(idPlannerFilter="":intLength,1:1)
+		
+		for loop=1:1:intLength {
+			set idPlanner = $piece(idPlanners,";",loop)
+			continue:(idPlannerFilter'="")&&(idPlanner'=idPlannerFilter)
+			
+			set strName  = $$$WWW013Name($get(^WWW013(0,idPlanner,1)))
+			set strNames = strNames_strName
+			if loop<intCommas {
+				set strNames = strNames_", "
+			}
+		}
+	}
+	quit strNames
+	
+	
+OnBlur(pCOL,pROW,&pYFELD)
+	;-------------------------------------------------------------------------------
+	; Handle changes in field values
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Jan-2010	shobby	SR15753: Removed redundant code.
+	; 09-Feb-2007	RPW		SR15362: Use the new calculate total price method.
+	; 23-Jan-2007	RPW		SR15362: If we change the release checkbox, then update the item errors.
+	; 22-Jan-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+	if pCOL=$$$FldINRequisitionQuantity {
+		do CalculateTotalPrice(.YFELD)
+		
+	} elseif pCOL=$$$FldINRequisitionRelease {
+	}
+	quit
+	
+	
+CalculateTotalPrice(&pobjReleaseLine)
+	;-------------------------------------------------------------------------------
+	; Update the total price
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Feb-2007	RPW		SR15326: Created
+	;-------------------------------------------------------------------------------
+	set $$$INRequisitionTotalPrice(pobjReleaseLine) = $$$INRequisitionQuantity(pobjReleaseLine) * $$$INRequisitionUnitPrice(pobjReleaseLine)
+	quit
+	
+	
+ItemCheck(pobjRequisition)
+	;-------------------------------------------------------------------------------
+	; Check for the item status for being able to put on a PO
+	;
+	; Inputs: Requisition
+	;
+	; Returns: 0 if OK else 1
+	;
+	; History:
+	; 03-Sep-2010	SCR		SR17309: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$IsUsable^INARTDataAccess($$$INRequisitionItem(pobjRequisition),"INAUF")
+	quit $select(strStatus=$$$OK:0,1:1)
+	
+	
+OnBeforeFormConstruction(pidClassField) ; DEPRECATED - No longer in active use
+	;-------------------------------------------------------------------------------
+	; Get the field values before showing the form
+	;
+	; Called By: Form INReqReleaseLine F28/D46 [Now commented]
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Feb-2009	HQN		SR16356: Moved logic to OnBeforeFormat
+	; 19-Feb-2007	RPW		SR15362: Created
+	;-------------------------------------------------------------------------------
+	quit
+	
+]]></Routine>
+</Export>

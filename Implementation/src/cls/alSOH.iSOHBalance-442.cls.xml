@@ -1,0 +1,892 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alSOH.iSOHBalance">
+<Description><![CDATA[
+Period Balances for an Item and Location]]></Description>
+<Abstract>1</Abstract>
+<ClassType/>
+<IncludeCode>%occInclude,COMSYS</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+
+<Method name="GetPeriods">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;,&amp;parrPeriod:alSYS.dt.dtString,&amp;pidPeriodType:alSOH.dPeriodType</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Get the Active Periods for a given Start and End Dates
+	; Also calculates the right Periodtype to use for calculations
+	; 
+	; ByRef :
+	; 	parrPeriod 			- List of Valid Periods
+	; 	pidPeriodType		- Period Type to Use
+	; 	
+	; Returns: none
+	;
+	; History:
+	; 22-Nov-2010	PPP		SR17617: Only include Periods not yet closed.
+	; 26-Jul-2010	PPP		SR17472: If run from 3rd party SQL, dates should be in
+	; 							internal format
+	; 16-Apr-2009	PPP		SR16441: Created
+	;-------------------------------------------------------------------------------
+
+	//#def1arg CACHEPeriod(%1) ^CacheTemp(YUCI,YUSER,"Period",%1)
+	//#def1arg CACHEDate(%1) ^CacheTemp(YUCI,YUSER,"Date",%1)
+	
+	set:$get(pdteEnd)="" pdteEnd = +$horolog 		//Default End date today
+ 	set pdteEnd = +pdteEnd
+ 	
+	set intDiff = 0
+	
+	set objResultSet = ##class(%Library.ResultSet).%New()
+
+	//SR17617
+ //	set sc = objResultSet.Prepare("SELECT ID FROM alSOH.dPeriodType")
+	set sc = objResultSet.Prepare("SELECT ID FROM alSOH.dPeriodType WHERE DateClosed is null")
+
+	if $$$ISOK(sc) {
+		set sc = objResultSet.Execute()
+ 
+		if $$$ISOK(sc) {
+			while objResultSet.Next(.sc) {
+				set idPeriodType = objResultSet.Data("ID")
+				
+				set objResultSet1 = ##class(%Library.ResultSet).%New()
+	//SR17472	set sc = objResultSet1.Prepare("SELECT ID, StartDate, EndDate FROM alSOH.dSOHPeriod WHERE PeriodType = ? AND StartDate >= ? AND EndDate <=? ORDER BY StartDate")
+				set sc = objResultSet1.Prepare("SELECT ID, %Internal(StartDate) As StartDate, %Internal(EndDate) As EndDate FROM alSOH.dSOHPeriod WHERE PeriodType = ? AND StartDate >= ? AND EndDate <=? ORDER BY StartDate")
+				
+				if $$$ISOK(sc) {
+					set sc = objResultSet1.Execute(idPeriodType, pdteStart, pdteEnd)
+					if $$$ISOK(sc) {
+						while objResultSet1.Next(.sc) {
+							set dteStart = objResultSet1.Data("StartDate")
+							set dteEnd   = objResultSet1.Data("EndDate")
+							set idPeriod = objResultSet1.Data("ID")
+							//write !,idPeriodType,":",idPeriod,":",$zdt(dteStart,3),":",$zdt(dteEnd,3),":",pdteEnd
+							
+							//set parrPeriod(idPeriodType,dteStart_"#"_idPeriod)=dteStart_"|"_dteEnd
+							set parrPeriod(idPeriodType,idPeriod)=dteStart_"|"_dteEnd
+							
+							if '$get(arrDate(idPeriodType,1)) || (dteStart<$get(arrDate(idPeriodType,1))) {
+								set arrDate(idPeriodType,1) = dteStart
+							}
+							if '$get(arrDate(idPeriodType,2)) || (dteEnd>$get(arrDate(idPeriodType,2))) {
+								set arrDate(idPeriodType,2) = dteEnd
+							}
+						}
+					}
+				}
+				do objResultSet1.%Close()
+			}  //while
+		}
+	}
+	do objResultSet.%Close()
+ 
+ 	set intDiff = 0
+ 	set idType  = ""
+ 	for {
+	 	set idType = $order(arrDate(idType))
+	 	quit:idType=""
+	 	
+	 //	write !,idType,":",$get(arrDate(idType,2)),":",$get(arrDate(idType,1)),"=",$get(arrDate(idType,2))-$get(arrDate(idType,1))
+	 	
+	 	//Difference is the greatest
+	 	if $get(arrDate(idType,2))-$get(arrDate(idType,1)) > intDiff {
+	 		set intDiff = $get(arrDate(idType,2))-$get(arrDate(idType,1))
+	 		set pidPeriodType = idType
+ 		}
+ 	}
+ 	
+ 	//Set the Period Type to be the first one if all PT are available
+ 	if $get(pidPeriodType) = "" {
+		if $data(parrPeriod) {
+			set pidPeriodType = $order(parrPeriod(""))
+		}
+ 	}
+ 	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="GetTrnQtyDateRangeUseP">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocation:alLOC.dLocation="&quot;,pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;,pstrTrnType:alSYS.dt.dtString="&quot;</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Gets the Transaction Qty based on Active Periods for a given Start and End Dates
+	; for an Item & Location
+	;  
+	; pstrTrnType - comma seperated list of Transaction Types
+	; 
+	; TransactionType		TxnID
+	; ===========================
+	; SupplierReturn		1
+	; SupplierReceipt		2
+	; Sale					3
+	; CustReturns			4
+	; ManufacturingIssue	5
+	; ManufacturingReceipt	6
+	; TransferIssue			7
+	; TransferReceipt		8
+	; Adjustment			9
+	; InTransit				10
+	; 
+	; ByRef :
+	; 	
+	; Returns: Qty - %Float
+	;
+	; History:
+	; 29-Apr-2010	GRF		SR17237: $get not necessary - variables set just prior
+	; 16-Apr-2009	PPP		SR16441: Created
+	;-------------------------------------------------------------------------------
+ 	set blnWrite = $$$NO
+ 	
+ 	if pdteEnd="" set pdteEnd = +$horolog
+	
+	do ..GetPeriods(pdteStart,pdteEnd,.arrPeriod,.idPT)
+	
+	set fltQty = 0
+	
+	if $data(arrPeriod) {
+		set (dteFinalStart,dteFinalEnd) = ""
+		
+		set idPeriodSort = ""
+		for {
+			set idPeriodSort = $order(arrPeriod(idPT,idPeriodSort))
+			quit:idPeriodSort=""
+			
+			set strData  = $get(arrPeriod(idPT,idPeriodSort))
+			set dteStart = $piece(strData,"|",1)
+			set dteEnd   = $piece(strData,"|",2)
+		//	set idPeriod = $piece(idPeriodSort,"#",2)
+			set idPeriod = idPeriodSort
+			
+			if (dteFinalStart="") || (dteStart<dteFinalStart) {
+				set dteFinalStart = dteStart
+			}
+			if (dteFinalEnd="") || (dteEnd>dteFinalEnd) {
+				set dteFinalEnd = dteEnd
+			}
+
+			set objResultSet = ##class(%Library.ResultSet).%New()
+
+			if pidLocation = "" {
+				set strSQL = "SELECT QtySupplierReturn, QtySupplierReceipt, QtySale, QtyCustomerReturn, QtyManufacturingIssue, QtyManufacturingReceipt, QtyTransferIssue, QtyTransferReceipt, QtyInTransit, QtyAdjustmentIn, QtyAdjustmentOut FROM alSOH.dPeriodBalance"
+				set strSQL = strSQL _ " WHERE Item = ? AND SOHPeriod = ?"
+				set sc = objResultSet.Prepare(strSQL)
+			
+			} else {
+				set strSQL = "SELECT QtySupplierReturn, QtySupplierReceipt, QtySale, QtyCustomerReturn, QtyManufacturingIssue, QtyManufacturingReceipt, QtyTransferIssue, QtyTransferReceipt, QtyInTransit, QtyAdjustmentIn, QtyAdjustmentOut FROM alSOH.dPeriodBalance"
+				set strSQL = strSQL _ " WHERE Item = ? AND Location = ? AND SOHPeriod = ?"
+				set sc = objResultSet.Prepare(strSQL)
+			}
+	
+			if $$$ISOK(sc) {
+			
+				if pidLocation = "" {
+					set sc = objResultSet.Execute(pidItem,idPeriod) 
+				} else {
+					set sc = objResultSet.Execute(pidItem,pidLocation,idPeriod)
+				}
+
+				if $$$ISOK(sc) {
+					while objResultSet.Next(.sc) {
+						set fltQtySupplierReturn  = objResultSet.Data("QtySupplierReturn")
+						set fltQtySupplierReceipt = objResultSet.Data("QtySupplierReceipt")
+						set fltQtySale            = objResultSet.Data("QtySale")
+						set fltQtyCustomerReturn  = objResultSet.Data("QtyCustomerReturn")
+						set fltQtyManIssue        = objResultSet.Data("QtyManufacturingIssue")
+						set fltQtyManReceipt      = objResultSet.Data("QtyManufacturingReceipt")
+						set fltQtyTransferIssue   = objResultSet.Data("QtyTransferIssue")
+						set fltQtyTransferReceipt = objResultSet.Data("QtyTransferReceipt")
+						set fltQtyInTransit       = objResultSet.Data("QtyInTransit")
+						set fltQtyAdjustmentIn    = objResultSet.Data("QtyAdjustmentIn")
+						set fltQtyAdjustmentOut   = objResultSet.Data("QtyAdjustmentOut")
+
+						write:blnWrite !,pidItem_":"_pidLocation_":"_idPeriod,":",dteStart,"->",dteEnd," SQL:"_sc
+
+						set fltQtyB=fltQty
+	 
+						if pstrTrnType = "" {
+							set fltQty = fltQty               + fltQtyInTransit       + 
+							             fltQtySupplierReturn + fltQtySupplierReceipt +
+							             fltQtySale           + fltQtyCustomerReturn  +
+							             fltQtyManIssue       + fltQtyManReceipt      +
+							             fltQtyTransferIssue  + fltQtyTransferReceipt +
+							             fltQtyAdjustmentIn   + fltQtyAdjustmentOut
+		
+							write:blnWrite " # ",fltQtyB_" ++ "_$get(fltQtyAdjustmentIn),"+",$get(fltQtyAdjustmentOut),"+",$get(fltQtyCustomerReturn),"+",$get(fltQtyManIssue),"+",$get(fltQtySale),"+",$get(fltQtySupplierReceipt),"+",$get(fltQtySupplierReturn),"+",$get(fltQtyTransferIssue),"+",$get(fltQtyTransferReceipt)_"+",$get(fltQtyInTransit)_"="_fltQty
+	
+						} else {
+						//	set blnTransitAdded = $$$NO
+							for intCnt=1:1:$length(pstrTrnType,",") {
+								
+								set idType = $piece(pstrTrnType,",",intCnt)
+								set fltQty = fltQty + $case(idType,
+								                              1:fltQtySupplierReturn,
+								                              2:fltQtySupplierReceipt,
+								                              3:fltQtySale,
+								                              4:fltQtyCustomerReturn,
+								                              5:fltQtyManIssue,
+								                              6:fltQtyManReceipt,
+								                              7:fltQtyTransferIssue,
+								                              8:fltQtyTransferReceipt,
+								                              9:(fltQtyAdjustmentIn+fltQtyAdjustmentOut),
+								                              10:fltQtyInTransit,
+								                              :0)
+		                         
+		                         //Not necessary any more - new tran type #10
+								//Only Add InTransit Once
+								//if (idType = 7) || (idType = 8) {
+								//	continue:blnTransitAdded
+								//	set fltQty = fltQty + fltQtyInTransit
+								//	set blnTransitAdded = $$$YES
+								//}
+							}
+						}  //End-If pstrTrnType
+					}  //End while
+				}  //End ISOK
+			}  //End for Period Types
+		}  //End if arrPeriod
+		
+		// Get the Transactions Qty for the remaining dates not catered for by the Period Totals using the Transactions themselves
+		if dteFinalStart>pdteStart {
+			set fltQtyB = +fltQty
+			set fltQty  = fltQty + ..GetTrnQtyDateRangeUseT(pidItem,pidLocation,pdteStart,(dteFinalStart-1),pstrTrnType)
+			write:blnWrite !,"Start Trn : ",pdteStart,"->",(dteFinalStart-1)," # "_fltQtyB_"="_fltQty,!
+		}
+	
+		if dteFinalEnd<pdteEnd {
+			set fltQtyB = +fltQty
+			set fltQty  = fltQty + ..GetTrnQtyDateRangeUseT(pidItem,pidLocation,(dteFinalEnd+1),pdteEnd,pstrTrnType)
+			write:blnWrite !,"End Trn : ",(dteFinalEnd+1),"->",pdteEnd," # "_fltQtyB_"="_fltQty,!
+		}
+	
+	} else {
+		write:blnWrite !,"Only Trn : ",pdteStart,"->",pdteEnd,!
+		set fltQty = +..GetTrnQtyDateRangeUseT(pidItem,pidLocation,pdteStart,pdteEnd,pstrTrnType)
+	}
+	quit fltQty
+]]></Implementation>
+</Method>
+
+<Method name="GetTrnQtyDateRangeUseT">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocation:alLOC.dLocation="&quot;,pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;,pstrTrnType:alSYS.dt.dtString="&quot;</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Gets the Transaction Qty based on Transactions for a given Start and End Dates
+	; for an Item & Location
+	; 
+	; pstrTrnType - comma seperated list of Transaction Types
+	; 
+	; TransactionType		TxnID
+	; ===========================
+	; SupplierReturn		1
+	; SupplierReceipt		2
+	; Sale					3
+	; CustReturns			4
+	; ManufacturingIssue	5
+	; ManufacturingReceipt	6
+	; TransferIssue			7
+	; TransferReceipt		8
+	; Adjustment			9
+	; InTransit				10
+	; 
+	; 
+	; ByRef :
+	; 	
+	; Returns: Qty - %Float
+	;
+	; History:
+	; 05-Apr-2011	shobby	SR17698: Don't include NonStock Transactions.
+	; 16-Apr-2009	PPP		SR16441: Created
+	;-------------------------------------------------------------------------------
+ 	if pdteEnd="" set pdteEnd = +$horolog
+ 
+	set fltQty     = 0	
+	set strTrnType = (","_pstrTrnType_",")
+    set pdteStart=+pdteStart  ;SR17698
+ 
+ 	if pstrTrnType = "" {
+		&SQL(
+			SELECT SUM(QtyMoved) 
+			INTO :fltQty
+			FROM alSOH.dStockHistory
+			WHERE 
+				Item = :pidItem                                   AND
+				(Location = :pidLocation OR :pidLocation is NULL) AND
+				DateConfirmed >= :pdteStart                       AND
+				DateConfirmed <= :pdteEnd
+				AND NonStock=0  
+		)
+
+	} else {
+		&SQL(
+			SELECT SUM(QtyMoved) 
+			INTO :fltQty
+			FROM alSOH.dStockHistory
+			WHERE 
+				Item = :pidItem                                   AND
+				(Location = :pidLocation OR :pidLocation is NULL) AND
+				DateConfirmed >= :pdteStart                       AND
+				DateConfirmed <= :pdteEnd                         AND
+				NonStock=0 AND
+				:strTrnType [ ("," || TxType || ",")
+		)
+	}
+	quit fltQty
+]]></Implementation>
+</Method>
+
+<Method name="GetInTransitDateRange">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocation:alLOC.dLocation="&quot;,pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Get InTransit Qty for an Item/Location/Date Range 
+	; 
+	; TransactionType		TxnID
+	; ===========================
+	; TransferInTransit		10
+	; 
+	; ByRef :
+	; 	
+	; Returns: %Float
+	;
+	; History:
+	; 16-Apr-2009	PPP		SR16441: Created
+	;-------------------------------------------------------------------------------
+	set fltQty = 0
+	
+	&SQL(
+		SELECT SUM(QtyMoved)
+		INTO :fltQty
+		FROM alSOH.dStockHistory
+		WHERE 
+			Item = :pidItem             AND
+			Location = :pidLocation     AND
+			DateConfirmed >= :pdteStart AND
+			DateConfirmed <= :pdteEnd   AND
+			TxType = 10
+	)
+	quit fltQty
+]]></Implementation>
+</Method>
+
+<Method name="GetConsumptionDateRange">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocation:alLOC.dLocation="&quot;,pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Gets the Consumption Qty for a given Start and End Dates and
+	; for an Item & Location
+	; 
+	; The following list of Transaction Types are used to calculate the 
+	; consumption qty
+	; 
+	; TransactionType		TxnID
+	; ===========================
+	; Sale					0
+	; Dispense Issue		21
+	; Dispense Return		22
+	; ManufacturingIssue	35
+	; ManufacturingReturn	37
+	; 
+	;24/09 - Not applicable with new changes
+	;But will deduct the Transfer Issue qty as a result of Stock Moves (5)
+	; 
+	; ByRef :
+	; 	
+	; Returns: Qty - %Float
+	;
+	; History:
+	; 24-Sep-2010	PPP		SR17562: New method of getting Consumption Qty
+	; 29-Oct-2009	PPP 	SR16991: Exclude Issues as a resultant of Moves
+	; 20-Apr-2009	PPP		SR16441: Created
+	;-------------------------------------------------------------------------------
+	//set fltCons = ..GetTrnQtyDateRangeUseP(pidItem, pidLocation, pdteStart, pdteEnd, "3,4,5,7")
+	//set fltMove = ..GetMoveIssueDateRange(pidItem, pidLocation, pdteStart, pdteEnd)
+	//quit (fltCons - fltMove)
+	
+	set strMovTypes = ##class(alSOH.iPeriodSubType).GetConsumptionTypes()
+	if strMovTypes = "" {
+		set strMovTypes = "0,21,22,35,37"
+	}
+	
+	quit ..GetConsumptionDateRangeUseP(pidItem, pidLocation, pdteStart, pdteEnd, strMovTypes)*-1
+]]></Implementation>
+</Method>
+
+<Method name="GetConsumptionDateRangeOld">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocation:alLOC.dLocation="&quot;,pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------- OLD METHOD ------------------------------------------
+	; Gets the Consumption Qty for a given Start and End Dates and
+	; for an Item & Location
+	; 
+	; But will deduct the Transfer Issue qty as a result of Stock Moves (5)
+	; 
+	; ByRef :
+	; 	
+	; Returns: Qty - %Float
+	;
+	; History:
+	; 24-Sep-2010	PPP		SR17562: Created
+	;-------------------------------------------------------------------------------
+	set fltCons = ..GetTrnQtyDateRangeUseP(pidItem, pidLocation, pdteStart, pdteEnd, "3,4,5,7")
+	set fltMove = ..GetMoveIssueDateRange(pidItem, pidLocation, pdteStart, pdteEnd)
+	quit (fltCons - fltMove)
+]]></Implementation>
+</Method>
+
+<Method name="GetLocListConsumption">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocations:alSYS.dt.dtString="&quot;,pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Gets the Consumption Qty for a given Start and End Dates and
+	; for an Item & a comma seperated Location List 	(1,5)
+	; 
+	; The following list of Transaction Types are used to calculate the 
+	; consumption qty
+	; 
+	; TransactionType		TxnID
+	; ===========================
+	; Sale					3
+	; CustReturns			4
+	; ManufacturingIssue	5
+	; TransferIssue			7
+	; 
+	; 
+	; ByRef :
+	; 	
+	; Returns: Qty - %Float
+	;
+	; History:
+	; 16-Dec-2010	PPP		SR17562: Updated with new method of getting Consumption Qty
+	; 30-Apr-2009	PPP		SR16441: Created
+	;-------------------------------------------------------------------------------
+	set fltQty = 0
+	
+	//SR17562
+	set strMovTypes = ##class(alSOH.iPeriodSubType).GetConsumptionTypes()
+	if strMovTypes = "" {
+		set strMovTypes = "0,21,22,35,37"
+	}
+		
+	for intCnt = 1:1:$length(pidLocations,",") {
+		set idLocn = $piece(pidLocations,",",intCnt)
+		//SR17562
+		//set fltQty = fltQty + ..GetTrnQtyDateRangeUseP(pidItem, idLocn, pdteStart, pdteEnd, "3,4,5,7")
+		set fltQty = fltQty + (..GetConsumptionDateRangeUseP(pidItem, idLocn, pdteStart, pdteEnd, strMovTypes)*-1)
+	}
+	
+	quit fltQty
+]]></Implementation>
+</Method>
+
+<Method name="GetAvgConsumption">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocation:alLOC.dLocation="&quot;,pintCycle:alSYS.dt.dtInteger=1,pintHistory:alSYS.dt.dtInteger=1</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Gets the Consumption Qty for a given
+	; -> Cycle 			1 - Monthly, 2 - Weekly, 3 - Quarterly, 4 - Half Yearly, 5 - Yearly
+	; -> History		No of Cycles
+	; for an Item & Location
+	; 
+	; The following list of Transaction Types are used to calculate the 
+	; consumption qty
+	; 
+	; TransactionType		TxnID
+	; ===========================
+	; Sale					3
+	; CustReturns			4
+	; ManufacturingIssue	5
+	; TransferIssue			7
+	; 
+	; 
+	; ByRef :
+	; 	
+	; Returns: Qty - %Float
+	;
+	; History:
+	; 16-Dec-2010	PPP		SR17562: Updated with new method of getting Consumption Qty
+	; 23-Aug-2010	GRF		SR16441: 3 months (90) per quarter not 4 (120)
+	; 20-Apr-2009	PPP		SR16441: Created
+	;-------------------------------------------------------------------------------
+
+	//SR17562
+	set strMovTypes = ##class(alSOH.iPeriodSubType).GetConsumptionTypes()
+	if strMovTypes = "" {
+		set strMovTypes = "0,21,22,35,37"
+	}
+
+	set fltQty = 0
+	;set intDays = $case(pintCycle,
+	;						1:30,
+	;						2:7,
+	;						3:120,
+	;						4:180,
+	;						5:365,
+	;						:1)
+	set intDays = $case(pintCycle,
+							1:30,
+							2:7,
+							3:90,
+							4:180,
+							5:365,
+							:1)
+	
+	for intCnt = 1:1:pintHistory {
+		set dteStart = ($horolog-1) - ((intCnt)*intDays) + 1
+		set dteEnd   = ($horolog-1) - ((intCnt-1)*intDays) 
+		//SR17562
+		//set fltCons  = ..GetTrnQtyDateRangeUseP(pidItem, pidLocation, dteStart, dteEnd, "3,4,5,7")
+		//write !,$zdt(dteStart,3),":",$zdt(dteEnd,3),":",fltCons
+		set fltCons  = (..GetConsumptionDateRangeUseP(pidItem, pidLocation, dteStart, dteEnd, strMovTypes)*-1)
+		set fltQty = fltQty + fltCons
+	}
+
+	quit $justify((fltQty/pintHistory),0,4)
+]]></Implementation>
+</Method>
+
+<Method name="GetQOH">
+<ClassMethod>1</ClassMethod>
+<CodeMode>expression</CodeMode>
+<FormalSpec>pidItem:alINV.dItem,pidLocn:alLOC.dLocation="&quot;</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[##class(alSOH.piSOHQty).GetQtyOnHand(pidItem,pidLocn,"",1)
+]]></Implementation>
+</Method>
+
+<Method name="GetMoveIssueDateRange">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocation:alLOC.dLocation="&quot;,pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Get Stock Movement Issue Qty for an Item/Location/Date Range 
+	; This qty is useful to calculate Consumptions (as movements are not consumptions)
+	; 
+	; TransactionType		TxnID
+	; ===========================
+	; TransferOut		7  (Movement Type = 5)
+	; 
+	; ByRef :
+	; 	
+	; Returns: %Float
+	;
+	; History:
+	; 29-Oct-2009	PPP		SR16991: Created
+	;-------------------------------------------------------------------------------
+	set fltQty = 0
+	
+	&SQL(
+		SELECT SUM(QtyMoved)
+		INTO :fltQty
+		FROM alSOH.dStockHistory
+		WHERE 
+			Item = :pidItem             AND
+			Location = :pidLocation     AND
+			DateConfirmed >= :pdteStart AND
+			DateConfirmed <= :pdteEnd   AND
+			TxType = 7                  AND
+			MovementType_MovementTypeId = 5
+	)
+	quit fltQty
+]]></Implementation>
+</Method>
+
+<Method name="GetStockForStorage">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidLocn:alSYS.dt.dtString,pidStorage:alSYS.dt.dtString,&amp;parrStock:alSYS.dt.dtString</FormalSpec>
+<ReturnType>alSYS.dt.dtStatus</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Get the Stock Listing for a given Storage 
+	; 
+	; 
+	; ByRef :parrStock - stock at a storage
+	; 	
+	; Returns: %Status
+	;
+	; History:
+	; 04-Dec-2009	PPP		SR17056: Added breakdown for Lot Number
+	; 25-Nov-2009	PPP		SR17056: Created
+	;-------------------------------------------------------------------------------
+	set sc = $$$YES
+	kill parrStock
+
+	set objStorage = ##class(alLOC.iLOC).GetStorage(pidLocn,pidStorage)
+
+	if objStorage'=$$$NULLOREF {
+		set rs     = ##class(%ResultSet).%New()
+		set strSQL = "SELECT Item, Bundle->LotNumber, QtyOnHand FROM alSOH.dBundleStock WHERE Storage = ?"
+	
+		set sc = rs.Prepare(strSQL)
+		if $$$ISOK(sc) {
+		
+			set sc = rs.Execute(objStorage.%Id())
+			if $$$ISOK(sc) {
+				for {
+					quit:'rs.Next()
+						
+					set strLot  = rs.Data("LotNumber")
+					set strItem = rs.Data("Item")_$select(strLot'="":":"_strLot,1:"")
+					set parrStock(strItem) = rs.Data("QtyOnHand")			
+				}
+			}
+		}
+	
+	} else {
+		set sc = $$$ERROR($$$GeneralError,$$$Text("IN00447"))   ; "Invalid Storage"
+	}
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="GetQtyPlanned">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocn:alSYS.dt.dtString,pidStorage:alSYS.dt.dtString,pidBundle:alSOH.dBundle</FormalSpec>
+<ReturnType>alSYS.dt.dtFloat</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Arguments:
+	; 	pidItem		dItem.%Id()
+	; 	pidLocn		dLocation.%Id()
+	; 	pidStore	dStorage.%Id()
+	; 	pidBundle	dBundle.%Id()
+	;
+	; Returns: 
+	; 	Quantity planned for this dBundleStock
+	; 
+	; History:
+	; 28-May-2013	SCR		CORE-94: Bug Fix
+	; 16-Mar-2010	PPP		SR17237: Created
+	;-------------------------------------------------------------------------------
+	set fltQtyPlanned = 0
+	&sql(
+		SELECT SUM(IFNULL(QtyRequired,0,QtyRequired))
+		INTO :fltQtyPlanned 
+		FROM alDRP.dPlannedMovement
+		WHERE
+			Item=:pidItem                  AND
+			FromStorage->Location=:pidLocn AND
+			FromStorage=:pidStorage        AND
+			Bundle=:pidBundle
+	)
+	quit fltQtyPlanned
+]]></Implementation>
+</Method>
+
+<Method name="GetConsumptionDateRangeUseP">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocation:alLOC.dLocation="&quot;,pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;,pstrMovTrnType:alSYS.dt.dtString="0,21,22,35,37"</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Gets the Consumption Qty based on Active Periods for a given Start and End Dates
+	; for an Item & Location-based on PEriod Balance Information and Stock Transactions
+	; 
+	; pstrMovTrnType - comma seperated list of Movement Transaction Types
+	; if pstrMovTrnType is blank or no input it defaults to the following Transactions
+	; 
+	; TransactionType		TxnID
+	; ===========================
+	; Sale					0
+	; Dispense Issue		21
+	; Dispense Return		22
+	; ManufacturingIssue	35
+	; ManufacturingReturn	37
+	; 
+	; ByRef :
+	; 	
+	; Returns: Qty - %Float
+	;
+	; History:
+	; 22-Oct-2010	PPP		SR17562/2: Removed duplicate SQL set block
+	;						Id no end date, has to inculide
+	; 24-Sep-2010	PPP		SR17562: Created
+	;-------------------------------------------------------------------------------
+ 	set blnWrite = $$$NO
+ 	
+ 	if pdteEnd="" set pdteEnd = $horolog+1		//SR17562:2
+	
+	do ..GetPeriods(pdteStart,pdteEnd,.arrPeriod,.idPT)
+	
+	set fltQty = 0
+	
+	if $data(arrPeriod) {
+		set (dteFinalStart,dteFinalEnd) = ""
+		
+		set idPeriodSort = ""
+		for {
+			set idPeriodSort = $order(arrPeriod(idPT,idPeriodSort))
+			quit:idPeriodSort=""
+			
+			set strData  = $get(arrPeriod(idPT,idPeriodSort))
+			set dteStart = $piece(strData,"|",1)
+			set dteEnd   = $piece(strData,"|",2)
+			set idPeriod = idPeriodSort
+			
+			if (dteFinalStart="") || (dteStart<dteFinalStart) {
+				set dteFinalStart = dteStart
+			}
+			if (dteFinalEnd="") || (dteEnd>dteFinalEnd) {
+				set dteFinalEnd = dteEnd
+			}
+
+			set objResultSet = ##class(%Library.ResultSet).%New()
+			
+			//SR17562/2
+			set strSQL = "SELECT QtyNonStockIn, QtyNonStockOut, QtySubType_Consumption FROM alSOH.dPeriodBalance"
+			if pidLocation = "" {
+				set strSQL = strSQL _ " WHERE Item = ? AND SOHPeriod = ?"
+				set sc = objResultSet.Prepare(strSQL)
+			
+			} else {
+				set strSQL = strSQL _ " WHERE Item = ? AND Location = ? AND SOHPeriod = ?"
+				set sc = objResultSet.Prepare(strSQL)
+			}
+	
+			if $$$ISOK(sc) {
+			
+				if pidLocation = "" {
+					set sc = objResultSet.Execute(pidItem,idPeriod) 
+				} else {
+					set sc = objResultSet.Execute(pidItem,pidLocation,idPeriod)
+				}
+
+				if $$$ISOK(sc) {
+					while objResultSet.Next(.sc) {
+						set fltQty = fltQty + objResultSet.Data("QtyNonStockIn")
+											+ objResultSet.Data("QtyNonStockOut")
+											+ objResultSet.Data("QtySubType_Consumption")
+
+						write:blnWrite !,pidItem_":"_pidLocation_":"_idPeriod,":",dteStart,"->",dteEnd," SQL:"_sc_" Qty:"_fltQty
+	 
+					}  //End while
+				}  //End ISOK
+			}  //End for Period Types
+		}  //End if arrPeriod
+		
+		// Get the Transactions Qty for the remaining dates not catered for by the Period Totals using the Transactions themselves
+		if dteFinalStart>pdteStart {
+			set fltQtyB = +fltQty
+			set fltQty  = fltQty + ..GetConsumptionDateRangeUseT(pidItem,pidLocation,pdteStart,(dteFinalStart-1),pstrMovTrnType)
+			write:blnWrite !,"Start Trn : ",pdteStart,"->",(dteFinalStart-1)," # "_fltQtyB_"="_fltQty,!
+		}
+	
+		if dteFinalEnd<pdteEnd {
+			set fltQtyB = +fltQty
+			set fltQty  = fltQty + ..GetConsumptionDateRangeUseT(pidItem,pidLocation,(dteFinalEnd+1),pdteEnd,pstrMovTrnType)
+			write:blnWrite !,"End Trn : ",(dteFinalEnd+1),"->",pdteEnd," # "_fltQtyB_"="_fltQty,!
+		}
+	
+	} else {
+		write:blnWrite !,"Only Trn : ",pdteStart,"->",pdteEnd,!
+		set fltQty = +..GetConsumptionDateRangeUseT(pidItem,pidLocation,pdteStart,pdteEnd,pstrMovTrnType)
+	}
+	
+	quit fltQty
+]]></Implementation>
+</Method>
+
+<Method name="GetConsumptionDateRangeUseT">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:alINV.dItem,pidLocation:alLOC.dLocation="&quot;,pdteStart:alSYS.dt.dtDate="&quot;,pdteEnd:alSYS.dt.dtDate="&quot;,pstrMovTrnType:alSYS.dt.dtString="0,21,22,35,37"</FormalSpec>
+<ReturnType>%Float</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Gets the Consumption Qty
+	;
+	; Based on Transactions for a given Start and End Dates for an Item & Location 
+	; Trn Qty + Non Stock Qty
+	; 
+	; 
+	; pstrTrnType - comma seperated list of Transaction Types
+	; 
+	; if pstrMovTrnType is blank or no input it defaults to the following Transactions
+	; 
+	; TransactionType		TxnID
+	; ===========================
+	; Sale					0
+	; Dispense Issue		21
+	; Dispense Return		22
+	; ManufacturingIssue	35
+	; ManufacturingReturn	37
+	; 
+	; 
+	; ByRef :
+	; 	
+	; Returns: Qty - %Float
+	;
+	; History:
+	; 24-Sep-2010	PPP		SR17562: Created
+	;-------------------------------------------------------------------------------
+ 	if pdteEnd="" set pdteEnd = +$horolog
+ 
+	set fltQty     = 0	
+	set strTrnType = (","_pstrMovTrnType_",")
+ 
+ 	if pstrMovTrnType = "" {
+		&SQL(
+			SELECT SUM(QtyMoved) 
+			INTO :fltQty
+			FROM alSOH.dStockHistory
+			WHERE 
+				Item = :pidItem                                   AND
+				(Location = :pidLocation OR :pidLocation is NULL) AND
+				DateConfirmed >= :pdteStart                       AND
+				DateConfirmed <= :pdteEnd
+		)
+
+	} else {
+		&SQL(
+			SELECT SUM(QtyMoved) 
+			INTO :fltQty
+			FROM alSOH.dStockHistory
+			WHERE 
+				Item = :pidItem                                   AND
+				(Location = :pidLocation OR :pidLocation is NULL) AND
+				DateConfirmed >= :pdteStart                       AND
+				DateConfirmed <= :pdteEnd                         AND
+				:strTrnType [ ("," || MovementType_MovementTypeId || ",")
+		)
+	}
+	
+	//Non Stock Qty
+	&SQL(
+		SELECT SUM(QtyMoved) 
+		INTO :fltQtyNoStock
+		FROM alSOH.dStockHistory
+		WHERE 
+			Item = :pidItem                                   AND
+			(Location = :pidLocation OR :pidLocation is NULL) AND
+			DateConfirmed >= :pdteStart                       AND
+			DateConfirmed <= :pdteEnd                         AND
+			NonStock = 1
+	)
+	
+	
+	quit (fltQty+fltQtyNoStock)
+]]></Implementation>
+</Method>
+<UDLText name="T">
+<Content>
+// End of Class
+
+</Content>
+</UDLText>
+</Class>
+</Export>

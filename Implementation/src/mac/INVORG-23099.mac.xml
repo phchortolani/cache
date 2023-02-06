@@ -1,0 +1,406 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INVORG" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INVORG
+	
+#include INConst
+#include COMSYS
+	;-------------------------------------------------------------------------------
+	; 09-Feb-2010	shobby	SR17138.3 (Class/Form INVORG changed) - Do not remove comment
+	; 17-Mar-2008	shobby	BR014772  (Class/Form INVORG changed) - Do not remove comment
+	;-------------------------------------------------------------------------------
+	
+Get()
+	;-------------------------------------------------------------------------------
+	; Public method to get the INVORG record
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Nov-2009	shobby	SRAdhoc	  : Use YM,YM not 0,0
+	; 06-Nov-2007	shobby	SRBR014764: Created
+	;-------------------------------------------------------------------------------
+	quit $get(^INVORG(YM,YM,1))
+	
+	
+DisableProgramFunctionality()		;SR17034
+	quit $$$INVORGDisableProgramFunctiona($$Get())
+	
+	
+PickMoreThanTransfer() quit $$$INVORGPickMoreThanTransfer($$Get())	;SR17729
+	
+	
+OnBeforeSave()
+    ;-------------------------------------------------------------------------------
+    ; Prevent save if any of the day offsets are negative
+    ; 
+    ; If we can access the stock from other locations, we must be able to see the
+    ; stock from these locations as well
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 28-Oct-2008	GRF		SR16028: DecomposeStatus is redundant; Once a Default
+    ; 							Group has been specified it cannot be deleted
+    ; 							(changes are permitted).
+    ; 15-Nov-2007	shobby	SRBR014765:Validate stocktake counts. 
+	; 12-Jan-2007	PO		SR15344: Validation added
+    ; 09-Jun-2005	GRF		$$$INVORGAccessOtherItemLocns - name updated
+    ; 31-May-2005	RPW		Created SR11649
+    ;-------------------------------------------------------------------------------
+	new idField,strStatus
+	
+	set strStatus = $$$OK
+ 	
+ 	if ($$$INVORGStocktakeMinCount(YFELD)>$$$INVORGStocktakeMaxCount(YFELD)) && ($$$INVORGStocktakeMaxCount(YFELD)'="") {
+ 		set strStatus=$$$MakeStatus("IN00793")  ; "Minimum count must be less than maximum count."
+ 		
+ 	} elseif ($$$INVORGStocktakeMinCount(YFELD)<1) && ($$$INVORGStocktakeMinCount(YFELD)'="") {
+	 	set strStatus=$$$MakeStatus("IN00794")  ; "Minimum count if specified must be at least 1."
+	 	
+ 	} elseif ($$$INVORGStocktakeMaxCount(YFELD)<1) && ($$$INVORGStocktakeMaxCount(YFELD)'="") {
+	 	set strStatus=$$$MakeStatus("IN00795")  ; "Maximum count if specified must be at least 1."
+ 	}
+ 	
+ 	; If allowed the more restrictive access, ensure the less restrictive is available
+	if $$$INVORGAccessOtherItemLocns(YFELD)=$$$YES {
+		set $$$INVORGViewStockFromAllLocations(YFELD)=$$$YES
+	}
+	
+	for idField = $$$FldINVORGFirm,$$$FldINVORGSource,$$$FldINVORGRaise,$$$FldINVORGPlace,$$$FldINVORGConfirm,$$$FldINVORGSupplier {
+		if $piece(YFELD,Y,idField) < 0 {
+			set strStatus = $$$MakeStatus("IN00638",$$^WWWFELDNAME(YFORM,"D",idField))
+			quit
+		}    ; "%1 number of days must be greater than or equal to zero."
+	}
+	
+	; SR16028
+	if $$$ISOK(strStatus) && ($$$INVORGDefaultItemGroup(YFELD)="") {
+		if $$$INVORGDefaultItemGroup($get(^INVORG(0,0,1)))'="" {
+			set strStatus = $$$MakeStatus("IN00766")       ; "Can not delete the Default Item Group once set"
+		}
+	}
+	if $$$ISERR(strStatus) {
+	;	$$$DecomposeStatus(strStatus)
+		$$$Alert(strStatus)
+		set Q = $$$QDontSave
+	}
+	quit
+	
+	
+DPforInventoryCost() 
+	;-------------------------------------------------------------------------------
+	; Return the number of Decimal Places to be used for Inventory Cost fields.
+	;    See also - logic in common function : GetDecimalPlaces^COMUtilNum
+	; 
+	; Returns: Number of Decimal Places
+	;
+	; History:
+	; 01-Jun-2009	GRF		SR16588: Only provide default DP if not set - may want 0
+	; 24-Oct-2005	PO		SR13702: Created
+	;-------------------------------------------------------------------------------
+	new intNumberOfDP
+	
+	set intNumberOfDP = $$$INVORGDecimalpointsforinventory($get(^INVORG(0,0,1)))
+	if intNumberOfDP="" set intNumberOfDP = 4
+	quit intNumberOfDP
+	
+	
+PopulateINVORGLANG(pstrLang="EN")
+	;-------------------------------------------------------------------------------
+	; Copies INVORG fields to INVORGLANG for one language
+	;
+	; Params:	pstrLang - language to copy to
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 28-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new objINVORG,objINVORGLANG,strStatus,YM
+	
+	set strStatus = $$$OK
+	
+	set YM = ""
+	for {
+		set YM = $order(^INVORG(YM))
+		quit:YM=""
+		
+		set objINVORG     = $get(^INVORG(0,0,1))
+		set objINVORGLANG = $$$INVORGTextWithinManifest(objINVORG)_"~"_$$$INVORGTextAfterPickList(objINVORG)_"~"_$$$INVORGAfterTextInternalDelivery(objINVORG)_"~"_$$$INVORGTextforEmailReminder(objINVORG)
+		set strStatus = $$$Save("INVORGLANG",YM_","_pstrLang,objINVORGLANG)
+		
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+	
+OnAfterSave()
+	;-------------------------------------------------------------------------------
+	; - Create Delete Storage for all locations
+	; - Refresh Item Groups if default Item Group is changed.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+    ; 21-Oct-2008	HQN		SR16028: Update V1.5 Default ItemGroup
+	; 26-Oct-2007	GRF		SR15563: explicitly pass YM to DeleteStockLoc
+	; 28-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new idLocn,objUItemGroup,sc
+	
+	set idLocn=""
+	for {
+		set idLocn=$order(^WWW0121(0,0,idLocn))
+		quit:idLocn=""
+		
+		do CreateDeleteStockLoc^WWW0121(0,idLocn)
+	}
+	
+	if $$$INVORGDefaultItemGroup($get(YFELD))'="" {       ; SR16028
+		set objUItemGroup = ##class(alINV.dUItemGroup).%OpenId("0||"_$$$INVORGDefaultItemGroup($get(YFELD)),4,.sc)
+		if $$$ISOK(sc) {
+			set objUItemGroup.IsDefault = $$$YES
+			set sc = objUItemGroup.%Save()
+		}
+	}
+	quit
+	
+	
+HideCustoms()
+	;-------------------------------------------------------------------------------
+	; Determines whether or not we are hiding customs information.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Oct-2006	Steve S	SRBR014280: Created
+	;-------------------------------------------------------------------------------
+	quit +$$$INVORGHideCustomsInformation($get(^INVORG(0,0,1)))
+	
+	
+SetEnablePricePlan(pidCompany,pblnEnable)
+	;-------------------------------------------------------------------------------
+	; Set the price plan checkbox. Called from terminal for testing purposes only
+	; until Price Plan is fully functional.
+	;
+	; Params:	pidCompany - company id
+	; 			pblnChecked - whether to check/uncheck  - defaults to uncheck
+	;
+	; Returns:	status
+	;
+	; History:
+	; 15-Jan-2007	JW		SR15274: Created
+	;-------------------------------------------------------------------------------
+	new objINVORG,strMessage,strStatus,YM
+	
+	quit:($get(pidCompany)="") "Please enter a valid company id"     ; FIXME : WWW009 text (preset SPRACHE) <GRF>
+	quit:('$data(^WWW012(0,pidCompany))) "Please enter a valid company id"
+	
+	quit:($IO'["|TNT|")||($IO'["|TRM|") "This must be run from either Terminal or Telnet"
+	
+	$$$VAR
+	set YM = pidCompany
+	
+	set pblnEnable = $select($get(pblnEnable):$$$YES,1:$$$NO)
+	
+	set objINVORG = $get(^INVORG(0,0,1))
+	
+	if $$$INVORGPricePlan(objINVORG) && pblnEnable {
+		set strMessage = "Price plan already enabled."
+		
+	} elseif '$$$INVORGPricePlan(objINVORG) && 'pblnEnable {
+		set strMessage = "Price plan already disabled."
+		
+	} else {
+		set $$$INVORGPricePlan(objINVORG) = pblnEnable
+		set strStatus = $$$Save("INVORG",0,objINVORG,$$$YES)
+		if $$$ISOK(strStatus) {
+			set strMessage = "Price plan now "_$select(pblnEnable:"enabled",1:"disabled")_"."
+		} else {
+			set strMessage = "Error while updating: "_$$$Text(strStatus)
+		}
+	}
+	
+	quit strMessage
+	
+	
+OnAfterDataFields()
+	;-------------------------------------------------------------------------------
+	; Add an event on the INVORG form.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 24-May-2007	Frank	SRBR14442: Created
+	;-------------------------------------------------------------------------------
+	if YSEITE = 2 {
+		do InitConsumptionFields()
+	}
+	quit
+	
+	
+InitConsumptionFields()
+	;-------------------------------------------------------------------------------
+	; Add some behaviour to the consumption fields. If Period type is neither month-specific
+	; not quarter-specific, the field 'Historical Month/Quarter' should be disabled.
+	; If Period Type is Month-Specific the field will be filled with the months of the year,
+	; and if Period Type is Quarter-Specific the field will be filled with the quarters
+	; of the year.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Jun-2009	GRF		Remove order macros; consistancy with other subr.
+	; 24-May-2007	Frank	SRBR14442: Created
+	;-------------------------------------------------------------------------------
+	new idMonth,idQuarter,idx1,idx2,intPeriodType,intMonthQuarter
+	new lstMonths,lstQuarters,objMonth,objQuarter,objINVORG
+ 
+	set objINVORG    = $get(^INVORG(0,0,1))	
+	set intPeriodType   = +$$$INVORGHistoricalPeriodType(objINVORG)
+	set intMonthQuarter = +$$$INVORGHistoricalMonthQuarter(objINVORG)
+	set lstMonths   = ""
+	set lstQuarters = ""
+	
+	// Loading months.
+	set idMonth = ""
+	for {
+		set idMonth   = $order(^WWW101(0,"COMMONTHSOFYEAR",SPRACHE,idMonth))
+		quit:idMonth=""
+		
+		set objMonth  = $get(^WWW101(0, "COMMONTHSOFYEAR", SPRACHE, idMonth, 1))
+		set lstMonths = lstMonths_$listbuild($$$WWW101Text(objMonth))
+	}
+	
+	// Loading quarters.
+	set idQuarter = ""
+	for {
+		set idQuarter = $order(^WWW101(0,"COMQUARTER",SPRACHE,idQuarter))
+		quit:idQuarter=""
+	
+		set objQuarter = $get(^WWW101(0, "COMQUARTER", SPRACHE, idQuarter, 1))
+		set lstQuarters = lstQuarters_$listbuild($$$WWW101Text(objQuarter))
+	}
+ 
+	write "<script language=""Javascript"">",!
+	&html<
+		arrMonths = new Array();
+		arrQuarters = new Array();
+		function initConsumptionFields() {
+	>
+	for idx1 = 1 : 1 : $listlength(lstMonths) {
+		&html<	arrMonths[arrMonths.length] = '#($list(lstMonths, idx1))#';>
+	}
+	
+	for idx2 = 1 : 1 : $listlength(lstQuarters) {
+		&html<	arrQuarters[arrQuarters.length] = '#($list(lstQuarters, idx2))#';>
+	}
+ 
+	&html<
+			checkPeriodType();
+		}
+		function checkPeriodType() {
+			if (WWW2.YINVORGD233.selectedIndex == #($$$EnumINHISTORICALPERIODTYPEMonthSpecific)#) {
+				setMonth();
+			} else if (WWW2.YINVORGD233.selectedIndex == #($$$EnumINHISTORICALPERIODTYPEQuarterSpecific)#) {
+				setQuarter();
+			} else {
+				disableMonthQuarter();
+			}
+		}
+		
+		function disableMonthQuarter() {
+			clearMonthQuarter();
+			WWW2.YINVORGD235.disabled = true;
+		}
+		
+		function clearMonthQuarter() {
+	>
+	write "			for (var idx = WWW2.YINVORGD235.length - 1; idx >= 0; idx--) {",!
+	&html<		WWW2.YINVORGD235.options[idx] = null;
+			}		
+		}
+		
+		function setMonth() {
+			clearMonthQuarter();
+			WWW2.YINVORGD235.options[0] = new Option(" ", 0);
+	>
+			
+	write "		for (var idx = 1; idx <= arrMonths.length; idx++) { "
+	&html<
+					WWW2.YINVORGD235.options[idx] = new Option(arrMonths[idx - 1], idx);
+					WWW2.YINVORGD235.disabled = false;
+				}
+		}
+		
+		function setQuarter() {
+			clearMonthQuarter();
+			WWW2.YINVORGD235.options[0] = new Option(" ", 0);
+	>
+			
+	write "		for (var idx = 1; idx <= arrQuarters.length; idx++) { "
+	&html<
+					WWW2.YINVORGD235.options[idx] = new Option(arrQuarters[idx - 1], idx);
+					WWW2.YINVORGD235.disabled = false;
+				}
+		}
+		initConsumptionFields();
+		if ((#(intPeriodType)# == #($$$EnumINHISTORICALPERIODTYPEMonthSpecific)#) || 
+			(#(intPeriodType)# == #($$$EnumINHISTORICALPERIODTYPEQuarterSpecific)#)) {
+				
+			WWW2.YINVORGD235.selectedIndex = #(intMonthQuarter)#;	
+		}
+		WWW2.YINVORGD233.onchange = checkPeriodType;
+		</script>
+	>
+	quit
+
+CustomerVendorLanguage()
+	;-------------------------------------------------------------------------------
+	;
+	; History:
+	; 23-Jun-2014	shobby	CORE:385.18		Moved from WWWLANGU
+	;-------------------------------------------------------------------------------
+	IF $GET(YM)'="" IF $GET(YBED)'="" IF $DATA(^INVORG(YM,YM,1)) IF $$$INVORGCustomerVendorAsUsers($get(^INVORG(YM,YM,1)))=YBED DO
+	. SET SPRACHE(1)=$$PROPGET^WWWAMVAR($GET(YUSER),"SPRACHE")
+	. IF SPRACHE(1)'=""  SET SPRACHE=SPRACHE(1)  QUIT
+	. IF $GET(%("%KEY","SPRACHE"))'="" SET SPRACHE=%("%KEY","SPRACHE")
+	quit
+
+AutoReminderEmail()
+	;-------------------------------------------------------------------------------
+	;
+	; History:
+	; 23-Jun-2014	shobby	CORE:385.18		Moved from WWWWVMAIL
+	;-------------------------------------------------------------------------------
+	quit $$$INVORGAutoReminderEMail($get(^INVORG(YM,YM,1)))
+	
+	
+LANGTextForEMailReminder()
+	;-------------------------------------------------------------------------------
+	;
+	; History:
+	; 23-Jun-2014	shobby	CORE:385.18		Moved from WWWWVMAIL
+	;-------------------------------------------------------------------------------
+	quit $$$INVORGLANGTextForEMailReminder($get(^INVORGLANG(YM,YM,SPRACHE,1)))
+
+	
+]]></Routine>
+</Export>

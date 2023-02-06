@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alREC.dUReceipt">
+<ClassType>persistent</ClassType>
+<IncludeCode>INConst,COMSYS</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>User.INREC</Super>
+
+<Property name="Location">
+<Description><![CDATA[
+Location]]></Description>
+<Type>%String</Type>
+
+<Parameter name="CAPTION" value="Location"/>
+
+<Parameter name="MAXLEN" value="30"/>
+</Property>
+
+
+<Property name="ReceiptLines">
+<Type>alREC.dUReceiptLine</Type>
+<Collection>list</Collection>
+<Transient>1</Transient>
+
+<Parameter name="CAPTION" value="AL00257"/>
+</Property>
+
+
+<Property name="ReceiptNumber">
+<Description><![CDATA[
+Receipt Number]]></Description>
+<Type>%String</Type>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="Receipt Number"/>
+
+<Parameter name="COLLATION" value="EXACT"/>
+
+<Parameter name="XMLPROJECTION" value="attribute"/>
+</Property>
+
+
+<Property name="ShippingCondition">
+<Description><![CDATA[
+Shipping Condition]]></Description>
+<Type>%String</Type>
+<InitialExpression>"0&quot;</InitialExpression>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="Shipping Condition"/>
+
+<Parameter name="MAXLEN" value="30"/>
+</Property>
+
+
+<Property name="ProcessedBy">
+<Description><![CDATA[
+Processed By]]></Description>
+<Type>%String</Type>
+
+<Parameter name="CAPTION" value="Processed By"/>
+
+<Parameter name="MAXLEN" value="30"/>
+</Property>
+
+
+<Property name="ProcessedDate">
+<Description><![CDATA[
+Processed Date]]></Description>
+<Type>WWW.DiscTimestamp</Type>
+
+<Parameter name="CAPTION" value="Processed Date"/>
+</Property>
+
+
+<Property name="Status">
+<Description><![CDATA[
+Status]]></Description>
+<Type>%String</Type>
+
+<Parameter name="CAPTION" value="Status"/>
+
+<Parameter name="MAXLEN" value="30"/>
+</Property>
+
+<UDLText name="T">
+<Content>
+//++++++++++++++++++++++++++++++++++++++++++
+
+</Content>
+</UDLText>
+
+
+<Method name="%OnOpen">
+<Description><![CDATA[
+This callback method is invoked by the <METHOD>%Open</METHOD> method to 
+provide notification that the object specified by <VAR>oid</VAR> is being opened.
+
+<P>If this method returns an error then the object will not be opened.]]></Description>
+<Private>1</Private>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	/*------------------------------------------------------------------------------
+	; History: 
+	; 31-Jul-2008	HQN SR15823: Use InsertObjectId to utilise object swizzling instead of direct load
+	; 18-Mar-2008	HQN	SR15640: Created
+	;-----------------------------------------------------------------------------*/
+	set blnIsModified = %this.%IsModified()
+	set objResultSet = ##class(%Library.ResultSet).%New("alREC.dUReceiptLine:GetViaReceipt")
+	if objResultSet.Execute(%this.ReceiptNumber) {
+		while objResultSet.Next() {
+			//set objReceiptLine = ##class(alREC.dUReceiptLine).%OpenId(objResultSet.Data("ID"))
+			do %this.ReceiptLines.InsertObjectId(objResultSet.Data("ID"))
+		}
+	}
+	do %this.%SetModified(blnIsModified)
+	
+	quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="OnReceive">
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Synchronises V2 Object and fires a state change to received
+	;
+	; History:
+	; 31-Jul-2008	HQN		SR15815: Remove call to dReceipt, V2 no longer used
+	; 							Lock Receipt Atomically
+	; 16-Jul-2008   Luke    SR15800: Add check if the Conversion has been run
+	; 26-Mar-2008	HQN		SR15640: Corrected Convert on save pid
+	; 18-Mar-2008	HQN		SR15640: Moved logic from INREC.mac to here
+	;-------------------------------------------------------------------------------
+	set sc = %this.%UpgradeConcurrency(4)
+	; Synch V2 object
+	set:$$$ISOK(sc) sc = %this.ConvertOnSave(%this.ReceiptNumber)
+	; Additional processing, status doesn't reflect quantities...
+	; partials aren't validated
+	
+	if $$$ISOK(sc) { 
+		; SR15815 vvvv
+		for loopLines=1:1:%this.ReceiptLines.Count() {
+			set objReceiptLine = %this.ReceiptLines.GetAt(loopLines)
+			set scLine = objReceiptLine.OnReceive()
+			set:$$$ISERR(scLine) sc = $$$ADDSC(sc,scLine)
+		}
+		
+		/*set objReceipt = ##class(alREC.dReceipt).%OpenId(%this.ReceiptNumber)
+		set sc = objReceipt.ChangeState(2)*/
+		; SR15815 ^^^^
+	}
+	if $$$ISOK(sc) {
+		// Update Status of this record
+		set %this.ProcessedDate = $horolog
+		set %this.ProcessedBy   = $get(YBED,"UNKNOWN")
+		set %this.Status        = "1" // Processed
+
+		set sc = %this.%Save()
+		do %this.%DowngradeConcurrency(0)
+	}
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="ConvertOnSave">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pKey:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Updates V2 Object
+	;
+	; History:
+	; 09-Sep-2008 	Luke	SR15897 Reverted SR15800:
+	; 17-Jul-2008   Luke    SR15800: Add check if the Conversion has been run
+	; 03-Apr-2008	PPP		SR15640: Only if Receive Type = 2 (Supplier Receipt)
+	; 18-Mar-2008	HQN		SR15640: Created
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+	//if ($g(^SysSetup("V2Convert"))= $$$YES) {  ///SR15800   SR15897
+		
+		set objUReceipt = ##class(alREC.dUReceipt).%OpenId("0||"_pKey)
+		if objUReceipt '= $$$NULLOREF {
+	
+			if objUReceipt.Type = 2 {			; Supplier Receipt Only
+				set objReceipt = ##class(alREC.dReceipt).%OpenId(objUReceipt.ReceiptNumber)
+				set:(objReceipt = $$$NULLOREF) objReceipt = ##class(alREC.dReceipt).%New()
+				set objReceipt.ReceiptNumber = objUReceipt.ReceiptNumber
+				
+				set objDULocation = objUReceipt.Location
+				set objLocation = ##class(alLOC.dLocation).%OpenId(objUReceipt.Location.Location)
+				set objReceipt.Location = objLocation
+				
+				set objStorage = ##class(alLOC.dStorage).%OpenId(objUReceipt.Location_"||"_objUReceipt.StockLocation)
+				set:(objStorage = $$$NULLOREF) objStorage = objDULocation.GetDefaultReceiptStorage()
+				
+				set sc = objReceipt.%Save() ; Child ConvertOnSave requires persistent ID
+				if $$$ISOK(sc) {
+					for loopLines=1:1:objUReceipt.ReceiptLines.Count() {
+						set objUReceiptLine = objUReceipt.ReceiptLines.GetAt(loopLines)
+						set sc = objUReceiptLine.ConvertOnSave(objUReceiptLine.ReceiptNumber_"||"_objUReceiptLine.LineNumber)
+						quit:$$$ISERR(sc)
+					}
+				}
+			}
+		}
+	/*} else {
+		set strMessage = $$$Text("alSYS00018")      ; "This movement is already completed."
+		set sc =$$$ERROR($$$GeneralError,strMessage)
+		///set sc = $$$MakeStatus("alSYS00018") ;   ///SR15800
+	}*/
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="LocationGet">
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit ##class(alLOC.dULocation).%OpenId("0||"_i%Location)
+]]></Implementation>
+</Method>
+
+<Method name="ConvertOnDelete">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidKey:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; History:
+	; 27-Mar-2008	HQN		SR15640: Delete V2 if exists
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+	set objReceipt = ##class(alREC.dReceipt).%OpenId(pidKey)
+	if objReceipt '= $$$NULLOREF {
+		set sc = objReceipt.%Delete(objReceipt.%Oid())
+	}
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="StorageAtNet">
+<Type>%Library.CacheSQLStorage</Type>
+</Storage>
+</Class>
+</Export>

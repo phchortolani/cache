@@ -1,0 +1,580 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INAUFTEILEKOST" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INAUFTEILEKOST(AUF,POS) ;INAUFTEILEKOST;FIS;NEURECHNEN UNTERTEILE SELBSTKOSTEN;21.02.2002
+#include COMSYS
+#include INConst
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		NEURECHNEN UNTERTEILE SELBSTKOSTEN
+	;       RE-CALCULATE COMPONENTS SELF COST
+	;
+	; Inputs : 
+	;
+	;
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 31-Jul-2006	GRF		Doco; Quits; Boolean MAcro
+	; 18-Aug-2005	FIS		SR13183 : CUMULATE SERVICE COSTS; POSTED VALUES
+	; 						(MATERIAL, OVERHEAD, SERVICE, OVERHEAD, OCR)
+	; 17-Aug-2005	GRF		SR13215 : ServiceOverhead
+	; 08-Aug-2005	GRF		SR13142 : use /3600
+	; 30-Jun-2005	GRF		SR12839 : Wrong location being recorded for "OCR" tx.
+	; 21.02.2002	FIS
+	;-------------------------------------------------------------------------------
+	NEW objOrderLine,SATZ,TEIL,YEBENE
+	
+	SET $ZTRAP="^WWWERROR"
+	
+	; Order & Line
+	SET AUF=$GET(AUF)			QUIT:AUF=""
+	SET POS=$GET(POS)			QUIT:POS=""
+	QUIT:'$DATA(^INAUFP(YM,AUF,POS))
+	QUIT:'$DATA(^INAUFPXL(YM,AUF,POS))
+	
+	set objOrderLine= $get(^INAUFP(YM,AUF,POS,1))
+	quit:$$$INAUFPSource(objOrderLine)'=3                    ;KEINE FERTIGUNG ;not manufacture 
+	quit:$$$INAUFPItemNumber(objOrderLine)=""                ;KEIN ARTIKEL    ;no item 
+	if $$$INAUFPReadyForDelivery(objOrderLine)'=$$$YES quit  ;NICHT AUSLIEFERFÄHIG = NOCH NICHT GEFERTIGT !! ;Not yet ready
+	
+	KILL ^WWWSOR(YUSER)
+	DO EBENE        ;ZERLEGEN UNTERTEILE IN EBENEN ;dissect within 
+	DO KALK         ;NEURECHNEN HERSTELLKOSTEN AUS MATERIAL UND LEISTUNG ;out of material And performance 
+	KILL ^WWWSOR(YUSER)
+	QUIT
+	
+EBENE
+	;-------------------------------------------------------------------------------
+	;	ZERLEGEN UNTERTEILE IN EBENEN ;dissect within level
+	; 
+	; History :
+	; 30-Jun-2005	GRF		SR12839 : $DATA test should be (1 or 11) not (10 or 11)
+	; 						- will give undefined error without $get if 10
+	;-------------------------------------------------------------------------------
+	NEW SUCH,TEIL
+	
+	;HAUPTTEIL
+	SET ^WWWSOR(YUSER,1,AUF,POS,"1","0")=objOrderLine  ;HAUPTTEIL=EBENE 1
+	
+	;UNTERTEILE
+	SET SUCH="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS_")"
+	FOR  DO  QUIT:SUCH=""
+	. SET SUCH=$QUERY(@SUCH)
+	. IF $TRANSLATE($PIECE(SUCH,",",2),$$$DBLQUOTE)'=AUF SET SUCH="" QUIT  ;21.06.04;FAN;25794; WENN alphanumerischen Auftragsnummern SOLL DATEN AUCH AUFBAUEN.
+	. ;IF $PIECE(SUCH,",",2)'=AUF SET SUCH="" QUIT  ;21.06.04;FAN;25794;  ;FALSCHER AUFTRAG
+	. IF $PIECE(SUCH,",",3)=POS DO
+	. . SET YEBENE = $QLENGTH(SUCH)-2
+	. . SET TEIL   = $PIECE(SUCH,",",4,99)
+	. . SET TEIL   = $TRANSLATE(TEIL,",)","..")
+	. . SET ^WWWSOR(YUSER,2,AUF,POS,YEBENE,TEIL)=""  ;SPEICHERN TEILE ;Save 
+	. .;IF ($DATA(@SUCH)=10)||($DATA(@SUCH)=11) SET ^WWWSOR(YUSER,1,AUF,POS,YEBENE,TEIL)=@SUCH  ;SPEICHERN HALBFERTIGUNGSTEILE ;Save 
+	. .;IF ($DATA(@SUCH)=1)||($DATA(@SUCH)=11) SET ^WWWSOR(YUSER,1,AUF,POS,YEBENE,TEIL)=@SUCH   ;SPEICHERN HALBFERTIGUNGSTEILE ;Save 
+	. . IF $DATA(@SUCH)=11 SET ^WWWSOR(YUSER,1,AUF,POS,YEBENE,TEIL)=@SUCH   ;SPEICHERN HALBFERTIGUNGSTEILE ;FIS;18.08.2005
+	
+	QUIT
+	
+KALK
+	;-------------------------------------------------------------------------------
+	; NEURECHNEN HERSTELLKOSTEN HALBFERTIGUNGSTEILE AUS MATERIAL UND LEISTUNG
+	; out of material And performance 
+	; 
+	; History :
+	; 04-Aug-2006	GRF		SR14895 : Naked Reference
+	; 09-Jan-2006	GRF		SR14163 : Pass correct location to INFIBBUCH for
+	; 						background job
+	;-------------------------------------------------------------------------------
+	;new AUSBUCH,BDEKALK,BDEZEIT,ENDE,MATERIALKOST,RUESTKOST
+	new AUSBUCH,BDEKALK,BDEZEIT,ENDE,MATERIALKOST,RUESTKOST,SERVICEKOST  ;FIS;18.08.05
+	new SATZ,ServOverhead,STDKALK,TEIL,TEILEKOST,XBDEKALK,YDATEI
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;  @SUCH	objINAUFPXL
+	;  SATZ		^WWWSOR(YUSER,1,AUF,POS,YEBENE,TEIL)
+	;  SATZ(1)	objINAUFPXL
+	;  WE1		objINWEUM
+	;  WE1		objINWEAUFPT
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	SET STDKALK=$PIECE($$^INMASCHKOST(3),Y,2)  ;HOLEN STANDARDKALKULATIONSVORGABE ;send for 
+	KILL AUSBUCH  ;SPEICHERN BEARBEITETE AUSBUCHUNGEN AUS WARENBEWEGUNGEN ;Save out of 
+	SET ENDE = $$$NO
+	
+	SET MATERIALKOST = 0  ;TOTAL MATERIAL COSTS
+	SET SERVICEKOST  = 0  ;TOTAL SERVICE COSTS
+	
+	;IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,90)=1 SET ENDE=1  ;FERTIGUNG ABGESCHLOSSEN
+	if $$$INAUFPReadyForDelivery(objOrderLine)=$$$YES SET ENDE=$$$YES  ;FERTIGUNG ABGESCHLOSSEN
+	;BERECHNUNG DER LEISTUNGEN  0=LT.BDE 1=LT.BDE WENN GESTEMPELT 2=KEINE BERECHNUNG LT.BDE  ;FIS;11.02.04;24974
+	
+	;SET BDEKALK=+$PIECE($GET(^INVORG(YM,YM,1)),Y,168)
+	SET BDEKALK=+$$$INVORGServicesCalculationInCost($get(^INVORG(YM,YM,1)))
+	IF $PIECE($GET(^INART(YM,$PIECE(objOrderLine,Y,4),1)),Y,348)'="" SET BDEKALK=+$PIECE(^INART(YM,$PIECE(objOrderLine,Y,4),1),Y,348) ; SR14895
+	SET XBDEKALK=BDEKALK
+	
+	SET YEBENE=""
+	FOR  SET YEBENE=$ORDER(^WWWSOR(YUSER,1,AUF,POS,YEBENE),-1) QUIT:YEBENE=""  DO
+	. SET TEIL=""
+	. FOR  SET TEIL=$ORDER(^WWWSOR(YUSER,1,AUF,POS,YEBENE,TEIL)) QUIT:TEIL=""  DO
+	. . SET SATZ=$GET(^WWWSOR(YUSER,1,AUF,POS,YEBENE,TEIL))
+	. . QUIT:SATZ=""
+	. . ;
+	. . SET BDEKALK=XBDEKALK
+	. . IF BDEKALK=1 IF +$$^INPROSTEMP0($PIECE(SATZ,Y,165))=0 SET BDEKALK=2  ;KEINE GESTEMPELTE ZEIT ;no time 
+	. . ;
+	. . ;VERSCHNITT BEI LAGERUMBUCHUNG ALS ZUSATZKOSTEN SPEICHERN ;next to when additional costs Save 
+	. . IF $PIECE(SATZ,Y,165)'="" DO
+	. . . NEW FERT,DAT,UHR,MIT,ART,BET,LAP,WED,PREIS,WE1
+	. . . SET FERT=$$^WWWUMLAU($PIECE(SATZ,Y,165),1)
+	. . . QUIT:'$DATA(^INWEUMs(YM,5,FERT))
+	. . . SET DAT=""
+	. . . FOR  SET DAT=$ORDER(^INWEUMs(YM,5,FERT,DAT)) QUIT:DAT=""  DO
+	. . . . SET UHR=""
+	. . . . FOR  SET UHR=$ORDER(^INWEUMs(YM,5,FERT,DAT,UHR)) QUIT:UHR=""  DO
+	. . . . . SET MIT=""
+	. . . . . FOR  SET MIT=$ORDER(^INWEUMs(YM,5,FERT,DAT,UHR,MIT)) QUIT:MIT=""  DO
+	. . . . . . SET ART=""
+	. . . . . . FOR  SET ART=$ORDER(^INWEUMs(YM,5,FERT,DAT,UHR,MIT,ART)) QUIT:ART=""  DO
+	. . . . . . . SET BET=""
+	. . . . . . . FOR  SET BET=$ORDER(^INWEUMs(YM,5,FERT,DAT,UHR,MIT,ART,BET)) QUIT:BET=""  DO
+	. . . . . . . . SET LAP=""
+	. . . . . . . . FOR  SET LAP=$ORDER(^INWEUMs(YM,5,FERT,DAT,UHR,MIT,ART,BET,LAP)) QUIT:LAP=""  DO
+	. . . . . . . . . SET WED=""
+	. . . . . . . . . FOR  SET WED=$ORDER(^INWEUMs(YM,5,FERT,DAT,UHR,MIT,ART,BET,LAP,WED)) QUIT:WED=""  DO
+	. . . . . . . . . . SET WE1=$GET(^INWEUM(YM,DAT,UHR,MIT,ART,BET,LAP,WED,1))
+	. . . . . . . . . . QUIT:$PIECE(WE1,Y,51)'=""    ;BEREITS ABGERECHNET ;yet
+	. . . . . . . . . . ; 
+	. . . . . . . . . . SET MENGE=+$PIECE(WE1,Y,34)  ;AUSBUCHUNGSMENGE
+	. . . . . . . . . . SET PREIS=+$PIECE(WE1,Y,8)   ;EINZEL-EK
+	. . . . . . . . . . IF PREIS=0 SET PREIS=$$^INARTKOST(ART)
+	. . . . . . . . . . IF (PREIS*MENGE)>0 DO
+	. . . . . . . . . . . NEW KEY,FELD,YFORM,YVOR,OK,LFN
+	. . . . . . . . . . . SET $PIECE(WE1,Y,51)=+$HOROLOG
+	. . . . . . . . . . . SET OK=$$^WWWSPEI("INWEUM",DAT_","_UHR_","_MIT_","_ART_","_BET_","_LAP_","_WED,WE1,1)  ;SPEICHERN ALS BERECHNET ;Save when 
+	. . . . . . . . . . . SET KEY(1)=AUF_","_POS_","_TEIL
+	. . . . . . . . . . . SET FELD(1)=$GET(^INAUFPTEXTRA(YM,AUF,POS,TEIL,1))
+	. . . . . . . . . . . SET KEY(2)=KEY(1)_","_$$^WWWNEXT1("INAUFPTEXTRAV",KEY(1),4)
+	. . . . . . . . . . . SET FELD(2)=$PIECE($GET(^INPARA(YM,"AUSBUCHUNG",SPRACHE,+$PIECE(WE1,Y,47),1)),Y,1)_" #"_$PIECE(SATZ,Y,165)_" ("_ART_") "_$$^INARTNAME(ART)_Y_(PREIS*MENGE)
+	. . . . . . . . . . . SET OK=$$^WWWSPEI("INAUFPTEXTRAV",KEY(2),FELD(2),1)  ;SPEICHERN DETAILINFO ;Save 
+	. . . . . . . . . . . SET PREIS(2)=0
+	. . . . . . . . . . . DO
+	. . . . . . . . . . . . IF +$PIECE(FELD(1),Y,5)'=0 IF +$PIECE(FELD(1),Y,6)'=1 SET $PIECE(FELD(1),Y,5)=$PIECE(FELD(1),Y,5)+(PREIS*MENGE)  ;KEINE DETAIL-AUFLISTUNG ;no 
+	. . . . . . . . . . . . SET LFN=""
+	. . . . . . . . . . . . FOR  SET LFN=$ORDER(^INAUFPTEXTRAV(YM,AUF,POS,TEIL,LFN)) QUIT:LFN=""  DO
+	. . . . . . . . . . . . . SET PREIS(2)=PREIS(2)+$PIECE($GET(^INAUFPTEXTRAV(YM,AUF,POS,TEIL,LFN,1)),Y,2)
+	. . . . . . . . . . . . ;
+	. . . . . . . . . . . . SET $PIECE(FELD(1),Y,6)=1         ;DETAIL-BUCHUNG
+	. . . . . . . . . . . . SET $PIECE(FELD(1),Y,5)=PREIS(2)  ;SUMME DETAILS ;sum 
+	. . . . . . . . . . . ;
+	. . . . . . . . . . . SET OK=$$^WWWSPEI("INAUFPTEXTRA",KEY(1),FELD(1),1)  ;SPEICHERN HAUPTSATZ ZUSATZKOSTEN ;Save additional costs 
+	. . ;
+	. . SET KOST=0  ;HERSTELLKOSTEN
+	. . ;
+	. . ;SUCHEN MATERIALIEN+HALBFERTIGUNGSTEILE ;seek 
+	. . ;===============================================================
+	. . ;HAUPTTEIL (AUFTRAGSPOSITION)
+	. . ;----------------
+	. . IF TEIL=0 DO
+	. . . SET TEIL(1)=TEIL
+	. . . FOR  SET TEIL(1)=$ORDER(^WWWSOR(YUSER,2,AUF,POS,YEBENE+1,TEIL(1))) QUIT:TEIL(1)=""  IF $PIECE(TEIL(1),".",2)="" DO
+	. . . . SET YDATEI(1)="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS
+	. . . . FOR YI=1:1 QUIT:$PIECE(TEIL(1),".",YI,99)=""  SET YDATEI(1)=YDATEI(1)_","_$PIECE(TEIL(1),".",YI)
+	. . . . SET YDATEI(1)=YDATEI(1)_")"
+	. . . . SET SATZ(1)=@YDATEI(1)  ;SATZ NEU HOLEN WEGEN ÄNDERUNGEN AUS BEARBEITEN VORHERIGER EBENE ;typesetting recent send for quibble out of plain 
+	. . . . IF $PIECE(SATZ(1),Y,26)="" IF $PIECE(SATZ(1),Y,4)'="" SET $PIECE(SATZ(1),Y,26)=$PIECE($GET(^INART(YM,$PIECE(SATZ(1),Y,4),1)),Y,26)  ;HOLEN ARTIKELART;FIS;24360;28.10.03
+	. . . . QUIT:$PIECE(SATZ(1),Y,26)=2  ;KEINE LEISTUNGEN ;not services
+	. . . . ; 
+	. . . . IF +$PIECE(SATZ,Y,5)=0 SET $PIECE(SATZ,Y,5)=1     ; objWWWSOR - quantity
+	. . . . SET TEILEKOST=0
+	. . . . ;IF $DATA(@YDATEI(1))'=11 IF $DATA(^INWEAUFPT(YM,AUF,POS,TEIL(1))) DO  ;ERMITTLUNG DER GENAUEN KOSTEN LAUT ENTNAHME-LAGERPLÄTZE;FIS;24260;12.01.04
+	. . . . IF $DATA(^INWEAUFPT(YM,AUF,POS,TEIL(1))) DO  ;ERMITTLUNG DER GENAUEN KOSTEN LAUT ENTNAHME-LAGERPLÄTZE;FIS;18.08.05
+	. . . . . NEW BET,LAP,WED,WE1,MENGEX
+	. . . . . IF +$PIECE(SATZ(1),Y,5)=0   SET $PIECE(SATZ(1),Y,5)  =1
+	. . . . . IF +$PIECE(SATZ(1),Y,39)=0  SET $PIECE(SATZ(1),Y,39) =1
+	. . . . . IF +$PIECE(SATZ(1),Y,250)=0 SET $PIECE(SATZ(1),Y,250)=$PIECE(SATZ(1),Y,47)
+	. . . . . SET MENGEX=$PIECE(SATZ(1),Y,39)  ;GESAMT-MENGE
+	. . . . . SET BET=""
+	. . . . . FOR  SET BET=$ORDER(^INWEAUFPT(YM,AUF,POS,TEIL(1),BET)) QUIT:BET=""  DO
+	. . . . . . SET LAP=""
+	. . . . . . FOR  SET LAP=$ORDER(^INWEAUFPT(YM,AUF,POS,TEIL(1),BET,LAP)) QUIT:LAP=""  DO
+	. . . . . . . SET WED=""
+	. . . . . . . FOR  SET WED=$ORDER(^INWEAUFPT(YM,AUF,POS,TEIL(1),BET,LAP,WED)) QUIT:WED=""  DO
+	. . . . . . . . SET WE1=$GET(^INWEAUFPT(YM,AUF,POS,TEIL(1),BET,LAP,WED,1))
+	. . . . . . . . QUIT:$PIECE(WE1,Y,4)'>0
+	. . . . . . . . QUIT:MENGEX'>0
+	. . . . . . . . ;IF MENGEX>$PIECE(WE1,Y,4) SET $PIECE(WE1,Y,4)=MENGEX
+	. . . . . . . . IF MENGEX<$PIECE(WE1,Y,4) SET $PIECE(WE1,Y,4)=MENGEX  ;FIS:06.08.04;MAX MENGE ;quantity 
+	. . . . . . . . IF +$PIECE(WE1,Y,8)=0     SET $PIECE(WE1,Y,8)=($PIECE(SATZ(1),Y,250)/$PIECE(SATZ(1),Y,5))
+	. . . . . . . . SET TEILEKOST=TEILEKOST+($PIECE(WE1,Y,4)*$PIECE(WE1,Y,8))  ;MENGE * KOSTEN ;quantity by cost 
+	. . . . . . . . SET MENGEX=MENGEX-$PIECE(WE1,Y,4)  ;BERECHNETE MENGE ;quantity 
+	. . . . . . ;
+	. . . . . . IF MENGEX>0 SET TEILEKOST=TEILEKOST+(MENGEX*($PIECE(SATZ(1),Y,47)/$PIECE(SATZ(1),Y,5)))  ;RESTMENGE OHNE ENTNAHMEPLATZ ;without 
+	. . . . . . SET $PIECE(@YDATEI(1),Y,47)=((TEILEKOST/$PIECE(SATZ(1),Y,39))*$PIECE(SATZ(1),Y,5))  ;DURCHSCHNITTLICHE KOSTEN IM MATERIAL SPEICHERN ;taste material Save 
+	. . . . ;
+	. . . . ;IF TEILEKOST=0 SET TEILEKOST=$PIECE(SATZ(1),Y,47)*$PIECE(SATZ,Y,5)  ;OHNE ENTNAHME-PLÄTZE
+	. . . . IF TEILEKOST=0 SET TEILEKOST=(($PIECE(SATZ(1),Y,47)/$PIECE(SATZ(1),Y,5))*$PIECE(SATZ(1),Y,39))  ;MATERIEL OHNE ENTNAHME-PLÄTZE;FIS;26251;09.08.04
+	. . . . SET KOST         = KOST        +TEILEKOST  ;TEILE EK (INKL VERSCHNITT) [WIRD IN ^INPROFERTIG GESETZT] * MENGE
+	. . . . SET MATERIALKOST = MATERIALKOST+TEILEKOST  ;COST OF MATERIAL;15.04.05;FIS;27509
+	. . . . ;
+	. . . . ;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	. . . . ;ZZGL. VERSCHNITT, DER BEI LAGERUMBUCHUNG ALS DIFFERENZ AUSGEBUCHT WURDE (1 X JE FERTIGUNGSNUMMER UND ARTIKEL)
+	. . . . ;;;IF $PIECE(SATZ(1),Y,165)'="" IF $PIECE(SATZ(1),Y,4)'="" DO
+	. . . . . NEW ZUSATZKOST
+	. . . . . QUIT:$DATA(AUSBUCH($PIECE(SATZ(1),Y,165),$PIECE(SATZ(1),Y,4)))  ;BEREITS ERFASST ;yet 
+	. . . . . SET AUSBUCH($PIECE(SATZ(1),Y,165),$PIECE(SATZ(1),Y,4))=""
+	. . . . . IF +$PIECE(SATZ(1),Y,5)=0 SET $PIECE(SATZ(1),Y,5)=1
+	. . . . . SET ZUSATZKOST=$$^INPROAUSBUCH($PIECE(SATZ(1),Y,165),$PIECE(SATZ(1),Y,4),($PIECE(SATZ(1),Y,47)/$PIECE(SATZ(1),Y,5)))
+	. . . . . QUIT:ZUSATZKOST=0
+	. . . . . SET KOST=KOST+ZUSATZKOST
+	. . . . . DO ^INSYSLOG("INAUFTEILEKOST","INAUFPXL",$TRANSLATE($PIECE($PIECE(YDATEI(1),",",2,999),")",1),",",";"),47,4,$PIECE(SATZ(1),Y,47),$PIECE(SATZ(1),Y,47)+ZUSATZKOST)  ;PROTOKOLL PREISÄNDERUNG
+	. . . . . SET $PIECE(@YDATEI(1),Y,47)=$PIECE(SATZ(1),Y,47)+ZUSATZKOST  ;KOSTEN AUF MATERIAL AUFSCHLAGEN ;taste upon material thump 
+	. . . . ;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DISABLED BLOCK END
+	. . ;
+	. . ;UNTERTEILE (ZWISCHENTEILE)
+	. . ;----------------
+	. . IF TEIL'=0 DO
+	. . . SET TEIL(1)=TEIL
+	. . . FOR  SET TEIL(1)=$ORDER(^WWWSOR(YUSER,2,AUF,POS,YEBENE+1,TEIL(1))) QUIT:TEIL(1)=""  QUIT:$EXTRACT(TEIL(1),1,$LENGTH(TEIL))'=TEIL  DO
+	. . . . SET YDATEI(1)="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS
+	. . . . FOR YI=1:1 QUIT:$PIECE(TEIL(1),".",YI,99)=""  SET YDATEI(1)=YDATEI(1)_","_$PIECE(TEIL(1),".",YI)
+	. . . . SET YDATEI(1)=YDATEI(1)_")"
+	. . . . SET SATZ(1)=@YDATEI(1)  ;SATZ NEU HOLEN WEGEN ÄNDERUNGEN AUS BEARBEITEN VORHERIGER EBENE ;typesetting recent send for quibble out of plain 
+	. . . . IF $PIECE(SATZ(1),Y,26)="" IF $PIECE(SATZ(1),Y,4)'="" SET $PIECE(SATZ(1),Y,26)=$PIECE($GET(^INART(YM,$PIECE(SATZ(1),Y,4),1)),Y,26)  ;HOLEN ARTIKELART;FIS;24360;28.10.03
+	. . . . QUIT:$PIECE(SATZ(1),Y,26)=2  ;KEINE LEISTUNGEN ;not services 
+	. . . . ;
+	. . . . IF +$PIECE(SATZ,Y,5)=0 SET $PIECE(SATZ,Y,5)=1     ; objWWWSOR - quantity
+	. . . . SET TEILEKOST=0
+	. . . . ;IF $DATA(@YDATEI(1))'=11 IF $DATA(^INWEAUFPT(YM,AUF,POS,TEIL(1))) DO  ;ERMITTLUNG DER GENAUEN KOSTEN LAUT ENTNAHME-LAGERPLÄTZE;FIS;24260;12.01.04
+	. . . . IF $DATA(^INWEAUFPT(YM,AUF,POS,TEIL(1))) DO  ;ERMITTLUNG DER GENAUEN KOSTEN LAUT ENTNAHME-LAGERPLÄTZE;FIS;18.08.05
+	. . . . . NEW BET,LAP,WED,WE1,MENGEX
+	. . . . . IF +$PIECE(SATZ(1),Y,5)=0   SET $PIECE(SATZ(1),Y,5)  =1
+	. . . . . IF +$PIECE(SATZ(1),Y,39)=0  SET $PIECE(SATZ(1),Y,39) =1
+	. . . . . IF +$PIECE(SATZ(1),Y,250)=0 SET $PIECE(SATZ(1),Y,250)=$PIECE(SATZ(1),Y,47)
+	. . . . . SET MENGEX=$PIECE(SATZ(1),Y,39)  ;GESAMT-MENGE
+	. . . . . SET BET=""
+	. . . . . FOR  SET BET=$ORDER(^INWEAUFPT(YM,AUF,POS,TEIL(1),BET)) QUIT:BET=""  DO
+	. . . . . . SET LAP=""
+	. . . . . . FOR  SET LAP=$ORDER(^INWEAUFPT(YM,AUF,POS,TEIL(1),BET,LAP)) QUIT:LAP=""  DO
+	. . . . . . . SET WED=""
+	. . . . . . . FOR  SET WED=$ORDER(^INWEAUFPT(YM,AUF,POS,TEIL(1),BET,LAP,WED)) QUIT:WED=""  DO
+	. . . . . . . . SET WE1=$GET(^INWEAUFPT(YM,AUF,POS,TEIL(1),BET,LAP,WED,1))
+	. . . . . . . . QUIT:$PIECE(WE1,Y,4)'>0
+	. . . . . . . . QUIT:MENGEX'>0
+	. . . . . . . . ;IF MENGEX>$PIECE(WE1,Y,4) SET $PIECE(WE1,Y,4)=MENGEX
+	. . . . . . . . IF MENGEX<$PIECE(WE1,Y,4) SET $PIECE(WE1,Y,4)=MENGEX  ;FIS:06.08.04;MAX MENGE ;quantity 
+	. . . . . . . . IF +$PIECE(WE1,Y,8)=0     SET $PIECE(WE1,Y,8)=($PIECE(SATZ(1),Y,250)/$PIECE(SATZ(1),Y,5))
+	. . . . . . . . SET TEILEKOST=TEILEKOST+($PIECE(WE1,Y,4)*$PIECE(WE1,Y,8))  ;MENGE * KOSTEN ;quantity taste 
+	. . . . . . . . SET MENGEX=MENGEX-$PIECE(WE1,Y,4)  ;BERECHNETE MENGE ;quantity 
+	. . . . . . ;
+	. . . . . . IF MENGEX>0 SET TEILEKOST=TEILEKOST+(MENGEX*($PIECE(SATZ(1),Y,47)/$PIECE(SATZ(1),Y,5)))  ;RESTMENGE OHNE ENTNAHMEPLATZ ;without 
+	. . . . . . SET $PIECE(@YDATEI(1),Y,47)=((TEILEKOST/$PIECE(SATZ(1),Y,39))*$PIECE(SATZ(1),Y,5))  ;DURCHSCHNITTLICHE KOSTEN IM MATERIAL SPEICHERN ;taste material Save 
+	. . . . ;
+	. . . . ;IF TEILEKOST=0 SET TEILEKOST=$PIECE(SATZ(1),Y,47)*$PIECE(SATZ,Y,5)
+	. . . . IF TEILEKOST=0 SET TEILEKOST=(($PIECE(SATZ(1),Y,47)/$PIECE(SATZ(1),Y,5))*$PIECE(SATZ(1),Y,39))  ;MATERIEL OHNE ENTNAHME-PLÄTZE;FIS;26251;09.08.04
+	. . . . SET KOST=KOST+TEILEKOST  ;TEILE EK (INKL VERSCHNITT) [WIRD IN ^INPROFERTIG GESETZT] * MENGE
+	. . . . SET MATERIALKOST=MATERIALKOST+TEILEKOST  ;COST OF MATERIAL;15.04.05;FIS;27509
+	. . . . ;
+	. . . . ;vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	. . . . ;ZZGL. VERSCHNITT, DER BEI LAGERUMBUCHUNG ALS DIFFERENZ AUSGEBUCHT WURDE (1 X JE FERTIGUNGSNUMMER UND ARTIKEL)
+	. . . . ;;;IF $PIECE(SATZ(1),Y,165)'="" IF $PIECE(SATZ(1),Y,4)'="" DO
+	. . . . . NEW ZUSATZKOST
+	. . . . . QUIT:$DATA(AUSBUCH($PIECE(SATZ(1),Y,165),$PIECE(SATZ(1),Y,4)))  ;BEREITS ERFASST ;yet 
+	. . . . . SET AUSBUCH($PIECE(SATZ(1),Y,165),$PIECE(SATZ(1),Y,4))=""
+	. . . . . IF +$PIECE(SATZ(1),Y,5)=0 SET $PIECE(SATZ(1),Y,5)=1
+	. . . . . SET ZUSATZKOST=$$^INPROAUSBUCH($PIECE(SATZ(1),Y,165),$PIECE(SATZ(1),Y,4),($PIECE(SATZ(1),Y,47)/$PIECE(SATZ(1),Y,5)))
+	. . . . . QUIT:ZUSATZKOST=0
+	. . . . . SET KOST=KOST+ZUSATZKOST
+	. . . . . DO ^INSYSLOG("INAUFTEILEKOST","INAUFPXL",$TRANSLATE($PIECE($PIECE(YDATEI(1),",",2,999),")",1),",",";"),47,4,$PIECE(SATZ(1),Y,47),$PIECE(SATZ(1),Y,47)+ZUSATZKOST)  ;PROTOKOLL PREISÄNDERUNG
+	. . . . . SET $PIECE(@YDATEI(1),Y,47)=$PIECE(SATZ(1),Y,47)+ZUSATZKOST  ;KOSTEN AUF MATERIAL AUFSCHLAGEN
+	. . . . ;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DISABLED BLOCK END
+	. . ;
+	. . ;BERECHNEN LEISTUNGEN ;calculate LEISTUNGEN 
+	. . ;===============================================================
+	. . ;VOR FERTIGUNG ODER OHNE FERTIGUNGSANWEISUNG ;pre- Or without 
+	. . ;-------------------------------------------
+	. . ;HAUPTTEIL  ;SOLLTE NICHT VORKOMMEN ! ;Not become 
+	. . IF (ENDE=$$$NO)||(BDEKALK=2) DO  ;TYBD 21.1.2003 NACH ABSCHLUSS ALLE OK ;within 
+	. . . set RUESTKOST=0
+	. . . IF BDEKALK'=2 QUIT:$PIECE(SATZ,Y,165)'=""  ;FIS;11.02.04;24974;KEINE BDE BERECHNUNG
+	. . . IF TEIL=0 DO
+	. . . . SET TEIL(1)=TEIL
+	. . . . FOR  SET TEIL(1)=$ORDER(^WWWSOR(YUSER,2,AUF,POS,YEBENE+1,TEIL(1))) QUIT:TEIL(1)=""  IF $PIECE(TEIL(1),".",2)="" DO
+	. . . . . SET YDATEI(1)="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS
+	. . . . . FOR YI=1:1 QUIT:$PIECE(TEIL(1),".",YI,99)=""  SET YDATEI(1)=YDATEI(1)_","_$PIECE(TEIL(1),".",YI)
+	. . . . . SET YDATEI(1)=YDATEI(1)_")"
+	. . . . . SET SATZ(1)=@YDATEI(1)  ;SATZ NEU HOLEN WEGEN ÄNDERUNGEN AUS BEARBEITEN VORHERIGER EBENE
+	. . . . . IF $PIECE(SATZ(1),Y,26)="" IF $PIECE(SATZ(1),Y,4)'="" SET $PIECE(SATZ(1),Y,26)=$PIECE($GET(^INART(YM,$PIECE(SATZ(1),Y,4),1)),Y,26)  ;HOLEN ARTIKELART;FIS;24360;28.10.03
+	. . . . . QUIT:$PIECE(SATZ(1),Y,26)'=2  ;NUR LEISTUNGEN ;only services 
+	. . . . . ;
+	. . . . . IF +$PIECE(SATZ,Y,5)=0 SET $PIECE(SATZ,Y,5)=1
+	. . . . . SET KOST=KOST+($PIECE(SATZ(1),Y,47)*$PIECE(SATZ,Y,5))  ;VORKALKULIERTER WERT * MENGE ;value by quantity 
+	. . . . . SET SERVICEKOST=SERVICEKOST+($PIECE(SATZ(1),Y,47)*$PIECE(SATZ(1),Y,39))  ;CUMULATIVE SERVICE COSTS;FIS;18.08.05
+	. . . . . SET RUESTKOST=RUESTKOST+($PIECE(SATZ(1),Y,70)*STDKALK/3600)
+	. . . ;
+	. . . ;UNTERTEILE
+	. . . IF TEIL'=0 DO
+	. . . . SET TEIL(1)=TEIL
+	. . . . FOR  SET TEIL(1)=$ORDER(^WWWSOR(YUSER,2,AUF,POS,YEBENE+1,TEIL(1))) QUIT:TEIL(1)=""  QUIT:$EXTRACT(TEIL(1),1,$LENGTH(TEIL))'=TEIL  DO
+	. . . . . SET YDATEI(1)="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS
+	. . . . . FOR YI=1:1 QUIT:$PIECE(TEIL(1),".",YI,99)=""  SET YDATEI(1)=YDATEI(1)_","_$PIECE(TEIL(1),".",YI)
+	. . . . . SET YDATEI(1)=YDATEI(1)_")"
+	. . . . . SET SATZ(1)=@YDATEI(1)  ;SATZ NEU HOLEN WEGEN ÄNDERUNGEN AUS BEARBEITEN VORHERIGER EBENE
+	. . . . . IF $PIECE(SATZ(1),Y,26)="" IF $PIECE(SATZ(1),Y,4)'="" SET $PIECE(SATZ(1),Y,26)=$PIECE($GET(^INART(YM,$PIECE(SATZ(1),Y,4),1)),Y,26)  ;HOLEN ARTIKELART;FIS;24360;28.10.03
+	. . . . . QUIT:$PIECE(SATZ(1),Y,26)'=2  ;NUR LEISTUNGEN ;only services
+	. . . . . ;
+	. . . . . ;		D65		$$$INVORGFinishOnlyForMainParts()
+	. . . . . IF $PIECE($GET(^INVORG(YM,YM,1)),Y,65)=$$$YES QUIT  ;ZEITERFASSUNG ERFOLGT DURCH HAUPTTEIL
+	. . . . . IF +$PIECE(SATZ,Y,5)=0 SET $PIECE(SATZ,Y,5)=1
+	. . . . . SET KOST        = KOST       +($PIECE(SATZ(1),Y,47)*$PIECE(SATZ,Y,5))  ;VORKALKULIERTER WERT * MENGE ;value * quantity 
+	. . . . . SET SERVICEKOST = SERVICEKOST+($PIECE(SATZ(1),Y,47)*$PIECE(SATZ(1),Y,39))  ;CUMULATIVE SERVICE COSTS;FIS;18.08.05
+	. . . . . SET RUESTKOST=RUESTKOST+($PIECE(SATZ(1),Y,70)*STDKALK/3600)
+	. . . SET KOST=KOST+$JUSTIFY(RUESTKOST,0,2)  ;+ RÜSTZEIT ;setup time 
+	. . ;
+	. . ;BEI/NACH FERTIGUNG
+	. . ;-----------------------------------------
+	. . IF (ENDE=$$$YES) || ($PIECE(SATZ,Y,165)'="") IF BDEKALK'=2 DO   ;DT NACH ENDE ;within termination 
+	. . . NEW UTEIL,EZEIT,YDATEI,YFELD,KALK,ART,WERT
+	. . . ;
+	. . . SET DAUER=$$^INPROSTEMP0($PIECE(SATZ,Y,165),1)  ;ERMITTLUNG DER STEMPELZEITEN ;inquiry the 
+	. . . QUIT:DAUER=0  ;KEINE ZEITEN ;no time taken
+	. . . ;
+	. . . FOR YI=1:1  QUIT:$PIECE(DAUER,Y,YI,999)=""  DO
+	. . . . SET UTEIL=$PIECE($PIECE(DAUER,Y,YI),"#",1)  ;ARBEITSGANG / UNTERNUMMER
+	. . . . SET EZEIT=$PIECE($PIECE(DAUER,Y,YI),"#",2)  ;EINZELZEIT   ; time
+	. . . . QUIT:+EZEIT=0
+	. . . . ;
+	. . . . IF +UTEIL'=0 DO  ;LEISTUNGEN, DIE AUF UNTERNUMMER GESTEMPELT WURDEN
+	. . . . . SET YDATEI="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS_","_$TRANSLATE(TEIL,".",",")_UTEIL_")"
+	. . . . . IF '$DATA(@YDATEI) SET UTEIL=0 QUIT
+	. . . . . SET YFELD=@YDATEI
+	. . . . . IF $PIECE(SATZ(1),Y,26)="" IF $PIECE(SATZ(1),Y,4)'="" SET $PIECE(SATZ(1),Y,26)=$PIECE($GET(^INART(YM,$PIECE(SATZ(1),Y,4),1)),Y,26)  ;HOLEN ARTIKELART;FIS;24360;28.10.03
+	. . . . . IF $PIECE(YFELD,Y,26)'=2 SET UTEIL=0 QUIT     ; not services
+	. . . . . ;
+	. . . . . SET ART=$PIECE(YFELD,Y,4)
+	. . . . . IF ART="" SET UTEIL=0 QUIT
+	. . . . . SET KALK=$$^INMASCHKOST(2)    ;HOLEN MASCHINENKOSTENSÄTZE 
+	. . . . . SET WERT(1)=$PIECE(KALK,Y,1)  ;MASCHINENSTUNDENSATZ ;machine hour rate 
+	. . . . . SET WERT(2)=$PIECE(KALK,Y,2)  ;BEDIENERSTUNDENSATZ
+	. . . . . set ServOverhead = $piece(KALK,Y,3)				;SR13215
+	. . . . . QUIT:(WERT(1)+WERT(2))=0
+	. . . . . ;
+	. . . . . IF +$piece(SATZ,Y,5)=0  SET $piece(SATZ,Y,5)  = 1           ; quantity
+	. . . . . IF +$piece(SATZ,Y,39)=0 SET $piece(SATZ,Y,39) = 1           ; output quantity
+	. . . . . ;SET KOST=KOST+(EZEIT*WERT(1)/3600)  ;MASCHINENKOSTEN ;table-mat 
+	. . . . . ;SET KOST=KOST+(EZEIT*WERT(2)/3600)  ;BEDIENERKOSTEN  ;table-mat 
+	. . . . . SET KOST=KOST+(EZEIT*WERT(1)/3600/$piece(SATZ,Y,39)*$piece(SATZ,Y,5))  ;MASCHINENKOSTEN  ;FIS,19.02.03
+	. . . . . SET KOST=KOST+(EZEIT*WERT(2)/3600/$piece(SATZ,Y,39)*$piece(SATZ,Y,5))  ;BEDIENERKOSTEN   ;FIS,19.02.03
+	. . . . . SET SERVICEKOST=SERVICEKOST+(EZEIT*WERT(1)/3600/$piece(SATZ,Y,39)*$piece(SATZ,Y,5))  ;CUMULATIVE SERVICE COSTS;FIS;18.08.05
+	. . . . . SET SERVICEKOST=SERVICEKOST+(EZEIT*WERT(2)/3600/$piece(SATZ,Y,39)*$piece(SATZ,Y,5))  ;CUMULATIVE SERVICE COSTS;FIS;18.08.05
+	. . . . ;
+	. . . . IF +UTEIL=0 DO  ;ZEITSTEMPEL OHNE ZUORDNUNG = NUR BEDIENERKOSTEN ;without only 
+	. . . . . SET WERT(2)=STDKALK
+	. . . . . QUIT:+WERT(2)=0
+	. . . . . IF +$piece(SATZ,Y,5)=0  SET $piece(SATZ,Y,5) =1
+	. . . . . IF +$piece(SATZ,Y,39)=0 SET $piece(SATZ,Y,39)=1
+	. . . . . ;SET KOST=KOST+(EZEIT*WERT(2)/3600)  ;BEDIENERKOSTEN ;table-mat 
+	. . . . . SET KOST        = KOST       +(EZEIT*WERT(2)/3600/$piece(SATZ,Y,39)*$piece(SATZ,Y,5))  ;BEDIENERKOSTEN  ;FIS,19.02.03
+	. . . . . SET SERVICEKOST = SERVICEKOST+(EZEIT*WERT(2)/3600/$piece(SATZ,Y,39)*$piece(SATZ,Y,5))  ;CUMULATIVE SERVICE COSTS;FIS;18.08.05
+	. . ;
+	. . ;ZZGL. ZUSATZKOSTEN ;additional costs 
+	. . ;===============================================================
+	. . ;IF '$DATA(^INAUFPTEXTRA(YM,AUF,POS)) DO
+	. . ;.SET KOST=KOST+($PIECE(SATZ,Y,74))  ;WERKZEUGKOSTEN
+	. . ;.SET KOST=KOST+($PIECE(SATZ,Y,75))  ;EXTRAKOSTEN
+	. . ;IF $DATA(^INAUFPTEXTRA(YM,AUF,POS)) DO  ;ERFASSTE ZUSATZKOSTEN;FIS;22540;12.01.04
+	. . ;.IF TEIL=0 DO  ;HAUPTTEIL UND 1. EBENE ;And plain 
+	. . ;..FOR TEIL(1)=0,"" DO
+	. . ;...DO:TEIL(1)'=""  IF TEIL(1)="" FOR  SET TEIL(1)=$ORDER(^WWWSOR(YUSER,2,AUF,POS,YEBENE+1,TEIL(1))) QUIT:TEIL(1)=""  IF $PIECE(TEIL(1),".",2)="" DO
+	. . ;....SET KOST=KOST+$$EXTRA(AUF,POS,TEIL(1),TEIL)
+	. . ;.IF TEIL'=0 DO  ;ZWISCHENTEILE
+	. . ;..SET TEIL(1)=TEIL FOR  SET TEIL(1)=$ORDER(^WWWSOR(YUSER,2,AUF,POS,YEBENE+1,TEIL(1))) QUIT:TEIL(1)=""  QUIT:$EXTRACT(TEIL(1),1,$LENGTH(TEIL))'=TEIL  DO
+	. . ;...SET KOST=KOST+$$EXTRA(AUF,POS,TEIL(1),TEIL)
+	. . ;
+	. . SET KOST=KOST+$$EXTRA(AUF,POS,TEIL,1)  ;ERFASSTE ZUSATZKOSTEN ;additional costs 
+	. . ;
+	. . ;SPEICHERN HERSTELLKOSTEN ;Save 
+	. . ;===============================================================
+	. . ;===============================================================
+	. . DO  ;;;;IF KOST'=0 DO  ;AUCH 0 MÖGLICH, DA LEISTUNGEN AUFS OBERTEIL GESTEMPELT WERDEN
+	. . . NEW YDATEI
+	. . . IF TEIL="0" SET YDATEI="^INAUFP("_""""_YM_""""_","_""""_AUF_""""_","_POS_",1)"
+	. . . IF TEIL'="0" DO
+	. . . . SET YDATEI="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS
+	. . . . FOR YI=1:1 QUIT:$PIECE(TEIL,".",YI,999)=""  SET YDATEI=YDATEI_","_$PIECE(TEIL,".",YI)
+	. . . . SET YDATEI=YDATEI_")"
+	. . . ;
+	. . . QUIT:'$DATA(@YDATEI)
+	. . . IF TEIL'="0" IF +$PIECE(SATZ,Y,39)'=0 SET KOST=((KOST/$PIECE(SATZ,Y,39))*$PIECE(SATZ,Y,5))
+	. . . IF TEIL="0"  DO ^INSYSLOG("INAUFTEILEKOST","INAUFP",AUF_";"_POS,47,1,$PIECE(@YDATEI,Y,47),$JUSTIFY(KOST,0,2))  ;PROTOKOLL PREISÄNDERUNG
+	. . . IF TEIL'="0" DO ^INSYSLOG("INAUFTEILEKOST","INAUFPXL",$TRANSLATE($PIECE($PIECE(YDATEI,",",2,999),")",1),",",";"),47,1,$PIECE(@YDATEI,Y,47),$JUSTIFY(KOST,0,2))  ;PROTOKOLL PREISÄNDERUNG
+	. . . SET $PIECE(@YDATEI,Y,47)=$JUSTIFY(KOST,0,2)
+	. . . ; NO NEW CALCULATION OF MANUFACTURING COSTS PERMITTED (through ^INAUFPTT2)
+	. . . SET $PIECE(@YDATEI,Y,254)=1  ;KEINE NEUBERECHNUNG DER HERSTELLKOSTEN ERLAUBT (DURCH ^INAUFPTT2)
+	. . . ;
+	. . . ; TODO : Can end up with fractions of cents being passed through <GRF>
+	. . . ;
+	. . . ;TRANSACTION POSTING ORDER COST RECOGNITION;FIS;14.04.05
+	. . . IF TEIL="0" IF (MATERIALKOST+SERVICEKOST)'=0 DO
+	. . . . NEW A,POSTED,REMAIN
+	. . . . set objOrder = $get(^INAUF(YM,AUF,1))
+	. . . .;SET $PIECE(@YDATEI,Y,430)=MATERIALKOST                   ;MATERIAL COSTS                  ;SR13183 replace 3 lines with 2
+	. . . .;SET POSTED=$PIECE(@YDATEI,Y,432)                         ;POSTED VALUE (MATERIAL COSTS: COS)
+	. . . .;SET REMAIN=(MATERIALKOST-POSTED)                         ;REMAINING VALUE (NOT POSTED)
+	. . . . ;
+	. . . . ;+++++++++++++++++++++++++++++++
+	. . . . ;
+	. . . . ;  POSTED VALUES (MATERIAL, OVERHEAD, SERVICE, OVERHEAD, OCR)
+	. . . . ;  
+	. . . . SET POSTED=$PIECE(@YDATEI,Y,432)+$PIECE(@YDATEI,Y,433)+$PIECE(@YDATEI,Y,436)+$PIECE(@YDATEI,Y,437)+$PIECE(@YDATEI,Y,438)
+	. . . . SET REMAIN=((MATERIALKOST+SERVICEKOST)-POSTED)            ;REMAINING VALUE (NOT POSTED)
+	. . . . QUIT:+REMAIN=0
+	. . . . ;
+	. . . . ;+++++++++++++++++++++++++++++++
+	. . . . ;  TODO : Compare each posted entry in turn against each total and generate
+	. . . . ;         OCR for specific types (labour to labour accts, mats to materials
+	. . . . ;         accts, etc) rather than a joint entry <GRF>
+	. . . . ;+++++++++++++++++++++++++++++++
+	. . . . SET A=""
+	. . . . SET $PIECE(A,Y,2)  = +$HOROLOG                           ;DATUM / DATE
+	. . . . SET $PIECE(A,Y,3)  = REMAIN                              ;MATERIAL OVERHEAD ($)
+	. . . .;SET $PIECE(A,Y,16) = YLOCATION                           ;BETRIEB / LOCATION   ;SR12839
+	. . . . set OrderLocn      = $$$INAUFLocation(objOrder)
+	. . . . if OrderLocn="" set OrderLocn = YLOCATION
+	. . . . set $piece(A,Y,16) = OrderLocn                           ;BETRIEB / LOCATION
+	. . . . SET $PIECE(A,Y,27) = AUF                                 ;AUFTRAG / ORDER
+	. . . . SET $PIECE(A,Y,28) = POS                                 ;POSITION / Order Line
+	. . . . SET $PIECE(A,Y,29) = $$$INAUFPItemNumber(objOrderLine)   ;ARTIKEL / ITEM
+	. . . . SET $PIECE(A,Y,50) = "OCR"                               ;TRANSACTION TYPE - ORDER COST RECOGNITION
+	. . . .;SET OK=$$^INFIBBUCH(A,YLOCATION,"","",4)                 ;SERVICE COSTS      ; SR14163
+	. . . . SET OK=$$^INFIBBUCH(A,OrderLocn,"","",4)                 ;SERVICE COSTS
+	. . . .;SET $PIECE(@YDATEI,Y,432)=(POSTED+REMAIN)                ;SAVE POSTED VALUE  ;SR13183 replace
+	. . . . SET $PIECE(@YDATEI,Y,438)=REMAIN                         ;SAVE POSTED OCR
+	
+	DO  ;NEUAUFBAU ARTIKELTEILE
+	. NEW YAUFTRAG,YPOS,SATZ
+	. SET YAUFTRAG=AUF
+	. SET YPOS=POS
+	. SET SATZ=$GET(^INAUFP(YM,AUF,POS,1))
+	. DO ^INAUFTEILE(YAUFTRAG,YPOS)
+	
+	QUIT
+	
+EXTRA(AUF,POS,TEIL,PLAN)
+	;-------------------------------------------------------------------------------
+	; ERFASSTE ZUSATZKOSTEN  !! ACHTUNG EINSPRUNG AUS INNACHKALK !!
+	; 
+	; Called by :
+	;	INAUFPD74
+	;	INAUFPTD74
+	;	INNACHKALK
+	;	KALK^INAUFTEILEKOST
+	;	
+	; 
+	; History :
+	; FIS;22540;12.01.04
+	;-------------------------------------------------------------------------------
+	NEW ZKOST,SATZ,WERKZEUG,EXTRA,VERSCHNITT,TEIL1
+	
+	SET ZKOST = 0
+	SET AUF   = $GET(AUF)      QUIT:AUF="" ZKOST
+	SET POS   = $GET(POS)      QUIT:POS="" ZKOST
+	SET TEIL  = $GET(TEIL)     QUIT:TEIL="" ZKOST
+	
+	SET SATZ=$GET(^INAUFPTEXTRA(YM,AUF,POS,TEIL,1))
+	IF $PIECE(SATZ,Y,12)=1 QUIT ZKOST  ;KEINE ZUSATZKOSTEN ;no additional costs 
+	
+	IF SATZ'="" DO
+	. SET TEIL1=$GET(^INAUFPT(YM,AUF,POS,TEIL,1))
+	. IF +$PIECE(TEIL1,Y,5)=0 SET $PIECE(TEIL1,Y,5)=1
+	. ;
+	. SET WERKZEUG=0
+	. IF $PIECE(SATZ,Y,2)'=1 SET WERKZEUG=$PIECE(SATZ,Y,1)
+	. IF $PIECE(SATZ,Y,2)=1  SET LFN="" FOR  SET LFN=$ORDER(^INAUFPTEXTRAW(YM,AUF,POS,TEIL,LFN)) QUIT:LFN=""  DO
+	. . SET WERKZEUG=WERKZEUG+$PIECE($GET(^INAUFPTEXTRAW(YM,AUF,POS,TEIL,LFN,1)),Y,2)
+	. ;
+	. SET EXTRA=0
+	. IF $PIECE(SATZ,Y,4)'=1 SET EXTRA=$PIECE(SATZ,Y,3)
+	. IF $PIECE(SATZ,Y,4)=1  SET LFN="" FOR  SET LFN=$ORDER(^INAUFPTEXTRAE(YM,AUF,POS,TEIL,LFN)) QUIT:LFN=""  DO
+	. . SET EXTRA=EXTRA+$PIECE($GET(^INAUFPTEXTRAE(YM,AUF,POS,TEIL,LFN,1)),Y,2)
+	. ;
+	. SET VERSCHNITT=0
+	. IF $PIECE(SATZ,Y,6)'=1 SET VERSCHNITT=$PIECE(SATZ,Y,5)
+	. IF $PIECE(SATZ,Y,6)=1  SET LFN="" FOR  SET LFN=$ORDER(^INAUFPTEXTRAV(YM,AUF,POS,TEIL,LFN)) QUIT:LFN=""  DO
+	. . SET VERSCHNITT=VERSCHNITT+$PIECE($GET(^INAUFPTEXTRAV(YM,AUF,POS,TEIL,LFN,1)),Y,2)
+	. ;
+	. SET ZKOST=(WERKZEUG+EXTRA+VERSCHNITT)
+	. ;IF $G(HTEIL)'=0 SET ZKOST=ZKOST/$PIECE(TEIL1,Y,5)         ;NUR UNTERTEILE DURCH MENGE TEILEN
+	
+	IF ZKOST=0 IF $GET(PLAN)=1 SET ZKOST=$$EXTRA1(AUF,POS,TEIL)  ;GEPLANTE ZUSATZKOSTEN ;additional costs 
+	QUIT ZKOST
+	
+EXTRA1(AUF,POS,TEIL)
+	;-------------------------------------------------------------------------------
+	; GEPLANTE ZUSATZKOSTEN  !! ACHTUNG EINSPRUNG AUS INNACHKALK !!
+	; 
+	; Called By :
+	;	EXTRA^INAUFTEILEKOST
+	;	INNACHKALK
+	; 
+	; History :
+	; FIS;22540;12.01.04
+	;-------------------------------------------------------------------------------
+	NEW ZKOST,SATZ,DATEI,YI,EXTRA,WERKZEUG,LOS,ART,MENGE,EH
+	
+	SET ZKOST =0
+	SET AUF   = $GET(AUF)      QUIT:AUF="" ZKOST
+	SET POS   = $GET(POS)      QUIT:POS="" ZKOST
+	SET TEIL  = $GET(TEIL)     QUIT:TEIL="" ZKOST
+	
+	IF TEIL=0 {
+		;HAUPTTEIL UND 1. EBENE ;And plain 
+		
+		SET TEIL(1)=0
+		SET DATEI="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS
+		SET DATEI=DATEI_")"
+		IF $DATA(@DATEI) {
+			SET EXTRA    = $PIECE(@DATEI,Y,75)  ;EXTRAKOSTEN
+			SET WERKZEUG = $PIECE(@DATEI,Y,74)  ;WERKZEUGKOSTEN
+			SET ZKOST    = ZKOST+EXTRA+WERKZEUG
+		}
+	} else {
+		; ZWISCHENTEILE
+		
+		SET TEIL(1)=TEIL
+		SET DATEI="^INAUFPXL("_""""_YM_""""_","_""""_AUF_""""_","_POS
+		FOR YI=1:1 {
+			QUIT:$PIECE(TEIL(1),".",YI,99)=""
+			SET DATEI=DATEI_","_$PIECE(TEIL(1),".",YI)
+		}
+		SET DATEI=DATEI_")"
+		IF $DATA(@DATEI) {
+			SET ZKOST=ZKOST+($PIECE(@DATEI,Y,74))  ;WERKZEUGKOSTEN
+			SET ZKOST=ZKOST+($PIECE(@DATEI,Y,75))  ;EXTRAKOSTEN
+		}
+	}
+	
+	;LOSGRÖSSE
+	SET LOS=0
+	IF TEIL=0  {
+		SET ART   = $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4)
+		SET MENGE = $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5)
+	} else {
+		SET ART   = $PIECE($GET(^INAUFPT(YM,AUF,POS,TEIL,1)),Y,4)
+		SET MENGE = $PIECE($GET(^INAUFPT(YM,AUF,POS,TEIL,1)),Y,39)
+	}
+ 
+	IF ART'="" SET LOS=+$PIECE($GET(^INART(YM,ART,1)),Y,72)
+	; TODO : Is it possible to have a value between 0 and 1 for LOS or MENGE?
+	;        Has an assumption of integer values been made?
+	IF +LOS<1 SET LOS=99999999
+	IF +MENGE<1 SET MENGE=1
+	SET MENGE=MENGE\LOS                ; FIXME : This code is not the normal "integer divide + 1" <GRF>
+	IF MENGE<1 SET MENGE=1
+	SET ZKOST=$JUSTIFY((ZKOST*MENGE),0,2)
+	QUIT ZKOST
+]]></Routine>
+</Export>

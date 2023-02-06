@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvSearch" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvSearch
+	;-------------------------------------------------------------------------------
+	; Search for Orders/Receipts for an Invoice then adding them
+	;-------------------------------------------------------------------------------
+#include FINConst
+#include COMSYS
+#include INConst
+#include COMConst
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^FINAPInvSearch("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+MatchInvoices(pidSupplier,pidImport="")
+	;-------------------------------------------------------------------------------
+	; Search invoices
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Jun-2005	JW/RW	SR12484: Created
+	;-------------------------------------------------------------------------------
+	if (pidSupplier'="") {
+		do Initialise^COMViewCustom("FINAPInvMatchCache","InvoicesSelected^FINAPInvSearch")
+		
+		do AddFilter^COMViewCustom("D"_$$$FldFINAPInvMatchCacheCompleted,"=",$$$NO)
+		; Remove the following line when orders can be invoiced without receipt
+		do AddFilter^COMViewCustom("D"_$$$FldFINAPInvMatchCacheReceipted,"=",$$$YES)
+		if pidImport="" {
+			do AddFilter^COMViewCustom("D"_$$$FldFINAPInvMatchCacheSupplier,"=",pidSupplier)
+		} else {
+			do AddFilter^COMViewCustom("D"_$$$FldFINAPInvMatchCacheImportNumber,"=",pidImport)
+		}
+		do Start^COMViewCustom()
+	
+	} else {
+		$$$AlertVB($$$Text("Fin00163"),$$$EnumCOMMSGExclamation)  ;Supplier Required
+	}
+	quit
+	
+	
+InvoicesSelected(pobjResultSet)
+	;-------------------------------------------------------------------------------
+	; select invoices from search
+	;
+	; Called by : MatchInvoices^FINAPInvSearch (callback)
+	; 
+	; Returns:
+	;
+	; History:
+	; 28-Jul-2009	PPP		SR16528: Do not goto page bottom if nothing has been added
+	; 20-Oct-2005	JW		SR11573: Use Batching to add
+	; 25-Aug-2005	PO		SR12965: Replaced UpdateTax with PopulateDataField for
+	; 							Tax Total
+	; 08-Jun-2005	JW		Created SR12484
+	;-------------------------------------------------------------------------------
+	new blnAdd,idInvMatch,objInvMatch,objInvoice
+	
+	$$$LogRx("")
+	$$$LogRx("-------------------------------------------------------------------------------")
+	$$$LogRx("")
+
+	set blnAdd = $$$NO
+		
+	$$$GRIDAddBatchStart
+	while pobjResultSet.Next() {
+		set idInvMatch  = $$GetID^COMViewCustom(pobjResultSet)
+		set objInvMatch = $get(^FINAPInvMatchCache(YM,idInvMatch,1))
+	$$$LogR("InvoicesSelected",idInvMatch_"<"_$$$FINAPInvMatchCacheReceipted(objInvMatch))
+		
+		// Receipted
+		if $$$FINAPInvMatchCacheReceipted(objInvMatch) {
+			do AddReceipt(idInvMatch,objInvMatch,.blnAdd)
+			
+		} else { // Order, no receipt
+			// Not implemented yet!!
+		}
+	}
+
+	if blnAdd = $$$YES {
+		$$$GRIDAddBatchStop
+	} else {
+		kill ^CacheTemp(YUSER,"Grid","AddBatch")
+	}
+ 	
+	do GetObject^COMGridEdit31Interface(.objInvoice,$$$YES) ; returns both simple variable and array
+	do PopulateDataField^COMUtils("FINAPInv",$$$FldFINAPInvTaxTotal,$$CalculateTotalTax^FINAPInvLineTax2(.objInvoice),,.objInvoice,$$$NO)
+	do UpdateContainer^COMGridEdit31Interface()
+	quit
+	
+	
+Imports(pidSupplier="")
+    ;-------------------------------------------------------------------------------
+    ; Search on order lines
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 22-Jun-2005	JW		Added quit - returned function to this routine.
+    ; 06-Apr-2005	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	do Initialise^COMViewCustom("INSHIPINFO",,$$$YES)
+	if pidSupplier'="" do AddFilter^COMViewCustom("D"_$$$FldINSHIPINFOSupplier,"=",pidSupplier)
+	do AddFilter^COMViewCustom("D"_$$$FldINSHIPINFOGoodsInvoiceNumber,"=","")
+	do Start^COMViewCustom("WWW2.YFINAPInvD51")
+	
+	quit
+	
+	
+AddReceipt(pidKey="",pobjInvMatch="", &pblnAdd) private
+	;-------------------------------------------------------------------------------
+	; Adds Uninvoiced receipts to the invoice.
+	; 
+	; Called by : InvoicesSelected^FINAPInvSearch
+	; 
+	; History:
+	; 10-Feb-2010	GRF		SR17138: Use new Ordered Unit data 
+	; 28-Jul-2009	PPP		SR16528: Added third variable to be set and passed back
+	; 17-Jun-2009	DWR		SR16602: changed the setting of unit price to come directly
+	; 							from FINAPInvMatch Cache record.
+	; 08-Jun-2005	JW/RW	Created SR12484 (replaces AddReceive)
+	;-------------------------------------------------------------------------------
+	new dteReceipt,idItem,idOrder,idOrderLine,idLocn,idStore,objInvLine,objLine,objItem
+	
+	$$$LogR("AddReceipt",pidKey_"<"_pobjInvMatch)
+	if '$$CacheLinkExists(pidKey) {
+	$$$LogRx("*1*")
+		set idItem      = $$$FINAPInvMatchCacheItem(pobjInvMatch)
+		set idOrder     = $$$FINAPInvMatchCacheSourceOrder(pobjInvMatch)
+		set idOrderLine = $$$FINAPInvMatchCacheOrderLine(pobjInvMatch)
+		set idLocn      = $$$FINAPInvMatchCacheLocation(pobjInvMatch)
+		set idStore     = $$$FINAPInvMatchCacheStockLocation(pobjInvMatch)
+		set dteReceipt  = $$$FINAPInvMatchCacheReceiptDate(pobjInvMatch)
+		
+		set objInvLine=""
+		
+		set $$$FINAPInvLineCacheLink(objInvLine)           = pidKey
+		set $$$FINAPInvLineOrderQuantity(objInvLine)       = $$$FINAPInvMatchCacheOrderQuantity(pobjInvMatch)
+		set $$$FINAPInvLineReceivedQuantity(objInvLine)    = $$$FINAPInvMatchCacheTotalQuantity(pobjInvMatch)
+		set $$$FINAPInvLineUnmatchedQuantity(objInvLine)   = $$$FINAPInvMatchCacheUnmatchedQuantity(pobjInvMatch)
+		set $$$FINAPInvLineAddedFromCache(objInvLine)      = $$$FINAPInvMatchCacheAddedToCache(pobjInvMatch)
+		
+		if (idOrder'="") && (idOrderLine'="") {
+			set objLine = $get(^INAUFP(YM,idOrder,idOrderLine,1))
+			set $$$FINAPInvLineItemDescription(objInvLine) = $$$INAUFPItemName(objLine)
+			set $$$FINAPInvLineOrderNumber(objInvLine)     = idOrder_","_idOrderLine
+		;	set $$$FINAPInvLineOrderUnit(objInvLine)       = $$$INAUFPQuantityUnit(objLine) ; SR17138
+			set $$$FINAPInvLineOrderUnit(objInvLine)       = $$OrderUnit^INRECSummaryUtil(objLine)
+			
+		} else { // Received without order
+			set objItem = $get(^INART(YM,idItem,1))
+			set $$$FINAPInvLineItemDescription(objInvLine) = $$$INARTSearchName(objItem)
+			set $$$FINAPInvLineOrderUnit(objInvLine)       = $$$INARTUnitofMeasure(objItem)
+		}
+		
+		;set $$$FINAPInvLineTaxCode(objInvLine)				= $$GetTaxCode(idOrder,idOrderLine,idItem,idLocn)
+		; Passing in location as a single value is not appropriate for current GetTaxCode (expects a record)
+		; and if no record then defaults to current header, which is appropriate for current uses of AddReceipt
+		; 
+		; There are NO occurrences of:
+		; AddReceipt^FINAPInvSearch
+		; InvoicesSelected^FINAPInvSearch
+		; MatchInvoices^FINAPInvSearch - Except for FINAPInv button line call
+		; 
+		; in any globals that would mean procedure called without FINAPInv header, so this change is safe.
+		
+		set $$$FINAPInvLineTaxCode(objInvLine)              = $$GetTaxCode(idOrder,idOrderLine,idItem)
+	;	set $$$FINAPInvLineOrderEach(objInvLine)            = $$GetUnitCost(pobjInvMatch)   ;SR16602
+		set $$$FINAPInvLineOrderEach(objInvLine)            = $$$FINAPInvMatchCacheEach(pobjInvMatch)
+		set $$$FINAPInvLineItem(objInvLine)                 = idItem
+		set $$$FINAPInvLineReceiveLocation(objInvLine)      = idLocn
+		set $$$FINAPInvLineReceiveStockLocation(objInvLine) = idStore
+		set $$$FINAPInvLineReceiveDate(objInvLine)          = dteReceipt
+		
+	$$$LogRx("*2*"_objInvLine)
+
+		do AddLine(objInvLine)
+		set pblnAdd = $$$YES
+	}
+	quit
+	
+	
+GetTaxCode(pidOrder="",pidLine="",pidProduct="",pobjInvoice="")
+	;-------------------------------------------------------------------------------
+	; Get the Tax code for a receive
+	;
+	; Returns:Tax Code
+	;
+	; History:
+	; 28-Jul-2005	JW		SR12992: Added supplier terms
+	; 02-May-2005	Paul K	SR12231: Created
+	;-------------------------------------------------------------------------------
+	new idTaxCode
+	
+	set idTaxCode=""
+	
+	if (pidOrder'="") && (pidLine'="") {
+		set idTaxCode = $$$INAUFPKInputVATPurchase($get(^INAUFPK(YM,pidOrder,pidLine,1)))
+		
+		if idTaxCode="" {
+			set idTaxCode = $$$INAUFPSalesTax($get(^INAUFP(YM,pidOrder,pidLine,1)))
+		}
+	}
+	if (idTaxCode="") && (pidProduct'="") {
+		set idTaxCode = $$$INARTVATTax($get(^INART(YM,pidProduct,1)))
+	}
+	
+	if idTaxCode="" {
+		if pobjInvoice="" set pobjInvoice = $$$GRIDYFELDContainer
+		set idTaxCode = $$DefaultTaxCode^COMTAX($$$FINAPInvTaxLocation(pobjInvoice))
+	}
+	quit idTaxCode
+	
+	
+AddLine(pobjInvLine)
+	;-------------------------------------------------------------------------------
+	;
+	; Called by : AddReceipt^FINAPinvSearch
+	; 
+	; Returns:
+	;
+	; History:
+    ; 09-Mar-2006	JW		SR14265: Changed checkbox population
+	; 25-Aug-2005	PO		SR12965: Replaced UpdatePriceFields with CalculateAmountsFromInvoiceEach
+	; 27-Jun-2005	PO		SR12705: Set where FC variance is to be posted
+	; 16-Jun-2005	PO		SR:12589 Use the exchange rate on the header for invoice each field
+	; 15-Jun-2005	JW/RW	SR12484: Moved tax/total update ABOVE variance update (now removed)
+	; 07-Apr-2005	RobertW	SR11836: Modified OpenQuantity to UnmatchedQuantity, removed duplicate line
+	; 07-Apr-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new fltAmount,objInvoice
+ 	
+	$$$LogR("AddLine",pobjInvLine)
+	set objInvoice = $$$GRIDYFELDContainer
+	
+	set $$$FINAPInvLineInvoiceQuantity(pobjInvLine) = $$$FINAPInvLineUnmatchedQuantity(pobjInvLine)
+ 	
+ 	set fltAmount                                   = $$$FINAPInvLineOrderEach(pobjInvLine)
+	set $$$FINAPInvLineInvoiceEach(pobjInvLine)     = $$$FCUpdate(fltAmount,$$$FINAPInvExchangeRate(objInvoice),1)
+	do ClosedDefault^FINAPInvMatchCache(.pobjInvLine)                               ; sets D29 $$$FINAPInvLineClosed()
+	set $$$FINAPInvLineInvoiceUnit(pobjInvLine)     = $$$FINAPInvLineOrderUnit(pobjInvLine)
+	do CalculateAmountsFromInvoiceEach^FINAPInvLineTax2(objInvoice,.pobjInvLine)    ; sets D14, D42, D43
+	set $$$FINAPInvLineVarianceFCDPost(pobjInvLine) = $$GetVARFCPost^FINAPInvLineGet(pobjInvLine)
+ 	
+	$$$LogRx("*3*"_pobjInvLine)
+
+	$$$GRIDAddLine(pobjInvLine)
+	//$$$GRIDAddLine(pobjInvLine,,,,,,,$$$YES)   ; possible change - see SR16532 <GRF>
+	quit
+	
+	
+CacheLinkExists(pidKey="") private
+	;-------------------------------------------------------------------------------
+	; Does the line exist in the grid yet?
+	;
+	; Returns: boolean
+	;
+	; History:
+	; 10-Apr-2010	GRF		SR17177: arrGrid rather than objGrid; GRID Macros
+	; 08-Jun-2005	JW/RW	SR12484: Created (replaced LineExists)
+	;-------------------------------------------------------------------------------
+	new arrGrid,idInvoice,idLine,objInvLine
+	
+	$$$GRIDGetContents(.arrGrid)
+	set idInvoice = $order(arrGrid(""))
+	
+	set idLine = ""
+	if idInvoice'="" {
+		for {
+			set idLine = $order(arrGrid(idInvoice,idLine))
+			quit:idLine=""
+			quit:$$$FINAPInvLineCacheLink(arrGrid(idInvoice,idLine))=pidKey
+		}
+	}
+	quit (idLine'="")
+	
+	
+GetUnitCost(pobjInvMatch="") ; DEPRECATED - use $$$FINAPInvMatchCacheEach(...)
+	;-------------------------------------------------------------------------------
+	; *****<FIXME> see note SR16602 below.****
+	; 
+	; Gets the unit cost for an order item or a product.
+	;
+	; Returns:Currency
+	;
+	; History:
+	; 16-Jun-2009	DWR		SR16602: This routine possible redundant as now getting
+	; 							unit cost from FINAPInvMatchCache directly.
+	; 10-Jan-2005	Steve S	SR14150: Initialise curPrice
+	; 08-Jun-2005	JW/RW	SR12484: Created (replaces GetUnitCost)
+	;-------------------------------------------------------------------------------
+	new counter,curPrice,dteCreated,dteReceipt,fltCurrencyRate,idLocn,idOrder,idOrderLine
+	new idStore,idSupplier,idUser,objOrder,objSupplier,objINWEAUF,objINWEFREI
+	new strCurrency,strKeys
+	
+	set curPrice = 0
+	set idOrder  = $$$FINAPInvMatchCacheSourceOrder(pobjInvMatch)
+	
+	// If receive with order - just check INWEAUF
+	if idOrder'="" {
+		set idOrderLine = $$$FINAPInvMatchCacheOrderLine(pobjInvMatch)
+		set idLocn      = $$$FINAPInvMatchCacheLocation(pobjInvMatch)
+		set idStore     = $$$FINAPInvMatchCacheStockLocation(pobjInvMatch)
+		set dteReceipt  = $$$FINAPInvMatchCacheReceiptDate(pobjInvMatch)
+		
+		if $$$FINAPInvMatchCacheReceipted(pobjInvMatch) {   ; FIXME : Base on INRECSummary instead of INWEAUF?  <GRF>
+			set objINWEAUF = $get(^INWEAUF(YM,idOrder,idOrderLine,idLocn,idStore,dteReceipt,1))
+			if objINWEAUF'="" {
+				set objOrder = $get(^INAUF(YM,idOrder,1))
+				if ($$$INAUFOrderCurrency(objOrder)'="") && ($$$INAUFOrderCurrency(objOrder)'=YWHR) {
+					set curPrice = $$$FCJoin($$$INWEAUFUnitPrice(objINWEAUF),$$$INWEAUFPriceForeignCurrency(objINWEAUF),$$$INAUFOrderCurrency(objOrder),$$$INWEAUFExchangeRate(objINWEAUF))
+				
+				} else {
+					set curPrice = $$$INWEAUFUnitPrice(objINWEAUF)
+				}
+			}
+			
+		} else { // Order, no receipt
+			// Not implemented yet!!
+			set curPrice = 0
+		}
+			
+	} else { // receive without order - check INWEFREI     ; FIXME : Base on INRECSummary instead?  <GRF>
+		set strKeys = $$$FINAPInvMatchCacheReceiveKeys(pobjInvMatch)
+		; FIXME : If subroutine is necessary - Base on INRECSummary <GRF>
+		
+		set idLocn	    = $$$KEY1(strKeys)
+		set dteCreated	= $$$KEY2(strKeys)
+		set idUser		= $$$KEY3(strKeys)
+		set counter		= $$$KEY4(strKeys)
+		
+		set objINWEFREI = $get(^INWEFREI(YM,idLocn,dteCreated,idUser,counter,1))
+		
+		if objINWEFREI'="" {   ; Assume that the unit price field on the INWEFREI record is in base.
+			set curPrice   = $$$INWEFREIPrice(objINWEFREI)
+			set idSupplier = $$$FINAPInvMatchCacheSupplier(pobjInvMatch)
+			if idSupplier'="" {
+				set objSupplier = $get(^INLIEF(YM,idSupplier,1))
+				
+				if objSupplier'="" {
+					set strCurrency     = $$$INLIEFCurrency(objSupplier)
+					set fltCurrencyRate = $$FindConversionRate^WWWZAHL(strCurrency,dteCreated) ; SR12582 This duplicates the INWEFREI exchange rate error
+					set curPrice        = $$$FCMake(curPrice,strCurrency,fltCurrencyRate)
+				}
+			}
+		}
+	}
+	
+	quit curPrice
+		
+]]></Routine>
+</Export>

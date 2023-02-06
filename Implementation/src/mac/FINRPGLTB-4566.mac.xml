@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINRPGLTB" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINRPGLTB
+	
+#include COMSYS
+#include FINConst
+#include WWWConst
+	
+#;define AddToRow(%1,%2)	set %1 = %1_$listbuild(%2) ; SR15632
+	
+	;---------------------------------------------------------
+	; Routines for the GL Trial Balance Report (processing)
+	; 14-Oct-2009	GRF		SR15632: Macro replacement
+	;---------------------------------------------------------
+	
+TrialBalance(pidCompany,pstrUser,pidPeriodType,pintYear,pidFromPeriod,
+			   pidToPeriod,pblnIncludeZero,pblnParentOnly,pidLang,pblnActivity=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Do the GL Trial Balance Query
+	;
+	; Params: pidCompany			: The company number
+	; 		  pstrUser				: The YUSER number
+	; 		  pidPeriodType			: The period type
+	; 		  pintYear				: The year number
+	; 		  pidFromPeriod			: The from period
+	; 		  pidToPeriod			: The to period
+	; 		  pblnIncludeZero		: Whether to show accounts with zero balance
+	; 		  pblnParentOnly		: Whether to look at parents only
+	; 		  pblnActivity			: Whether to add activity rows also
+	; 		  pidLang				: The language to use
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Aug-2006	PO		SR14877: use YUSER for subscript and removed $$$Next
+	; 27-Jul-2006	SteveS	SR14861: Added pblnActivity parameter
+	; 19-Jul-2006	RPW		SR14877: Use $sortbegin to speed up the global writes.
+	; 24-May-2006	Stev S	SR14525: Created
+	;-------------------------------------------------------------------------------
+	new idAccount,objFINGLAccount,strUsage,lstRow,YM,YUSER,strType,blnZero,intIndex
+	new blnInclude,ret,SPRACHE
+	
+	set YM      = $get(pidCompany)
+	set YUSER   = $get(pstrUser)
+	set Y       = "~"
+	set SPRACHE = $get(pidLang) //not needed if not showing activity
+	
+	set ret=$sortbegin(^CacheTempQuery) // SR14877
+	
+	set idAccount=""
+	for {
+		set idAccount=$order(^CacheTempAccounts(YUSER,idAccount))
+		quit:(idAccount="")
+		
+		set objFINGLAccount=$get(^FINGLAccount(YM,idAccount,1))
+		
+		set strUsage   = $$$FINGLAccountAccountUsage(objFINGLAccount)
+		set strType    = $$$FINGLAccountAccountType(objFINGLAccount)
+		set blnInclude = $$$YES
+		
+		if (pblnParentOnly) && (strUsage'=$$$EnumFINGLACCOUNTUSAGEParent) {
+			set blnInclude = $$$NO               // if show parents only, skip transaction accounts
+		
+		} elseif ('pblnParentOnly) && (strUsage'=$$$EnumFINGLACCOUNTUSAGETransaction) {
+			set blnInclude = $$$NO               // if trans only, skip parent accounts
+		
+		} elseif (strType=$$$EnumFINGLACCOUNTTYPEStatistical) {
+			set blnInclude = $$$NO               // always skip statistical accounts
+		}
+		
+		if blnInclude {
+			set blnZero=$$$NO
+			set lstRow=$$GetAccountRow(idAccount,pidPeriodType,pintYear,pidFromPeriod,pidToPeriod,.blnZero,pblnActivity)
+			
+			if ('blnZero)||(pblnIncludeZero) { // non-zero, or we're including zero balances
+				set ^CacheTempQuery(pstrUser,$increment(^CacheTempQuery(pstrUser)))=lstRow // SR14877
+				if pblnActivity { //SR14861
+					do GetActivity(idAccount,pidPeriodType,pintYear,pidFromPeriod,pidToPeriod)
+				}
+			}
+		}
+	}
+ 
+ 	set ret=$sortend(^CacheTempQuery) // SR14877
+ 
+	quit
+ 
+ 
+GetAccountRow(pidAccount,pidPeriodType,pintYear,pidFromPeriod,pidToPeriod,&pblnZero,pblnActivity)
+	;-------------------------------------------------------------------------------
+	; Return a row of the trial balance report
+	;
+	; Params:	pidAccount		: The account number
+	; 			pidPeriodType	: The period type to report for
+	; 			pintYear		: The year to report on
+	; 			pidFromPeriod	: From this period ...
+	; 			pidToPeriod		: ... to this period
+	; 			pblnActivity	: Whether to append activity data
+	;
+	; ByRefs:	pblnZero		: Whether this counts as a "zero" line
+	;
+	; Returns: lstRow (the rowset)
+	;
+	; History:
+	; 27-Jul-2006	SteveS	SR14861: Added pblnActivity parameter
+	; 19-Jul-2006	RPW		SR14877: Use GetPeriodTotal locally as it's faster than
+	; 							the original
+	; 24-May-2006	SteveS	SR14525: Created
+	;-------------------------------------------------------------------------------
+	new lstRow,objFINGLAccount,strDesc,curOpenBal,curEndBal,curActivity
+	new idCurrency,intNumDP,idPeriodNext
+	
+	set objFINGLAccount	= $get(^FINGLAccount(YM,pidAccount,1))
+	set strDesc			= $$$FINGLAccountDescription(objFINGLAccount)
+	set idPeriodNext	= $$GetNextPeriod^FINGLPeriod(pidPeriodType,pidToPeriod)
+	
+	set curOpenBal		= $$GetPeriodTotal(pidAccount,"",pidFromPeriod)
+	set curEndBal		= curOpenBal + $$GetPeriodTotal(pidAccount,pidFromPeriod,idPeriodNext)
+	set curActivity		= curEndBal-curOpenBal
+	
+	set idCurrency		= $$$WWW012StandardCurrency($get(^WWW012(0,YM,1)))
+	set intNumDP		= $$GetDecimalPoints^WWWZAHL(idCurrency)
+	
+	set lstRow=""   ; FIXME : Use $$$AddToRow from COMSYS <GRF> (SR15632)
+	
+	set lstRow=lstRow_$listbuild(pidAccount)									; (1) Acc Number
+	set lstRow=lstRow_$listbuild(strDesc)										; (2) Acc Desc.
+	set lstRow=lstRow_$listbuild($$$FINGLAccountAccountType(objFINGLAccount))	; (3) Acc Type
+	set lstRow=lstRow_$listbuild($justify(curOpenBal,0,intNumDP))				; (4) Acc Opening Bal
+	set lstRow=lstRow_$listbuild($justify(curActivity,0,intNumDP))				; (5) Acc Activity
+	set lstRow=lstRow_$listbuild($justify(curEndBal,0,intNumDP))				; (6) Acc Ending Bal
+ 
+	//SR14861: Activity information
+	if pblnActivity {
+		set lstRow=lstRow_$listbuild("")		//	Tran Description
+		set lstRow=lstRow_$listbuild("")		//	Start Date
+		set lstRow=lstRow_$listbuild("")		//	End Date
+		set lstRow=lstRow_$listbuild("")		//	Amount
+	}
+	
+	set pblnZero=('curOpenBal)&&('curEndBal)
+	
+	quit lstRow
+	
+	
+GetPeriodTypeDescription(pidCompany,pidPeriodType)
+ 	;-------------------------------------------------------------------------------
+	; Return a meaning description of this period type
+	;
+	; Params:	pidCompany		: The company number (YM)
+	; 			pidPeriodType	: The period type
+	;
+	; ByRefs:
+	;
+	; Returns: strDesc (the description)
+	;
+	; History:
+	; 24-May-2006	SteveS	SR14525: Created
+	;-------------------------------------------------------------------------------
+	new YM,strDesc,objFINGLPeriodType
+ 
+	set YM      = $get(pidCompany)
+	set strDesc = ""
+	
+	if (YM'="") && ($get(pidPeriodType)'="") {
+		set objFINGLPeriodType = $get(^FINGLPeriodType(YM,pidPeriodType,1))
+		set strDesc = $$$FINGLPeriodTypeDescription(objFINGLPeriodType)
+	}
+ 
+	quit strDesc
+	
+	
+PeriodDate(pidCompany,pidPeriod,pidLang,pblnStart=$$$YES)
+	;-------------------------------------------------------------------------------
+	; Return the period date in a meaningful string
+	;
+	; Params: pidCompany		: The company number (YM)
+	; 		  pidPeriod			: The period we're checking
+	; 		  pidLang			: The language we're in
+	; 		  pblnStart			: Whether we want the start or end
+	;
+	; ByRefs:
+	;
+	; Returns: strDate (meaningful date)
+	;
+	; History:
+	; 24-May-2006	SteveS	SR14525: Created
+	;-------------------------------------------------------------------------------
+	new YM,dteDate,objFINGLPeriod,strDate
+ 
+	set YM      = $get(pidCompany)
+	set strDate = ""
+	
+	if (YM'="") && ($get(pidPeriod)'="") && ($get(pidLang)'="") {
+		set objFINGLPeriod = $get(^FINGLPeriod(YM,pidPeriod,1))
+		if pblnStart {
+			set dteDate = $$$FINGLPeriodStartDate(objFINGLPeriod)
+		} else {
+			set dteDate = $$$FINGLPeriodEndDate(objFINGLPeriod)
+		}
+		set strDate = $$^WWWDATE(dteDate,pidLang)
+	}
+ 
+	quit strDate	
+	
+GetTranTypeDesc(pidCompany,pidTranType)
+	;-------------------------------------------------------------------------------
+	; Return a meaningful description of a GL tran type
+	;
+	; Params: pidCompany		: The company number
+	; 		  pidTranType		: The tran type
+	;
+	; ByRefs:
+	;
+	; Returns: strDesc
+	;
+	; History:
+	; 26-May-2006	SteveS	SR14525: Created
+	;-------------------------------------------------------------------------------
+	new YM,strDesc,objFINGLTranType
+ 
+	set YM      = $get(pidCompany)
+	set strDesc = ""
+	
+	if (YM'="") && ($get(pidTranType)'="") {
+		set objFINGLTranType = $get(^FINGLTranType(YM,pidTranType,1))
+		set strDesc = $$$FINGLTranTypeDescription(objFINGLTranType)
+	}
+	
+	quit strDesc
+ 
+GetActivity(pidAccount,pidPeriodType,pintYear,pidFromPeriod,pidToPeriod)
+	;-------------------------------------------------------------------------------
+	; Build the "activity" (total) rows
+	;
+	; Params:	pidAccount		: The GL Account
+	; 			pidPeriodType	: The period type
+	; 			pintYear		: The year
+	; 			pidFromPeriod	: From ledger period
+	; 			pidToPeriod		: To ledger period
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-May-2006	SteveS	SR14525: Created
+	;-------------------------------------------------------------------------------
+	new lstPeriods,intIndex,idPeriod,idTranType,arrTranTotal,curAmount
+ 	
+	set lstPeriods=$$GetPeriodsForYear^FINGLPeriod(pidPeriodType,pintYear)
+	
+	for intIndex=1:1:$listlength(lstPeriods) {
+		set idPeriod=$listget(lstPeriods,intIndex)
+		if (idPeriod>=pidFromPeriod)&&(idPeriod<=pidToPeriod) {
+			do GetPeriodTotal^FINGLPeriodTotal(pidAccount,idPeriod,"",.arrTranTotal)
+			set idTranType=""
+			for {
+				set idTranType=$order(arrTranTotal(idTranType))
+				quit:idTranType=""
+			
+				set curAmount = +$get(arrTranTotal(idTranType))
+				if curAmount do ActivityRow(pidAccount,idPeriod,idTranType,curAmount)
+			}
+		}
+	}
+	
+	quit
+	
+	
+ActivityRow(pidAccount,pidPeriod,pidTranType,pcurPeriodTotal) private
+	;-------------------------------------------------------------------------------
+	; Builds an activity row for an account in the TB report
+	;
+	; Params:	pidAccount		: The account number
+	; 			pidPeriod		: The period we're looking at
+	; 			pidTranType		: The tran type within this period
+	; 			pcurPeriodTotal	: The total for this period
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Aug-2006	PO		SR14877: Now using YUSER for subscript and removed $$$Next
+	; 27-Jul-2006	SteveS	SR14861: Append account data
+	; 20-Jun-2006	SteveS	SR14525: Created
+	;-------------------------------------------------------------------------------
+	new lstRow,objFINGLPeriod,objFINGLAccount,objFINGLTranType
+ 	
+	set objFINGLPeriod   = $get(^FINGLPeriod(YM,pidPeriod,1))
+	set objFINGLAccount  = $get(^FINGLAccount(YM,pidAccount,1))
+	set objFINGLTranType = $get(^FINGLTranType(YM,pidTranType,1))
+	
+	set lstRow=""   ; FIXME : Use $$$AddToRow from COMSYS <GRF> (SR15632)
+	
+	set lstRow=lstRow_$listbuild(pidAccount)
+	set lstRow=lstRow_$listbuild($$$FINGLAccountDescription(objFINGLAccount))
+	set lstRow=lstRow_$listbuild($$$FINGLAccountAccountType(objFINGLAccount))
+	set lstRow=lstRow_$listbuild("")										//Acc Opening Bal
+	set lstRow=lstRow_$listbuild("")										//Acc Activity
+	set lstRow=lstRow_$listbuild("")										//Acc Ending Bal
+	set lstRow=lstRow_$listbuild($$$FINGLTranTypeDescription(objFINGLTranType))
+	set lstRow=lstRow_$listbuild($$Date^COMRPUtil($$$FINGLPeriodStartDate(objFINGLPeriod),SPRACHE))
+	set lstRow=lstRow_$listbuild($$Date^COMRPUtil($$$FINGLPeriodEndDate(objFINGLPeriod),SPRACHE))
+	set lstRow=lstRow_$listbuild(pcurPeriodTotal)
+		
+	set ^CacheTempQuery(YUSER,$increment(^CacheTempQuery(YUSER))) = lstRow
+	
+	quit
+	
+GetPeriodTotal(pidAccount,pidStartPeriod,pidEndPeriod)
+	;-------------------------------------------------------------------------------
+	; Return period total
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 24-Jul-2006	SteveS	SR14861: Use direct addition (No FC required for a Trial Balance)
+	; 19-Jul-2006	RPW		SR14877: Copied from FINGLPeriod and updated to loop
+	; 							from a start to and end period on this account
+	; 06-Jul-2006	JW&SS	SR14525: Added array by ref
+	; 14-Apr-2005	RPW		SR12159: Make sure that FINGLTranType is no longer shared.
+	; 25-Jun-2004	shobby	Foreign Currency.
+	;-------------------------------------------------------------------------------
+	new curTotal,curAmount,idPeriod,idTranType
+	
+	set curTotal=""
+	if pidStartPeriod'="" set pidStartPeriod=pidStartPeriod-1
+	set idPeriod=pidStartPeriod
+	
+	for {
+		set idPeriod=$order(^FINGLPeriodTotal(YM,pidAccount,idPeriod))
+		quit:(idPeriod="")
+		quit:(idPeriod>=pidEndPeriod)
+		
+		set idTranType=""
+		for  {
+			set idTranType=$order(^FINGLPeriodTotal(YM,pidAccount,idPeriod,idTranType))
+			quit:idTranType=""
+				
+			if '$$$FINGLTranTypeBudget($get(^FINGLTranType(YM,idTranType,1))) {
+				set curAmount = $get(^FINGLPeriodTotal(YM,pidAccount,idPeriod,idTranType,1))
+				set curTotal  = curTotal+curAmount //SR14861
+			}
+		}
+	}
+	quit curTotal
+	
+]]></Routine>
+</Export>

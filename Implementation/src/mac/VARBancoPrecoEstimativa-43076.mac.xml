@@ -1,0 +1,825 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARBancoPrecoEstimativa" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARBancoPrecoEstimativa
+#include COMSYS
+#include COMConst
+#include VARConst
+#include INConst
+#include VARSESAUConst
+
+OnAfterDataFields(pYKEY,pYFELD,pYSEITE)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnAfterDataFields do form VARBancoPrecoEstimativa.
+    ; 
+    ; Histórico:
+    ; 	06-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	if ($get(YSEITE) = 1) {		//Aba Principal
+		do LoadGrid(pYKEY)
+		do PrintTableItens(pYKEY)
+	}
+	
+	if ($get(YSEITE) = 2) {		//Aba Participantes
+		do LoadGridFornecedores(pYKEY)
+		do PrintTableFornecedores(pYKEY)
+	}
+	
+	quit
+	
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnBeforeSave do form VARBancoPrecoEstimativa.mac.
+    ; 
+    ; Histórico:
+    ; 	10-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------		
+	new strStatus
+	set strStatus = $$$GRIDSave(pYKEY)
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$Transaction^COMTransaction("SaveParticipantes^VARBancoPrecoEstimativa("""_pYKEY_""")",$$$YES)
+	}
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		do ReturnError^COMUtilError(strStatus)
+	}
+	
+	quit
+	
+OnAfterSave(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Adiciona os produtos do pedido de compra (quando o grid está vazio).
+	;
+   	; Chamado por:
+   	;	Campo OnAfterSave do form VARBancoPrecoEstimativa
+    ;
+    ; History:
+	;	10-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	new strStatus
+	set strStatus = $$$OK
+	
+	set idPedidoCompra = $piece(YFELD,Y,1)
+	quit:(idPedidoCompra = "")
+
+	//Adiciona os produtos do pedido de compra (somente quando o grid está vazio)
+	if '$data(^VARBancoPrecoEstimativaLinha(YM,pYKEY)) {
+			set strStatus = $$Transaction^COMTransaction("InserirItens^VARBancoPrecoEstimativa("""_pYKEY_""")",$$$YES)
+	}
+	
+	quit	
+	
+OnBeforeDelete(pidEstimativa)
+	;-------------------------------------------------------------------------------
+	; Descrição:
+	;	Antes de deletar o registro pai, deleta as linhas e as tabelas filhas para que
+	;	não hajam registros órfãos nestas.
+	;
+	; Chamado por:
+	;	Campo OnBeforeDelete do form VARBancoPrecoEstimativa.
+	; 
+	; Histórico:
+	; 	06-Ago-2010		Criado
+	;-------------------------------------------------------------------------------	
+	new strStatus		
+	set strStatus = $$$OK
+	set strStatus = $$Transaction^COMTransaction("OnBeforeDeleteTxn^VARBancoPrecoEstimativa("""_pidEstimativa_""")",$$$YES)
+ 
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontDelete
+		do ReturnError^COMUtilError(strStatus)
+	}
+ 
+	quit strStatus
+	
+	
+OnBeforeDeleteTxn(pidEstimativa)
+	;-------------------------------------------------------------------------------
+	; Chamado por:
+	;	Função OnBeforeDelete^VARBancoPrecoEstimativa.mac
+	; 
+	; Histórico:
+	; 	06-Ago-2010		Criado
+	;-------------------------------------------------------------------------------	
+	new strStatus, idEstimativaLinha, idEstimativaForn, idEstimativaProp
+	
+	set strStatus = $$$OK
+	
+	//Deletando as propostas dos fornecedores
+	set idEstimativaLinha = ""
+	$$$Order3(^VARBancoPrecoEstimativaProp,YM,pidEstimativa,idEstimativaLinha)
+		$$$Order4(^VARBancoPrecoEstimativaProp,YM,pidEstimativa,idEstimativaLinha,idEstimativaProp)
+			set strStatus = $$$Kill("VARBancoPrecoEstimativaProp",pidEstimativa_$$$COMMA_idEstimativaLinha_$$$COMMA_idEstimativaProp)
+			quit:($$$ISERR(strStatus))
+		$$$End
+	$$$End
+	
+	if $$$ISOK(strStatus) {
+		//Deletando os participantes
+		set idEstimativaForn = ""
+		$$$Order3(^VARBancoPrecoEstimativaForn,YM,pidEstimativa,idEstimativaForn)
+			set strStatus = $$$Kill("VARBancoPrecoEstimativaForn",pidEstimativa_$$$COMMA_idEstimativaForn)
+			quit:($$$ISERR(strStatus))
+		$$$End
+	}
+ 
+ 	if $$$ISOK(strStatus) {
+		//Deletando as linhas da estimativa
+		set idEstimativaLinha = ""
+		$$$Order3(^VARBancoPrecoEstimativaLinha,YM,pidEstimativa,idEstimativaLinha)
+			set strStatus = $$$Kill("VARBancoPrecoEstimativaLinha",pidEstimativa_$$$COMMA_idEstimativaLinha)
+			quit:($$$ISERR(strStatus))
+		$$$End
+ 	}	
+	
+	quit strStatus
+
+InserirItens(pidEstimativa)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Insere os itens pendentes do pedido de compra na estimativa de preço.
+    ;
+    ; Chamado por:
+    ;	Função OnAfterSave^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	10-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new strStatus, objEstimativa, objPedidoCompra, idPedidoCompraLinha, objPedidoCompraLinha, idProduto, unidade,
+		fltQuantAAtender, idEstimativaLinha, objEstimativaLinha, keyEstimativaLinha
+	
+	set strStatus = $$$OK
+	set objEstimativa = $get(^VARBancoPrecoEstimativa(YM,pidEstimativa,1))
+	
+	set idPedidoCompra = $$$VARBancoPrecoEstimativaPedidodeCompra(YFELD)
+	set idEstimativaLinha  = 0
+	
+	$$$Order3(^VARPedidoCompraLinha,YM,idPedidoCompra,idPedidoCompraLinha)
+	
+		set objPedidoCompraLinha = $get(^VARPedidoCompraLinha(YM,idPedidoCompra,idPedidoCompraLinha,1))		
+		
+		//Dados do pedido
+		set idProduto = $$$VARPedidoCompraLinhaProduto(objPedidoCompraLinha)
+		set unidade   = $$$VARPedidoCompraLinhaUnidade(objPedidoCompraLinha)
+		set fltQuantAAtender = $$GetQuantidadeAAtender^VARPedidoCompraLinha(idPedidoCompra, idPedidoCompraLinha)
+		
+		;Só adiciona o item se resta saldo a atender
+		continue:(fltQuantAAtender <= 0)
+		
+		//Preparando a linha da estimativa
+		set idEstimativaLinha = $i(idEstimativaLinha)
+				
+		set objEstimativaLinha = ""
+		set $$$VARBancoPrecoEstimativaLinhaProduto(objEstimativaLinha)    = idProduto
+		set $$$VARBancoPrecoEstimativaLinhaQuantidade(objEstimativaLinha) = fltQuantAAtender
+		set $$$VARBancoPrecoEstimativaLinhaUnidade(objEstimativaLinha) 	  = unidade
+
+		set keyEstimativaLinha = pidEstimativa_$$$COMMA_idEstimativaLinha
+		set strStatus = $$$Save("VARBancoPrecoEstimativaLinha",keyEstimativaLinha,objEstimativaLinha,1)
+		
+		quit:$$$ISERR(strStatus) strStatus
+		
+	$$$End
+	
+	quit strStatus	
+	
+LoadGrid(pid="")
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função OnAfterDataFields^VARBancoPrecoEstimativa.mac
+    ; 
+    ; Histórico:
+    ; 	06-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new YFORM, YFELD, YKEY, YAUSWAHL
+	
+	set YFORM = "VARBancoPrecoEstimativaLinha"
+	set YFELD = ""
+	set YKEY = $get(pid)
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)	= 1
+	set $$$COMGridEditParameterGridName(YAUSWAHL)	= YFORM
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)	= '($$$WWW120AuthorizationToModifyData(YVOR)=5)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)	= "VARBancoPrecoEstimativa"
+
+	$$$GRIDStart(YFORM,YKEY)
+	
+	quit
+	
+LoadGridFornecedores(pid="")	
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função OnAfterDataFields^VARBancoPrecoEstimativa.mac
+    ; 
+    ; Histórico:
+    ; 	06-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new YFORM, YFELD, YKEY, YAUSWAHL
+	
+	w "&nbsp;<span style=line-height:21px><strong>Fornecedores participantes da estimativa de preços</strong></span>"
+	
+	set YFORM = "VARBancoPrecoEstimativaForn"
+	set YFELD = ""
+	set YKEY = $get(pid)
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)	= 1
+	set $$$COMGridEditParameterGridName(YAUSWAHL)	= YFORM
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)	= '($$$WWW120AuthorizationToModifyData(YVOR)=5)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)	= "VARBancoPrecoEstimativa"
+
+	$$$GRIDStart(YFORM,YKEY)
+	
+	quit
+
+OnBeforeDeleteLinha(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Só permite deletar uma linha (produto), caso esta não tenha propostas cadastradas.
+	;
+   	; Chamado por:
+   	;	Campo ExecuteBeforeDeletePossib do form VARBancoPrecoEstimativaLinha.
+    ;
+    ; History:
+	;	10-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	set idEstimativa = $$$KEY1(pYKEY)
+	set idEstimativaLinha = $$$KEY2(pYKEY)
+	
+	quit:('$data(^VARBancoPrecoEstimativaLinha(YM,idEstimativa,idEstimativaLinha)))
+	
+	if $data(^VARBancoPrecoEstimativaProp(YM,idEstimativa,idEstimativaLinha)) {
+		set Q = $$$QDontDelete
+ 		do ReturnError^COMUtilError("Não é possível deletar um produto que tenha propostas cadastradas para ele.")
+	}
+
+	quit
+
+OnBlurProduto(pintCol,pintRow,&pobjYFELD)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo ExecuteOnBlur do campo (1)-Produto no form VARBancoPrecoEstimativaLinha
+    ; 
+    ; Histórico:
+    ; 	09-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new idProduto, idEstimativa, idPedidoCompra
+	
+	set idProduto      = $piece(pobjYFELD,Y,1)	
+	set idEstimativa   = $$$KEY1(YKEY)	
+	set idPedidoCompra = $piece($get(^VARBancoPrecoEstimativa(YM,idEstimativa,1)),Y,1)
+	
+	if (idPedidoCompra '= "") {
+		if ( '$data(^VARPedidoCompraLinhas(YM,1,idProduto,idPedidoCompra)) ) {
+			set $piece(YFELD,Y,1) = ""	;Produto
+			set $piece(YFELD,Y,8) = ""	;Unidade
+						
+			$$$Alert("O produto "_idProduto_" não existe no pedido de compra. Favor verificar.")
+			quit
+		}
+	}
+	
+	if idProduto = "" {
+		set $piece(YFELD,Y,8) = ""	;Unidade
+		quit
+	}
+	
+	set objProduto = $get(^INART(0,idProduto,1))
+	set Unidade    = $piece(objProduto,Y,40)
+
+	set $piece(pobjYFELD,Y,8) = Unidade
+	
+	quit
+
+CanPrintRelatorio(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo ExecuteToCheckForDisabled do botão (1)-Imprimir no form VARBancoPrecoEstimativa
+    ; 
+    ; Histórico:
+    ; 	10-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:(pYKEY = "")
+	
+	// Verifica se a estimativa de preços tem produtos
+	if '$data(^VARBancoPrecoEstimativaLinha(YM,pYKEY)) {
+		set YQ = 1_"É necessário inserir pelo menos um produto na estimativa de preços."
+		quit
+	}
+
+	quit
+	
+CanPrintMapaComparativo(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo ExecuteToCheckForDisabled do botão (2)-Mapa Comparativo no form 
+    ;	VARBancoPrecoEstimativa.
+    ; 
+    ; Histórico:
+    ; 	10-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:(pYKEY = "")
+	
+	new idEstimativaLinha, noPropostas
+	
+	// Verifica se a estimativa de preços tem produtos
+	if '$data(^VARBancoPrecoEstimativaLinha(YM,pYKEY)) {
+		set YQ = 1_"É necessário inserir pelo menos um produto na estimativa de preços."
+		quit
+	}
+	
+	// Verifica se cada produtos tem pelo menos 3 propostas
+	$$$Order3(^VARBancoPrecoEstimativaLinha,YM,pYKEY,idEstimativaLinha)
+		set noPropostas = 0
+		set noPropostas = $$getNoPropostas(pYKEY,idEstimativaLinha)
+		if (noPropostas = 0) {
+			set YQ = 1_"Cada produto deve ter no mínimo uma proposta para que possa ser impresso o mapa comparativo."
+			quit	
+		}
+	$$$End
+
+	quit
+
+PrintTableItens(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função OnAfterDataFields^VARBancoPrecoEstimativa.mac
+    ; 
+    ; Histórico:
+    ; 	6-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:(pYKEY = "")
+	
+	new count, lstHeader, idEstimativa, idEstimativaLinha, objEstimativaLinha, idProduto, quantidade,
+		isCotado, key, strCallBack, strBotao, noPropostas, strPossuiPropostas
+		
+	set idEstimativa = $$$KEY1(pYKEY)
+	set count = 0
+	
+	set precoTotalPedido = 0
+	
+	set lstHeader = ""
+	set lstHeader = lstHeader_$listbuild("Seq.","Produto","Quantidade","No. de Propostas","")
+
+	if $$Start^COMTable(lstHeader,"Produtos na estimativa de preços",,,$$$NO) {
+
+		$$$Order3(^VARBancoPrecoEstimativaLinha,YM,idEstimativa,idEstimativaLinha)
+
+			set count = $i(count)
+			
+			set objEstimativaLinha = $get(^VARBancoPrecoEstimativaLinha(YM,idEstimativa,idEstimativaLinha,1))
+			
+			set idProduto  = $$$VARBancoPrecoEstimativaLinhaProduto(objEstimativaLinha)
+			set quantidade = $$$VARBancoPrecoEstimativaLinhaQuantidade(objEstimativaLinha)
+			
+			set key = idEstimativa_$$$COMMA_idEstimativaLinha
+			set strCallBack = "GoToCadastroPropostas^VARBancoPrecoEstimativa"			
+			set strBotao 	= "<img src="_YGIF_"Propostas.gif TITLE='Clique para cadastrar/visualizar propostas de fornecedores para esse produto.' border=0 align=""CENTER"">"
+			
+			set noPropostas = $$getNoPropostas(idEstimativa,idEstimativaLinha)
+			
+			if (noPropostas = 0) {
+				set noPropostas = "<font color=red>Nenhuma</font>"	
+			} elseif (noPropostas > 0) && (noPropostas < 3) {
+				set noPropostas = "<font color=red>"_noPropostas_" proposta(s)</font>"
+			} else {
+				set noPropostas = "<font color=blue>"_noPropostas_" proposta(s)</font>"
+			}
+			
+			do NewLine^COMTable()
+	 		do InsertCell^COMTable(count)
+	 		do InsertCell^COMTable(idProduto_" - "_$$SQLGetDescricaoProduto^VARSQL(idProduto),,,,,,,,,$$$YES)
+	 		do InsertCell^COMTable($$^WWWTR(0,12,quantidade),,,,"RIGHT")
+	 		do InsertCellCallback^COMTable(noPropostas,strCallBack,key)
+	 		do InsertCellCallback^COMTable(strBotao,strCallBack,key)
+	      	do EndLine^COMTable()
+	
+		$$$End
+		
+		if (count = 0) {
+			do NewLine^COMTable()
+			do InsertCell^COMTable("Nenhum produto na estimativa de preços",,,,,,5)
+			do EndLine^COMTable()
+			
+		}
+		
+		do Stop^COMTable()
+	}
+
+	quit
+	
+getNoPropostas(pidEstimativa,pidEstimativaLinha)
+	quit:(pidEstimativaLinha = "") ""
+	
+	new noPropostas, objProposta, preco
+	set noPropostas = 0
+	
+	$$$Order4(^VARBancoPrecoEstimativaProp,YM,pidEstimativa,pidEstimativaLinha,idProposta)
+		
+		set objProposta = $get(^VARBancoPrecoEstimativaProp(YM,pidEstimativa,pidEstimativaLinha,idProposta,1))
+		
+		set fltPreco = $piece(objProposta,Y,3)		
+		if (fltPreco '= "") {
+			set noPropostas = $i(noPropostas)
+		}
+	$$$End
+
+	quit noPropostas
+	
+
+GoToCadastroPropostas(pidEstimativa,pidEstimativaLinha)
+	new keyEstimativaLinha
+	set keyEstimativaLinha = pidEstimativa_$$$COMMA_pidEstimativaLinha
+	do GoToForm^COMUtilForm("VARBancoPrecoEstimativaPropCad",keyEstimativaLinha)
+	
+	quit
+	
+		
+PrintTableFornecedores(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função OnAfterDataFields^VARBancoPrecoEstimativa.mac
+    ; 
+    ; Histórico:
+    ; 	06-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	if ( (pYKEY = "") || (pYKEY = "+") ) {
+		w "<br />&nbsp;&nbsp;Favor selecionar uma estimativa de preços.<br /><br />"
+		quit
+	}
+
+	kill ^VARTempParticipEstimativa(YM,YBED)
+	
+	new idItem, strListaFornecedores, count, lstHeader, idFornecedor, objFornecedor, nomeFantasia, cnpjcpf,
+		email, telefone, fax, key, blnFornJaIncluido, blnAtLeastOneToChoose, strItems
+	
+	set strItems = ""
+	
+	$$$Order3(^VARBancoPrecoEstimativaLinha,YM,pYKEY,idEstimativaLinha)
+	
+		set idItem = $piece($get(^VARBancoPrecoEstimativaLinha(YM,pYKEY,idEstimativaLinha,1)),Y,1)
+		set strItems = strItems_";"_idItem
+	
+	$$$End
+	
+	if (strItems = "") {
+		w "<br />&nbsp;&nbsp;Nenhum produto inserido na estimativa de preços.<br /><br />"
+		quit
+	}
+	
+	set strListaFornecedores = $$GetFornecedores^VARINART(strItems)
+	set count = 0
+	
+	set blnAtLeastOneToChoose = $$$NO
+	
+	//Monta cabeçalho da tabela
+ 	set lstHeader=""
+  	set lstHeader=lstHeader_$listbuild("","Seq.","Cód.","Fornecedor","CNPJ/CPF","Email","Telefone 1","Fax")
+				 			    			    							 	
+  	if $$Start^COMTable(lstHeader,"<div style=margin:3px;>Lista sugerida de fornecedores para participar da estimativa de preços</div>",,,$$$NO) {
+		
+		for cnt = 1:1:$length(strListaFornecedores,";") {      		
+    		set idFornecedor = $piece(strListaFornecedores,";",cnt)
+     			
+    		continue:(idFornecedor = "")
+    		continue:(idFornecedor = 0)  ;Não mostrar o fornecedor 0-Própria Empresa
+    		set count = $i(count)
+      			
+    		set objFornecedor = $get(^INLIEF(YM,idFornecedor,1))
+    		set nomeFantasia  = $piece(objFornecedor,Y,8)
+    		set cnpjcpf       = $piece(objFornecedor,Y,201)
+      		set email         = $piece(objFornecedor,Y,24)
+      		set telefone      = $piece(objFornecedor,Y,208)
+      		set fax       	  = $piece(objFornecedor,Y,22)
+      		
+      		set key = pYKEY_","_idFornecedor
+      		
+      		if $data(^VARBancoPrecoEstimativaForns(0,1,idFornecedor,pYKEY)) {
+	      		set blnFornJaIncluido = $$$YES
+      		} else {
+	      		set blnFornJaIncluido = $$$NO
+	      		set blnAtLeastOneToChoose = $$$YES
+      		}
+      		
+      		do NewLine^COMTable()
+			do InsertCellCheckbox^COMTable(key,"SelecionarSugestao^VARBancoPrecoEstimativa",blnFornJaIncluido,blnFornJaIncluido)      		
+      		do InsertCell^COMTable(count,"INLIEF",idFornecedor)
+      		do InsertCell^COMTable(idFornecedor,"INLIEF",idFornecedor)
+      		do InsertCell^COMTable(nomeFantasia,"INLIEF",idFornecedor)
+      		do InsertCell^COMTable(cnpjcpf,"INLIEF",idFornecedor)
+      		do InsertCell^COMTable(email,"INLIEF",idFornecedor)
+      		do InsertCell^COMTable(telefone,"INLIEF",idFornecedor)
+      		do InsertCell^COMTable(fax,"INLIEF",idFornecedor)
+      		do EndLine^COMTable()		
+		}
+		
+		if (blnAtLeastOneToChoose = $$$YES) {
+			do NewLine^COMTable("lightsteelblue")
+			do InsertCellCheckbox^COMTable(pYKEY,"SelecionarTodos^VARBancoPrecoEstimativa",$$$NO,$$$NO)
+			do InsertCell^COMTable("<strong>Utilizar todos acima</strong>",,,,,,7)
+			do EndLine^COMTable()
+		}		
+			
+		if (count = 0) {
+			do NewLine^COMTable("white")
+			do InsertCell^COMTable("Nenhum fornecedor sugerido.",,,,,,8)
+			do EndLine^COMTable()
+		}
+		
+		do Stop^COMTable()
+  	}
+	
+	quit
+	
+SelecionarSugestao(pYKEY="",pChecked="")
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Salva a marcação ou desmarcação do usuário no checkbox com a sugestão de 
+    ; 	fornecedor.
+   	;
+   	; Chamado por:
+    ;	Função PrintTableFornecedores^VARBancoPrecoEstimativa.mac
+    ; 
+    ; Histórico:
+    ; 	06-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	new idFornecedor	
+	set idFornecedor = $$$KEY2(pYKEY)
+	
+	if ($piece(pChecked,",",1) = "true") {
+		set ^VARTempParticipEstimativa(YM,YBED,$$$KEY1(pYKEY),idFornecedor,1) = ""
+	
+	} elseif ($piece(pChecked,",",1) = "false") {
+		kill ^VARTempParticipEstimativa(YM,YBED,$$$KEY1(pYKEY),idFornecedor)
+	}
+	
+	quit $$$YES
+	
+SelecionarTodos(pYKEY="",pChecked="")
+	quit:(pYKEY = "")
+
+	if ($piece(pChecked,",",1) = "true") {
+		
+		new strFornecedores, idFornecedor
+		set strFornecedores = $$GetFornecedores^VARINART(90040)
+
+		for cnt = 1:1:$length(strFornecedores,";") {      		
+    		set idFornecedor = $piece(strFornecedores,";",cnt)
+    		
+    		continue:(idFornecedor = "")
+    		continue:(idFornecedor = 0)  ;Não mostrar o fornecedor 0-Própria Empresa    		
+			
+			set ^VARTempParticipEstimativa(YM,YBED,pYKEY,idFornecedor,1) = ""			
+		}
+		
+	} elseif ($piece(pChecked,",",1) = "false") {
+		kill ^VARTempParticipEstimativa(YM,YBED,pYKEY)
+	}
+
+	quit $$$YES
+	
+SaveParticipantes(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Chamado por:
+    ;	Função OnBeforeSave^VARBancoPrecoEstimativa.mac
+    ; 
+    ; Histórico:
+    ; 	6-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	new strStatus, ultimoReg, idFornecedor, objParticipante, chave
+	
+	set strStatus = $$$OK
+	set ultimoReg = ""
+	
+	$$$Order4(^VARTempParticipEstimativa,YM,YBED,pYKEY,idFornecedor)
+		if ultimoReg = "" {
+			set ultimoReg = $order(^VARBancoPrecoEstimativaForn(YM,pYKEY,ultimoReg),-1) + 1			
+		} else {
+			set ultimoReg = ultimoReg + 1	
+		}		
+		
+		set chave = pYKEY_","_ultimoReg
+		set objParticipante = idFornecedor
+		
+		set strStatus = $$$Save("VARBancoPrecoEstimativaForn",chave,objParticipante,1)
+	$$$End
+	
+	quit strStatus
+	
+OnBlurFornecedor(pYKEY,pYFORM)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Verifica se o fornecedor já foi inserido na lista de fornecedores.
+    ;
+    ; Chamado por:
+    ;	Campo "ExecuteOnBlur" do campo (1)-Fornecedor do form VARBancoPrecoEstimativaForn
+    ; 
+    ; Histórico:
+    ; 	10-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new idSupplier, listSuppliers, date, focusField, currentLine, isSupplierIncluded
+		
+	set idSupplier  = $piece(YFELD,Y,1)
+	set listSuppliers = $$getFornecedoresJaIncluidos()
+	
+	set date = $piece($horolog,YKOMMA,1)
+	set focusField = $get(^WWWDATEN(0,date,YUSER,pYFORM,"V","FOCUSFIELD"))
+	set currentLine = $extract($piece(focusField,"_",1),2,$length(focusField))
+	
+	set isSupplierIncluded = $$$NO
+	
+	for gridLine=1:1:$length(listSuppliers) {
+	// Skips if dealing with current line of the grid:
+		continue:(gridLine = currentLine)
+
+		if ($piece(listSuppliers,Y,gridLine) = idSupplier) {
+			set isSupplierIncluded = $$$YES
+			quit
+		}
+	}
+
+	set seq = ""
+	if (isSupplierIncluded = $$$YES) {
+		// Searches for the "Seq." value of the grid line:
+		for {
+			set seq = $order(^WWWDATEN(0,date,YUSER,pYFORM,"V","REFERENCEROW",seq))
+			quit:(seq = "")
+			if ($get(^WWWDATEN(0,date,YUSER,pYFORM,"V","REFERENCEROW",seq,1)) = gridLine) {
+				quit
+			}
+		}
+		// ----
+		set $piece(YFELD,Y,1) = ""
+		$$$Alert("Este fornecedor '"_idSupplier_"' já foi incluído na Seq. "_seq_".")
+	}
+	
+	quit
+	
+getFornecedoresJaIncluidos()
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função OnBlurFornecedor^VARBancoPrecoEstimativaForn.mac
+    ;
+    ; Histórico:
+    ; 	10-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new date, supplierColumn, listSuppliers, gridLine, supplierCode
+	
+	set date = $piece($horolog,YKOMMA,1)
+	
+	set supplierColumn = 1
+	set listSuppliers  = ""
+ 
+	// Loop on grid lines:
+	set gridLine = 1
+	for {
+		set supplierCode = $get(^WWWDATEN(0,date,YUSER,pYFORM,"V","Y"_gridLine_"_"_supplierColumn,1))
+		quit:(supplierCode = "")
+		
+		if ($get(^WWWDATEN(0,date,YUSER,pYFORM,"V","KILLEDRECORD",gridLine)) '= 1) {			
+			set $piece(listSuppliers,Y,gridLine) = supplierCode
+		}
+		
+		set gridLine = $i(gridLine)
+	}
+	
+	quit listSuppliers
+	
+CanEnviarEmail(pYKEY)
+	if ((pYKEY '= "") && ($order(^VARBancoPrecoEstimativaForn(YM,pYKEY,"")) '= "")) {
+		set YQ = $$$YQEnable
+	}
+	else {
+		set YQ = 1
+	}
+	
+	quit
+	
+OnBeforeButtonLine
+	write !, "<script language=""javascript"">"
+	&js<
+		    function enviarCallbackEmail() {
+			    CallBack('PreparaEmail^VARBancoPrecoEstimativa','#(YKEY)#');
+		    }
+		>
+	write !, "</script>"
+	
+	quit
+	
+PreparaEmail(pidEstimativa)
+	;-------------------------------------------------------------------------------
+    ; Prepara os dados e gera um e-mail para envio de cotações.
+    ; 
+    ; History:
+    ; 04-Nov-2009   Gustavo Fiuza		Updated
+    ; 29-Out-2009	Rodrigo Petik		Created
+    ;-------------------------------------------------------------------------------
+	new objModeloEmail, De, Para, textoAssunto, textoMensagem, anexo, codModulo, codRegistro,
+		textoProcedencia, textoAssinatura, idDestinatarios, ExecutarAposEnviar, codEmail
+	
+	set objModeloEmail = $get(^VARParametroClienteEmail(YM,$$$EnumVARParametroClienteEmailCotacaoFornecedores,1))
+	
+	set De				= $$$VARParametroClienteEmailRemetente(objModeloEmail) ;$piece(^VARParametroCliente(YM,0,1),Y,10)
+	set Para			= $$GetEmailsFornecedoresParticipantes(pidEstimativa)
+	set textoAssunto	= $$$VARParametroClienteEmailTitulo(objModeloEmail)_" "_pidEstimativa
+	set textoMensagem	= $$$VARParametroClienteEmailMensagemPadrao(objModeloEmail)
+	
+	/********************************************************************
+	1 - Definir o Nome do Arquivo para o Jasper Gerar o mesmo como .pdf
+	*********************************************************************/
+	set anexo = "ReportEstimativaPreco_"_$$getYYMMDDhhmmss()
+			
+	/********************************************************************
+	2 - Gerar relatório com Jasper passando o nome do arquivo pdf
+	*********************************************************************/
+	/*set link=$$Start2^VARJasperRun("ReportEstimativaPreco",nomeArquivo)	
+		set link=$$addParameter^VARJasperRun(link,numPesquisa,1)		
+	do Run^VARJasperRun(link)*/
+	
+    do RunReportEstimativaPreco^VARJasperRunReport(pidEstimativa,anexo,0)
+    
+    /*******************************************************************************
+	3 - Passar o nomeArquivo gerado pelo jasper com a extensão .pdf como anexo
+	*******************************************************************************/
+ 	set anexo = anexo_".pdf"
+ 
+	set codModulo          = 1 ;1 - Dispensa de Licitação (designação temporária)
+	set codRegistro        = pidEstimativa
+	set textoProcedencia   = $$$VARParametroClienteEmailProcedencia(objModeloEmail)_" "_pidEstimativa
+	set textoAssinatura    = $$$VARParametroClienteEmailAssinatura(objModeloEmail)
+	
+	;sobre o repositorio onde o arquivo se encontra para ser anexado.
+	set repositorio = "Jasper"
+		 	
+ 	/*
+ 	 Finalizar setando o EmailTemp, criando o registro de E-Mail e solicitando o popup com o mesmo.
+ 	*/
+ 	
+ 	set codEmail = 0 Do CriaRegistroEmailJasper^VAREmail(.codEmail,De,Para,textoAssunto,textoMensagem,anexo,
+    													codModulo,codRegistro,textoProcedencia,textoAssinatura,
+    													repositorio)
+    
+    set ^VAREmailTemp(YM,YUSER,"Modulo") = 5 ; modulo cadastrado em VARBRUPLOAD
+ 	;Chama a tela de e-mail se o usuário clicou no botão
+	do openPopUpEmail^VAREmail(codEmail)
+	
+	;do RedirectForm^COMUtilForm("VARBancoPrecoEstimativa",pidEstimativa,YBACK,"","")
+ 
+	quit
+	
+getYYMMDDhhmmss()
+	new vAno,vMes,vDia,vHoraAtual,vHora,vMinuto,vSegundo
+	
+	set vAno = $extract($$^WWWYEAR(),3,4)
+	set vMes = $$^WWWMONTH() 
+	if (vMes < 10){
+		set vMes="0"_vMes
+	}
+	set vDia = $$^WWWDAY1()
+	if (vDia < 10){
+		set vDia="0"_vDia
+	}
+	set vHoraAtual = $$^WWWTIME($HOROLOG)
+	set vHora = $piece(vHoraAtual,":",1)
+	set vMinuto = $piece(vHoraAtual,":",2)
+	set vSegundo = $piece(vHoraAtual,":",3)
+		
+	quit vAno_vMes_vDia_vHora_vMinuto_vSegundo
+	
+GetEmailsFornecedoresParticipantes(pidEstimativa)
+	new linha,idFornecedor,objFornecedor,strEmailsFornecedores
+	
+	set linha = ""
+	set strEmailsFornecedores = ""
+	for {
+		set linha = $order(^VARBancoPrecoEstimativaForn(YM,pidEstimativa,linha))
+		quit:(linha = "")
+		
+		set idFornecedor = $piece(^VARBancoPrecoEstimativaForn(YM,pidEstimativa,linha,1),Y,1)
+		
+		set objFornecedor = $get(^INLIEF(YM,idFornecedor,1))
+		if ((objFornecedor '= "") && ($$$INLIEFEmail(objFornecedor) '= "")) {
+			if (strEmailsFornecedores'="") {
+				set strEmailsFornecedores = strEmailsFornecedores_","
+			}
+			set strEmailsFornecedores = strEmailsFornecedores_$$$INLIEFEmail(objFornecedor)
+		}
+	}
+	
+	quit strEmailsFornecedores
+]]></Routine>
+</Export>

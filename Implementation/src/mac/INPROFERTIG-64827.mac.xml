@@ -1,0 +1,642 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INPROFERTIG" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INPROFERTIG
+#include COMSYS
+#include INConst
+#include WWWConst
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		PRODUKTIONSFERTIGMELDUNGEN
+	;		PRODUCTION COMPLETE MESSAGES
+	;		
+	;	Called by form INPROFERTIG
+	;		[ AlphaLinc >> Production >> PDA >> Enter Production Stop ]
+	;	And form INPROENDE (Finish Work Order) via routine INPROENDE
+	;   and form INRECWO   (Partial Receipt)   via routine INRECProcess
+	;   
+	;	also routines INBDE1, INDEVICEFERTIGUNG, INPROBDE, INPROPRIONEXT & INSERV009
+	;
+	; Inputs : 
+	;	NODISPLAY	= 1 KEINE ANZEIGE ;no Show
+	;	NOTIME		boolean - Save Timestamps - depends on where called from as to relevance
+	;	YINUSE		=1 ?
+	;	VORG(1)		Work Order
+	;					;ENTWEDER NUR STEMPELNUMMER Z.B. 1221 =YI(1)
+	;					;ODER MIT UNTERNUMMER       Z.B. 1221.1 = YI(1).YI(3)
+	;	VORG(2)		Employee			;MITARBEITER
+	; ?	VORG(3)							;DATUM STOP
+	; ?	VORG(4)							;UHRZEIT
+	;	VORG(5)		New Serial No.		;SERIENNUMMER
+	;	VORG(6)		Lot No.				;LOTNUMMER
+	;	VORG(7)		Output Qty			;PRODUKTIONSMENGE
+	;	VORG(8)		Start Statistical Cost Accounting (On Main Item)    [Boolean]
+	;					;NK STARTEN WENN HAUPTTEIL                ;29.11.04;26744
+	;	VORG(98) = BESTAND NICHT NOKORRIGIEREN JA/NEIN ;Work Order *NOT* complete - default is complete!
+	;	VORG(99) = ANZEIGEART    ; display type
+	;
+	; Usage :
+	;	YI(1)    = STEMPELNUMMER/FERTIGUNGSAUFTRAG
+	;	YI(2)    = DATENSATZ DER FERTIGUNGSNUMMER
+	;	YI(3)    = UNTER-STEMPELNUMMER
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 23-Feb-2007	GRF		SR15454: Property name clarified "INVORGBSubContractLocn"
+	; 30-Jan-2007	GRF		SR14471+ : Restored incorrectly deleted lines, actually against SR15243
+	; 29-Sep-2006	GRF		SR14471 : Naked References; doco; quits
+	; 03-Nov-2005	GRF/RW	SR13085 : Process from form INRECWO
+	; 09-Aug-2005	GRF		SR13152 : Doco & Macros re statistical costs
+	; 29-Jul-2005	GRF		SR13120 : Doco & Macros re finishing work order
+	; 27-Jul-2005	FIS		SR13101 : Service No. smaller Suffix Length
+	; 22-Jul-2005	GRF		SR13071 : Interim correction to ensure work order
+	; 						contains a service subscript; !,&=>||,&&
+	; 11-Jul-2005	GRF		SR12863 : Macro calls; doco
+	; 08-Jul-2005	GRF		SR12863 : Doco; comment out unnecessary tests & $gets
+	; 13.09.2000	DT
+	;-------------------------------------------------------------------------------
+	new MNG,MULTI,NOKORR,OK,OrigCompQty,OrigParentQty,PartCompQty,PartParentQty,QPRUEF,Status,TIME
+	new YAUF,YDATEI,YI,YI1,YLFN,YLFN1,YPOS,YTAG
+	
+	SET VORG(5)=$TRANSLATE($GET(VORG(5)),",",";")
+	SET VORG(6)=$TRANSLATE($GET(VORG(6)),",",";")
+	
+	IF $GET(VORG(1))="" IF $GET(VORG(99))=1 DO ^WWWINFO($$^WWWTEXT(32292),0) QUIT  ;BITTE PRÜFEN! ;please check
+	QUIT:$GET(VORG(1))=""                                    ;KEINE STEMPELNUMMERN ;No work order No.
+	
+	IF $GET(VORG(2))="" SET VORG(2)=YBED                     ;BEDIENER
+	IF $GET(VORG(3))="" SET VORG(3)=+$HOROLOG                ;DATUM ;Date
+	IF $GET(VORG(4))="" SET VORG(4)=+$PIECE($HOROLOG,",",2)  ;UHRZEIT
+	SET VORG(1)=$TRANSLATE(VORG(1),"| ;"_$CHAR(10,13),",,,,,")
+	SET MULTI=0                                              ;MEHRERE STEMPELNUMMER GLEICHZEITIG ;divers synchronous 
+	
+	SET NOKORR=+$$$INVORGNoQtyCheckon1stWorkOrder($get(^INVORG(YM,YM,1)))         ;BESTANDSKORREKTUR 0=BESTAND KORRIGIEREN 1=NICHT KORRIGIEREN
+	IF $GET(VORG(99))'="" SET NOKORR=+$GET(VORG(98))         ;MANUELLE AUSWAHL WENN EINSPRUNG AUS FORMULAR ;Selection when out of form 
+	SET NOTIME=+$GET(NOTIME)  ;KEINE ZEITEN SPEICHERN, NUR BESTANDSBERICHTIGUNG
+	
+	set Status = $$WithSuffix(VORG(1))
+	if Status'=$$$OK do ^WWWINFO($$^WWWTEXT(32292)_" : "_$piece(Status,Y,2),0) quit
+	
+	;UMSCHLÜSSELN STEMPELNUMMER.UNTERNUMMER
+	FOR YI=1:1 SET YI(0)=$PIECE(VORG(1),",",YI)  QUIT:$PIECE(VORG(1),",",YI,999)=""  DO
+	. QUIT:YI(0)=""
+	. IF '$FIND(YI(0),".") DO         ;OHNE STEMPEL-UNTERNUMMER ;work order doesn't have "base.service" format
+	. . IF $DATA(^INPROSTEMP(YM,YI(0)))  QUIT 
+	. . IF $DATA(^INPROSTEMP1(YM,YI(0))) QUIT 
+	. . ;
+	. . ; If not found, try converting to "base.service" format
+	. . SET YI(0)=$REVERSE($EXTRACT($REVERSE(YI(0)),3,99))_"."_$REVERSE($EXTRACT($REVERSE(YI(0)),1,2))
+	. . ; FIXME : 2nd part of test not required since YI(0) can't be
+	. . ;         null, must have at least one character after the dot. <GRF>
+	. . IF ($PIECE(YI(0),".",1)="") || ($PIECE(YI(0),".",2)="") QUIT                                         ;UNGÜLTIGE EINGABE
+	. . IF '$DATA(^INPROSTEMP(YM,$PIECE(YI(0),".",1))) && '$DATA(^INPROSTEMP1(YM,$PIECE(YI(0),".",1))) QUIT  ;EXISTIERT NICHT ;Not 
+	. . SET $PIECE(VORG(1),",",YI)=YI(0)
+	
+	FOR YI=1:1 SET YI(1)=$PIECE($PIECE(VORG(1),",",YI),".",1)  QUIT:$PIECE(VORG(1),",",YI,999)=""  DO
+	. QUIT:YI(1)=""
+	. SET YI(2)=$GET(^INPROSTEMP1(YM,YI(1),1))  ;ZURUECKHOLEN ALTE DATEN
+	. IF $TRANSLATE($PIECE(YI(2),Y,1,21),Y)="" SET YI(2)=$GET(^INPROSTEMP(YM,YI(1),1))
+	. IF $PIECE($GET(^INPROSTEMP1(YM,YI(1),1)),Y,22)'="" SET $PIECE(YI(2),Y,22)=$PIECE(^INPROSTEMP1(YM,YI(1),1),Y,22)    ; 29-Sep-2006
+	. DO
+	. . QUIT:YI(2)=""                  ;ALT NICHT VORHANDEN ;no old record
+	. . SET YI(3)=+$PIECE($PIECE(VORG(1),",",YI),".",2)
+	. . IF YI(3)=0 SET YI(3)=""
+	. . IF $PIECE(YI(2),Y,14)="" QUIT  ;NICHT GESTARTET ;Not started
+	. . SET MULTI=MULTI+1
+	. ;
+	. IF VORG(5)'="" IF $FIND(VORG(5),";") DO  ;MAX ANZAHL SERIENNUMMERN
+	. . SET VORG(5)=$PIECE(VORG(5),";",1,$PIECE(YI(2),Y,21))
+	
+	IF +MULTI=0 SET MULTI=1
+	
+	;+++++++++++++++++++++++++++++++++++++++++++
+	; VORG(1)     Contains a comma delimited list of ???
+	;             each entry is extracted as     "YI(1).YI(3)"
+	; 
+	; YI(2)       objINPROSTEMP1   Processed Manufacturing Numbers  and
+	;             objINPROSTEMP    Open Production Order  (temporary)
+	; YII(1)      objINPROSTEMPT   Manufacturing Sections
+	; SATZ        objINAUFP        Order Line
+	; AUFX(9)     gblINAUFPXL
+	;+++++++++++++++++++++++++++++++++++++++++++
+	FOR YI=1:1 SET YI(1)=$PIECE($PIECE(VORG(1),",",YI),".",1)  QUIT:$PIECE(VORG(1),",",YI,999)=""  DO
+	. QUIT:YI(1)=""
+	. SET YI(3)=+$PIECE($PIECE(VORG(1),",",YI),".",2)
+	. IF YI(3)=0 SET YI(3)=""
+	. ;
+	. ; *************************************************************
+	. ; Open => Completed Order (update if previously created)
+	. ; 
+	. SET YI(2)=$GET(^INPROSTEMP1(YM,YI(1),1))  ;ZURUECKHOLEN ALTE DATEN ; recall old data
+	. IF $TRANSLATE($PIECE(YI(2),Y,1,21),Y)="" SET YI(2)=$GET(^INPROSTEMP(YM,YI(1),1))
+	. IF $PIECE($GET(^INPROSTEMP1(YM,YI(1),1)),Y,22)'="" SET $PIECE(YI(2),Y,22)=$PIECE(^INPROSTEMP1(YM,YI(1),1),Y,22)    ; 29-Sep-2006
+	. IF $PIECE(YI(2),Y,22)="" SET $PIECE(YI(2),Y,24)=""  ;BESTAND NICHT BERICHTIGT ;Not 
+	. SET ^INPROSTEMP(YM,YI(1),1)=YI(2)
+	. ;
+	. IF NOTIME'=1 DO  ;SPEICHERN STEMPELZEITEN ;Save timestamps
+	. . DO OK          ;BESTÄTIGUNG ;affirmation 
+	. . SET $PIECE(^INPROSTEMP(YM,YI(1),1),Y,16)=VORG(3)        ; Stop date/Time
+	. . SET $PIECE(^INPROSTEMP(YM,YI(1),1),Y,17)=VORG(4)
+	. . SET YLFN=$ORDER(^INPROSTEMP0(YM,YI(1),""),-1)+1         ;IMMER PLUS EINS ;increment seq no
+	. . ;IF YLFN="" SET YLFN=1                                  ;GRF;08-Jul-2005
+	. . ;QUIT:YLFN=""                                           ;KEINE ZEITDATEN (MULTI ON/OFF) ;no 
+	. . ;IF $PIECE($GET(^INPROSTEMP0(YM,YI(1),YLFN,1)),Y,16)'="" SET YLFN=YLFN+1
+	. . SET $PIECE(^INPROSTEMP0(YM,YI(1),YLFN,1),Y,10)=YI(3)    ;UNTER-STEMPELNUMMER
+	. . SET $PIECE(^INPROSTEMP0(YM,YI(1),YLFN,1),Y,16)=VORG(3)  ;DATUM ; Date 
+	. . SET $PIECE(^INPROSTEMP0(YM,YI(1),YLFN,1),Y,17)=VORG(4)  ;UHRZEIT
+	. . SET $PIECE(^INPROSTEMP0(YM,YI(1),YLFN,1),Y,19)=VORG(2)  ;MITARBEITER
+	. . ;
+	. . ;SPEICHERN ZEITEN FÜR AUSWERTUNG ;Save to 
+	. . ;  Time Stamps (Site Locn, Date, Employee, Time Status)
+	. . SET ^WWW013Z(YM,YLOCATION,VORG(3),VORG(2),VORG(4),5,1)=Y_Y_Y_Y_YI(1)_Y_$PIECE(YI(2),Y,1)_Y_$PIECE(YI(2),Y,3)_Y_VORG(5)_Y_Y_YI(3)  ;GESTARTET
+	. . DO ^WWWSSORT("WWW013Z",YLOCATION_","_VORG(3)_","_VORG(2)_","_VORG(4)_","_5)  ;AUFBEREITEN SORTKEY
+	. ;
+	. do:'$get(blnDontComplete)               ; SR13085
+	. . SET ^INPROSTEMP1(YM,YI(1),1)=$GET(^INPROSTEMP(YM,YI(1),1))  ;SPEICHERUNG DER ERLEDIGTEN FERTIGUNGEN ;the 
+	. . KILL ^INPROSTEMP(YM,YI(1))                                  ;LÖSCHEN DER ERLEDIGTEN FERTIGUNGEN ;Delete the 
+	. ;SET ^INPROSTEMP1(YM,YI(1),1)=$GET(^INPROSTEMP(YM,YI(1),1))  ;SPEICHERUNG DER ERLEDIGTEN FERTIGUNGEN ;the 
+	. ;KILL ^INPROSTEMP(YM,YI(1))  ;LÖSCHEN DER ERLEDIGTEN FERTIGUNGEN ;Delete the 
+	. ;
+	. ; *************************************************************
+	. ;
+	. SET YLFN=$PIECE(YI(2),Y,6)   ;TEILESTRUKTUR
+	. SET YAUF=$PIECE(YI(2),Y,1)   ;AUFTRAG ;order 
+	. SET YPOS=$PIECE(YI(2),Y,3)   ;POSTITON
+	. ;
+	. ;QUIT WENN KEINE BESTANDSBERICHTIGUNG
+	. QUIT:NOKORR=$$$YES
+	. ;
+	. ; FIXME : Doesn't unlock if YAUF or YPOS = ""  <GRF>
+	. LOCK +^INBUCHLOCK(YM,YAUF,YPOS):20  ;AUFTRAG FÜR BEARBEITUNG ANDERER BESTANDSBUCHUNGEN SPERREN;02.02.04;FIS;24941
+	. ;
+	. ;QUIT WENN KEIN AUFTRAG
+	. QUIT:YAUF=""
+	. QUIT:YPOS=""
+	. ;
+	. IF $TRANSLATE(YLFN,"""")=$TRANSLATE(YAUF_","_YPOS,"""") DO  ;HAUPTTEIL/POSITION
+	. . NEW SATZ,KEY,YFORM,YVOR
+	. . SET YFORM="INAUFP"
+	. . SET SATZ=$GET(^INAUFP(YM,YAUF,YPOS,1))
+	. . ;		D163		$$$INAUFPProductionStart()
+	. . ;		D164		$$$INAUFPProductionFinish()
+	. . ;		D165		$$$INAUFPProductionNo()
+	. . SET $PIECE(SATZ,Y,163)=$PIECE(YI(2),Y,14)_","_$PIECE(YI(2),Y,15)   ;START ;take-off 
+	. . SET $PIECE(SATZ,Y,164)=VORG(3)_","_VORG(4)   ;STOP
+	. . IF $PIECE(SATZ,Y,165)=VORG(1) DO
+	. . . ;
+	. . . ; FIXME : Is this quit intended to end the 2dot DO?
+	. . . ;         Or has code been missed or lost?
+	. . . ;         It does nothing useful at present.  <GRF>
+	. . . ;         
+	. . . ;		D56			$$$INAUFPNewSerialNumber()
+	. . . ;		D198		$$$INAUFPLotNo()
+	. . . IF $PIECE(SATZ,Y,56)'="" IF VORG(5)'="" IF $PIECE(SATZ,Y,56)'=VORG(5) DO
+	. . . . ;ÄNDERN SN IN AUFTRAGSPOSITION ?? ;alter within 
+	. . . . QUIT
+	. . . ;
+	. . . ;
+	. . . ;
+	. . . IF $PIECE(SATZ,Y,56)'="" SET VORG(5)=$PIECE(SATZ,Y,56)  ;SERIENNUMMER BEREITS VORHANDEN ;yet on hand 
+	. . . IF VORG(5)'="" IF $PIECE(SATZ,Y,56)=""  SET $PIECE(SATZ,Y,56) =VORG(5)  ;SERIENNUMMER
+	. . . IF VORG(6)'="" IF $PIECE(SATZ,Y,198)="" SET $PIECE(SATZ,Y,198)=VORG(6)  ;LOT-NUMMER
+	. . ;
+	. . ;
+	. . ;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+	. . ; SR13085 - added
+	. . set OrigParentQty = $piece(SATZ,Y,5)
+	. . if $get(VORG(7))="" set VORG(7) = OrigParentQty - $piece(SATZ,Y,420)
+	. . set $piece(SATZ,Y,420) = $piece(SATZ,Y,420) + VORG(7)
+	. . set MNG = VORG(7)
+	. . ;<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+	. . ;
+	. . SET KEY=YAUF_","_YPOS
+	. . SET OK=$$^WWWSPEI("INAUFP",KEY,SATZ,1)   ;SPEICHERN DATENSATZ ;Save data record 
+	. . ;
+	. . ;---------------------------------------------------------------------------
+	. . ; If Production & QMA are NOT Closed    &   No Stock Corrected Date recorded
+	. . IF $PIECE(YI(2),Y,24)'=$$$YES IF $PIECE(YI(2),Y,22)="" DO  ;BESTANDSVERÄNDERUNG BEREITS GEBUCHT
+	. . . QUIT:$PIECE(SATZ,Y,4)=""
+	. . . ;
+	. . . ; Don't proceed if any instructions have been entered in "QC Text for Production"
+	. . . ; NOTE : This could even include a space - what are the consequences
+	. . . ;        What are the consequences if no instruction has been entered
+	. . . ;        with a required QA test?
+	. . . ;
+	. . . ;SET QPRUEF=$PIECE($GET(^INART(YM,$PIECE(SATZ,Y,4),1)),Y,174)  ;ARTIKEL MIT QUALITÄTSPRUEFUNG
+	. . . SET QPRUEF=$PIECE(SATZ,Y,174)                  ;ARTIKEL MIT QUALITÄTSPRUEFUNG ;Quality assurance
+	. . . IF QPRUEF'="" IF $PIECE($GET(^INQPRUEF(YM,YLOCATION,QPRUEF,1)),Y,3)'="" QUIT  ;ACHTUNG ARTIKEL MIT QUALITÄTSPRUEFUNG IN DER FEERTIGUNG ;estimation item by means of within the 
+	. . . ;
+	. . . ;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+	. . . ; SR13085 - commented
+	. . . ;+++++++++++++++++++++++++++++++++
+	. . . ;  Get Qty from INAUFP record and over-ride with output qty
+	. . . ;SET MNG=$PIECE(SATZ,Y,5)                       ;MENGE ;quantity 
+	. . . ; TODO : Can't complete with a zero qty since this will keep full qty
+	. . . ;        e.g. Order 5 Part receive 1 and 2 then want to close without receiving final 2
+	. . . ;IF +$GET(VORG(7))'=0 SET MNG=VORG(7)
+	. . . ;+++++++++++++++++++++++++++++++++
+	. . . ;<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+	. . . SET OK=$$^INARTPLUS(YI(1),0,$PIECE(SATZ,Y,4),MNG,1,VORG(5),VORG(6))  ;BESTANDSBUCHUNG DES LETZTEN TEILS ;partly 
+	. . . ; TODO : What is consequence of setting/not setting this flag when partial delivery?
+	. . . ;        Also setting INPROSTEMP1 #22/24 while still have INPROSTEMP present
+	. . . ;SET $PIECE(^INAUFP(YM,YAUF,YPOS,1),Y,90)=$$$YES  ;AUSLIEFERUNGSFÄHIG   ; SR13085
+	. . . SET $PIECE(^INAUFP(YM,YAUF,YPOS,1),Y,90)='$get(blnDontComplete,$$$NO)  ;AUSLIEFERUNGSFÄHIG
+	. . . ;IF $PIECE($GET(^INPROSTEMP1(YM,YI(1),1)),Y,22)="" SET $PIECE(^INPROSTEMP1(YM,YI(1),1),Y,22)=+$HOROLOG
+	. . . ;SET $PIECE(^INPROSTEMP1(YM,YI(1),1),Y,24)=$$$YES
+	. . . do:'$get(blnDontComplete)
+	. . . . IF $PIECE($GET(^INPROSTEMP1(YM,YI(1),1)),Y,22)="" SET $PIECE(^INPROSTEMP1(YM,YI(1),1),Y,22)=+$HOROLOG
+	. . . . SET $PIECE(^INPROSTEMP1(YM,YI(1),1),Y,24)=$$$YES
+	. . . ;IF $GET(VORG(8))=1 SET ^WWWSOR(YUSER_"NKALK",YAUF,YPOS)=""  ;29.11.04;26744
+	. . ;
+	. . ;---------------------------------------------------------------------------
+	. . ;
+	. . IF $GET(VORG(8))=1 DO
+	. . .;QUIT:$PIECE($GET(^INAUFP(YM,YAUF,YPOS,1)),Y,267)'=""  ;BEREITS BERECHNET   ; SR13152
+	. . . quit:$$$INAUFPStatisticalCostCalculated($get(^INAUFP(YM,YAUF,YPOS,1)))'=""  ;BEREITS BERECHNET 
+	. . . SET ^WWWSOR(YUSER_"NKALK",YAUF,YPOS)=""  ;29.11.04;26744
+	. ;
+	. ;ZUSAMMENBAUEN DER DATEI ZUM DURCHSUCHEN DER EBENE ;the data file scour the plain 
+	. KILL YDATEI
+	. SET YDATEI="^INAUFPXL("_""""_YM_""""
+	. FOR YI1=1:1 QUIT:$PIECE(YLFN,",",YI1)=""  DO  
+	. . SET YDATEI=YDATEI_","_""""_$TRANSLATE($PIECE(YLFN,",",YI1),"""")_""""
+	. . SET YDATEI(YI)=YDATEI_")"  ;GGF FÜR UNTERDATEIEN ;to 
+	. ;
+	. SET YDATEI(0)=YDATEI_")"
+	. SET YXL=$GET(@(YDATEI(0)))   ;POSITIONSDATEN
+	. ; TODO : blnDontComplete?  Record Manufacturing End timestamp? maybe not
+	. IF YXL'="" DO
+	. . SET $PIECE(@(YDATEI(0)),Y,164)=VORG(3)_","_VORG(4)       ;STOP
+	. . IF $PIECE(YXL,Y,56)'="" SET VORG(5)=$PIECE(YXL,Y,56)     ;SERIENNUMMER BEREITS VORHANDEN ;yet on hand 
+	. . IF VORG(5)'="" SET $PIECE(@(YDATEI(0)),Y,56) =VORG(5)    ;SERIENNUMMER
+	. . IF VORG(6)'="" SET $PIECE(@(YDATEI(0)),Y,198)=VORG(6)    ;LOT-NUMMER
+	. ;
+	. ;UNTERTEILE ZWISCHENSPEICHERN (ÜBERTRAGUNG DES EK AUS WE NACH ARTIKELTEIL) ;Planned Cost out of In within 
+	. KILL ^WWWSOR(YUSER,"T")
+	. IF YXL'="" DO
+	. . NEW ART
+	. . SET SUCH=YDATEI(0)
+	. . FOR  DO  QUIT:SUCH=""
+	. . . SET SUCH=$QUERY(@SUCH)
+	. . . IF $TRANSLATE($PIECE(SUCH,",",2,$LENGTH(YLFN,",")+1),"""")'=$TRANSLATE(YLFN,"""") SET SUCH="" QUIT  ;21.06.04;FAN;25794; WENN alphanumerischen Auftragsnummern SOLL DATEN AUCH AUFBAUEN.
+	. . . ;IF $PIECE(SUCH,",",2,$LENGTH(YLFN,",")+1)'=YLFN SET SUCH="" QUIT  ;21.06.04;FAN;25794; 
+	. . . SET ART=$PIECE(@SUCH,Y,4)
+	. . . QUIT:ART=""
+	. . . SET ^WWWSOR(YUSER,"T",ART,$TRANSLATE($PIECE($PIECE(SUCH,"(",2),")",1),","_"""","."))=$PIECE($PIECE(SUCH,"(",2),")",1)
+	. ;
+	. ;TEILE IN INAUFPT ;within 
+	. KILL YDATEI
+	. IF $PIECE(YLFN,",",3)'="" DO
+	. . SET YDATEI="^INAUFPT("_""""_YM_""""_","_""""_YAUF_""""_","_""""_YPOS_""""_","_""""
+	. . FOR YI1=3:1 QUIT:$PIECE(YLFN,",",YI1)=""  DO 
+	. . . SET YDATEI=YDATEI_$PIECE(YLFN,",",YI1)_"."
+	. . . QUIT
+	. . SET YDATEI(0)=YDATEI_""""_",1)"
+	. . SET YXL=$GET(@(YDATEI(0)))   ;POSITIONSDATEN
+	. . IF YXL'="" DO
+	. . . SET $PIECE(@(YDATEI(0)),Y,164)=VORG(3)_","_VORG(4)      ;STOP
+	. . . IF $PIECE(YXL,Y,56)'="" SET VORG(5)=$PIECE(YXL,Y,56)    ;SERIENNUMMER BEREITS VORHANDEN ;yet on hand 
+	. . . IF VORG(5)'="" SET $PIECE(@(YDATEI(0)),Y,56) =VORG(5)   ;SERIENNUMMER
+	. . . IF VORG(6)'="" SET $PIECE(@(YDATEI(0)),Y,198)=VORG(6)   ;LOT-NNUMMER
+	. ;
+	. ;BEREITS WEITER OBEN ERLEDIGT ;yet ulterior upstairs 
+	. ;IF $DATA(^INPROSTEMP(YM,YI(1),1)) SET ^INPROSTEMP1(YM,YI(1),1)=^INPROSTEMP(YM,YI(1),1)  ;SPEICHERUNG DER ERLEDIGTEN FERTIGUNGEN
+	. ;KILL ^INPROSTEMP(YM,YI(1))  ;LÖSCHEN DER ERLEDIGTEN FERTIGUNGEN
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ; If Production and QMA are NOT closed
+	. IF $PIECE(YI(2),Y,24)'=$$$YES DO   ;BESTAND AUS TEILEN AUSBUCHEN WENN NOCH NICHT OK ;out of when yet Not 
+	. . NEW YII,YEK,KOST,HAL,BUCH,REST,YART,AUFX
+	. . SET YII=""
+	. . FOR  SET YII=$ORDER(^INPROSTEMPT(YM,YI(1),YII)) QUIT:YII=""  DO    ;BEI ALLEN ARTIKEL DIE MENGE ABZIEHEN ;next to item who quantity subtract 
+	. . . SET YII(1)=$GET(^INPROSTEMPT(YM,YI(1),YII,1))
+	. . . ;		D1		$$$INVORGBOnHandLocation()
+	. . . SET HAL=$PIECE($GET(^INVORGB(YM,YM,YLOCATION,1)),Y,1)  ;PRODUKTIONSLAGER // Move outside loop?
+	. . . ;
+	. . . ;PRUEFUNG, OB DIE MENGE ODER ARTIKEL GEÄNDERT WURDE; TYBD;27,11,2003
+	. . . SET AUFX=$PIECE(YII(1),Y,9)
+	. . . SET AUFX(9)=""
+	. . . IF $PIECE(AUFX,",",1)'="" IF $PIECE(AUFX,",",2,99)'="" SET AUFX(9)="^INAUFPXL("_""""_YM_""""_","_""""_$PIECE(AUFX,",",1)_""""_","_$PIECE(AUFX,",",2,99)_")"
+	. . . IF AUFX(9)'="" QUIT:'$DATA(@AUFX(9))            ;TEIL GELÖSCHT  ;NUR WENN VORHANDEN;FIS;16.12.03
+	. . . ;>>>>>IF AUFX(9)'="" QUIT:$PIECE(@AUFX(9),Y,244)'=""  ;MENGE SCHON BERICHTIGT  ;NUR WENN VORHANDEN;FIS;16.12.03
+	. . . ;>>>>>if '$get(blnDontComplete) IF AUFX(9)'="" QUIT:$PIECE(@AUFX(9),Y,244)'=""  ;MENGE SCHON BERICHTIGT  ;NUR WENN VORHANDEN;FIS;16.12.03
+	. . . ;SET AUFX(1)=$PIECE(AUFX,",",1)
+	. . . ;SET AUFX(9)="^INAUFPXL("_""""_YM_""""_","_""""_AUFX(1)_""""_","_$PIECE(AUFX,",",2,99)_")"
+	. . . ;IF '$DATA(@AUFX(9)) QUIT  ;TEIL GELÖSCHT
+	. . . ;QUIT:$PIECE(@AUFX(9),Y,244)'=""  ;MENGE SCHON BERICHTIGT
+	. . . ;;SET $PIECE(YII(1),Y,4)=$PIECE(@AUFX(9),Y,4)  ;ARTIKEL
+	. . . ;;IF +$PIECE(@AUFX(9),Y,39)'=0 SET $PIECE(YII(1),Y,5)=$PIECE(@AUFX(9),Y,39)  ;MENGE
+	. . . ;
+	. . . ;
+	. . . ;-----------------------LEIHLAGERPLATZ BEI FREMDFERTIGUNG,ULM 15.01.03   ; BORROWING STOCK PILE DURING EXTERNAL MANUFACTURE
+	. . . DO
+	. . . . NEW LAP
+	. . . . SET LAP=$$$INVORGBSubContractLocn($GET(^INVORGB(YM,YM,YLOCATION,1)))_"*"_YI(1)  ;LEIHLAGER + STEMPELNUMMER   ;SR15454
+	. . . . IF $DATA(^INWE(YM,$PIECE(YII(1),Y,4),YLOCATION,LAP)) SET HAL=LAP
+	. . . ;-----------------------
+	. . . ;    1     2   3    4       5          6        7       8     9   10     11     12     13      14     15     16      17
+	. . . ; AUFTRAG,POS,ART,REST,SERIENNUMMER,LAGERPL,FERTIGUNG,MINUS,TEIL,KOST,WEDATUM,NACHB,VBETRIEB,NOPOST,NOSPEI,FERTNO,CHECKLP
+	. . . ;                       1     2           3                  4         5 6  7 8 <---              9           ---> 10
+	. . . ;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+	. . . ; SR13085
+	. . . set OrigCompQty = $PIECE(YII(1),Y,5)
+	. . . ;set BUCH=$$^INARTMINUS(YI(1),YII,$PIECE(YII(1),Y,4),OrigCompQty,,HAL,1,2,$piece($piece(YII(1),Y,9),",",3,99),1)  ;BESTAND BUCHEN
+	. . . set PartParentQty = $get(VORG(7))
+	. . . set OrigParentQty = $piece($get(^INAUFP(YM,YAUF,$p(YLFN,",",2),1)),Y,5)
+	. . . set PartCompQty = OrigCompQty * PartParentQty / OrigParentQty
+	. . . set BUCH=$$^INARTMINUS(YI(1),YII,$PIECE(YII(1),Y,4),PartCompQty,,HAL,1,2,$piece($piece(YII(1),Y,9),",",3,99),1)  ;BESTAND BUCHEN
+	. . . ;<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+	. . . ; Insufficient Components in StockLocn HAL so need to account for balance - new qty in REST ?
+	. . . SET REST=$PIECE(BUCH,"*",1)
+	. . . IF +REST'=0 SET BUCH=$$^INARTMINUS(YI(1),YII,$PIECE(YII(1),Y,4),REST,,,1,1,$PIECE($PIECE(YII(1),Y,9),",",3,99),1,,1)  ;BESTAND NACHBUCHEN
+	. . . ; FIXME : ? What is implication of EK (BUCH#2) changing between first and second call to INARTMINUS? <GRF> e.g. if not using avg cost
+	. . . SET YEK=$PIECE(BUCH,"*",2)
+	. . . QUIT:+YEK=0                 ;KEINE WERTE ;no values
+	. . . ;  
+	. . . ;ÜBERTRAGEN EK AUS WE NACH ARTIKELTEIL; FIS,25.01.02
+	. . . IF $DATA(^WWWSOR(YUSER,"T",$PIECE(YII(1),Y,4))) DO
+	. . . . NEW DATEI,KEY,LFN,MENGE,VERSCHNITT
+	. . . . SET KEY=$PIECE(YII(1),Y,9)  ;FIS;30.12.03
+	. . . . IF KEY'="" SET KEY=YM_","_KEY
+	. . . . DO:KEY'=""  IF KEY="" SET LFN="" FOR  SET LFN=$ORDER(^WWWSOR(YUSER,"T",$PIECE(YII(1),Y,4),LFN)) QUIT:LFN=""  SET KEY=$GET(^WWWSOR(YUSER,"T",$PIECE(YII(1),Y,4),LFN)) DO
+	. . . . . QUIT:KEY=""
+	. . . . . SET DATEI="^INAUFPXL("_""""_YM_""""
+	. . . . . FOR YI=2:1  QUIT:$PIECE(KEY,",",YI,999)=""  SET DATEI=DATEI_","_""""_$PIECE(KEY,",",YI)_""""
+	. . . . . SET DATEI=DATEI_")"
+	. . . . . QUIT:'$DATA(@DATEI)
+	. . . . . ; 
+	. . . . . ; FIXME : SR14471 : Use D109 Received quantity if non-null?     <GRF>    30-Jan-2007
+	. . . . . ;         Called on (full/partial) completion of mfr order - do
+	. . . . . ;         we need to modify for part mfr?
+	. . . . . ; 
+	. . . . . SET MENGE=+$PIECE(@DATEI,Y,5) // SR15243: Put back in by Glen.
+	. . . . . IF MENGE=0 SET MENGE=1
+	. . . . . ;		D10		$$$INVORGBlendInAdd()
+	. . . . . SET VERSCHNITT=$PIECE($GET(^INVORG(YM,YM,1)),Y,10)  ;VERSCHNITT IN % ;within 
+	. . . . . IF +VERSCHNITT'=0 DO
+	. . . . . . SET MENGE=MENGE+(MENGE/100*VERSCHNITT)
+	. . . . . ;
+	. . . . . DO ^INSYSLOG("INPROFERTIG","INAUFPXL",$TRANSLATE($PIECE($PIECE(DATEI,",",2,999),")",1),",",";"),47,1,$PIECE(@DATEI,Y,47),YEK*MENGE)  ;PROTOKOLL PREISÄNDERUNG
+	. . . . . SET $PIECE(@DATEI,Y,47) =YEK*MENGE  ;SPEICHERN TATSÄCHLICHER EK ;Save Planned Cost 
+	. . . . . SET $PIECE(@DATEI,Y,244)=+$HOROLOG  ;SPEICHERN BUCHUNGSDATUM  (DIENT AUCH ZUR KONTROLLE IN INAUFPTT = KEIN NEURECHNEN DES EK) ;Save too within no 
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. KILL ^WWWSOR(YUSER,"T")
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;  No Sub-Assemblies thus don't need further processing?
+	. ;-----------------------------------------------------------------------------
+	. IF $TRANSLATE(YLFN,$$$DBLQUOTE)=$TRANSLATE(YAUF_","_YPOS,$$$DBLQUOTE) DO  QUIT  ;HAUPTTEIL
+	. . LOCK -^INBUCHLOCK(YM,YAUF,YPOS)  ;SPERRE AUFHEBEN;02.02.04;FIS;24941
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;  Sub-Assemblies?
+	. ;-----------------------------------------------------------------------------
+	. ; If Production and QMA are NOT Closed
+	. IF $PIECE(YI(2),Y,24)'=$$$YES DO   ;BESTAND DES FERTIGUNGSTEILS BUCHEN WENN NOCH NICHT OK ;when yet Not 
+	. . NEW YII,YUEBERT,YUEBERT1
+	. . QUIT:$PIECE(YI(2),Y,22)'=""  ;SCHON BERICHTIGT ;yet 
+	. . SET YUEBERT=$PIECE(YI(2),Y,23)
+	. . IF YUEBERT="" DO
+	. . . SET YUEBERT1=$PIECE($PIECE(YI(2),Y,6),",",3,99)
+	. . . SET YUEBERT1=$PIECE(YUEBERT1,",",$LENGTH(YUEBERT1,",")-1)
+	. . . IF YUEBERT1=""  SET YUEBERT=$PIECE($GET(^INAUFP(YM,YAUF,YPOS,1)),Y,165)            ;UEBER =HAUPTPOSITION
+	. . . IF YUEBERT1'="" SET YUEBERT=$PIECE($GET(^INAUFPT(YM,YAUF,YPOS,YUEBERT1,1)),Y,165)  ;UEBERGEORDNETE FERTIGUNG
+	. . ;
+	. . ;BESTAND ODER AUFTRAGSBESTAND BUCHEN ;Or volume of orders 
+	. . IF YUEBERT="" IF $PIECE($GET(^INAUFP(YM,YAUF,YPOS,1)),Y,7)'=3 QUIT  ;NUR, WENN EINGENFERTIGUNG
+	. . ;<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+	. . ; SR13085 TODO : If necessary refer to D420 as above.
+	. . ;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+	. . SET MNG=$PIECE(YI(2),Y,21)  ;MENGE ;quantity 
+	. . IF +$GET(VORG(7))'=0 SET MNG=VORG(7)
+	. . SET OK=$$^INARTPLUS(YI(1),0,$PIECE(YI(2),Y,4),MNG,1,VORG(5),VORG(6))  ;NEUE MENGE ;quantity 
+	. . SET $PIECE(^INPROSTEMP1(YM,YI(1),1),Y,22)=+$HOROLOG
+	. . SET $PIECE(^INPROSTEMP1(YM,YI(1),1),Y,24)=$$$YES
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;
+	. LOCK -^INBUCHLOCK(YM,YAUF,YPOS)  ;SPERRE AUFHEBEN;02.02.04;FIS;24941
+	. QUIT
+	
+	;++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	;ALLE UNTERTEILE BUCHEN (WENN NUR HAUPTTEILE GESTEMPELT WERDEN)
+	;ALL LOWER PARTS recorded (IF ONLY MAIN PARTS MARKED)
+	; NOKORR : $$$NO  - Work Order is complete - continue to finalise.
+	;          $$$YES - Not complete - only recording labour applied.
+ 
+	IF NOKORR'=$$$YES IF $$$INVORGFinishOnlyForMainParts($get(^INVORG(YM,YM,1)))=1 DO
+	. IF $GET(YINUSE)=1 QUIT  ;NICHT WENN BEREITS IM DURCHLAUF ;Not when already in the run 
+	. FOR YI=1:1 SET YI(1)=$PIECE($PIECE(VORG(1),",",YI),".",1)  QUIT:$PIECE(VORG(1),",",YI,999)=""  DO
+	. . QUIT:YI(1)=""
+	. . IF $GET(VORG(99))'=1 DO ^INPROSTEMPU(YI(1))
+	. .;IF $GET(VORG(99))=1 JOB ^INPROSTEMPU(YI(1)):(:1):1 IF '$T DO ^INPROSTEMPU(YI(1))  ;ACHTUNG! EVTL. DOPPELTE STEMPEL WENN HINTERGRUNDJOB
+	. . IF $GET(VORG(99))=1 JOB START^INPROSTEMPU(YI(1),0,YM,SPRACHE,YBED,YLOCATION)::1 IF '$T DO ^INPROSTEMPU(YI(1))  ;ACHTUNG! EVTL. DOPPELTE STEMPEL WENN HINTERGRUNDJOB ;pestle when 
+	
+	;++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	QUIT
+	
+WithSuffix(WorkOrder="")    PRIVATE
+	;-------------------------------------------------------------------------------
+	; Revised code
+	; 
+	; Strip off the last two digits to get the base work order number.
+	; Assumes all work order numbers have the same length so that there is no
+	; conflict between 123456*78 and 12345678*??.
+	; 
+	; History :
+	; 09-Aug-2005	GRF		SR13101 : return value not actually present on initial quit
+	; 28-Jul-2005	GRF		SR13101 : modified return value to initial quit
+	; 26-Jul-2005	GRF		SR13071 : can also be called from form/routine INPROENDE
+	; 						when we don't want to check for a suffix.
+	; 25-Jul-2005	GRF		SR13071 : Interim correction to ensure work order
+	; 						contains a service subscript
+	;-------------------------------------------------------------------------------
+	new BaseNo,DATEI,ItemType,Len,objINAUFPXL,objINPROXR,PartKey,Status,Suffix
+	
+	set Status=$$$NO_Y_$$^WWWTEXT(32292)  ; Please check
+	quit:WorkOrder="" Status
+	
+	set Status=$$$OK
+	quit:$get(YFORM)'="INPROFERTIG" Status
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	; Base Number not recognised
+	;     Full Number recognised         - missing suffix
+	;     Full Number not recognised     - bad number
+	; Base Number recognised
+	;   Item Section Structure found
+	;     Suffix not recognised          - bad number
+	;     Suffix recognised
+	;         Work Order not recorded    - Not Available
+	;         Work Order recorded        - okay
+	;   Item Section Structure not found - Not Available
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set Len    = $length(WorkOrder)
+	if Len>2 {  //FIS;27-Jul-05;SR13101
+		set BaseNo = $extract(WorkOrder,1,Len-2)
+		set Suffix = $extract(WorkOrder,Len-1,Len)
+	} else {  //FIS;27-Jul-05;SR13101
+		set BaseNo = WorkOrder
+		set Suffix = ""
+	}
+	
+	if '$data(^INPROXR(YM,BaseNo)) || (Suffix="") {  //FIS;27-Jul-05;SR13101
+		if $data(^INPROXR(YM,WorkOrder)) {
+			set Status=$$$NO_Y_$$$Text($listbuild("IN00358",WorkOrder))  ;Must specify suffix as well (%1##)
+		} else {
+			set Status=$$$NO_Y_$$$Text($listbuild("IN00359",WorkOrder))  ;Unidentified Work Order (%1)
+		}
+	} else {
+		set objINPROXR = $get(^INPROXR(YM,BaseNo,1))
+		set PartKey    = $piece(objINPROXR,Y,1,3)
+		if $piece(PartKey,Y,3)="" set PartKey=$piece(PartKey,Y,1,2)
+		set PartKey    = $translate(PartKey,Y,$$$COMMA)_$$$COMMA_(+Suffix)
+		
+		set DATEI = "^INAUFPXL("_$$^WWWKEYBUILD(YM_","_PartKey)_")"
+		
+		if $data(@DATEI) {
+			set objINAUFPXL = @DATEI
+			set ItemType = $piece(objINAUFPXL,Y,26)
+			
+			if ItemType'=2 {
+				set Status = $$$NO_Y_$$$Text($listbuild("IN00360",Suffix))  ;Incorrect Suffix (%1)
+			} else {
+				if '$data(^INPROSTEMP(YM,BaseNo))  &&
+				   '$data(^INPROSTEMP1(YM,BaseNo)) &&
+				   '$data(^INPROSTEMP0(YM,BaseNo))    {
+					set Status=$$$NO_Y_$$^WWWTEXT(86)             ;NICHT VORHANDEN ; "Not Available!"
+				} else {
+					set Status=$$$OK
+				}
+			}
+		} else {
+			set Status=$$$NO_Y_$$^WWWTEXT(86)                     ;NICHT VORHANDEN ; "Not Available!"
+		}
+	}
+	quit Status
+	
+OK ;OK
+	QUIT:$GET(NODISPLAY)=1  ;KEINE ANZEIGE ;no Show 
+	IF $GET(VORG(99))=1 DO  QUIT
+	. NEW YNR,TEXT,YLINK,YAUF,YPOS,YSTEMP1
+	. SET YLINK=""
+	. DO  ;LINK
+	. . NEW YKEY,YI
+	. . SET YI=YAKTION_"EP=WWWFORM&YFORM=INPROSTART"
+	. . DO VAR^WWWCGI              ; returns YI=HTML list of Y* variables for link
+	. . SET YLINK=YI
+	. . QUIT
+	. SET YNR=YI(1)
+	. SET YNR=YI(1)
+	. SET YSTEMP1=$GET(YI(2))
+	. NEW YI
+	. SET TEXT=$$^WWWTEXT(32132)_" "_YNR  ;FERTIGUNG
+	. SET TEXT=TEXT_" "
+	. SET TEXT=TEXT_$$^WWWTEXT(151)_": "_$$^WWWDATE(VORG(3))_", "_$$^WWWTIME(VORG(4))_" "_$$^WWWTEXT(3178)  ;BEENDET, UHR
+	. SET TEXT=TEXT_"|"
+	. SET TEXT=TEXT_$$^WWWTEXT(159)_": "_VORG(2)  ;MITARBEITER
+	. IF VORG(2)'="" IF $PIECE($GET(^WWW013(0,VORG(2),1)),Y,1)'="" SET TEXT=TEXT_" - "_$PIECE(^WWW013(0,VORG(2),1),Y,1)    ; 29-Sep-2006
+	. ;		D65		$$$INVORGFinishOnlyForMainParts()
+	. ;  Achtung, dieser Vorgang kann mehrere Minuten dauern ! ;"This Can Take Several Minutes!  "
+	. IF NOKORR'=$$$YES IF $PIECE($GET(^INVORG(YM,YM,1)),Y,65)=1      SET TEXT=TEXT_"|"_$$^WWWTEXT(33159)
+	. SET YAUF=$PIECE(YSTEMP1,Y,1)   ;order & order line
+	. SET YPOS=$PIECE(YSTEMP1,Y,3)
+	. ;IF YAUF'="" IF YPOS'="" DO  ;QM-PARAMETER DER AUFTRAGSPOSITION ANZEIGEN
+	. ;.SET SATZ=$GET(^INAUFP(YM,YAUF,YPOS,1))
+	. ;.SET QPRUEF=$PIECE(SATZ,Y,174)  ;ARTIKEL MIT QUALITÄTSPRUEFUNG
+	. ;.IF QPRUEF'="" SET TEXT=TEXT_"|"_$$^WWWFELDNAME("INQPRUEF","P",2)_": "_$PIECE($GET(^INPARA(YM,"QMPARA",SPRACHE,QPRUEF,1)),Y,1)  ;QM-PARAMETER
+	. ;.QUIT
+	. DO ^WWWINFO(TEXT,0,YLINK)
+	
+	WRITE "<B>"     
+	WRITE YCR,"<BR>",YI(1)," ",YBED," ",$$^WWWDATE(VORG(3))," ",$$^WWWTIME(VORG(4))_" "
+	WRITE "</B>"    
+	QUIT
+	
+FALSCH1 ;KEIN STEMPEL ;no stamp 
+	;-------------------------------------------------------------------------------
+	;  It appears this subroutine is never called <GRF> 11-Jul-2005
+	;  We don't care that the work order wasn't started as we can correct the times
+	;  from the production log.
+	;-------------------------------------------------------------------------------
+	QUIT:$GET(NODISPLAY)=$$$YES  ;KEINE ANZEIGE ; Don't Show 
+	
+	IF $GET(VORG(99))=1 DO  QUIT
+	. NEW YNR,TEXT
+	. SET YNR=YI(1)
+	. NEW YI
+	. SET TEXT=$$^WWWTEXT(32132)_" "_YNR_" ?????? - "_$$^WWWTEXT(32292)  ;FERTIGUNG ??? - BITTE PRÜFEN! ;please 
+	. DO ^WWWINFO(TEXT,0)
+	
+	WRITE "<B>"     
+	WRITE YCR,"<BR><FONT COLOR="_YRED_">",YI(1)," ?????? </FONT>"
+	WRITE "</B>"    
+	QUIT
+	
+FALSCH2 ;NICHT GESTARTET ;Not started
+	;-------------------------------------------------------------------------------
+	;  It appears this subroutine is never called <GRF> 11-Jul-2005
+	;  We don't care that the work order wasn't started as we can correct the times
+	;  from the production log.
+	;-------------------------------------------------------------------------------
+	QUIT:$GET(NODISPLAY)=$$$YES  ;KEINE ANZEIGE ; Don't Show 
+	
+	IF $GET(VORG(99))=1 DO  QUIT
+	. NEW YNR,TEXT
+	. SET YNR=YI(1)
+	. NEW YI
+	. SET TEXT=$$^WWWTEXT(32132)_" "_YNR_" !!!!!! - "_$$^WWWTEXT(32292)  ;FERTIGUNG !!! - BITTE PRÜFEN! ;please 
+	. DO ^WWWINFO(TEXT,0)
+	
+	WRITE "<B>"     
+	WRITE YCR,"<BR><FONT COLOR="_YRED_">",YI(1)," !!!!!! </FONT>"
+	WRITE "</B>"    
+	QUIT
+	
+STEMPEL ; STEMPELUHR ALS SUBMIT ;when 
+	;-------------------------------------------------------------------------------
+	;  Called directly from form INPROFERTIG - After Data Fields
+	;-------------------------------------------------------------------------------
+	if $$$WWW012FormsFramed($get(^WWW012(0,YM,1)))=$$$YES do FS^WWWTAB()   ;BEC;23699;YM DURCH 0 ERSETZT;26.05.03
+	
+	WRITE YCR
+	WRITE "<TABLE BORDER=0 CELLSPACING=0 ALIGN=CENTER>"
+	WRITE YCR
+	WRITE "<TR><TD ALIGN=CENTER>"
+	WRITE YCR
+	WRITE "<BR>"
+	WRITE "<A onClick='return doLink(this)' HREF=""JavaScript:"
+	WRITE "SAVENOW();"
+	WRITE """"_">"
+	WRITE "<bgsound src="_""""_"kasse.wav"_""""_">"
+	
+	;  "Production Stopped"
+	WRITE "<IMG SRC="_""""_YGIF_"tstamp.gif"_""""_" TITLE="_""""_$$^WWWTEXT(32165)_""""_" border=0></A>"
+	WRITE YCR
+	
+	; HINWEISTEXT FÜR BESTANDSKORREKTUR
+	; REFERENCE NOTE FOR STOCK ADJUSTMENT
+	if $$$INVORGFinishOnlyForMainParts($get(^INVORG(YM,YM,1)))=$$$YES {
+		if $$$INVORGNoQtyCheckon1stWorkOrder($GET(^INVORG(YM,YM,1)))'=$$$YES {
+			WRITE "</TD></TR>"
+			WRITE YCR,"<TR><TD ALIGN=CENTER>"
+			WRITE "<FONT COLOR="_YRED_" SIZE=2><B>"
+			WRITE $$^WWWTEXT(33160)  ;Nach Bestätigung werden alle Unterteile im Bestand korrigiert. ;"After The Production Completed Report the Sub-Parts Inventory will be corrected"
+			WRITE "<BR>"
+			WRITE $$^WWWTEXT(33159)  ;Achtung, dieser Vorgang kann mehrere Minuten dauern !    ; "This Can Take Several Minutes!  "
+			WRITE "</B></FONT>"
+			WRITE YCR
+		}
+	}
+	
+	WRITE "</TD></TR>"
+	WRITE "</TABLE>"
+	QUIT
+	
+]]></Routine>
+</Export>

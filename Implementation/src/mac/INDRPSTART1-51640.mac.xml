@@ -1,0 +1,855 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INDRPSTART1" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INDRPSTART1(YMAN)
+	
+#include COMSYS
+#include INConst
+	
+#define Log(%1,%2) do Log^INDRPRUNLog(%1,%2)
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INDRPSTART1("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+	;-------------------------------------------------------------------------------
+	; RUNID setup options (likely situations and variations)
+	; Level 1
+	;	D17		Start Process Immediately Y/N
+	;			If checked, add this process to the "To Be Actioned" list [DRPRUN()]
+	;			No other Levels are considered.
+	;
+	; Level 2
+	;	D6		Process Handling
+	;			If set to inactive, no further consideration is given to this process	
+	; 
+	; Level 3
+	;	D9		Launch On ? Day			     1-7  (MON - SUN)
+	;	D10		Launch In ? Month		     1-12 (JAN - DEC)
+	;	D11		Launch On ? Day of Month     1-31
+	;			If any of these three values are specified they must be met before
+	;			any frequency or start time contraints are considered.
+	;
+	; Level 4 - subject to previous levels of validation
+	;	D7		Time of Day               (HH:MM values from combo box)
+	;	D8		Launch Every ? Days       (integer or null) [Frequency]
+	;	
+	;	D7		D8
+	;	---------------
+	;	""		""		  Always added to "To Be Actioned" list - "Continuous"
+	;	""		1		  Run once every day                    - "Daily"
+	;	""		integer	  Run once every "n" days
+	;	times	""		  Run at or after each specified time [defaults to 1 day interval] - "Set Times"
+	;	times	integer	  Run at or after each specified time at n day interval
+	;
+	;
+	; NOTE 1 : A frequency of other than one is not appropriate when Day of Week or
+	;          Day of Month are used and probably not when Month is used.
+	;          There is no validation to stop the user setting these.
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		DRP PROCESSING
+	;
+	; Called By : INBACKJOBS, AUTO^INDRPSTART, START^INDRPSTART
+	; 
+	; Inputs : YMAN - overriding company (YM) - now obsolete
+	;
+	;
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 07-Jul-2011	shobby	SR17822: Lock the INReqFirm record when DRP is running. 
+	; 19-Oct-2010	GRF		SR17487.1: remove extra "for"
+	; 01-Oct-2010	GRF		SR17487: clean up - dot to brace; doco; common functions
+    ; 12-Mar-2009	PPP		SR16397: Added Logging for the process
+	; 25-Oct-2007	FIS		SRBR014383: Changed position of stop-condition
+	; 01-Oct-2007	shobby	SRBR014383: Improve the response time for starting/stopping
+	; 26-Sep-2006	RPW		SR14933: Moved the User Name determination into a separate tag.
+	; 30-Aug-2006	RPW		SR14873: Removed naked reference
+	; 08-Dec-2005	GRF		SR13984 : Doco, Boolean Macros
+	; 22.06.2005	FIS		CHANGE FOR NETCHANGE RUN (SR12526)
+	; 31.10.2001	FIS		Created
+	;-------------------------------------------------------------------------------
+	
+	;---------------------------------------
+	;	RANG	Company Ranking for order to process - default 999999
+	;	YBED	DRP Process User
+	;---------------------------------------
+	
+	;---> HINTERGRUNDJOB / BACKGROUND JOB <---
+	set $ztrap="^WWWERROR"
+	do LOW^%PRIO
+	do LOW^%PRIO	
+	
+	new (YMAN)
+	
+	do ^WWWVAR
+	if $get(YMAN)'="" set YM = YMAN  ;MANDANT   ; Now obsolete - always value 0
+	set $piece(^WWWUSER(0,YUSER,1),Y,2)="DRP"  ;SR17822
+	
+	;---------------------------------------
+	;	D79		$$$INVORGUserIdentifierDRPProcess()
+	;	D108	$$$INVORGFastestRepetitionOfDRPRun()
+	;	
+	;	D6		$$$WWW013Language1()
+	;---------------------------------------
+	
+	do GetUserDetails(.YBED,.SPRACHE)
+	$$$Log($$$Text($listbuild("IN00942",YBED,YUSER)),1)		              ; "Starting DRP Process %1 : %2"
+	
+	
+	;+++++++++++++++++++++++++++++++++++++++   ; if modified also change in INBACKJOBS lock file
+	LOCK +^INDRPRUNJOB(YM):1 if '$test quit    ; Not possible - already running
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set YHANG = 600  ; Time between DRP Cycles - Default 10 minutes - refreshed during each pause in case changed
+	if +$$$INVORGFastestRepetitionOfDRPRun($get(^INVORG(0,0,1)))'=0 set YHANG = $$$INVORGFastestRepetitionOfDRPRun(^INVORG(0,0,1))
+	
+	; Run as a continuous background process (cycling until STOP switch is set to $$$YES
+	; 
+	
+	set blnStop = $$$NO
+	for {
+		; Build a temp list of locations contained in INDRPSYS in priority order
+		;-----------------------------------
+		do SetPriorities("DRP"_YUSER)
+		
+		; Build an action list DRPRUN(...) and then use it to control DRP processing
+	 	; Run each process once
+		;-----------------------------------
+		$$$Log($$$Text("IN00943"),1)		                              ; "Building Action List for DRP Run"
+		do RUNCHECK
+		set RUNID=""
+		for {
+			set RUNID = $order(DRPRUN(RUNID))
+			quit:RUNID=""
+			
+			set RUN1 = $get(DRPRUN(RUNID))
+			do IsStopped(.blnStop)         ; Check whether set to stop processing - may happen any time
+			quit:blnStop
+			
+			;+++++++++++++++++++++++++++++++++
+			; Check whether lock is okay
+			LOCK +^INDRPRUNJOB(YM):1 if '$test set blnStop = $$$YES   ; FIXME : Unnecessary? second lock <GRF>
+			;+++++++++++++++++++++++++++++++++
+			quit:blnStop
+			
+			; Record Start Timestamp & Log : "Process Handling Started"
+			;-------------------------------
+			set $piece(^INDRPRUNID(0,RUNID,1),Y,4) = $horolog
+			do ^INDRPRUNPROT($$^WWWTEXT(32812),,RUNID)                    ; Log - "Process Handling Started"
+			
+			; Process locations in ranked order for each initiated DRP action
+			;-------------------------------
+			set RANG = ""
+			for {
+				set RANG = $order(^WWWSOR("DRP"_YUSER,"RANG",RANG))
+				quit:RANG=""
+				
+				set BET = ""
+				for {
+					set BET = $order(^WWWSOR("DRP"_YUSER,"RANG",RANG,BET))
+					quit:BET=""
+					
+					$$$Log($$$Text($listbuild("IN00944",BET,RUNID)),1)    ; "Starting DRP Run for Location %1 with ID %2"
+					do ^INDRPRUNPROT($$^WWWTEXT(32827),BET,RUNID)         ; Log - "Handling Location Started"
+					do ARTIKEL
+					$$$Log($$$Text($listbuild("IN00945",BET,RUNID)),1)    ; "End DRP Run for Location %1 with ID %2"
+					do ^INDRPRUNPROT($$^WWWTEXT(32828),BET,RUNID)         ; Log - "Handling Location Terminates"
+				}
+			}
+			; Record Stop Timestamp & Log : "Process Handling Terminates"
+			;-------------------------------
+			set $piece(^INDRPRUNID(0,RUNID,1),Y,5) = $horolog
+			do ^INDRPRUNPROT($$^WWWTEXT(32813),,RUNID)
+		}
+		kill ^WWWSOR("DRP"_YUSER)
+		do IsStopped(.blnStop)       ; Recheck - may not have entries in DRPRUN array
+		do HANG(.YHANG,.blnStop)
+		quit:blnStop
+	}
+	
+	;*******************************************************************************
+	HALT        ;             TERMINATION OF BACKGROUND JOB
+	;*******************************************************************************
+	
+	
+SetPriorities(pstrUserKey)
+	;-------------------------------------------------------------------------------
+	; 
+	; Inputs: pstrUserKey = "DRP"_YUSER
+	; 
+	; History:
+	; 19-Oct-2010	GRF		SR17487: quit=>continue
+	; 01-Oct-2010	GRF		SR17487: Extract & document
+	;-------------------------------------------------------------------------------
+	new idLocn,strPriority
+	
+	kill ^WWWSOR(pstrUserKey)
+	
+	; a) Location with priority set
+	;-----------------------------------
+	set idLocn = ""
+	for {
+		set idLocn = $order(^INDRPWHSORT(0,idLocn))
+		quit:idLocn=""
+		continue:'$data(^INDRPSYS(0,idLocn))                    ; skip where no DRP location 
+		
+		set strPriority = $$$INDRPWHSORTRankOfRun($get(^INDRPWHSORT(0,idLocn,1)))
+		if +strPriority=0 set strPriority = 999999
+		set ^WWWSOR(pstrUserKey,"ERL",idLocn)       = ""
+		set ^WWWSOR(pstrUserKey,"RANG",strPriority,idLocn) = ""
+	}
+	
+	; b) Location without priority set - set to lowest value
+	;-----------------------------------
+	set idLocn = ""
+	for {
+		set idLocn = $order(^WWW0121(0,0,idLocn))
+		quit:idLocn=""
+		continue:$data(^WWWSOR(pstrUserKey,"ERL",idLocn))       ; already recorded above
+		continue:'$data(^INDRPSYS(0,idLocn))                    ; skip where no DRP location 
+		
+		set strPriority = 999999
+		set ^WWWSOR(pstrUserKey,"RANG",strPriority,idLocn) = ""
+	}
+	quit
+	
+	
+IsStopped(&pblnStop)
+	;-------------------------------------------------------------------------------
+	; ^INDRPRUNJOB contains a historical record of when DRP Processing was started
+	; of stopped.
+	; 
+	; By Ref : Pass in current status in case stopped elsewhere
+	;          Sets flag to $$$YES if stopped.
+	;          
+	; History:
+	; 01-Oct-2010	GRF		SR17487: Extract & document
+	;-------------------------------------------------------------------------------
+	new dteLastDay,tmeLastRun
+	
+	; Get Last processing date and time and check whether DRP was stopped or started
+	; If no entries treat as stopped
+	set dteLastDay = $order(^INDRPRUNJOB(0,""),-1)                                            
+	if dteLastDay'="" {
+		set tmeLastRun = $order(^INDRPRUNJOB(0,dteLastDay,""),-1)
+		if tmeLastRun'="" {
+			if $piece($get(^INDRPRUNJOB(0,dteLastDay,tmeLastRun,1)),Y,1)'=1 set pblnStop = $$$YES
+		;	Process is "Stopped"
+			
+		} else {
+			set pblnStop = $$$YES
+		}
+	
+	} else {
+		set pblnStop = $$$YES
+	}
+	quit
+	
+	/*
+INDRPSTART1(YMAN)  ; Previous version
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		DRP-PROZESS BEARBEITUNG
+	;
+	; Called By : INBACKJOBS, AUTO^INDRPSTART, START^INDRPSTART
+	; 
+	; Inputs : YMAN - overriding company (YM) - now obsolete
+	;
+	;
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+    ; 12-Mar-2009	PPP		SR16397: Added Logging for the process
+	; 25-Oct-2007	FIS		SRBR014383: Changed position of stop-condition
+	; 01-Oct-2007	shobby	SRBR014383: Improve the response time for starting/stopping
+	; 26-Sep-2006	RPW		SR14933: Moved the User Name determination into a separate tag.
+	; 30-Aug-2006	RPW		SR14873: Removed naked reference
+	; 08-Dec-2005	GRF		SR13984 : Doco, Boolean Macros
+	; 22.06.2005	FIS		CHANGE FOR NETCHANGE RUN (SR12526)
+	; 31.10.2001	FIS		Created
+	;-------------------------------------------------------------------------------
+	
+	;---------------------------------------
+	;	RANG	Company Ranking for order to process - default 999999
+	;	YBED	DRP Process User
+	;	YHANG	Time between DRP Cycles - Default 10 minutes
+	;---------------------------------------
+	
+	;---> HINTERGRUNDJOB / BACKGROUND JOB <---
+	SET $ZTRAP="^WWWERROR"
+	DO LOW^%PRIO
+	DO LOW^%PRIO	
+	
+	NEW (YMAN)
+	
+	DO ^WWWVAR
+	IF $GET(YMAN)'="" SET YM=YMAN  ;MANDANT   ; Now obsolete - always value 0
+	
+	;---------------------------------------
+	;	D79		$$$INVORGUserIdentifierDRPProcess()
+	;	D108	$$$INVORGFastestRepetitionOfDRPRun()
+	;	
+	;	D6		$$$WWW013Language1()
+	;---------------------------------------
+	
+	do GetUserDetails(.YBED,.SPRACHE) // SR14933
+	$$$Log($$$Text($listbuild("IN00942",YBED,YUSER)),1)		// "Starting DRP Process %1 : %2"
+	
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	LOCK +^INDRPRUNJOB(YM):1 IF '$TEST QUIT  ;NICHT MÖGLICH (LÄUFT BEREITS)  ;BEI ÄNEDERUNG DER LOCKDATEI AUCH ÄNDERUNG IN INBACKJOBS ;Not potential next to the too alteration within 
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	SET YHANG = 600  ;INTERVALL IN DER DER INDRPRUN GESTARTET WIRD ; TYBD 10.10.2002
+	IF +$PIECE($GET(^INVORG(0,0,1)),Y,108)'=0 SET YHANG = $PIECE(^INVORG(0,0,1),Y,108) // SR14873  FIXME : repeated in HANG - why?
+	
+	SET STOP = $$$NO  ;ABBRUCHVARIABLE ZUM STOPPEN DES PROZESSES
+	DO
+	. FOR  QUIT:STOP=$$$YES  DO  do HANG(.YHANG,.STOP)  ;HINTERGRUNDPROZESS (ENDLOS ODER STOP) ; Cycle until to stop ;BR014383 ;FIS;25.10.07
+	. . ;
+	. . ; Build a temp list of companies contained in INDRPSYS
+	. . ; in priority order based on ^INDRPWHSORT
+	. . ; and then adding any un-prioritised companies from ^WWW0121.
+	. . ;-----------------------------------
+	. . KILL ^WWWSOR("DRP"_YUSER)
+	. . SET BET = ""                                                 ;BETRIEBE MIT RANGFOLGE
+	. . FOR  SET BET = $ORDER(^INDRPWHSORT(0,BET)) QUIT:BET=""  DO   ;REIHENFOLGE BETRIEBE  ;BUGFIX;FIS;29.04.05;SR12200
+	. . . QUIT:'$DATA(^INDRPSYS(0,BET))                              ;KEINE DRP VORGABEN = KEIN PROZESS 
+	. . . ;
+	. . . SET RANG = $PIECE($GET(^INDRPWHSORT(0,BET,1)),Y,1)
+	. . . IF +RANG=0 SET RANG = 999999
+	. . . SET ^WWWSOR("DRP"_YUSER,"ERL",BET)       = ""
+	. . . SET ^WWWSOR("DRP"_YUSER,"RANG",RANG,BET) = ""
+	. . ;
+	. . SET BET = ""                                                 ;BETRIEBE OHNE RANGFOLGE
+	. . FOR  SET BET = $ORDER(^WWW0121(0,0,BET)) QUIT:BET=""  DO     ;REIHENFOLGE BETRIEBE ;row 
+	. . . QUIT:$DATA(^WWWSOR("DRP"_YUSER,"ERL",BET))                 ;BEREITS ERFASST ;already recorded 
+	. . . QUIT:'$DATA(^INDRPSYS(0,BET))                              ;KEIN DRP BETRIEB ;no DRP location 
+	. . . ;
+	. . . SET RANG = 999999
+	. . . SET ^WWWSOR("DRP"_YUSER,"RANG",RANG,BET) = ""
+	. . ;
+	. . ; Build an action list and then use it to control DRP processing
+	. . ;-----------------------------------
+	. . $$$Log($$$Text("IN00943"),1)		                         ; "Building Action List for DRP Run"
+	. . DO RUNCHECK     ; builds DRPRUN(...)
+	. . SET RUNID=""
+	. . FOR  SET RUNID = $ORDER(DRPRUN(RUNID)) QUIT:RUNID=""  DO  QUIT:STOP=$$$YES  ;ABARBEITEN DRP-LAUF PROZESSE
+	. . . SET RUN1 = $GET(DRPRUN(RUNID))
+	. . . ;
+	. . . ; Re-check the last log entry with each pass to see if we have to stop
+	. . . ;---------------------------------
+	. . . ;PRÜFEN OB PROZESS GESTOPPT WURDE
+	. . . SET LASTDAY = $ORDER(^INDRPRUNJOB(0,""),-1)                                       ;LETZTER BEARBEITUNGSTAG ;last 
+	. . . IF LASTDAY="" SET STOP = $$$YES QUIT                                              ;NICHT KORREKT GESTARTET ;Not 
+	. . . SET LASTRUN = $ORDER(^INDRPRUNJOB(0,LASTDAY,""),-1)                               ;SUCHEN LETZTER RUN      ;check last run
+	. . . IF LASTRUN="" SET STOP = $$$YES QUIT                                              ;NICHT KORREKT GESTARTET ;Not 
+	. . . IF $PIECE($GET(^INDRPRUNJOB(0,LASTDAY,LASTRUN,1)),Y,1)'=1 SET STOP = $$$YES QUIT  ;PROZESS GESTOPPT
+	. . . ;
+	. . . ;+++++++++++++++++++++++++++++++++
+	. . . ;PRÜFEN OB LOCK IN ORDNUNG                               ;check whether within adjustment 
+	. . . LOCK +^INDRPRUNJOB(YM):1 IF '$TEST SET STOP=$$$YES QUIT  ;LOCK NICHT OK      ; FIXME : Unnecessary second lock <GRF> 
+	. . . ;+++++++++++++++++++++++++++++++++
+	. . . ;
+	. . . ; Record Start Date & Log : "Process Handling Started"
+	. . . ;---------------------------------
+	. . . SET $PIECE(^INDRPRUNID(0,RUNID,1),Y,4) = $horolog  ;STARTDATUM
+	. . . DO ^INDRPRUNPROT($$^WWWTEXT(32812),,RUNID)              ; Log - "Process Handling Started"
+	. . . ;
+	. . . ; Process companies in ranked order for each initiated DRP action
+	. . . ;-----------------------	
+	. . . SET RANG=""
+	. . . FOR  SET RANG=$ORDER(^WWWSOR("DRP"_YUSER,"RANG",RANG)) QUIT:RANG=""  DO  QUIT:STOP=1  ;ABARBEITEN BETRIEBE NACH RANGFOLGE ;within 
+	. . . . SET BET=""
+	. . . . FOR  SET BET=$ORDER(^WWWSOR("DRP"_YUSER,"RANG",RANG,BET)) QUIT:BET=""  DO  QUIT:STOP=1
+	. . . . . $$$Log($$$Text($listbuild("IN00944",BET,RUNID)),1)            ; "Starting DRP Run for Location %1 with ID %2"
+	. . . . . DO ^INDRPRUNPROT($$^WWWTEXT(32827),BET,RUNID)  ; Log - "Handling Location Started"
+	. . . . . DO ARTIKEL                                     ; ABARBEITEN EINZELNE ARTIKEL JE BETRIEB   ; item once location 
+	. . . . . $$$Log($$$Text($listbuild("IN00945",BET,RUNID)),1)     ; "End DRP Run for Location %1 with ID %2"
+	. . . . . DO ^INDRPRUNPROT($$^WWWTEXT(32828),BET,RUNID)  ; Log - "Handling Location Terminates" 
+	. . . ;
+	. . . SET $PIECE(^INDRPRUNID(0,RUNID,1),Y,5) = $horolog  ;STOPDATUM
+	. . . DO ^INDRPRUNPROT($$^WWWTEXT(32813),,RUNID)         ; Log - "Process Handling Terminates"
+	. . ;
+	. . KILL ^WWWSOR("DRP"_YUSER)
+	. . ;
+	. . ; Check before waiting (kills job earlier but otherwise not needed) 
+	. . ;--------------------------------
+	. . ;PRÜFEN OB PROZESS GESTOPPT WURDE ;check whether were 
+	. . SET LASTDAY = $ORDER(^INDRPRUNJOB(0,""),-1)                                       ;LETZTER BEARBEITUNGSTAG ;last 
+	. . IF LASTDAY="" SET STOP = $$$YES QUIT                                              ;NICHT KORREKT GESTARTET ;Not 
+	. . SET LASTRUN = $ORDER(^INDRPRUNJOB(0,LASTDAY,""),-1)                               ;SUCHEN LETZTER RUN      ;check last run
+	. . IF LASTRUN="" SET STOP = $$$YES QUIT                                              ;NICHT KORREKT GESTARTET ;Not 
+	. . IF $PIECE($GET(^INDRPRUNJOB(0,LASTDAY,LASTRUN,1)),Y,1)'=1 SET STOP = $$$YES QUIT  ;PROZESS GESTOPPT
+	. . ;--------------------------------
+	
+	;*******************************************************************************
+	HALT
+	;*******************************************************************************
+	;                         TERMINATION OF BACKGROUND JOB
+	*/
+	
+HANG(&pintHang=600,&pblnStop=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Check the last log entry to see if the user has tried to stop the DRP/MRP process
+	;  - if so, halt the background job.  Hangs at 1 second intervals.
+	; If this puts too much load on the processor we can extend it a bit.
+	;
+	; Inputs:
+	; 	pintHang : Number of seconds to wait between running the DRP Process.
+	; 	pblnStop : Flag to indicate the user has requested that DRP be stopped.
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Oct-2007	shobby	SRBR014383: Fix problem determining the last run time.
+	; 01-Oct-2007	shobby	SRBR014383: Created (Subroutined out of main routine)
+	;-------------------------------------------------------------------------------
+	new dteLastDay,intCounter,tmeLastRun
+	
+	for intCounter=1:1 {
+		quit:pblnStop=$$$YES
+		quit:intCounter>pintHang
+		
+		hang 1
+		if +$piece($get(^INVORG(0,0,1)),Y,108)'=0 set pintHang = $piece(^INVORG(0,0,1),Y,108) // SR14873 presumably can be modified like INDRPRUNJOB could change?
+		
+		set dteLastDay = $order(^INDRPRUNJOB(0,""),-1)
+		if dteLastDay'="" set tmeLastRun = $order(^INDRPRUNJOB(0,dteLastDay,""),-1)
+		if dteLastDay="" {
+			set pblnStop = $$$YES
+		
+		} elseif tmeLastRun="" {
+			set pblnStop = $$$YES
+		
+		} elseif $piece($get(^INDRPRUNJOB(0,dteLastDay,tmeLastRun,1)),Y,1)'=1 {
+			set pblnStop = $$$YES
+		}
+	}
+	quit pblnStop
+	
+	
+GetUserDetails(&pidUser,&pidLanguage)
+	;-------------------------------------------------------------------------------
+	; Get the DRP user and the language
+	;
+	; Called By : ^INDRPSTART1, DRP^INDCMAUFSave, SourceTxnAux^INReqSource
+	;             + VAR code
+	; 
+	; ByRefs:		pidUser    : The id of the user
+	;				pidLanguage: The language of the user
+	;
+	; Returns:	Nothing
+	;
+	; History:
+	; 26-Sep-2006	RPW		SR14933: Created
+	;-------------------------------------------------------------------------------
+ 	new idUser
+ 	
+	set idUser = $$$INVORGUserIdentifierDRPProcess($get(^INVORG(0,0,1)))
+	    
+	if idUser'="" set pidUser = idUser
+	if $data(^WWW013(0,pidUser,1)) set pidLanguage = $piece($get(^WWW013(0,pidUser,1)),Y,6)
+	if $get(pidLanguage)=""        set pidLanguage = "EN"  ;DEFAULT
+	
+	quit
+	
+	
+RUNCHECK
+	;-------------------------------------------------------------------------------
+	; PRÜFEN, WELCHER DRP-RUN AUSGEFÜHRT WERDEN SOLL
+	;
+	;	RUN1		objINDRPRUNID
+	;		D5		Charge (Last Stop) Time
+	;		D7		Time of Day
+	;		D8		Launch Every ? Days		  #
+	;		D9		Launch On ? Day			  1-7 (MONDAY - SUNDAY)
+	;		D10		Launch In ? Month		  1-12 (JAN - DEC)
+	;		D11		Launch On ? Day of Month  1-31
+	;		D17		Start Process Immediately Y/N
+	;	
+	;	Can have multiple entries with semicolon delimiters
+	;	
+	;	Try every method with any failure stopping the particular RUNID being added to the process list.
+	; e.g.	
+	;	^INDRPRUNID(0,"P002",1)="Permanently~~~60000,57000~60000,57001~1~ ~ ~           ~~~59000~USER~60000,49000~USER~P002~"
+	;	^INDRPRUNID(0,"P003",1)="Daily      ~~~60000,30000~60000,30000~ ~2~1~1;2;3;4;5;6~~~60000~USER~60000,50000~USER~    ~"
+	;
+	; Called By : ^INDRPSTART1
+	; 
+	; ByRef : DRPRUN array killed and then constructed for use by ^INDRPSTART1
+	;         SPRACHE
+	;
+	; History:
+	; 19-Oct-2010	GRF		SR17487.1: quit => continue; test lists against ";;";
+	;							$$IntToDMY^WWWDATE should be converted to date
+	;							(use +); empty start time list now interpretted as
+	;							always yes subject to other tests - i.e. run
+	;							continuously; default intFrequency only applies when
+	;							strTimeList specified
+	; 17-Sep-2010	GRF		SR17487: More flexible times; std variables where possible
+	; 10-Feb-2010	PPP		SR17156: Times to run is now a list
+	;-------------------------------------------------------------------------------
+ 	new blnRun,dteLastRun,idDRPRun,idTime,intCnt,intFrequency,intLast,intTime
+ 	new loop,objRun,strDoMthList,strDoWkList,strMonthList,strTime,strTimeList
+ 	new tmeLastTime,tmeNow,tmeStart,tmsChargeTime
+	
+	$$$LogR("RUNCHECK","")
+	kill DRPRUN   ; FIXME : arrDRPRUN
+	
+	set idDRPRun = ""
+	for {
+		set idDRPRun = $order(^INDRPRUNID(0,idDRPRun))
+		quit:idDRPRun=""
+		
+		set objRun = $get(^INDRPRUNID(0,idDRPRun,1))
+		$$$LogRx("1:"_idDRPRun_"<"_objRun_"<")
+		if $$$INDRPRUNIDImmediateStart(objRun) {
+			set DRPRUN(idDRPRun) = objRun
+			set $$$INDRPRUNIDImmediateStart(^INDRPRUNID(0,idDRPRun,1)) = ""  ; Clear immediate start - return to cycle
+			continue                                                                    ; SR17487.1
+		}
+		continue:+$$$INDRPRUNIDProcessHandling(objRun)=0                     ; Inactive   SR17487.1
+		
+		set tmsChargeTime = $$$INDRPRUNIDChargeTimeRun(objRun)              ; D5
+		set strTimeList   = $$$INDRPRUNIDLaunchTime(objRun)                 ; D7
+		set intFrequency  = $$$INDRPRUNIDLaunchEveryDays(objRun)            ; D8
+		set strDoWkList   = $$$INDRPRUNIDLaunchOnDayOfWeek(objRun)          ; D9
+		set strMonthList  = ";"_$$$INDRPRUNIDLaunchInMonth(objRun)_";"      ; D10
+		set strDoMthList  = ";"_$$$INDRPRUNIDLaunchOnDayOfMonth(objRun)_";" ; D11
+		
+		set dteLastRun  = +tmsChargeTime
+		set tmeLastTime = +$piece(tmsChargeTime,$$$COMMA,2)
+		
+		set blnRun = $$$YES                             ; Assume will run
+		
+		; Day of Week, Month, and Day of Month provide over-riding requirements.
+		; If these are not met then we don't bother considering start times and frequency.
+		
+		if (strDoWkList'="")    && '$find(strDoWkList, ";"_$$^WWWDAY($horolog)_";")           set blnRun = $$$NO ; Not on this Day of Week
+		if (strMonthList'=";;") && '$find(strMonthList,";"_$$^WWWMONTH($horolog)_";")         set blnRun = $$$NO ; Not in this Month
+		if (strDoMthList'=";;") && '$find(strDoMthList,";"_+$$IntToDMY^WWWDATE($horolog)_";") set blnRun = $$$NO ; Not on this Day of Month
+		
+		; 
+		; 1. If there are no start times
+		; a) If frequency is blank - continuous cycling - subject to other tests.
+		; b) If frequency is set   - last run + frequency must be before today to
+		;                            ensure only run once after that interval.
+		; 
+		; 2. If there are start times
+		;    If frequency is not specified or is zero, uses frequency of 1 (daily)
+		;    
+		; a) If Last Run was today then don't have a problem with frequency
+		;    (Since we don't have any prior history, we have to disregard any changes
+		;    made to intFrequency after the first run of the day.)
+		;  
+		;    If there are no start times, there must be only a single unscheduled start for the
+		;    day and this has to have occurred already so "continue" will cause restart to be skipped.
+		;
+		;    Otherwise we check the start times one at a time, skipping any before the last run time.
+		;    - If the start time is after the last run but before NOW we trigger a run and don't have to look further.
+		;    - Any start times after NOW are not due so we stop checking.
+		;
+		; b) If Last Run wasn't today then we need to check against the frequency.
+		;    Last Run Date + frequency gives Next Run Date.
+		;    If this is before or equal to today then only need to check if first
+		;    start time has been passed.  Any subsequent start times will be considered under 2a).
+		
+		if strTimeList'="" {
+			if (+intFrequency=0) set intFrequency = 1      ; If time of day is specified, defaults to Run Everyday
+		} else {
+			if (intFrequency'="") && (intFrequency+tmsChargeTime >= $horolog) set blnRun = $$$NO ; Too soon to run again
+		}
+		
+		if blnRun && (strTimeList'="") {
+	$$$LogRx("2:"_strTimeList_"<"_"<"_tmsChargeTime_"<"_$horolog)
+			set blnRun = $$$NO
+			set strTimeList = $$OrderTimes(strTimeList,SPRACHE)   ; enums => ordered horolog - e.g. "1;2;3;4" => "0;21600;43200;75600"
+			set tmeNow      = $piece($horolog,",",2)
+			if dteLastRun=+$horolog {       ; has run today
+				for loop=1:1:$length(strTimeList,";") {
+					set tmeStart = $piece(strTimeList,";",loop)
+					continue:(tmeLastTime>tmeStart)
+					quit:tmeStart>tmeNow                          ; remaining entries not due yet
+					
+					set blnRun = $$$YES
+					quit:blnRun
+				}
+				
+			} elseif (dteLastRun+intFrequency <= $horolog) {  ; sufficient delay - only need to consider first entry - if none defined still starts
+				if $piece(strTimeList,";",1)<=tmeNow set blnRun = $$$YES
+			}
+		}
+		
+	$$$LogRx("3:"_blnRun)
+		if blnRun set DRPRUN(idDRPRun) = objRun
+	}
+	quit
+	
+	
+OrderTimes(pstrEnumList,pidLang)	
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Dec-2010	GRF		SR17487: Delimiter is ":" not "."
+	; 17-Sep-2010	GRF		SR17487: Created
+	;-------------------------------------------------------------------------------
+	new arrTimes,enumTime,loop,strHHMMList,strStart,tmeEntry
+	
+	; validate match to pattern HH:MM with range 00:00-23:59
+	
+	for loop=1:1:$length(pstrEnumList,";") {
+		set enumTime = $piece(pstrEnumList,";",loop)
+		continue:enumTime=""
+		set strStart = $$$INPARAText($get(^INPARA(0,"DRPRUNTIME",pidLang,enumTime,1)))
+		continue:(strStart'?2n1":"2n)
+		continue:strStart<0
+		continue:$piece(strStart,":",1)>23
+		continue:$piece(strStart,":",2)>59
+		
+		set arrTimes("x"_strStart) = ""
+	}
+	
+	set strHHMMList = ""
+	set strStart = ""
+	for {
+		set strStart = $order(arrTimes(strStart))
+		quit:strStart=""
+		
+		set tmeEntry = $$^WWWTIME1($extract(strStart,2,6))
+		set strHHMMList = strHHMMList_";"_tmeEntry
+	}
+	set strHHMMList = $extract(strHHMMList,2,999)
+	quit strHHMMList
+	
+	
+oldRUNCHECK   ;PRÜFEN, WELCHER DRP-RUN AUSGEFÜHRT WERDEN SOLL
+	KILL DRPRUN
+	
+	/*+++++++++++++++++++++++++++++++++++++
+	;	RUN1		objINDRPRUNID
+	;		D5		Charge (Last Stop) Time
+	;		D7		Time of Day
+	;		D8		Launch Every ? Days		  #
+	;		D9		Launch On ? Day			  1-7 (MONDAY - SUNDAY)
+	;		D10		Launch In ? Month		  1-12 (JAN - DEC)
+	;		D11		Launch On ? Day of Month  1-31
+	;		D17		Start Process Immediately Y/N
+	;	
+	;	Can have multiple entries with semicolon delimiters
+	;	
+	;	Try every method with any failure stopping the particular RUNID being added to the process list.
+	; e.g.	
+	;	^INDRPRUNID(0,"P002",1)="Permanently~~~60000,57000~60000,57001~1~ ~ ~           ~~~59000~USER~60000,49000~USER~P002~"
+	;	^INDRPRUNID(0,"P003",1)="Daily      ~~~60000,30000~60000,30000~ ~2~1~1;2;3;4;5;6~~~60000~USER~60000,50000~USER~    ~"
+	;
+	;
+	; History:
+	; 10-Feb-2010	PPP		SR17156: Times to run is now a list
+	;++++++++++++++++++++++++++++++++++++*/
+ 	; ****** FIXME: SCR Variables should be newed *************
+ 	new DAY,NORUN,RUNID,RUN1
+ 	new idTime,intCnt,intLast,intTime,strTime,strTimes
+ 	
+	$$$LogR("oldRUNCHECK","")
+	
+	SET RUNID=""  
+	FOR  SET RUNID=$ORDER(^INDRPRUNID(YM,RUNID)) QUIT:RUNID=""  DO
+	. SET RUN1=$GET(^INDRPRUNID(YM,RUNID,1))
+	. $$$LogRx("1:"_RUNID_"<"_RUN1_"<")
+	. ;
+	. IF $PIECE(RUN1,Y,17)=1 DO  QUIT  ;SOFORT STARTEN ;right now launching 
+	. . SET DRPRUN(RUNID)=RUN1
+	. . SET $PIECE(^INDRPRUNID(YM,RUNID,1),Y,17)=""  ;NUR 1 X ;only once 
+	. ;
+	. IF +$PIECE(RUN1,Y,6)=0 QUIT  ;RUN IST NICHT AKTIVIERT ;Not 
+	. IF $PIECE(RUN1,Y,7)'="" IF +$PIECE(RUN1,Y,8)=0 SET $PIECE(RUN1,Y,8)=1  ;NUR 1X BEI UHRZEITVORGABE;FIS;22.12.03 ;only next to 
+	. ;
+	. SET NORUN = $$$NO
+	. ;
+	. ;STARTET ALLE ... TAGE
+	. IF $PIECE(RUN1,Y,8)'="" DO
+	. . IF ($PIECE(RUN1,Y,8)+$PIECE(RUN1,Y,5))>$HOROLOG                SET NORUN = $$$YES
+	. ;
+	. ;WOCHENTAGE
+	. IF $PIECE(RUN1,Y,9)'="" DO
+	. . SET DAY=$$^WWWDAY($HOROLOG)
+	. . IF '$FIND(","_$TRANSLATE($PIECE(RUN1,Y,9),";",",")_",",DAY)    SET NORUN = $$$YES  ;FALSCHER WOCHENTAG
+	. ;
+	. ;MONATE
+	. IF $PIECE(RUN1,Y,10)'="" DO
+	. . SET MONTH=$$^WWWMONTH($HOROLOG)
+	. . IF '$FIND(","_$TRANSLATE($PIECE(RUN1,Y,10),";",",")_",",MONTH) SET NORUN = $$$YES  ;FALSCHER MONAT
+	. ;
+	. ;TAG EINES MONATS ;TAG monthly 
+	. IF $PIECE(RUN1,Y,11)'="" DO
+	. . SET DAY=$PIECE($$^WWWDATE($HOROLOG),".",1)    ; FIXME : this will not work if MM/DD/YYYY on two counts
+	. . IF '$FIND(","_$TRANSLATE($PIECE(RUN1,Y,11),";",",")_",",DAY)   SET NORUN = $$$YES  ;FALSCHER TAG DES MONATS
+	. ;
+	. ;UHRZEIT
+	. ; Wait until designated start time
+	. ;IF $PIECE(RUN1,Y,7)'="" DO
+	. . ;QUIT:$PIECE(RUN1,Y,8)=""  ;NICHT BEI STÄNDIGEM RUN ;Not next to 
+	. . ;SET TIME=$PIECE($GET(^INDRPPARA(YM,"TIME",SPRACHE,$PIECE(RUN1,Y,7),1)),Y,1)
+	. . ;QUIT:TIME=""
+	. . ;SET TIME=$$^WWWTIME1($TRANSLATE(TIME,";-.,/|\",":"))
+	. . ;IF TIME>$PIECE($HOROLOG,",",2) SET NORUN = $$$YES
+	. .
+	. ; Wait until designated start time	//SR17156
+	. set strTimes = $piece(RUN1,Y,7)
+	. set intLast  = $piece($piece(RUN1,Y,5),",",2)	//Last Charge Time
+	. $$$LogRx("2:"_strTimes_"<"_$piece(RUN1,Y,5)_"<"_$piece(RUN1,Y,8)_"<"_$horolog)
+	. if strTimes'="" do
+	. . quit:$piece(RUN1,Y,8)=""	//Launch Every ?    ; FIXME : this will have been set to 1 above
+	. . if (($piece(RUN1,Y,8)+$piece(RUN1,Y,5))<$horolog) set NORUN=$$$NO quit
+	. . if (($piece(RUN1,Y,8)+$piece(RUN1,Y,5))=+$horolog)&&(+$piece(RUN1,Y,5)<$horolog) set intLast=0	//If (Run Date<$H) i.e. is past ignore Runtime
+	. . for intCnt = 1:1:$length(strTimes,";") do  quit:NORUN=$$$NO
+	. . . set idTime = $piece(strTimes,";",intCnt)
+	. . . set strTime=$piece($get(^INDRPPARA(YM,"TIME",SPRACHE,idTime,1)),Y,1)
+	. . . quit:strTime=""
+	. . . set intTime=$$^WWWTIME1($TRANSLATE(strTime,".",":"))
+	. . . set NORUN = $select((($piece($horolog,",",2)>intTime)&&(intLast<intTime))=1:$$$NO,1:$$$YES)
+	. . . //w !,$piece($horolog,",",2),":",intTime,":",intLast,": NORUN :",NORUN
+	. ;
+	. $$$LogRx("3:"_NORUN)
+	. QUIT:NORUN=$$$YES
+	. SET DRPRUN(RUNID)=RUN1
+	
+	$$$LogRm(DRPRUN)
+	$$$LogRx("4:")
+	QUIT
+	
+	
+ARTIKEL
+	;-------------------------------------------------------------------------------
+	;	ARTIKELPRÜFUNG JE BETRIEB ;once location 
+	; 
+	; Called By: ^INDRPSTART1 
+	; 
+	; By Ref : BET, RUN1, RUNID
+	; 
+	; History:
+	; 01-Oct-2010	GRF		SR17487: Cleanup old commented code
+	; 30-Aug-2006	RPW		SR14873: Removed naked reference
+	;-------------------------------------------------------------------------------
+	NEW YSOURCING
+	
+	SET YSOURCING=""
+	
+	FOR RUNID0=RUNID,"" DO
+	. DO:RUNID0'=""  IF RUNID0="" FOR  SET RUNID0=$ORDER(^INDRPRUNIDs(0,1,$$^WWWUMLAU(RUNID,1),RUNID0))  QUIT:RUNID0=""  DO
+	. . IF RUNID0'=RUNID IF $DATA(DRPRUN(RUNID0)) QUIT  ;WIRD NOCH BEARBEITET ;yet 
+	. . ; Log - "Allocation Origin Started"
+	. . IF RUNID0'=RUNID SET YSOURCING = $$$YES DO ^INDRPRUNPROT($$^WWWTEXT(33986),,RUNID)  ;26407;FIS;21.09.04;NUR FESTLEGEN WARENHERKUNFT, KEINE BESCHAFFUNG
+	. . ;
+	. . ;PROCEED ONLY ITEMS WITH DRP-ITEM/LOCATION SETUP
+	. . ;		D12		$$$INDRPSYSProcessOnlyItemsWithDRP()
+	. . IF $PIECE($GET(^INDRPSYS(0,BET,1)),Y,12)=1 DO  QUIT
+	. . . $$$Log($$$Text($listbuild("IN00946",BET,RUNID0)),1)		; "Include only Items for DRP Location %1, Run-ID %2"
+	. . . NEW GRP,DESC,RUNIDS,GRPS
+	. . . ;
+	. . . SET RUNIDS = $$^WWWUMLAU(RUNID0,1)
+	. . . SET ART=""
+	. . . FOR  SET ART = $ORDER(^INDRPITEMs(0,2,RUNIDS,BET,ART)) QUIT:ART=""  DO
+	. . . . SET ART2 = $GET(^INDRPITEM(0,BET,ART,1))
+	. . . . QUIT:ART2=""
+	. . . . DO ARTRUN
+	. . . ;
+	. . . IF YSOURCING=$$$YES DO ^INDRPRUNPROT($$^WWWTEXT(33987),,RUNID)  ; Log - "Allocation Origin Stopped"
+	. . ;
+	. . ;ALLE ARTIKEL ;item 
+	. . SET ART=""
+	. . FOR  SET ART=$ORDER(^INART(0,ART)) QUIT:ART=""  DO
+	. . . SET ART2=""
+	. . . DO
+	. . . . NEW WG
+	. . . . IF $DATA(^INDRPITEM(0,BET,ART,1)) SET ART2=^INDRPITEM(0,BET,ART,1) QUIT  ;IM DRP ANGELEGT // SR14873
+	. . . . SET WG=$PIECE($GET(^INART(0,ART,1)),Y,30)             ;WARENGRUPPE
+	. . . . IF WG="" SET WG=$PIECE($GET(^INVORG(0,0,1)),Y,13)     ;DFLT. WARENGRUPPE
+	. . . . IF WG'="" IF $DATA(^INDRPITEMS(0,BET,WG,1)) SET ART2=^INDRPITEMS(0,BET,WG,1) SET $PIECE(ART2,Y,2)=1  ;STANDARD VORGABEN
+	. . . ;
+	. . . QUIT:$PIECE(ART2,Y,1)'=RUNID0  ;NICHT IN DIESEM PROZESS ;Not within 
+	. . . QUIT:ART2=""
+	. . . DO ARTRUN
+	. . ;
+	. . IF YSOURCING=$$$YES DO ^INDRPRUNPROT($$^WWWTEXT(33987),,RUNID)  ; Log - "Allocation Origin Stopped"
+	
+	QUIT
+	
+	
+ARTRUN ;DRP RUN JE ARTIKEL STARTEN ;DRP once item launching 
+	;-------------------------------------------------------------------------------
+	; Routines called before the DRP run for each Item
+	; 
+	; Called By: ARTIKEL^INDRPSTART1
+	; 
+	; By Ref : A]]><![CDATA[RT, ART2 (objINDRPITEM or objINDRPITEMS), BET, RUN1, RUNID, YSOURCING
+	; 
+	; History
+	; 12-Oct-2010	SCR		SR17569: Pass Location (BET) and ItemLocation (ART2) to INDRPAUFKILL
+	;								 Dont do 'ToDay' check for INDRPAUFKILL
+	; 16-Jul-2010	SCR		SR17381: Always call the clean up code once a day
+    ; 12-Mar-2009	PPP		SR16397: Added Logging for the process
+	; 23-Aug-2006	RPW		SR14873: Removed naked reference
+	; 22.06.2005	FIS		SR12526
+	; 29.04.2005	FIS		SR12200
+	;-------------------------------------------------------------------------------
+	new intTimeFence,objSup
+	
+	IF '$DATA(^INDRPITEMRUN(0,BET,ART,1)) SET ^INDRPITEMRUN(0,BET,ART,1)=""   ;ARTIKEL-BEARBEITUNGSDATEI  ; Last DRP/MRP Handling Item // SR14873
+	DO
+	. SET ITEMRUN = $GET(^INDRPITEMRUN(0,BET,ART,1))
+	. ;  INDRPNETCHANGE : Changed Items to be processed in DRP/MRP
+	. ;  D217		$$$INVORGDRPOnlyForNetChange()
+	. IF $PIECE(ITEMRUN,Y,1)'<$HOROLOG IF $PIECE($GET(^INVORG(0,0,1)),Y,217)=$$$YES QUIT:'$DATA(^INDRPNETCHANGE(0,ART,BET))  ;FIS;RUN ONLY AGAIN TODAY, IF THERE WAS A CHANGE FOR THIS ITEM;FIS;29.04.05;SR12200;FIS;22.06.05;SR12526
+	. IF $PIECE(ITEMRUN,Y,1)<$HOROLOG  KILL ^INDRPNETCHANGE(0,ART,BET)  ;DELETE OLD DATA AND RUN ALWAYS;FIS;29.04.05;SR12200;FIS;22.06.05;SR12526
+	. ;
+	. IF YSOURCING'=$$$YES IF +$PIECE(RUN1,Y,5)'=0 IF $PIECE(ITEMRUN,Y,1)>$PIECE(RUN1,Y,5) QUIT  ;ARTIKEL BEREITS BEARBEITET ;item yet
+	. IF YSOURCING'=$$$YES IF +$PIECE(RUN1,Y,5)'=0 IF $PIECE(ITEMRUN,Y,1)=+$PIECE(RUN1,Y,5) if $PIECE(ITEMRUN,Y,2)>$PIECE($PIECE(RUN1,Y,5),",",2) quit ;BEREITS BEARBEITET ;yet 
+	. IF $PIECE(ART2,Y,2)'=1 QUIT                                    ;ARTIKEL NICHT AKTIV ;item Not ENABLED 
+	. IF +$PIECE(ART2,Y,22)'=0 IF $PIECE(ART2,Y,22)<$HOROLOG $$$Log($$$Text("IN00947"),1) QUIT  ;ARTIKEL NICHT MEHR GÜLTIG ;item Not more valuable  //Item no longer in use, exiting...
+	. ;
+	. IF YSOURCING'=$$$YES DO ^INDRPRUNPROT($$^WWWTEXT(32814),BET,RUNID,ART)   ; Log - "Item Handling Started"
+	. ;
+	. IF YSOURCING'=$$$YES DO
+	. . IF ($PIECE(ART2,Y,8)="B") || ($PIECE(ART2,Y,8)="O") || ($PIECE(ART2,Y,8)="Q") QUIT  ;BACK-TO-BACK / ORDER-TO-ORDER / ORDER-TO-REQUIREMENT NOT DELETE ;FIS;25.04.05;RS12200
+	. . ;IF +$PIECE(RUN1,Y,8)=0 QUIT:$PIECE(ITEMRUN,Y,1)'<$HOROLOG                           ;BEI DAUERHAFTEM RUN NUR 1 X PRO TAG LÖSCHEN ; SR17569
+	. . ;IF +$PIECE(RUN1,Y,8)=0 DO ^INDRPAUFKILL(ART,,$$$YES) QUIT  ;LÖSCHEN UNBEARBEITETE AUFTRÄGE DES ARTIKELS (IMMER, AUCH DIE VON HEUTE)
+	. . ;DO ^INDRPAUFKILL(ART,,$$$YES) QUIT  ; SR17381  Always do the clean up. This will be daily based on ^INDRPITEMRUN(YM,BET,ART,1)
+	. . DO ^INDRPAUFKILL(ART,BET,$$$YES,ART2) QUIT  ; SR17569  Always do the clean up. This will be daily based on ^INDRPITEMRUN(YM,BET,ART,1)
+	. . ;DO ^INDRPAUFKILL(ART)                                 ;LÖSCHEN UNBEARBEITETE AUFTRÄGE VOM VORTAG (WENN LAUT SETUP GEWÜSCHT)
+	. ;
+	. set intTimeFence = $piece(ART2,Y,9)
+	. ;
+	. set ^WWW006(0,+$horolog,"^INReqFirm/0.0.1/",1)=YUSER_Y_$piece($horolog,",",2)   ;SR17822
+	. DO
+	. . NEW BGJOB,YLOCATION
+	. . SET YLOCATION = BET       ;BETRIEB SETZEN ;location typeset 
+	. . SET BGJOB     = $$$YES
+	. . SET ^INDRPUSER(0,YUSER,1) = Y_ART_Y_Y_1_Y_Y_intTimeFence_Y_0     ;Save Selection
+	. . $$$Log($$$Text($listbuild("IN00948",BET,ART)),1)		          ; "Starting DRP Run for %1:%2"
+	. . DO RUN^INDRPRUN
+	. . $$$Log($$$Text($listbuild("IN00949",BET,ART)),1)		          ; "Ending DRP Run for %1:%2"
+	. ;
+	. IF YSOURCING'=$$$YES DO ^INDRPRUNPROT($$^WWWTEXT(32815),BET,RUNID,ART)  ; Log - "Item Handling Terminates"
+	
+	KILL ^INDRPNETCHANGE(0,ART,BET)  ;DELETE ITEM FOR NETCHANGE AFTER RUN OF LAST LOCATION;FIS;22.06.05;SR12526
+	;;IF $ORDER(^WWWSOR("DRP"_YUSER,"RANG",RANG,BET))="" KILL ^INDRPNETCHANGE(0,ART)  ;DELETE ITEM FOR NETCHANGE AFTER RUN OF LAST LOCATION;FIS;29.04.05;SR12526
+	IF YSOURCING'=$$$YES SET ^INDRPITEMRUN(0,BET,ART,1) = +$HOROLOG_Y_$PIECE($HOROLOG,",",2)  ;SPEICHERN BEARBEITUNGSDATUM/ZEIT ;Save 
+	
+	QUIT
+	
+]]></Routine>
+</Export>

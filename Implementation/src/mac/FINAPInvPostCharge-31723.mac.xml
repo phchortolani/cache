@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvPostCharge" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvCharge
+	;-------------------------------------------------------------------------------
+	; Routines relating to the posting of charges.
+	;-------------------------------------------------------------------------------
+#include COMSYS
+#include FINConst
+	
+AddCharges(pidInvoice,pidBatch,pidBlock,pblnReverse=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Adds FINAPInvCharge accounts and amounts to the batch.
+    ; 
+    ; Returns:Status
+    ; 
+    ; History:
+    ; 29-Jul-2009	GRF		SR16667: Doco
+    ; 25-Jan-2006	RPW		SR13087: Pass the intercompany details into the batch for APEX and TAX.
+    ; 26-Oct-2005	JW		SR13743: COMTAX now has pblnTaxInc param.
+    ; 20-Sep-2005	shobby	SR13213: Flag to allow reversal of transactions.
+    ; 22-Jul-2005	Steve S	SR13072: Pass in 'Buy' flag
+    ; 31-Mar-2005	GRF		$$$FINAPInvDefaultTaxCode was $$$FINAPInvTaxCode
+    ; 08-Mar-2005	JW		Added On Charges
+    ; 23-Feb-2005	JW		SR11405: Created (modified AddLines)
+    ;-------------------------------------------------------------------------------
+	new arrTaxLines,blnInclTax,blnTaxInvoice,curAmount,dteTrans
+	new idAccount,idARInv,idCompany,idCompanyAccount,idLine,idSupplier,idTaxLocn
+	new objInvoice,objParameters,objPostLine,objPostDiv,blnPostOnCharge
+	new taxCode,idTax,ratesArray,strStatus,objTax,taxType,taxRate,tax
+	new taxSum,taxDiff
+	
+	set strStatus=$$$OK
+	
+	if ($get(pidInvoice)'="") && ($get(pidBatch)'="") && ($get(pidBlock)'="") {
+		set objInvoice      = $get(^FINAPInv(YM,pidInvoice,1))
+		set idSupplier      = $$$FINAPInvInvoiceSupplier(objInvoice)
+		set objParameters   = idSupplier_","_pidInvoice
+		set blnTaxInvoice   = $$$FINAPInvTaxInvoice(objInvoice)
+		set blnPostOnCharge = $$$FINAPInvPostOnCharges(objInvoice)
+		set blnInclTax 		= $$$FINAPInvLinesIncludeTax(objInvoice)
+		
+		set idTaxLocn       = $$$FINAPInvTaxLocation(objInvoice)
+		set dteTrans        = $$$FINAPInvEnteredDate(objInvoice)
+		
+		set taxSum = 0
+		set idLine=""
+		for {
+			set idLine=$order(^FINAPInvCharge(YM,pidInvoice,idLine))
+			quit:idLine=""
+			
+			set $piece(objParameters,",",3) = idLine
+			
+			set objPostLine      = $get(^FINAPInvCharge(YM,pidInvoice,idLine,1))
+			set idAccount        = $$$FINAPInvChargeAccount(objPostLine)
+			set idCompany        = $$$FINAPInvChargeCompany1(objPostLine)
+			set idCompanyAccount = $$$FINAPInvChargeCompanyAccount(objPostLine)
+			
+		; Post account group lines	
+		;-----------------------------------
+			if idAccount="" {
+				for {
+					set idAccount = $order(^FINAPInvChargeDivision(YM,pidInvoice,idLine,idAccount))
+					quit:idAccount=""
+					
+					set objPostDiv = $get(^FINAPInvChargeDivision(YM,pidInvoice,idLine,idAccount,1))
+					set curAmount  = $$$FINAPInvChargeDivisionAmount(objPostDiv)
+					
+					
+					set strStatus = $$AddLine^FININTBatch(pidBatch,pidBlock,idAccount,curAmount,
+					                                      "APEX",objParameters,pidInvoice,idSupplier,
+					                                      pblnReverse)
+					quit:$$$ISERR(strStatus)	
+				}
+				
+		; Post Single Account Line - On Charge
+		;-----------------------------------
+			} else { // 
+				if $$$FINAPInvChargeIsOnCharge(objPostLine) {
+					// Create Customer Invoice
+					set strStatus = $$CreateARFromAPInv^FINARInv(pidInvoice,idLine,.idARInv)
+					
+					// Populate AR Invoice # on Charge
+					if $$$ISOK(strStatus) {
+						set $$$FINAPInvChargeARInvoiceNumber(objPostLine) = idARInv
+						set strStatus = $$$Save("FINAPInvCharge",pidInvoice_","_idLine,objPostLine,1)
+						
+						if $$$ISOK(strStatus) && blnPostOnCharge { // Post AR Invoice
+							set strStatus = $$Post^FINARInvPost(idARInv,$$$NO)
+							
+							if $$$ISERR(strStatus) {
+								set strStatus = $listbuild("Fin00712",idLine,strStatus)
+							}  ; "On Charge %1 cannot be posted: %2"
+						}
+					}
+					
+		; Post Single Account Line - NOT On Charge	
+		;-----------------------------------
+				} else {
+					set curAmount = $$$FINAPInvChargeAmountTaxEx(objPostLine)
+					set strStatus = $$AddLine^FININTBatch(pidBatch,pidBlock,idAccount,curAmount,
+					                                      "APEX",objParameters,pidInvoice,idSupplier,
+					                                      pblnReverse,,,,
+					                                      ,idCompany,idCompanyAccount) ; SR13087
+				}
+			}
+			
+		; Record Taxes (need to store tax lines before posting in case of sum difference)
+		;-----------------------------------
+			if $$$ISOK(strStatus) && blnTaxInvoice && '$$$FINAPInvChargeIsOnCharge(objPostLine) { ; Taxes (copied from FINARInvPost)
+				
+				set taxCode = $$IsTaxable^COMTAX($$$FINAPInvChargeTaxCode(objPostLine),blnTaxInvoice,,idTaxLocn)
+				
+				if taxCode'=0 {      // Set array up for CalculateTaxes call
+					set curAmount = $select(blnInclTax:$$$FINAPInvChargeAmount(objPostLine),
+					                                 1:$$$FINAPInvChargeAmountTaxEx(objPostLine))
+					set arrTaxLines(idLine) = taxCode_Y_curAmount
+				}
+			}
+			quit:$$$ISERR(strStatus)
+		}
+		
+		
+		; Post Tax lines
+		;-----------------------------------
+		if $$$ISOK(strStatus) && blnTaxInvoice && (+$$$FINAPInvTaxTotal(objInvoice)'=0) {
+			; Expand Tax Line information      ;This is a 'buy' type -- pass in the $$$YES flag
+			set strStatus = $$CalculateTaxes^COMTAX(idTaxLocn,dteTrans,.arrTaxLines,$$$YES,$$$FINAPInvTaxTotal(objInvoice),blnInclTax)
+			
+			if $$$ISOK(strStatus) {
+				set idLine=""
+				for {
+					set idLine = $order(arrTaxLines(idLine))
+					quit:idLine=""
+					
+					set idTax = ""
+					for {
+						set idTax = $order(arrTaxLines(idLine,idTax))
+						quit:idTax=""
+						
+						set objTax    = $get(arrTaxLines(idLine,idTax))
+						set taxType   = $piece(objTax,Y,1)
+						set idAccount = $piece(objTax,Y,3)
+						set tax       = $piece(objTax,Y,4)
+						
+						set strStatus = $$AddLine^FININTBatch(pidBatch,pidBlock,idAccount,tax,
+						                                      "TAX",objParameters_","_idLine_","_taxType,pidInvoice,idSupplier,
+						                                      pblnReverse,,,,
+						                                      ,idCompany,idCompanyAccount)
+						quit:$$$ISERR(strStatus)
+					}
+					quit:$$$ISERR(strStatus)
+				}
+			}
+		}
+	}
+	
+	quit strStatus
+	
+	; AddLine(	idBatch				intBlockNumber		idAccount				curAmount
+	;			idInterfaceType		strParameters		strSource				strReference
+	;			blnReverse			strUser				strDepartment			strCSTMat
+	;			strCSTVals			idCompany			idCompanyAccount		strCleared	)
+	
+]]></Routine>
+</Export>

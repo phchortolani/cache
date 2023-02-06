@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLFCAdjust" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLFCAdjust  ;  Foreign Currency Adjustment
+ 
+ 	#include COMSYS
+ 	#Include FINConst
+	#Include FIN
+ 
+ 
+AfterSave(pdteAdjust="",pblnPost=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; After Save
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 14-Jun-2006	RPW			SR14642: Cleaned up variable usage
+    ; 03-Jun-2004	SCR			Created
+    ;-------------------------------------------------------------------------------
+	do Adjust(pdteAdjust,pblnPost,1)
+	do ^WWWFORM
+	
+	quit
+	
+AfterDataFields(pdteAdjust="",pblnPost=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; After Data Fields
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 14-Jun-2006	RPW			SR14642: Cleaned up variable usage
+    ; 07-Jun-2004	SCR			Created
+    ;-------------------------------------------------------------------------------
+	do Adjust(pdteAdjust,pblnPost)
+	
+	quit
+	
+Adjust(pdteAdjust="",pblnPost=$$$NO,pblnSilent=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Adjust FC Account
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 14-Jun-2006	RPW			SR14642: Send the Adjustments through the Interface Batch instead of direct to the GL Accounts
+    ; 28-Oct-2005	JW			SR13074: Translate Exchange Rate
+    ; 08-Apr-2005	RobertW		SR11836: Change FCMake to FCJoin
+    ; 07-Jun-2004	SCR			Added Silent
+    ; 04-Jun-2004	SCR			Added Post Option
+    ; 03-Jun-2004	SCR			Created
+    ;-------------------------------------------------------------------------------
+ 
+	new idAccount,idCurrency,curOldBalance,curOldBase,curOldRate,curNewBalance,curNewBase,fltNewRate
+	new curVariance,curForeign,objAccount,idVarianceAccount,strRef,lstHeader
+	new idTran,idHistory,strStatus,fltDebit,fltCredit,blnDone,idFluctuation,idBatch,idBlock
+	
+	set strStatus=$$$OK
+	
+	set $ztrap="AdjustError" // SR14642
+	
+	if pblnPost {
+		tstart
+	}
+	
+	kill ^CacheTemp("FINCFADJ",$job)
+	set lstHeader=$listBuild(
+				$$$StrFINGLAccountNumber,
+				$$$StrFINGLAccountCurrencyAdjustment,
+				$$$Text("Fin00039",0),
+				$$$Text("Fin00331",0),
+				$$$Text("Fin00333",0),
+				$$$Text("Fin00330",0))
+	if 'pblnSilent do Start^COMTable(lstHeader)
+	set idTran=""
+	set idAccount=""
+	set idCurrency=" " // SR14642
+	if pblnPost {
+		set idHistory=$order(^FINGLFCAdjHist(YM,""),-1)+1
+		set ^FINGLFCAdjHist(YM,idHistory,1)=""
+	}
+ 	
+ 	 // SR14642: Do not look through ALL the accounts, there are lots of these, just look at the FC ones,
+ 	 // that's all this is interested in anyway.
+	for {
+		//set idAccount=$order(^FINGLAccount(YM,idAccount))
+		set idCurrency=$order(^FINGLAccounts(YM,5,idCurrency))
+		quit:idCurrency=""
+		
+		set idFluctuation=""
+		for {
+			set idFluctuation=$order(^FINGLAccounts(YM,5,idCurrency,idFluctuation))
+			quit:(idFluctuation="")
+			
+			set idAccount=""
+			for {
+				set idAccount=$order(^FINGLAccounts(YM,5,idCurrency,idFluctuation,idAccount))
+				quit:(idAccount="")
+				
+				;set idCurrency=$$GetFCCode^FINGLFC(idAccount)
+				//if idCurrency'="" {
+					set curOldBalance=$$GetBalanceAtDate^FINGLAccountTran(idAccount,pdteAdjust)
+					set curOldBase=$$$FCBase(curOldBalance)
+					set curOldRate=$$$FCRate(curOldBalance)
+					set fltNewRate=$$GetRate^FINGLFC(idCurrency,pdteAdjust)
+					set curNewBalance=$$$FCUpdate(curOldBalance,fltNewRate,1)
+					set curNewBase=$$$FCBase(curNewBalance)
+					set curVariance=curNewBase-curOldBase
+					set curForeign=$$$FCAmount(curNewBalance)
+					set objAccount=$get(^FINGLAccount(YM,idAccount,1))
+					set idVarianceAccount=$$$FINGLAccountCurrencyAdjustment(objAccount)
+					set strRef="Old: "_curOldBase_" @ "_curOldRate_"  New: "_curNewBase_" @ "_fltNewRate
+					set ^CacheTemp("FINCFADJ",$job,idAccount)=curVariance_Y_idVarianceAccount_Y_strRef
+					if 'pblnSilent {
+						do NewLine^COMTable()
+						do InsertCell^COMTable(idAccount_" "_$$$FINGLAccountDescription(objAccount),"FINGLAccount",idAccount)
+						do InsertCell^COMTable(idVarianceAccount,"FINGLAccount",idAccount)
+						do InsertCell^COMTable(idCurrency_" "_$$FormatCurrency^COMTable(curForeign),"FINGLAccount",idAccount)
+						do InsertCell^COMTable($$FormatCurrency^COMTable(curOldBase)_" @ "_$$^WWWTR(0,18,curOldRate),,"FINGLAccount",idAccount)		//SR13074
+						do InsertCell^COMTable($$FormatCurrency^COMTable(curNewBase)_" @ "_$$^WWWTR(0,18,fltNewRate),"FINGLAccount",idAccount)
+						do InsertCurrencyCell^COMTable(curVariance,,"FINGLAccount",idAccount)
+						do EndLine^COMTable()
+					}
+					if (curVariance)&&(pblnPost) {  ; Start of Posting Code
+						if idTran="" {  ; If first transaction create header
+							// SR14642
+							if $get(idBatch)="" {
+								set strStatus=$$CreateBatch^FINGLFCAdjustPost(pdteAdjust,idHistory,"FINGLFCAdjust",.idBatch,.idBlock)
+							}
+							/*
+							set idHistory=$order(^FINGLFCAdjHist(YM,""),-1)+1
+							set ^FINGLFCAdjHist(YM,idHistory,1)=""
+							set strStatus=$$Create^FINGLTran(.idTran,idHistory_",FINGLFCAdjustment",pdteAdjust,"FC","BAL")
+							set ^FINGLFCAdjHist(YM,idHistory,1)=$h_Y_idTran
+							*/
+						}
+						if curVariance>0 {
+							set fltDebit=$$$FCJoin(curVariance,0,idCurrency,fltNewRate)
+							set fltCredit=""
+						} else {
+							set fltCredit=$$$FCJoin(-curVariance,0,idCurrency,fltNewRate)
+							set fltDebit=""
+						}
+						set strStatus=$$CreateLine^FINGLFCAdjustPost(idAccount,fltDebit,fltCredit,strRef,idBatch,idBlock,pdteAdjust) // SR14642
+						//set strStatus=$$CreateLine^FINGLTran(idTran,idAccount,fltDebit,fltCredit,strRef,0) // SR14642
+						if curVariance>0 {
+							set fltCredit=curVariance
+							set fltDebit=""
+						} else {
+							set fltDebit=-curVariance
+							set fltCredit=""
+						}
+						set strStatus=$$CreateLine^FINGLFCAdjustPost(idVarianceAccount,fltDebit,fltCredit,strRef,idBatch,idBlock,pdteAdjust) // SR14642
+						//set strStatus=$$CreateLine^FINGLTran(idTran,idVarianceAccount,fltDebit,fltCredit,idAccount,0) // SR14642
+					}
+				//}
+			}
+		}
+	}
+ 
+ 	// SR14642
+	if $get(idBatch)'="" {
+		set strStatus=$$Post^FINGLFCAdjustPost(idBatch,idBlock,.idTran)
+		set ^FINGLFCAdjHist(YM,idHistory,1)=$h_Y_idTran
+	}
+	/*
+	if (idTran'="")&&$$$ISOK(strStatus) {
+		set strStatus=$$Post^FINGLTran(idTran)
+	}
+	*/
+ 
+	if 'pblnSilent do Stop^COMTable()
+	
+	if pblnPost {
+		if $$$ISOK(strStatus) {
+			if $tlevel>0 tcommit
+		} else {
+			trollback
+		}
+	}
+	
+	quit
+	
+AdjustError ; Internal Tag // SR14642
+	if pblnPost {
+		trollback
+	}
+	quit
+]]></Routine>
+</Export>

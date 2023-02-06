@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPPayment2" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPPayment2
+	
+#include COMSYS
+#include FINConst
+	
+IsPrePay(pidPay)
+	;-------------------------------------------------------------------------------
+	; Determines whether a payment run is using the PrePay method of payment
+	;
+	; Returns: boolean
+	;
+	; History:
+	; 20-Oct-2005	SteveS	SR13273: Created
+	;-------------------------------------------------------------------------------
+	new blnPrePay,objPay,strPayMethod
+ 
+	set blnPrePay = $$$NO
+	
+	if '$$$NoKey(pidPay) {
+		set objPay       = $get(^FINAPPayment(0,pidPay,1))
+		set strPayMethod = $$$FINAPPaymentPaymentMethod(objPay)
+		set blnPrePay    = (strPayMethod=$$$EnumFINARBANKLINEMETHODPrePayment)	
+	}
+	quit blnPrePay
+	
+	
+CanPrint(pidPayment)
+	;-------------------------------------------------------------------------------
+	; Determines whether or not a payment run can be printed
+	;
+	; Returns:
+	;
+	; History:
+	; 06-Jan-2006	SC		SR13798: Decode wrapper removed. Decode is in COMSYS.INC
+	; 20-Oct-2005	SteveS	SR12828: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+ 
+	if $get(pidPayment)="" {
+		set strStatus = $listbuild("Fin00089")             ; "No Record Selected."
+		
+	} elseif '$data(^FINAPPaymentLine(0,pidPayment)) {
+		set strStatus = $listbuild("Fin00924",pidPayment)  ; "Supplier Payment `%1` has no lines for printing.	"
+	}
+ 
+	if $$$ISOK(strStatus) {
+		set YQ = $$$YQEnable	
+	} else {
+		set YQ = $$$YQDisable(strStatus)
+	}
+	quit strStatus
+	
+	
+CheckRecordConsistency(pidFINAPPayment)
+    ;-------------------------------------------------------------------------------
+    ; Checks whether all Payment Lines are correctly formed, if a record malformed
+    ; then it is corrected.
+    ;
+    ; Params: Supplier Payment key
+    ;
+    ; Returns: Status
+    ;
+    ; History:
+    ; 16-May-2006	SteveS	SR14579: Lines counter
+    ; 02-Feb-2006	SteveS	Moved from FINAPPayment.mac
+    ; 02-Aug-2005	PO		SR12850: Commented out all code for handling Prepayment
+    ;							field as it is incorrect
+    ; 29-Jul-2005	PO		SR12850: Created
+    ;-------------------------------------------------------------------------------
+	new curPayment,curSumOfPayAmtsOnHold,idCount,idFINAPPayment,idFINAPPaymentLine
+	new idFINAPPaymentLineKey,idFINAPPaymentInvoice,idSupplier
+	new objFINAPInvoice,objFINAPPaymentInvoice,objFINAPPaymentLine,strStatus
+	
+	set strStatus = $$$OK
+ 	set idCount = 0
+ 	
+	if ($length(pidFINAPPayment,",")=1) && '$$$NoKey(pidFINAPPayment) {
+		set idFINAPPaymentLine = ""
+		for {
+			set idFINAPPaymentLine = $order(^FINAPPaymentLine(0,pidFINAPPayment,idFINAPPaymentLine))
+			quit:idFINAPPaymentLine=""
+			
+			set idCount = idCount+1
+			set objFINAPPaymentLine   = $get(^FINAPPaymentLine(0,pidFINAPPayment,idFINAPPaymentLine,1))
+			set idSupplier            = $$$FINAPPaymentLineSupplierNumber(objFINAPPaymentLine)
+			set idFINAPPaymentLineKey = pidFINAPPayment_","_idFINAPPaymentLine
+			
+			;kill objGrid ; Clear out previous invoices for invoices about to be read in.
+			set idFINAPPaymentInvoice = ""
+			set curSumOfPayAmtsOnHold = 0
+			for {
+				set idFINAPPaymentInvoice = $order(^FINAPPaymentInvoice(0,pidFINAPPayment,idFINAPPaymentLine,idFINAPPaymentInvoice))
+				quit:idFINAPPaymentInvoice=""
+				
+				set objFINAPPaymentInvoice = $get(^FINAPPaymentInvoice(0,pidFINAPPayment,idFINAPPaymentLine,idFINAPPaymentInvoice,1))
+				set objFINAPInvoice        = $get(^FINAPInvoice(0,idSupplier,idFINAPPaymentInvoice,1))
+				
+				;If invoice onhold then remove the PayAmount, this is happening onsave of PayLine however need it earlier to remove data inconsistency.
+				if $$$FINAPInvoiceOnHold(objFINAPInvoice) {
+					set curSumOfPayAmtsOnHold = $$$FCAdd(curSumOfPayAmtsOnHold,$$$FINAPPaymentInvoicePayAmount(objFINAPPaymentInvoice))
+					set $$$FINAPPaymentInvoicePayAmount(objFINAPPaymentInvoice) = ""
+					set $$$FINAPPaymentInvoicePay(objFINAPPaymentInvoice) = ""
+					
+					set strStatus = $$Save^COMUtils("FINAPPaymentInvoice",idFINAPPaymentLineKey_","_idFINAPPaymentInvoice,objFINAPPaymentInvoice,$$$YES)
+				}
+			}
+			
+			if curSumOfPayAmtsOnHold {
+				set $$$FINAPPaymentLineTotal(objFINAPPaymentLine) = $$$FCSub($$$FINAPPaymentLineTotal(objFINAPPaymentLine),curSumOfPayAmtsOnHold)
+				set strStatus = $$Save^COMUtils("FINAPPaymentLine",idFINAPPaymentLineKey,objFINAPPaymentLine,$$$YES)
+			}
+		}
+		
+	} else {
+		if $$$NoKey(pidFINAPPayment) {
+			set strStatus = $listbuild("Fin00690")  ; "Please Select A Data Record First."
+		} else {
+			set strStatus = $listbuild("Fin00857")  ; "Incorrect number of key values, Supplier Payments use one key value."
+		}
+	}
+ 	set ^CacheTempFINAPPaymentLines(YUSER) = idCount
+	quit strStatus
+		
+		
+OnBlurPaymentDate(pYKEY,pYFELD,pYLFN)
+	;-------------------------------------------------------------------------------
+	; Code to run on blur of the payment date field
+	;
+	; Params: pYKEY,pYFELD,pYLFN (@nm values)
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Mar-2010	shobby	SR15753: New standards
+	; 05-Oct-2006	SteveS	SR15074: Created
+	;-------------------------------------------------------------------------------
+	new idPayMethod,dtePay
+	
+	do OnBlurEffectiveDate^FINGLEffectiveDate(pYFELD,pYLFN,.dtePay)
+	
+	if ('$$$NoKey(pYKEY)) {
+		set idPayMethod = $$$FINAPPaymentPaymentMethod(pYFELD)
+		if idPayMethod = $$$EnumFINARBANKLINEMETHODCheque {
+			set $$$FINAPPaymentDateofcheque(pYFELD)=dtePay
+		}
+	}
+	quit
+	
+	
+OnAfterSave(pidPayment)
+	;-------------------------------------------------------------------------------
+	; Routine to run after saving a data record
+	;
+	; Params: pidPayment		: The payment number
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Oct-2006	SteveS	SR15074: Created
+	;-------------------------------------------------------------------------------
+	do UpdateDateOfCheque(pidPayment)
+	quit
+	
+	
+UpdateDateOfCheque(pidPayment)
+	;-------------------------------------------------------------------------------
+	; When a new payment has just been saved, merge the payment date
+	; over to the date of cheque.
+	;
+	; Params: pidPayment		: The payment number
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Oct-2006	SteveS	SR15074: Created
+	;-------------------------------------------------------------------------------
+	new objFINAPPayment,dtePay,idPayMethod,dteCheque,strStatus
+	
+	if '$$$NoKey(pidPayment) {
+		set objFINAPPayment = $get(^FINAPPayment(0,pidPayment,1))
+		set dtePay 			= $$$FINAPPaymentPaymentDate(objFINAPPayment)
+		set idPayMethod 	= $$$FINAPPaymentPaymentMethod(objFINAPPayment)
+		set dteCheque		= $$$FINAPPaymentDateofcheque(objFINAPPayment)
+		
+		if (idPayMethod=$$$EnumFINARBANKLINEMETHODCheque)&&(dteCheque="") {
+			set $$$FINAPPaymentDateofcheque(objFINAPPayment) = dtePay
+			set strStatus = $$$Save("FINAPPayment",pidPayment,objFINAPPayment,$$$YES)
+		}
+	}
+	quit
+	
+]]></Routine>
+</Export>

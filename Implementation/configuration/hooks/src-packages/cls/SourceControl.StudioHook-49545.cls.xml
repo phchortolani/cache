@@ -1,0 +1,409 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="SourceControl.StudioHook">
+<Description><![CDATA[
+Hook for deleting, saving and loading files to the file system.
+
+This class is responsible for exporting the contents of the current file
+to the file system every time the user saves it. The external file should be
+stripped of some XML tags, such as timestamps or chuecksums in order to be
+easier to merge using external tools (timestamps change each time and are
+not a concern, but the merge tool would consider it a conflict).
+
+
+History
+    2008-Jul-08     Soeiro      Created (based on source logging)]]></Description>
+<ClassType/>
+<Import>SourceControl.control,SourceControl.fix,SourceControl.data,SourceControl.data.global,VAR.infra.util</Import>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%Studio.SourceControl.Base</Super>
+
+<Parameter name="EnumWWWEVENTTYPEOnBeforeSave">
+<Type>%String</Type>
+<Default>1</Default>
+</Parameter>
+
+
+<Parameter name="EnumWWWEVENTTYPEOnBeforeDelete">
+<Type>%String</Type>
+<Default>2</Default>
+</Parameter>
+
+
+<Parameter name="EnumWWWEVENTTYPEOnBeforePrint">
+<Type>%String</Type>
+<Default>3</Default>
+</Parameter>
+
+
+<Parameter name="EnumWWWEVENTTYPEOnBeforeEditAccess">
+<Type>%String</Type>
+<Default>4</Default>
+</Parameter>
+
+
+<Parameter name="EnumWWWEVENTTYPEOnAfterSave">
+<Type>%String</Type>
+<Default>5</Default>
+</Parameter>
+
+
+<Parameter name="EnumWWWEVENTTYPEOnFilter">
+<Type>%String</Type>
+<Default>6</Default>
+</Parameter>
+
+
+<Parameter name="EnumWWWEVENTTYPEOnBeforeDataAccess">
+<Type>%String</Type>
+<Default>7</Default>
+</Parameter>
+
+
+<Method name="OnBeforeLoad">
+<Description><![CDATA[
+Import the file from the external file system into Cache.
+(this is supposed to be automatically done by ANT, but there
+are cases when one might want to manually import a file)]]></Description>
+<FormalSpec>internalName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+    if ('##class(Config).IsOnBeforeLoadActive()) {
+        quit $$$OK
+    }
+
+    if (##class(FileType).IsIgnored(internalName)) {
+        write !, "The file '"_internalName_"' was not loaded from an "_
+            "external source because it is in the exclude list."
+        quit $$$OK
+    }
+
+    set externalFileName = ##class(FileControl).GetExternalFileName(internalName)   
+    quit ##class(Importer).ImportExternalFile(externalFileName)
+]]></Implementation>
+</Method>
+
+<Method name="OnBeforeSave">
+<Description><![CDATA[
+Called before the item is saved to the Cache database it is passed
+a reference to the current temporary storage of this item so that it
+can be modified before the save completes. If you quit with an error
+value then it will abort the save.
+
+No verification is done yet.]]></Description>
+<FormalSpec>internalName:%String,location:%String="&quot;,object:%RegisteredObject=$$$NULLOREF</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set status = $$$OK
+
+	if (##class(Config).IsRunSourceLogging()) {
+		set obj = ##class(Common.SourceLogging).%New("")
+    	set status = obj.OnBeforeSave(internalName, location, object)
+	}
+
+    quit status
+]]></Implementation>
+</Method>
+
+<Method name="OnAfterSave">
+<Description><![CDATA[
+Actual hook. Whenever a file is saved, Studio call this Method]]></Description>
+<FormalSpec>internalName:%String,object:%RegisteredObject=$$$NULLOREF</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set status = $$$OK
+
+    // Get type
+    set type = ##class(FileType).GetType(internalName)
+
+	do ##class(SourceBase).SaveAuditInfo(type, internalName)
+    //write !, "OnAfterSave: internalName="_internalName_", type="_type
+
+    // If the type is something that Cache keeps in the CSP directory,
+    // we copy it to the project/web directory
+    if ((type = ##class(FileType).%GetParameter("CSP")) ||
+        (type = ##class(FileType).%GetParameter("CSR")) ||
+        (type = ##class(FileType).%GetParameter("CSS")) ||
+        (type = ##class(FileType).%GetParameter("XML")) ||      
+        (type = ##class(FileType).%GetParameter("JS"))) {
+        set status = ..CopyWebFileToProject(internalName)
+    }
+    else {
+		set isAlreadyImporting = 0
+		for i = $stack:-1:0 {
+			set call = $piece($stack(i, "place"), " ", 1)
+			if (($piece(call, "+", 1) = "Import") &&
+				($piece(call, "^", 2) = "%occSAX")) {
+				set isAlreadyImporting = 1
+				quit
+			}
+		}
+
+		if ('isAlreadyImporting) {
+			// Export the Studio file as CleanXML
+			set status = ##class(SourceBase).ExportAsCleanXML(internalName)
+		}
+		else {
+			write !, "The file '"_internalName_"' was not saved to an "_
+				"external source because it was manually imported via "_
+				"Caché Studio."
+			set status = $$$OK
+		}
+    }
+
+	if (##class(Config).IsRunSourceLogging()) {
+		set obj = ##class(Common.SourceLogging).%New("")
+    	set statusSL = obj.OnAfterSave(internalName, object)
+
+		if ($$$ISOK(status)) set status = statusSL
+	}
+
+	quit status
+]]></Implementation>
+</Method>
+
+<Method name="OnAfterCompile">
+<Description><![CDATA[
+According to Caché's documentation:
+"Compilation can change a class as it can update the storage information. As such we need
+to check if the item has changed and save it out again if it has"
+]]></Description>
+<FormalSpec>internalName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+    set className = ""
+
+    //write !, "OnAfterCompile: internalName="_internalName 
+
+    // Find the type
+    set type = ##class(FileType).GetType(internalName)
+
+	do ##class(SourceBase).SaveAuditInfo(type, internalName)
+
+    // For CSP, cache generates a class and compiles it. We must find
+    // the name of the class and export it.
+    if (type = ##class(FileType).%GetParameter("CSP")) {
+        set className = ..GetCSPClassByInternalCSPName(internalName)
+        //write !, "OnAfterCompile: className="_className
+
+        // Export the class
+        quit ##class(SourceBase).ExportAsCleanXML(className)
+    }
+    elseif (type = ##class(FileType).%GetParameter("CLS")) {
+        // In this case, according to this:
+        // "Compilation can change a class as it can update the storage
+        // information. As such we need to check if the item has
+        // changed and save it out again if it has"
+        // we must now check the timestamp and export it again if it
+        // has changed
+
+        // Get Caché's internal timestamp (YYY-MM-DD HH:MM:SS) and
+        // convert it to $ztimestamp
+        set timeStamp = ##class(%RoutineMgr).TS(internalName)
+        if (timeStamp '= "") {
+            set externalTimeStamp = $zdatetimeh(timeStamp, 3)
+            set externalFileName =
+                ##class(FileControl).GetExternalFileName(internalName)
+
+            // The externalTimeStamp there means the time stamp that
+            // are not in SourceControlTimeStamps.
+            if (##class(FileControl).IsArtifactOutdated(externalFileName)) {
+                // Export the class again (it was exported when saved,
+                // but it might have changed during compilation)
+                quit ##class(SourceBase).ExportAsCleanXML(internalName)
+            }
+        }
+    }
+
+    // Verify timestap and save if necessary
+    quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="OnAfterDelete">
+<Description><![CDATA[
+Deletes the file from the file system]]></Description>
+<FormalSpec>internalName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set status = $$$OK
+
+    // Find the type
+    set type = ##class(FileType).GetType(internalName)
+
+	do ##class(SourceBase).KillAuditInfo(type, internalName)
+
+    set externalFileName = ##class(FileControl).GetExternalFileName(internalName)
+    do ##class(DirectoryFile).Delete(externalFileName, 1)
+
+	if (##class(Config).IsRunSourceLogging()) {
+		set obj = ##class(Common.SourceLogging).%New("")
+    	set status = obj.OnAfterDelete(internalName)
+	}
+
+    quit status
+]]></Implementation>
+</Method>
+
+<Method name="Install">
+<ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[
+    if ($get(^SYS("SourceControlClass")) '= "SourceControl.StudioHook") {
+        set ^SYS("SourceControlClass") = "SourceControl.StudioHook"
+    }
+
+    if ($data(^WWWVERSION)) {
+        set $ztrap = "exception"
+
+        write !, "Installing WWW001 VAR Hooks ..."
+        set command = "do ^WWWVAR"
+        xecute command
+
+        set globals = ##class(NetManagerAll).GetAllGlobals()
+        for i = 1:1:$listlength(globals) {
+            set global = $listget(globals, i)
+            set class = $extract(global, 2, $length(global))
+
+            set command = "do ^WWWSPEI(""WWW001VARHooks"", """_class_","_..#EnumWWWEVENTTYPEOnAfterSave_""", "_
+                """##class(SourceControl.Exporter).TagNMArtifactByNameKey(YDATEI,YKEY,$get(YBED),$get(YUSER))"")"
+            xecute command
+            set command = "do ^WWWSPEI(""WWW001VARHooks"", """_class_","_..#EnumWWWEVENTTYPEOnBeforeDelete_""", "_
+                """##class(SourceControl.Exporter).DeleteArtifactByNameKey(YDATEI,YKEY,$get(YBED),$get(YUSER))"")"
+            xecute command
+        }
+    }
+
+    write !, "OK"
+
+finally
+    quit
+
+exception
+    set $ztrap = ""
+
+    write !, "Error: ", $zerror
+
+    goto finally
+]]></Implementation>
+</Method>
+
+<Method name="Uninstall">
+<ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[
+    if ($get(^SYS("SourceControlClass")) = "SourceControl.StudioHook") {
+        set ^SYS("SourceControlClass") = ""
+    }
+
+    set $ztrap = "exception"
+
+    write !, "Uninstalling WWW001 VAR Hooks ..."
+    set command = "do ^WWWVAR"
+    xecute command
+
+    set globals = ##class(NetManagerAll).GetAllGlobals()
+    for i = 1:1:$listlength(globals) {
+        set global = $listget(globals, i)
+        set class = $extract(global, 2, $length(global))
+
+        set command = "do ^WWWKILL(""WWW001VARHooks"", """_class_","_..#EnumWWWEVENTTYPEOnAfterSave_""")"
+        xecute command
+        set command = "do ^WWWKILL(""WWW001VARHooks"", """_class_","_..#EnumWWWEVENTTYPEOnBeforeDelete_""")"
+        xecute command
+    }
+    write !, "OK"
+
+finally
+    quit
+
+exception
+    set $ztrap = ""
+
+    write !, "Error: ", $zerror
+
+    goto finally
+]]></Implementation>
+</Method>
+
+<Method name="CopyWebFileToProject">
+<Description><![CDATA[
+This method copies an external file that is visible by Cache Studio (CSP,CSS,CSR,XML,JS) 
+to the correct project directory. Cache Studio view those files in the deployment directory.
+All directories are created when needed.
+]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>internalName:%String="&quot;</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+    set status = $$$YES
+
+    if ($extract(internalName, $length(internalName) - 2, $length(internalName)) = "csp") {
+		if ((##class(Config).IsBuildOnlyNonVAR() && ($find(internalName, "/VAR") '= 0)) ||
+			(##class(Config).IsBuildOnlyVAR() && ($find(internalName, "/VAR") = 0)) ||
+			(('##class(Config).IsBuildASDE()) && ($find(internalName, "asde/") '= 0))) {
+			quit $$$YES
+		}
+    }
+
+    if ($length(internalName) = 0) {
+        quit ##class(Errors).MakeErrorStatus("The internalName can't "_
+            "be empty!")    
+    }
+
+    set sourceFile = ##class(FileControl).GetExternalFileName(internalName, 1)
+    if ($length(sourceFile) = 0) {
+        quit ##class(Errors).MakeErrorStatus("The resulting source file name "_
+            "can't be empty!")
+    }
+
+    set targetFile = ##class(FileControl).GetExternalFileName(internalName)
+    if ($length(targetFile) = 0) {
+        quit ##class(Errors).MakeErrorStatus("The resulting destination file name "_
+            "can't be empty!")
+    }
+
+    // Make sure the destination directory exists
+    set status = ##class(DirectoryFile).CreateDirectoryChainFromFile(targetFile)
+    if (##class(Errors).IsError(status)) {
+        quit status
+    }
+
+    // Now copy the file (fortunately, Cache preserves the original
+    // file timestamp)
+    set status = ##class(%File).CopyFile(sourceFile, targetFile)
+    if ('##class(Errors).IsErrorQuiet(status)) {
+        do ##class(FileControl).UpdateTimeStamp(targetFile)
+        write !, "Exported '"_internalName_"'"
+        write !, "External name: '"_targetFile_"'"
+    }
+
+    quit status
+]]></Implementation>
+</Method>
+
+<Method name="GetCSPClassByInternalCSPName">
+<Description><![CDATA[
+Returns the internal Studio class name for a class that is generated from a
+CSP file.
+
+Example: when the file is "/csp/alphalinca/teste.csp" (internal name) Cache 
+generates the Class "csp.teste.cls"]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>internalName:%String</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[
+    // Basic validation
+    if ($get(internalName) = "") {
+        quit ""
+    }
+
+    // Get the file without the path
+    set name = ##class(DirectoryFile).GetFileNameFromFullPath(internalName)
+
+    // Strip the 3-letter extension
+    set name = ##class(Strings).GetFirstPart(name)  
+
+    quit "csp."_name_"."_##class(FileType).%GetParameter("TXTCLS")
+]]></Implementation>
+</Method>
+</Class>
+</Export>

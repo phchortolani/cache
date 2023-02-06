@@ -1,0 +1,256 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="CSPX.EnsMsgReportPane">
+<Description><![CDATA[
+An AutoPage pane that displays a session summary report document]]></Description>
+<ClassType/>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%CSP.Page</Super>
+<System>3</System>
+
+<Parameter name="DOMAIN">
+<Description><![CDATA[
+Use our own domain for localization]]></Description>
+<Default>Ensemble</Default>
+</Parameter>
+
+
+<Parameter name="CONTENTTYPE">
+<Default>text/xml</Default>
+</Parameter>
+
+
+<Method name="OnPage">
+<Description><![CDATA[
+Draw the XML report]]></Description>
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// get page ID values
+	Set tID(1) = %request.Data("$ID1",1)
+
+	// If this is a search submit,get request parms via object
+	If ($G(%request.Data("$SUBMITBTN",1)) = "$AUTOFORM_SEARCH" ) {
+		Set tRequest = ##class(CSPX.EnsMsgTraceFilterForm).ProcessSubmit(%request, .tID)
+		Set sessionid = tRequest.SessionId
+		Set startTime = tRequest.StartTime
+		Set endTime = tRequest.EndTime
+		Set startId = tRequest.StartId
+		Set endId = tRequest.EndId
+		
+		Set query = "&$SUBMITBTN=$AUTOFORM_SEARCH&SessionId=" _ sessionid _ 
+						"&StartTime=" _ startTime _
+						"&EndTime=" _ endTime _
+						"&StartId=" _ startId _
+						"&EndId=" _ endId
+	}
+	Else {
+		Set sessionid = $G(tID(1))
+		Set startTime = ""
+		Set endTime = ""
+		Set startId = ""
+		Set endId = ""
+		Set query = ""
+	}
+
+	// Build the trace
+	Do ..GenerateXMLReport(sessionid,startTime,endTime,startId,endId)
+		
+	Quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="GenerateXMLReport">
+<Description><![CDATA[
+Generate an XML version of the trace.<br>
+]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>sessionId:%String,startTime:%String,endTime:%String,startId:%Integer,endId:%Integer</FormalSpec>
+<Implementation><![CDATA[
+	Write "<?xml version=""1.0"" ?>",!!
+	Write "<EnsMsgReport SessionId="""_sessionId_""">",!
+	
+	Do ..GenerateMsgReport(sessionId,startTime,endTime,startId,endId)
+	Do ..GenerateEventReport(sessionId)
+	Do ..GenerateRuleLogReport(sessionId)
+	
+	Write "</EnsMsgReport>",!
+]]></Implementation>
+</Method>
+
+<Method name="GenerateMsgReport">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>sessionId:%String,startTime:%String,endTime:%String,startId:%Integer,endId:%Integer</FormalSpec>
+<Implementation><![CDATA[
+	// First, generate the trace data ...
+	Set count = ##class(CSPX.EnsMsgTraceSVG).BuildTraceInfo(sessionId,startTime,endTime,startId,endId)
+	
+	// The results of this are in ^CacheTempMsgTrace(%session.SessionId)
+	
+	// Do messages
+	Write "<EnsMsgLog>",!
+	// Now, loop across the temp global and generate the output
+	For index = 1:1:count {
+		Merge entry = ^CacheTempMsgTrace(%session.SessionId,index)
+		Do ..RenderTraceEntryAsXML(.entry)
+	}
+	Write "</EnsMsgLog>",!
+	
+	// Cleanup
+	Do ##class(CSPX.EnsMsgTraceSVG).ClearTraceData()
+	
+	Quit
+]]></Implementation>
+</Method>
+
+<Method name="GenerateEventReport">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>sessionId:%String</FormalSpec>
+<Implementation><![CDATA[
+	// Event log information
+	Set query = "SELECT ID,{fn RIGHT(%EXTERNAL(TimeLogged),999 )} As TimeLogged,Type,Job, "
+	Set query = query _ "SessionId As Session,ConfigName As Source,(SourceClass || '.' || SourceMethod || '()') "
+	Set query = query _ "As Method,Text FROM Ens_Util.Log "
+	Set query = query _ "WHERE Type IN ('Assert','Error','Warning','Info','Trace','Alert') AND SessionId = ? "
+	Set query = query _ "ORDER BY %ID Desc"
+
+	Set tRS = ##class(%ResultSet).%New()
+	Set tSC = tRS.Prepare(query)
+	Set tRS.RuntimeMode = 2
+	
+	Do tRS.Execute(sessionId)
+	
+	Write "<EnsEventLog>",!
+	
+	While (tRS.Next()) {
+		Do ..RenderEventAsXML(tRS)
+	}
+	
+	Do tRS.Close()
+	
+	Write "</EnsEventLog>",!
+	
+	Quit
+]]></Implementation>
+</Method>
+
+<Method name="GenerateRuleLogReport">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>sessionId:%String</FormalSpec>
+<Implementation><![CDATA[
+	
+	
+	Set query = "SELECT ID,SessionId As Session,ExecutionId,{fn RIGHT(%EXTERNAL(TimeExecuted),12)} As TimeExecuted,"
+	Set query = query _ "HostClass,ActivityName As Activity,RuleName As Rule,RuleVersion,Reason,ReturnValue As Return,IsError,ErrorMsg,RuleId,RoutineName "
+	Set query = query _ "FROM Ens_Rule.RuleLog WHERE SessionId = ? "
+	Set query = query _ "ORDER BY SessionId Desc, ExecutionId Desc"
+
+	Set tRS = ##class(%ResultSet).%New()
+	Set tSC = tRS.Prepare(query)
+	Set tRS.RuntimeMode = 2
+	
+	Do tRS.Execute(sessionId)
+	
+	Write "<EnsRuleLog>",!
+	
+	While (tRS.Next()) {
+		Do ..RenderRuleLogAsXML(tRS)
+	}
+	
+	Do tRS.Close()
+	
+	Write "</EnsRuleLog>",!
+	
+	Quit
+]]></Implementation>
+</Method>
+
+<Method name="RenderTraceEntryAsXML">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;entry</FormalSpec>
+<Implementation><![CDATA[
+	Set id = entry("id")
+	Write "    <EnsMsgEntry Id="""_id_""""
+	Set sub="" For {
+		Set sub=$O(entry(sub)) Quit:sub=""
+		If sub="id" Continue
+
+		Set tag=$ZCVT($E(sub,1),"U")_$E(sub,2,$L(sub))
+		
+		Write !,"                 "
+		Write tag_"="""_$ZCVT(entry(sub),"O","HTML")_""""
+	}
+	Write ">",!
+	
+	// Dump out the message object
+	Set hdr = ##class(Ens.MessageHeader).%OpenId(id,0)
+	If $IsObject(hdr)&&(hdr.MessageBodyClassName'="") {
+		Set msg = $zobjclassmethod(hdr.MessageBodyClassName,"%OpenId",hdr.MessageBodyId)
+
+		Write "<!-- Message: type: ",msg.%ClassName(1),"  body-id: ",msg.%Id()," -->",!
+	
+		If (msg.%Extends("%XML.Adaptor")) {
+			// show contents as XML
+			Do msg.XMLExport()
+		} Else {
+			Write "<![CDATA["		
+	 		Do msg.%ShowContents()
+			Write "]]]]><![CDATA[>",!
+		}
+		
+		Write "<!-- Message: ends -->",!
+	}
+	
+	Write "    </EnsMsgEntry>",!
+	
+	Quit
+]]></Implementation>
+</Method>
+
+<Method name="RenderEventAsXML">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;pRS</FormalSpec>
+<Implementation><![CDATA[
+	Write "    <EnsEventEntry Id="""_pRS.Data("ID")_""""
+	
+	For i=1:1:pRS.GetColumnCount() {
+
+		Set tag = pRS.GetColumnHeader(i)
+		If (tag = "ID") || (tag = "Text") Continue
+		
+		Write !,"                   "
+		Write tag_"="""_$ZCVT(pRS.GetData(i),"O","HTML")_""""
+	}
+	
+	Write ">",!
+	Write "<![CDATA["
+	Write pRS.Data("Text")
+	Write "]]]]><![CDATA[>",!
+	Write "    </EnsEventEntry>",!
+	
+	Quit
+]]></Implementation>
+</Method>
+
+<Method name="RenderRuleLogAsXML">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;pRS</FormalSpec>
+<Implementation><![CDATA[
+	Write "    <EnsRuleLogEntry Id="""_pRS.Data("ID")_""""
+	
+	For i=1:1:pRS.GetColumnCount() {
+
+		Set tag = pRS.GetColumnHeader(i)
+		If (tag = "ID") Continue
+		
+		Write !,"                   "
+		Write tag_"="""_$ZCVT(pRS.GetData(i),"O","HTML")_""""
+	}
+	
+	Write "/>",!
+	
+	Quit
+]]></Implementation>
+</Method>
+</Class>
+</Export>

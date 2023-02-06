@@ -1,0 +1,1373 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INIssueRev" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INIssueRev
+	;-------------------------------------------------------------------------------
+	; 06-Jan-2009	DavidR	copy from SES for INIssue development
+	;-------------------------------------------------------------------------------
+#include COMConst
+#include INConst
+#include WWWConst
+#include COMSYS
+#include COMDebug
+#include MEDConst
+
+	
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+	
+OnBeforeButtonLine(pidIssueRev,pobjIssueRev,&pobjForm)
+	;-------------------------------------------------------------------------------
+	; Set form to readonly if not editable
+	;
+	; Params:	pidIssueRev		IssueRev id
+	;			pobjIssueRev	IssueRev object
+	;
+	; Returns:	pobjForm	Form object (WWW120)
+	;
+	; History:
+	; 04-Aug-2009	GRF		ReadOnly Macro
+	; 30-Mar-2009	PPP		SR16xxx: Creation
+	;-------------------------------------------------------------------------------
+	if '$$$NoKey(pidIssueRev) {
+		if '$$Editable(pidIssueRev) {
+			set $$$WWW120AuthorizationToModifyData(pobjForm) = $$$EnumReadOnly	// Read Only
+		}
+	}
+	quit
+	
+Editable(pidIssueRev) 
+	;-------------------------------------------------------------------------------
+	; Is form editable (unprocessed) ?
+	;
+	; Params:	pidIssue - Issue id
+	;
+	; Returns:	status
+	;
+	; History:
+	; 20-Jul-2009	DWR		SR16761	Editable should be checking if INIssueRev is 
+	; 							competed not INIssue.
+	; 30-Mar-2009	PPP		SR16xxx: Created
+	;-------------------------------------------------------------------------------
+	new enumLocnType,idLocn,objIssueRev,strStatus
+	
+	set strStatus = $$$OK
+	quit:$$$NoKey(pidIssueRev) strStatus
+	
+	if $$$ISOK(strStatus) && $data(^INIssueRev(YM,pidIssueRev,1)) {
+		set objIssueRev = $get(^INIssueRev(YM,pidIssueRev,1))
+		
+	;	if $$$INIssueStatus(objIssueRev) = 9  {            // A-Closed SR16761
+		if $$$INIssueRevStatus(objIssueRev) = 9  {         // A-Closed
+			set strStatus = $$$MakeStatus("IN00377")       ; "Record already processed"
+		}
+		
+		//if $$$ISOK(strStatus) {
+		//	if $data(^INIssueRevLine(YM,pidIssueRev)) {
+		//		set strStatus = $$$MakeStatus("IN00377")		//TODO new return status message
+		//	}		
+		//}
+	}
+	quit strStatus
+	
+	
+CanPost(pidIssRev)
+	;-------------------------------------------------------------------------------
+	; Can the record be posted
+	;
+	; Called By: Process^INIssueRev
+	;
+	; Params:	pidIssRev - IssueRev id
+	;
+	; Returns:	status
+	;
+	; History:
+	; 18-Mar-2014	SCR		SESDF-1299: Check for Without Issue
+	; 20-Sep-2013	SCR		CORE-93: Set Issue from the Line (If it exisits)
+	; 20-Oct-2010	GRF		SR17539.1: Don't perform bundle stock check for Dispense
+	;							to Patient
+	; 23-Sep-2010	GRF		SR17539: BundleQtyIsAvailable replaces QtyIsAvailable
+	; 29-Apr-2010	GRF		-: blnQtyChk not newed
+	; 23-Mar-2009	PPP		SR17246: Only count lines that have a +ve Return Qty
+	; 16-Mar-2010	GRF		SR17229: use idToLocn; no qty check if consumed
+	; 09-Mar-2010	GRF		SR17196: move YQHandler before CheckRepeatItems since YQ
+	; 							setting was being over-ridden; call QtyIsAvailable
+	; 06-Jan-2010	GRF		SR17080: Check stocktake locking; elseif required for
+	; 							qty returned checks
+	; 19-May-2009	DWR		SR16509: corrected instances of set strStatus to use correct
+	; 							$$$MakeStatus macro
+	; 11-May-2009	DWR		SR16509: modified check to make sure can't post if user
+	; 							has entered more than (what was issued less what has
+	; 							already been returned)
+	; 30-Mar-2009	PPP		SR16xxx: Created
+	;-------------------------------------------------------------------------------
+	new blnQtyChk,fltQtyAlreadyRet,fltQtyIssued,fltQtyReturned					;SR17539.1
+	new idIssue,idLine,idToLocn,intPostableLines,objIssRev,objLine,strStatus	;SR17539.1
+	new blnNI,idItem,arrItem,strItemKey
+	
+	set intPostableLines = 0
+	set strStatus        = $$$OK
+	set blnQtyChk        = $$$NO
+	
+	if '$$$NoKey(pidIssRev) {
+		set objIssRev	= $get(^INIssueRev(0,pidIssRev,1))
+		set idToLocn	= $$$INIssueRevToLocn(objIssRev)
+		set idIssue		= $$$INIssueRevIssueNumber(objIssRev)    ; SR17539.1
+		set blnNI		= $$$INIssueRevReturnwithoutIssue(objIssRev)		
+		
+		if '$data(^INIssueRevLine(0,pidIssRev)) {
+			set strStatus = $$$MakeStatus("IN00740")							
+		} ; "No postable lines"
+		
+		if $$$ISOK(strStatus) {   ; SR17080 vvv
+			if $$IsLockedStockLocation^INLocking($$$INIssueRevFromLocn(objIssRev)) {
+				set strStatus = $$ReasonLocked^INLocking($$$INIssueRevFromLocn(objIssRev),"","")
+			}
+		}
+			
+		if $$$ISOK(strStatus) {
+			if $$IsLockedStockLocation^INLocking(idToLocn) {              ; SR17229
+				set strStatus = $$ReasonLocked^INLocking(idToLocn,"","")
+			}
+		}                         ; SR17080 ^^^
+		
+		if $$$ISOK(strStatus) {
+			if $$$INIssueRevStatus(objIssRev) '= 9 {            ; Closed
+			;	set strStatus = $$ProductError("IN00432")       ; "Please fix all errors before firming."
+				
+				if $$$ISOK(strStatus) {
+					set idLine = ""
+					
+					for {
+						set idLine = $order(^INIssueRevLine(YM,pidIssRev,idLine))
+						quit:idLine=""
+						quit:$$$ISERR(strStatus)
+						
+						set objLine = $get(^INIssueRevLine(YM,pidIssRev,idLine,1))
+						set fltQtyReturned   = $$$INIssueRevLineQuantityReturned(objLine)
+						set fltQtyAlreadyRet = $$$INIssueRevLineQtyAlreadyRetrn(objLine)
+						set fltQtyIssued     = $$$INIssueRevLineQtyConsumed(objLine)
+						set idItem			 = $$$INIssueRevLineItemNo(objLine)
+						
+						if blnNI&&$$$ISOK(strStatus) {
+							if '$data(^INAvgCost(YM,idItem)) {
+								set strStatus	= $$$MakeStatus("IN01811",idItem)  ;Item %1 has no cost and can not process
+								quit
+							}
+						}
+						if blnNI&&$$$ISOK(strStatus) {
+							if fltQtyReturned'>0 {
+								set strStatus	= $$$MakeStatus("IN01813",idLine)  ;Quantity must be greater than 0 on line %1
+							}
+						}
+						
+						if blnNI&&$$$ISOK(strStatus) {
+							set strItemKey	= $$$INIssueRevLineItemNo(objLine)_Y_$$$INIssueRevLineLotNumber(objLine)_Y_$$$INIssueRevLineExpirationDate(objLine)_Y_
+												$$$INIssueRevLineBrand(objLine)_Y_$$$INIssueRevLineOwner(objLine)_Y_$$$INIssueRevLineProgram1(objLine)
+							if $data(arrItem(strItemKey)) {
+								set strStatus	= $$$MakeStatus("IN01816",$get(arrItem(strItemKey)),idLine)  ;Same Item & Attuibutes repeated on lines %1 & %2
+							}
+							set arrItem(strItemKey) = idLine
+						}
+						if $$$INIssueRevLineIssue(objLine)'="" {
+							set idIssue	= $$$INIssueRevLineIssue(objLine)
+						}
+						if $$$INIssueRevLineBundle(objLine)="" && ('blnNI) {
+							set strStatus	= $$$MakeStatus("IN01442",idLine)  ;Please select Lot for Line %1
+							quit
+						}
+						if fltQtyReturned < 0 {
+							set strStatus = $$$MakeStatus("IN00456",idLine)  ; "Negative quantity on line %1"
+						
+						
+					//SR17246 - This check is not necessary
+					//	} elseif 'fltQtyReturned {
+					//		set strStatus = $$$MakeStatus("IN00929",idLine)  ; "No quantity on line %1"
+						
+						} elseif (fltQtyReturned + fltQtyAlreadyRet) > fltQtyIssued && ('blnNI)  {
+							set strStatus = $$$MakeStatus("IN00932",idLine,$$^WWWTR(0,12,fltQtyIssued-fltQtyAlreadyRet))
+						}   ; "Reversal Quantity too great in line %1 (Maximum %2)"
+						
+						//SR17246 - Only count lines that have a +ve Return Qty
+						if fltQtyReturned>0 {
+							set intPostableLines = intPostableLines+1
+						}
+						
+						; SR17229 vvv		if $$$ISOK(strStatus) set strStatus = $$QtyIsAvailable^INIssueRevLine(idToLocn,objLine,idLine)  ; SR17196 
+						if $$$ISOK(strStatus) {
+						;	if '$$IsConsumable^INARTLOCPAR($$$INIssueRevLineItemNo(objLine),idToLocn) { ; SR17539.1
+						;	if '$$IsConsumable^INARTLOCPAR($$$INIssueRevLineItemNo(objLine),idToLocn) && ; HEVA-1095
+							if (idToLocn'="") &&
+								$$$WWW0121StorageLocn($get(^WWW0121(0,0,idToLocn,1))) &&
+							   ($$$INIssueRevLineToStorage(objLine) '= "X")		 	 &&
+							   ($$GetIssueType(idIssue)'=3) &&
+							   ('blnNI)							                                             {
+								
+							;	set strStatus = $$QtyIsAvailable^INIssueRevLine(idToLocn,objLine,idLine)       ; SR17539
+								set strStatus = $$BundleQtyIsAvailable^INIssueRevLine(idToLocn,objLine,idLine)
+							}
+						} ; SR17229 ^^^
+					}
+				} 
+				
+			} else {
+				set strStatus = $$$MakeStatus("IN00377")        ; "Already Processed"
+			}
+		}
+		
+	} else {
+		set strStatus = $$$MakeStatus("32072")                  ; "Please select a data record first."
+	}
+	
+	if $$$ISOK(strStatus) && (intPostableLines=0) {
+		set strStatus = $$$MakeStatus("IN00740")                ; "No postable lines"
+	}
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$CheckIssueOnLines(pidIssRev)
+	}
+	$$$YQHandler(strStatus)
+	
+	if $$$ISOK(strStatus) && ('blnNI)	 {
+	;	if $$$WWW0121StorageLocn($get(^WWW0121(0,0,idToLocn,1))) {
+			do CheckRepeatItems^INIssueRevLine(pidIssRev)
+	;	}
+	}
+	quit strStatus
+	
+
+CheckIssueOnLines(pidIssRev)
+	;-------------------------------------------------------------------------------
+	; Check Issues on lines
+	;	1 Check that there are no Duplicate Issue/Lines
+	;	2 Check that there are no unposted Returns for any lines
+	;
+	; Called By: CanPost^INIssueRev
+	;
+	; Params:	pidIssue - Issue key
+	;
+	; Returns:	status
+	;
+	; History:
+	; 18-Sep-2013	SCR		CORE-93: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idLine,objLine,idIssue,idIssueLine,idCheckRev,objCheckRev,arrLines,idxIssue
+	
+	set strStatus = $$$OK
+	if $$$ISOK(strStatus) {
+		set idLine	= ""
+		for {
+			set idLine		= $order(^INIssueRevLine(YM,pidIssRev,idLine))
+			quit:idLine=""
+			quit:$$$ISERR(strStatus)
+			set objLine		= $get(^INIssueRevLine(YM,pidIssRev,idLine,1))
+			set idIssue		= $$$INIssueRevLineIssue(objLine)
+			continue:idIssue=""  ; Not interested in blank Issues
+			set idIssueLine	= $$$INIssueRevLineRefLine(objLine)
+			if $data(arrLines(idIssue,idIssueLine)) {
+				set strStatus =  $$$MakeStatus("IN01440",idIssue,idIssueLine,$get(arrLines(idIssue,idIssueLine)),idLine)  ;Issue %1 Line %2 is duplicated on lines %3 and %3
+				quit
+			}
+			set arrLines(idIssue,idIssueLine)	= idLine
+			set idxIssue	= $$$Index(idIssue)
+			set idCheckRev	= ""
+			for {
+				set idCheckRev	= $order(^INIssueRevLines(YM,2,idxIssue,idIssueLine,idCheckRev))
+				quit:idCheckRev=""
+				continue:idCheckRev=pidIssRev
+				set objCheckRev	= $get(^INIssueRev(YM,idCheckRev,1))
+				if $$$INIssueRevStatus(objCheckRev)'=9 {
+					set strStatus =  $$$MakeStatus("IN01441",idIssue,idLine,idCheckRev)  ;Issue %1 on Line %2 is also on Return %3 which is unposted. Either one must be processed or deleted
+					quit
+				}
+			}
+		}
+	}
+	quit strStatus
+
+
+GetIssueType(pidIssue)
+	;-------------------------------------------------------------------------------
+	; Issue type for specified INIssue record
+	;
+	; Called By: CanPost^INIssueRev
+	;
+	; Params:	pidIssue - Issue key
+	;
+	; Returns:	enumType
+	;
+	; History:
+	; 20-Oct-2010	GRF		SR17539.1: Created
+	;-------------------------------------------------------------------------------
+	new objIssue
+	
+	quit:$get(pidIssue)="" ""
+	
+	set objIssue = $get(^INIssue(0,pidIssue,1))
+	quit $$$INIssueType(objIssue)
+	
+	
+ProductError(pstrError)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Mar-2009	PPP		SR16XXX: Created
+	;-------------------------------------------------------------------------------
+	new idItem,idLine,strStatus
+	
+	set strStatus = $$$OK
+	
+	if $data($$$TempStore("IssueRevLineErrors")) {
+		set strStatus = $$$MakeStatus(pstrError)	
+	}
+	quit strStatus	
+	
+	
+CanViewReport()
+ 	;-------------------------------------------------------------------------------
+ 	;
+ 	; Disable button on the report if the request has not been processed
+ 	; 
+ 	; History:
+ 	; 06-Jan-2009	DavidR	copied and modified for Core use
+ 	; 11-Oct-2007	Gustavo	Created (VARSESRetornoAoEstoque)
+ 	;-------------------------------------------------------------------------------
+ 	if (YKEY) {	 		 	; FIXME : incomplete?
+		if $$$INIssueRevStatus(YFELD)=2 {
+			set YQ = $$$YQDisable("IN00910")  ; "The report will only be available after the return has been processed"
+		} else { 
+			set YQ = $$$YQEnable
+		} 	
+ 	} 
+	quit
+	
+	
+OnBeforeEditAccessHook(pYKEY)
+	;-------------------------------------------------------------------------------
+ 	; Checks to ensure that the location matches the record, and if the location is
+ 	; a storage location.
+ 	; 
+ 	; History:
+ 	; 24-Mar-2014	SCR:SESDF-1299 Reversed last change and prevent creation by a Consumption Location
+ 	; 12-Mar-2014	SCR:SESDF-1299 Allow Return for Consumption Location when Form = INIssueRevNI
+ 	; 07-Jan-2009	DavidR:	Copied and modified for Core use
+ 	; ??-???-????	??????: Created (VARSESRetornoAoEstoque)
+ 	;-------------------------------------------------------------------------------
+	new blnLocalStorage,blnResult,idSupLocn,objLocation,objReturn		
+	
+	set idSupLocn = YLOCATION
+ 	set blnResult = $$$OK
+	if (pYKEY'="") {
+		set objReturn = $get(^INIssueRev(YM,pYKEY,1))
+								
+		if (YLOCATION'=$piece(objReturn,Y,3)) && $data(^INIssueRev(YM,pYKEY,1)) {
+			set idSupLocn = $piece(objReturn,Y,3)
+			
+			$$$Alert($$$Text($listbuild("IN00911",$piece(objReturn,Y,3),YLOCATION))_".")
+			set blnResult = $$$NO		
+		}  ; "This document belongs to Location %1!  Current Location is %2. The screen will be available only for viewing"
+					
+	} else {
+		set objLocation     = $get(^WWW0121(0,YM,idSupLocn,1))
+		set blnLocalStorage = $$$WWW0121StorageLocn(objLocation)
+		 
+		if 'blnLocalStorage{
+			$$$Alert($$$Text($listbuild("IN00912",YLOCATION))_".")
+			set blnResult = $$$NO
+		}  ; "The current location (%1) cannot process returns. The screen will be available only for viewing documents" 
+	} 
+	if blnResult {
+		set objLocation	= $get(^WWW0121(0,YM,YLOCATION,1))
+		if '$$$WWW0121StorageLocn(objLocation) {
+			$$$Alert($$$Text($listbuild("IN00912",YLOCATION))_".")
+			set blnResult = $$$NO		
+		}
+	}  
+	quit blnResult
+ 
+	
+OnAfterDataFields(pidForm,pidKey,pobjReversal)
+	;-------------------------------------------------------------------------------
+	; What needs running after header is drawn
+	;  Load Grid etc
+	;
+	; Params:
+	; pidForm		Form id that called this function
+	; pidKey		Key of the record
+	; pobjReversal	Header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 18-Feb-2009 DavidR SR16293: Created
+	;-------------------------------------------------------------------------------
+	do LoadGrid(pidKey,pidForm,pobjReversal)     ; Form "INIssueRev"
+	
+	;if (pidKey'="") && ('$data(^INIssueRevLine(0,pidKey))) {
+ 	;	if $$$INIssueRevIssueNumber(pidKey) '= "" {
+ 	;		set strStatus = $$CopyIssueLines(pidKey,pobjReversal)
+ 	;	}
+ 	;}
+
+	quit
+	
+	
+LoadGrid(pidKey,pstrContainer,pobjReversal)
+	;-------------------------------------------------------------------------------
+	; Load Edit Grid, run validation for currently editable grid and cause grid to be redrawn.
+	;
+	; Params:
+	; pidKey			Key of header record
+	; pstrContainer		Form id that called this function
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 12-Mar-2014	SCR		CORE-93: IssueRev without Issue
+	; 15-Sep-2013	SCR		CORE-93: If no INIssue use INIssueRevLineSearch
+	; 18-Feb-2009	DavidR	SR16293: Created copied from INTFRRev
+	;-------------------------------------------------------------------------------
+	new blnEnabled,idForm,YAUSWAHL,YFORM
+	
+	set idForm = pstrContainer_"Line"
+	if (pidKey'="")&&($$$INIssueRevIssueNumber($get(^INIssueRev(YM,pidKey,1)))="") {
+		set idForm	= "INIssueRevLineSearch"
+		set $$$COMGridEditParameterNewLine(YAUSWAHL)	= $$$YES
+	}
+	if pstrContainer="INIssueRevNI" {
+		set idForm="INIssueRevLineNI"
+	}
+	set YFORM  = idForm
+	
+	set blnEnabled = ($$$INIssueRevStatus(pobjReversal) '= 9)
+ 
+	//if blnEnabled {
+	//	set blnEnabled = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	//}
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 300
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)       = blnEnabled
+	set $$$COMGridEditParameterContainer(YAUSWAHL)     = pstrContainer
+	
+	set ^CacheTemp(YUSER,"GridLine") = YPARA
+	
+	kill $$$TempStore("IssueRevLineErrors")
+	$$$GRIDStart(idForm,pidKey)
+	
+	quit
+ 
+ 
+OnBeforeSave(pYKEY, &pYFELD)
+	;-------------------------------------------------------------------------------
+	; Saves the grid
+	;
+	; Returns:
+	;
+	; History:
+	; 13-Sep-2013	SCR		CORE-93: Item Search without 'Issue' on Header
+	; 08-May-2009	DWR		Add validation of the issue to not save if there are no 
+	; 							lines to load
+	; 09-Jan-2009	DavidR	Copied for Core use
+	; 14-Nov-2006	RGB		Created (SR BR014300)
+	;-------------------------------------------------------------------------------
+	new fltConsumed,fltRet,idIssue,idIssueLine,idIssueStatus,idItem,idSupplierLocn
+	new intLn,objIssue,objIssueLine,strStatus
+	
+	set strStatus	= $$$OK
+	
+ 	set strStatus 	= $$$GRIDSave(pYKEY)
+	set idIssue 	= $$$INIssueRevIssueNumber(pYFELD)
+ 	if $$$ISOK(strStatus) {
+	 	if $$$INIssueRevReturnType(pYFELD)=2 {
+		 	if $$$INIssueRevFromLocn(pYFELD)=$$$INIssueRevToLocn(pYFELD) {
+			 	set strStatus = $$$MakeStatus("IN01814")  ;To Location can not be the same as From Location
+				set Q = $$$QDontSave
+		 	}
+	 	}
+ 	}
+ 	
+ 	if idIssue = ""  { ; Skip Issue Checking
+		if $$$ISOK(strStatus) {
+			set $$$INIssueRevStatus(pYFELD)   = 1
+	 	}
+ 	} else {
+
+		if $$$ISOK(strStatus) {
+	
+			set objIssue = ""
+			if idIssue'="" { 	
+				set objIssue      = $get(^INIssue(YM,idIssue,1))
+				set idIssueStatus = $$$INIssueStatus(objIssue)
+	
+				if idIssueStatus '> 6 {
+					set strStatus = $$$MakeStatus("IN00928",idIssue)	// "Cannot select Issue '%1'. Invalid status"
+					do ReturnError^COMUtilError(strStatus)
+					set Q = $$$QDontSave
+				}
+				
+				if ((+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(0,YM,1)))) && ($$$ISOK(strStatus))){
+					
+					set idIssueLine = ""
+					set intLn = 0
+					
+					for {
+						set idIssueLine = $order(^INIssueLine(YM,idIssue,idIssueLine))
+						quit:(idIssueLine = "")
+		
+						set objIssueLine = $get(^INIssueLine(YM,idIssue,idIssueLine,1))
+						quit:(objIssueLine = "")				
+		
+						set idItem = $$$INIssueLineItem(objIssueLine)
+						set fltRet = $$GetQtyRetForIssue(idIssue,idItem,idIssueLine)
+						
+						set fltConsumed = $$$INIssueLineQtyIssued(objIssueLine)
+						
+						if fltConsumed>fltRet {
+							set intLn = $increment(intLn)
+						}
+					}
+					
+					if intLn=0 set strStatus = $$$MakeStatus("34361")
+				}
+				
+				//Check if there is another Return using the same Issue # 
+				//that has not been processed
+				if $$$ISOK(strStatus) {
+					set strStatus = $$CheckInProgress(pYKEY,idIssue)
+					;if $$$ISERR(strStatus) {
+					;	do ReturnError^COMUtilError(strStatus)
+					;	set Q = $$$QDontSave				
+					;}
+				}
+			}
+			;if $$$ISOK(strStatus) {
+			;	if pYKEY="+" {
+			;		set strStatus = $$CopyIssueLines(pYKEY, pYFELD)
+			;	}
+			;}
+			if $$$ISOK(strStatus) {
+			 	set $$$INIssueRevFromLocn(pYFELD) = $$$INIssueFromLocn(objIssue)
+			 	set $$$INIssueRevToLocn(pYFELD)   = $$$INIssueToLocn(objIssue)
+			 	set $$$INIssueRevStatus(pYFELD)   = 1
+	 
+				set idSupplierLocn = $$$INIssueRevToLocn(pYFELD)
+				
+				if (idSupplierLocn = "") && (idIssue = "") {	
+					set strStatus = $$$MakeStatus("IN00913")	//"Please specify the Requesting Location as the Issue was not specified"
+					do ReturnError^COMUtilError(strStatus)
+					set Q = $$$QDontSave
+				}
+			}
+		}
+ 	} 
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError(strStatus)
+		set Q = $$$QDontSave
+	}
+	quit
+	
+	
+CheckInProgress(pidIssueRev, pidIssueNo)
+	new idDocNo,idxIssueNo,strIssueRev,strStatus
+	
+	set idxIssueNo = $$$Index(pidIssueNo)
+	
+	set strIssueRev=""
+	set idDocNo = ""
+	for {
+		set idDocNo = $order(^INIssueRevs(YM,2,1,idxIssueNo,idDocNo))  ; D12 (Status : 2.1, D1 (Issue No) : 2.2 - new index
+		quit:idDocNo=""
+		continue:idDocNo=pidIssueRev
+		
+		set strIssueRev = strIssueRev_","_idDocNo
+		
+	}
+ 
+	if strIssueRev = "" {
+		set strStatus = $$$OK
+	} else {
+		set strStatus = $$$MakeStatus("IN00933",$piece(strIssueRev,",",2,99),pidIssueNo)
+	}  ;  "Unprocessed Return Documents '%1' exist for the Issue %2"
+ 
+	quit strStatus
+ 
+ 
+OnAfterSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Saving a new header will cause the lines for the indicated Issue to be loaded
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+ 	if '$data(^INIssueRevLine(0,pYKEY)) {
+ 		if $$$INIssueRevIssueNumber(pYFELD) '= "" {
+ 			set strStatus = $$CopyIssueLines(pYKEY,pYFELD)
+ 		}
+ 	}
+	
+	//do ReturnError^COMUtilError(strStatus)
+	$$$YQHandler(strStatus)
+	
+	quit strStatus
+	
+	
+CopyIssueLines(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Copy the lines of the transfer for the return
+	;
+	; History:
+	; 23-Sep-2013	SCR		CORE-93: Check for Usable Items
+	; 23-Mar-2010	PPP		SR17246: The UnitQuantityReturned, QuantityReturned = 0
+	;								 as part of the Load.
+	; 22-Dec-2009	PPP		SR17094: Do not copy lines if the Issue was not posted.
+	; 31-Aug-2009	GRF		SR16783: byRef array not used - removed; pidIssue =>
+	; 							idIssue
+	; 28-Aug-2009	DWR		SR16783: changed call to modified routine name, pass 
+	; 							line number.
+	; 09-Jan-2009	DavidR:  Copied from SES and modified for core.
+	; ??-???-????   ??????:  Created (VARSESRetornoAoEstoque)
+	;-------------------------------------------------------------------------------
+ 	new fltConsumed,fltRet,idIssue,idIssueLine,idItem,intLn
+ 	new objIssue,objIssueLine,objRevLine,strStatus,strErrorItems
+	
+	set strStatus = $$$YES
+	set intLn = 0
+ 
+	set idIssue = $$$INIssueRevIssueNumber(pYFELD) 
+	if idIssue="" {
+		set strStatus = $$$MakeStatus("IN00928",idIssue)	// "Invalid Issue %1 selected"
+		quit strStatus
+	}
+	
+	//SR17094
+	set objIssue = $get(^INIssue(YM,idIssue,1))
+	set strErrorItems	= ""
+	
+	if $$$INIssuePosted(objIssue)'="" {
+		set idIssueLine = ""
+		for {
+			set idIssueLine = $order(^INIssueLine(YM,idIssue,idIssueLine))
+			quit:(idIssueLine = "")
+		
+			set objIssueLine = $get(^INIssueLine(YM,idIssue,idIssueLine,1))
+			quit:(objIssueLine = "")				
+		
+			set objRevLine = ""
+			set idItem = $$$INIssueLineItem(objIssueLine)
+			set fltRet = $$GetQtyRetForIssue(idIssue,idItem,idIssueLine)  ;SR16783
+			if $$$ISERR($$IsUsable^INARTDataAccess(idItem,YFORM)) {
+				set:strErrorItems'="" strErrorItems=strErrorItems_","
+				set strErrorItems	= strErrorItems_idItem
+				continue
+			}
+		
+			//SR17094
+			set fltConsumed = $$$INIssueLineQtyIssued(objIssueLine)
+ 		
+			//Only if outstanding qty left	
+			if fltConsumed>fltRet {
+				set $$$INIssueRevLineItemNo(objRevLine)           = idItem
+				set $$$INIssueRevLineStockUnit(objRevLine)        = $$$INIssueLineUnit(objIssueLine)
+				set $$$INIssueRevLineQtyConsumed(objRevLine)      = $$$INIssueLineQtyIssued(objIssueLine)
+				set $$$INIssueRevLineBundle(objRevLine)           = $$$INIssueLineBundle(objIssueLine)
+				set $$$INIssueRevLineRefLine(objRevLine)          = idIssueLine		//$$$INIssueLineLineNumber(objIssueLine)
+				set $$$INIssueRevLineFromStorage(objRevLine)      = $$$INIssueLineFromStorage(objIssueLine)
+				set $$$INIssueRevLineToStorage(objRevLine)        = $$$INIssueLineToStorage(objIssueLine)
+				set $$$INIssueRevLineQtyAlreadyRetrn(objRevLine)  =	fltRet
+			//	set $$$INIssueRevLineQuantityReturned(objRevLine) =	($$$INIssueRevLineQtyConsumed(objRevLine)-fltRet)
+				
+				//SR17246
+				set $$$INIssueRevLineUnitQuantityReturned(objRevLine) = 0
+				set $$$INIssueRevLineQuantityReturned(objRevLine)     = 0
+				set strStatus = $$$Save("INIssueRevLine",pYKEY_$$$COMMA_idIssueLine,objRevLine,$$$YES) 
+				quit:($$$ISERR(strStatus))
+				set intLn = $increment(intLn)
+			}
+		}
+	}
+		
+ 	if intLn=0 set strStatus = $$$MakeStatus("IN00909")  ; "No Lines to Return"
+ 	if strErrorItems'=""  {
+	 	set strStatus = $$$MakeStatus("IN01448",strErrorItems)  ;Following Item(s) cannot be used %1
+ 	}
+ 	
+	quit strStatus
+	
+	
+OnAfterDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Calls the com grid interface for deleting a line
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Nov-2006	RGB		Created (SR BR014300)
+	;-------------------------------------------------------------------------------
+	do DELETE^COMGridEdit31Interface()
+	quit
+	
+	
+OnBeforeFormConstruction(pYBBN,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Called From:
+	; 	INIssueRev
+	; 	
+	; History:
+	; 30-Mar-2009	PPP		SR: Creation
+	;-------------------------------------------------------------------------------
+	if $$$INIssueRevIssueNumber(pYFELD)'="" {
+		if $$$GetFormField("INIssueRev",pYBBN) = $$$FldINIssueRevIssueNumber {
+			set YHID = 1
+		}
+	}
+	
+	kill $$$TempStore("IssueRevLineErrors")
+	quit
+	
+ 
+Process(pidReturn,pblnNoForm=$$$NO)
+	;-------------------------------------------------------------------------------
+ 	; Called By : CreateIssueRev^INIssueRevAuto (with "No Form" parameter)
+ 	;             Form INIssueRev - Button 1 "Process"
+ 	;
+ 	; History:
+ 	; 03-Aug-2009	SCR		SR16760: Added "no form" option for programmatic use.
+ 	; 09-Jan-2009	DavidR  copied and modified for core use					
+ 	; 21-Nov-2008	HQN		SR16135: Called from a button, refactored to return	
+ 	; 							strStatus on error instead of alerting
+	;-------------------------------------------------------------------------------
+	new arrErrorMsg,intErrorMessage,objReturn,strErrorMessage,strStatus
+		
+ 	set strStatus = $$$OK
+ 	
+	if ($get(pidReturn) = "") {
+		set strStatus = $$$MakeStatus("IN00914")
+	} ; "Error: Return number not specified"
+	
+	set objReturn = $get(^INIssueRev(YM,pidReturn,1))
+	
+	if $$$ISOK(strStatus) {
+		if (objReturn = "") {
+			set strStatus = $$$MakeStatus("IN00915",pidReturn)
+		} ; "Error: Return '%1' was not found"
+	}
+
+	if $$$ISOK(strStatus) {
+		if $$$INIssueRevStatus(objReturn) = 9 {	
+			set strStatus = $$$MakeStatus("IN00916",pidReturn)
+		} ; "Error: Return  '%1'  has already been processed"
+	}
+ 
+	if $$$ISOK(strStatus) {
+			set strStatus = $$CanPost(pidReturn)
+	}
+	
+	if $$$ISOK(strStatus) {
+		if $$IsTxNoPresent(pidReturn) {
+			if '$$CanReturnItems(pidReturn,.arrErrorMsg) {
+				set strErrorMessage = ""
+				set intErrorMessage = ""
+				for {
+					set intErrorMessage = $order(arrErrorMsg(intErrorMessage))
+					quit:intErrorMessage=""
+					
+					set strErrorMessage = strErrorMessage_arrErrorMsg(intErrorMessage)_"\n"
+				}
+				if (pblnNoForm=$$$NO) {  ; SR16760
+					$$$StartScript()
+					write "alert('"_strErrorMessage_"');"
+					$$$EndScript()
+					do ReloadForm^COMUtilForm()
+				}
+				set strStatus = $$$MakeStatus("IN00916",pidReturn)
+			} ; "Error: Return  '%1'  has already been processed"
+		}
+	}
+ 
+	if $$$ISOK(strStatus) set strStatus = $$Transaction^COMTransaction("ProcessTxn^INIssueRev("""_pidReturn_""","""_objReturn_""")")
+	
+	if (pblnNoForm=$$$NO) { ; SR16760
+		if $$$ISOK(strStatus) {
+ 			do ReloadForm^COMUtilForm()
+		} else { 
+			do ReturnError^COMUtilError(strStatus)
+		}
+	}
+	quit strStatus
+	
+	
+ProcessTxn(pidReturn,pobjReturn)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 17-Sep-2013	SCR		CORE-93: Change Update Requisition
+	; 16-Jul-2010	GRF		SR17440: Update the Cost on the Lines
+	; 22-Dec-2009	GRF		SR17085: Call UpdateRequisition
+	; 09-Jan-2009	DavidR	Copied from VARSESRetornoAoEstoque modified for CORE use
+	; 21-Nov-2008	HQN		SR16135: return strStatus, error handling bubbles up
+	; 20-Nov-2008	HQN		SR16135: Define strStatus, may not get set prior to the
+	; 							check
+	;-------------------------------------------------------------------------------
+	new idLine,idLocn,objIssueRevLine,objLine,objV1IssueRev,sc,strStatus
+		
+	set sc        = $$$OK 
+	set strStatus = $$Editable(pidReturn)
+	
+	if $$$ISOK(strStatus) {
+		set objV1IssueRev = $get(^INIssueRev(0,pidReturn,1))
+	//	set idLocn = $$$INIssueFromLocn(objV1IssueRev)
+		set idLocn = $$$INIssueRevFromLocn(objV1IssueRev)    ; SR17440
+		
+		set idLine = ""
+		for {
+			set idLine = $order(^INIssueRevLine(0,pidReturn,idLine))
+			quit:idLine=""
+			set objLine = $get(^INIssueRevLine(0,pidReturn,idLine,1))
+			continue:(+$$$INIssueRevLineQuantityReturned(objLine) = 0)
+			
+			set strStatus = $$UpdateCostOnRevLine(pidReturn,idLine,.objLine,idLocn)     ; modifies & saves objLine  ; SR17440
+			
+			if $$$ISOK(strStatus) {                             ; SR17440
+				set objIssueRevLine = ##class(alISS.dUIssueRevLine).%OpenId("0||"_pidReturn_"||"_idLine)
+				set sc = objIssueRevLine.FirmIssueRev()
+				
+				if $$$ISERR(sc) set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+			}                                                   ; SR17440
+			quit:$$$ISERR(strStatus)
+		}
+			
+		if $$$ISOK(strStatus) {
+			set $$$INIssueRevStatus(objV1IssueRev) = 9 		// A-Closed
+			set $$$INIssueRevPosted(objV1IssueRev) = $horolog
+			set strStatus = $$$Save("INIssueRev",pidReturn,objV1IssueRev,$$$YES)
+		}
+		if $$$ISOK(strStatus) {   ; SR17085
+			set strStatus = $$UpdateRequisition(pidReturn)
+		}
+	}
+	quit strStatus
+	
+	
+UpdateCostOnRevLine(pidReturn,pidLine,&pobjLine,pidLocn)
+	;-------------------------------------------------------------------------------
+	; Update the Unit Cost for Reversal Line 
+	;
+	; Returns: Status
+	;
+	; History:
+	; 20-Jul-2010	PPP		SR17440: Fixed the data from INIssueLine to INIssueRevLine
+	; 16-Jul-2010	GRF		SR17440: Created from INDispenseToPatient version
+	;-------------------------------------------------------------------------------
+	new idItem,idUnit,strStatus
+	
+	set strStatus = $$$OK
+	
+	//set idItem  = $$$INIssueLineItem(pobjLine)
+	//set idUnit  = $$$INIssueLineUnit(pobjLine)
+	set idItem  = $$$INIssueRevLineItemNo(pobjLine)
+	set idUnit  = $$$INIssueRevLineStockUnit(pobjLine)
+	set $$$INIssueRevLineUnitCost(pobjLine) = $$GetCost^INItemCost(idItem,pidLocn)*$$GetUOMConversion^INUOMConversion(idItem,idUnit) 
+		
+	//set strStatus = $$$Save("INIssueLine",pidReturn_","_pidLine,pobjLine,$$$YES)	
+	set strStatus = $$$Save("INIssueRevLine",pidReturn_","_pidLine,pobjLine,$$$YES)	
+	
+	quit strStatus
+	
+	
+UpdateRequisition(pidReturn) private
+	;-------------------------------------------------------------------------------
+	; When INIssueRev is satisfactorily processed, update INReqLine with
+	; new returned quantity in INIssueRevLine.
+	; 
+	; Called By : ProcessTxn^INIssueRev
+	; 
+	; History:
+	; 18-Mar-2014	SCR		SESDF-1299: Handle no Issue
+	; 17-Sep-2013	SCR		CORE-93: Pass in Return id only
+	; 04-Feb-2010	SCR		SR17163: Allow for Issue without Requisition
+	; 22-Dec-2009	GRF		SR17085: created
+	;-------------------------------------------------------------------------------
+	new fltQtyReturned,idIssueLine,idReqn,idReqnLine,idRetLine
+	new objIssueLine,objReqLine,objReturnLine,strStatus,objRet
+	new idIssue
+	
+	set strStatus	= $$$OK
+	set objRet		= $get(^INIssueRev(YM,pidReturn,1))
+	
+	;if pidIssue="" {
+	;	set strStatus = $$$MakeStatus($listbuild("IN01180",pidReturn))
+	;	quit
+	;} ; "Requisition Issue not found for Return to Stock : %1"
+	;
+	;set strStatus = $$$OK
+	;set idReqn    = $$$INIssueReference($get(^INIssue(0,pidIssue,1)))
+	
+	;if idReqn'="" {
+	set idRetLine = ""
+	for {
+		set idRetLine = $order(^INIssueRevLine(0,pidReturn,idRetLine))
+		quit:idRetLine=""
+		set objReturnLine = $get(^INIssueRevLine(0,pidReturn,idRetLine,1))
+		
+		set fltQtyReturned = $$$INIssueRevLineQuantityReturned(objReturnLine)
+		continue:'fltQtyReturned
+		if $$$INIssueRevLineIssue(objReturnLine)'="" {
+			set idIssue = $$$INIssueRevLineIssue(objReturnLine)
+		} else {
+			set idIssue	= $$$INIssueRevIssueNumber(objRet)
+		}
+		continue:idIssue=""
+		set idReqn    = $$$INIssueReference($get(^INIssue(0,idIssue,1)))
+		
+		set idIssueLine = $$$INIssueRevLineRefLine(objReturnLine)
+		if idIssueLine="" {
+			set strStatus = $$$MakeStatus($listbuild("IN01181",pidReturn,idRetLine))
+		; "Requisition Issue Line not found for Return to Stock : %1,%2"
+		
+		} else {
+			set idReqnLine   = $$$INIssueLineReference($get(^INIssueLine(0,idIssue,idIssueLine,1)))
+			if idReqnLine'="" {
+				set objReqLine = $get(^INReqLine(0,idReqn,idReqnLine,1))
+				if objReqLine'="" {
+					set $$$INReqLineQtyReversed(objReqLine) = $$$INReqLineQtyReversed(objReqLine) + fltQtyReturned
+					set strStatus = $$$Save("INReqLine",idReqn_$$$COMMA_idReqnLine,objReqLine,$$$YES)
+		
+				} ; else  {  ; SR17163
+				;	set strStatus = $$$MakeStatus($listbuild("IN01182",idReqn,idReqnLine))
+				;} ; "Requisition record not found (%1,%2)"
+			} else {
+				set strStatus = $$$MakeStatus($listbuild("IN01183",idIssue,idIssueLine))
+			} ; "Requisition Line not found in Issue Line %1,%2"
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	
+	;} else {
+	;	set strStatus = $$$MakeStatus($listbuild("IN01184",idIssue))
+	;} ; "Requisition Number not found in Issue %1"
+	quit strStatus
+	
+	
+TotalQtyForThisReturn(pidIssR]]><![CDATA[ev,pidItem)
+	;-------------------------------------------------------------------------------
+	; Get the total qty for this Item within this record
+	;
+	; Params:	pidIssRev - IssueRev id
+	;
+	; Returns:	status
+	;
+	; History:
+	; 30-Mar-2009	PPP		SR16: Created
+	;-------------------------------------------------------------------------------
+	new fltTotalCon,fltTotalRet,idRevLine,idxItem,objReturnLine
+	
+	set idxItem     = $$$Index(pidItem)
+	set fltTotalCon = 0
+	set fltTotalRet = 0
+	
+	set idRevLine = ""
+	for {
+		set idRevLine = $order(^INIssueRevLines(YM,1,idxItem,pidIssRev,idRevLine))
+		quit:idRevLine=""
+		
+		set objReturnLine = $get(^INIssueRevLine(YM,pidIssRev,idRevLine,1))
+		set fltTotalCon   = fltTotalCon + $$$INIssueRevLineQtyConsumed(objReturnLine)
+		set fltTotalRet   = fltTotalRet + $$$INIssueRevLineQuantityReturned(objReturnLine)
+	}
+	quit fltTotalCon_Y_fltTotalRet
+	
+	
+BuildQtyArray(pidDocNo,&arrQty)
+	;-------------------------------------------------------------------------------
+	;
+	;-------------------------------------------------------------------------------
+	new fltTotalCon,fltTotalRet,idItem,idLineNo,objReturnLine
+	
+	set idLineNo = ""
+	for {
+		set idLineNo = $order(^INIssueRevLine(YM,pidDocNo,idLineNo))
+		quit:idLineNo=""
+		
+		set objReturnLine = $get(^INIssueRevLine(YM,pidDocNo,idLineNo,1))
+		set idItem = $$$INIssueRevLineItemNo(objReturnLine)
+		if idItem'="" {
+			set arrQty(idItem,"C") = $get(arrQty(idItem,"C")) + $$$INIssueRevLineQtyConsumed(objReturnLine)
+			set arrQty(idItem,"R") = $get(arrQty(idItem,"R")) + $$$INIssueRevLineQuantityReturned(objReturnLine)
+		}
+	}
+	quit
+	
+	
+CanReturnItems(pidDocNo,&pstrErrorMsg)
+	;--------------------------------------------------------------------------
+ 	; History:
+	; 28-Aug-2009	DWR		SR16783 changed call to modified routine name, pass 
+	; 							line number.
+ 	; 09-Jan-2009   DavidR	Copied and modified for Core use from 
+ 	;                       VARSESRetornoAoEstoque
+ 	; 27-Nov-2008	HQN     SR16133: Returning Consumptions via PatientNo not
+ 	;                       implemented. Branch new executions
+	;--------------------------------------------------------------------------
+	new arrItemHistory,arrQty,blnCanReturn,fltFirmedReturnQty
+	new fltTotalCon,fltTotalRet,idAdjustmentNoidHistDocNo,idHistLineNo,idItem
+	new idAdjustmentNo,idHistDocNo,idIssueNo,idLineNo,idTransferNo
+	new loop,objReturn,objReturnLine
+ 
+	set blnCanReturn = $$$YES
+	set objReturn    = $get(^INIssueRev(YM,pidDocNo,1))
+	set idIssueNo    = $$$INIssueRevIssueNumber(objReturn)
+	
+	;    1) Pass DocNo to function to build array based on items
+	do BuildQtyArray(pidDocNo,.arrQty)
+	
+	;    2) Cycle through return lines
+	;		if FirmedReturnQty + CurrentReturnQty (ignore other unfirmed qty)
+	;	        > Total Current ConsumedQty (Copy original from source? or reduced?)
+	;	    Create array of error messages (alert?)
+	;	           FIXME : Check origin of ConsumedQty so logic is confirmed <GRF>
+	
+	set idLineNo = ""
+	for {
+		set idLineNo = $order(^INIssueRevLine(YM,pidDocNo,idLineNo))
+		quit:idLineNo=""
+		
+		set objReturnLine = $get(^INIssueRevLine(YM,pidDocNo,idLineNo,1))
+		set idItem = $$$INIssueRevLineItemNo(objReturnLine)
+		if idItem'="" {
+			set fltTotalCon = +$get(arrQty(idItem,"C"))
+			set fltTotalRet = +$get(arrQty(idItem,"R"))
+				
+			kill arrItemHistory
+			;	Get the total return Qty for Issue + array by pidDocNo/idLineNo for Issue and Item
+			if idIssueNo'="" {
+				set fltFirmedReturnQty = $$GetQtyRetForIssue(idIssueNo,idItem,idLineNo,.arrItemHistory)      ; SR16783
+			}
+			
+			if (fltFirmedReturnQty + fltTotalRet) > fltTotalCon {
+				set pstrErrorMsg(1) = $$$Text($listbuild("IN00917",idItem))       ; "Maximum return qty was exceeded for item: %1"
+				set pstrErrorMsg(2) = $$$Text($listbuild("IN00918",$$^WWWTR(0,12,fltTotalCon)))  ; "Consumed Quantity : %1"
+				set pstrErrorMsg(3) = $$$Text($listbuild("IN00919",$$^WWWTR(0,12,fltTotalRet)))  ; "Return Quantity : %1"
+				
+				;	Show previously firmed INIssueRev details (for this item) - source of FirmedReturnQty
+				if $data(arrItemHistory) {
+					set pstrErrorMsg(7) = ""
+					set pstrErrorMsg(8) = $$$Text("IN00920")_":"                  ; "Quantities already returned"
+				}
+				
+				set loop = 0
+				set idHistDocNo = ""
+				for {
+					set idHistDocNo = $order(arrItemHistory(idHistDocNo))
+					quit:idHistDocNo=""
+					
+					set idHistLineNo = ""
+					for {
+						set idHistLineNo = $order(arrItemHistory(idHistDocNo,idHistLineNo))
+						quit:idHistLineNo=""
+						
+						; "Document: ###, Line: ###, Quantity: ###"
+						set pstrErrorMsg(90 + $i(loop)) = $$$Text("IN00921")_": "_idHistDocNo_", "_							// Return No
+						                                  $$$Text("IN00922")_": "_idHistLineNo_", "_						// Line No
+						                                  $$$Text("IN00923")_": "_arrItemHistory(idHistDocNo,idHistLineNo)	// Quantity
+					}
+				}
+				set blnCanReturn = $$$NO
+				quit         ; outer for loop
+			}
+	 	
+		} else {
+			; bad item validation
+		}
+	}
+	quit blnCanReturn
+	
+	
+GetQtyRetForIssue(pidIssueNo,pidItem,pidLine,&parrReturnQty)
+	;--------------------------------------------------------------------------
+	; Review all returns for an issue line and determine the total quantity
+	; returned so that this can be compared with the quantity issued.
+	; Optionally return an array of the quantities returned.
+	; 
+	; 
+	; History:
+	; 14-Sep-2013	SCR		CORE-93: Need to Check By Line for Returns with multiple Issues
+	; 05-Nov-2009	DWR		SR16973: Only add the value if the line reference
+	; 							matches the passed in pidLine.
+	; 07-Oct-2009	SCR		SR16930: Undid last change change
+	; 26-Aug-2009	DWR		SR16783: shortened routine name and added third 
+	; 							parameter. because passing in line number
+	; 							no need to loop through the index of the lines.
+	; 							they should be like for like line numbers
+	; 							so call directly.
+	; 12-Jan-2009	DavidR	copied and Modified for core use
+	; 01-Dec-2008	GRF		SR16133: Use Procedure Block Zero format
+	; 27-Nov-2008	HQN		SR16133: Created
+	;--------------------------------------------------------------------------
+	new fltQtyReturned,fltTotalQty,idDocNo,idxAdjNo,idxIssueNo,idxItem
+	new objReturnLine,idLineNo,idRefLine,objDocNo
+ 
+	set idxIssueNo  = $$$Index(pidIssueNo)
+	set idxItem     = $$$Index(pidItem)
+	set fltTotalQty = 0
+	
+	set idDocNo = ""
+	for {
+		set idDocNo = $order(^INIssueRevs(YM,2,9,idxIssueNo,idDocNo))  ; D12 (Status) : 2.1, D1 (Issue No) : 2.2 - new index
+		quit:idDocNo=""
+		
+	;	set objReturnLine  = $get(^INIssueRevLine(YM,idDocNo,pidLine,1))       ; vvv SR16783 SR16930
+	;	set fltQtyReturned = $$$INIssueRevLineQuantityReturned(objReturnLine)
+	;	set fltTotalQty    = fltTotalQty + fltQtyReturned
+	;	set:(fltQtyReturned>0) parrReturnQty(idDocNo,pidLine) = fltQtyReturned
+	;}	
+	
+		set idLineNo = ""
+		for {
+			set idLineNo = $order(^INIssueRevLines(YM,1,idxItem,idDocNo,idLineNo))
+			quit:idLineNo=""
+			
+			set objReturnLine  = $get(^INIssueRevLine(YM,idDocNo,idLineNo,1))
+			;vvv SR16973 vvv
+			set idRefLine = $$$INIssueRevLineRefLine(objReturnLine)
+			continue:idRefLine'=pidLine
+			
+			set fltQtyReturned = $$$INIssueRevLineQuantityReturned(objReturnLine)
+			set fltTotalQty    = fltTotalQty + fltQtyReturned
+			set:(fltQtyReturned>0) parrReturnQty(idDocNo,idLineNo) = fltQtyReturned
+		} 
+	}                                                                         ; ^^^ SR16783 SR16930
+	set idDocNo = ""		; Scan for Issue By Line
+	for {
+		set idDocNo	= $order(^INIssueRevLines(YM,2,idxIssueNo,pidLine,idDocNo))
+		quit:idDocNo=""
+		set objDocNo = $get(^INIssueRev(YM,idDocNo,1))
+		continue:$$$INIssueRevStatus(objDocNo)'=9
+		set idLineNo = ""
+		for {
+			set idLineNo =  $order(^INIssueRevLines(YM,2,idxIssueNo,pidLine,idDocNo,idLineNo))
+			quit:idLineNo=""
+			set objReturnLine  = $get(^INIssueRevLine(YM,idDocNo,idLineNo,1))
+
+			set idRefLine = $$$INIssueRevLineRefLine(objReturnLine)
+			continue:idRefLine'=pidLine
+			
+			set fltQtyReturned = $$$INIssueRevLineQuantityReturned(objReturnLine)
+			set fltTotalQty    = fltTotalQty + fltQtyReturned
+			set:(fltQtyReturned>0) parrReturnQty(idDocNo,idLineNo) = fltQtyReturned
+		}
+	}
+
+	quit fltTotalQty
+	
+	
+OnBeforeDeleteHook(pYKEY)
+	do DeleteLines^INIssueRevLine(pYKEY)
+	quit $$$OK
+			
+ 
+IsTxNoPresent(pidReturn)
+	;-------------------------------------------------------------------------------
+	; if Issue number is recorded return YES
+	; 
+	; History:
+	; 09-Jan-2009	DavidR:   Created
+	;------------------------------------------------------------------------------
+	new objReturn
+	
+	set objReturn = $get(^INIssueRev(YM,pidReturn,1))
+	quit ($$$INIssueRevIssueNumber(objReturn)'="")
+
+StartDispenseSearch()
+	;-------------------------------------------------------------------------------
+	; Start the Dispense COMView 
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Jun-2013	SCR		CORE-93: Created
+	;-------------------------------------------------------------------------------
+	new strYFELD,idPatent,idFromLoc
+	
+	set strYFELD = $$GetFormData^COMUtilForm(YFORM)
+	set idFromLoc	= $$$INIssueRevFromLocn(strYFELD)
+	set idPatent = $$$INIssueRevPaitent(strYFELD)
+	do Initialise^COMViewCustom("MEDDispense","",$$$YES) // MUST NOT CALL WITHOUT WRAPPER
+	do AddFilter^COMViewCustom("D9",$$$EnumCOMVIEWCOMPARATORNotEquals,"")
+	do AddFilter^COMViewCustom("D5",$$$EnumCOMVIEWCOMPARATOREquals,idFromLoc)
+	if idPatent'="" {
+		do AddFilter^COMViewCustom("D15",$$$EnumCOMVIEWCOMPARATOREquals,idPatent)
+	}
+	do Start^COMViewCustom("WWW2.YINIssueRevD15") // MUST NOT CALL WITHOUT WRAPPER
+	
+	
+	quit $$$OK
+	
+StartIssueSearch()
+	;-------------------------------------------------------------------------------
+	; Start the Dispense COMView 
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Jun-2013	SCR		CORE-93: Created
+	;-------------------------------------------------------------------------------
+	new strYFELD,idFromLoc,idToLoc
+	
+	set strYFELD 	= $$GetFormData^COMUtilForm(YFORM)
+	set idFromLoc	= $$$INIssueRevFromLocn(strYFELD)
+	set idToLoc		= $$$INIssueRevToLocn(strYFELD) 
+	do Initialise^COMViewCustom("INIssue","",$$$YES,,,,"INIssueRevD1") // MUST NOT CALL WITHOUT WRAPPER
+	do AddFilter^COMViewCustom("D1",$$$EnumCOMVIEWCOMPARATOREquals,9)
+	do AddFilter^COMViewCustom("D3",$$$EnumCOMVIEWCOMPARATOREquals,idFromLoc)
+	
+	if idToLoc'="" {
+		do AddFilter^COMViewCustom("D2",$$$EnumCOMVIEWCOMPARATOREquals,idToLoc)
+	}
+	do Start^COMViewCustom("WWW2.YINIssueRevD1") // MUST NOT CALL WITHOUT WRAPPER
+	
+	quit $$$OK
+	
+	
+	
+OnBlurDispense(&pobjRev)
+	;-------------------------------------------------------------------------------
+	; Update Patient and Issue 
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Jun-2013	SCR		CORE-93: Created
+	;-------------------------------------------------------------------------------
+	new idDisp,idPatient,objDisp,idIssue,idFromLoc,blnFail
+	
+	set blnFail		= $$$NO
+	set idDisp		= $$$INIssueRevDispense(pobjRev)
+	set idFromLoc	= $$$INIssueRevFromLocn(pobjRev)
+	set idIssue		= ""
+	set idPatient	= ""
+	if idDisp '= "" {
+		set objDisp		= $get(^MEDDispense(YM,idDisp,1))
+		set idIssue		= $$$MEDDispenseIssue(objDisp)
+		set idPatient	= $$$MEDDispensePatient(objDisp)
+	}
+	if (idDisp'="") {
+		if $$$MEDDispenseSupplyingLocation(objDisp)'=idFromLoc {
+ 			set %TXT(1) = "#FUNCTION~alert('"_$$$Text( $listbuild("IN01444",$$$MEDDispenseSupplyingLocation(objDisp),idFromLoc))_"'); window.setTimeout('document."_YHTMFORM_".Y"_YFORM_"D15.focus()',1);" ;  ;Dispense from location %1 and cannot be returned in location %2
+   			set $$$INIssueRevDispense(pobjRev) = ""
+   			set blnFail		= $$$YES
+		}
+	}
+	if idIssue=""&&(idDisp'="") {
+ 		set %TXT(1) = "#FUNCTION~alert('"_$$$Text("IN01423")_"'); window.setTimeout('document."_YHTMFORM_".Y"_YFORM_"D15.focus()',1);" ; ;Dispense has no Issue to Reverse
+   		set $$$INIssueRevDispense(pobjRev) = ""
+   		set blnFail		= $$$YES
+	}
+	if blnFail=$$$NO {
+		set $$$INIssueRevIssueNumber(pobjRev)	= idIssue
+	}
+	if idPatient'=""&&(blnFail=$$$NO) {
+		set $$$INIssueRevPaitent(pobjRev)		= idPatient
+	}
+	quit
+	
+OnBlurType(&pobjRev)
+	;-------------------------------------------------------------------------------
+	; Clear relevent fields 
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jun-2013	SCR		CORE-93: Created
+	;-------------------------------------------------------------------------------
+	new intType
+	set intType	= $$$INIssueRevReturnType(pobjRev)
+	if intType = 1 {
+		set $$$INIssueRevToLocn(pobjRev)		= ""
+		set $$$INIssueRevIssueNumber(pobjRev)	=""
+	}
+	if intType = 2 {
+		set $$$INIssueRevPaitent(pobjRev)		= ""
+		set $$$INIssueRevDispense(pobjRev)		= ""
+	}
+	
+OnBlurIssue(&pobjRev)
+	;-------------------------------------------------------------------------------
+	; Check Issue 
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Jun-2013	SCR		CORE-93: Created
+	;-------------------------------------------------------------------------------
+	new objIssue,idToLoc,idIssue,idFromLoc
+	
+	set idIssue		= $$$INIssueRevIssueNumber(pobjRev)
+	set idToLoc 	= $$$INIssueRevToLocn(pobjRev)
+	set idFromLoc	= $$$INIssueRevFromLocn(pobjRev)
+	if (idIssue'="") {
+		set objIssue = $get(^INIssue(YM,idIssue,1))
+		if (idToLoc'="") {
+			if $$$INIssueToLocn(objIssue)'=idToLoc {
+ 				set %TXT(1) = "#FUNCTION~alert('"_$$$Text( $listbuild("IN01445",$$$INIssueToLocn(objIssue),idToLoc))_"'); window.setTimeout('document."_YHTMFORM_".Y"_YFORM_"D15.focus()',1);" ;  ;Issue To Location %1 does not match Return To Location %2
+ 				set $$$INIssueRevIssueNumber(pobjRev) = ""
+			}
+		}
+		if $$$INIssueFromLocn(objIssue)'=idFromLoc {
+ 			set %TXT(1) = "#FUNCTION~alert('"_$$$Text( $listbuild("IN01446",$$$INIssueFromLocn(objIssue),idFromLoc))_"'); window.setTimeout('document."_YHTMFORM_".Y"_YFORM_"D15.focus()',1);" ; ;Issue From Location %1 does match Return From Location %2
+			set $$$INIssueRevIssueNumber(pobjRev) = ""
+		}
+		if $$$INIssueType(objIssue) = 6 {
+ 			set %TXT(1) = "#FUNCTION~alert('"_$$$Text( "IN01450") _"'); window.setTimeout('document."_YHTMFORM_".Y"_YFORM_"D15.focus()',1);"  ;Cannot return a Production order
+			set $$$INIssueRevIssueNumber(pobjRev) = ""
+		}
+	}
+
+HasGridLines()
+	;-------------------------------------------------------------------------------
+	; Check for Grid Lines
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Jun-2013	SCR		CORE-93: Created
+	;---------arrGrid----------------------------------------------------------------------
+	new arrGrid
+	if $tr(YKEY,"+")="" quit $$$NO
+	$$$GRIDGetContents(.arrGrid)
+	quit $data(arrGrid(YKEY))
+]]></Routine>
+</Export>

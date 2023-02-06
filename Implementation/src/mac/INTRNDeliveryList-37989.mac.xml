@@ -1,0 +1,530 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRNDeliveryList" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRNDeliveryList
+	
+#include INConst
+#include COMSYS
+	
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+	
+CanPrintDelivery(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Determines whether Delivery List can be displayed
+	;
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: YQ implicitly
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,objTFR
+ 
+	do IsPrintingValid^INTRNValidation(pidTFR)
+ 
+	set strStatus=$$IsPrintingValid^INTRNValidation(pidTFR)
+
+	if ((+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) ||
+	    (+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+	    (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+		if $$$ISOK(strStatus) {
+			set objTFR = $get(^INTFR(YM,pidTFR,1))
+			if ($$$INTFRFREE6(objTFR) '= ""){
+				set strStatus = $$$NO
+			}
+		}
+	}
+  
+	if $$$ISOK(strStatus) {
+		set objTFR = $get(^INTFR(YM,pidTFR,1))
+		
+		if $$$INTFRPickListPrinted(objTFR) = "" {
+			set strStatus = $listbuild("IN00422")  ; "Pick list needs to be printed."
+	; FIXME : This is not a valid strStatus string.
+		
+		} else {
+			set strStatus = $$ProductError^INTRNValidation("IN00438")
+		} ; "Please fix all errors before printing."
+	}
+	$$$YQHandler(strStatus)
+	quit
+	
+	
+PrintDelivery(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Display Delivery List
+	;
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	do CanPrintDelivery(pidTFR) 
+	
+	if YQ = $$$YQEnable {
+		do PrintDeliveryList(pidTFR)
+	} else {
+		do ReturnError^COMUtils($$$YQMessage)
+	}
+	quit
+ 
+ 
+PrintDeliveryList(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Display Delivery List.
+	;
+	; Params:
+	; pidTFR - Transfer Order Id
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	 
+	set strStatus = $$Transaction^COMTransaction("PrintDeliveryListTxn^INTRNDeliveryList("""_pidTFR_""")",$$$YES)
+ 
+	if $$$ISOK(strStatus) {
+		//set $piece(^INUSER(YM,YBED,1),Y,76) = $$$INTFRTour($get(^INTFR(YM,pidTFR,1)))
+		//do GoToTransferForm(61) ;BR014631
+		;do GoToForm^COMUtilForm("INTRANSFER","","","",,,62)
+		set strStatus = $$PrintDeliveryListDoc(pidTFR)
+	}
+ 
+	quit
+ 
+PrintDeliveryListTxn(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Update Delivery List printed time stamp.
+	;
+	; Params:
+	; pidTFR - Transfer Order Id
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new objTFR,strStatus
+ 
+	set strStatus = $$$OK
+	
+	set objTFR = $get(^INTFR(YM,pidTFR,1))
+	set $$$INTFRDeliveryListPrinted(objTFR) = $horolog
+	set strStatus = $$$Save("INTFR",pidTFR,objTFR,$$$YES)
+ 
+	quit strStatus
+ 
+ 
+PrintDeliveryListDoc(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Finally Print the Delivery List (HTML Print)
+	;
+	; Params:
+	; pidTFR - Transfer Order Id
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new ShipLocn,strStatus
+	
+	set ShipLocn = $get(YLOCATION)
+	
+	kill ^WWWSOR(YUSER)
+	set ANZM=0 
+	do SORT(pidTFR)
+	
+	set YNOFOOT=1
+	do ^WWWBACK
+	do DRUCK(pidTFR)
+	if ANZM=0 do ^WWWINFO($$^WWWTEXT(46),1,,1)  ; "No Data Available"
+	kill ^WWWSOR(YUSER)
+	quit $$$OK
+	
+	
+SORT(pidTFR)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; NOTE: CHANGES HERE PROBABLY NEED TO BE MADE TO SORT in INTRANSFER [4,5,61,62,7,8,9]
+	;       AND BeforeSave^INTRANSFER6 (& possibly other places)
+	;
+	; History:
+	; 06-Jan-2010	GRF		SR17080: tag change
+	; 07-Sep-2006	RPW		SR15002: If it's a Transfer (NEW) then get the receiving 
+	; 							location and put the data in the correct order.
+	; 12-Nov-2005	PO		SR13824: Skip deleted demands
+	;-------------------------------------------------------------------------------
+	new ARTB,ARTN,DEMAND,DEMAND1,EINHEIT,idItem,idLine,idReceivingLocation,idStorage,idTFR
+	new MENGE,MENGEL,objItem,objLine,objTFR
+	
+	set objTFR = $get(^INTFR(YM,pidTFR,1))
+	set idReceivingLocation = $$$INTFRReceivingLocation(objTFR)
+	
+	set idLine = ""
+	for {
+		set idLine = $order(^INTFRLine(YM,pidTFR,idLine))
+		quit:idLine=""
+		
+		set objLine = $get(^INTFRLine(YM,pidTFR,idLine,1))
+		set idItem  = $$$INTFRLineItem(objLine)
+		set objItem = $get(^INART(YM,idItem,1))
+		
+		if $piece(objItem,Y,40)'="" {
+			set EINHEIT = $$$AppEnum("EINHEIT",$piece(objItem,Y,40))
+		}
+ 
+		set ARTB   = "("_idItem_") "_$extract($piece(objItem,Y,1),0,20)_"..."
+		set MENGEL = +$$$INTFRLineQuantity(objLine) 
+		
+	;	set idStorage = $$GetStockLoc^INRECTFRLine(idItem,idReceivingLocation) ; SR17080
+		set idStorage = $$GetStorage^INRECTFRLine(idItem,idReceivingLocation)
+		if idStorage = "" set idStorage = " "
+		
+		set DEMAND  = $$$KEY2($$$INTFRLineDemand(objLine))
+		set DEMAND1 = ""	//???
+		
+		set ^WWWSOR(YUSER,pidTFR,idStorage,DEMAND)=ARTB_Y_+MENGEL_" "_EINHEIT_Y_DEMAND_Y_$piece(DEMAND1,Y,2)
+	}
+	quit
+	
+	
+DRUCK(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Prints delivery slip.
+	;
+	; Params: None
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 22-Sep-2008	HQN		SR15862: Corrected If/For refactor from 12-Sep-2008
+	; 12-Sep-2008	GRF		Dot Levels
+	; 07-Sep-2006	PO		SR15002: If we have a transfer no, print in location order.
+	; 18-Jul-2006	PO		SR14847: Show quantity to be picked in initially selected
+	; 							unit as well as base
+	; 20-Apr-2006	SC		SR14320: Modified to use INVORGLANG, allows other languages.
+	;-------------------------------------------------------------------------------
+	new RecLoc,RecLocB,ShipLocn,SOR1,strAlternate,TOUR1,TOURB,TOURTEXT,UES,VERSNR,VORG1
+	new ANZSEIT,DEMAND,idTFR,objTFR,objTour,objVORGLANG
+	
+	set VORG1       = $get(^INVORG(YM,YM,1))
+	set objVORGLANG = $get(^INVORGLANG(YM,YM,SPRACHE,1))
+	set TEXT=$$$INVORGLANGAfterTextInternalDelivery(objVORGLANG)          ;ZUSATZTEXT
+ 
+	set ANZSEIT = $piece(VORG1,Y,84)       ;MAXIMAL ANZAHL PRO SEITE ;Number within side 
+	if ANZSEIT="" set ANZSEIT = 30
+ 
+	set objTFR   = $get(^INTFR(YM,pidTFR,1))
+	set ShipLocn = $$$INTFRSendingLocation(objTFR)
+ 
+	set UES=""
+	set $piece(UES,Y,1)=$$^WWWTEXT(207)   ;NR
+	set $piece(UES,Y,2)=$$^WWWTEXT(32024) ;ARTIKEL ;item 
+	set $piece(UES,Y,3)=$$^WWWTEXT(31407) ;MENGE   ;quantity 
+	set $piece(UES,Y,4)=$$^WWWTEXT(32612) ;DEMAND
+	set $piece(UES,Y,5)=$$^WWWTEXT(32047) ;AUFTRAG ;order 
+	set $piece(UES,Y,6)=$$^WWWTEXT(31407) ;MENGE   ;quantity 
+ 
+	do DrawTable(ShipLocn,pidTFR,pidTFR,ANZSEIT)
+ 
+	;ARTIKEL DRUCKEN ;item print 
+	if pidTFR = "" do
+	. set VERSNR=""
+	. for  set VERSNR = $order(^WWWSOR(YUSER,VERSNR)) quit:VERSNR=""  do
+	. . set ANZM=0
+	. . set TOUR1=$get(^INDRPUMTOUR(YM,ShipLocn,VERSNR,1))
+	. . set TOURB=""
+	. . set RecLocB=""
+	. . set RecLoc=$piece(TOUR1,Y,3)
+	. . set TOUR=$piece(TOUR1,Y,2)
+	. . if TOUR=""  set TOUR=" "
+	. . if TOUR'="" set TOURB=$piece($get(^INDRPUMLKW(YM,TOUR,1)),Y,2)
+	. . if RecLocB'="" set RecLocB="("_RecLoc_") "_$piece($get(^WWW0121(0,YM,RecLoc,1)),Y,1)
+	. . ;
+	. . if ANZM>0 do FF^WWWW()
+	. . do UEBER(pidTFR)
+	. . set YDDSATZ=0
+	. . set DEMAND=""
+	. . for  set DEMAND=$order(^WWWSOR(YUSER,VERSNR,DEMAND)) quit:DEMAND=""  do
+	. . . set SOR1=$get(^WWWSOR(YUSER,VERSNR,DEMAND))
+	. . . ;
+	. . . if ANZM'=0 if ANZM#ANZSEIT=0 do   ;NEUE SEITE ;side 
+	. . . . write "</TD></TR>"
+	. . . . write "</TABLE>"
+	. . . .;DO ZUSATZTEXT
+	. . . . do FF^WWWW()
+	. . . . do UEBER(pidTFR)
+	. . . ;
+	. . . set ANZM=ANZM+1
+	. . . ;
+	. . . do NL^WWWTAB
+	. . . do NFZ^WWWTAB
+	. . . write ANZM
+	. . . write "&nbsp;"
+	. . . write YCR
+	. . . ;
+	. . . do ZW^WWWTAB
+	. . . write $piece(SOR1,Y,1)          ;Type
+	. . . write "&nbsp;"
+	. . . write YCR
+	. . . ;
+	. . . do ZWR^WWWTAB
+	. . . set strAlternate = $$BaseQuantity^INTRANSFER5(ShipLocn,$piece(SOR1,Y,3),$piece($piece(SOR1,Y,2)," ",2))
+	. . . if strAlternate '= "" write strAlternate
+	. . . write $piece(SOR1,Y,2)          ;quantity 
+	. . . write "&nbsp;"
+	. . . write YCR
+	. . . ;
+	. . . do ZWZ^WWWTAB
+	. . . write $piece(SOR1,Y,3)          ;DEMAND
+	. . . write "&nbsp;"
+	. . . write YCR
+	. . . ;
+	. . . do ZWZ^WWWTAB
+	. . . write $piece(SOR1,Y,4)          ;order 
+	. . . write "&nbsp;"
+	. . . write YCR
+	. . . ;
+	. . . do ZWZ^WWWTAB                   ;ANGENOMMEN ;adoptive 
+	. . . write "&nbsp;"
+	. . . write YCR
+	. . . ;
+	. . . do EF^WWWTAB
+	. . . do EL^WWWTAB
+	. . ;
+	. . do STOP^WWWTAB
+	. . ;ZUSATZTEXT
+	. . do ZUSATZTEXT(TEXT)
+	
+	quit
+	
+	
+DrawTable(pidSendingLocn,pidTour,pidTFR,pintLinesPerPage)
+	;-------------------------------------------------------------------------------
+	; Construct Delivery List
+	;
+	; Params:
+	; pidSendingLocn - Sending Site Location
+	; pidTour - Tour Id
+	; pidTFR - Transfer Id
+	; pintLinesPerPage - Number of line to display per page
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 17-Dec-2010	GRF		-: replace $order macros
+	; 04-Sep-2006	PO		SR15002: Rewite of line printing in DRUCK
+	;-------------------------------------------------------------------------------
+	new idReceivingLocn,idDemand,strAlternate,objSOR
+ 
+	do UEBER(pidTFR)
+ 
+	set ANZM = 0
+	set YDDSATZ = 0
+ 
+	set idReceivingLocn = ""
+	for {
+		set idReceivingLocn = $order(^WWWSOR(YUSER,pidTour,idReceivingLocn))
+		quit:idReceivingLocn=""
+		
+		set idDemand = ""
+		for {
+			set idDemand = $order(^WWWSOR(YUSER,pidTour,idReceivingLocn,idDemand))
+			quit:idDemand=""
+			
+			set objSOR = $get(^WWWSOR(YUSER,pidTour,idReceivingLocn,idDemand))
+ 
+			if (ANZM '= 0) && (ANZM#pintLinesPerPage = 0) {
+				write "</td></tr></table>"
+				do FF^WWWW()
+				do UEBER(pidTFR)
+			}
+			set ANZM = ANZM + 1
+ 
+			do NL^WWWTAB
+			do NFZ^WWWTAB
+			write ANZM_"&nbsp;"
+	
+			do ZW^WWWTAB
+			write $piece(objSOR,Y,1)_"&nbsp;"
+ 
+			do ZWR^WWWTAB
+			set strAlternate = $$BaseQuantity^INTRANSFER5(pidSendingLocn,$piece(objSOR,Y,3),$piece($piece(objSOR,Y,2)," ",2))
+			if strAlternate '= "" write strAlternate
+			write $piece(objSOR,Y,2)_"&nbsp;"
+ 
+			do ZWZ^WWWTAB
+			write $piece(objSOR,Y,3)_"&nbsp;"
+ 
+			do ZWZ^WWWTAB
+			write $piece(objSOR,Y,4)_"&nbsp;"
+ 
+			do ZWZ^WWWTAB
+			write "&nbsp;"
+ 
+			do EF^WWWTAB
+			do EL^WWWTAB
+		}
+	}
+ 
+	do STOP^WWWTAB
+	do ZUSATZTEXT()
+ 
+	quit
+	
+ 
+DEMANDEIN     ;IN DRP DEMAND SPEICHE ;within DRP spoke 
+	/*
+	NEW SATZ,KEY
+	
+	SET KEY=ShipLocn_","_DEMAND
+	SET SATZ=DEMAND1
+	DO
+	. SET $PIECE(SATZ,Y,62)=+$H        ;LIEFERSCHEIN GEDRUCKT AM ;packing slip to the 
+	. SET $PIECE(SATZ,Y,63)=YBED       ;LIEFERSCHEIN GEDRUCKT DURCH ;packing slip trans- 
+	. IF $PIECE(DEMAND1,Y,50)="" SET $PIECE(SATZ,Y,50)=$PIECE(SATZ,Y,5)    ;GEPICKT MENGE ;quantity 
+	. IF $PIECE(DEMAND1,Y,60)="" SET $PIECE(SATZ,Y,60)=$PIECE(SATZ,Y,50)   ;GELADET MENGE ;quantity 
+	. IF $PIECE(DEMAND1,Y,26)="" SET $PIECE(SATZ,Y,26)=$PIECE(SATZ,Y,60)   ;GELIEFERT MENGE ;quantity 
+	. SET YOK=$$^WWWSPEI("INDRPDEMAND",KEY,SATZ,1)
+	. DO ^INDRPSAVED(KEY,SATZ)  ;UPDATE SUPPLY OF DESTINATION LOCATION;FIS;01.04.04 ;LOCATION 
+	*/
+	quit
+ 
+ZUSATZTEXT(TEXT)   ;ZUSATZTEXT
+	new YI
+	
+	if ANZM'=0 if $get(TEXT)'="" do
+	. write "<BR>"
+	. if '$find(TEXT,"<") do  quit
+	. for YI=1:1  quit:$piece(TEXT,"|",YI,9999)=""  write $piece(TEXT,"|",YI),"<BR>",YCR  ;NUR TEXT ;only Text 
+	. for YI=1:1  quit:$piece(TEXT,"|",YI,9999)=""  write $piece(TEXT,"|",YI),YCR         ;HTML
+	
+	write YCR
+	do FF^WWWW()
+	write YCR,YCR
+	quit
+	
+	
+UEBER(pidTFR) ;  
+	new I
+	
+	do KOPF(pidTFR)
+	do START100^WWWTAB  ;STARTEN DER ÜBERSCHRIFT ;launching the superscription 
+	write "<THEAD>" 
+	do NL^WWWTAB
+	for I=1:1 quit:$piece(UES,Y,I,99)=""  do NHWZ^WWWTAB write $piece(UES,Y,I),"&nbsp;" do EH^WWWTAB
+	do EL^WWWTAB
+	write "</THEAD>"
+	quit
+	
+	
+KOPF(pidTFR) 
+	;-------------------------------------------------------------------------------
+	; Heading
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Dec-2010	GRF		-: close font block; TD should close with /TD not /TH
+	; 15-May-2006	PO		SR14427: If transfer performed via Transfer Order form
+	; 							then display relevant details (Phase 2)
+	;-------------------------------------------------------------------------------
+	new dteTransfer,idFromLoc,idRef,idTFR,idToLoc,intStatus
+	new objRecord,objTFR,strDescription
+	
+	set objTFR    = $get(^INTFR(YM,pidTFR,1))
+	set idFromLoc = $$$INTFRSendingLocation(objTFR)
+	set idToLoc   = $$$INTFRReceivingLocation(objTFR)
+	set idRef     = $$$INTFRDispatch(objTFR)
+	set intStatus = $$$INTFRStatus(objTFR)
+	
+	do START1000^WWWTAB
+	write YCR,"<TR><TD>"
+	write "<NOBR>"
+	
+	write YCR,"<TABLE BORDER=0 CELLSPACING=1 WIDTH=100%><TR>",YCR
+	write "<TD ALIGN=CENTER COLSPAN=2>"
+	write "<FONT SIZE=3><B>"
+	write YKOPF
+	write "</B></FONT>"
+	write "<BR>"
+	write "<FONT SIZE=1>"
+	write $$^WWWTEXT(388)_": "_idFromLoc_" "_$piece($get(^WWW0121(0,YM,idFromLoc,1)),Y,1)  ; "Location"	
+	write "</FONT>"
+	write "</TD>",YCR
+	write "</TR></TABLE>",YCR
+	
+	do
+	. write YCR,"<TABLE BORDER=0 CELLSPACING=1 WIDTH=100%>"
+	. write "<TR><TD WIDTH=33%>"
+	. write "<FONT SIZE=2>"
+	. write "<B>"
+	. write $$^WWWTEXT(32807)_" "_$$^WWWTEXT(388)_": "  ;BETRIEB
+	. write idToLoc	//$PIECE(TOUR1,Y,3)  ;FÜR BETRIEB ;to location 
+	. if idToLoc'="" write " "_$piece($get(^WWW0121(0,YM,idToLoc,1)),Y,1)  ;NAME
+	. write "<BR>"
+	. write $$^WWWTEXT(32808)_": "  ; "Route"
+	. write idRef
+	. if idRef'="" write " "_$piece($get(^INDRPUMLKW(YM,idRef,1)),Y,2)
+	. write "</B></FONT>"
+	. write "</TD>",YCR
+	. ;
+	. write "<TD ALIGN=CENTER VALIGN=BOTTOM WIDTH=33%>"
+	. write "<FONT SIZE=2>"
+	. write "<B>"
+	. write " "
+	. write "<BR>"
+	. write $piece($$^WWWTEXT(34327)," ",2,99) 	; "Print Delivery Slip"
+	. write "</B></FONT>"
+	. write "</TD>",YCR
+	. ;
+	. write "<TD ALIGN=RIGHT VALIGN=BOTTOM WIDTH=33%>"
+	. write "<FONT SIZE=2>"
+	. write "<B>"
+	. ;
+	. ;
+	. if pidTFR '= "" do
+	. . write $$^WWWFELDNAME("INTFR","P",1)_": "_pidTFR
+	. . write "<br />"_$$$Text(32168)_": "_$$^WWWDATE($$$INTFRDueDate(objTFR))  ; "Delivery Date"
+	. ;
+	. write "</B>"
+	. write "</TD></TR>",YCR
+	
+	write "</TABLE>",YCR
+	
+	write "</TD></TR>",YCR
+	do STOP^WWWTAB
+	quit
+	
+]]></Routine>
+</Export>

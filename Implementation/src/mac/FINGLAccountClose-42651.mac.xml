@@ -1,0 +1,402 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLAccountClose" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLAccountClose  ; Account End of Year Close
+	
+#include COMSYS
+#include FINConst
+	
+CloseOff(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Post the balance of all transactions for a year to the close off account
+	;
+	; History
+	; 14-Jun-2006	RPW		SR14642: Use the Interface Batch method instead of
+	; 							direct to the GL Accounts.
+	; 14-Jun-2006	RPW		SR14738: Fixed CacheTemp Usage
+	; 02-May-2006	SC		SR14590: Added error checking to TransactionsForAccount
+	;  5-Apr-2006	JW		SR14523: Cleaned up. Removed hard coded text.
+	; 26-May-2005	SCR		SR12440 Transaction Date was set to 31-Dec-???? now
+	; 							is the last day of the financial year 'LedPeriod'
+	; 26-May-2005	SCR		SR12440 Move Account list from Local to Global
+	; 26-May-2005	SCR		SR12440 Pass Tran Number to History
+	; 10-Mar-2005	RPW		Fixed TCOMMIT and TROLLBACK (SR11273)
+	; 18-Jun-2004	shobby	Foreign Currency
+	; 29-May-2003	shobby	Change close off date to the last day of the year.
+	; 28-May-2003	shobby	Rewrote to handle posting to Income/Expense accounts,
+	; 							and ignoring unposted transactions.
+	; 28-May-2003	shobby	Moved some code to subroutines.
+	; 26-May-2003	shobby	Creation
+	;-------------------------------------------------------------------------------
+	new strStartDate,strEndDate,objFINGLEndOfYear,fltTotal,strAccount,strStatus
+	new strReference,idAccount,idxPostings,idTran,fltTotal1,fltAmount
+	new idBatch,idBlock
+	
+	quit:pYKEY="" $$$OK
+	set $ztrap="CloseOffError"
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	tstart
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set strStatus = $$GetDates(pYKEY,.strStartDate,.strEndDate) //SR14590
+	if $$$ISOK(strStatus) {
+		set objFINGLEndOfYear=$get(^FINGLEndOfYear(0,pYKEY,1))
+		set idAccount=$$$FINGLEndOfYearAccount(objFINGLEndOfYear)
+		
+		kill ^CacheTempFINEOY(YUSER)  ; for List Account
+		set strStatus=$$TransactionsForAccount(strStartDate,strEndDate,.fltTotal,idAccount) //SR14590
+		
+		if $$$ISOK(strStatus) {
+		
+			; If already Posted then calculate the difference if the calculation is different from the previous time
+			
+			if $data(^CacheTempFINEOY(YUSER))'=0 {
+				set $$$FINGLEndOfYearAmount(objFINGLEndOfYear)=fltTotal
+				set strStatus=$$$Save("FINGLEndOfYear",pYKEY,objFINGLEndOfYear,1)
+				
+				; Post a transaction
+				if $$$ISOK(strStatus) {
+					set strStatus=$$CreateBatch(pYKEY,strEndDate,.idBatch,.idBlock)	// SR14642
+					
+					if $$$ISOK(strStatus) {
+						set fltTotal1=0
+						
+						//set strReference="Ref: End Of Year"
+						set strReference=$$^WWWFORMNAME("FINGLEndOfYear") //SR14523
+						set idxPostings=""
+						for  {
+							set idxPostings=$order(^CacheTempFINEOY(YUSER,idxPostings))
+							quit:idxPostings=""
+							set fltAmount=$get(^CacheTempFINEOY(YUSER,idxPostings))
+							set fltTotal1=$$$FCAdd(fltTotal1,fltAmount)
+							set strStatus=$$CreateLine(idBatch,idBlock,pYKEY,idxPostings,fltAmount,strReference) // SR14642
+							quit:$$$ISERR(strStatus)
+						}
+						
+						if $$$ISOK(strStatus) {
+							set strStatus=$$CreateLine(idBatch,idBlock,pYKEY,idAccount,$$$FCSign(fltTotal1),strReference)
+							if $$$ISOK(strStatus) {
+								set strStatus = $$PostBlock^FININTBatch(idBatch,idBlock)
+								if $$$ISOK(strStatus) {
+									set strStatus = $$PostBatch^FININTBatch(idBatch,"EOY",.idTran)
+									if $$$ISOK(strStatus) {
+										set strStatus=$$CreateHistoryLine(pYKEY,idTran)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		kill ^CacheTempFINEOY(YUSER)  ; for List Account
+	}
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+		do ^WWWFORM
+	} else {
+		trollback
+		do ReturnError^COMUtils(strStatus)
+	}
+	
+	quit strStatus
+	
+CloseOffError ; Internal Tag // SR14642
+	trollback
+	quit $listbuild($zerror)
+	
+	
+CreateBatch(pidEOY,pdteDate,&pidBatch,&pidBlock)
+	;-------------------------------------------------------------------------------
+	; Create and Post a Batch to generate a FINGLTran for FINGLEndOfYear entries
+	;
+	; Params:
+	; pidEOY  : The id of the End Of Year
+	; pdteDate: The date for the end of year
+	; pidBatch: The id of the FININTBatch
+	; pidBlock: The id of the FININTBatchBlock
+	;
+	; ByRefs:
+	; pidBatch
+	; pidBlock
+	;
+	; Returns:
+	; strStatus: $$$OK no errors, anything else are errors
+	;
+	; History:
+	; 13-Jun-2006	RPW		SR14642: Created
+	;-------------------------------------------------------------------------------
+ 
+	new strStatus,objFINGLEndOfYear,strDetail,strForm,idBatch,idBlock
+	
+	set objFINGLEndOfYear=$get(^FINGLEndOfYear(0,pidEOY,1))
+	
+	set strDetail     = "Fin01043"_$$$COMMA_pidEOY  ;Distribution & Accrual %1
+	set strForm		  = $$CheckForm^FINUtils($get(YFORM),"FINGLEndOfYear")	; Get the form using YFORM, with validation
+	set strStatus     = $$Allocate^FININTBatch(.pidBatch,.pidBlock,"GLEOY",,pdteDate,,YBED,,strForm,pidEOY,strDetail) ; SR13087
+	
+	quit strStatus
+	
+CreateLine(pidBatch,pidBlock,pidEOY,pidAccount,pcurAmount,pstrAccountType)
+	;-------------------------------------------------------------------------------
+	; Create the individual Batch Line for the End Of Year
+	;
+	; Params:
+	; pidBatch       : The id of the FININTBatch
+	; pidBlock       : The id of the FININTBatchBlock
+	; pidEOY         : The id of the End Of Year
+	; pidAccount     : The id of the Account to post to.
+	; pcurAmount     : The amount to put to the account
+	; pstrAccountType: The type of Account (reference information).
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; strStatus: $$$OK no errors, anything else are errors
+	;
+	; History:
+	; 28-Jun-2006	JW		SR14642: Added FCSign
+	; 14-Jun-2006	RPW		SR14642: Created
+	;-------------------------------------------------------------------------------
+	new curAmount,objParams,strStatus,curDebit,curCredit
+	
+	set $piece(objParams,",",1) = pidEOY
+	set $piece(objParams,",",2) = pidAccount
+	set $piece(objParams,",",8) = pstrAccountType
+ 	
+	set strStatus=$$AddLine^FININTBatch(pidBatch,pidBlock,pidAccount,$$$FCSign(pcurAmount),"EOY",objParams,pidEOY_$$$COMMA_pidAccount,pstrAccountType)
+		
+	quit strStatus
+	
+	
+CreateHistoryLine(pYKEY,pidTran="")
+	;------------------------------------------------------------------------------------------------------
+	; Creates a CloseOff line to preserve the history of multiple close offs.
+	;
+	; History
+	; 14-Jun-2006	RPW		SR14642: Use $$$Save macro.
+	; 26-May-2005	SCR		SR:12440 Added Transaction Number
+	; 29-May-2003	shobby	Creation
+	;------------------------------------------------------------------------------------------------------
+	new strStatus,objEOYLine,intLine
+	
+	set intLine = $order(^FINGLEndOfYearLine(0,pYKEY,""),-1)+1
+	set objEOYLine = ""
+	set $$$FINGLEndOfYearLineDate1(objEOYLine) = $horolog
+	set $$$FINGLEndOfYearLineUser1(objEOYLine) = YBED
+	set $$$FINGLEndOfYearLineTran(objEOYLine)  = pidTran
+	set strStatus=$$$Save("FINGLEndOfYearLine",pYKEY_","_intLine,objEOYLine,1)
+	
+	quit strStatus
+	
+	
+OnBeforeSave(pKey="",pstrRec="") 
+    ;-------------------------------------------------------------------------------
+    ; Set Dates for pstrRec
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 03-May-2006	SC		SR14590: Check for error from GetDates, if error prevent save.
+    ; 15-Dec-2005	GRF		Added quit
+    ; 26-May-2005	SCR		Created SR:12440
+    ;-------------------------------------------------------------------------------
+    new strStartDate,strEndDate,strStatus
+    
+    if pKey'="" {
+	    ;do GetDates(pKey,.strStartDate,.strEndDate)
+	    set strStatus = $$GetDates(pKey,.strStartDate,.strEndDate) //SR14590
+	    if $$$ISOK(strStatus) {	    
+		    if $$$FINGLEndOfYearYearStartDate(pstrRec)="" set $$$FINGLEndOfYearYearStartDate(pstrRec) = strStartDate
+		    if $$$FINGLEndOfYearYearEndDate(pstrRec)=""   set $$$FINGLEndOfYearYearEndDate(pstrRec)   = strEndDate
+		    set Q=$$$QSave
+	    } else {
+			do ReturnError^COMUtils(strStatus) 
+			set Q=$$$QDontSave
+		}
+    }
+	quit strStatus
+	
+	
+GetDates(pYKEY,pstrStartDate,pstrEndDate)
+	;------------------------------------------------------------------------------------------
+	; Get Start and End Dates
+	; Used by CloseOff
+	;
+	; History:
+	; 03-May-2006	SC		SR14590: Check for null lstPeriods. (ie. Closing a year with no periods setup).
+	; 28-May-2003	shobby	Creation
+	;------------------------------------------------------------------------------------------
+	new lstPeriods,objFINGLPeriod,intFINGLPeriodType,strStatus
+	
+	set strStatus=$$$OK	
+	set intFINGLPeriodType = $$DefaultPeriod^FINGLPeriod()
+	if intFINGLPeriodType'="" {
+		set lstPeriods     = $$GetPeriodsForYear^FINGLPeriod(intFINGLPeriodType,pYKEY)
+		if lstPeriods="" set strStatus=$listbuild("Fin01014",pYKEY) ; "No General Ledger Periods setup for Year: %1"
+		if $$$ISOK(strStatus) {
+			set objFINGLPeriod = $get(^FINGLPeriod(0,$listget(lstPeriods,1),1))
+			set pstrStartDate  = $$$FINGLPeriodStartDate(objFINGLPeriod)
+			set objFINGLPeriod = $get(^FINGLPeriod(0,$listget(lstPeriods,$listlength(lstPeriods)),1))
+			set pstrEndDate    = $$$FINGLPeriodEndDate(objFINGLPeriod)
+		}
+	}
+	quit strStatus
+	
+	
+LoadDefaultDates(pKey="",pType="")
+    ;-------------------------------------------------------------------------------
+    ; Load Dates in to form, Called from 
+    ; pKEY = Year
+    ; PType = Start or End Date, 1 = Start , 2 = End
+    ;
+    ; Returns: Date for Year and Type
+    ;
+    ; History:
+    ; 26-May-2005	SCR		Created SR:12440
+    ;-------------------------------------------------------------------------------
+    new strStart,strEnd,strDate,strStatus
+    
+    set strDate = ""
+    if pKey'="" {
+	    set strStatus = $$GetDates(pKey,.strStart,.strEnd)
+	    if $$$ISOK(strStatus) {
+	    	if pType=1 set strDate = strStart
+    		if pType=2 set strDate = strEnd
+	    }
+    }
+    quit strDate
+	
+	
+TransactionsForAccount(pstrStartDate,pstrEndDate,pfltTotal,pidAccount)
+	;------------------------------------------------------------------------------------------
+	; Loop through FINGLTran/FINGLTranLine and find what postings need to be made to CloseOff
+	; Used by CloseOff
+	;
+	; History:
+	; 14-Jun-2006	RPW		SR14642: Fixed CacheTemp Usage
+	; 02-May-2006	SC		SR14590: Error checking for null GL account, changed CacheTemp subscripts
+	;  5-Apr-2006	JW		SR14523: Cleaned up, corrected starting date
+	; 26-May-2005	SCR		SR:12440 Date Range was not using last Date, now is 
+	; 26-May-2005	SCR		SR:12440 Added FC Checking
+	; 26-May-2005	SCR		Move Account list from Local to Global
+	; 11-Jul-2003	shobby	Adjustment to allow inclusion of End Of Year transactions
+	; 						when repeating a closeoff. (TR005540)
+	; 29-May-2003	shobby	Only include Income/Expense accounts
+	; 28-May-2003	shobby	Creation
+	;------------------------------------------------------------------------------------------
+	new idTxDate,idNumber,idTLNumber,objFINGLTranLine,idAccount
+	new curDebit,curCredit,objFINGLTran,strStatus
+	
+	set strStatus = $$$OK
+	
+	set pfltTotal = 0
+	set idTxDate  = pstrStartDate-1
+	for  {
+		set idTxDate = $order(^FINGLTrans(0,1,idTxDate))
+		quit:idTxDate=""
+		quit:idTxDate>pstrEndDate
+		
+		set idNumber=""
+		for  {
+			set idNumber=$order(^FINGLTrans(0,1,idTxDate,idNumber))
+			quit:idNumber=""
+			
+			set objFINGLTran = $get(^FINGLTran(0,idNumber,1))
+			
+			if $$$FINGLTranPostedDate(objFINGLTran)'="" {
+				set idTLNumber = ""
+				for  {
+					set idTLNumber = $order(^FINGLTranLine(0,idNumber,idTLNumber))
+					quit:idTLNumber=""
+					
+					set objFINGLTranLine=$get(^FINGLTranLine(0,idNumber,idTLNumber,1))
+					set idAccount=$$$FINGLTranLineAccount(objFINGLTranLine)
+					if idAccount ="" set strStatus=($listbuild("Fin01015",idNumber,idTLNumber)) ;No Account on Tran %1, Line %2 //SR14590
+						
+					if $$$ISOK(strStatus) { //SR14590
+						if $$IsIncomeExpense(idAccount) {
+							if idAccount'=pidAccount {
+								set curDebit  = $$$FINGLTranLineDebit(objFINGLTranLine)
+								set curCredit = $$$FINGLTranLineCredit(objFINGLTranLine)
+								set pfltTotal = pfltTotal+curDebit-curCredit
+								//SR14642
+								set ^CacheTempFINEOY(YUSER,idAccount) = $$$FCAdd($get(^CacheTempFINEOY(YUSER,idAccount)),curDebit)
+								set ^CacheTempFINEOY(YUSER,idAccount) = $$$FCSub($get(^CacheTempFINEOY(YUSER,idAccount)),curCredit)
+								if (+^CacheTempFINEOY(YUSER,idAccount)=0) && ($$$FCZero($get(^CacheTempFINEOY(YUSER,idAccount)))) {
+									kill ^CacheTempFINEOY(YUSER,idAccount)
+								}
+							}
+						}
+					}
+				}
+			}
+
+		}
+	}
+	quit strStatus
+	
+	
+IsIncomeExpense(pidAccount)
+	;------------------------------------------------------------------------------------------
+	; Determine if an account is an Income or Expense account.
+	;
+	; History:
+	; 29-May-2003	shobby	Creation
+	;------------------------------------------------------------------------------------------
+	new blnFlag,objFINGLAccount,strAccountType
+	
+	set blnFlag         = $$$NO
+	set objFINGLAccount = $get(^FINGLAccount(0,pidAccount,1))
+	if objFINGLAccount'="" {
+		set strAccountType = $$$FINGLAccountAccountType(objFINGLAccount)
+		set blnFlag        = ((strAccountType=1)||(strAccountType=2))
+	}
+	
+	quit blnFlag
+ 
+ 
+RemoveEndOfYear(pintYear)
+	;------------------------------------------------------------------------------------------
+	; Remove End Of Year transactions, testing purposes.
+	;
+	; History:
+	; 21-Dec-2006	GRF		SR14039: Run RePostAllLines as foreground process.
+	; 14-Jun-2006	RPW		SR14642: Use COMSYS not FINSYS
+	; 20-Jun-2005	shobby	Use KILL^COMUtils (SR12632)
+	; 29-May-2003	shobby	Remove FINGLEndOfYearLine
+	; 29-May-2003	shobby	added call to RePostAllLines
+	; 28-May-2003	shobby	Creation
+	;------------------------------------------------------------------------------------------
+	new idx,objFINGLTran,idx2,objEOY
+	
+	if $get(pintYear)="" set pintYear = 2003
+	
+	set idx = ""
+	for  {
+		set idx = $order(^FINGLTran(0,idx))
+		quit:idx=""
+		
+		set objFINGLTran = $get(^FINGLTran(0,idx,1))
+		if $$$FINGLTranTransactionType(objFINGLTran)="EOY" {
+			set idx2 = ""
+			for  {
+				set idx2 = $order(^FINGLTranLine(0,idx,idx2))
+				quit:idx2=""
+				
+				do KILL^COMUtils("FINGLTranLine",idx_","_idx2)
+			}
+			do KILL^COMUtils("FINGLTran",idx)
+		}
+	}
+	set objEOY = $get(^FINGLEndOfYear(0,pintYear,1))
+	set $$$FINGLEndOfYearAmount(objEOY)=0
+	
+	do Save^COMUtils("FINGLEndOfYear",pintYear,objEOY,1)
+	kill ^FINGLEndOfYearLine(0,pintYear)
+	do RePostAllLines^FINGLTran($$$NO)
+	quit
+	
+]]></Routine>
+</Export>

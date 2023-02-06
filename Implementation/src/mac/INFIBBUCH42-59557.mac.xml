@@ -1,0 +1,337 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INFIBBUCH42" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INFIBBUCH42
+#include COMSYS
+#include INConst
+	;-------------------------------------------------------------------------------
+	; History:
+	; 23-Mar-2005	GRF		SR10478 : Break routine into more manageable chunks
+	;-------------------------------------------------------------------------------
+	
+OUTINVOICE(BUCHUNG,YFPARA)
+	;-------------------------------------------------------------------------------
+	; Ausgangsrechnung
+	; 
+	; History:
+	; 06-Dec-2006	GRF		SR15271 : Add Intra-Company Order/Internal Customer
+	; 16-Dec-2005	RPW		SR14022: Do not send due date as Finance recalculates
+	; 							it and is correct, due to IN not supporting the
+	; 							based on field on FINSYSTerm.
+	; 12-Sep-2005	JW		SR13434: Removed dot notation. Corrected discount calls.
+	; 22-Aug-2005	JW		SR13297: Send discounts as well.
+	; 19-Aug-2005	shobby	SR12908: Include OrderNo in message.
+	; 25-Jul-2005	JW		SR12992: Calculate tax rate properly.
+	; 21-Jun-2005	GRF		SR10478: Keep MAN for EXCHANGE^INFIBBUCH; pass YM
+	; 21-Jun-2005	GRF		SR12721: replace BTR with FINBTR maintaining
+	; 							consistancy with other routines.
+	; 02-Jun-2005	GRF		COM Routines will exist
+	; 27-May-2005	GRF		SR10478: Missed parameter in WWWUMLAU call
+	; 20-May-2005	GRF		SR11386: Reverse hardcoded tax switch - needs to be
+	; 							aware of actual situation.
+	; 12-May-2005	GRF		SR10478: Activate GINILocn - replaces SOURCELOCN
+	; 04-May-2005	GRF		SR10478: Preserve GINI Location for Customer Orders
+	; 27-Apr-2005	GRF		SR10478: Use OrderNo; use SOURCELOCN for #16
+	; 26-Apr-2005	GRF		SR10478: Add TRANTYPE for "COS"; reverted 27-Apr-2005
+	; 12-Apr-2005	GRF		SR10478: Activate
+	; 23-Mar-2005	GRF		SR10478: Rationalise use of $$^WWWUMLAU calls
+	; 16-Mar-2005	GRF		SR10478: Preserve original location and item group for
+	; 							post cost-matrix profile resolution
+	; 03-Feb-2005	GRF		SR10478: Added characteristic values; Common ITEM, POS
+	; 							defns; Clear unnecessary DO block
+	; 20-Jan-2005	GRF		SR11518: TaxTotal not used - removed
+	; 20-Oct-2004	MS		SR10689: commented out line that sets customer and
+	; 							replaced with line that sets customer to the CREDIT
+	; 							ENTITY for the customer
+	;-------------------------------------------------------------------------------
+	new blnInternalCust,BTR,CUST,FINBTR,GINILocn,idCustomer,ITEM,MAN,objOrder,OrderNo,OrderType
+	new POS,SOURCELOCN,strAccount,TAXCI,TAXCO,TAXLOC,TAXST,ulCust,WAGR
+	
+	set MAN = YM
+	set BTR = $piece(BUCHUNG,Y,16)
+	if BTR="" {
+		set BTR = $get(YLOCATION)
+		set $piece(BUCHUNG,Y,16) = $get(YLOCATION)
+	}
+	set FINBTR = BTR
+	
+	if $piece(YFPARA,Y,2)'="" set MAN    = $piece(YFPARA,Y,2)  ;Company in GL
+	if $piece(YFPARA,Y,3)'="" set FINBTR = $piece(YFPARA,Y,3)  ;Location in GL
+	
+	set OrderNo = $piece(BUCHUNG,Y,27)
+	set ITEM    = $piece(BUCHUNG,Y,29)
+	set WAGR=""
+	if ITEM'="" set WAGR = $piece($get(^INART(0,ITEM,1)),Y,30)
+	if WAGR=""  set WAGR = $piece($get(^INVORG(0,0,1)),Y,13)  ;DFLT.
+	
+	; ******************************************************************************
+	; Special charges - process to BUCHUNG separately then build
+	; balance of record and transmit.
+	
+	if OrderNo="YVERPACK" do  quit  ;verpackung / cost of packing
+	. set ^mtemp($job,"CusInv","Packing")    = $piece(BUCHUNG,Y,3)
+	. set ^mtemp($job,"CusInv","AccPacking") = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,23),FINBTR,WAGR)
+	
+	if OrderNo="YKMGELD" do  quit  ;kilometergeld / cost of distance
+	. set ^mtemp($job,"CusInv","Distance")    = $piece(BUCHUNG,Y,3)
+	. set ^mtemp($job,"CusInv","AccDistance") = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,26),FINBTR,WAGR)
+	
+	if OrderNo="YFRACHT" do  quit  ;fracht / freight
+	. set ^mtemp($job,"CusInv","Freight")    = $piece(BUCHUNG,Y,3)
+	. set ^mtemp($job,"CusInv","AccFreight") = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,24),FINBTR,WAGR)
+	
+	if OrderNo="YVERSICH" do  quit  ;versicherung / insurance
+	. set ^mtemp($job,"CusInv","Insurance")    = $piece(BUCHUNG,Y,3)
+	. set ^mtemp($job,"CusInv","AccInsurance") = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,25),FINBTR,WAGR)
+	
+	if OrderNo="YZUSCHLAG" do  quit  ;spezialzuschlag / additional costs
+	. set ^mtemp($job,"CusInv","Additional")   =$piece(BUCHUNG,Y,3)
+	. set ^mtemp($job,"CusInv","AccAdditional")=$$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,29),FINBTR,WAGR)
+	
+	; ******************************************************************************
+	
+	set idCustomer = $piece(BUCHUNG,Y,4)
+	set OrderType  = 0                           ; Customer Order
+	if (idCustomer'="") {
+		set blnInternalCust = $$$INKUNDEInternalCustomer($get(^INKUNDE(0,idCustomer,1)))
+		if blnInternalCust set OrderType = 7     ; Intra-Company Order
+	}
+	
+	if OrderNo'="" {
+		set objOrder = $get(^INAUF(0,OrderNo,1))
+		set GINILocn  = $piece(objOrder,Y,6)
+	}
+	
+	; Goods Issued Not Invoiced
+	set SOURCELOCN = BTR
+	if $get(GINILocn)'="" set SOURCELOCN = GINILocn
+	
+	set ^mtemp($job,"CusInv","OrderNo")			   = OrderNo
+	set ^mtemp($job,"CusInv","SaleID")             = $piece(BUCHUNG,Y,7)        ; INVOICE NO. -> MUST BE UNIQUE
+	set ^mtemp($job,"CusInv","Location")           = BTR                        ; Location IN GL
+	set ^mtemp($job,"CusInv","SourceLocn")         = SOURCELOCN
+	set ^mtemp($job,"CusInv","Company")            = 0                          ; COMPANY
+	set ^mtemp($job,"CusInv","Date")               = $piece(BUCHUNG,Y,2)        ; DATE
+	set ^mtemp($job,"CusInv","Invoice Number")     = $piece(BUCHUNG,Y,7)        ; INVOICE NO.
+	set ^mtemp($job,"CusInv","Customer")           = $$CreditEntity(idCustomer) ; CUSTOMER/DEBIT ACCOUNT NUMBER
+	set ^mtemp($job,"CusInv","Settlement Discount")=+$piece(BUCHUNG,Y,14)_"%"   ; discount %
+	set ^mtemp($job,"CusInv","Terms")              = $piece(BUCHUNG,Y,34)       ; payment terms
+	
+	set ^mtemp($job,"CusInv","TranType")           = "SAL"
+	set ^mtemp($job,"CusInv","OrderType")          = OrderType
+	
+	/* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	;	   							YFPARA	BUCHUNG
+	; 	AccCOGS		dr COGS			 #34	  #35	(SAL 1)
+	;	AccSOH		cr GINYI		 #36	 		(SAL 2)
+	;			or	cr SOH 							(ISS 1 => COM)	??? Not required? Always processed as despatched first.
+	;	Customer	dr Debtor
+	;	AccIncome	cr Sales Income	 #33	   #5	(SAL 3)
+	;++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+	
+	set POS = $piece(BUCHUNG,Y,28)
+	
+	if (+POS'=0) && (OrderNo'="") {
+		set ^mtemp($job,"CusInv","Lines",POS,"AccSOH")      = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,36),FINBTR,WAGR)  ; GOODS SHIPPED  -> NOT SOH ACCOUNT !!! ;privation 
+		set ^mtemp($job,"CusInv","Lines",POS,"AccCOGS")     = $$EXCHANGE^INFIBBUCH($piece(BUCHUNG,Y,35),FINBTR,WAGR) ; COST OF GOODS SOLD
+		set ^mtemp($job,"CusInv","Lines",POS,"AccIncome")   = $$EXCHANGE^INFIBBUCH($piece(BUCHUNG,Y,5),FINBTR,WAGR)  ; SALES ACCOUNT
+		set ^mtemp($job,"CusInv","Lines",POS,"RefLine")     = ITEM                                                   ; ITEM NO.
+		set ^mtemp($job,"CusInv","Lines",POS,"Cost")        = $$$INAUFPCost($get(^INAUFP(0,OrderNo,POS,1)))          ; COST
+		set ^mtemp($job,"CusInv","Lines",POS,"SourceGroup") = WAGR
+		; IF ITEM HAS AN OVERRIDING INCOME ACCOUNT
+		if ITEM'="" {
+			set strAccount = $piece($get(^INART(0,ITEM,1)),Y,31)		;Revenue Account Inland
+			;quit:strAccount=""
+			if strAccount'="" {
+				set ^mtemp($job,"CusInv","Lines",POS,"AccIncome") = $$EXCHANGE^INFIBBUCH($zconvert(strAccount,"U"),FINBTR,WAGR)
+			}
+		}
+		
+		set TAXLOC = ""
+		/* xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+		; FIXME : #1 Should we get Acct # from Credit Entity or
+		;            is this handled in FININTSale? <NO>
+		;         #2 Having gotten Acct # - why are we applying
+		;            it back to INKUNDE - is #48 (Debtor Number)
+		;            something else?
+		;            Basically wrong but to be clarified with
+		;            masterfile review.
+		; xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx */
+		set CUST   = $piece(BUCHUNG,Y,4)
+		set ulCust = $$^WWWUMLAU(CUST,1)
+		if $data(^INKUNDEs(0,4,ulCust)) {
+			set CUST=$order(^INKUNDEs(0,4,ulCust,"")) ; different acct # in GL
+		}
+		/* xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+		; FIXME : #52 in INKUNDE is a simple text field
+		;         #52 in WWW0121 is from COMTAXLocation
+		; xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx */
+		
+		//SR12992: Do below
+		; IF CUST'="" SET TAXLOC = $$$INKUNDETaxLocation($GET(^INKUNDE(0,CUST,1)))
+		; IF TAXLOC="" IF SOURCELOCN'="" SET TAXLOC=$PIECE($GET(^WWW0121(0,0,SOURCELOCN,1)),Y,52)     ;BEC;25866;07.06.04;DA ZENTRALE DATEI
+	
+		; COM Tax Interface
+		; Assumes Tax is subtracted from lines (See TaxInc variable)
+		; It needs to be upgraded to Handle Tax on Total
+		; The Logic should not be in this interface. 
+		; It should be deeper in the Invoice processing where the COGS is 
+		;    calculated and stored so it is calculated each time a report is run. 
+		; 
+		new RatesArray,MWST,TaxRate,TaxLine,TaxDetail,TaxCode,TaxAccount,LineAmount,TaxAmount,TaxInc
+		new idItemTaxCode,idCustomerTaxCode,fltOrderDiscounts,fltLineDiscounts,TaxableLineAmount
+		
+		// SR12992: Use COMTAX.
+		// NOTE: In the future, hopefully we can rely on piece 6 of BUCHUNG for tax code.
+		
+		; set MWST=1 ; *** Hard Coded Value
+		do INDRUCKTAX^INTAX(,$get(^INAUFP(0,OrderNo,POS,1)),,,CUST,,.MWST,.TAXLOC)
+		
+		set LineAmount=$piece(BUCHUNG,Y,3)	// Nett amount after line discounts
+		
+		set fltOrderDiscounts = $$OrderDiscounts(OrderNo,POS,FINBTR,WAGR)
+		set fltLineDiscounts  = $$LineDiscounts(OrderNo,POS,FINBTR,WAGR)
+		
+		set TaxableLineAmount = LineAmount - fltOrderDiscounts
+		
+		;set TaxTotal=0
+		;set TaxInc=1  ; Tax Included Flag
+		;set TaxInc=0  ; Tax Excluded Flag
+		
+		do TaxRates^COMTAX(MWST,TAXLOC,+$horolog,.RatesArray)      ;Bec;05.12.03;24774;CHECK IF COMPILED ROUTINE EXIST.
+		set TaxRate=""
+		for TaxLine=1:1 {
+			set TaxRate=$order(RatesArray(TaxRate))
+			quit:TaxRate=""
+			
+			set TaxDetail=$get(RatesArray(TaxRate))
+			quit:TaxDetail=""
+		
+			set TaxCode   =$piece(TaxDetail,Y,1)
+			set TaxRate   =$piece(TaxDetail,Y,2)
+			set TaxAccount=$piece(TaxDetail,Y,3)
+			
+			;if TaxInc {
+			;	set TaxAmount =$justify(TaxableLineAmount-(TaxableLineAmount/(100+TaxRate)*100),0,2)
+			;	set TaxableLineAmount=TaxableLineAmount-TaxAmount
+			;} else {
+				set TaxAmount=$justify(TaxableLineAmount*TaxRate/100,0,2)
+			;}
+			set ^mtemp($job,"CusInv","Lines",POS,"Taxes",TaxLine,"LineTaxAccount")=$$EXCHANGE^INFIBBUCH(TaxAccount,FINBTR,WAGR)  ;state taxes
+			set ^mtemp($job,"CusInv","Lines",POS,"Taxes",TaxLine,"LineTaxAmount") =TaxAmount
+			set ^mtemp($job,"CusInv","Lines",POS,"Taxes",TaxLine,"LineTaxCode")   =TaxCode
+		}
+		
+		set ^mtemp($job,"CusInv","Lines",POS,"Value") = LineAmount + fltLineDiscounts
+		
+		do CopyCharVals^INFIBBUCH4("CusInv",BUCHUNG,POS)
+	}
+	quit	
+	
+	
+CreditEntity(CustomerId="")
+    ;-------------------------------------------------------------------------------
+	; Returns the customer id that is the credit entity for the
+	; input CustomerId parameter.
+	; If the input CustomerId is a credit entity, return this,
+	; otherwise return the Credit Entity field of the customer record
+	;
+	; 05-Nov-2004	Paul K	SR10786 : Return the customer id if no credit entity.
+	; 20-Oct-2004 	MS		SR10689 : Created
+    ;-------------------------------------------------------------------------------
+	new CreditEntity,objINCustomer
+	
+	set CreditEntity = CustomerId			             ; initialise to self
+	
+	if CustomerId'="" {
+		set objINCustomer = $get(^INKUNDE(0,CustomerId,1))
+		if '$piece(objINCustomer,Y,216) {                  ; if this is not a credit entity
+			set CreditEntity = $piece(objINCustomer,Y,36)  ; get the credit entity from INKUNDE
+		}
+		if CreditEntity="" set CreditEntity = CustomerId
+	}
+	quit CreditEntity
+	
+	
+LineDiscounts(pidOrder,pidOrderLine,FINBTR="",WAGR="")
+    ;-------------------------------------------------------------------------------
+    ; Send line discounts - return total
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 13-Sep-2005	JW		SR13434: Created (split old function in 2)
+    ;-------------------------------------------------------------------------------
+	new idDiscount,objDiscount,idType,curAmount,totalDiscounts
+	
+	quit:($get(pidOrder)="")||($get(pidOrderLine)="")
+	
+	set totalDiscounts = 0
+	
+	set idDiscount = ""
+	for {
+		set idDiscount = $order(^INAUFPDISCOUNT(0,pidOrder,pidOrderLine,idDiscount))
+		quit:idDiscount=""
+		
+		set objDiscount = $get(^INAUFPDISCOUNT(0,pidOrder,pidOrderLine,idDiscount,1))
+		
+		set curAmount = $zabs($justify($$$INAUFDISCOUNTDiscountAmount(objDiscount),0,2))
+		set idType    = $$$INAUFDISCOUNTDiscountType(objDiscount)
+		if $$$INDISCOUNTSurcharge($get(^INDISCOUNT(0,idType,1))) {
+			set curAmount = -curAmount
+		}
+		set totalDiscounts = totalDiscounts + curAmount
+		set ^mtemp($job,"CusInv","Lines",pidOrderLine,"Discount",idDiscount,"LineDiscAmount")	= curAmount
+		set ^mtemp($job,"CusInv","Lines",pidOrderLine,"Discount",idDiscount,"LineDiscAccount")	= $$EXCHANGE^INFIBBUCH($$$INAUFPDISCOUNTAccount(objDiscount),FINBTR,WAGR)
+		set ^mtemp($job,"CusInv","Lines",pidOrderLine,"Discount",idDiscount,"LineDiscCode")		= idType
+	}
+	quit totalDiscounts
+	
+	
+OrderDiscounts(pidOrder,pidOrderLine,FINBTR="",WAGR="")
+    ;-------------------------------------------------------------------------------
+    ; Send order discounts (apportioned) and return total
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 13-Sep-2005	JW		SR13434: Created (split old function in 2)
+    ;-------------------------------------------------------------------------------
+	new idDiscount,objDiscount,orderTotal,arrlineAmounts,idType,curAmount,totalDiscounts,arrResults
+	
+	quit:($get(pidOrder)="")||($get(pidOrderLine)="")
+	
+	set totalDiscounts = 0
+	
+	if $data(^INAUFDISCOUNT(0,pidOrder)) {
+		set orderTotal = $$OrderTotal^INAUFCalc(pidOrder,.arrlineAmounts)
+		
+		set idDiscount=""
+		for {
+			set idDiscount = $order(^INAUFDISCOUNT(0,pidOrder,idDiscount))
+			quit:idDiscount=""
+			
+			set objDiscount = $get(^INAUFDISCOUNT(0,pidOrder,idDiscount,1))
+			
+			set curAmount = $zabs($justify($$$INAUFDISCOUNTDiscountAmount(objDiscount),0,2))
+			set idType    = $$$INAUFDISCOUNTDiscountType(objDiscount)
+			if $$$INDISCOUNTSurcharge($get(^INDISCOUNT(0,idType,1))) {
+				set curAmount = -curAmount
+			}
+			do VirtualRoundApportion^COMUtilNum(curAmount,.arrlineAmounts,.arrResults,orderTotal)
+			set curAmount = +$get(arrResults(pidOrderLine))
+			
+			set totalDiscounts = totalDiscounts + curAmount
+			set ^mtemp($job,"CusInv","Lines",pidOrderLine,"Discount","Total-"_idDiscount,"LineDiscAmount")	= curAmount
+			set ^mtemp($job,"CusInv","Lines",pidOrderLine,"Discount","Total-"_idDiscount,"LineDiscAccount")	= $$EXCHANGE^INFIBBUCH($$$INAUFDISCOUNTAccount(objDiscount),FINBTR,WAGR)
+			set ^mtemp($job,"CusInv","Lines",pidOrderLine,"Discount","Total-"_idDiscount,"LineDiscCode")	= idType
+		}
+	}
+	quit totalDiscounts
+	
+]]></Routine>
+</Export>

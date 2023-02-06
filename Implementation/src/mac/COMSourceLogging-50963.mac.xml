@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMSourceLogging" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMSourceLogging
+#include COMSYS
+ 
+#define PROD "PROD"
+#define PRODUCTION "PRODUCTION"
+#define ALLOWEDROUTINES(%1) $find(";COMTest2;AEPDemoData;",";"_$piece(%1,".MAC",1)_";")>0
+#define TIMEOUT 10
+ 
+ 
+OnBeforeLoad(pstrInternalName)
+ 
+	;	FIXME : <GRF> "PRODUCTION" is now "DEV"; "PROD" is ???
+	
+	if $$$ALLOWEDROUTINES(pstrInternalName) {
+		if $znspace=$$$PROD {
+			if '$$LatestVersion($piece(pstrInternalName,".",1),$$$PROD,$$$PRODUCTION) {
+				do Sync($piece(pstrInternalName,".",1),$$$PRODUCTION,$$$PROD)
+			}
+		}
+	}
+	quit $$$OK
+	
+	
+LatestVersion(pstrName,pstrNameSpace1,pstrNameSpace2)
+	new strDate1,strDate2
+	
+	set strDate1=$get(^[pstrNameSpace1]rMAC(pstrName,0))
+	set strDate2=$get(^[pstrNameSpace2]rMAC(pstrName,0))
+	quit $$DateDiff^COMUtilDate(strDate1,strDate2)'>0
+	
+		
+GetStatus(InternalName,Editable)
+	new strStatus,blnTest 
+ 	set strStatus=$$$OK
+ 
+	 if $znspace=$$$PROD {
+		 if $$$ALLOWEDROUTINES(InternalName) {
+			 if Editable=1 {
+				set strName=$piece(InternalName,".MAC",1)
+				if strName'=InternalName {
+					if $data(^CacheTempCodeSyncTimer($job,strName)) {
+						set blnTest=$$$YES
+					} else {
+						lock ^[$$$PRODUCTION]ROUTINE(strName):5
+						set blnTest=$test
+						if 'blnTest {
+							set strStatus=$$Error^%apiOBJ(5863,InternalName)
+						} elseif '$$LatestVersion($piece(InternalName,".",1),$$$PROD,$$$PRODUCTION) {
+							set strStatus=$$Error^%apiOBJ(6853)
+						} else {
+							;if ($get(^rMAC(strName,0))=$get(^[$$$PRODUCTION]rMAC(strName,0)))&&($get(^rMAC(strName,0,"SIZE"))=$get(^[$$$PRODUCTION]rMAC(strName,0,"SIZE"))) {
+								lock -^[$$$PRODUCTION]ROUTINE(strName)
+								job CheckLockRelease^COMSourceLogging($job,strName)
+							;} else {
+								;set strStatus="Some sort of loading latest message"
+								;set ^CacheTempCodeSync($i(^CacheTempCodeSync))=$zdt($h,3)_"~"_$job_"~"_strName_"~Loading latest version"
+								;kill ^rMAC(pstrName)
+								; copy from production
+								;merge ^rMAC(pstrName)=^[$$$PRODUCTION]rMAC(pstrName)
+								;;;lock -^[$$$PRODUCTION]ROUTINE(strName)
+							;}
+						}
+					}
+				}
+			 }
+		 }
+	 }
+	 Quit strStatus
+ 
+OnAfterSave(pstrInternalName="")
+	;job Sync^COMSourceLogging($piece(pstrInternalName,".",1),$$$PROD,$$$PRODUCTION) ;sch	
+	quit
+	
+	
+Sync(pstrName="",pstrNameSpaceFrom="",pstrNameSpaceTo="")
+	new objRoutine,strNameSpace,strStatus
+ 
+	if $znspace=$$$PROD {
+	 	if $$$ALLOWEDROUTINES(pstrName) {
+			set strNameSpace=$znspace
+			zn pstrNameSpaceTo
+			;do ##class(Common.SourceLogging).OnBeforeSave(pstrName_".MAC")
+			kill ^[pstrNameSpaceTo]rMAC(pstrName)
+			kill ^[pstrNameSpaceTo]rINDEX(pstrName)
+			merge ^[pstrNameSpaceTo]rMAC(pstrName)=^[pstrNameSpaceFrom]rMAC(pstrName)
+			;do ##class(Common.SourceLogging).OnAfterSave(pstrName_".MAC")
+			set ^[pstrNameSpaceTo]rINDEX(pstrName,"MAC")=$lb($zdt($get(^[pstrNameSpaceTo]rMAC(pstrName,0)),3),$get(^[pstrNameSpaceTo]rMAC(pstrName,0,"SIZE")))  ;Nasty hack RebuildItemIndex should have done this?
+			set objRoutine=##class(%Library.Routine).%New(pstrName_".MAC")
+			set strStatus=objRoutine.Compile()
+			do objRoutine.%Close()
+			do ##class(%Library.RoutineIndex).RebuildItemIndex(pstrName,"MAC",pstrNameSpaceTo)
+			zn strNameSpace
+			;	set ^CacheTempCodeSync($i(^CacheTempCodeSync))=$zdt($h,3)_"~"_$job_"~"_pstrName
+	 	}
+ 	}
+	quit
+	
+CheckLockRelease(pstrJob,pstrName)
+	new strStatus,blnFound
+	
+	set $ztrap="CheckLockReleaseError"
+	set strStatus=0
+	set blnFound=0
+	set ^CacheTempCodeSyncTimer(pstrJob,pstrName)=$h
+	lock ^[$$$PRODUCTION]ROUTINE(pstrName):5
+	for {
+		hang 3
+		quit:$$$ISOK(strStatus)
+		
+		set strLock=""
+		set blnFound=0
+		for {
+			quit:blnFound=1
+			set strLock=$order(^$[$$$PROD]Lock(strLock))
+			quit:strLock=""
+			
+			if $piece(strLock,"""",2)=pstrName {
+				set blnFound=1
+				set ^CacheTempCodeSyncTimer(pstrJob,pstrName)=$h
+				lock ^[$$$PRODUCTION]ROUTINE(pstrName):5
+			}
+		}
+		if ('blnFound)&&($$DateDiff^COMUtilDate($get(^CacheTempCodeSyncTimer(pstrJob,pstrName)),$h)>$$$TIMEOUT) {
+			hang 2
+			set strLock=""
+			for {
+				quit:$$$ISOK(strStatus)
+				set strLock=$order(^$[$$$PRODUCTION]Lock(strLock))
+				quit:strLock=""
+				
+				if $piece(strLock,"""",2)=pstrName {
+					do Sync^COMSourceLogging(pstrName,$$$PROD,$$$PRODUCTION) ;sch	
+					lock -^[$$$PRODUCTION]ROUTINE(pstrName)
+					set strStatus=$$$OK 
+					kill ^CacheTempCodeSyncTimer(pstrJob,pstrName)
+				}
+			}
+		}
+	}
+	
+	kill ^CacheTempCodeSyncTimer(pstrJob,pstrName)
+	quit
+ 
+CheckLockReleaseError
+	kill ^CacheTempCodeSyncTimer(pstrJob,pstrName)
+	set ^CacheTempCodeSyncError($i(^CacheTempCodeSyncError))=$zdt($h,3)_"~"_$zerror
+	set $ztrap=""
+	quit 
+]]></Routine>
+</Export>

@@ -1,0 +1,792 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INDRPRUNSort" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INDRPRUNSort
+#include INConst
+#include COMSYS
+ 
+#define Log(%1) do Log^INDRPRUNLog(%1)
+ 
+ 
+Sort(ART,BETRIEB)
+	;-------------------------------------------------------------------------------
+	; Store the demands and supplies to be displayed into WWWSOR
+	;
+	; Params:	ART		- item
+	; 			BETRIEB	- location
+	;
+	; Returns:
+	;
+	; History:
+    ; 12-Mar-2009	PPP		SR16397: Added Logging for the process
+	; 09-Jan-2007	JW		SR15347: Moved from SORT^INDRPRUN. Rewrote. Added Requisitions
+	;-------------------------------------------------------------------------------
+ 	new idxART,idLocation,objLocation,idBackToStock,blnRun,strSale,idSaleOrder,idSaleOrderLine
+ 	new idDemand,blnRunDemand
+ 	new ABGE,DEMAND,SUPPLY,AUF,POS,idxLocation,idReq
+ 	
+	// SR14933 vvv
+	set strSale				= $get(^CacheTempDRPSaleRun(YUSER))
+	set idSaleOrder			= $$$KEY1(strSale)					// Only look at exact order
+	set idSaleOrderLine		= $$$KEY2(strSale)
+	set blnRun 				= (idSaleOrder="")
+	set idDemand			= $get(^CacheTempDRPDS(YUSER))		// Only look at exact demand
+	set blnRunDemand 		= (idDemand="")
+	// SR14933 ^^^
+	
+	set idxART = $$$Index(ART)
+	
+	for ABGE=$$$ANINO,$$$NO {	;NUR UNERLEDIGTE AUFTRÄGE ;only 
+		;+++++++++++++++++++++++++++++++++++
+		;  INDRPDEMAND - Index 1 : blnDemandClosed, idItem
+		;  Find Open Demands for specified Item
+		;+++++++++++++++++++++++++++++++++++
+		;BEDARF AUS DEMAND-DATEI ;out of 
+		;-----------------------
+		if blnRun {
+			$$$Log($$$Text("IN01010"))		//Collating Demands
+			if 'blnRunDemand {			// SR14933
+				do Demand(idDemand,BETRIEB,ART)
+			} else {
+				$$$Order6(^INDRPDEMANDs,YM,1,ABGE,idxART,BETRIEB,DEMAND)
+					do Demand(DEMAND,BETRIEB,ART)
+				$$$End
+			}
+		}
+		
+		;+++++++++++++++++++++++++++++++++++
+		;  INDRPSUPPLY - Index 1 : blnClosed, idItem
+		;  Find Open Demands for specified Item
+		;+++++++++++++++++++++++++++++++++++
+		;SUPPLY AUS SUPPLY-DATEI ;out of 
+		;-----------------------
+		if blnRun && blnRunDemand {
+			$$$Log($$$Text("IN01011"))		//Collating Supplies
+			$$$Order6(^INDRPSUPPLYs,YM,1,ABGE,idxART,BETRIEB,SUPPLY)		; JW/RW	SR12056 // SR14933
+				do Supply(SUPPLY,BETRIEB,ART)
+			$$$End
+		}
+		
+		;BEDARF/SUPPLY AUS AUFTRÄGEN ;out of 
+		;---------------------------
+		if blnRunDemand {
+			$$$Log($$$Text("IN01012"))		//Collating Order Lines
+			if 'blnRun {			// SR14933	; JW/RW	SR12056
+				if $$OrderOK(idSaleOrder) {
+					do OrderLine(idSaleOrder,idSaleOrderLine,BETRIEB,ART)
+				}
+			} else {
+				$$$Order5(^INAUFPs,YM,5,ABGE,idxART,AUF)
+					if $$OrderOK(AUF) {
+						$$$Order6(^INAUFPs,YM,5,ABGE,idxART,AUF,POS)
+							do OrderLine(AUF,POS,BETRIEB,ART)
+						$$$End
+					}
+				$$$End
+			}
+		}
+	}
+	
+	;+++++++++++++++++++++++++++++++++++
+	; Requisitions
+	;+++++++++++++++++++++++++++++++++++
+	set idxLocation = $$$Index(BETRIEB)
+	$$$Log($$$Text("IN01013"))		//Collating Requisitions
+ 
+	$$$Order6(^INRequisitions,YM,7,idxART,idxLocation,YM,idReq)
+		do Requisition(idReq)
+	$$$End
+	
+	$$$Order4(^INARTNEBENs,YM,1,idxART,ARTH)
+		DO NEBEN(ART,ARTH,BETRIEB)  ;PRODUKTIONS-NEBENARTIKEL  ; JW/RW	SR12056
+	$$$End
+	
+	quit
+ 
+ 
+Demand(DEMAND,BETRIEB,ART)
+	;-------------------------------------------------------------------------------
+	; Demand processing
+	;
+	; Params:	DEMAND	- demand id
+	; 			BETRIEB	- location
+	; 			ART		- item
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Jul-2011	shobby	SR17806: Only log the first 10000 characters.  Has blown
+	;								 up at UFH with 32k record.
+	; 19-Jul-2010	SCR		SR17442: Added Quit if Closed test
+	; 15-May-2007	RPW		SR15513: Show blocked demands
+	; 04-Jan-2007	JW		SR15347: Encapsulated.
+	;-------------------------------------------------------------------------------
+	new DEMAND1,blnDel,strStruct,strINAUFPXL,objINAUFPXL,YI,YVOR,YFORM,YOK
+	new AUF,POS,TEIL,TEIL1
+ 
+	$$$Log($$$Text($lb("IN01014",BETRIEB_"/"_DEMAND)))		//Checking Demand : %1
+	
+	SET DEMAND1=$GET(^INDRPDEMAND(YM,BETRIEB,DEMAND,1))
+	quit:DEMAND1="" 
+	quit:$$$INDRPDEMANDDemandClosed(DEMAND1)  ; SR17442
+	
+	;PRÜFEN GÜLTIGKEIT;FIS;07.07.04;26056
+	
+	SET blnDel=$$$NO
+	set strStruct = $$$INDRPDEMANDItemStructure(DEMAND1)
+	IF strStruct'="" {
+		set AUF = $$$DEQUOTE($PIECE(strStruct,".",1))
+		set POS = $PIECE(strStruct,".",2)
+		
+		if '$DATA(^INAUFP(YM,AUF,POS,1)) {
+			SET blnDel=$$$YES	  ;TEIL GELÖSCHT ;part 
+		} else {
+			SET strINAUFPXL="^INAUFPXL("""_YM_""","""_$$$DEQUOTE($PIECE(strStruct,".",1))_""""
+			for YI=2:1 {
+				quit:$PIECE(strStruct,".",YI,99)=""
+				$$$Append(strINAUFPXL,","_$PIECE(strStruct,".",YI))		// Note: arbitrary number of nodes
+			}
+			$$$Append(strINAUFPXL,")")										// Note: No trailing 1
+			
+			IF $FIND($$$DEQUOTE(strINAUFPXL),",,") || ($FIND($$$DEQUOTE(strINAUFPXL),",)")) {
+				SET blnDel=$$$YES
+				
+			} elseif $DATA(@strINAUFPXL) {
+				set objINAUFPXL = $GET(@strINAUFPXL)
+				IF ($PIECE(objINAUFPXL,Y,200)'=DEMAND) || ($PIECE(objINAUFPXL,Y,4)'=$PIECE(DEMAND1,Y,4)) {
+					SET blnDel=$$$YES  ;LÖSCHEN DEMAND, DA UNGÜLTIG
+				}
+			}
+		}
+		if blnDel {			;DEMAND AUS TEILESTRUKTUR ;out of 
+			set $$$INDRPDEMANDDeleteOrder(DEMAND1) = $$$YES 		// SR14803
+			set $$$INDRPDEMANDItemStructure(DEMAND1) = "" 			// SR14803
+			set $$$INDRPDEMANDMemo(DEMAND1) = $$^WWWTEXT(33693) 	// SR14803			; Sub Part Deleted From Item Structure
+			SET YOK=$$^WWWSPEI("INDRPDEMAND",BETRIEB_","_DEMAND,DEMAND1,1)
+		}
+	}
+ 
+	if blnDel $$$Log($$$Text($lb("IN01015",DEMAND))) quit		//Demand %1 flagged to be deleted
+ 
+	//quit:blnDel
+	
+	DO ^INDRPSAVED(BETRIEB_","_DEMAND,DEMAND1)  ;MAKE SURE SUPPLY IS UP TO DATE;FIS;SR14769
+	
+	// SR15513 remove line
+	//quit:($PIECE(DEMAND1,Y,70)=3)&&($PIECE(DEMAND1,Y,19)=1)  ;SHOW ONLY RELEASED TRANSFER REQUESTS;FIS;22.04.05;SR12200
+	
+	if ($PIECE(DEMAND1,Y,70)=3)&&($PIECE(DEMAND1,Y,61)'="") $$$Log($$$Text($lb("IN01027",DEMAND))) quit	//Demand (T/O) %1 and has been Shipped, exiting...
+	//quit:($PIECE(DEMAND1,Y,70)=3)&&($PIECE(DEMAND1,Y,61)'="")  ; SR13920
+	
+	SET $PIECE(DEMAND1,Y,9)="D"  ;FÜR STATUSERMITTLUNG ;to 
+	IF +$PIECE(DEMAND1,Y,6)=0 {  ;BEDARFSTERMIN
+		IF $PIECE(DEMAND1,Y,3)'="" SET $PIECE(DEMAND1,Y,6)=$PIECE(DEMAND1,Y,3)+$PIECE($GET(^INDRPSYS(YM,BETRIEB,1)),Y,2)  ;BEDARFSTERMIN AUS PARAMETER ;out of parameter 
+		IF $PIECE(DEMAND1,Y,6)=""  SET $PIECE(DEMAND1,Y,6)=" "
+	}
+	IF +$PIECE(DEMAND1,Y,17)=0 SET $PIECE(DEMAND1,Y,17)=$$^WWWTIME1("23:59:59")  ;BEDARFSUHRZEIT
+	IF $PIECE(DEMAND1,Y,52)="" SET $PIECE(DEMAND1,Y,52)=$PIECE($GET(^INDRPITEM(YM,BETRIEB,ART,1)),Y,7)  ;EINHEIT ;unit 
+	IF $PIECE(DEMAND1,Y,52)="" SET $PIECE(DEMAND1,Y,52)=$PIECE($GET(^INART(YM,ART,1)),Y,40)
+	
+	;NEGATIVER DEMAND = SUPPLY (NEGATIVE UNTERTEILESTRUKTUR);FIS;22891;15.12.03
+	IF $PIECE(DEMAND1,Y,5)<0 {
+		SET $PIECE(DEMAND1,Y,5)=-$PIECE(DEMAND1,Y,5)
+		SET ^WWWSOR(YUSER,"0",$PIECE(DEMAND1,Y,6),$PIECE(DEMAND1,Y,17),DEMAND_"#2")=DEMAND1
+		
+	} else {
+		;SPEICHERN DEMAND ;Save 
+		SET ^WWWSOR(YUSER,"0",$PIECE(DEMAND1,Y,6),$PIECE(DEMAND1,Y,17),DEMAND_"#1")=DEMAND1
+		
+		;PRÜFEN OB SUPPLY ZU DEMAND = EIGENFERTIGUNG ;check whether within 
+		IF (strStruct'="") && ($PIECE(DEMAND1,Y,98)'=$$$YES) {  ;FERTIGUNGSTEIL (NICHT GELÖSCHT)
+			SET TEIL=$PIECE($PIECE(DEMAND1,Y,72),".",3,99)
+			quit:TEIL=""
+			SET TEIL1=$GET(^INAUFPT(YM,AUF,POS,TEIL,1))
+			quit:$PIECE(TEIL1,Y,26)=2  ;LEISTUNG ;performance 
+			quit:($PIECE(TEIL1,Y,7)=1)||($PIECE(TEIL1,Y,7)=4)  ;WH IST NICHT FERTIGUNG ;Not 
+			quit:$DATA(@strINAUFPXL)<10		;WH IST NICHT FERTIGUNG, WENN KEINE UNTERTEILE;FIS;05.12.03;24741
+			
+			SET $PIECE(DEMAND1,Y,13)=$PIECE(TEIL1,Y,168)
+			;+++++++++++++++++++++++++++++
+			;  Save DEMAND1 in ^WWWSOR(USER,0,D6,D17,Demand#type)
+			;+++++++++++++++++++++++++++++
+			SET ^WWWSOR(YUSER,"0",$PIECE(DEMAND1,Y,6),$PIECE(DEMAND1,Y,17),DEMAND_"#2")=DEMAND1
+		}
+	}
+		
+  	$$$Log($$$Text($lb("IN01016",DEMAND))_$tr($extract(DEMAND1,1,10000),Y,","))		//Demand %1 Included  ;SR17806
+  
+	quit
+	
+ 
+Supply(SUPPLY,BETRIEB,ART)
+	;-------------------------------------------------------------------------------
+	; Supply processing
+	;
+	; Params:	SUPPLY	- supply id
+	; 			BETRIEB	- location
+	; 			ART		- item
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Jan-2007	JW		SR15347: Encapsulated.
+	;-------------------------------------------------------------------------------
+	new SUPPLY1
+	
+	SET SUPPLY1=$GET(^INDRPSUPPLY(YM,BETRIEB,SUPPLY,1))
+	quit:SUPPLY1=""
+ 
+	$$$Log($$$Text($lb("IN01017",SUPPLY)))	//Checking Supply : %1
+	
+	SET $PIECE(SUPPLY1,Y,9)="S"  ;FÜR STATUSERMITTLUNG ;to 
+	IF +$PIECE(SUPPLY1,Y,6)=0 {  ;SUPPLYTERMIN
+		IF $PIECE(SUPPLY1,Y,3)'=""  SET $PIECE(SUPPLY1,Y,6) = $PIECE(SUPPLY1,Y,3)+$PIECE($GET(^INDRPSYS(YM,BETRIEB,1)),Y,2)  ;SUPPLYTERMIN AUS PARAMETER ;out of parameter 
+		IF $PIECE(SUPPLY1,Y,13)'="" SET $PIECE(SUPPLY1,Y,6) = $PIECE(SUPPLY1,Y,13)       ;BESTÄTIGT FÜR ;to 
+		IF $PIECE(SUPPLY1,Y,6)=""   SET $PIECE(SUPPLY1,Y,6) = " "
+	}
+	
+	IF $PIECE(SUPPLY1,Y,13)'=""   SET $PIECE(SUPPLY1,Y,6)  = $PIECE(SUPPLY1,Y,13)      ;BESTÄTIGT FÜR ;to 
+	IF +$PIECE(SUPPLY1,Y,17)=0    SET $PIECE(SUPPLY1,Y,17) = $$^WWWTIME1("00:00:00")   ;SUPPLYUHRZEIT
+	IF $PIECE(SUPPLY1,Y,52)=""    SET $PIECE(SUPPLY1,Y,52) = $PIECE($GET(^INDRPITEM(YM,BETRIEB,ART,1)),Y,7)  ;EINHEIT ;unit
+	IF $PIECE(SUPPLY1,Y,52)=""    SET $PIECE(SUPPLY1,Y,52) = $PIECE($GET(^INART(YM,ART,1)),Y,40)
+	
+	IF +$$$INDRPSUPPLYReceivedQuantity1(SUPPLY1)'=0 {
+		SET $$$INDRPSUPPLYQuantity(SUPPLY1)=$$$INDRPSUPPLYQuantity(SUPPLY1)-$$$INDRPSUPPLYReceivedQuantity1(SUPPLY1) ;PARTIAL RECEIVED ; SR13854
+		set $$$INDRPSUPPLYReceivedQuantity1(SUPPLY1) = 0		//SR14909
+	}
+	DO ^INDRPSAVES(BETRIEB_","_SUPPLY,SUPPLY1)  ;MAKE SURE SUPPLY IS UP TO DATE;FIS;SR14769
+	
+	;+++++++++++++++++++++++++++++
+	;  Save SUPPLY1 in ^WWWSOR(USER,0,D6,D17,Supply#type)
+	;+++++++++++++++++++++++++++++
+	SET ^WWWSOR(YUSER,"0",$PIECE(SUPPLY1,Y,6),$PIECE(SUPPLY1,Y,17),SUPPLY_"#2")=SUPPLY1
+ 
+  	$$$Log($$$Text($lb("IN01018",SUPPLY))_$tr(SUPPLY1,Y,","))		//Supply %1 Included 
+	
+	quit
+ 
+ 
+ 
+OrderOK(AUF)
+	;-------------------------------------------------------------------------------
+	; Check whether to process order
+	;
+	; Params:	AUF	- order id
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Jan-2007	JW		SR15347: Encapsulated.
+	;-------------------------------------------------------------------------------
+	new AUF1,blnOK
+	
+	set blnOK = $$$YES
+	
+	SET AUF1=$GET(^INAUF(YM,AUF,1))
+	if $PIECE(AUF1,Y,60)=1 {  ;AUFTRAG ABGESCHLOSSEN ;order 
+		set blnOK = $$$NO
+		
+	} elseif ($GET(ATPREQUEST)=1)&&($PIECE(AUF1,Y,38)=1) {  ;BLOCKED ORDER;FIS;12.03.04
+		set blnOK = $$$NO
+	}
+	
+	quit blnOK
+	
+ 
+OrderLine(AUF,POS,BETRIEB,ART)
+	;-------------------------------------------------------------------------------
+	; Order line processing
+	;
+	; Params:	AUF	- order id
+	; 			POS	- order line id
+	; 			BETRIEB	- location
+	; 			ART		- item
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Jan-2007	JW		SR15347: Encapsulated.
+	;-------------------------------------------------------------------------------
+	new POS1,AUF1,idOrderType,AUFX,POSX,MENGEX,RES1X,AB,LIEF,AB1,LAP,WE,AUF0,POS0,TYPE
+	new WEMENGE,RESMENGE,SATZ,idBackToStock,tmsStart
+	new idOrderLoc,dteCreated,idReductionStkLoc,tmeDeliv,fltQty
+	
+ 	$$$Log($$$Text($listbuild("IN01019",AUF_"/"_POS)))		//Checking Order %1
+ 
+	set POS1=$get(^INAUFP(YM,AUF,POS,1))
+	QUIT:POS1=""
+	
+	set AUF1=$get(^INAUF(YM,AUF,1))
+	set idOrderType       = $$$INAUFOrderType(AUF1)		//SR15347
+	set idOrderLoc        = $$$INAUFLocation(AUF1)
+	set idReductionStkLoc = $$$INAUFPDefaultLocationForStockRe(POS1)
+	
+	//quit:(idOrderLoc'=BETRIEB)&&((idReductionStkLoc="")||(idReductionStkLoc'=BETRIEB))		;WRONG LOCATION;FIS;04.05.05;SR12200
+	//QUIT:$$$INAUFPPosCompleted(POS1)  ;ABGESCHLOSSEN
+	//QUIT:$$$INAUFPCancellation(POS1)   ;STORNO
+ 
+	//IF idOrderType=1 QUIT:$$$INAUFPReadyForDelivery(POS1)=1  ;AUSLIEFERUNGSFÄHIG=FERTIGUNG BEENDET
+	//IF idOrderType=2 IF $PIECE(POS1,Y,109)'<$PIECE(POS1,Y,5) QUIT  ;WE ERFOLGT ;In 
+	//IF idOrderType=0 IF $PIECE(POS1,Y,92)'="" QUIT:$PIECE(POS1,Y,97)'=""  ;INVOICED AND SHIPPED;FIS;30.06.05;SR12717
+ 
+	if (idOrderLoc'=BETRIEB)&&((idReductionStkLoc="")||(idReductionStkLoc'=BETRIEB)) $$$Log($$$Text($lb("IN01024",AUF_"/"_POS))) quit 		;WRONG LOCATION;FIS;04.05.05;SR12200	//Order %1 wrong location exiting
+	if $$$INAUFPPosCompleted(POS1) $$$Log($$$Text($lb("IN01025",AUF_"/"_POS))) quit  ;ABGESCHLOSSEN	//Order %1 Completed
+	if $$$INAUFPCancellation(POS1) $$$Log($$$Text($lb("IN01026",AUF_"/"_POS))) quit  ;STORNO	//Order %1 Cancelled
+	
+	if idOrderType=1 if $$$INAUFPReadyForDelivery(POS1)=1 $$$Log($$$Text($lb("IN01020",AUF_"/"_POS))) QUIT //T/O %1 Ready For Delivery exiting...
+	if idOrderType=2 if $PIECE(POS1,Y,109)'<$PIECE(POS1,Y,5) $$$Log($$$Text($lb("IN01021",AUF_"/"_POS,$PIECE(POS1,Y,109),$PIECE(POS1,Y,5)))) QUIT  ;WE ERFOLGT ;In  //P/O %1 Total Received Qty %2 > Order Qty %3 exiting...
+	if idOrderType=0 if $PIECE(POS1,Y,92)'="" if $PIECE(POS1,Y,97)'="" $$$Log($$$Text($lb("IN01022",AUF_"/"_POS))) QUIT ;INVOICED AND SHIPPED;FIS;30.06.05;SR12717	//C/O %1 Invoiced & Shipped exiting...
+	
+	FOR TYPE=1,2 {
+		continue:(TYPE=1)&&(idOrderType'=0)		// Only customers orders
+		IF TYPE=2 IF idOrderType'=5 IF $$$INAUFPSource(POS1)'=3 IF $$$INAUFPSource(POS1)'=1 IF $$$INAUFPSource(POS1)'=5 continue  ;BESTELLUNG ODER FERTIGUNG ODER LAGERBESTELLUNG;TYBD; REQUISITION
+		
+		SET SATZ     = ""
+		SET WEMENGE  = 0
+		SET RESMENGE = 0
+		
+		set $$$INDRPDEMANDRequestingLocation(SATZ)	= $$$Coalesce(idOrderLoc,BETRIEB)
+		set $$$INDRPDEMANDOrderNo(SATZ)   			= AUF_"-"_POS
+		set dteCreated								= $$$INAUFPOrderDate(POS1)
+		set $$$INDRPDEMANDCreatedon(SATZ)   		= $$$Coalesce(dteCreated,$$$INAUFOrderDate(AUF1))
+		set $$$INDRPDEMANDItemNo(SATZ)   			= ART
+		set fltQty   								= $$$INAUFPQuantity(POS1)
+		set $$$INDRPDEMANDSupplyCreated(SATZ) 		= $$$INAUFPSupplyCreatedTimestamp(POS1)
+		set $$$INDRPDEMANDPriority(SATZ)  			= $$$INAUFPriority(AUF1)  						; FIS;25.04.05;SR12200
+		
+		if (idReductionStkLoc'="") && (idReductionStkLoc'=BETRIEB) && (idOrderLoc=BETRIEB) {
+			set $$$INDRPDEMANDDeleteOrder(SATZ)		= $$$YES  				;SALES LOCATION = SHOW ONLY (AS CANCELLED);FIS;04.05.05;SR12200
+		} else {
+			set $$$INDRPDEMANDDeleteOrder(SATZ)  	= $$$INAUFPCancellation(POS1)
+		}
+		set $$$INDRPDEMANDDueOnBefore(SATZ) 		= $$GetDueDate(TYPE=2,$PIECE(SATZ,Y,3),AUF1,POS1,BETRIEB,AUF,POS,ART)
+		
+		// NOTE JW - Why delivery time? This has nothing to do with due time!
+		set tmeDeliv = $$$INAUFPDeliveryTime(POS1)
+		set $$$INDRPDEMANDDemandTime(SATZ) = $$$Coalesce(tmeDeliv,$case(idOrderType,0:$$$SecsInDay-1,:$$$Midnight))
+		
+		if idOrderType=0 {
+			set $$$INDRPDEMANDDemand(SATZ) = $case($$$INAUFPSource(POS1),	1:"01",		;Sales order
+																			2:"02",		;From Stock
+																			3:"03",		;Production
+																			4:"04",		;Service
+																			5:"05",		;Purchase Order
+																			 :0)		;BESCHAFFUNGSART
+		} else {
+			set $$$INDRPDEMANDDemand(SATZ) = $case(idOrderType,	2:2,			;LF-BESTELLUNG
+																1:1,			;EIGENFERTIGUNG
+																5:2,			;REQUISITION  ;FIS;11.05.05:SR12005
+																 :"")
+		}
+		
+		; ---- DEMAND/NACHFRAGE ---- (KUNDENAUFTRAG)
+		;---------------------------------------------------------------------
+		if TYPE=1 {
+			set $$$INDRPDEMANDDemandType(SATZ)			= 1   ;DEMAND-ART=KUNDENAUFTRAG
+			set $$$INDRPDEMANDCompletionPlanned(SATZ)	= $$$INAUFPRequiredDeliveryDate(POS1)
+			set $$$INDRPDEMANDPickListPrintDate(SATZ)	= $$$INAUFPPicklistPrintedDate(POS1)
+			set $$$INDRPDEMANDPlannedShippingDate(SATZ)	= $$$INAUFPDeliveryDate(POS1)
+			set $$$INDRPDEMANDDateShipped(SATZ)			= $$$INAUFPDeliveryNotePrintedDate(POS1)
+			set $$$INDRPDEMANDReference(SATZ)			= AUF_"-"_POS       						;FIS;25.04.05;SR12200
+			if $$$INAUFPReadyForDelivery(POS1) set $$$INDRPDEMANDPickedQuantity(SATZ) = $$$INAUFPQuantity(POS1)
+			set $$$INDRPDEMANDSourcedQuantity(SATZ)		= $$$INAUFPQuantity1(POS1)   				;FIS;24420;22.10.03
+		
+		; ---- SUPPLY/ANGEBOT ---- (FERTIGUNG,EIGENAUFTRAG,BESTELLUNG,LAGERBESTELLUNG)
+		;---------------------------------------------------------------------
+		} else {
+			if ($$$INAUFPSource(POS1)=2) || (idOrderType=1) {		;From Stock OR EIGENFERTIGUNG
+				set $$$INDRPDEMANDDemandType(SATZ) = 2
+				
+				set tmsStart = $$$INAUFPProductionStart1(POS1)
+				IF tmsStart'="" {
+					set $$$INDRPDEMANDDueOnBefore(SATZ) = tmsStart+$$^INDAUERTAGE($$$INAUFPExecutionTime(POS1))  ;Manufacturing end
+				}
+				IF $$$INAUFPProductionNo(POS1)="" {  ;NUR GEPLANT ;only 
+					set $$$INDRPDEMANDCompletionPlanned(SATZ) = tmsStart
+				} else {
+					set $$$INDRPDEMANDCompletionConfirmed(SATZ) = tmsStart
+				}
+				IF $$$INAUFPReadyForDelivery(POS1) {
+					SET WEMENGE=$$$INAUFPOutput1(POS1)     ;FERTIGUNG ABGESCHLOSSEN
+				} elseIF $$$INAUFPPartialReceiptQty(POS1)'="" {
+					SET WEMENGE=$$$INAUFPPartialReceiptQty(POS1)        ;PARTIAL RECEIPT
+				}
+				
+			} elseif (idOrderType=5) {
+				set $$$INDRPDEMANDDemandType(SATZ) = 5				;REQUISITION
+				
+			} else {
+				set $$$INDRPDEMANDDemandType(SATZ) = 1				;SUPPLY-ART=LF-BESTELLUNG
+				
+				; Check whether Supply Confirmed / Sales order stored Or reservation
+				IF $$$INAUFPSource(POS1)=5 {    ;LAGER-BESTELLUNGEN
+					SET MENGEX=0
+					
+					// Note JW: How stupid is this? Looping through every INRESERVIERT? Index people?
+					
+					$$$Order2(^INRESERVIERT,YM,AUFX)			;TEILWEISE RESERVIERT ; Partial reservation 
+						$$$Order3(^INRESERVIERT,YM,AUFX,POSX)
+							IF $DATA(^INRESERVIERT(YM,AUFX,POSX,AUF,POS,1)) {
+								SET RES1X=^INRESERVIERT(YM,AUFX,POSX,AUF,POS,1)      ; 04-Sep-2006
+								SET MENGEX=MENGEX+($PIECE(RES1X,Y,1)-$PIECE(RES1X,Y,2))  ;RESERVIERTE MENGE ;quantity 
+								IF $TRANSLATE(AUFX," ")'="" SET $$$INDRPDEMANDOrderNo(SATZ)=AUFX_"-"_POSX  ;ELP
+							}
+						$$$End
+					$$$End
+					set fltQty = MENGEX
+					
+				} else {
+					set LIEF=$$$INAUFPSupplier(POS1)
+					IF (LIEF'="") && $DATA(^INLIEF(YM,LIEF,1)) && '$$$INLIEFOrderConfirmation($GET(^INLIEF(YM,LIEF,1))) {
+						SET $$$INDRPDEMANDCompletionConfirmed(SATZ) = $$$INDRPDEMANDDueOnBefore(SATZ)  ;LIEFERANT VERSCHICKT KEINE AB'S ;supplier no ; 04-Sep-2006
+					}
+					IF $DATA(^INAUFPA(YM,AUF,POS)) {  ;LIEFERTERMIN LT. AUFTRAGSBESTÄTIGUNG ;time of delivery order confirmation 
+						IF LIEF="" SET LIEF=$ORDER(^INAUFPA(YM,AUF,POS,""))
+						SET AB=$ORDER(^INAUFPA(YM,AUF,POS,LIEF,""),-1)
+						if AB'="" {
+							SET AB1 = $GET(^INAUFPA(YM,AUF,POS,LIEF,AB,1))
+							SET $$$INDRPDEMANDConfirmedReceiptDate(SATZ) 	= $$$INAUFPAOrderConfirmationDate(AB1)      ;EINGANGSBSTÄTIGUNGSDATUM
+							IF $$$INAUFPADeliveryDate(AB1)'="" {
+								SET $$$INDRPDEMANDDueOnBefore(SATZ) 		= $$$INAUFPADeliveryDate(AB1)  ;VORAUSSICHTL. EINGANGSDATUM
+								SET $$$INDRPDEMANDCompletionConfirmed(SATZ)	= $$$INAUFPADeliveryDate(AB1)  ;BESTÄTIGTES ERLEDIGUNGSDATUM
+							}
+						}
+					}
+					IF $DATA(^INWEAUF(YM,AUF,POS,BETRIEB)) {  ;WARENEINGANG BEREITS ERFOLGT ;receiving yet 
+						$$$Order5(^INWEAUF,YM,AUF,POS,BETRIEB,LAP)
+							$$$Order6(^INWEAUF,YM,AUF,POS,BETRIEB,LAP,WE)
+								SET $$$INDRPDEMANDDueOnBefore(SATZ)	= WE
+								SET $$$INDRPDEMANDCompletionConfirmed(SATZ) = WE ;WARENEINGANGSDATUM
+								SET WEMENGE=WEMENGE+$$$INWEAUFIncomingGoodsQuantity($GET(^INWEAUF(YM,AUF,POS,BETRIEB,LAP,WE,1)))
+							$$$End
+						$$$End
+					}
+					IF WEMENGE=0 SET WEMENGE = $$$INAUFPIncomingGoodsQuantity(POS1)
+					
+					;TEILWEISE RESERVIERT ; Partial reservation
+					$$$Order4(^INRESERVIERT,YM,AUF,POS,AUF0)
+						$$$Order5(^INRESERVIERT,YM,AUF,POS,AUF0,POS0)
+							SET RESMENGE=RESMENGE+$$$INRESERVIERTReservedQuantity($GET(^INRESERVIERT(YM,AUF,POS,AUF0,POS0,1)))  ;RESERVIERTE MENGE ;quantity 
+						$$$End
+					$$$End
+				}
+			}
+			
+			IF $$$INAUFPSource(POS1)=1 IF $$$INAUFPOrderPrintedDate(POS1)="" SET $$$INDRPDEMANDCompletionConfirmed(SATZ)=""  ;BESTELLUNG NICHT GEDRUCKT=UNBEARBEITET ;sales order Not 
+			
+			// NOTE JW: Following line OVERWRITES value from line approx 323 - not good
+			SET $$$INDRPDEMANDCompletionPlanned(SATZ)=$$$INAUFPRequiredDeliveryDate(POS1)
+		}
+		continue:(fltQty>0)&&(WEMENGE'<fltQty)   ;WE BEREITS ERFOLGT ;In yet 
+		IF fltQty>0 {
+			set fltQty = fltQty - WEMENGE - RESMENGE
+		}
+		continue:fltQty=0  ;AUFTRAG OHNE MENGE ;order without quantity 
+		set $$$INDRPDEMANDQuantity(SATZ) = fltQty
+		
+		;+++++++++++++++++++++++++++++
+		;  Save SATZ in ^WWWSOR(USER,0,D6,D17,Ord-Line#type)
+		;+++++++++++++++++++++++++++++
+		
+		;RÜCKNAHMEN EXTRA ANZEIGEN;FIS;24842;17.12.03
+		IF idOrderType=0 && (fltQty<0) {
+			; SR14085: There is a problem here in that this should only be calculated when
+			; the stock is on a blocked location.
+			set idBackToStock=$$$INAUFPItemsBackToStock(POS1) ; SR14085 06-Jan-2006		RPW		This field may not always be set!
+			
+			if (idBackToStock'="") && $$$INLPStockLocationIsLocked($get(^INLP(YM,$PIECE(SATZ,Y,1),idBackToStock,1))) {  ; SR14085
+				SET ^WWWSOR(YUSER,"RMA")=$GET(^WWWSOR(YUSER,"RMA"))-fltQty
+			}
+			
+			;NEGATIVER DEMAND = SUPPLY (NEGATIVE EIGENFERTIGUNG/RÜCKNAHME);FIS;22891;15.12.03
+		} elseIF TYPE=1 && (fltQty<0) {
+			set $$$INDRPDEMANDQuantity(SATZ) = -fltQty
+			SET ^WWWSOR(YUSER,"0",$$$INDRPDEMANDDueOnBefore(SATZ),$$$INDRPDEMANDDemandTime(SATZ),AUF_"-"_POS_"#2") = SATZ
+			$$$Log($$$Text($lb("IN00986",AUF_"-"_POS))_$tr(SATZ,Y,","))		//Order %1 Included
+			
+		} else {	;SPEICHERN SUPPLY/DEMAND ;Save 
+			SET ^WWWSOR(YUSER,"0",$$$INDRPDEMANDDueOnBefore(SATZ),$$$INDRPDEMANDDemandTime(SATZ),AUF_"-"_POS_"#"_TYPE) = SATZ
+			$$$Log($$$Text($lb("IN00986",AUF_"-"_POS_"#"_TYPE))_$tr(SATZ,Y,","))		//Order %1 Included
+		}
+	}
+	
+	quit
+	
+	
+GetDueDate(pblnSupply,pdteCreated,AUF1,POS1,BETRIEB,AUF,POS,ART)
+	;-------------------------------------------------------------------------------
+	; Get due date for order -> supply/demand
+	;
+	; Params:	pblnSupply - whether supply or demand side
+	; 			pdteCreated - date order line created
+	; 			AUF1,POS1,BETRIEB,AUF,POS,ART - same as calling routine
+	;
+	; Returns:	date due
+	;
+	; History:
+	; 04-Jan-2007	JW		SR15347: Encapsulated.
+	;-------------------------------------------------------------------------------
+	new dteDue,KOND,AB,CD
+	
+	SET dteDue=""  ;TERMIN !! ÄNDERUNGEN GGF. AUCH IN INDRPRUN5 VORNEHMEN !!! ;too within 
+	IF 'pblnSupply || ($$$INAUFPSource(POS1)=5) SET dteDue=$PIECE(POS1,Y,76)  ;AUSLIEFERUNGSDATUM=WEDATUM BEI LAGERNBESTELLUNG ;next to 
+	IF dteDue="" SET dteDue=$$$INAUFPRequiredDeliveryDate(POS1)  ;LIEFERTERMIN POS ;time of delivery 
+	IF dteDue="" SET dteDue=$PIECE(AUF1,Y,19)  ;LIEFERTERMIN AUF ;time of delivery upon 
+	
+	IF dteDue="" {
+		if pblnSupply {
+			SET AB=$ORDER(^INAUFPA(YM,AUF,POS,""),-1)	;LIEFERTERMIN LT. AUFTRAGSBESTÄTIGUNG ;time of delivery order confirmation 
+			IF AB'="" {
+				SET CD=$ORDER(^INAUFPA(YM,AUF,POS,AB,""),-1)  ;FIS;22.04.05
+				IF CD'="" {
+					SET KOND=$GET(^INAUFPA(YM,AUF,POS,AB,CD,1))	;PJK 20050420 ref to INAUFPA had wrong num of primary keys
+					IF $PIECE(KOND,Y,23)'="" SET dteDue=$PIECE(KOND,Y,23)  ;LIEFERTAG LT. LETZTER AB ;last Confirm. 
+				}
+			}
+			if (dteDue="") && (pdteCreated'="") {
+				if $DATA(^INAUFPK(YM,AUF,POS)) {  ;LIEFERTERMIN LT. AUFTRAG-LIEFERANTENKONDITION ;time of delivery 
+					SET KOND=$GET(^INAUFPK(YM,AUF,POS,1))
+					IF $PIECE(KOND,Y,23)'="" SET dteDue=pdteCreated+$PIECE(KOND,Y,23)  ;AUFTRAGSDATUM + LIEFERZEIT IN TAGEN ;purchasing lead time within 
+				}
+				IF dteDue="" && ($PIECE(POS1,Y,12)'="") && $DATA(^INARTK(YM,ART,$PIECE(POS1,Y,12))) {    ;LIEFERTERMIN LT. ARTIKEL-LIEFERANTENKONDITION ;time of delivery 
+					SET KOND=$GET(^INARTK(YM,ART,$PIECE(POS1,Y,12),1))
+					IF $PIECE(KOND,Y,23)'="" SET dteDue=pdteCreated+$PIECE(KOND,Y,23)  ;AUFTRAGSDATUM + LIEFERZEIT IN TAGEN ;purchasing lead time within 
+				}
+				IF dteDue="" && ($PIECE(POS1,Y,12)'="") && $DATA(^INLIEF(YM,$PIECE(POS1,Y,12))) {    ;LIEFERTERMIN LT. LIEFERANTENSTAMM ;time of delivery 
+					SET KOND=$GET(^INLIEF(YM,$PIECE(POS1,Y,12),1))
+					IF $PIECE(KOND,Y,46)'="" SET dteDue=pdteCreated+$PIECE(KOND,Y,46)  ;AUFTRAGSDATUM + LIEFERZEIT IN TAGEN ;purchasing lead time within 
+				}
+			}
+		}
+		IF (dteDue="") && (pdteCreated'="") {  ;BEDARFSTERMIN AUS PARAMETER ;out of parameter 
+			SET dteDue=pdteCreated+$PIECE($GET(^INDRPSYS(YM,BETRIEB,1)),Y,2)
+		}
+		IF dteDue="" SET dteDue=+$HOROLOG
+		
+		if pblnSupply SET dteDue=dteDue+$$^INTAGEPLUS(+$HOROLOG,dteDue,BETRIEB,$$$YES,$PIECE(POS1,Y,12))  ;PLUS FEIERTAGE UND WOCHENENDE;FIS;24406;04.11.03
+	}
+	
+	quit dteDue
+	
+	
+Requisition(pidReq)
+	;-------------------------------------------------------------------------------
+	; Requisition processing
+	;
+	; Params:	pidReq - Requisition id
+	;
+	; Returns:
+	;
+	; History:
+	; 04-May-2011	PPP		SR17165: Changed Type forGlobal ^INRequistion to "Supplies"
+	; 01-Jun-2007	RPW		SR15513: Do not show released requisitions
+	; 05-Jan-2007	JW		SR15347: Created
+	;-------------------------------------------------------------------------------
+	new objReq,dteDue,objDemand
+	
+	set objReq = $get(^INRequisition(YM,YM,pidReq,1))
+	
+	if $$$INRequisitionStatus(objReq)'=$$$EnumINREQSTATUSReleased {
+	
+		set dteDue = $$$INRequisitionDueDate(objReq)
+		if dteDue="" set dteDue = +$horolog						// Anything else?
+		set $$$INDRPDEMANDDueOnBefore(objDemand) = dteDue
+			
+		set $$$INDRPDEMANDRequestingLocation(objDemand) = $$$INRequisitionLocation(objReq)
+		set $$$INDRPDEMANDOrderNo(objDemand)			= pidReq
+		set $$$INDRPDEMANDCreatedon(objDemand)			= +$$$INRequisitionCreatedAt(objReq)
+		set $$$INDRPDEMANDItemNo(objDemand)				= $$$INRequisitionItem(objReq)
+		set $$$INDRPDEMANDDemandTime(objDemand)			= $$$Midnight						// Weird... anything else?
+		set $$$INDRPDEMANDDemand(objDemand)				= 2
+		set $$$INDRPDEMANDQuantity(objDemand)			= $$$INRequisitionQuantity(objReq)
+		//set $$$INDRPDEMANDDemandType(objDemand) 		= 5 //"Requisition"
+		set $$$INDRPDEMANDDemandType(objDemand) 		= 6	//SR17165 "Planned Supply"
+		
+		SET ^WWWSOR(YUSER,"0",dteDue,$$$INDRPDEMANDDemandTime(objDemand),pidReq_"#2") = objDemand
+		
+		/*
+		set $$$INDRPDEMANDSupplyCreated(SATZ) 			= ""
+		set $$$INDRPDEMANDPriority(SATZ)				= ""
+		set $$$INDRPDEMANDCompletionConfirmed(SATZ)		= ???
+		set $$$INDRPDEMANDCompletionPlanned(SATZ)		= ???
+		*/
+	}
+		
+	quit
+	
+	
+	
+NEBEN(ART,ARTH,BETRIEB)
+    ;--------------------------------------------------------------------------------
+	;  Production By-Products
+	;
+	;	PRODUKTIONS-NEBENARTIKEL
+	;	SUCHEN NACH AUFTRÄGEN MIT ARTIKELN, DURCH DEREN PRODUKTION ODER WE AUCH EIN WE DIESES ARTIKELS ENTSTEHT
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Jan-2007	JW		SR15347: Moved from INDRPRUN. Moved loop into Sort.
+	;-------------------------------------------------------------------------------
+	NEW ARTH1,ABGE,AUF,POS,AUF1,POS1,WEMENGE,RESMENGE,SATZ,idxARTH
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;	ARTH1		objINARTNEBEN	Production By-Products
+	;	AUF1		objINAUF		Order
+	;	POS1		objINAUFP		Order Line
+	;	SATZ		
+	;	KOND		objINAUFPK
+	;	AB1			objINAUFPA
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	//SET ARTH=""		SR15347
+	//FOR  SET ARTH=$ORDER(^INARTNEBENs(YM,1,idxART,ARTH)) QUIT:ARTH=""  DO  ;SUCHEN HAUPTARTIKEL ;seek   ; JW/RW	SR12056
+	
+	do
+	. SET ARTH1=$GET(^INARTNEBEN(YM,ARTH,ART,1))
+	. QUIT:+$PIECE(ARTH1,Y,1)=0  ;KEINE ENTSTEHUNGSMENGE ;no 
+	. QUIT:+$PIECE(ARTH1,Y,2)=0  ;KEINE PRODUKTIONS/WE-MENGE ;no 
+	. ;
+	. set idxARTH = $$^WWWUMLAU(ARTH,1)
+	. ;
+	. FOR ABGE=" ",0 DO
+	. . SET AUF=""
+	. . FOR  SET AUF=$ORDER(^INAUFPs(YM,5,ABGE,idxARTH,AUF)) QUIT:AUF=""  DO   ; JW/RW	SR12056
+	. . . SET AUF1=$GET(^INAUF(YM,AUF,1))
+	. . . QUIT:$PIECE(AUF1,Y,60)=1  ;AUFTRAG ABGESCHLOSSEN ;order 
+	. . . QUIT:$PIECE(AUF1,Y,6)'=BETRIEB  ;FALSCHER BETRIEB ;location 
+	. . . 
+	. . . SET POS=""
+	. . . FOR  SET POS=$ORDER(^INAUFPs(YM,5,ABGE,idxARTH,AUF,POS)) QUIT:POS=""  DO
+	. . . . SET POS1=$GET(^INAUFP(YM,AUF,POS,1))
+	. . . . QUIT:POS1=""
+	. . . . ;
+	. . . . IF $$$INAUFOrderType(AUF1)=1 QUIT:$PIECE(POS1,Y,90)=1  ;AUSLIEFERUNGSFÄHIG=FERTIGUNG BEENDET
+	. . . . IF $$$INAUFOrderType(AUF1)=2 QUIT:$PIECE(POS1,Y,90)=1  ;AUSLIEFERUNGSFÄHIG=WE ERFOLGT
+	. . . . IF $$$INAUFOrderType(AUF1)=0  IF $PIECE(POS1,Y,92)'="" QUIT:$PIECE(POS1,Y,97)'=""  ;INVOICED AND SHIPPED;FIS;30.06.05;SR12717
+	. . . . IF $$$INAUFOrderType(AUF1)'=5 IF $PIECE(POS1,Y,7)'=3 IF $PIECE(POS1,Y,7)'=1 IF $PIECE(POS1,Y,7)'=5 QUIT  ;NUR BESTELLUNG ODER FERTIGUNG ODER LAGERBESTELLUNG ;only sales order Or Or 
+	. . . . ;
+	. . . . SET SATZ=""
+	. . . . SET WEMENGE=0
+	. . . . SET RESMENGE=0
+	. . . . SET $PIECE(SATZ,Y,1)  = $PIECE(AUF1,Y,6)  ;BETRIEB
+	. . . . IF $PIECE(SATZ,Y,1)="" SET $PIECE(SATZ,Y,1)=BETRIEB
+	. . . . SET $PIECE(SATZ,Y,2)  = AUF_"-"_POS
+	. . . . SET $PIECE(SATZ,Y,3)  = $PIECE(POS1,Y,193)  ;AUFTRAGSDATUM
+	. . . . IF $PIECE(SATZ,Y,3)="" SET $PIECE(SATZ,Y,3)=$PIECE(AUF1,Y,4)  ;AUFTRAGSDATUM
+	. . . . SET $PIECE(SATZ,Y,4)  = ART  ;ARTIKEL ;item 
+	. . . . SET $PIECE(SATZ,Y,5)  = $PIECE(POS1,Y,5)  ;MENGE DES HAUPTARTIKELS ;quantity 
+	. . . . SET $PIECE(SATZ,Y,98) = $PIECE(POS1,Y,9)  ;STORNO
+	. . . . ;SET $PIECE(SATZ,Y,52)=$PIECE(POS1,Y,40)  ;EINHEIT
+	. . . . ;IF $PIECE(SATZ,Y,52)="" SET $PIECE(SATZ,Y,52)=$PIECE($GET(^INART(YM,ART,1)),Y,40)  ;EINHEIT
+	. . . . ;
+	. . . . SET $PIECE(SATZ,Y,70)=1                           ;SUPPLY-ART=LF-BESTELLUNG
+	. . . . IF $$$INAUFOrderType(AUF1)=1 SET $PIECE(SATZ,Y,70)=2     ;EIGENFERTIGUNG
+	. . . . IF $PIECE(POS1,Y,7)=3 SET $PIECE(SATZ,Y,70)=2     ;FERTIGUNG
+	. . . . ;
+	. . . . IF $PIECE(SATZ,Y,70)=1 QUIT:$PIECE(ARTH1,Y,3)'=1  ;ENTSTEHUNG BEI PRODUKTION, NICH BEI WE
+	. . . . IF $PIECE(SATZ,Y,70)=2 QUIT:$PIECE(ARTH1,Y,3)'=0  ;ENTSTEHUNG BEI WE, NICHT BEI PRODUKTION
+	. . . . ;
+	. . . . IF $$$INAUFOrderType(AUF1)=2 SET $PIECE(SATZ,Y,9)="2"    ;LF-BESTELLUNG
+	. . . . IF $$$INAUFOrderType(AUF1)=1 SET $PIECE(SATZ,Y,9)="1"    ;EIGENFERTIGUNG
+	. . . . IF $$$INAUFOrderType(AUF1)=0 DO                          ;KUNDENAUFTRAG ;customer´s order 
+	. . . . . SET $PIECE(SATZ,Y,9)="0"
+	. . . . . IF $PIECE(POS1,Y,7)=1 SET $PIECE(SATZ,Y,9)="01" ;BESTELLUNG ;sales order 
+	. . . . . IF $PIECE(POS1,Y,7)=2 SET $PIECE(SATZ,Y,9)="02" ;LAGERBESTAND
+	. . . . . IF $PIECE(POS1,Y,7)=3 SET $PIECE(SATZ,Y,9)="03" ;FERTIGUNG
+	. . . . . IF $PIECE(POS1,Y,7)=4 SET $PIECE(SATZ,Y,9)="04" ;DIENSTLEISTUNG
+	. . . . . IF $PIECE(POS1,Y,7)=5 SET $PIECE(SATZ,Y,9)="05" ;LAGERBESTELLUNG
+	. . . . ;
+	. . . . SET $PIECE(SATZ,Y,6)=$PIECE(POS1,Y,19)                         ;LIEFERTERMIN POS ;time of delivery 
+	. . . . IF $PIECE(SATZ,Y,6)="" SET $PIECE(SATZ,Y,6)=$PIECE(AUF1,Y,19)  ;LIEFERTERMIN AUF ;time of delivery upon 
+	. . . . IF $PIECE(SATZ,Y,6)="" IF $DATA(^INAUFPK(YM,AUF,POS)) DO       ;LIEFERTERMIN LT. LIEFERANTENKONDITION ;time of delivery 
+	. . . . . NEW KOND
+	. . . . . SET KOND=$GET(^INAUFPK(YM,AUF,POS,1))
+	. . . . . IF $PIECE(KOND,Y,23)'="" IF $PIECE(SATZ,Y,3)'="" DO
+	. . . . . . SET $PIECE(SATZ,Y,6)=$PIECE(SATZ,Y,3)+$PIECE(KOND,Y,23)  ;AUFTRAGSDATUM + LIEFERZEIT IN TAGEN ;purchasing lead time within 
+	. . . . ;
+	. . . . IF $PIECE(SATZ,Y,6)="" IF $PIECE(SATZ,Y,3)'="" DO  ;BEDARFSTERMIN AUS PARAMETER ;out of parameter 
+	. . . . . SET $PIECE(SATZ,Y,6)=$PIECE(SATZ,Y,3)+$PIECE($GET(^INDRPSYS(YM,BETRIEB,1)),Y,2)
+	. . . . ;
+	. . . . IF $PIECE(SATZ,Y,6)="" SET $PIECE(SATZ,Y,6)=+$HOROLOG
+	. . . . ;
+	. . . . ;PRÜFEN OB SUPPLY BESTÄTIGT / BESTELLUNG EINGELAGERT ODER RESERVIERT ;check whether sales order Or reservation 
+	. . . . IF $PIECE(SATZ,Y,70)=1 DO  ;BESTELLUNGEN
+	. . . . . ;
+	. . . . . IF $PIECE(POS1,Y,7)=5 DO  QUIT  ;LAGER-BESTELLUNGEN
+	. . . . . . NEW AUFX,POSX,MENGEX
+	. . . . . . SET MENGEX=0
+	. . . . . . IF $DATA(^INRESERVIERT(YM)) DO                  ;TEILWEISE RESERVIERT ; Partial reservation 
+	. . . . . . . SET AUFX=""
+	. . . . . . . FOR  SET AUFX=$ORDER(^INRESERVIERT(YM,AUFX)) QUIT:AUFX=""  DO
+	. . . . . . . . SET POSX=""
+	. . . . . . . . FOR  SET POSX=$ORDER(^INRESERVIERT(YM,AUFX,POSX)) QUIT:POSX=""  DO
+	. . . . . . . . . IF $DATA(^INRESERVIERT(YM,AUFX,POSX,AUF,POS,1)) DO
+	. . . . . . . . . . SET MENGEX=MENGEX+($PIECE(^INRESERVIERT(YM,AUFX,POSX,AUF,POS,1),Y,1)-$PIECE(^INRESERVIERT(YM,AUFX,POSX,AUF,POS,1),Y,2))  ;RESERVIERTE MENGE ;quantity       ; 04-Sep-2006
+	. . . . . . . . . . ;SET $PIECE(SATZ,Y,2)=AUFX_"-"_POSX
+	. . . . . . ;
+	. . . . . . SET $PIECE(SATZ,Y,5)=MENGEX
+	. . . . . ;
+	. . . . . IF $PIECE(POS1,Y,12)'="" IF $DATA(^INLIEF(YM,$PIECE(POS1,Y,12),1)) DO
+	. . . . . . IF $PIECE($GET(^INLIEF(YM,$PIECE(POS1,Y,12),1)),Y,34)'=1 SET $PIECE(SATZ,Y,13)=$PIECE(SATZ,Y,6)  ;LIEFERANT VERSCHICKT KEINE AB'S ;supplier no       ; 04-Sep-2006
+	. . . . . ;
+	. . . . . IF $DATA(^INAUFPA(YM,AUF,POS)) DO  ;LIEFERTERMIN LT. AUFTRAGSBESTÄTIGUNG ;time of delivery order confirmation 
+	. . . . . . NEW LIEF,AB,AB1
+	. . . . . . SET LIEF=$PIECE(POS1,Y,12)                  ;LIEFERANT   ;supplier 
+	. . . . . . IF LIEF="" SET LIEF=$ORDER(^INAUFPA(YM,AUF,POS,""))
+	. . . . . . SET AB=$ORDER(^INAUFPA(YM,AUF,POS,LIEF,""),-1) QUIT:AB=""  DO
+	. . . . . . . SET AB1=$GET(^INAUFPA(YM,AUF,POS,LIEF,AB,1))
+	. . . . . . . SET $PIECE(SATZ,Y,7)=$PIECE(AB1,Y,1)      ;EINGANGSBSTÄTIGUNGSDATUM
+	. . . . . . . IF $PIECE(AB1,Y,23)'="" DO
+	. . . . . . . . SET $PIECE(SATZ,Y,6) =$PIECE(AB1,Y,23)  ;VORAUSS]]><![CDATA[ICHTL. EINGANGSDATUM
+	. . . . . . . . SET $PIECE(SATZ,Y,13)=$PIECE(AB1,Y,23)  ;BESTÄTIGTES ERLEDIGUNGSDATUM
+	. . . . . ;
+	. . . . . IF $DATA(^INWEAUF(YM,AUF,POS,BETRIEB)) DO  ;WARENEINGANG BEREITS ERFOLGT ;receiving yet 
+	. . . . . . NEW LAP,WE
+	. . . . . . SET LAP=""
+	. . . . . . FOR  SET LAP=$ORDER(^INWEAUF(YM,AUF,POS,BETRIEB,LAP)) QUIT:LAP=""  DO
+	. . . . . . . SET WE=""
+	. . . . . . . FOR  SET WE=$ORDER(^INWEAUF(YM,AUF,POS,BETRIEB,LAP,WE)) QUIT:WE=""  DO
+	. . . . . . . . SET $PIECE(SATZ,Y,6)=WE SET $PIECE(SATZ,Y,13)=WE                             ;WARENEINGANGSDATUM
+	. . . . . . . . SET WEMENGE=WEMENGE+$PIECE($GET(^INWEAUF(YM,AUF,POS,BETRIEB,LAP,WE,1)),Y,4)  ;WE-MENGE
+	. . . . . ;
+	. . . . . IF WEMENGE=0 SET WEMENGE=$PIECE(POS1,Y,109)
+	. . . . . ;
+	. . . . . IF $DATA(^INRESERVIERT(YM,AUF,POS)) DO                  ;TEILWEISE RESERVIERT ; Partial reservation 
+	. . . . . . NEW AUF0,POS0
+	. . . . . . SET AUF0=""
+	. . . . . . FOR  SET AUF0=$ORDER(^INRESERVIERT(YM,AUF,POS,AUF0)) QUIT:AUF0=""  DO
+	. . . . . . . SET POS0=""
+	. . . . . . . FOR  SET POS0=$ORDER(^INRESERVIERT(YM,AUF,POS,AUF0,POS0)) QUIT:POS0=""  DO
+	. . . . . . . . SET RESMENGE=RESMENGE+$PIECE($GET(^INRESERVIERT(YM,AUF,POS,AUF0,POS0,1)),Y,1)  ;RESERVIERTE MENGE ;quantity 
+	. . . . ;
+	. . . . IF $PIECE(SATZ,Y,70)=2 DO  ;FERTIGUNGEN
+	. . . . . SET $PIECE(SATZ,Y,13)=$PIECE(POS1,Y,168)  ;FERTIGUNGSBEGINN
+	. . . . . IF $PIECE(POS1,Y,168)'="" SET $PIECE(SATZ,Y,6)=$PIECE(SATZ,Y,13)+$$^INDAUERTAGE($PIECE(SATZ,Y,45))  ;FERTIGUNGSENDE
+	. . . . . IF $PIECE(POS1,Y,165)="" DO  ;NUR GEPLANT ;only 
+	. . . . . . SET $PIECE(SATZ,Y,12)=$PIECE(SATZ,Y,13)
+	. . . . . . SET $PIECE(SATZ,Y,13)=""
+	. . . . . ;
+	. . . . . IF $PIECE(POS1,Y,90)=1 SET WEMENGE=$PIECE(POS1,Y,39)  ;FERTIGUNG ABGESCHLOSSEN
+	. . . . ;
+	. . . . IF $PIECE(POS1,Y,7)=1 IF $PIECE(POS1,Y,83)="" SET $PIECE(SATZ,Y,13)=""  ;BESTELLUNG NICHT GEDRUCKT=UNBEARBEITET ;sales order Not 
+	. . . . SET $PIECE(SATZ,Y,17)=$PIECE(POS1,Y,100)        ;LIEFERUNGSUHRZEIT
+	. . . . IF $PIECE(SATZ,Y,17)="" SET $PIECE(SATZ,Y,17)=$$^WWWTIME1("23:59:59")  ;UHRZEIT
+	. . . . SET $PIECE(SATZ,Y,12)=$PIECE(POS1,Y,19)         ;GEPLANTES ERLEDIGUNGSDATUM
+	. . . . ;
+	. . . . IF WEMENGE'<$PIECE(SATZ,Y,5) QUIT               ;WE BEREITS ERFOLGT ;In yet 
+	. . . . SET $PIECE(SATZ,Y,5)=$PIECE(SATZ,Y,5)-WEMENGE   ;TEIL-WE
+	. . . . SET $PIECE(SATZ,Y,5)=$PIECE(SATZ,Y,5)-RESMENGE  ;RESERVIERTE MENGE ;quantity 
+	. . . . QUIT:$PIECE(SATZ,Y,5)=0                         ;AUFTRAG OHNE MENGE ;order without quantity 
+	. . . . ;
+	. . . . ;ENTSTEHUNGSMENGE
+	. . . . SET $PIECE(SATZ,Y,5) = $PIECE(SATZ,Y,5)/$PIECE(ARTH1,Y,2)*$PIECE(ARTH1,Y,1)  ;MENGE DES ENTSTEHUNGSPRODUKTES ;quantity 
+	. . . . ;
+	. . . . ;SPEICHERN SUPPLY/DEMAND ;Save 
+	. . . . SET ^WWWSOR(YUSER,"0",$PIECE(SATZ,Y,6),$PIECE(SATZ,Y,17),AUF_"-"_POS_"#2")=SATZ
+	
+	QUIT
+]]></Routine>
+</Export>

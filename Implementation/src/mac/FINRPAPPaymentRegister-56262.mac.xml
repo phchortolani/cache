@@ -1,0 +1,540 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINRPAPPaymentRegister" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINRPAPPaymentRegister
+#include COMSYS
+#include FINConst
+	
+#;define AddToRow(%1)	set lstRow = lstRow_$listbuild(%1)  ; SR15632
+#define NumLines		+$get(^CacheTempData(YUSER))
+	
+PaymentRegister(pidCompany,pidLanguage,pYUSER,pstrReport="",pdtePayment,pidLoc="",
+				pidSortBy=$$$EnumFINAPPAYMENTREGISTERSORTBYPaymentNumber)
+	;-------------------------------------------------------------------------------
+	; Run the payment register query.
+	;
+	; Params:	pidCompany		: The company we're in (YM)
+	; 			pidLanguage		: The language we're using (SPRACHE)
+	; 			pYUSER			: The session id (YUSER)
+	; 			pstrReport		: Report to reprint
+	; 			pdtePayment		: As at this payment date
+	; 			pidLoc			: For this location only
+	; 			pidSortBy		: How to sort the results
+	; 								1 = Cheque Number
+	; 								2 = Department
+	; 								3 = Supplier Number
+	; 								4 = Supplier Name
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Oct-2009	GRF		SR15632: Macro replacement
+	; 17-Oct-2006	SteveS	SR15124: Call to AddLinesCount
+	; 22-Sep-2006	SteveS	SR15012: Created
+	;-------------------------------------------------------------------------------
+	new YM,SPRACHE,YUSER,idxAccount,dtePayment,idPayment,objFINAPPaymentLine,idLine
+	new ret,objFINAPPayment,idPayLoc,idAccount,idRun,Y,idxStatus
+ 
+	set YM			= $get(pidCompany)
+	set SPRACHE 	= $get(pidLanguage)
+	set YUSER		= $get(pYUSER)
+	set Y			= "~"
+	
+	quit:(YM="")||(SPRACHE="")||(YUSER="") // can't proceed without setup variables
+ 
+	kill ^CacheTempTotals(YUSER)
+ 
+	if $$$SQLNull(pidLoc) 		set pidLoc=""
+	if $$$SQLNull(pidSortBy)	set pidSortBy=""
+	if $$$SQLNull(pstrReport)	set pstrReport=""
+ 
+	if ($get(pdtePayment)="")||($$$SQLNull(pdtePayment)) set pdtePayment=+$horolog
+	
+	set idRun = pstrReport
+	
+	set ret = $sortbegin(^CacheTempData)
+	
+	if (pstrReport="") {
+		set idRun = $$AddReportLog(pdtePayment,pidLoc)
+		set idAccount=""
+		for {
+			set idAccount = $order(^CacheTempAccounts(YUSER,idAccount))
+			quit:(idAccount="")
+			
+			set idxAccount = $$$Index(idAccount)
+		
+			set dtePayment = ""
+			for {
+				set dtePayment=$order(^FINAPPayments(YM,40,idxAccount,dtePayment))
+				quit:(dtePayment="")||(dtePayment>pdtePayment)
+			
+				set idPayment=""
+				for {
+					set idPayment=$order(^FINAPPayments(YM,40,idxAccount,dtePayment,idPayment))
+					quit:(idPayment="")
+					
+					set objFINAPPayment = $get(^FINAPPayment(YM,idPayment,1))
+					set idPayLoc = $$$FINAPPaymentCreateLocation(objFINAPPayment)
+				
+					// location filter
+					continue:(pidLoc'="")&&(idPayLoc'=pidLoc)
+	
+					// only want posted / cancelled lines			
+					for idxStatus=$$$Index($$$EnumFINSYSSTATUSPosted),$$$Index($$$EnumFINSYSSTATUSCancelled) {
+						set idLine=""
+						for {
+							set idLine=$order(^FINAPPaymentLines(YM,5,idxStatus,idPayment,idLine))
+							quit:(idLine="")
+						
+							do ProcessLine(idPayment,idLine,pidSortBy,idRun)
+						
+						}
+					}
+				}	
+			}
+		}
+	} else {
+		do Reprint(pstrReport,pidSortBy,pidLoc)
+	}
+	
+	set ^CacheTempReportID(YUSER) = idRun
+	
+	set ret = $sortend(^CacheTempData)
+	
+	if pstrReport="" do AddLinesCount(idRun) //SR15124
+	
+	do PrepareData^COMRPUtil(YUSER)
+	do FormatTotals()
+ 
+	quit
+	
+	
+Reprint(pstrReport,pidSortBy,pidLoc)
+	;-------------------------------------------------------------------------------
+	; Reprint the required lines
+	;
+	; Params:	pstrReport		: Re-print this report
+	; 			pidSortBy		: How we're sorting
+	; 			pidLoc			: For this location only
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Sep-2006	Steve S		SR15012: Created
+	;-------------------------------------------------------------------------------
+	new idxRun,intIndex,idPayment,idLine,objFINAPPayment,idPayLoc
+ 
+	set idxRun = $$$Index(pstrReport)
+ 
+	for intIndex = 10,20 {
+		set idPayment=""
+		for {
+			set idPayment = $order(^FINAPPaymentLines(YM,intIndex,idxRun,idPayment))
+			quit:idPayment=""
+			
+			set objFINAPPayment = $get(^FINAPPayment(YM,idPayment,1))
+			set idPayLoc		= $$$FINAPPaymentCreateLocation(objFINAPPayment)
+			
+			continue:(pidLoc'="")&&(pidLoc'=idPayLoc) // location filter
+			
+			set idLine = ""
+			for {
+				set idLine = $order(^FINAPPaymentLines(YM,intIndex,idxRun,idPayment,idLine))
+				quit:idLine=""
+				
+				do ProcessLine(idPayment,idLine,pidSortBy,"")
+			}
+		}
+	}
+ 
+ 
+	quit
+		
+	
+ProcessLine(pidPayment,pidLine,pidSortBy,pidRun="")
+	;-------------------------------------------------------------------------------
+	; Process a supplier payment line
+	;
+	; Params:	pidPayment		: The payment run number
+	; 			pidLine			: The payment run line number
+	; 			pidSortBy		: How to sort the data
+	; 			pidRun			: The current run number (blank means a re-print)
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Sep-2006	Steve S		SR15012: Created
+	;-------------------------------------------------------------------------------
+	new objFINAPPaymentLine,idLineStatus,blnPosted,idPostPrint,idUnPostPrint
+	
+	set objFINAPPaymentLine = $get(^FINAPPaymentLine(YM,pidPayment,pidLine,1))
+	
+	set idLineStatus = $$$FINAPPaymentLineStatus(objFINAPPaymentLine)
+	
+	set blnPosted 		= (idLineStatus=$$$EnumFINSYSSTATUSPosted)
+	set idPostPrint 	= $$$FINAPPaymentLinePaymentReportID(objFINAPPaymentLine)
+	set idUnPostPrint 	= $$$FINAPPaymentLineCancellationReportID(objFINAPPaymentLine)
+ 
+	if blnPosted { 	// posted
+		if (idPostPrint="")||(pidRun="") {	// not printed, or re-print
+			do AddLine(pidPayment,pidLine,pidSortBy,pidRun)	
+		}
+	} else {		// cancelled
+		if (idUnPostPrint="")||(pidRun="") { // not printed, or re-print
+			if (idPostPrint'="") {
+				do AddLine(pidPayment,pidLine,pidSortBy,pidRun,$$$YES)		
+			} else {
+				do AddLine(pidPayment,pidLine,pidSortBy,pidRun,,,$$$YES)
+				do AddLine(pidPayment,pidLine,pidSortBy,pidRun,$$$YES,$$$YES)
+			}
+		}
+	}
+ 
+	quit
+	
+	
+AddLine(pidPayment,pidLine,pidSortBy,pidRun,pblnNegative=$$$NO,pblnPaired=$$$NO,
+		pblnBlankStatus=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Build + Add a payment line to the report
+	;
+	; Params:	pidPayment		: The payment number
+	; 			pidLine			: The payment line number
+	; 			pidSortBy		: How we're sorting
+	; 			pidRun			: The current run number (Blank means re-print)
+	; 			pblnNegative	: Whether to multiply the amount by -1
+	; 			pblnPaired		: Whether this line is being "paired" with another line
+	; 			pblnBlankStatus	: Whether to overide the status with a "blank" status
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jan-2007	Steve S		SR15355: Use namespace subscript
+	; 17-Oct-2006	Steve S		SR15124: Added Pay Ref / Status override / No $ symbols
+	; 25-Sep-2006	Steve S		SR15012: Created
+	;-------------------------------------------------------------------------------
+	new objFINAPPayment,objFINAPPaymentLine,strLineStatus,strStatusText
+	new idDepartment,idSupplier,curAmount,dtePayment,lstRow,idAcc
+	new strMethod,blnCancelled,strAmount,intElement,strSort,strRemittance
+	new curOriginal,idMethod,strPayRef,strSortSecond,strNS
+ 
+ 	set strNS = $zutil(5) //SR15355
+ 	
+	set objFINAPPayment		= $get(^FINAPPayment(YM,pidPayment,1))
+	set objFINAPPaymentLine = $get(^FINAPPaymentLine(YM,pidPayment,pidLine,1))
+	
+	set idAcc = $$$FINAPPaymentBankAccount(objFINAPPayment)
+	
+	set blnCancelled=$$$NO
+	set strLineStatus = $$$FINAPPaymentLineStatus(objFINAPPaymentLine)
+	set strStatusText=""
+	
+	set curAmount		= $$$FCBase($$$FINAPPaymentLineTotal(objFINAPPaymentLine))
+	set curOriginal		= curAmount // used for summing
+	
+	if pblnNegative || ((strLineStatus=$$$EnumFINSYSSTATUSCancelled) && pblnPaired) {
+		set curAmount=-curAmount //6
+	}
+	
+	//SR15124
+	set strAmount		= $$FormatCurrency^COMRPUtil(curAmount,YM,SPRACHE,0,$$$NO)
+	//set strAmount		= $$FormatCurrency^COMRPUtil(curAmount,YM,SPRACHE,0,$$$YES)
+	
+	if (strLineStatus=$$$EnumFINSYSSTATUSCancelled) { // only show "cancelled" status on the report
+		set strStatusText=$$$AppEnum("FINSYSSTATUS",$$$EnumFINSYSSTATUSCancelled)
+		set blnCancelled=$$$YES
+	}
+	
+	if pblnBlankStatus { //SR15124
+		set strStatusText=""
+	}
+	
+	set idDepartment	= $$$FINAPPaymentLineDepartment(objFINAPPaymentLine)
+	set idSupplier		= $$$FINAPPaymentLineSupplierNumber(objFINAPPaymentLine)
+	
+	// Format cancelled amounts in brackets
+	//if pblnNegative && (blnCancelled && (curAmount>0)) set strAmount = "("_strAmount_")"
+	
+	set dtePayment		= $$$FINAPPaymentPaymentDate(objFINAPPayment)
+	set idMethod		= $$$FINAPPaymentPaymentMethod(objFINAPPayment)
+	set strMethod		= $$$AppEnum("FINARBANKLINEMETHOD",idMethod)
+	
+	set strRemittance   = $$GetRemittanceName^FINRPAPSupplierUtils(idSupplier,$$$NO,YM)
+	if strRemittance'="" set strRemittance = $$Text^COMRPUtil("Fin01080",SPRACHE)_": "_strRemittance  ;Payable to
+ 
+	// TODO: Support Pay Ref for EFT.
+ 
+	set strPayRef 		= $$$FINAPPaymentLineChequeNumber(objFINAPPaymentLine) //SR15124
+ 
+	set lstRow = ""
+ 
+	$$$AddToRow(idDepartment)
+	$$$AddToRow(idSupplier)
+	$$$AddToRow($$$FINAPSupplierSupplierName($get(^FINAPSupplier(YM,idSupplier,1))))
+	$$$AddToRow(strRemittance)
+	$$$AddToRow(pidPayment)
+	$$$AddToRow(dtePayment)
+	$$$AddToRow($$Date^COMRPUtil(dtePayment,SPRACHE))
+	$$$AddToRow(strAmount)
+	$$$AddToRow(strMethod)
+	$$$AddToRow(strStatusText)
+	$$$AddToRow(idAcc)
+	$$$AddToRow(curOriginal)
+	$$$AddToRow(strPayRef) //SR15124
+	
+	set intElement=1
+	
+	set strSort=""
+	set strSortSecond=""
+	
+	if pidSortBy=$$$EnumFINAPPAYMENTREGISTERSORTBYPaymentNumber {
+		set intElement=5
+	} elseif pidSortBy=$$$EnumFINAPPAYMENTREGISTERSORTBYDepartment {
+		set intElement=1
+		set strSortSecond=strPayRef // if by dept ==> 2nd sort is pay ref
+	} elseif pidSortBy=$$$EnumFINAPPAYMENTREGISTERSORTBYSupplierNumber {
+		set intElement=2
+	} elseif pidSortBy=$$$EnumFINAPPAYMENTREGISTERSORTBYSupplierName {
+		set intElement=3
+	} elseif pidSortBy=$$$EnumFINAPPAYMENTREGISTERSORTBYPaymentRef { //SR15124
+		set intElement=13
+	}
+	
+	set strSort = $listget(lstRow,intElement)
+	
+	if strSort="" set strSort=" "
+	if strSortSecond="" set strSortSecond=" "
+ 
+ 	//SR15355
+	set ^CacheTempData(strNS,YUSER,idAcc,strSort,strSortSecond,$increment(^CacheTempData(strNS,YUSER))) = lstRow
+	
+	if (pidRun'="") {
+		if blnCancelled {
+			set $$$FINAPPaymentLineCancellationReportID(objFINAPPaymentLine)=pidRun
+		} else {
+			set $$$FINAPPaymentLinePaymentReportID(objFINAPPaymentLine)=pidRun
+		}
+		
+		do Save^COMRPUtil(YM,YUSER,"FINAPPaymentLine",pidPayment_","_pidLine,objFINAPPaymentLine)
+	}
+	
+	if idMethod = "" set idMethod = " " // avoid subscript problems
+ 
+	set ^CacheTempTotals(strNS,YUSER,idAcc,idMethod) = $get(^CacheTempTotals(strNS,YUSER,idAcc,idMethod)) + curAmount
+	set ^CacheTempTotals(strNS,YUSER,idAcc)		   	 = $get(^CacheTempTotals(strNS,YUSER,idAcc)) + curAmount
+	
+	quit
+	
+	
+FormatTotals()
+	;-------------------------------------------------------------------------------
+	; Format the stored totals appropriately.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jan-2007	Steve S		SR15355: Use namespace subscript
+	; 17-Oct-2006	Steve S		SR15124: Display values with no curreny symbols
+	; 04-Oct-2006	Steve S		SR15012: Created
+	;-------------------------------------------------------------------------------
+	new idAccount,idMethod,curTotal,strTotal,strNS
+ 
+ 	set strNS = $zutil(5) //SR15355
+	set idAccount = ""
+	for {
+		set idAccount = $order(^CacheTempTotals(strNS,YUSER,idAccount))
+		quit:(idAccount="")
+		
+		set idMethod = ""
+		for {
+			set idMethod = $order(^CacheTempTotals(strNS,YUSER,idAccount,idMethod))
+			quit:(idMethod="")
+			
+			set curTotal = $get(^CacheTempTotals(strNS,YUSER,idAccount,idMethod))
+			//SR15124
+			set strTotal = $$FormatCurrency^COMRPUtil(curTotal,YM,SPRACHE,0,$$$NO)
+			//set strTotal = $$FormatCurrency^COMRPUtil(curTotal,YM,SPRACHE,0,$$$YES)
+			
+			//SR15355
+			set ^CacheTempTotals(strNS,YUSER,idAccount,idMethod) = strTotal
+		}
+	}
+ 
+ 
+	quit
+	
+	
+BuildTotalRow(pidCompany,pidLanguage,pYUSER,pidAcc)
+	;-------------------------------------------------------------------------------
+	; Build the totals row for an account.
+	;
+	; Params:	pidCompany	: The company number (YM)
+	; 			pidLanguage	: The language (SPRACHE)
+	; 			pYUSER		: The session id
+	; 			pidAcc		: The account number
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jan-2007	Steve S		SR15355: Use namespace subscript
+	; 17-Oct-2006	Steve S		SR15124: Display values with no curreny symbols
+	; 06-Oct-2006	SS & PO		SR15012: Prevent subscript error
+	; 04-Oct-2006	Steve S		SR15012: Created
+	;-------------------------------------------------------------------------------
+	new lstRow,strTotal,idMethod,YM,SPRACHE,YUSER,strNS
+ 
+	set YM		 = pidCompany
+	set SPRACHE  = pidLanguage
+	set YUSER 	 = pYUSER
+	
+	set strNS = $zutil(5) //SR15355
+	set lstRow = ""
+ 
+ 	if $$$SQLNull(pidAcc) set pidAcc=""
+ 
+	for idMethod = $$$EnumFINARBANKLINEMETHODCash,$$$EnumFINARBANKLINEMETHODCheque,$$$EnumFINARBANKLINEMETHODEFT,$$$EnumFINARBANKLINEMETHODZeroPayment,$$$EnumFINARBANKLINEMETHODPrePayment {
+		if (pidAcc'="")&&($data(^CacheTempTotals(strNS,YUSER,pidAcc,idMethod))) {
+			set strTotal = $get(^CacheTempTotals(strNS,YUSER,pidAcc,idMethod))
+		} else {
+			//SR15124
+			//set strTotal = $$FormatCurrency^COMRPUtil(0,YM,SPRACHE,0,$$$YES)
+			set strTotal = $$FormatCurrency^COMRPUtil(0,YM,SPRACHE,0,$$$NO)
+		}
+ 
+		set lstRow = lstRow_$listbuild(strTotal)
+	}
+	
+	//SR15355
+	set ^CacheTempRow(strNS,YUSER,1) = lstRow
+ 
+	quit
+	
+	
+GetTotalAmount(pidCompany,pidLanguage,pYUSER,pidAccount)
+	;-------------------------------------------------------------------------------
+	; Get the grand total (formatted) for an account
+	;
+	; Params:	pidCompany	: The company number (YM)
+	; 			pidLanguage	: The language (SPRACHE)
+	; 			pYUSER		: The session id
+	; 			pidAccount	: The account number
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jan-2007	Steve S		SR15355: Use namespace subscript
+	; 17-Oct-2006	Steve S		SR15124: Display values with no curreny symbols
+	; 09-Oct-2006	Steve S		SR15012: Created
+	;-------------------------------------------------------------------------------
+	new YM,SPRACHE,YUSER,lstRow,curAmount,strNS
+ 
+	set YM 			= pidCompany
+	set SPRACHE 	= pidLanguage
+	set YUSER 		= pYUSER
+ 
+	set strNS = $zutil(5)  //SR15355
+	
+	if (pidAccount'="") {
+		set curAmount = $get(^CacheTempTotals(strNS,YUSER,pidAccount))
+	} else {
+		set curAmount = 0
+	}
+	
+	//SR15124
+	set lstRow = $listbuild($$FormatCurrency^COMRPUtil(curAmount,YM,SPRACHE,0,$$$NO))
+	//set lstRow = $listbuild($$FormatCurrency^COMRPUtil(curAmount,YM,SPRACHE,0,$$$YES))
+ 
+	//SR15355 
+	set ^CacheTempRow(strNS,pYUSER,1) = lstRow
+ 
+ 
+	quit 
+	
+	
+AddReportLog(pdtePayment,pidLoc)
+	;-------------------------------------------------------------------------------
+	; Add a report log for this report run
+	;
+	; Params:	pdtePayment		: The payment date
+	; 			pidLoc			: Site location filter
+	;
+	; ByRefs:
+	;
+	; Returns:	idRun (the run number)
+	;
+	; History:
+	; 17-Oct-2006	Steve S		SR15124: Store Payment Date + Site Loc
+	; 29-Sep-2006	Steve S		SR15012: Created
+	;-------------------------------------------------------------------------------
+	new idRun,objRun
+ 
+	set idRun = $$NextKey^COMRPUtil(YM,"FINAPPaymentRegister")
+ 
+	set objRun = ""
+	
+	set $$$FINAPPaymentRegisterReportRunDate(objRun) 	= $piece($horolog,",",1)
+	set $$$FINAPPaymentRegisterReportRunTime(objRun) 	= $piece($horolog,",",2)
+	set $$$FINAPPaymentRegisterReportRunby(objRun)	 	= $$$GetUserID(YUSER)
+	set $$$FINAPPaymentRegisterPaymentDate(objRun) 		= pdtePayment			//SR15124
+	set $$$FINAPPaymentRegisterSiteLocation(objRun) 	= pidLoc				//SR15124
+	
+	do Save^COMRPUtil(YM,YUSER,"FINAPPaymentRegister",idRun,objRun)
+ 
+	quit idRun
+	
+	
+GetRunID(pYUSER)
+	;-------------------------------------------------------------------------------
+	; Return the RUN ID.
+	;
+	; Params:	pYUSER		: Session id.
+	;
+	; ByRefs:
+	;
+	; Returns:	idRun
+	;
+	; History:
+	; 29-Sep-2006	Steve S		SR15012: Created
+	;-------------------------------------------------------------------------------
+	quit $get(^CacheTempReportID(pYUSER))
+	
+	
+AddLinesCount(pidRun)
+	;-------------------------------------------------------------------------------
+	; Now that the report has run, add the number of lines it returned.
+	;
+	; Params:	pidRun		: The run number
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Oct-2006	Steve S		SR15124: Created
+	;-------------------------------------------------------------------------------
+	new objRun
+	
+	set objRun = $get(^FINAPPaymentRegister(YM,pidRun,1))
+	set $$$FINAPPaymentRegisterNumberofLines(objRun) = $$$NumLines
+	
+	do Save^COMRPUtil(YM,YUSER,"FINAPPaymentRegister",pidRun,objRun)
+ 
+	quit
+]]></Routine>
+</Export>

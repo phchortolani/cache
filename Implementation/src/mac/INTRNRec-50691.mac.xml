@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRNRec" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRNRec
+#include INConst
+#include COMSYS
+#include %occInclude
+	
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+	
+CanCreateReceipt(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Whether receipt can be created.
+	;
+	; Called By: Form INTRN Button 8
+	; 
+	; Params:	pidTFR - Transfer Id
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing; YQ implicitly
+	;
+	; History:
+	; 04-Sep-2012	SCR		SR18101: Only allow to create a receipt if user is in receiving location
+	; 04-Nov-2008	HQN		SR16088: Add check for valid in disk record, changing
+	; 						tabs marks valid if key entered but still in memory
+	; 30-Oct-2008	PP		SR16106: Only check for Storage if Receipt Location is an 
+	; 						'Storage Location' (InventoryAllowed)
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new arrObjLines,blnAllZero,idDemand,idLocn,idStore,loop
+	new objLine,objLocn,objREC,objTFR,strStatus
+	
+	set strStatus = $$$OK
+	
+	if $$$NoKey(pidTFR) {
+		set strStatus = $listbuild(32072)    ; "Please Select A Data Record First."
+	
+	} else {
+		set objTFR = $get(^INTFR(0,pidTFR,1))
+		if (objTFR = $$$NULLOREF) {
+			set strStatus = $$$NO
+		} else {
+			set idLocn = $$$INTFRReceivingLocation(objTFR)
+			if idLocn'="" {
+				set objLocn = $get(^WWW0121(0,0,idLocn,1))
+				
+				if $$InventoryAllowed^WWW0121Rules(0,idLocn,objLocn) && ($$$WWW0121ReceiptStorage(objLocn)="") {		//SR16106
+					set strStatus = $listbuild("alLOC0001",idLocn)	; "No default storage found for location %1"
+					
+				} elseif $$$WWW0121AutoReceiptTransferOrders(objLocn) {
+					set strStatus = $listbuild("IN00532")  ; "Can not manually receive goods for this Site Location."
+					
+				} elseif $case($$$INTFRStatus(objTFR),$$$EnumINTFRSTATUSCreated:$$$YES,$$$EnumINTFRSTATUSFirmed:$$$YES,:$$$NO) {
+					set strStatus = $listbuild("IN00528")  ; "Transfer needs to be sent for receipt to be created."
+						
+			//	Only try to create a receipt if there are no open receipts
+				} elseif '$$OpenReceipt(pidTFR) {		 //SR15239
+					set $$$INRECType(objREC)     = $$$EnumINRECTransferReceipt
+					set $$$INRECLocation(objREC) = $$$INTFRReceivingLocation(objTFR)
+					set $$$INRECStatus(objREC)   = $$$EnumINSTATUSUnprocessed
+		 			
+	;***************************************
+					LOCK +^INTFR(0,pidTFR,1):1
+	;***************************************
+					if $test {
+						set strStatus = $$CreateLines^INRECTFRLine(objREC,pidTFR,.arrObjLines)
+
+						set blnAllZero = $$$YES
+						set idStore = ""
+						for {
+							set idStore = $order(arrObjLines(idStore))
+							quit:idStore=""
+							
+							set idDemand = ""
+							for {
+								set idDemand = $order(arrObjLines(idStore,idDemand))
+								quit:idDemand=""
+								
+								set loop = ""
+								for {
+									set loop = $order(arrObjLines(idStore,idDemand,loop))
+									quit:loop=""
+									
+									set objLine = arrObjLines(idStore,idDemand,loop)
+									if +$$$INRECLineQuantity(objLine)'=0 set blnAllZero = $$$NO
+								}
+							}
+						}
+		 				
+						if blnAllZero {
+							set strStatus = $listbuild("IN00529")
+						}  ; "This transfer has been fully received"
+	;***************************************
+						LOCK -^INTFR(0,pidTFR,1)#"I"
+	;***************************************
+					
+					} else {
+						set strStatus = $listbuild("IN00530",pidTFR)
+					}  ; "Unable to lock Transfer Order '%1'."
+				}
+			}
+		}
+	}
+	; SR18101 vvvvvv
+	if ($$$INVORGRestrictreceivinglocation($get(^INVORG(YM,YM,1)))) {
+		if ($$$INTFRReceivingLocation($get(objTFR)) '= YLOCATION) {
+			set strStatus = $listbuild("IN00678")
+		}
+	}
+	; SR18101 ^^^^^^
+
+	$$$YQHandler(strStatus)
+	
+	quit
+ 
+CreateReceipt(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Create Transfer Receipt
+	; 
+	; NOTE: Reason for not calling CreateReceipt^INTFRInterface directly from form def
+	;		is so that a common interface is used.
+	;
+	; Params:
+	; pidTFR - Transfer Id
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new idRec
+	
+	if $$OpenReceipt(pidTFR,.idRec) {
+		do GoToForm^COMUtilForm("INRECTFR",idRec)
+		
+	} elseif $$$ISOK($$Transaction^COMTransaction("CreateReceiptTxn^INTRNRec("""_pidTFR_""")",$$$YES)) {
+		do GoToForm^COMUtilForm("INRECTFR",$get(^CacheTempTransferReceipt(YUSER)))
+	}
+	
+	//kill ^CacheTempTransferReceipt(YUSER)
+	kill $$$TempStore("idREC")
+ 
+	quit
+ 
+OpenReceipt(pidTFR,&pidRec)
+	;-------------------------------------------------------------------------------
+	; Whether there is an open (unprocessed) receipt for a certain transfer
+	;
+	; Params:	pidTFR - INTFR id
+	;
+	; ByRefs:	pidRec - first unprocessed receipt (null if none)
+	;
+	; Returns:	boolean - whether open receipt exists
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new idxTfr
+	
+	set idxTfr = $$$Index(pidTFR)
+	set pidRec = ""
+	for {
+		set pidRec = $order(^INRECs(0,1,idxTfr,pidRec))
+		quit:pidRec=""
+		
+		quit:$$Editable^INREC($get(^INREC(0,pidRec,1)))
+	}
+	
+	quit (pidRec'="")
+ 
+ 
+CreateReceiptTxn(pidTFR,pidREC="")
+	;-------------------------------------------------------------------------------
+	; Create Transfer Receipt
+	; 
+	; Params:
+	;	pidTFR - Transfer Id
+	;
+	; ByRefs: None
+	;
+	; Returns:
+	; strStatus : $$$OK no error, otherwise the error that occurred.
+	;
+	; History:
+	; 05-Feb-2014	SCR		HEVA-1343: Option to preset the Rec ID
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new arrObjLines,blnAllZero,idDemand,idREC,idRECLine,idStore,intCount,loop
+	new objLine,objREC,objTFR,strStatus
+
+	set objTFR = $get(^INTFR(0,pidTFR,1))
+ 	if pidREC'="" && ('$data(^INREC(YM,pidREC))) {
+	 	set idREC	= pidREC
+ 	} else {
+		set idREC = $$^WWWNEXT("INREC")
+ 	}
+	set ^CacheTempTransferReceipt(YUSER) = idREC
+	set $$$TempStore("idREC")            = idREC
+	
+	set blnAllZero = $$$YES
+ 
+	set $$$INRECType(objREC)            = $$$EnumINRECTransferReceipt
+	set $$$INRECLocation(objREC)        = $$$INTFRReceivingLocation(objTFR)
+	set $$$INRECStatus(objREC)          = $$$EnumINSTATUSUnprocessed
+	set $$$INRECTransferNumbers(objREC) = pidTFR
+	
+	;SESDF-816
+	if (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+		set $$$INRECFREE1(objREC)       = $$$INTFRSendingLocation(objTFR)	;FREE1 - Local Abastecedor
+		set $$$INRECFREE2(objREC)       = $$$INTFRRequisitionNumber(objTFR)	;FREE2 - No. Solicitação de Transferência
+	}
+ 
+	set strStatus = $$$Save("INREC",idREC,objREC,$$$YES)
+	
+	if $$$ISOK(strStatus) {
+	;***************************************
+		LOCK +^INTFR(0,pidTFR,1):1
+	;***************************************
+		if $test {
+			set strStatus = $$CreateLines^INRECTFRLine(objREC,pidTFR,.arrObjLines)
+			if $$$ISOK(strStatus) {
+				//SR15177 - incorrect, and it is caught below.
+				//set strStatus = $listbuild("IN00529")  ; There are no lines to receipt.
+				
+				set idStore = ""
+				for {
+					set idStore = $order(arrObjLines(idStore))
+					quit:idStore=""
+					
+					set idDemand = ""
+					for {
+						set idDemand=$order(arrObjLines(idStore,idDemand))
+						quit:idDemand=""
+						
+						set loop = ""
+						for {
+							set loop = $order(arrObjLines(idStore,idDemand,loop))
+							quit:loop=""
+							
+							set objLine = arrObjLines(idStore,idDemand,loop)
+							if +$$$INRECLineQuantity(objLine)'=0 {
+								set blnAllZero = $$$NO
+								set idRECLine  = $increment(intCount)
+								set strStatus  = $$$Save("INRECLine",idREC_$$$COMMA_idRECLine,objLine,$$$YES)
+							}
+							quit:$$$ISERR(strStatus)
+						}
+						quit:$$$ISERR(strStatus)
+					}
+					quit:$$$ISERR(strStatus)
+				}
+			}
+	;***************************************
+			LOCK -^INTFR(0,pidTFR,1)#"I"
+	;***************************************
+		
+		} else {
+			set strStatus = $listbuild("IN00530",pidTFR)
+		}  ; "Unable to lock Transfer Order '%1'."
+		
+		if $$$ISOK(strStatus) && blnAllZero {
+			set strStatus = $listbuild("IN00529")
+		}  ; "This transfer has been fully received."
+	}
+	
+	quit strStatus
+	
+]]></Routine>
+</Export>

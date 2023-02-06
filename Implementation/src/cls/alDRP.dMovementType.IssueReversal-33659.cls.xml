@@ -1,0 +1,323 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alDRP.dMovementType.IssueReversal">
+<ClassType>serial</ClassType>
+<IncludeCode>INConst</IncludeCode>
+<Super>alDRP.dMovementType</Super>
+
+<Property name="MovementTypeId">
+<Type>alSYS.dt.dtInteger</Type>
+<InitialExpression>"22&quot;</InitialExpression>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="AL00475"/>
+</Property>
+
+
+<Method name="Validate">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; History
+	; 30-Mar-2009   PPP SR16???: Created
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+	if pobjMove.Completed {
+		set strMessage = $$$Text("IN00711")      ; "This movement is already completed."
+		set sc =$$$ERROR($$$GeneralError,strMessage)
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="Confirm">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+#define enumAverageCost		9
+	;-------------------------------------------------------------------------------
+	; Update the BundleStock and StockHistory plus incidentals and then back
+	; populate the V1 data.
+	;
+	; 
+	; History
+	; 02-Dec-2014	SCR		ALPHAUP-328: Check for return from patient (No From Loc)
+	; 04-Aug-2010	SCR		SR17387: Pass Source Details to Auto Adjust.
+	; 12-Jul-2010	SCR		SR17387: Pass Source Details, Form & Rec to Finance
+	; 16-Mar-2010	GRF		SR17229: Need to make interface record a reversal of issue
+	; 							(i.e. sign changes while swapping From and To)
+	; 19-Nov-2009	GRF		SR16471: Change scope of lock by making it a global
+	; 11-Nov-2009	GRF		SR16871: relocate unlock to cover data being updated;
+	; 							replace old version with cleanup
+	; 09-Nov-2009	GRF		SR16871: Check From/To Cost Centres - update avg cost if
+	; 							they differ; use idItem
+	; 02-Nov-2009	GRF		SR16871: INItemCost with location replaces INARTKOST;
+	; 							Remove ConfirmMovement
+	; 21-Oct-2009	GRF		SR16875: TxnValue should be extended cost
+	; 25-Sep-2009	PPP		SR16909: Bug Fix - Location changed to ToLocn
+	; 21-Sep-2009	GRF		SR16361: ConfirmMovement returns strStatus
+	; 14-Sep-2009	DWR		SR16880: call to new alSFI.dStockFin class
+	; 30-Mar-2009   PPP		SR16???: Created
+	;--------------------------------------------------------------------------------
+	set sc     = $$$OK
+	set idItem = pobjMove.Item.ItemId
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	LOCK +^alSOHProcessing(idItem):2
+	if '$test {
+		set strMessage = $$$Text($listbuild("IN00853",idItem))
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+	;  "Can not acquire a lock for Item: (%1) please try again"
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	} else {
+		set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+	
+	; Update Average Costs if cost centres differ - BEFORE Post called so get correct QOH for ToLocn  ; SR16871
+	;---------------------------------------
+		set dteTrans    = pobjMove.TransferDate
+		set idToLocn    = pobjMove.ToLocn.Code
+		set idCCReceive = $$GetCostCentre^INCostCentre(pobjMove.FromLocn.Code)
+		set idCCSend    = $$GetCostCentre^INCostCentre(idToLocn)
+		set fltTfrCost  = $$TransferCost^INItemCost(idItem,fltCost,idCCSend,idCCReceive)
+		
+		if idCCSend'=idCCReceive {
+			set strReceiptRef = "0,0,"_idToLocn_","_pobjMove.ToStorage.Code_","_dteTrans_","_pobjMove.Reference_","_pobjMove.LineNumber_",T"
+			set curNewAvg     = $$UpdateCost^INAvgCost(idItem,idToLocn,pobjMove.QtyPicked,fltTfrCost,strReceiptRef,idCCSend)
+		}
+	
+	; Issue Reverse
+	;---------------------------------------
+		if pobjMove.FromLocn'=$$$NULLOREF {
+			set objTransType   = ##class(alSOH.dTransactionType).%OpenId(7)
+			set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove, 
+														   pobjMove.FromLocn,
+														   pobjMove.FromStorage,
+														   -pobjMove.QtyReceived,
+														   fltCost,
+														   objTransType,
+														   .sc)
+		
+			set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist)
+		}
+	
+		if $$$ISOK(sc) {
+			set objTransType = ##class(alSOH.dTransactionType).%OpenId(8)
+		
+			set objToStkHist = ##class(alSOH.piSOH).Post(pobjMove, 
+														 pobjMove.ToLocn,
+														 pobjMove.ToStorage,
+														 pobjMove.QtyReceived,
+														 fltCost,
+														 objTransType,
+														 .sc)
+		
+			set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objToStkHist)
+		}
+	;+++++++++++++++++++++++++++++++++++++++ ; SR16871
+		LOCK -^alSOHProcessing(idItem)
+	;+++++++++++++++++++++++++++++++++++++++
+	}
+			
+	; Stock to Finance Interface            ; SR16880
+	;---------------------------------------
+	if $$$ISOK(sc) {
+		set objStockFin = ##class(alSFI.dStockFin).%New()
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "MVI"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.IssueReversal"
+		set objStockFin.TxnInformation = "Issue Reversal"
+		set objStockFin.Item           = pobjMove.Item
+	; SR17229 vvv	
+		set objStockFin.Quantity       = -pobjMove.QtyReceived
+		set objStockFin.TxnValue       = -fltCost * pobjMove.QtyReceived
+		set objStockFin.FromLocn       = pobjMove.ToLocn
+		set objStockFin.FromStorage    = pobjMove.ToStorage
+		set objStockFin.ToLocn         = pobjMove.FromLocn               //SR16909
+		set objStockFin.ToStorage      = pobjMove.FromStorage
+		set objStockFin.SourceRec      = pobjMove.Reference              ; SR17387
+		set objStockFin.SourceForm     = "INIssueRev"                    ; SR17387
+		set objStockFin.SourceDetail   = 34349_","_pobjMove.Reference_","_pobjMove.LineNumber ; SR17387
+		                                 ; "Issue Reverse %1, Line %2"
+	/*
+		set objStockFin.Quantity       = pobjMove.QtyReceived
+		set objStockFin.TxnValue       = fltCost * pobjMove.QtyReceived
+		set objStockFin.FromLocn       = pobjMove.FromLocn
+		set objStockFin.FromStorage    = pobjMove.FromStorage
+		set objStockFin.ToLocn         = pobjMove.ToLocn               //SR16909
+		set objStockFin.ToStorage      = pobjMove.ToStorage
+	*/  ; SR17229 ^^^
+	
+		set sc = objStockFin.StockToFin()
+		
+		set YUSER =%("%KEY","YUSER") 
+		set:YUSER="" YUSER=" "
+		
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		if $$$ISOK(sc) set ^CacheTemp(YUSER,"FIBURecord") = $$$YES
+	}
+	
+	; Adjust Stock Values if cost centres differ - AFTER Post called so QOH updated in INStockVal    ; SR16871
+	;---------------------------------------
+	if $$$ISOK(sc) && (idCCSend'=idCCReceive) {
+		;set strStatus = $$AutoUpdate^INStockValCCAdj("ReqReverse",pobjMove.Reference_","_pobjMove.LineNumber,idItem,idCCSend,curNewAvg)
+		set strStatus = $$AutoUpdate^INStockValCCAdj("ReqReverse",pobjMove.Reference_","_pobjMove.LineNumber,idItem,idCCSend,curNewAvg,objStockFin)  ; SR17387
+		set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"Error Updating Stock Values")
+	}
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="OldConfirm">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// * * *   D O   N O T   U S E   T H I S   M E T H O D   * * *
+#define enumAverageCost		9
+	;-------------------------------------------------------------------------------
+	; Update the BundleStock and StockHistory plus incidentals and then back
+	; populate the V1 data.
+	;
+	; 
+	; History
+	; 19-Nov-2009	GRF		SR16471: Change scope of lock by making it a global
+	; 09-Nov-2009	GRF		SR16871: Check From/To Cost Centres - update avg cost if
+	; 							they differ; use idItem
+	; 02-Nov-2009	GRF		SR16871: INItemCost with location replaces INARTKOST;
+	; 							Remove ConfirmMovement
+	; 21-Oct-2009	GRF		SR16875: TxnValue should be extended cost
+	; 25-Sep-2009	PPP		SR16909: Bug Fix - Location changed to ToLocn
+	; 21-Sep-2009	GRF		SR16361: ConfirmMovement returns strStatus
+	; 14-Sep-2009	DWR		SR16880: call to new alSFI.dStockFin class
+	; 30-Mar-2009   PPP		SR16???: Created
+	;--------------------------------------------------------------------------------
+	set sc = $$$OK
+
+	set idItem = pobjMove.Item.ItemId
+	
+	lock +^alSOHProcessing(idItem):2
+	if '$test {
+		set strMessage = $$$Text($listbuild("IN00853",idItem))
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+	;  "Can not acquire a lock for Item: (%1) please try again"
+	
+	} else {
+		lock -^alSOHProcessing(idItem)
+	;	set fltCost = $$GetCostV2^INARTKOST(idItem) ; SR16871
+		set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+	}
+	
+	; Update Average Costs if cost centres differ - BEFORE Post called so get correct QOH for ToLocn  ; SR16871
+	;---------------------------------------
+	if $$$ISOK(sc) {
+		set dteTrans    = pobjMove.TransferDate
+		set idToLocn    = pobjMove.ToLocn.Code
+		set idCCReceive = $$GetCostCentre^INCostCentre(pobjMove.FromLocn.Code)
+		set idCCSend    = $$GetCostCentre^INCostCentre(idToLocn)
+		set fltTfrCost  = $$TransferCost^INItemCost(idItem,fltCost,idCCSend,idCCReceive)
+		
+		if idCCSend'=idCCReceive {
+			set strReceiptRef = "0,0,"_idToLocn_","_pobjMove.ToStorage.Code_","_dteTrans_","_pobjMove.Reference_","_pobjMove.LineNumber_",T"
+			set curNewAvg     = $$UpdateCost^INAvgCost(idItem,idToLocn,pobjMove.QtyPicked,fltTfrCost,strReceiptRef,idCCSend)
+		}
+	}
+	
+	; Issue Reverse
+	;---------------------------------------
+	if $$$ISOK(sc) {
+		set objTransType   = ##class(alSOH.dTransactionType).%OpenId(7)
+		set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove, 
+													   pobjMove.FromLocn,
+													   pobjMove.FromStorage,
+													   -pobjMove.QtyReceived,
+													   fltCost,
+													   objTransType,
+													   .sc)
+		
+		set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist)
+	}
+	
+	if $$$ISOK(sc) {
+		set objTransType = ##class(alSOH.dTransactionType).%OpenId(8) //SR15813:
+		
+		set objToStkHist = ##class(alSOH.piSOH).Post(pobjMove, 
+													 pobjMove.ToLocn,
+													 pobjMove.ToStorage,
+													 pobjMove.QtyReceived,
+													 fltCost,
+													 objTransType,
+													 .sc)
+		
+		set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objToStkHist) ; 18-Aug-2008 HQN SR15801
+	}
+			
+	; Stock to Finance Interface            ; SR16880
+	;---------------------------------------
+	if $$$ISOK(sc) {
+		set objStockFin = ##class(alSFI.dStockFin).%New()
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "MVI"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.IssueReversal"
+		set objStockFin.TxnInformation = "Issue Reversal"
+		set objStockFin.Item           = pobjMove.Item
+		set objStockFin.Quantity       = pobjMove.QtyReceived
+	;	set objStockFin.TxnValue       = fltCost                  ; SR16875
+		set objStockFin.TxnValue       = fltCost * pobjMove.QtyReceived
+		set objStockFin.FromLocn       = pobjMove.FromLocn
+		set objStockFin.FromStorage    = pobjMove.FromStorage
+		set objStockFin.ToLocn         = pobjMove.ToLocn	//SR16909
+		set objStockFin.ToStorage      = pobjMove.ToStorage
+		
+		set sc = objStockFin.StockToFin()
+		
+		set YUSER =%("%KEY","YUSER") 
+		set:YUSER="" YUSER=" "
+		
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		if $$$ISOK(sc) set ^CacheTemp(YUSER,"FIBURecord") = $$$YES
+	}
+	
+	; Adjust Stock Values if cost centres differ - AFTER Post called so QOH updated in INStockVal    ; SR16871
+	;---------------------------------------
+	if $$$ISOK(sc) && (idCCSend'=idCCReceive) {
+		set strStatus = $$AutoUpdate^INStockValCCAdj("ReqReverse",pobjMove.Reference_","_pobjMove.LineNumber,idItem,idCCSend,curNewAvg)
+		set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"Error Updating Stock Values")
+	}
+	
+	/* ; SR16871 vvv
+	; Back Populate V1
+	;---------------------------------------
+	if $get(^SysSetup("KeepOldStockHistory")) && $$$ISOK(sc) {
+		set strStatus = $$ConfirmMovement^INStockMovement(idItem,
+												          pobjMove.Bundle,
+												          pobjMove.QtyReceived,
+												          pobjMove.FromLocn.Code,
+												          pobjMove.FromStorage.Code,
+												          pobjMove.ToLocn.Code,
+												          pobjMove.ToStorage.Code,
+												          pobjMove.MovementType.MovementTypeId,
+												          pobjMove.Reference,
+												          pobjMove.LineNumber)
+	
+		set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"Error Back Populating INWE") ///$$$Text("IN00711"))
+	}
+	*/ ; SR16871 ^^^
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="Default">
+<Type>%Library.CacheSerialState</Type>
+<Data name="dMovementTypeState">
+<Subscript>"alDRP.dMovementType"</Subscript>
+<Value name="1">
+<Value>MovementTypeId</Value>
+</Value>
+<Value name="2">
+<Value>Reference</Value>
+</Value>
+</Data>
+</Storage>
+</Class>
+</Export>

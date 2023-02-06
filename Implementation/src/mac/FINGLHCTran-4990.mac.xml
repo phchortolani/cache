@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLHCTran" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLHCTran  ; GL Health Check for Transactions
+	#Include FINHC
+	#define Check "^CacheTemp(YUSER,""FINGLHCTran"")"
+ 
+	
+Transaction(Start="",End="",Location="",Level="",Result)
+	;-------------------------------------------------------------------------------
+	; Check For
+	; 1 There is 1 Top Account
+	; 2 There Balance is zero
+	; 3 All Periods Amount are zero
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Apr-2005		RobertW		SR12159: Make sure that FINGLTranType is no longer shared.
+	; 09-Mar-2004		SCR		Creation
+	;-------------------------------------------------------------------------------
+ 	;
+ 
+	new Status,ErrorCount,ParentCount,Acc,Rec,Bal
+	new Period,Type,TypeRec,PeriodAmount
+	
+	set Status=$$$OK
+	set ErrorCount=0
+	set ParentCount=0
+	set Acc=""
+	kill Result  				; Clear Result
+ 
+	for {
+		set Acc=$order(^FINGLAccount(YM,Acc))
+		quit:Acc=""
+		set Rec=$get(^FINGLAccount(YM,Acc,1))
+		if $$$FINGLAccountAccountType(Rec)=$$$EnumFINGLACCOUNTTYPETopAccount {
+			set ParentCount=ParentCount+1
+			; Balance = zero check
+			set Bal=$get(^FINGLAccountTotal(YM,Acc,"BAL",1))
+			if Bal {
+				set Status='$$$OK
+				set Result("Hash",Acc_" Bal")=1
+			}
+			set Period=""
+			for {
+				set Period=$order(^FINGLPeriodTotal(YM,Acc,Period))
+				quit:Period=""
+				set Type=""
+				for {
+					set Type=$order(^FINGLPeriodTotal(YM,Acc,Period,Type))
+					quit:Type=""
+					set PeriodAmount=$get(^FINGLPeriodTotal(YM,Acc,Period,Type,1))
+					set TypeRec=$get(^FINGLTranType(YM,Type,1))
+					if ('$$$FINGLTranTypeBudget(TypeRec))&&(PeriodAmount) {
+						set Result("Hash",Acc_" Per "_Period_" "_Type)=PeriodAmount
+						set Status='$$$OK
+					}
+				}
+			}
+		}
+		
+	}
+	if Status=$$$OK {
+		set Status=2  ; Because this is a Standalone Check return 2 if Ok
+	}
+	Quit Status
+ 
+ 
+TransactionAccount(Start="",End="",Location="",Level="",Result)
+    ;-------------------------------------------------------------------------------
+    ; Check that each transaction points to a defined transaction account.
+    ; 1. Checks that Transaction exists
+    ; 2. Checks that Account exists.
+    ; 3. Checks that Account is a transaction account
+    ; 
+    ; Returns:
+    ;
+    ; History:
+    ; 22-Mar-2004		shobby			Created
+    ;-------------------------------------------------------------------------------
+	;
+	new strStatus,idxTransaction,idxNumber,objFINGLTranLine,idAccount,objFINGLAccount
+	new strAccountUsage
+	
+	kill Result
+	set idxTransaction=""
+	set strStatus=$$$OK
+	for {
+		set idxTransaction=$order(^FINGLTranLine(YM,idxTransaction))
+		quit:idxTransaction=""
+		set idxNumber=""
+		for {
+			set idxNumber=$order(^FINGLTranLine(YM,idxTransaction,idxNumber))
+			quit:idxNumber=""
+			set objFINGLTranLine=$get(^FINGLTranLine(YM,idxTransaction,idxNumber,1))
+			if objFINGLTranLine="" {
+				set Result("Hash","Transaction:"_idxTransaction_" No.:"_idxNumber)="Missing"
+				set strStatus='$$$OK
+			} else {
+				set idAccount=$$$FINGLTranLineAccount(objFINGLTranLine)
+				set objFINGLAccount=$get(^FINGLAccount(YM,idAccount,1))
+				if objFINGLAccount="" {
+					set Result("Hash","Account:"_idAccount)="Missing"
+					set strStatus='$$$OK
+				} else {
+					set strAccountUsage=$$$FINGLAccountAccountUsage(objFINGLAccount)
+					if strAccountUsage'=$$$EnumFINGLACCOUNTUSAGETransaction {
+						set Result("Hash","Transaction ("_idxTransaction_","_idxNumber_")")="Account '"_idAccount_"' is not a Transaction Account"
+						set strStatus='$$$OK
+					}
+				}
+			}
+		}
+	}
+	if strStatus=$$$OK {
+		set strStatus=2  ; Because this is a Standalone Check return 2 if Ok
+	}
+	quit strStatus
+ 
+ 
+InterfaceBatch(Start="",End="",Location="",Level="",Result)
+    ;-------------------------------------------------------------------------------
+    ; Check that the total of each Interface batch is equal to 0.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 22-Mar-2004		shobby			Created
+    ;-------------------------------------------------------------------------------
+ 
+	new strStatus,idxBatch,idxNumber,objFININTBatchLine,fltTotal,strBlock
+	set strStatus=$$$OK
+	
+	kill Result
+	set idxBatch=""
+	for {
+		set idxBatch=$order(^FININTBatchLine(YM,idxBatch))
+		quit:idxBatch=""
+		set idxNumber=""
+		set fltTotal=0
+		for {
+			set idxNumber=$order(^FININTBatchLine(YM,idxBatch,idxNumber))
+			quit:idxNumber=""
+			set objFININTBatchLine=$get(^FININTBatchLine(YM,idxBatch,idxNumber,1))
+			set fltTotal=fltTotal+$$$FININTBatchLineAmount(objFININTBatchLine)
+		}
+		if fltTotal'=0 {
+			set strStatus='$$$OK
+			; Now drill down to find the troublesome block number(s)
+			do GetBadBlocks(idxBatch,.Result)
+		}
+	}
+	if strStatus=$$$OK {
+		set strStatus=2  ; Because this is a Standalone Check return 2 if Ok
+	}
+	quit strStatus
+	
+ 
+GetBadBlocks(pidBatch,Result)
+    ;-------------------------------------------------------------------------------
+    ; Identifies the Block which has a non zero balance.  Used by InterfaceBatch
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 24-Oct-2006	JW			SR15101: Index Batch number!
+    ; 01-Dec-2005	RPW			SR13916: Make sure we test the single/last block.
+    ; 21-Apr-2004	shobby		Need to check for 0 total on change of minor block number as well.
+    ; 22-Mar-2004	shobby		Created
+    ;-------------------------------------------------------------------------------
+	new strBlockMajor,strBlockMinor,node,strBlockMajorPrevious,fltTotal,idxNumber,idBatch
+	new strBlock,objFININTBatchLine,strBlockMinorPrevious
+	
+	set strBlockMajor=""
+	set strBlockMajorPrevious=""
+	set strBlockMinorPrevious=""
+	set fltTotal=0
+	set node=$query(^FININTBatchLines(YM,1,$$$Index(pidBatch),""))		//SR15101
+	if node'="" {
+		for {
+			quit:node=""
+			set idBatch=$qs(node,3)
+			quit:(idBatch'=pidBatch)
+			set strBlockMajor=$qs(node,4)
+			set strBlockMinor=$qs(node,5)
+			set idxNumber=$qs(node,7)
+			set objFININTBatchLine=$get(^FININTBatchLine(YM,pidBatch,idxNumber,1))
+			if objFININTBatchLine'="" {
+				if (strBlockMajor'=strBlockMajorPrevious)||(strBlockMinor'=strBlockMinorPrevious) {
+					if fltTotal'=0 {
+						set strBlock=strBlockMajorPrevious
+						if $translate(strBlockMinorPrevious," ")'="" {
+							set strBlock=strBlock_"."_strBlockMinorPrevious	
+						}
+						set Result("Hash","Batch:"_pidBatch_","_strBlock)="Total ("_fltTotal_") should be 0."
+						set fltTotal=0
+					}
+				}
+				set strBlockMajorPrevious=strBlockMajor
+				set fltTotal=fltTotal+$$$FININTBatchLineAmount(objFININTBatchLine)
+				set strBlockMinorPrevious=strBlockMinor
+			}
+			set node=$query(@node)
+		}
+	}
+	
+	if fltTotal'=0 {
+		set strBlock=strBlockMajorPrevious
+		if $translate(strBlockMinorPrevious," ")'="" {
+			set strBlock=strBlock_"."_strBlockMinorPrevious	
+		}
+		set Result("Hash","Batch:"_pidBatch_","_strBlock)="Total ("_fltTotal_") should be 0."
+		set fltTotal=0
+	}
+	
+	quit
+ 
+ 
+ForeignCurrencyAccount(Start="",End="",Location="",Level="",Result)
+    ;-------------------------------------------------------------------------------
+    ; Determines if the balance of a FC Account is equal to the FC transactions.
+    ; 
+    ; Note **********   Not Completed  ************************
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 24-Mar-2004		shobby			Created
+    ;-------------------------------------------------------------------------------
+ 
+	new strStatus,idFINGLAccount,objFINGLAccount,idCurrency,idCurrencyFluctuation
+	new fltAmount,idTransaction,idNumber,objFINGLTranLine
+	
+	set strStatus=$$$OK
+	set idCurrency=" "
+	for {
+		set idCurrency=$order(^FINGLAccounts(YM,5,idCurrency))
+		quit:idCurrency=""
+		set idCurrencyFluctuation=$order(^FINGLAccounts(YM,5,idCurrency,""))  ; there can be only one.
+		set idFINGLAccount=$order(^FINGLAccounts(YM,5,idCurrency,idCurrencyFluctuation,""))
+		set idTransaction=""
+		set fltAmount=0
+		for {
+			set idTransaction=$order(^FINGLTranLines(YM,50,idTransaction))
+			quit:idTransaction=""
+			set idNumber=""
+			for {
+				set idNumber=$order(^FINGLTranLines(YM,50,idTransaction,idNumber))
+				quit:idNumber=""
+				set objFINGLTranLine=$get(^FINGLTranLine(YM,idTransaction,idNumber,1))
+				set fltAmount=fltAmount+$$$FINGLTranLineDebit(objFINGLTranLine)
+				set fltAmount=fltAmount-$$$FINGLTranLineCredit(objFINGLTranLine)
+			}
+		}
+		if fltAmount'=0 {
+			set Result("Hash","Foreign Currency Account:"_idFINGLAccount)="Total ("_fltAmount_") should be 0."
+			set strStatus='$$$OK
+		}
+	}
+	if strStatus=$$$OK {
+		set strStatus=2  ; Because this is a Standalone Check return 2 if Ok
+	}
+	
+	quit strStatus
+ 
+ 
+TransactionFromPostedTransactionBatch(Start="",End="",Location="",Level="",Result)
+    ;-------------------------------------------------------------------------------
+    ; All Transactions must come from a posted Transaction Batch
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 13-Apr-2004	   Shobby		   Created
+    ;-------------------------------------------------------------------------------
+	quit
+ 
+ 
+ 
+ 
+CheckSource(Start="",End="",Location="",Level="",Result)
+    ;-------------------------------------------------------------------------------
+    ; Checks that the source that created the FINGLTran exists.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 18-May-2004   Shobby   Created
+    ;-------------------------------------------------------------------------------
+	;
+	new strStatus,objFINGLTran,idFINGLTran,strSource,blnData,intErrorCounter
+ 
+	if $get(Y)="" do ^WWWVAR
+	kill Result
+	set strStatus=$$$OK
+	set intErrorCounter=0
+	
+	set idFINGLTran=""
+	for {
+		set idFINGLTran=$order(^FINGLTran(YM,idFINGLTran))
+		quit:idFINGLTran=""
+		set objFINGLTran=$get(^FINGLTran(YM,idFINGLTran,1))
+		set strSource=$$$FINGLTranSource(objFINGLTran)
+		set strSource("Id")=$piece(strSource,YKOMMA,1)
+		set strSource("Class")=$piece(strSource,YKOMMA,2)
+		set blnData=""
+		w !,idFINGLTran
+		xecute "set blnData=$data(^"_strSource("Class")_"(YM,"_strSource("Id")_",1))"
+		if blnData=0 {
+			set Result("Hash","Error No. "_$i(intErrorCounter))="Source record for ^FINGLTran("_YM_YKOMMA_idFINGLTran_YKOMMA_"1) not found.  Should be ^"_strSource("Class")_"("_YM_YKOMMA_strSource("Id")_YKOMMA_"1)."
+			set strStatus='$$$OK
+		}
+	}
+	
+	if strStatus=$$$OK {
+		set strStatus=2  ; Because this is a Standalone Check return 2 if Ok
+	}
+	quit strStatus
+ 
+]]></Routine>
+</Export>

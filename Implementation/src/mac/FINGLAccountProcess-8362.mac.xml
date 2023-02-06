@@ -1,0 +1,468 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLAccountProcess" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLAccountProcess ; Account Processing , Security
+	
+#include COMSYS
+#Include FINConst
+	
+AddAmount(pidAccount,pcurAmount,pdteTransDate,pidTranType,pstrAccountTotalType,pblnForce=0,pblnStore=$$$NO)
+	/*-------------------------------------------------------------------------------
+	; Adds an amount to an account total and period total, then recursively looks up 
+	; account tree adding the amount.
+	;
+	; Returns:Status
+	; 
+	; History
+	; 11-Oct-2005	RPW		SR13639: Added pblnStore to handle not directly saving data now, but put it off until later
+	; 01-Sep-2004	JW		SR10409 : Add amount to Roll Up Accounts
+	; 08-Sep-2004	shobby	$$$FCBase SR10349
+	; 02-Jun-2004	SCR		FC Upgrade & Single Amount
+	; 14-May-2004	shobby	Amounts should be added to period totals regardless of
+	; 						AccountTotalType (highlighted by Health Checks), this
+	; 						reverses change done for (TR00519)
+	; 12-May-2004	shobby	Update Parent account regardless of AccountTotalType (TR007707)
+	; 16-Sep-2003	ms/sh/pk Update Account total regardless of AccountTotalType (TR005875)
+	; 16-Sep-2003	shobpk	Added Force flag to post to closed periods
+	; 04-Jul-2003	shobby	Don't post to account if not Financial transaction (TR005519)
+	; 18-Mar-2003			
+	; 14-Mar-2003	shobby	Prevent posting a foreign currency amount to an account
+	; 						not set up for that Currency.
+	; -----------------------------------------------------------------------------*/
+	new idParent,strStatus,objAccount
+	new count,idRollUp,rollUpTos,curBase
+	
+	set objAccount=$get(^FINGLAccount(0,pidAccount,1))
+	set strStatus=$$$OK
+	set strStatus=$$AddAccountTotal(pidAccount,pcurAmount,pstrAccountTotalType,pblnForce,pblnStore) ; SR13639
+	if pstrAccountTotalType="BAL" {
+		if $$$ISOK(strStatus) set strStatus=$$AddAmount^FINGLPeriodTotal(pidAccount,pdteTransDate,pidTranType,pcurAmount,pblnForce)
+	}
+	if $$$ISOK(strStatus) {
+		set idParent=$$$FINGLAccountParent(objAccount)  ;parent account
+		set curBase=$$$FCBase(pcurAmount)
+		if (idParent'="") set strStatus=$$AddAmount(idParent,curBase,pdteTransDate,pidTranType,pstrAccountTotalType,pblnForce,pblnStore) ; SR13639
+		
+		set rollUpTos = $$$FINGLAccountRollUpTo(objAccount) ; SR10409 roll up accounts
+		if rollUpTos'="" {
+			for count=1:1:$length(rollUpTos,";") {
+				set idRollUp = $piece(rollUpTos,";",count)
+				set strStatus=$$AddAmount(idRollUp,curBase,pdteTransDate,pidTranType,pstrAccountTotalType,pblnForce,pblnStore) ; SR13639
+			}
+		}
+	}
+	quit strStatus
+	
+	
+CanPostToThisAccount(pidAccount,pcurAmount)
+	; ------------------------------------------------------------------------------
+	; Check the Foreign Currency details to see if this value can be posted to
+	; this account.
+	;
+	; History
+	; 11-Jan-2005	PO		SR11389 If no currency detailed in strAmountCurrency use
+	; 						standard currency
+	; 21-Sep-2004	shobby	Disable preventing posting to accounts when Currencies
+	; 						don't match.  Will allow this but the amounts will be
+	; 						translated in the AddAmount
+	; 02-Jun-2004	SCR		FC Update
+	; 02-Apr-2004	shobby	Returned number of account if can't post because it is
+	; 						on hold. (TR007478)
+	; 20-Mar-2003	shobby	Only test security if permissions have been set.
+	; 19-Mar-2003	shobby	Test 3 - Appropriate security permissions
+	; 19-Mar-2003	shobby	Expanded tests to include whether the account is on hold.
+	; 14-Mar-2003	shobby	Creation
+	; ------------------------------------------------------------------------------
+	new objAccount,strAccountCurrency,strAmountCurrency,strStatus,TranCurrency
+	
+	set strStatus=$$$OK
+	set objAccount=$get(^FINGLAccount(0,pidAccount,1))
+	
+	; Test 3 - Appropriate security permissions
+	if $$$FINGLAccountUserAccess(objAccount)'="" {
+		if $find(";"_$$$FINGLAccountUserAccess(objAccount)_";",";"_YBEDBER_";")=0 {
+			set strStatus=$listbuild("Fin00106",pidAccount)
+		}
+	}
+	
+	; Test 2 - that account is not on hold.
+	if $$$FINGLAccountOnHold(objAccount) {
+		set strStatus=$listbuild("Fin00105",pidAccount)		;Can't post to accounts marked as 'On Hold'.
+	}
+	
+	; Test 1 - for matching foreign currency details
+	if $$$ISOK(strStatus) {
+		set strAccountCurrency=$$GetFCCode^FINGLFC(pidAccount)
+		set strAmountCurrency=$$$FCur(pcurAmount)
+		if strAccountCurrency'=strAmountCurrency {
+			if strAccountCurrency="" {
+				;set strStatus=$lb("Fin00096",pidAccount)  ;Cannot post Foreign Currency amounts to account '%1'.
+				set strStatus=$$$OK  ;translate the amount later.
+			} elseif strAmountCurrency="" {
+				set strStatus=$listbuild("Fin00097",$$$FINGLAccountDescription(objAccount),$$GetCurrencyDescription(strAccountCurrency)) ;Account '%1' requires amount to be posted to be of Foreign Currency '%2'.
+			} else {
+				set TranCurrency=$$GetCurrencyDescription(strAmountCurrency) ; SR11389
+				if TranCurrency="" set TranCurrency=$get(YWHR)
+				set strStatus=$listbuild("Fin00095",TranCurrency,$$$FINGLAccountDescription(objAccount),$$GetCurrencyDescription(strAccountCurrency)) ;Currency of '%1' cannot be posted to account '%2', only currencies of '%3'.
+			}
+		}
+	}
+	
+	quit strStatus
+ 
+GetCurrencyDescription(pstrCurrencyKey)
+	; ------------------------------------------------------------------------------
+	; Returns the Description based on the Currency Key.
+	;
+	; History
+	; 17-Mar-2004	shobby	Simplified.
+	; 14-Mar-2003	shobby	Creation
+	; ------------------------------------------------------------------------------
+	quit $get(^WWW100(0,"WAEHRUNG",SPRACHE,pstrCurrencyKey,1))
+ 
+ 
+GetAmount(pidAccount,pcurAmount)
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 14-Sep-2004	shobby	Creation
+    ;-------------------------------------------------------------------------------
+	new curAmount
+	
+	quit $select($$GetFCCode^FINGLFC(pidAccount)="":$$$FCBase(pcurAmount),1:pcurAmount)
+	
+	;if $$GetFCCode^FINGLFC(pidAccount)="" {
+	;	set curAmount=$$$FCBase(pcurAmount)
+	;} else {
+	;	set curAmount=pcurAmount
+	;}
+	;quit curAmount
+	
+AddAccountTotal(pidAccount,pcurAmount,pstrAccountTotalType,pblnForce=0,pblnStore=$$$NO)
+    /*-------------------------------------------------------------------------------
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 21-Oct-2005	PO		SR13891: Corrected use of ^CacheTempFINGLAccountTotal
+    ; 11-Oct-2005	RPW		SR13639: Added pblnStore to handle not directly saving data now, but put it off until later
+    ; 10-Sep-2005	RPW		SR13639: Use the new GetAmount macro instead of the function call.
+	; 21-Sep-2004	shobby	If posting a Foreign Currency amount to a non-foreign
+	; 						currency amount, convert to Base amount.
+    ; 02-Jun-2004	SCR		FC Upgrade & Single Amount
+    ; 18-Mar-2004	shobby	When forcing save values into CacheTemp.  They will be
+    ; 						sent to FINGLAccountTotal later.
+    ; 18-Mar-2004	shobby	Added a force flag for when doing a RepostAllLines.
+    ; 18-Mar-2004	shobby	Replaced Global kill with KILL^FINSYS
+	;-------------------------------------------------------------------------------*/
+	new curAmount,strType,strStatus
+	
+	; look through all of the Account Totals and add the credits/debits
+	set strType=0
+	set strStatus=$$$OK
+	
+	if '$$$FCZero(pcurAmount) {
+		if pblnForce {
+			set curAmount=$get(^CacheTemp("FINGLAccountTotal",YUSER,pidAccount,pstrAccountTotalType))
+			set curAmount=$$$FCAdd(curAmount,pcurAmount)
+			if $$$FCZero(curAmount) {
+				kill ^CacheTemp("FINGLAccountTotal",YUSER,pidAccount,pstrAccountTotalType)
+			} else {
+				set ^CacheTemp("FINGLAccountTotal",YUSER,pidAccount,pstrAccountTotalType)=curAmount
+			}
+		} else {
+			;set curAmount=$piece($get(^FINGLAccountTotal(0,pidAccount,pstrAccountTotalType,1)),Y,1)
+			;set curAmount=$$$FCAdd(curAmount,pcurAmount)
+			
+			 ; SR13639
+			if pblnStore {
+				;if '$data(^CacheTempFINGLAccountTotal(0,pidAccount,","_pstrAccountTotalType,1)) {
+				if '$data(^CacheTempFINGLAccountTotal(YUSER,pidAccount_","_pstrAccountTotalType)) {
+					set curAmount=$piece($get(^FINGLAccountTotal(0,pidAccount,pstrAccountTotalType,1)),Y,1)
+				} else {			
+					;set curAmount=$get(^CacheTempFINGLAccountTotal(0,pidAccount,","_pstrAccountTotalType,1))
+					set curAmount=$get(^CacheTempFINGLAccountTotal(YUSER,pidAccount_","_pstrAccountTotalType))
+				}
+				set curAmount=$$$FCAdd(curAmount,pcurAmount)
+			
+				set ^CacheTempFINGLAccountTotal(YUSER,pidAccount_","_pstrAccountTotalType)=curAmount
+			} else {
+				
+				set curAmount=$piece($get(^FINGLAccountTotal(0,pidAccount,pstrAccountTotalType,1)),Y,1)
+				set curAmount=$$$FCAdd(curAmount,pcurAmount)
+			
+				if $$$FCZero(curAmount) {
+					;kill ^FINGLAccountTotal(0,pidAccount,pstrAccountTotalType,1)
+					do KILL^FINSYS("FINGLAccountTotal",pidAccount_","_pstrAccountTotalType)
+				} else {
+					;set curAmount=$$GetAmount(pidAccount,curAmount)  ;<TODO FC>
+					set curAmount = $$$GetAmount(pidAccount,curAmount)  ;<TODO FC>
+					set strStatus = $$$Save("FINGLAccountTotal",pidAccount_","_pstrAccountTotalType,curAmount,$$$YES)
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+AccountValid(Number,Data)
+	;-------------------------------------------------------------------------------
+	; Account Valid Checking
+	;
+	; History
+	; 13-Dec-2004	GRF		SR10105 : Error message wasn't including Parent (Rule 4)
+	; 27-Sep-2004	JW		SR10409 : Added rule 9,10,11. Editted 2,4,5 to include
+	; 						Stat Accounts.
+	; 09-Jul-2003	SCR		Rule 2 - Bug in Parent type check
+	; 17-Mar-2003	shobby	Rule 8 - Cannot have foreign currency on Parent account.
+	; 14-Mar-2003	shobby	Rule 7 - Cannot change Foreign Currency status if
+	; 						Account has Transactions
+	;-------------------------------------------------------------------------------
+	new Status,Top,Parent,ParentType,Account,CurrentData,Count,Tree
+	set Status=$$$OK
+	;
+	; Rule 1 - there can only be one top account
+	; If this account is a top account , do the only one top account check
+	if $piece(Data,Y,1)=5 {
+		set Top=$order(^FINGLAccounts(0,4,5,""))
+		if Top=Number set Top=$order(^FINGLAccounts(0,4,5,Top)) ; if this account, check for some more.
+		if Top'="" set Status=$listbuild("Fin00029",Top)  ; If a different account, raise an error
+	}
+	
+	; Rule 2 - Except for the top (and stat) accounts, every must have a parent and the parent must be a parent account
+	if (($piece(Data,Y,1)'=5)&&($piece(Data,Y,1)'=7))&(Status=$$$OK) {
+		set Parent=$piece(Data,Y,4)
+		if Parent="" set Status=$listbuild("Fin00030")  ; Must have a parent
+		if Parent'="" {
+			if '$data(^FINGLAccount(0,Parent,1)) set Status=$listbuild("Fin00031",Parent) ; Parent Account does not exist
+			set ParentType=$piece($get(^FINGLAccount(0,Parent,1)),Y,3)
+			if ParentType'=2 set Status=$listbuild("Fin00032")  ; Parent Account is not Parent Type
+		}
+	}
+	
+	; Rule 3 - A Transaction Account can not be a parent account
+	if ($piece(Data,Y,3)=1)&(Status=$$$OK) {
+		if $data(^FINGLAccounts(0,50,Number)) set Status=$listbuild("Fin00033")   ; This Account can not be a Transaction Account when it is a Parent to other Accounts
+	}
+	
+	; Rule 4 - Accounts must point the Top Account (unless stat account)
+	if ($piece(Data,Y,1)'=5)&&($piece(Data,Y,1)'=7)&(Status=$$$OK) {
+		set Account=Number
+		set CurrentData=Data
+		set Count=0
+		for {
+			if Account'=Number set CurrentData=$get(^FINGLAccount(0,Account,1))  ;do this as Current Data has the potential changes, not yet saved to global
+			set Count=Count+1
+			quit:$piece(CurrentData,Y,1)=5  ;Made it to the top.
+			
+			if $data(Tree(Account)) set Status=$listbuild("Fin00034") ; This Account is used as a Parent to it self, Check Struct
+			quit:Status'=1
+			
+			set Tree(Account)=Account			
+			set Parent=$piece(CurrentData,Y,4)
+			if Parent="" set Status=$listbuild("Fin00030")  ;No Parent
+			quit:Status'=1
+			
+		;	if '$data(^FINGLAccount(0,Parent,1)) set Status=$listbuild("Fin00031") ; Parent Account does not exist
+			if '$data(^FINGLAccount(0,Parent,1)) set Status=$listbuild("Fin00031",Parent) ; Parent Account does not exist
+			quit:Status'=1
+			
+			set ParentType=$piece($get(^FINGLAccount(0,Parent,1)),Y,3)
+			if ParentType='2 set Status=$listbuild("Fin00032") quit ; Parent Account is not Parent Type
+			quit:Status'=1
+			
+			set Account=Parent ; Set for the next loop
+			}
+		}
+ 
+	; Rule 5 - Top Account (and stat accts) can not have a parent
+	if (($piece(Data,Y,1)=5)||($piece(Data,Y,1)=7))&(Status=$$$OK) {
+		set Parent=$piece(Data,Y,4)
+		if Parent'="" set Status=$listbuild("Fin00035") ; Top / Statistical Account can not have a Parent
+	}
+ 
+	; Rule 6 - Parent account can not have transactions.
+	if $$$FINGLAccountAccountUsage(Data)=2 do
+	. if $$HasTransactionsEx(Number) do
+	. . set Status=$listbuild("Fin00055")	
+	
+	; Rule 7 - Cannot change Foreign Currency status if Account has Transactions
+	if $$$FINGLAccountCurrency(Data)'=$$$FINGLAccountCurrency($get(^FINGLAccount(0,Number,1))) {
+		if $$HasTransactionsEx(Number) {
+			set Status=$listbuild("Fin00098")
+		}
+	}
+	
+	; Rule 8 - Cannot have foreign currency on Parent account
+	if $$$FINGLAccountAccountUsage(Data)=2 {
+		if $$$FINGLAccountCurrency(Data)'="" {
+			set Status=$listbuild("Fin00101")
+		}
+	}
+	
+	; Rule 9 - Non statistical accounts must have a usage.
+	if ($$$FINGLAccountAccountType(Data)'=$$$EnumFINGLACCOUNTTYPEStatistical) {
+		if $$$FINGLAccountAccountUsage(Data) = "" {
+			set Status=$listbuild("Fin00374")  ; Must choose Account Usage")
+		}
+		
+	} elseif (Status=$$$OK) {  // Statistical accounts
+		
+		; Change Statistical Accounts' Usage to a null value.
+		set $$$FINGLAccountAccountUsage(YFELD) = ""
+		
+		; Rule 10 - Cannot change to Stat Account if have children or transactions 
+		; Is this rule redundant?? (Locked field)
+		set Status = $$HasChildren(Number)
+		
+		if ( Status = $$$OK ) set Status = $$HasTransactions(Number)
+		
+		; Rule 11 - Roll Up To accounts can't be circular
+		if ( Status = $$$OK ) set Status = $$Circular^FINGLStatAccount(Number,Data)
+	}
+	
+	quit Status
+	
+CheckCanDelete(pYKEY,pYFORM)
+	if $$CanDeleteAccount(pYKEY) {
+		set %TXT(1)="#Y"_pYFORM_"M23~"_"READ"
+		set %TXT(1)="#Y"_pYFORM_"M23~1"
+	} else {
+		set %TXT(1)="#Y"_pYFORM_"M23~"_"WRITE"
+		set %TXT(1)="#Y"_pYFORM_"M23~0"
+	}
+	quit
+ 
+CanDeleteAccount(YKEY,pblnIgnoreChildren=$$$NO)
+	;-------------------------------------------------------------------------------
+	;
+	; History
+	; 21-Jun-2004	shobby	Optionally Ignore Children test.
+	; 05-Feb-2003	shobby	Creation
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus=$$$OK
+	
+	if 'pblnIgnoreChildren {
+		set strStatus=$$HasChildren(YKEY)
+	}
+	if $$$ISOK(strStatus) set strStatus=$$HasTransactions(YKEY)
+	
+	quit strStatus
+	
+HasTransactions(YKEY)
+	;-------------------------------------------------------------------------------
+	;
+	; History
+	; 05-Feb-2003	shobby	Creation
+	; 22-Sep-2003	SCR		Check for Null KEY
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus=$$$OK
+	if (YKEY'="")&&($data(^FINGLTranLines(0,1,YKEY))) {
+		set strStatus=$listbuild("Fin00040",YKEY)
+	}
+	;
+	quit strStatus
+ 
+HasTransactionsEx(pidAccount)
+	;-------------------------------------------------------------------------------
+	; History
+	; 14-Feb-2003	shobby	Creation
+	;-------------------------------------------------------------------------------
+	quit $data(^FINGLTranLines(0,1,pidAccount))
+	
+ 
+HasChildren(pYKEY)
+	;-------------------------------------------------------------------------------
+	; can't delete account if account has children
+	; 
+	; History
+	; 
+	;-------------------------------------------------------------------------------
+	new idChild,strStatus
+	
+	set strStatus=$$$OK
+	if $get(pYKEY)'="" {
+		set idChild=$order(^FINGLAccounts(0,50,pYKEY,""))
+		if idChild'="" {
+			set strStatus=$listbuild("Fin00058",pYKEY,idChild)  ;Account Has Children
+		}
+	}
+	quit strStatus
+ 
+CheckForeignCurrencyField()
+	;-------------------------------------------------------------------------------
+	; Hide/Show 'Total Foreign Currency' field based on whether account is set
+	; up for Foreign Currency
+	; 
+	; History
+	; 28-May-2004	SCR		Changed Locking to use Incremental
+	; 20-Mar-2003	shobby	Creation
+	;-------------------------------------------------------------------------------
+	new intDataInputTypeNew,intDataInputTypeOld,objAccount,strLine
+	
+	if YKEY'="" {
+		lock +^FINGLAccountFC
+		set objAccount=$get(^FINGLAccount(0,YKEY,1))
+		set strLine=$get(^WWW122(0,"FINGLAccount",27,1))
+		set intDataInputTypeOld=$piece(strLine,Y,2)
+		if $$$FINGLAccountCurrency(objAccount)="" {
+			set intDataInputTypeNew=15
+		} else {
+			set intDataInputTypeNew=10
+		}
+		if intDataInputTypeOld'=intDataInputTypeNew {
+			set $piece(strLine,Y,2)=intDataInputTypeNew
+			set ^WWW122(0,"FINGLAccount",27,1)=strLine
+		}
+		lock -^FINGLAccountFC
+	}
+	quit
+	
+CheckSecurity(pYKEY)
+	;---------------------------------------------------------------------------
+	; Routine to check whether the current user is allowed access to this record
+	; 
+	; History
+	; 28-Sep-2004	JW		SR10409 : Added statistical page
+	; 14-Apr-2004	shobby	Only disable data input fields.  (TR007417)
+	; 27-Jun-2003	shobby	Also lock the record when it is on hold. (TrackRecord 005497)
+	; 26-Jun-2003	shobby	Used the YVOR technology to make it actually work (TR005453)
+	; 19-Jun-2003	shobby	Creation
+	; --------------------------------------------------------------------------
+	new loop,strSecurity,blnLocked,blnNoAccess
+	
+	set blnNoAccess = ""
+	set blnLocked   = 0
+	
+	if $get(pYKEY)'="" {
+		if (YSEITE=1) || (YSEITE=5) || (YSEITE=7) || (YSEITE=8) {   ; SR10409
+			if $$$FINGLAccountUserAccess(YFELD)="" {
+			} else {
+				set blnNoAccess = $$$EnumReadOnly
+				set strSecurity = ";"_$$$FINGLAccountUserAccess(YFELD)_";"
+				for loop=1:1:$length(YBEDBER,",") {
+					if $find(strSecurity,$piece(YBEDBER,",",loop))>0 {
+						set blnNoAccess = ""
+						quit
+					}
+				}
+			}
+			; Check OnHold
+			if (blnNoAccess="") && ($$$FINGLAccountOnHold(YFELD)) set blnNoAccess=5
+			if (blnNoAccess="") {
+				set blnLocked = ($$$ISERR($$HasChildren(pYKEY))) || ($$$ISERR($$HasTransactions(pYKEY)))
+			}
+		}
+		;
+	}
+	set $$$FINGLAccountLocked(YFELD)             = blnLocked
+	set $$$WWW120AuthorizationToModifyData(YVOR) = blnNoAccess
+	quit (blnNoAccess=$$$EnumReadOnly)
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,1249 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMViewFilterControl" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMViewFilterControl
+    ;-------------------------------------------------------------------------------
+	; Builds and maintains the filter control for COMView.
+    ;-------------------------------------------------------------------------------
+#include COMConst
+#include WWWConst
+#include COMView
+#include %occInclude
+	; 23-Dec-2013	shobby	Resubmit after failed compile due to missing COMConst for COMViewD
+
+	
+#define FirstFilter(%1) ($order(^CacheTempView(YUSER,"Filter",%1),-1)="")
+	
+SetupControls(pidClass) 
+    ;-------------------------------------------------------------------------------
+    ; Create comparator select object
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 13-Nov-2007	GRF		Doco
+    ; 15-Jul-2005	shobby	SR12754: LANGUAGE var changed to SPRACHE (not always reliable)
+    ;-------------------------------------------------------------------------------
+	new idComp,strComp
+	
+	set idComp  = ""
+	set strComp = ""
+	for {
+		set idComp = $order(^WWW101(0,"COMVIEWCOMPARATOR",SPRACHE,idComp))
+		quit:(idComp="")
+		
+		if (strComp'="") set strComp = strComp_","
+		set strComp = strComp_"'"_$$$AppEnum("COMVIEWCOMPARATOR",idComp)_"'"
+	}
+	
+	if (pidClass'="") {
+		&js<
+ objDIV.CreateComp = function(SelectObject,pList) {
+ var arrOpt=new Array(#(strComp)#);
+ var arrList=pList.split(',');
+ while (arrList.length!=0) {
+ var o = document.createElement('option');
+ var value=arrList.shift();
+ o.value=value;
+ o.innerHTML=arrOpt[value-1];
+ SelectObject.appendChild(o);
+ }
+ };
+>
+		do DisplayControls(pidClass)
+	}
+	quit
+ 
+ 
+DisplayControls(pidClass)
+    ;-------------------------------------------------------------------------------
+    ; Shows the controls for favourites
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 29-Jan-2008	shobby	SRBR014551: Don't allow adding of selection controls if
+    ; 							this favourite is based on direct SQL
+    ; 09-Feb-2007	RPW		SR15426: Use correct W3C syntax for getting DOM elements.
+    ; 24-Nov-2004	Paul K	Created
+    ;-------------------------------------------------------------------------------
+    new idField,idFilter,lstFilters,objFilter
+	
+	if pidClass'="" {
+		write "ClearRows(ctrl);",!
+		
+		if $$GetCurrentSQL^COMView(pidClass)="" {  ;BR014551
+			if $get(^CacheTempView(YUSER,"EditMode")) {
+				do CreateFavouriteControl^COMView()
+			} else {
+				write "document.getElementById('hdrctrl').style.display='none';",! // SR15426
+			}
+			
+			set idFilter = ""
+			for {
+				set idFilter = $order(^CacheTempView(YUSER,"Filter",idFilter))
+				quit:idFilter=""
+				
+				set objFilter = $get(^CacheTempView(YUSER,"Filter",idFilter))
+				set idField	  = $$$COMViewFilterField(objFilter)
+				
+				if $get(^CacheTempView(YUSER,"EditMode")) || $$$COMViewFilterDisplay(objFilter) {
+					do CreateControl(pidClass,idFilter)
+				}
+			}
+			do SetInitialFocus(pidClass)
+		}
+	}
+	quit
+	
+	
+SetInitialFocus(pidClass)
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 14-Apr-2005	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new idView,objView,idFilter,objFilter
+	
+	set idView = $$GetCurrentView^COMView(pidClass)
+	if idView'="" {
+		set objView = $get(^COMView(0,pidClass,idView,1))
+		
+		set idFilter = ""
+		for {
+			set idFilter = $order(^CacheTempView(YUSER,"Filter",idFilter))
+			quit:idFilter=""
+			
+			set objFilter = $get(^CacheTempView(YUSER,"Filter",idFilter))
+			quit:$$$COMViewDefaultProperty(objView)=$$$COMViewFilterField(objFilter)
+		}
+		
+		if idFilter="" {
+			set idFilter = ""
+			for {
+				set idFilter = $order(^CacheTempView(YUSER,"Filter",idFilter),-1)
+				quit:idFilter=""
+				
+				set objFilter = $get(^CacheTempView(YUSER,"Filter",idFilter))
+				quit:$get(^CacheTempView(YUSER,"EditMode"))||$$$COMViewFilterDisplay(objFilter)
+			}
+		}
+		
+		if idFilter'="" write "FirstFocus='value"_idFilter_"';"
+	}
+	
+	quit
+	
+	
+CreateControl(pidClass,pidFilter,blnRefresh=$$$NO) 
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Params: pidClass, pidFilter, blnRefresh
+    ;
+    ; ByRefs: 
+    ;
+    ; Returns: Nothing
+    ;
+    ; History:
+    ; 17-Sep-2009	shobby	SR16708: Removed useEventBlur logic from 16521
+	; 06-May-2009	PPP		SR16521: Barcode Scanning to identify Item, 
+	; 						1. If a Quick Search class CreateText uses OnBlur Event
+    ; 07-Apr-2009	PPP		SR16468: Header details - Object Properties to go 
+    ; 							through language translation before display
+    ; 							(WWWClassTranslation)
+    ; 09-Sep-2008	PP		SR15866: Update COMView to Objects
+    ; 21-Feb-2008	shobby	SRBR014900: GetDescription^COMUtilClass moved to COMViewDescription
+    ; 19-Dec-2007	shobby	SRBR014751: Use the form to find relation information.
+    ; 24-Sep-2007   Karine	SR15237: Get the right field description from "GetDescription^COMUtilClass"
+    ; 							GetDescription^COMUtilClass - handle all possibilities
+    ; 							to get the right field name
+    ; 							$$^WWWFELDNAME - does not get the right name if there
+    ; 							is customized names.	
+    ; 09-Feb-2007	RPW		SR15426: If this is a In Form COMView, check if the user
+    ; 							has the priviliges to remove a filter.
+    ; 							Use standard W3C syntax for getting DOM elements
+    ; 20-Feb-2006	PO		SR14250: Source security settings from form related to
+    ; 							data and not COMViewSearch
+    ; 31-Jan-2006	PO		SR14250: Allow filter removal based on priviledge
+    ;-------------------------------------------------------------------------------
+	new blnAllowFieldRemoval,blnFocussed,blnInForm,blnObj,blnUseEventBlur
+	new idClass,idField,idForm,idInputType,idRelationClass,idView
+	new objFilter,objProperty,objRelation,objView,strDescription
+		
+	set blnObj = $get(^CacheTempObj(YUSER,"Object"))	//SR15866
+	if (pidClass'="") && (pidFilter'="") {
+		set idForm      = $get(^CacheTempView(YUSER,"Form")) // SR14250
+		set blnFocussed = 0
+		set objFilter   = $get(^CacheTempView(YUSER,"Filter",pidFilter))
+		set idField     = $$$COMViewFilterField(objFilter)
+		
+		if 'blnRefresh {
+			set blnInForm = $get(^CacheTempView(YUSER,YUCI,"InForm"))
+			set blnAllowFieldRemoval = ( $$HasViewAccess^COMView(YBED,idForm,YM) &&
+			                             ('blnInForm || (blnInForm && $$SuperUser^COMViewUtils())) )
+			//write "window.status=window.status+'."_pidFilter_":"_idField_"';	"		
+			write "CreateControl('"_pidFilter_"','"_idField_"',"_$select(blnAllowFieldRemoval:"true",1:"false")_");"
+		}
+		
+		write "document.getElementById('ctrl"_pidFilter_"_3').innerHTML='';"
+ 
+		if idField'="Custom" {
+			if 'blnObj {		//SR15866
+				set objRelation=$$GetRelation^COMViewUtils(.pidClass,$$$COMViewFilterField(objFilter),.idForm)
+				set idField=$piece(idField,".",$length(idField,"."))
+				write "document.getElementById('ctrl"_pidFilter_"_1').innerHTML='"_$zconvert($$GetDescription^COMViewDescription(pidClass,$extract(idField,1),$extract(idField,2,99)),"o","JS")_"';" ;BR014900
+ 
+				if $$$WWW002InputType(objRelation)=2 {
+					do CreateCheckBox(pidFilter)
+				
+				} else {
+					if ($$$WWW002RelationClass(objRelation)'="")&&(($$$WWW002RelationClass(objRelation)'=pidClass)||'$find($$$COMViewFilterField(objFilter),"P"))&&($$$WWW002InputType(objRelation)'=3) {
+						do CreateCombo^COMViewFilterCombo(pidClass,pidFilter,objRelation)
+					} elseif $find(",1,14,",","_$$$WWW002InputType(objRelation)_",") {  ;date or time stamp.
+						do CreateDate(pidClass,pidFilter)
+					} else {
+						//SR16521
+						;set blnUseEventBlur = $$IsSearchClass^COMQuickSearch(pidClass)  ;16708
+						do CreateText(pidClass,pidFilter)								 ;16708
+					}
+					do CreateComparitor(pidClass,pidFilter,objRelation,$$$COMViewFilterField(objFilter))
+				}
+ 
+			} else {		//SR15866
+ 	 			set strDescription = $$GetTextRelated^WWWClassTranslation(pidClass,idField,$get(SPRACHE)) 		//SR16468
+				//write "document.getElementById('ctrl"_pidFilter_"_1').innerHTML='"_idField_"';"
+				write "document.getElementById('ctrl"_pidFilter_"_1').innerHTML='"_strDescription_"';"
+				
+				set idInputType = $$GetFinalInputType(pidClass,idField)
+ 	 
+				if 1 {	//objProperty '= $$$NULLOREF {             ; FIXME : Remove test
+					//set idInputType = objProperty.Type
+					
+					if $extract(idInputType,1,8)'="alSYS.dt" {
+						set idRelationClass = idInputType
+					}
+ 
+					if idInputType = "alSYS.dt.dtBoolean" {
+						do CreateCheckBox(pidFilter)
+					
+					} elseif (idInputType = "alSYS.dt.dtDate") || (idInputType = "alSYS.dt.dtTimeStamp") {
+						do CreateDate(pidClass,pidFilter)						
+					
+					} else {
+						if (idInputType'=$$$NULLOREF) && ($extract(idInputType,1,8)'="alSYS.dt") {
+							do CreateCombo^COMViewObject(pidClass,pidFilter,idInputType)	//SR16521
+						}  else {
+							;set blnUseEventBlur = $$IsSearchClass^COMQuickSearch(pidClass)	;16708
+							do CreateText(pidClass,pidFilter)								;16708
+						}
+					}
+					do CreateComparitor(pidClass,pidFilter,"",$$$COMViewFilterField(objFilter))
+				}
+			}
+ 
+		} else {
+			do CreateCustom(pidClass,pidFilter)
+			write "document.getElementById('ctrl"_pidFilter_"_1').innerHTML='"_"Custom"_"';"
+		}
+		set idView  = $$GetCurrentView^COMView(pidClass)
+		set objView = $get(^COMView(0,pidClass,idView,1))
+ 
+		write "document.getElementById('display"_pidFilter_"').checked="_$select($$$COMViewFilterDisplay(objFilter):"true",1:"false")_";"
+		write "document.getElementById('group"_pidFilter_"').checked="_$select($$$COMViewFilterGroupBy(objFilter):"true",1:"false")_";"
+		write "document.getElementById('default"_pidFilter_"').checked="_$select(idField=$$$COMViewDefaultProperty(objView):"true",1:"false")_";"
+		write "document.getElementById('ctrl"_pidFilter_"_4').style.display='"_$select($get(^CacheTempView(YUSER,"EditMode")):"inline",1:"none")_"';"
+	}
+	
+	write !
+	
+	quit
+	
+	
+GetFinalInputType(pidClass,pidField)
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Params:
+    ;
+    ; ByRefs:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 09-Sep-2008	PP		SR15866:Update COMView to Objects
+    ;-------------------------------------------------------------------------------
+	new idClass2,idField1,idField2,idInputType1,idInputType2
+	new objProperty1,objProperty2,strType
+	
+	set (idInputType1,idInputType2) = ""
+	
+	set idField1     = $piece(pidField,"->",1)		//$length(idField,"->"))
+	set objProperty1 = ##class(%Library.PropertyDefinition).%OpenId(pidClass_":"_idField1)
+	if objProperty1 '= $$$NULLOREF {
+		set idInputType1 = objProperty1.Type
+	}
+ 
+	set idClass2 = $$GetClass^COMViewObject(pidClass,pidField)
+	set idField2 = $piece(pidField,"->",$length(pidField,"->"))      ; FIXME : Getting piece 1 and piece n - do we need to consider intermediate values?  <GRF>
+	set objProperty2 = ##class(%Library.PropertyDefinition).%OpenId(idClass2_":"_idField2)
+	if objProperty2 '= $$$NULLOREF {
+		set idInputType2 = objProperty2.Type
+	}
+	
+	set strType = ""
+	
+	if idInputType1 = idInputType2 {
+		set strType = idInputType1
+	
+	} elseif (idInputType1="alSYS.dt.dtDate") || (idInputType2="alSYS.dt.dtDate") {
+		set strType = "alSYS.dt.dtDate"
+	
+	} elseif (idInputType1="alSYS.dt.dtBoolean") || (idInputType2="alSYS.dt.dtBoolean") {
+		set strType = "alSYS.dt.dtBoolean"
+	
+	} else {
+		set strType = idInputType1
+	}
+ 
+	quit strType
+	
+	
+CreateText(pidClass,pidFilter,pblnIsDate=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Params:
+    ;
+    ; ByRefs:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 19-Sep-2009	shobby	SR16708: Removed pblnUseEventBlur
+    ; 18-May-2009	PPP		SR16545: As date filter can be a numeric, check if
+    ; 							is <1000 and add $h
+    ; 01-Sep-2008	shobby	SRBR014976: Set the FontFace as per company settings.
+    ; 20-Feb-2008	shobby	SRBR014900: Only display the search value in text boxes.
+    ; 22-Feb-2007	Steve S	SR15440: pblnIsDate parameter
+    ; 09-Feb-2007	RPW		SR15426: Use correct W3C syntax for getting DOM elements.
+    ; 06-Sep-2006	RPW		SRBR014073: Distinguish this as a control instead of data.
+    ; 12-Jul-2006	Pablo	SRBR014073: Display saved dates in favourites
+    ; 30-Jan-2006	PO		SR14245: Enable paste to trigger search
+    ; 10-Feb-2005	PO		SR10965: Changed to handle new return value of DisplayValue.
+    ;-------------------------------------------------------------------------------
+	new lstValue,objFilter,strValue
+	
+	set objFilter = $get(^CacheTempView(YUSER,"Filter",pidFilter))
+	
+	;BR014900 vvv
+	;This is a text box why do we want to add relationship details here?
+	;set lstValue  = $$DisplayValue^COMViewFilter(pidClass,$$$COMViewFilterField(objFilter),$$$COMViewFilterValue1(objFilter),,,,$$$YES) ; SR10965 // SRBR014073
+	;set strValue  = $listget(lstValue,2)
+	set strValue = $$$COMViewFilterValue1(objFilter)
+	;BR014900 ^^^
+	
+	if pblnIsDate && (strValue'="") {
+		if strValue<10000 set strValue = ($horolog + strValue)	//SR16545
+		set strValue=$$$FormatDate(strValue) //SR15440
+	}
+	write "",!
+
+	write $char(9)_"var objText = document.createElement('input');",!
+
+	write $char(9)_"objText.style.fontFamily='"_$$FontFace^WWW012()_"';",!  ; BR014976
+	write $char(9)_"objText.style.verticalAlign='middle';" ;SR17583
+	write $char(9)_"objText.attachEvent(""onkeyup"",ControlChanged);",!
+	write $char(9)_"objText.attachEvent(""onpaste"",ControlChanged);",!
+	write $char(9)_"objText.attachEvent(""onfocusout"",ControlChanged);",!
+	write $char(9)_"objText.attachEvent(""onfocus"",SearchSetFocus);",!
+	//if pblnUseEventBlur write $char(9)_"objText.attachEvent(""onblur"",ControlBlur);",!  ;16708
+	write $char(9)_"objText.id='value'+'"_pidFilter_"';",!
+	write $char(9)_"objText.value='"_$$$JSText(strValue)_"';",!
+	write $char(9)_"objText.initialValue='"_$$$JSText(strValue)_"';",!
+	if (pblnIsDate) {
+		write $char(9)_"objText.setAttribute('type', 'NewDate');",!
+	}
+	write $char(9)_"document.getElementById('ctrl"_pidFilter_"_3').appendChild(objText);",!
+	write $char(9),!
+ 
+	quit
+ 
+CreateDate(pidClass,pidFilter)
+    ;-------------------------------------------------------------------------------
+    ; Create a Date control. Note. probably won't finish in time!!
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 17-Sep-2009	shobby	SR16708:Removed third parameter. (pblnUseEventBlur)
+	; 12-May-2009	PPP		SR16521:Barcode Scanning to identify Item; Removed
+	; 							ControlBlur function, always present, setup in
+	; 							COMViewSetupJS1 was previously only for a Date.
+    ; 09-Feb-2007	RPW		SR15426: Use correct W3C syntax for getting DOM elements.
+    ; 12-Jul-2006	Pablo	SRBR014073: Display saved dates in favourites
+    ; 25-Nov-2004	Paul K	Created
+    ;-------------------------------------------------------------------------------
+    do CreateText(pidClass,pidFilter,$$$YES)
+    quit
+ /* //SR16521  ;16708 can remove this commented code.
+ function ControlBlur() {
+ var el = event.srcElement;
+ var value = el.value;
+ if (event.type == 'paste') { // SR14245
+ value = clipboardData.getData('Text');
+ el.value = value;
+ }
+ alert(event.type + " " + "Date CB")
+ CallBack('ControlBlur^COMViewFilterControl', el.id, value);
+ return true;
+ }
+ */ 
+    // SRBR014073    
+    &js<
+ function ShowDate() {
+ var objText=event.srcElement.parentNode.children[0];
+ CallBack("ShowDatePicker^COMViewFilterControl",objText.id,objText.value);
+ }
+ var objDate=document.createElement('img');
+ objDate.src='#(YGIF)#date.gif';
+ objDate.attachEvent("onclick",ShowDate);
+ objDate.align='absbottom';
+ document.getElementById('ctrl#(pidFilter)#_3').appendChild(objDate);
+ >
+	quit
+	
+	
+ShowDatePicker(pidDate,pstrValue)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	; pidDate	- HTML Id of the date field
+	; pstrValue	- Value / Content of the date field
+	;
+	; Returns:
+	;
+	; History:
+	; 21-Feb-2007	PO		SR15435: Use getElementById for the date field
+	;-------------------------------------------------------------------------------
+	new strLink
+	
+	if YBED["SHOBBY" { //SR17460
+		&js<
+		    objCalendar= new discCalendar();
+			objCalendar.weekend='#($$GetWeekend^WWWCalendar(YLOCATION))#';
+			objCalendar.monthsLong='#($$GetMonthsLong^WWWCalendar())#';
+			objCalendar.daysShort ='#($$GetDaysShort^WWWCalendar())#';
+			
+			objCalendar.holidays.add('19/09');
+			objCalendar.holidays.add('24/09');
+			var result=objCalendar.displayDatePicker('#(pidDate)#');
+		 	//var objText=document.getElementById('#(pidDate)#');
+
+			// if (result != null ) {
+			 //	objText.value=result;
+			// 	objText.fireEvent('onkeyup');
+			// }
+			// objText.focus();
+		    return 1;  //SR17460
+		>
+		quit
+	}
+	set strLink = YAKTION_"EP=WWWFORM&YFORM=WWWCAL2&YUSER="_YUSER_"&YBED="_YBED_"&YUCI="_YUCI_"&YM="_YM_"&YLFDAT="_pidDate
+	
+	&js<
+	var result = window.showModalDialog('#(strLink)#','Calendar','DialogWidth: 290px; DialogHeight: 330px; resizable: no; status: no; scrollbar: no;');
+ 	var objText=document.getElementById('#(pidDate)#');
+
+	 if (result != null ) {
+	 	objText.value=result;
+	 	objText.fireEvent('onkeyup');
+	 }
+	 objText.focus();
+ >
+ 	quit $$$OK
+	
+	
+CreateCheckBox(pidFilter) 
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 13-Aug-2012	shobby	SR18080: Corrected actions of checkboxes.
+	; 19-Jul-2010	GRF		SR17253: function chkDisabled reverted - ctrlPressed is
+	; 							 deprecated in WWWFORMCrossBrowserSupport
+	; 21-Oct-2008	shobby	BR014967: Included lastState property on checkbox so
+	; 							that it will immediately move to the 'ShowAll' when
+	; 							control key is held down when clicking regardless of
+	; 							current state of checkbox.
+    ; 26-Aug-2008	shobby	BR014967: Allow the option of 'ShowAll' on checkbox selectors.
+	; 26-Oct-2005	PO		SR12957: Use defaultChecked instead of checked attr.
+	; 							Reason: On addition of the object into the DOM the
+	; 							object is manipulated so the checked value is false
+	; 							instead of true. This is odd but issue has at least
+	; 							been resolved for IE6.
+	;-------------------------------------------------------------------------------
+	new objFilter
+	
+	set objFilter = $get(^CacheTempView(YUSER,"Filter",pidFilter))
+	set $$$COMViewFilterComparator(objFilter) = $$$EnumCOMVIEWCOMPARATOREquals
+	
+	set ^CacheTempView(YUSER,"Filter",pidFilter) = objFilter
+	
+	&js<
+ 
+ var objCheck= document.createElement('input');
+ objCheck.type='checkbox';
+ objCheck.checkbox='tristate'; //BR014967
+ objCheck.id='value'+'#(pidFilter)#';
+ objCheck.defaultChecked=#(+$$$COMViewFilterValue1(objFilter))#;
+ 
+ var objDisabledCheck=document.createElement('TD');
+ objDisabledCheck.id=objCheck.id+'container';
+ //objDisabledCheck.attachEvent('onclick',ControlChanged);
+ objDisabledCheck.attachEvent('onmousedown',function() { chkDisabled('value'+'#(pidFilter)#')});  //SR18080
+ objDisabledCheck.ctrlKey=false;
+ 
+ if (#(+$$$COMViewFilterValue1(objFilter))#==2) {
+	objCheck.disabled=true;
+ 	objDisabledCheck.ctrlKey=true;
+ }
+ document.getElementById('ctrl#(pidFilter)#_3').appendChild(objDisabledCheck);  //SR17396
+ objDisabledCheck.appendChild(objCheck);
+ 
+function chkDisabled(pid) { //BR014967  			//SR18080
+	var chk		= document.getElementById(pid)		//SR18080
+	var chkcon	= chk.parentNode;
+
+	//if ((window.event && window.event.ctrlKey) || ctrlPressed) {  //SR17253
+
+	if (window.event && window.event.ctrlKey) {  //SR17253
+		if ((chk.checked==true) || (chkcon.lastState!=true)) {
+			chk.disabled=!chk.disabled;
+		}
+		if (chk.disabled==true) {
+			chk.checked=true;
+			chkcon.checked=2;
+		} else {
+			chk.checked==!chkcon.ctrlKey
+			chkcon.checked=+!chk.checked;
+		}
+	} else {
+		chkcon.checked=+!chk.checked;
+		chk.disabled=false;
+	}
+	//chkcon.lastState = window.event ? window.event.ctrlKey : ctrlPressed;  //SR17253   REVERTED
+	chkcon.lastState = window.event.ctrlKey
+	ControlChanged();
+	//chkcon.ctrlKey = window.event ? window.event.ctrlKey : ctrlPressed;  //SR17253   REVERTED
+	chkcon.ctrlKey = window.event.ctrlKey
+ }
+>
+	quit
+	
+	
+ControlChanged(idFilter,strValue,pJSblnSubmit,pblnEnter=$$$NO) ;16708B
+	;-------------------------------------------------------------------------------
+	; 
+	; Called by JS: ControlChanged()
+	; 
+	; Params:	idFilter
+	; 			strValue
+	; 			pJSblnSubmit	- whether to redisplay the grid
+	;
+	; ByRefs:
+	;
+	; Returns:	$$$OK
+	;
+	; History:
+	; 20-Dec-2013	shobby	CORE-299: Update the 'Hide' customisation.
+	; 06-Apr-2009	shobby	SR16443: Update the display of the favourite text depending on the value of
+	; 							the 'Distribute' flag.  (ie Distribute favourites are black others are darkblue)
+	; 04-Sep-2007	shobby	SRBR014677: Cache a temporary change value
+	; 22-May-2007	RPW		SR?: 
+	; 09-Feb-2007	RPW		SR15426: Handle the new Lock field for creating locked
+	; 							favourites. These are used for InForm COMViews,
+	; 							ie Fixed Filters.
+	; 30-Nov-2006	RPW		SR14709: Fixed & usage to handle each piece correctly.
+	; 25-Oct-2006	PO		SR15143: Reinstated code commented out by SR14709
+	; 25-Oct-2006	RPW		SR14709: Make sure type 14's (timestamp) are converted
+	; 							to horolog format.
+	; 24-Aug-2006	JW		SR14763: Changed 3rd param.
+	; 14-Jun-2006	Steve S	SR14613: Only submit if using keystroke/enter key pushed
+	; 16-Feb-2005	PK & PO	SR11661 Added Support for default type.
+	;-------------------------------------------------------------------------------
+	new blnCreateNew,blnSubmit,enumInputType,idClass,idField,idView,intCount
+	new objField,objFilter,objView
+	new strDate,strDelimiter,strQuery,strStatus,strValueUnformatted
+	
+	set blnSubmit = $$$JSBoolean(pJSblnSubmit)
+	set strValue  = $zconvert(strValue,"i","URL")
+	set idClass   = $get(^CacheTempView(YUSER,"Class"))
+	set pblnEnter = $$$JSBoolean(pblnEnter)
+
+	if (idClass'="") {
+		if $find(idFilter,"value") {
+			set idFilter=$piece(idFilter,"value",2)
+			set objFilter=$get(^CacheTempView(YUSER,"Filter",idFilter))
+
+			if $$$COMViewFilterStoreValue(objFilter)'="" {
+				xecute "set "_ $$$COMViewFilterStoreValue(objFilter)_"="""_strValue_Y_YLOCATION_""""
+			}
+ 
+			set idField  = $$$COMViewFilterField(objFilter)
+			set objField = $$GetRelation^COMViewUtils(idClass,.idField)
+			
+			// Make sure the date is changed to horolog format.
+			set enumInputType  = $$$WWW002InputType(objField)
+			
+			if (enumInputType=14) || (enumInputType=1) {                  // date / time
+				do ConvertDateToHorolog(strValue,idFilter,objFilter,,pblnEnter) ;16708B
+			} else {
+				set $$$COMViewFilterValue1(objFilter)       = strValue
+				set ^CacheTempView(YUSER,"Filter",idFilter) = objFilter
+			}
+ 
+			do:blnSubmit DisplayGrid^COMViewFilter(,,,,blnSubmit)
+			
+			; Put the old value back as this is necessary.
+			if $find(strValue,"&") {
+				set $$$COMViewFilterValue1(objFilter)       = strValue
+				set ^CacheTempView(YUSER,"Filter",idFilter) = objFilter
+			}
+			
+		} elseif $find(idFilter,"comp") {
+			set idFilter  = $piece(idFilter,"comp",2)
+			set objFilter = $get(^CacheTempView(YUSER,"Filter",idFilter))
+			
+			if (strValue'=$$$COMViewFilterComparator(objFilter)) {
+				if (strValue                             =$$$EnumCOMVIEWCOMPARATORWithin) ||
+				   ($$$COMViewFilterComparator(objFilter)=$$$EnumCOMVIEWCOMPARATORWithin)   {
+					set $$$COMViewFilterComparator(objFilter)   = strValue
+					set ^CacheTempView(YUSER,"Filter",idFilter) = objFilter
+					do CreateControl(idClass,idFilter,1)
+				}
+			}
+			set $$$COMViewFilterComparator(objFilter)   = strValue
+			set ^CacheTempView(YUSER,"Filter",idFilter) = objFilter
+			do:blnSubmit DisplayGrid^COMViewFilter(,,,,blnSubmit)
+			
+		} elseif $find(idFilter,"display") {
+			set idFilter = $piece(idFilter,"display",2)
+			set $$$COMViewFilterDisplay(^CacheTempView(YUSER,"Filter",idFilter)) = strValue
+			
+		} elseif $find(idFilter,"group") {
+			set idFilter = $piece(idFilter,"group",2)
+			set $$$COMViewFilterGroupBy(^CacheTempView(YUSER,"Filter",idFilter)) = strValue
+			do:blnSubmit DisplayGrid^COMViewFilter(,,,,blnSubmit)
+			
+		} elseif $find(idFilter,"description") {
+			set idView  = $$GetCurrentView^COMView(idClass)
+			set objView = $get(^COMView(0,idClass,idView,1))			
+			set $$$COMViewDescription(objView) = strValue
+			set strStatus = $$$Save("COMView",idClass_$$$COMMA_idView,objView,$$$YES)
+			do DisplayView^COMView(idClass,idView)
+			
+		} elseif $find(idFilter,"Location") {
+			set idView  = $$GetCurrentView^COMView(idClass)
+			set objView = $get(^COMView(0,idClass,idView,1))			
+			set $$$COMViewLocation(objView) = strValue
+			set strStatus = $$$Save("COMView",idClass_$$$COMMA_idView,objView,$$$YES)
+			
+		} elseif $find(idFilter,"user") {
+			set idView=$$GetCurrentView^COMView(idClass)
+			set objView=$get(^COMView(0,idClass,idView,1))			
+			set $$$COMViewUser1(objView) = strValue
+			set strStatus=$$$Save("COMView",idClass_$$$COMMA_idView,objView,$$$YES)
+			
+		} elseif $find(idFilter,"distribute") {
+			set idView  = $$GetCurrentView^COMView(idClass)
+			set objView = $get(^COMView(0,idClass,idView,1))			
+			set $$$COMViewDistribute(objView) = strValue
+			set strStatus = $$$Save("COMView",idClass_$$$COMMA_idView,objView,$$$YES)
+			do DisplayView^COMView(idClass,idView)
+			
+		} elseif $find(idFilter,"default") {
+			set idView  = $$GetCurrentView^COMView(idClass)
+			set objView = $get(^COMView(0,idClass,idView,1))			
+			set $$$COMViewDefaultProperty(objView) = strValue
+			set strStatus = $$$Save("COMView",idClass_$$$COMMA_idView,objView,$$$YES)
+			
+		} elseif $find(idFilter,"lock") {
+			set idView  = $$GetCurrentView^COMView(idClass)
+			set objView = $get(^COMView(0,idClass,idView,1))			
+			set $$$COMViewLock(objView) = strValue
+			set strStatus = $$$Save("COMView",idClass_$$$COMMA_idView,objView,$$$YES)
+		} elseif $find(idFilter,"hide") { ;CORE-299
+			set idView  = $$GetCurrentView^COMView(idClass)
+			set objView = $get(^COMView(0,idClass,idView,YM,1))			
+			set $$$COMViewDHide(objView) = strValue
+			set strStatus = $$$Save("COMViewD",idClass_$$$COMMA_idView_$$$COMMA_YM,objView,$$$YES)
+		}
+	}
+	if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+		if (($get(objFilter) '= "") && (YFORM = "VARDispensacaoViaPrescricao")){
+			set ^VARTempDispesacaoViaPrescricao(YBED,$piece(objFilter,Y,1)) = $piece(objFilter,Y,2)
+		}
+	}
+	quit $$$OK
+	
+
+ConvertDate(pstrDate,pstrFormat)
+	;-------------------------------------------------------------------------------
+	; Converts a date to a horolog based on the specified format.
+	;
+	; Inputs:
+	;	pstrDate	: 25/02/2000 or 02.25.2000 or 20000225 etc.
+	;	pstrFormat	: DD/MM/YYYY or MM.DD.YYYY or YYYYMMDD etc.
+	;
+	; Returns: +$horolog of date
+	;
+	; History:
+	; 27-Apr-2010	GRF		SR17263.1: Translate "A" to "Y" as well; doco
+	; 01-Apr-2010	shobby	SR17263: Created
+	;-------------------------------------------------------------------------------
+	new arrDate,loop,intDay,intMonth,intYear,strChar,strDate
+	
+	set $ztrap = "ConvertDateError"
+	
+	;---------------------------------------
+	; 25/02/2000 for DD/MM/YYYY
+	; --->           --->    process character by character   ; FIXME : what if 25/2/2000 instead?
+	;
+	;   arrDate("D") = 25
+	;   arrDate("M") = 2
+	;   arrDate("Y") = 2000
+	;   arrDate("/") = 0
+	;   strDate = "20000225" => 58129
+	;---------------------------------------
+	
+	set pstrFormat = $translate(pstrFormat,"TJA","DYY")   ; SR17263.1
+	set strDate = ""
+	for loop=1:1:$length(pstrFormat) {
+		set strChar = $extract(pstrFormat,loop)
+		set arrDate(strChar) = $get(arrDate(strChar))*10+$extract(pstrDate,loop)
+	}
+	if $length(arrDate("Y"))<3 set arrDate("Y") = $$GETYEAR^WWWDATE1(arrDate("Y"))
+	
+	set strDate = $translate($justify($get(arrDate("Y")),4)," ",0)_$translate($justify($get(arrDate("M")),2)," ",0)_$translate($justify($get(arrDate("D")),2)," ",0)
+	set strDate = $zdateh(strDate,8)
+	quit strDate
+
+ConvertDateError ; Internal Tag
+	; FIXME : if 02/25/2000 submitted for "DD/MM/YYYY" then exit here
+	;         returns "02/25/2000" which may cause problems elsewhere
+	; FIXME : if pstrDate not defined will get error diversion here then second undefined error
+	set $ztrap=""
+	quit pstrDate
+
+	
+ConvertDateToHorolog(ptmsValue,pidFilter,pobjFilter,pstrSubmit="",pblnEnter) ;16708B
+	;-------------------------------------------------------------------------------
+	; Convert the timestamp details to horolog format is required.
+	; 
+	; This was in ControlBlur but has been moved here.
+	; 
+	; NOTE : WWWDATE = Internal To Literal   WWWDATE1 = Literal to Internal
+	; 
+	; Called By : ControlChanged, ControlBlur, self - RECURSIVE, 2 instances 1 level
+	; 
+	; Params:
+	; 	ptmsValue  : The timestamp to be converted (DD/MM/YYYY, etc. or intOffset
+	; 					or two entries with "&" delimiter)
+	; 	pidFilter  : The id of the filter being manipulated
+	; 	pobjFilter : The filter details
+	; 	pstrSubmit : Whether to submit.  Note we only do this for the blur as this
+	; 	             is handled differently than pressing enter.
+	; 	             If the ptmsValue contains a "&", ControlBlur will call with pstrSubmit
+	; 	             also set to the contents of ptmsValue.
+	;
+	; ByRefs:
+	;
+	; Returns: nothing - updates ^CacheTempView(YUSER,"Filter",pidFilter)
+	;
+	; History:
+ 	; 09-Aug-2011	shobby	SR17807: GetFormat has moved.
+	; 01-Apr-2010	shobby	SR17263: Call out to ConvertDate
+	; 18-May-2009	PPP		SR16545: Store the values entered for the Date for 
+	; 							recalculation in the raw format ie 60, -60 etc
+	; 							when displayed will be changed to the literal format
+	; 30-Nov-2006	RPW		SR14709: Fixed & usage to handle each piece correctly.
+	; 20-Nov-2006	RPW		SR14709: Fixed delimiter requirements so that 'incorrect'
+	; 							delimiters did not cause the value to vanish. Also
+	; 							translate them to /.
+	; 25-Oct-2006	RPW		SR14709: Created
+	;-------------------------------------------------------------------------------
+	new strDate,strDelimiter,dteNow,strValueUnformatted,objFilter,strDate1,strDate2
+	
+	set dteNow = +$horolog
+	// SR14709: If we are an & do this nasty hack to get each date piece.
+	if (ptmsValue="") {
+		set $$$COMViewFilterValue1(pobjFilter)=""
+		set ^CacheTempView(YUSER,"Filter",pidFilter) = pobjFilter
+		
+	} elseif $find(ptmsValue,"&") {
+		set strDate1 = $piece(ptmsValue,"&",1)
+		set strDate2 = $piece(ptmsValue,"&",2)
+		
+		quit:strDate2=""                                           ; EARLY QUIT
+		
+		do ConvertDateToHorolog(strDate1,pidFilter,pobjFilter)
+		set ptmsValue = $$GetFilterValue1(pidFilter)
+		
+		if strDate2'="" {                                          ; FIXME : see quit ^^^ <GRF>
+			do ConvertDateToHorolog(strDate2,pidFilter,pobjFilter)
+			set ptmsValue = ptmsValue_"&"_$$GetFilterValue1(pidFilter)
+		}
+		
+		set $$$COMViewFilterValue1(pobjFilter)       = ptmsValue
+		set ^CacheTempView(YUSER,"Filter",pidFilter) = pobjFilter
+		
+		if pstrSubmit'="" {
+			do SubmitDateToScreen(pidFilter,pstrSubmit)
+		}
+ 
+ 		//Store Date in unformatted view if + or - are used	//SR16545
+	} elseif '$find(ptmsValue,"&") && (+$translate(ptmsValue," ")=$translate(ptmsValue," ")) && pblnEnter { ;16708B
+	; FIXME : '$find is superfluous
+		set $$$COMViewFilterValue1(pobjFilter) = $translate(ptmsValue," ")
+		set ^CacheTempView(YUSER,"Filter",pidFilter) = pobjFilter
+		set ptmsValue  = $horolog + $translate(ptmsValue," ")
+		set pstrSubmit = $$^WWWDATE(ptmsValue)
+		if pstrSubmit'="" {
+			do SubmitDateToScreen(pidFilter,pstrSubmit)
+		}
+ 
+	} else {
+	;SR17807 set strValueUnformatted = $$ConvertDate(ptmsValue,$$GetFormat^INPARA(1))
+		set strValueUnformatted = $$ConvertDate(ptmsValue,$$GetFormat^WWW100(1))	;SR17807 
+		set $$$COMViewFilterValue1(pobjFilter)       = strValueUnformatted
+		set ^CacheTempView(YUSER,"Filter",pidFilter) = pobjFilter
+		
+	;SR17263 if ($length(ptmsValue,",")=1) &&
+	;SR17263   (($$^WWWDATE($piece(ptmsValue," ",1)) = "") || (ptmsValue<=31)) { // formatted date
+	;SR17263 	// Correct date not containing month and/or year
+	;SR17263 	set strDate      = $piece(ptmsValue," ",1)
+	;SR17263 	set strDelimiter = $extract($zstrip(strDate,"*AN"))
+	;SR17263 	if (strDelimiter = "") set strDelimiter = "/"
+	;SR17263 	if strDelimiter'="/" {
+	;SR17263 		set strDate      = $translate(strDate,strDelimiter,"/")
+	;SR17263 		set strDelimiter = "/"
+	;SR17263 	}
+				
+	;SR17263 	if ($piece(strDate,strDelimiter,2) = "") set $piece(strDate,strDelimiter,2) = $$^WWWMONTH(dteNow)
+	;SR17263 	if ($piece(strDate,strDelimiter,3) = "") set $piece(strDate,strDelimiter,3) = $$^WWWYEAR(dteNow)
+	;SR17263 	set $piece(ptmsValue," ",1) = $$^WWWDATE($$^WWWDATE1(strDate))
+				
+	;SR17263 	if ($$^WWWDATE1($piece(ptmsValue," ",1)) '= "") {
+	;SR17263 		// change to horolog format
+	;SR17263 		if $length(ptmsValue, " ") > 1 {
+	;SR17263 			set strValueUnformatted = $$^WWWDATE1($piece(ptmsValue," ",1))_","_$$^WWWTIME1($piece(ptmsValue, " ", 2))
+	;SR17263 		} else {
+	;SR17263 			set strValueUnformatted = $$^WWWDATE1(ptmsValue)
+	;SR17263 	]]><![CDATA[	}
+					
+	;SR17263 		set $$$COMViewFilterValue1(pobjFilter)       = strValueUnformatted
+	;SR17263 		set ^CacheTempView(YUSER,"Filter",pidFilter) = pobjFilter
+	;SR17263 	}
+			if pstrSubmit'="" {        ; FIXME : since only set when ptmsValue contains "&" will never execute <GRF>
+				do SubmitDateToScreen(pidFilter,pstrSubmit)
+			}
+	;SR17263 }
+	}
+	quit
+	
+	
+GetFilterValue1(pidFilter)
+	;-------------------------------------------------------------------------------
+	; Get Value 1 from the filter
+	;
+	; Params:
+	; pidFilter : Which filter to read
+	;
+	; Returns:
+	; The value of the filter value 1
+	;
+	; History:
+	; 01-Dec-2006	RPW		SR14709: Created
+	;-------------------------------------------------------------------------------
+ 	new objFilter
+ 	
+	set objFilter = $get(^CacheTempView(YUSER,"Filter",pidFilter))
+	quit $$$COMViewFilterValue1(objFilter)
+	
+	
+SubmitDateToScreen(pidFilter,pstrSubmit)
+	;-------------------------------------------------------------------------------
+	; Write out the filter information to the screen
+	;
+	; Params:
+	; pidFilter : Which filter to change
+	; pstrSubmit: The value to write to the filter.
+	;
+	; History:
+	; 01-Dec-2006	RPW		SR14709: Created
+	;-------------------------------------------------------------------------------
+	write "if (document.getElementById('value"_pidFilter_"') != null) {"
+	write "	   document.getElementById('value"_pidFilter_"').value = '"_pstrSubmit_"';"
+	write "}"
+	do:$$UseKeyStroke^COMViewConfig() DisplayGrid^COMViewFilter() // BR014073
+	
+	quit
+	
+
+	/*	
+ControlBlur(pidFilter, pstrValue) // SRBR014073  ;16708 removed VVVVVV
+	;-------------------------------------------------------------------------------
+	; Display saved dates in favourites
+	;
+	; Called by JS: ControlBlur()
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Sep-2009	shobby	SR16708: This appears to be redundant.
+	; 06-May-2009	PPP		SR16521: Barcode Scanning to identify Item; if Current
+	; 							or Relation class is a Quick Search find if there is an
+	; 							alternate ID
+	; 30-Nov-2006	RPW		SR14709: Fixed & usage to handle each piece correctly.
+	; 25-Oct-2006	RPW		SR14709: Moved timestamp conversion to ConvertDateToHorolog routine.
+	; 21-Sep-2006	PO		BR014073: Only call DisplayGrid if using key stroke delay search
+    ; 12-Jul-2006	Pablo	SRBR014073: Created
+	;-------------------------------------------------------------------------------
+	new blnObj,enumInputType,idClass,idField,idInputType,objFilter,objWWW003
+	new strDate,strDelimiter,strValueUnformatted
+
+	set pstrValue = $zconvert(pstrValue,"i","URL")
+	set idClass   = $get(^CacheTempView(YUSER,"Class"))
+	set blnObj    = $get(^CacheTempObj(YUSER,"Object"))	//SR15866
+
+	if (idClass '= "") {
+		if $find(pidFilter,"value") {
+			set pidFilter = $piece(pidFilter,"value",2)
+			set objFilter = $get(^CacheTempView(YUSER,"Filter",pidFilter))
+ 
+ 			//SR16521
+ 			if 'blnObj {
+				set objWWW003 = $$GetRelation^COMViewUtils(.idClass,$$$COMViewFilterField(objFilter))
+				
+				set enumInputType = $$$WWW002InputType(objWWW003)
+				
+				if (enumInputType = 14) || (enumInputType=1) {            // date / time
+					do ConvertDateToHorolog(pstrValue,pidFilter,objFilter,$select($find(pstrValue,"&"):pstrValue,1:""))				
+				}
+				
+				//SR16521
+				if $$GetId^COMQuickSearch(idClass,$$$WWW002RelationClass(objWWW003),.pstrValue) {		
+					set $$$COMViewFilterValue1(objFilter)        = pstrValue
+					set ^CacheTempView(YUSER,"Filter",pidFilter) = objFilter
+					do SubmitDateToScreen(pidFilter,pstrValue)
+				}
+ 
+ 			} else {
+				set idField = $$$COMViewFilterField(objFilter)
+ 				set idInputType = $$GetFinalInputType(idClass,idField)
+				if (idInputType = "alSYS.dt.dtDate") {                    // date / time
+					do ConvertDateToHorolog(pstrValue,pidFilter,objFilter,$select($find(pstrValue,"&"):pstrValue,1:""))
+				}
+ 			
+				//SR16521
+ 				set idField = $$$COMViewFilterField(objFilter)
+				if $$GetId^COMQuickSearch(idInputType,,.pstrValue) {		
+					set $$$COMViewFilterValue1(objFilter) = pstrValue
+					set ^CacheTempView(YUSER,"Filter",pidFilter) = objFilter
+					do SubmitDateToScreen(pidFilter,pstrValue)
+				}
+ 			}
+		}
+	}
+	
+	quit $$$OK // SRBR014073   ;16708 removed ^^^^^^^
+	*/
+	
+CreateComparitorFuntion()		// NOT IN USE ???  FIXME Fun_ c _tion
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 15-Jul-2005	shobby	SR12754: LANGUAGE changed to SPRACHE (not always reliable)
+    ;-------------------------------------------------------------------------------
+	new idComp,strComp
+	
+	set idComp  = ""
+	set strComp = ""
+	for {
+		set idComp = $order(^WWW101(0,"COMVIEWCOMPARATOR",SPRACHE,idComp))
+		quit:idComp=""
+		
+		if strComp'="" set strComp=strComp_","
+		set strComp=strComp_"'"_$$$WWW101Text($get(^WWW101(0,"COMVIEWCOMPARATOR",SPRACHE,idComp,1)))_"'"
+	}
+	
+	&js<
+ var arrOpt=new Array(#(strComp)#);
+ var arrList=pList.split(',');
+ while (arrList.length!=0) {
+ var o = document.createElement('option');
+ var value=arrList.shift();
+ o.value=value;
+ o.innerHTML=arrOpt[value-1];
+ SelectObject.appendChild(o);
+ }
+ >
+	quit ""
+ 
+SelectControl(pidField,pidFilter)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Jan-2008	shobby	SRBR014551: Don't create a control if this favourite is based on SQL
+	; 09-Jun-2006	Steve S	SR14613: Only re-display if using keystroke
+	;-------------------------------------------------------------------------------
+	new idClass,idFilter,objFilter
+	
+	set idFilter  = ""
+	set pidFilter = ""
+	set idClass = $get(^CacheTempView(YUSER,"Class"))
+	
+	if pidFilter="" set pidFilter=$order(^CacheTempView(YUSER,"Filter",""),-1)+1
+	set idFilter=""
+	
+	for {
+		set idFilter=$order(^CacheTempView(YUSER,"Filter",idFilter))
+		quit:idFilter<pidFilter
+		
+		set ^CacheTempView(YUSER,"Filter",idFilter+1)=$get(^CacheTempView(YUSER,"Filter",idFilter))
+	}
+	
+	set objFilter=""
+	set $$$COMViewFilterField(objFilter)   = pidField
+	set $$$COMViewFilterValue1(objFilter)  = ""
+	set $$$COMViewFilterDisplay(objFilter) = 1
+	set ^CacheTempView(YUSER,"Filter",pidFilter) = objFilter
+	if $$GetCurrentSQL^COMView(idClass)=""	do CreateControl(idClass,pidFilter) ;BR014551
+	do:$$UseKeyStroke^COMViewConfig() DisplayGrid^COMViewFilter() //SR14613
+	
+	quit
+	
+RemoveControl(pidFilter)
+	;-------------------------------------------------------------------------------
+	; 
+	; Called by JS: RemoveControl()
+	; 
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Jul-2007	HeberB	SRBR014579: Update External filter on CacheTempView
+	; 15-Feb-2007	Steve S	SR15431: Use standard alert, not VBConfirm
+	; 09-Jun-2006	Steve S	SR14613: Only re-display if using keystroke
+	;-------------------------------------------------------------------------------
+	new idFilter,idFilterExternal,idLastFilter
+	
+	set pidFilter = $piece($piece(pidFilter,"ctrl",2),"_",1)
+	
+	if ($order(^CacheTempView(YUSER,"Filter",pidFilter))="")    &&
+	   ($order(^CacheTempView(YUSER,"Filter",pidFilter),-1)="")    {
+		
+		$$$Alert("Com00252") ; "Can not remove all entries from the Field Selection"
+	
+	} else {
+		set idFilter = pidFilter
+		for {
+			set idLastFilter = idFilter
+			set idFilter = $order(^CacheTempView(YUSER,"Filter",idFilter))
+			quit:idFilter=""
+			
+			set ^CacheTempView(YUSER,"Filter",idLastFilter) = $get(^CacheTempView(YUSER,"Filter",idFilter))
+			set idFilterExternal = $$GetIdExternalFilter^COMView(idLastFilter)
+			if (idFilterExternal'="") {	                            // the one removed is external
+				kill ^CacheTempView(YUSER,YUCI,"External",idFilterExternal)
+			}
+			set idFilterExternal = $$GetIdExternalFilter^COMView(idFilter)
+			if (idFilterExternal) {	                                // the one moved is external
+				set ^CacheTempView(YUSER,YUCI,"External",idFilterExternal) = idLastFilter
+			}
+		}
+		kill ^CacheTempView(YUSER,"Filter",idLastFilter)
+		do DisplayControls($get(^CacheTempView(YUSER,"Class")))
+		do:$$UseKeyStroke^COMViewConfig() DisplayGrid^COMViewFilter() //SR14613
+	}
+	quit
+	
+	
+FormOnlyChecked(pblnChecked)
+	;-------------------------------------------------------------------------------
+	; Callback when the 'form only' checkbox is ticked for a favourite
+	;
+	; Params:	pblnChecked	: Whether the box is ticked or not
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Feb-2007	Steve S		SR15431: Created
+	;-------------------------------------------------------------------------------
+	new idView,objCOMView,strStatus,idClass
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;
+	tstart
+	;
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set strStatus = $$$OK
+	
+	set idView  = $get(^CacheTempView(YUSER,"EditMode","ViewName"))
+	set idClass = $get(^CacheTempView(YUSER,"Class"))
+	
+	if (idView="") {
+		set strStatus = $$$MakeStatus("Com00111")         ; "No favourite selected"
+	} elseif (idClass="") {
+		set strStatus = $$$MakeStatus("Com00113")         ; "No class selected."
+	} elseif '$data(^COMView(0,idClass,idView)) {
+		set strStatus = $$$MakeStatus("Com00114",idView)  ; "Favourite %1 does not exist."
+	} else {
+		set objCOMView = $get(^COMView(0,idClass,idView,1))
+		set $$$COMViewForm(objCOMView)=$select(pblnChecked:$$$CallingForm,$$$YES:"")
+		set strStatus = $$$Save("COMView",idClass_","_idView,objCOMView,$$$YES)
+	}
+ 
+	;+++++++++++++++++++++++++++++++++++++++
+	;
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+	} else {
+		trollback
+		$$$Alert(strStatus)	
+	}
+	;
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	quit
+	
+ 
+CreateComparitor(pidClass,pidFilter,pobjRelation,pstrField) 
+	;-------------------------------------------------------------------------------
+	; History:
+	; 12-Jul-2010	shobby	SR17396: use document.getElementById
+	; 26-Sep-2008	shobby	SRBR014982: Include the 'within' selection criteria on all
+	; 									texts (not just those with a relationship to another class)
+	; 01-Sep-2008	shobby	SRBR014978: Support changes in fonts.
+	; 19-Jul-2006	JW		SR14832: Support 'between' clause
+	; 29-May-2006	Steve S	SR14675: Support 'like' filter
+	; 28-Oct-2005	JW		SR13074: Exchange Rate type
+	;-------------------------------------------------------------------------------
+	new strList,strDefault,objFilter
+	
+	;-------------------------------------------------------------------------------
+	;				  WWW002/WWW003						||	 COMViewFilter
+	;					InputType						||	  Comparator	
+	;-------------------------------------------------------------------------------
+	;	0	Hidden				10	File Name			||
+	;	1	Date				11	Draw				||	1	Greater Than
+	;	2	Yes/No				12	Floating			||	2	Less Than
+	;	3	Memo				13	IP-format			||	3	Equals
+	;	4	Integer				14	Timestamp			||	4	Not Equals
+	;	5	Password			15	Collection			||	5	Starts With
+	;	6	Text				16	Embedded			||	6	Contains
+	;	7	Time				17	Date CCYYMMDD		||	7	Within
+	;	8	Currency			18	Exchange Rate		||	8	Like
+	;	9	Counter										||	9	Between
+	;													||  10  Find In
+	;-------------------------------------------------------------------------------
+	
+	;---------------------------------------
+	; Numeric Fields
+	;---------------------------------------
+	if $find(",1,4,7,8,12,14,17,18,",","_$$$WWW002InputType(pobjRelation)_",") {  //SR13074
+		set strList    = "1,2,3,4,9"
+		set strDefault = 1
+		
+	;---------------------------------------
+	; Boolean Field
+	;---------------------------------------
+	} elseif $$$WWW002InputType(pobjRelation)=2 {
+		set strList    = "3"
+		set strDefault = 3
+	
+	;---------------------------------------
+	; Other (Test, Date)
+	;---------------------------------------
+	} else {
+		set strList = "1,2,3,4,5,6,7,8,9,10"
+		if ($$$WWW002RelationClass(pobjRelation)'="")       &&
+		   ($$$WWW002RelationClass(pobjRelation)'=pidClass) &&
+		   ($$$WWW002InputType(pobjRelation)'=3)               {
+			
+			set strDefault = 3
+		} else {
+			set strDefault = 5
+		}
+	}
+	
+	set objFilter = $get(^CacheTempView(YUSER,"Filter",pidFilter))
+	
+	if $find(","_strList_",",","_$$$COMViewFilterComparator(objFilter)_",") {
+		set strDefault=$$$COMViewFilterComparator(objFilter)
+	} else {
+		set $$$COMViewFilterComparator(objFilter)    = strDefault
+		set ^CacheTempView(YUSER,"Filter",pidFilter) = objFilter
+	}
+	
+	/*
+	&js<
+ ctrl#(pidFilter)#_2.innerHTML='';
+ var s = document.createElement('select');
+ s.style.fontFamily='#($$FontFace^WWW012())#'; //BR014976
+ s.attachEvent("onchange",ControlChanged);
+ 
+ s.id='comp'+#(pidFilter)#;
+ objDIV.CreateComp(s,'#(strList)#');
+ s.value=#(strDefault)#;
+ s.initialValue=#(strDefault)#;
+ ctrl#(pidFilter)#_2.appendChild(s);
+ >
+
+	*/
+ 	;if pidClass["FINGL" write "debugger;"
+
+ 	write "ctrl"_pidFilter_"_2.innerHTML='';",!
+ 	write "var s = document.createElement('select');",!
+ 	write "s.style.fontFamily='"_$$FontFace^WWW012()_"';",!
+ 	write "s.attachEvent(""onchange"",ControlChanged);",!
+ 	write "s.id='comp'+"_pidFilter_";",!
+ 	write "objDIV.CreateComp(s,'"_strList_"')",!
+ 	write "s.value="_strDefault_";",!
+ 	write "s.initialValue="_strDefault_";",!
+ 	//SR17396 write "ctrl"_pidFilter_"_2.appendChild(s);",!
+ 	write "document.getElementById('ctrl"_pidFilter_"_2').appendChild(s);",!	//SR17396 
+
+ 	quit
+ 	
+ 	
+CreateCustom(pidClass,pidFilter)
+	do CreateText(pidClass,pidFilter)
+	write "objText.size=50;",!
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,415 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARCompraEntregaAgendamento" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[VARCompraEntregaAgendamento
+	#include COMSYS
+	#include COMConst
+	#include INConst
+	#include VARConst
+	#include VARCompra
+	quit
+
+OnBeforeButtonLine()
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Ao construir a tela, verifica se ela deve ser editável ou não, dependendo
+    ;	se a Ordem de Compra ainda não foi processada.
+	;
+    ; Chamado por:
+    ;	Campo OnBeforeButtonLine do form VARCompraEntregaAgendamento.
+    ; 
+    ; Histórico:
+    ; 	08-Sep-2011		Criado
+    ;-------------------------------------------------------------------------------
+	new intStatusCompra
+
+	// Se nenhuma ordem de compra foi escolhida, torna a tela não editável:
+	if ($get(YKEY) = "") || ($$$KEY1($get(YKEY)) = "") {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = 5
+		quit
+	}
+
+	// Se ordem de compra ainda não processada, não é possível editar agendamentos:
+	set intStatusCompra = +$$$INAUFFREE14($get(^INAUF(YM, $piece(YKEY, YKOMMA, 1), 1)))
+	if ((intStatusCompra '= 1) && (intStatusCompra '= 2)) {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = 5
+		quit
+	}
+
+	quit
+
+OnBeforeSaveHook(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnBeforeSave do form VARCompraEntregaAgendamento.
+    ; 
+    ; Histórico:
+    ; 	08-Sep-2011		Criado
+    ;-------------------------------------------------------------------------------
+    new datAgend, tmeHorarioInicio, tmeHorarioTermino
+
+	set datAgend = $piece(YFELD, Y, 1)
+
+	if (datAgend < +$horolog) {
+		quit "A data de agendamento deve ser maior que a data atual."
+	}
+
+	set tmeHorarioInicio = $piece(YFELD, Y, 2)
+	set tmeHorarioTermino = $piece(YFELD, Y, 3)
+
+	if ((tmeHorarioInicio > $ztimeh("23:59:59")) ||
+		(tmeHorarioTermino > $ztimeh("23:59:59"))) {
+		quit "O horário de início / término não pode ser maior ou igual a "_
+			"24:00:00."
+	}
+	if ((tmeHorarioTermino - tmeHorarioInicio) <= 0) {
+		quit "O horário de término deve ser maior que o horário de início. "_
+			"Favor verificar."
+	}
+	
+	set NoOrdemCompra = $piece(YKEY,",",1)
+	set NoEntrega     = $piece(YKEY,",",2)
+	set NoAgendamento = $piece(YKEY,",",3)
+	set Sequencial    = $$GetMaxSequencial(NoOrdemCompra,NoEntrega)
+	set DataAlteracao = $piece($horolog,",",1)
+	set Doca          = $piece(YFELD,Y,4)
+	set HoraAlteracao = $piece($horolog,",",2)
+	set DataAgend     = $piece(YFELD,Y,1)
+	set Usuario       = $get(YBED)
+	set HoraInicio    = $piece(YFELD,Y,2)
+	set HoraTermino   = $piece(YFELD,Y,3)
+	
+	set objHistoricoAgendamento = ""
+	set $piece(objHistoricoAgendamento,Y,1) = DataAlteracao
+	set $piece(objHistoricoAgendamento,Y,2) = Doca
+	set $piece(objHistoricoAgendamento,Y,5) = HoraAlteracao
+	set $piece(objHistoricoAgendamento,Y,6) = DataAgend
+	set $piece(objHistoricoAgendamento,Y,7) = Usuario
+	set $piece(objHistoricoAgendamento,Y,8) = HoraInicio
+	set $piece(objHistoricoAgendamento,Y,9) = HoraTermino
+
+	set stKey = NoOrdemCompra_","_NoAgendamento_","_NoEntrega_","_(Sequencial+1)
+	set StrStatus = $$$Save("VARTempCompraEntregaAgendamentoHistorico",stKey,objHistoricoAgendamento,1)
+	
+	set objCompraEntrega = $get(^VARCompraEntrega(YM,NoOrdemCompra,NoEntrega,1))
+	set $$$VARCompraEntregaLocaldeEntrega(objCompraEntrega) = $piece(YFELD,Y,10)
+	set StrStatus = $$$Save("VARCompraEntrega",NoOrdemCompra_$$$COMMA_NoEntrega,objCompraEntrega,1)
+	
+	quit $$$OK
+
+OnAfterDataFields(YKEY)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnAfterDataFields do form VARCompraEntregaAgendamento.
+    ; 
+    ; Histórico:
+    ; 	08-Sep-2011		Criado
+    ;-------------------------------------------------------------------------------
+	do LoadGrid(YKEY, YFELD)
+	do LoadGridHistoricoAlteracao(YKEY, YFELD)
+	quit
+
+GetDataPrevista(pid)
+	new objCompraEntrega
+
+	if ($$$NoKey(pid) || (pid = (YKOMMA_YKOMMA)) ||
+		('$data(^VARCompraEntregaLinha(YM, $piece(pid, YKOMMA, 1),
+			$piece(pid, YKOMMA, 2))))) {
+		quit ""
+	}
+
+	quit $$GetDataPrevista^VARCompraEntregaLinha($piece(pid, YKOMMA, 1),
+			$piece(pid, YKOMMA, 2))
+
+GetFornecedor(pid)
+	if ($$$NoKey(pid) || (pid = (YKOMMA_YKOMMA))) quit ""
+
+	quit $$getFornecedorCompra^VARCompra($piece(pid, YKOMMA, 1))
+
+LoadGrid(pid, pobj)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função OnAfterDataFields^VARCompraEntregaAgendamento.mac
+    ; 
+    ; Histórico:
+    ; 	08-Sep-2011		Criado
+    ;------------------------------------------------------------------------------- 
+    new idCompra, linhaDaCompra, objlinhaDaCompra, idProduto, qtyCompra,
+    	nomeProduto, objLinhaEntrega, qtdEntrega
+
+	if ($$$NoKey(pid)) quit
+
+	set idCompra = $$$KEY1(pid)
+	set idCompraEntrega = $$$KEY2(pid)
+
+	set lstHeader = $listbuild("Seq.", "Produto", "Quant.&nbsp;<br />"_
+		"&nbsp;&nbsp;Compra", "Quant.&nbsp;<br />&nbsp;&nbsp;Entrega")
+	if ($$Start^COMTable(lstHeader, "Entrega por linha da compra:")) {
+		set linhaDaCompra = ""
+		for i=1:1 {
+			set linhaDaCompra = $order(^INAUFP(YM, idCompra, linhaDaCompra))
+			if ($length(linhaDaCompra) = 0) quit
+
+			set objlinhaDaCompra = $get(^INAUFP(YM, idCompra, linhaDaCompra, 1))
+			if ($length(objlinhaDaCompra) = 0) continue
+
+			set idProduto = $$$INAUFPItemNumber(objlinhaDaCompra)
+			set qtyCompra = $$$INAUFPQuantity(objlinhaDaCompra)
+			set nomeProduto = $$SQLGetDescricaoProduto^VARSQL(idProduto)
+
+			do NewLine^COMTable()
+			do InsertCell^COMTable(linhaDaCompra, , , , "CENTER")
+			do InsertCell^COMTable("("_idProduto_") "_nomeProduto)
+			do InsertCell^COMTable($$^WWWTR(0, 12, qtyCompra), , , , "RIGHT")
+
+			set objLinhaEntrega = $get(^VARCompraEntregaLinha(YM, idCompra,
+				idCompraEntrega, linhaDaCompra, 1))
+			if ($get(objLinhaEntrega) '= "") {
+				set qtdEntrega = $$$VARCompraEntregaLinhaQuantidade(objLinhaEntrega)
+
+				// Evitando erro de DIVIDE
+				if (qtyCompra = 0) {
+					do InsertCell^COMTable(0, , , , "RIGHT")
+				}
+				else {
+					do InsertCell^COMTable(qtdEntrega_" ("_
+						$normalize(qtdEntrega / qtyCompra * 100, 1)_"%)", ,
+						, , "RIGHT")
+				}
+			}
+			else {
+				do InsertCell^COMTable("")
+			}
+
+			do EndLine^COMTable()
+		}
+
+		do Stop^COMTable()
+	}
+	quit
+
+GetAgendamentoEntregas(pdteAgendIni, pdteAgendFin, ptmeAgend)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função GetAgendamentosDoDiaHora^VARCompraEntregaPrevisaoCal.mac
+    ; 
+    ; Histórico:
+    ; 	08-Sep-2011		Criado
+    ;-------------------------------------------------------------------------------
+	new strAgendamentos, dteAgend, tmeAgend, intHourAgend, intHourParAgend,
+		idCompra, objCompra, statusCompra, dataEmpenho, idEntrega, objAgend,
+		blnAchou, intAgendCount, idLocal
+
+	set strAgendamentos = ""
+	
+	if (($length(pdteAgendIni) > 0) &&
+		$data(^VARCompraEntregaAgendamentos(YM, 1, pdteAgendIni))) {
+		set dteAgend = pdteAgendIni
+	}
+	else {
+		set dteAgend = $order(^VARCompraEntregaAgendamentos(YM, 1, ""))
+	}
+	while ($length(dteAgend) > 0) {
+		// Se o usuário filtrou por data inicial ou final
+		if ((($length(pdteAgendIni) '= 0) && (dteAgend < pdteAgendIni)) ||
+			(($length(pdteAgendFin) '= 0) && (dteAgend > pdteAgendFin))) {
+			set dteAgend = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend))
+			continue
+		}
+
+		if (($length(ptmeAgend) > 0) &&
+			$data(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, ptmeAgend))) {
+			set tmeAgend = ptmeAgend
+		}
+		else {
+			set tmeAgend = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, ""))
+		}
+		while ($length(tmeAgend) > 0) {
+			// Se o usuário filtrou por hora
+			if ($length(ptmeAgend) '= 0) {
+				set intHourAgend = +$piece($$^WWWTIME(tmeAgend), ":", 1)
+				set intHourParAgend = +$piece($$^WWWTIME(ptmeAgend), ":", 1)
+
+				if (intHourAgend '= intHourParAgend) {
+					set tmeAgend = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, tmeAgend))
+					continue
+				}
+			}
+
+			set idCompra = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, tmeAgend, ""))
+			while ($length(idCompra) > 0) {
+				set objCompra = $get(^INAUF(YM, idCompra, 1))
+				
+				set idLocal = $$$INAUFLocation(objCompra)
+				
+				set statusCompra = $$$INAUFFREE14(objCompra)
+				
+				if ((statusCompra '= 1) && (statusCompra '= 2) && (statusCompra '= 3)) {
+					set idCompra = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, tmeAgend, idCompra))
+					continue
+				}
+
+				set dataEmpenho = $$getDataEntregaEmpenho^VARCompra(idCompra)
+				if (dataEmpenho = "") {
+					set idCompra = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, tmeAgend, idCompra))
+					continue
+				}
+
+				set idEntrega = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, tmeAgend, idCompra, ""))
+				
+				while ($length(idEntrega) > 0) {
+					set objAgend = $get(^VARCompraEntregaAgendamento(YM, idCompra,
+						idEntrega, $$$ChaveUnicaAgendamento, 1))
+						
+					// Verifica local da compra ou da entrega
+					set objEntrega   = $get(^VARCompraEntrega(YM,idCompra,idEntrega,1))
+					if ($$$VARCompraEntregaLocaldeEntrega(objEntrega) = ""){
+						set idLocal = $$$INAUFLocation(objCompra)		
+					}
+					else {
+						set idLocal = $$$VARCompraEntregaLocaldeEntrega(objEntrega)
+					}
+
+					if ($length(strAgendamentos) = 0) {
+						set idLocalForm = $piece(^VARTempCompraPrevisaoEntregaCal(YBED), Y, 3)
+						if (idLocalForm = idLocal){
+							set $piece(strAgendamentos, ";", 1) = idCompra_","_
+								idEntrega_","_$$$ChaveUnicaAgendamento_","_idLocal
+						}
+					}
+					else {
+						// Inserir somente uma vez a Compra
+						set blnAchou = 0
+						for intAgendCount = 1:1:$length(strAgendamentos, ";") {
+							if ($piece(strAgendamentos, ";", intAgendCount) =
+									idCompra_","_idEntrega_","_
+									$$$ChaveUnicaAgendamento) {
+								set blnAchou = 1
+								quit
+							}
+						}
+						if (blnAchou) {
+							set idEntrega = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, tmeAgend, idCompra, idEntrega))
+							continue
+						}
+
+						set $piece(strAgendamentos, ";", $length(strAgendamentos,
+							";") + 1) = idCompra_","_idEntrega_","_
+							$$$ChaveUnicaAgendamento
+					}
+					
+					set idEntrega = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, tmeAgend, idCompra, idEntrega))
+				}
+				
+				set idCompra = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, tmeAgend, idCompra))
+			}
+
+			set tmeAgend = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend, tmeAgend))
+		}
+
+		set dteAgend = $order(^VARCompraEntregaAgendamentos(YM, 1, dteAgend))
+	}
+
+	quit strAgendamentos
+
+GetStatusCompra(pidCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função GetAgendamentosDoDiaHora^VARCompraEntregaPrevisaoCal.mac
+    ; 
+    ; Histórico:
+    ; 	26-Jan-2012		Criado
+    ;-------------------------------------------------------------------------------
+	set objCompra = $get(^INAUF(0, pidCompra, 1))
+	set statusCompra = $$$INAUFFREE14(objCompra)
+	quit statusCompra
+
+LoadGridHistoricoAlteracao(pYKEY, pYFELD)
+	
+	quit:(pYKEY = "")
+	set idCompra = $piece(pYKEY,",",1)
+	set NEntrega = $piece(pYKEY,",",2)
+	
+	Set HistoricoAlteracaoSQL = ##class(%ResultSet).%New()  ;Create Result Set Object
+	
+	set meuSQL = ""
+	set meuSQL = meuSQL_" select "
+	set meuSQL = meuSQL_" Temp.NoOrdemCompra, "
+	set meuSQL = meuSQL_" Temp.DataAlteracao, "
+	set meuSQL = meuSQL_" Temp.HoraAlteracao, "
+	set meuSQL = meuSQL_" Temp.Usuario, "
+	set meuSQL = meuSQL_" Temp.Data, "
+	set meuSQL = meuSQL_" Temp.HorarioInicio, "
+	set meuSQL = meuSQL_" Temp.HorarioTermino, "
+	set meuSQL = meuSQL_" Temp.Doca, "
+	set meuSQL = meuSQL_" AG.Observacoes, "
+	set meuSQL = meuSQL_" $$SQLGetCodigoFornecedor^VARSQL(Temp.NoOrdemCompra) as CodFornecedor "
+	set meuSQL = meuSQL_" FROM VARTempCompraEntregaAgendamentoHistorico as Temp "
+	set meuSQL = meuSQL_" INNER JOIN VARCompraEntregaAgendamento AG ON Temp.NoOrdemCompra = AG.NoOrdemCompra AND Temp.NoEntrega = AG.NoEntrega1 "
+	set meuSQL = meuSQL_" WHERE CAST(Temp.NoOrdemCompra AS VARCHAR) = '"_idCompra_"' AND CAST(Temp.NoEntrega AS VARCHAR) = '"_NEntrega_"'"
+	set meuSQL = meuSQL_" ORDER BY Temp.Sequencial DESC"
+	
+	do HistoricoAlteracaoSQL.Prepare(meuSQL)  ;Prepare Query
+	do HistoricoAlteracaoSQL.Execute()  ;Execute Query
+	
+	set lstHeader = $listbuild("Data Alteração","Hora Alteração","Usuário","Data","Horário Início","Horário Término","Doca")
+	
+	if $$Start^COMTable(lstHeader) {
+		
+		write "<b>Histórico de Alterações:</b>"
+		set count = 0
+		
+		While (HistoricoAlteracaoSQL.Next()) {
+			set NoOrdemCompra		        = HistoricoAlteracaoSQL.GetData(1)
+			set DataAlteracao		        = HistoricoAlteracaoSQL.GetData(2)
+			set HoraAlteracao		        = HistoricoAlteracaoSQL.GetData(3)
+			set Usuario				        = HistoricoAlteracaoSQL.GetData(4)
+			set Data				        = HistoricoAlteracaoSQL.GetData(5)
+			set HorarioInicio		        = HistoricoAlteracaoSQL.GetData(6)
+			set HorarioTermino		        = HistoricoAlteracaoSQL.GetData(7)
+			set Doca				        = HistoricoAlteracaoSQL.GetData(8)
+			set Observacoes			        = HistoricoAlteracaoSQL.GetData(9)
+			set CodFornecedor 				= HistoricoAlteracaoSQL.GetData(10)
+			
+			set count = $increment(count)
+			
+			do NewLine^COMTable()
+			do InsertCell^COMTable($zdate(DataAlteracao,4),,,,"CENTER")
+			do InsertCell^COMTable($ztime(HoraAlteracao),,,,"CENTER")
+			do InsertCell^COMTable(Usuario,,,,"CENTER")
+			do InsertCell^COMTable($zdate(Data,4),,,,"CENTER")
+			do InsertCell^COMTable($ztime(HorarioInicio),,,,"CENTER")
+			do InsertCell^COMTable($ztime(HorarioTermino),,,,"CENTER")
+			do InsertCell^COMTable(Doca,,,,"CENTER")
+	    	do EndLine^COMTable()		
+	
+		}
+		
+		if (count = 0){
+			do NewLine^COMTable()
+			do InsertCell^COMTable("Nenhuma alteração encontrada.",,,,,,7)
+	    	do EndLine^COMTable()		
+		}
+		
+		do Stop^COMTable()		
+  	}
+	
+	do HistoricoAlteracaoSQL.Close()
+	
+	quit
+	
+GetMaxSequencial(pNoOrdemCompra, pNoEntrega1)
+	set Sequencial = ""
+	&sql(
+		select MAX (Sequencial)
+		into :Sequence
+		from VARTempCompraEntregaAgendamentoHistorico
+		where 
+		CAST(NoOrdemCompra AS VARCHAR) = :pNoOrdemCompra
+		and CAST(NoEntrega AS VARCHAR) = :pNoEntrega1
+	)
+	if 'SQLCODE {
+		set Sequencial = Sequence
+	} 
+	
+	quit Sequencial]]></Routine>
+</Export>

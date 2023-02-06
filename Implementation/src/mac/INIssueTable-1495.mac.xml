@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INIssueTable" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INIssueTable
+	
+#include COMSYS
+#include INConst
+#include %occInclude
+ 
+#define DELIM	$char(31)
+	
+ShowItems(pidEvent,pidParameters)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By : Dynamic Table for Form INIssue; OnBlur^INIssueLine
+	;		
+	; Inputs : 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Sep-2013	SCR		CORE-266: Pass in Loc 
+	; 26-Jun-2013	SCR		CORE-134: Include current Reserved stock
+	; 01-Dec-2009	GRF		SR17007: separate tags for multi-lock operations
+	; 01-Jun-2009	PPP		SR16599: Add Row highlight & click functionality
+	; 16-Jan-2009	DavidR	SR16262 added check for a record first before running
+	; 06-May-2008	HQN		Reverted change, show all dBundleStocks for Location
+	; 							instead of 2 selectors
+	; 01-May-2008	HQN		SR15703: Early exit, don't bother to show entries
+	; 						for Blank Policies(Attributes.Count() = 0)
+	; 30-Apr-2008	HQN		SR15685: Branch table to show dSOH entries
+	; 29-Apr-2008	HQN		SR15696: Early exit if Issue not editable
+	; 08-Apr-2008	HQN		SR15625: Corrected lookup for copied lines
+	; 							1.5 might not be stored to disk yet,
+	; 							Get Location from screen
+	; 04-Apr-2008	HQN		SR15625: Appended QtyOnHand; Open Objects unlocked
+	; 02-Apr-2008	HQN		SR15625: Copied from ShowItems^INReqTable
+	;-------------------------------------------------------------------------------
+	new idIssue,idIssueLine,idKey,lstColTypes,lstHeaders,objItem,objItemPolicy,objLocn
+	new strFunction,strGridLineYFORM,strIssue,strIssueLine,strStatus
+	
+	kill ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle")
+	
+	set strGridLineYFORM = $$$DYNTABLEGridLineFocusGrid(pidParameters)
+	set idKey       = $$ReferenceKey^COMGridEdit31Interface(strGridLineYFORM,$$$DYNTABLEGridLineFocusRow(pidParameters))
+	set idIssue     = $$$KEY1(idKey)
+	set idIssueLine = $$$KEY2(idKey)
+	
+	if '$$IsEditable^INIssue(idIssue) quit                       ; *** EARLY EXIT ***
+	
+	;et strStatus    = $$GetLock^WWWMultiLock("INIssue",strGridLineYFORM,idIssue_$$$COMMA_idIssueLine,$$$NO) ; SR17007
+	set strStatus    = $$GetLock^WWWMultiLock("INIssue",strGridLineYFORM,idIssue_$$$COMMA_idIssueLine)
+	; FIXME : strStatus is not checked <GRF>
+	
+ 	set strIssue	 = $$$GRIDYFELDContainer
+ 	set strIssueLine = $$$GRIDGetYFELD(idIssueLine)
+	
+	; Load Lookup objects
+	;set objIssueLine = ##class(alISS.dUIssueLine).%OpenId("0||"_idIssue_"||"_idIssueLine,0)
+	set objLocn = ##class(alLOC.dLocation).%OpenId($$$INIssueFromLocn(strIssue))
+	set objItem = ##class(alINV.dItem).%OpenId($$$INIssueLineItem(strIssueLine),0)
+	
+	if objItem'=$$$NULLOREF {    ; SR16262 
+		set objItemPolicy = objItem.ItemPolicy
+		set strFunction   = "FillLine"
+		
+			
+		set strStatus = $$BuildDynTableHeader(objItemPolicy,.lstHeaders,.lstColTypes,objLocn.Code)
+	; FIXME : strStatus is not checked <GRF>
+		
+		do BuildDynTableRows(objItem.%Id(),objLocn.Code,$$$INIssueLineFromStorage(strIssueLine),$$$INIssueProgram1(strIssue),idIssue) ; CORE-134
+		;do BuildDynTableRows(objItem.%Id(),objLocn.Code,$$$INIssueLineFromStorage(strIssueLine),$$$INIssueProgram1(strIssue))
+		; setup JS Callback
+		if $$$ISERR(strStatus) {
+			write "function "_strFunction_"() {"
+			write "alert('"_$$$JSText($$$Text(strStatus))_"');"
+			write "}"
+		} else {
+			write "function "_strFunction_"() {"
+			write "CallBack(""SelectBundle^INIssueTable"", getRowNum(getFocusField()), this.DiscData[0]);"
+			write "}"
+		}
+		;}
+		//SR16599
+		//The last parameter (after pidEvent) needs to be set for the RowClick event, will be used by RowClick^WWW120DynTable
+		//	e.g. "WarehouseLine^INReqTable"
+		//	will be called with the following parameters
+		//	1. Row ID
+		//	2. Each entry in ^CacheTempDynamicTable(...,data) separated by "~" will be a new parameter
+		//			in this routines case : do WarehouseLine^INReqTable(pidRow,idLocn) will be executed on Row click
+		do DrawTable^WWW120DynTable(lstHeaders,"dStockBundle",lstColTypes,pidParameters,strFunction,pidEvent,"SelectBundle^INIssueTable")
+	}
+	
+	;kill ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle")
+	quit $$$OK
+	
+	
+BuildDynTableHeader(pobjItemPolicy,&plstHeaders,&plstColTypes,pidLoc)
+	;-------------------------------------------------------------------------------
+	; Setup Table Headers
+	;         (1)               (2)                      (3)
+	;     "Storage"     Attribute Headings       "Available Quantity"
+	;                   (e.g. "Lot Number")       
+	; 
+	; History:
+	; 13-Feb-2009	GRF		SR16281: Allow *ALL* table entries to update edit grid.
+	; 20-Jan-2009	GRF		SR16317: Revise "Bundle" display - hide internal and
+	; 							change name; prefixes
+	; 31-Oct-2008	HQN		SR16077: Changed column label from QtyOnHand to 
+	; 							Available Quantity
+	; 12-May-2008	Luke 	SR15722: added translations for QtyOnHand
+ 	; 08-May-2008	Luke 	SR15722: added translations for Storage and 
+ 	; 							"Stock Bundle" 
+ 	; 01-May-2008	HQN		SR15703: Using Translations for Column Headers
+	; 29-Apr-2008	HQN		SR15696: Removed all entries for ReceiptNo so it doesnt 
+	; 							show up
+	; 07-Apr-2008	HQN		Separated from ShowItems() for reuse in other routines
+	;-------------------------------------------------------------------------------
+	new idAttrKey,objAttr,strAttrName
+	
+	;---------------------------------------  1
+	
+	;set plstHeaders  = $listbuild($$$Text("alISS0004"),$$$Text("alISS0003"))  ; "Stock Bundle" / "Storage"  ; SR15722 ; SR16317
+	;set plstColTypes = $listbuild($listbuild("left","link"),$listbuild("left","link"))
+	set plstHeaders  = $listbuild($$$Text("alISS0003"))     ; "Storage"
+	set plstColTypes = $listbuild($listbuild("left","link"))
+	
+	;---------------------------------------  2
+	
+	do DynaHeadings^INBundleUtils(pobjItemPolicy,pidLoc,.plstHeaders,.plstColTypes)
+	
+	;---------------------------------------  3
+		
+	set plstHeaders  = plstHeaders_$listbuild($$$Text(32665))          ; "Available Quantity "
+ 	set plstColTypes = plstColTypes_$listbuild($listbuild("right","link"))
+	quit $$$OK
+	
+	
+BuildDynTableRows(pidItem,pidLocn,pidStorage,pidProgram="",pidIssue="")
+	;-------------------------------------------------------------------------------
+	; Build an array "^CacheTempDynamicTable" which contains the lines corresponding
+	; to the headings in BuildDynTableHeader
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 26-Jun-2013	SCR		CORE-134: Include current Reserved stock
+	; 18-Apr-2013	shobby	HEVA-154.1: Display descriptions in Dynatable
+	; 02-Apr-2013	SCR		HEVA-811: Show Owner, Program & Brand Names
+	; 08-Dec-2009	shobby	SR17034: Additional parameter pidProgram to be passed into SourceStock
+	; 20-Feb-2009	GRF		SR16303: Potential for objPolicyAttr to be held over
+	; 							from previous cycle of for loop when not defined.
+	; 20-Jan-2009	GRF		SR16317: Revise "Bundle" display; cleanup old comments;
+	; 							correct prefixes; objStorage not used
+	; 08-Oct-2008	PPP		SR16015: Show Dates based on ^WWWDATE
+	; 07-Oct-2008	PPP		SR15862: Added Bundle Description along with ID
+	; 15-May-2008	Luke	SR15747: Changed sourcing mechanism to go through DRP
+	; 14-May-2008	Luke	SR15741 removed Out of date items from being shown
+	; 30-Apr-2008	HQN		Corrected Attribute lookup to look at Bundle.ItemPolicy
+	; 							instead of Item.ItemPolicy, which may be different
+	; 							due to editing of the Item's ItemPolicy
+	; 29-Apr-2008	HQN		SR15696: Removed all entries for ReceiptNo so it doesn't
+	; 							show up
+	; 23-Apr-2008	HQN		Corrected call to alINV.iUINV instead of alINV.iINV
+	; 03-Apr-2008	HQN		Converted from indexed loop to Next() loop; Date
+	; 							Datatype detection for rendering; Use new 
+	; 							ItemPolicy.Attributes lookups; Appended QtyOnHand
+	; 01-Apr-2008	HQN		Created
+	; 
+	; FIXME: Validation of result table against headers
+	;-------------------------------------------------------------------------------
+	new idAttrKey,idLine,idPolicyAttr,loopRS,objAttr,objBundleStock,objItem
+	new objItemPolicy,objLocn,objPolicyAttr,objResultSet,strAttrValues
+	new strValue,strName,strDesc
+	
+	set objItem    = ##class(alINV.iUINV).GetItem(pidItem)
+	set objLocn    = ##class(alLOC.iULOC).GetLocation(pidLocn)
+	;set objStorage = ##class(alLOC.iLOC).GetStorage(pidLocn,pidStorage)
+	
+	if (objItem '= $$$NULLOREF) && (objLocn '= $$$NULLOREF) {
+		kill ^CacheTempDynamicTable(YUCI,YUSER,"dBundleStock")
+		set objItemPolicy = objItem.ItemPolicy
+ 
+ 		; FIXME: HQN Should this actually show sourcing sequence?
+		; Retrieve Records
+		;set objResultSet = ##class(alDRP.iDRP).SourceStock(objItem,objLocn,pidProgram,11,pidIssue)  ; CORE-134 enable this to include current reserved stock
+		set objResultSet = ##class(alDRP.iDRP).SourceStock(objItem,objLocn,pidProgram)   //SR15747  ;SR17034
+		for loopRS=1:1:objResultSet.Count() {
+			set objBundleStock = objResultSet.GetAt(loopRS)
+			
+			set ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",$increment(idLine),"data") = objBundleStock.%Id()
+			
+			;-------------------------------  1
+			
+		;	set strAttrValues = objBundleStock.Bundle.Description_"  ("_objBundleStock.Bundle.%Id()_")"_Y_objBundleStock.Storage.Code_Y  ; SR16317
+			if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+				if (YLOCATION = $$getFarmaciaAcoesJudiciais^VARParametroCliente(0)){
+					set strAttrValues = "("_objBundleStock.Storage.Code_") "_$$SQLGetPatientName^VARSQL(objBundleStock.Storage.Code)_Y	;SR17541 
+				}else{
+					set strAttrValues = objBundleStock.Storage.Code_Y
+				}
+			}else{
+				set strAttrValues = objBundleStock.Storage.Code_Y
+			}
+			
+			;-------------------------------  2
+				set strAttrValues=strAttrValues_$$BundleAttributes2^INBundleUtils(objBundleStock,pidLocn)  ;HEVA-154.1
+			;-------------------------------  3
+			
+			set strAttrValues = strAttrValues_objBundleStock.QtyOnHand
+			set ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idLine) = strAttrValues
+		}
+	}
+	quit $$$OK
+	
+	
+SelectBundle(pidRow,pidKey)
+	;---------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Nov-2010	PPP		SR17600: New variables and set values for both
+	; 03-Oct-2008 	Luke 	SR15978: Removed update to col 9, BOH
+	; 06-May-2008	HQN 	SR15703: Update both storage and Bundle values with
+	; 							selected dStockBundle record; Set QOH manually
+	; 02-Apr-2008	HQN		Created
+	; 
+	;&js< alert(#(pidRow)#);alert('#(pidKey)#');>
+	;---------------------------------------------------------------------------
+	new IssuedFrom,IssueTo
+	new objBundleStock,sc,strIssue,strIssueLine,YFORM
+	
+	set strIssue     = $$$GRIDYFELDContainer
+	set strIssueLine = $$GetYFELDEX^COMGridEdit31Interface("INIssueLine",$$$GRIDYKEYContainer_","_pidRow)
+	set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(pidKey,0,.sc)
+	
+	//SR17600
+	; Explicitly set the stored variables (IssuedFrom,IssueTo) from the INIssue Form, 
+	; this is a HyperEvent call and it isn't set ; DisplayData+60^COMGridEdit31F1 error
+	; property for INLP relation
+	set IssuedFrom 	= $$$INIssueFromLocn(strIssue) 
+	set IssueTo 	= $$$INIssueToLocn(strIssue) 
+	; WARNING : "IssuedFrom" & "IssueTo" are required for relationship check
+	;           for D4 & D3 respectively of Class INIssueLine on form INDispenseToPatientLine
+	;           ReferenceKey^COMGridEdit31Interface in SetRecord^COMGridEdit31S1
+	
+	do:$$$ISOK(sc) SetRecord^COMGridEdit31S1("INIssueLine",pidRow,$$$FldINIssueLineFromStorage_$$$COMMA_objBundleStock.Storage.Code)
+	do:$$$ISOK(sc) SetRecord^COMGridEdit31S1("INIssueLine",pidRow,$$$FldINIssueLineBundle_$$$COMMA_objBundleStock.Bundle.%Id(),$$$FldINIssueLineQtyIssued)
+	quit
+	
+ 
+]]></Routine>
+</Export>

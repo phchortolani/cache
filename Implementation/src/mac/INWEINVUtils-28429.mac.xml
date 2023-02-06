@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INWEINVUtils" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INWEINVUtils
+#include COMSYS
+#include INConst
+#include WWWConst
+ 
+GetNumberOfLines(pidStocktake)
+	; return the number of lines in the stocktake (in INWEINV)
+	quit $order(^INWEINV(YM,pidStocktake,""),-1) 
+ 
+ListLineCounts(pidStocktake,pidCount) 
+	new idLine, objCount, objLine
+	$$$Order3(^INWEINV,YM,pidStocktake,idLine) 
+		set objCount = $$GetCount^INWEINVCount(pidStocktake,idLine,pidCount)
+		if objCount '= "" {
+			set objLine = $$GetStocktakeLine^INStocktaking(pidStocktake,idLine)
+			write !,pidStocktake_", "_idLine_", "_pidCount _ " : " _ $$$INWEINVCountQuantity(objCount) 
+		}
+	$$$End
+	quit
+ 
+GetQty(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Get stock difference between current and snapped quantities
+	; (called from field "Movement Since Generation" on form INWEINVELINE)
+	;
+	; Returns: Float
+	;
+	; History:
+	; 04-Jan-2010	PPP		SR17645: Added new parameter, idBundle for $$CorrectByHistoryV2
+	; 03-Nov-2008	PPP		SR16117:Get the trn qty for an item at a Location  for a date/time range
+	; 						CorrectByHistoryV2
+	; 03-Oct-2008	GRF		SR15810: $$CorrectByHistory^INWEINRUECK was being based
+	; 							on comma-delimited location list - corrected pending
+	; 							replacement.
+	; 29-Nov-2007	shobby	SRBR014798: If the timestamp is empty use the current time.
+	; 19-Aug-2006	RPW		SR14857: Pass through the storages to the correction routines.
+	; 17-Aug-2006	RPW		SR14857: Use CorrectByHistory for the Movement Quantity
+	; 30-May-2006	JW		SR14681: Reservations/Orders
+	; 22-May-2006	JW		SR14654: Don't consolidate if lot controlled / serial nums
+	; 28-Feb-2006	PP		SR14508: Created
+	;-------------------------------------------------------------------------------
+	new idItem,idLoc,idBin,fltMoveQty,dteReceipt,objItem,enumType,fltCount,fltDiffQty
+	new idFilterLocns,idFromStorage,idToStorage,objStocktake
+	new tmsCounted,tmsInvCreated
+	
+	if $$$INWEINVPosted(pYFELD)'="" quit ""									; Already Posted
+	//if $$$INWEINVOrderNumber(pYFELD)'="" quit $$$Text($listbuild("IN00469",$$$INWEINVOrderNumber(pYFELD)))	  ; Order# %1 ; Relates to an Order not Sourced Yet
+	
+	set enumType = $$$INWEINVStockType(pYFELD)
+	if enumType = "S" {
+		quit $$$Text($listbuild("IN00469",$$$INWEINVOrderNumber(pYFELD)))	  ; Order# %1 			; Relates to sourced stock
+	
+	} elseif enumType = "R" {
+		quit $$$Text($listbuild("IN00488",$$$INWEINVOrderNumber(pYFELD)))	  ; Reservation# %1
+	}
+	
+	set idItem	= $$$INWEINVItemNumber(pYFELD)
+	if idItem="" quit ""
+	
+	set idLoc	= $$$INWEINVLocation(pYFELD)
+	set idBin	= $$$INWEINVStockLocation(pYFELD)
+	//SR17645
+	set idBundle= $$$INWEINVBundleID(pYFELD)
+	
+	/* 14857
+	set dteReceipt = ""
+	if '$$$INWEINVPConsolidateReceiptDates($get(^INWEINVP(YM,$$$KEY1(pYKEY),1))) {
+		set dteReceipt = $$$INWEINVGoodsReceiptDate(pYFELD)
+		
+	} else {
+		set objItem = $get(^INART(YM,idItem,1))		//SR14654
+		if ($$$INARTSerialNumber(objItem)=1) || ($$$INARTLotControlled(objItem)=1) {
+			set dteReceipt = $$$INWEINVGoodsReceiptDate(pYFELD)
+		}
+	}
+	*/
+	
+	// SR14857
+	
+	//set fltCount   = +$$$INWEINVTargetQuantity(pYFELD)
+	//set fltDiffQty = fltCount -$$$INWEINVActualQuantity(pYFELD)   ;SR14508 difference
+	set tmsCounted =  $$$INWEINVCountTimestamp(pYFELD)
+	if tmsCounted="" set tmsCounted = $horolog               ;BR014798
+	
+	set objStocktake = $get(^INWEINVP(YM,$$$KEY1(pYKEY),1))
+	
+	set tmsInvCreated = $$$INWEINVPSystemDate(objStocktake)
+	set idFilterLocns = $$$INWEINVPSiteLocation(objStocktake)
+	set idFromStorage = $$$INWEINVPFromStockLocation(objStocktake)
+	set idToStorage   = $$$INWEINVPToStockLocation(objStocktake)
+	
+	//set fltMoveQty = fltDiffQty - $$CorrectByHistory^INWEINRUECK(idItem,fltDiffQty,tmsInvCreated,tmsCounted,idFilterLocns,idFromStorage,idToStorage)
+	set fltMoveQty = $$CorrectByHistoryV2(idItem,tmsInvCreated,tmsCounted,idLoc,idBin,idBundle)	//SR17645
+	
+	quit fltMoveQty
+ 
+ 
+CorrectByHistoryV2(idItem,tmsInvCreated,tmsCounted,idLoc,idBin,idBundle)
+	;-------------------------------------------------------------------------------
+	; Get the trn qty for an item at a Location  for a date/time range
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Jan-2010	PPP		SR17645: Added new parameter, idBundle
+	; 05-Nov-2008	HQN		SR16121: Corrected missed time calculations, return
+	; 							calculated value instead of last read entry
+	; 03-Nov-2008	PP		SR16117: Created
+	;-------------------------------------------------------------------------------
+	new dteEnd,dteStart,dteTrn,fltQty,fltTrnQty,objResultSet,SQLCODE
+	new strSQL,strStatus,tmeEnd,tmeStart,tmeTrn
+	
+	set:$get(tmsCounted)="" tmsCounted=$h
+	
+	set dteStart = $piece(tmsInvCreated,",")
+	set dteEnd   = $piece(tmsCounted,",")
+	/* ; SR16121 vvvv
+	set tmeStart = $piece(tmsInvCreated,",")
+	set tmeEnd = $piece(tmsCounted,",")
+	*/ ; SR16121 ^^^^
+ 	set tmeStart = $piece(tmsInvCreated,",",2)
+	set tmeEnd = $piece(tmsCounted,",",2)
+ 	
+ 	set strStatus    = $$$OK
+	set objResultSet = ##class(%Library.ResultSet).%New()
+	set strSQL       = "SELECT QtyMoved, DateConfirmed, TimeConfirmed FROM alSOH.dStockHistory WHERE Item = ?"
+	set strSQL = strSQL _" AND Bundle = ?"		//SR17645
+	set strSQL = strSQL _" AND Location->Code = ?"
+	set strSQL = strSQL _" AND Storage->Code = ?" 
+	set strSQL = strSQL _" AND DateConfirmed >= ?"
+	set strSQL = strSQL _" AND DateConfirmed <= ?"
+
+ 	set (fltTrnQty,fltQty) = 0
+ 	
+	if objResultSet.Prepare(strSQL) {
+		if objResultSet.Execute(idItem, idBundle, idLoc, idBin, dteStart, dteEnd ) {	//SR17645
+			while objResultSet.Next() {
+				quit:$$$ISERR(strStatus)
+				
+				set dteTrn = objResultSet.Data("DateConfirmed")
+				set tmeTrn = objResultSet.Data("TimeConfirmed")
+				set fltQty = objResultSet.Data("QtyMoved")
+ 
+				if (dteTrn = dteStart) {
+					if (tmeTrn >= tmeStart) {
+						set fltTrnQty = fltTrnQty + fltQty
+					}
+				} elseif (dteTrn = dteEnd) {
+					if (tmeTrn <= tmeEnd) {
+						set fltTrnQty = fltTrnQty + fltQty
+					}
+				
+				} else {
+					set fltTrnQty = fltTrnQty + fltQty				
+				}
+			}
+		}
+	}
+ 
+	quit fltTrnQty	
+	;quit fltQty ; SR16121
+]]></Routine>
+</Export>

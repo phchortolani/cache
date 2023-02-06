@@ -1,0 +1,1138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReceiptButtonP" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReceiptButtonP
+	;+++++++++++++++++++++++++++++++++++++++
+	; Receipt Button processing - Post Receipt
+	; see INRECDoco
+	; 
+	; 31-Jul-2009	GRF		SR16602: Split from INReceipt; move Receipt from
+	; 							INRECSummary
+	;+++++++++++++++++++++++++++++++++++++++
+#include COMSYS
+#include INConst
+#include FINConst
+#include COMConst
+#include %occInclude
+#include COMGridEdit31
+#include INSYS
+	
+#define EnumTypeStandard	0
+#define EnumTypeDiscount	1
+#define EnumTypeBonus		2
+#define IsItemLine   ((enumLineType=$$$EnumTypeStandard) || (enumLineType=$$$EnumTypeBonus))
+#define IsChargeLine ((enumLineType'="") && (enumLineType'=$$$EnumTypeStandard) && (enumLineType'=$$$EnumTypeBonus))
+	
+#define enumAverageCost		9
+	
+#define LogR(%1,%2) 	;
+#define LogR2(%1,%2) 	;
+#define LogR4(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogR3x(%1)		;
+#define LogR4x(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReceiptButtonP("_%2_") : "_$zh $$$JournalOn
+#;define LogR2(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReceiptButtonP("_%2_") : "_$zh $$$JournalOn
+#;define LogR4(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReceiptButtonP("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogR3x(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogR4x(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+IsReceivable(pidReceipt,pobjReceipt="")
+	;-------------------------------------------------------------------------------
+	; Can this record be "Received"?
+	; 
+	; CalledFrom:
+	;	Post Receipt Button INReceipt Form
+	; 
+	; History:
+	; 21-May-2012	PPP		SR18011:Check for Duplicate Supplier/Invoice No.
+	; 25-Mar-2010	GRF		SR17244: check for in-line discounts without charge
+	;							details or in-line discounts when Invoice Number is
+	;							missing; idSupp used in ProcessAllocations not here
+	; 01-Dec-2009	GRF		SR16605: call CheckDiscounts
+	; 18-Nov-2009	GRF		SR17046/SR16871: base INFIBPAR on location hierarchy
+	; 21-Oct-2009	DWR		SR16963: Set object if empty earlier. Prevent subscript
+	; 							errors.
+	; 05-Aug-2009	PPP		SR16816	Lock Receipts based on Stocktake
+	; 03-Aug-2009	DWR		SR16792: Added a check that if there are charge lines
+	; 							present, and the comapny has financials set up,
+	; 							invoice number must be entered.
+	; 16-Jul-2009	GRF		SR16669: CostDistribution macro change
+	; 15-Jul-2009	GRF		SR16689: Correct INRECSummary property names in macros
+	; 08-Jul-2009	GRF		SR16689: Check for bonus with cost; Line Type macros
+	; 03-Jul-2009	GRF		SR16649: Call CheckForDeletedOrder
+	; 25-Jun-2009	GRF		SR16671: More informative tooltip; don't need to recheck
+	;							$$$ISERR(strStatus) for quit when have just set it
+	;							using $$$MakeStatus; $$$ISOK rather than '$$$ISERR;
+	;							explicit no lines check for readability
+	; 06-Apr-2009	DWR		SR16363: Added a first check to see if Total Qty on Tab 2 
+	;							(Inspection) per line match the Qty Received on Tab 1
+	;							(Receipt) 
+	; 13-Mar-2009	GRF		SR16363: Reverse logic and remove else
+	; 03-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new NumeroNF,enumLineType,fltReceiptQty,idLocn,idRecLine,idSummary,objFINParam
+	new objSummLine,strStatus,totalRecebimento
+	
+	;$$$LogR("IsReceivable",pidReceipt_"<"_pobjReceipt_"<")
+	set strStatus = $$$OK
+	if '$$$NoKey(pidReceipt) {
+		if pobjReceipt="" {    ; SR16963 Moved here from below
+			set pobjReceipt = $get(^INREC(0,pidReceipt,1))
+		}
+		if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+			if $piece(pobjReceipt,Y,75) = 0 {
+				set strStatus = "0 Não é permitido que o custo do recebimento seja zero. "
+			}	
+			elseif $piece(pobjReceipt,Y,30) '= "" {  ;Número da Ordem
+					set totalRecebimento = $piece(pobjReceipt,Y,74)
+					set NumeroNF =  $piece(pobjReceipt,Y,14)
+					if '(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+						if NumeroNF = "" {
+							set strStatus = "0 O Número da Nota Fiscal é obrigatório. "
+						}
+						elseif totalRecebimento = 0 {
+							set strStatus = "0 O valor total do Recebimento não pode ser zero. Confira os custos. "
+						}
+					} else {
+						if ((NumeroNF = "") && ($$$INRECFREE28(pobjReceipt) = 1)) {
+							set strStatus = "0 O Número da Nota Fiscal é obrigatório. "
+						}
+						elseif ((totalRecebimento = 0) && ($$$INRECFREE28(pobjReceipt) = 1)) {
+							set strStatus = "0 O valor total do Recebimento não pode ser zero. Confira os custos. "
+						}						
+					}
+			}
+			
+			if $$$ISOK(strStatus) {
+				set strStatus = $$ValidaDescontosETaxas^VARINReceipt(pidReceipt)
+			}			
+		}
+		if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+			if $$$ISOK(strStatus) {
+				set strStatus = $$ValidaNotaFiscal^VARINReceipt(pidReceipt)
+			}
+		}
+		; SR17244 vvv moved up as common entry
+		set idLocn      = $$$INRECLocation(pobjReceipt)
+		set objFINParam = $$GetGLParams^WWW0121Utils(idLocn)
+		; ^^^
+		
+		//SR16816 Test for locking
+		if $$IsLockedSiteLocation^INLocking($$$INRECLocation(pobjReceipt)) {
+			set strStatus = $$ReasonLocked^INLocking($$$INRECLocation(pobjReceipt))
+		}
+		
+		if $$$ISOK(strStatus) {		
+			if ($$$INRECFirmed(pobjReceipt)=$$$NO) || ($$$INRECFirmed(pobjReceipt)="") {
+				set strStatus = $$$MakeStatus("IN01028") ; "Receipt not firmed "
+			}
+		}
+		
+		if $$$ISOK(strStatus) {										
+		;	if pobjReceipt="" {     ; SR16963  Moved above ^^^
+		;		set pobjReceipt = $get(^INREC(0,pidReceipt,1))
+		;	}
+			
+			if ($$$INRECStatus(pobjReceipt) '= $$$EnumINSTATUSUnprocessed) {						
+				set strStatus = $$$MakeStatus("IN00377")  ; "Record already processed"
+			
+			} elseif '$data(^INRECLine(0,pidReceipt)) {  ; SR16671
+				set strStatus = $$$MakeStatus("IN00403")  ; "No goods have been selected for receipt"
+				
+			} else {
+				set idRecLine = ""                        ; Validate lines
+				for {
+					set idRecLine = $order(^INRECLine(0,pidReceipt,idRecLine))
+					quit:idRecLine=""
+					set strStatus = $$IsReceivable^INReceiptLine2(pidReceipt,idRecLine)
+					quit:$$$ISERR(strStatus)
+				}
+			}
+		}
+		
+		if $$$ISOK(strStatus) {										
+			set idSummary = ""
+			for {
+				set idSummary = $order(^INRECSummary(0,pidReceipt,idSummary))
+				quit:idSummary=""
+			
+				set objSummLine  = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+				set enumLineType = $$$INRECSummaryLineType(objSummLine)
+				if $$$IsItemLine && ($$$INRECSummaryItem(objSummLine)'="") {
+					if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+					   (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+						set fltReceiptQty = $$GetQtyEnteredFromGlobals^VARINReceipt(pidReceipt_$$$COMMA_idSummary)   ; Sum Quantities
+					} else {
+						set fltReceiptQty = $$GetQtyEntered^INReceiptLine(pidReceipt_$$$COMMA_idSummary)   ; Sum Quantities
+					}
+					if (fltReceiptQty '= $$$INRECSummaryQuantityReceived(objSummLine)) {
+						set strStatus = $$$MakeStatus("IN00930",idSummary)
+						quit
+					} ; "Quantities Received on line %1 of the "Receipts" tab must match corresponding line(s) on the "Inspection" tab."
+					
+					set strStatus = $$CheckDiscounts(pidReceipt,idSummary,objSummLine)    ; SR16605
+					quit:$$$ISERR(strStatus)
+				}
+				if ($$$INRECInvoiceNumber(pobjReceipt)'="") {
+					if $$$IsChargeLine {
+						if ($$$INRECSummaryCostAllocation(objSummLine)="")   ||
+						   ($$$INRECSummaryGLAccount(objSummLine)="")        ||
+						   ($$$INRECSummaryDiscountCode(objSummLine)="")     ||
+						   ($$$INRECSummaryDiscountType(objSummLine)="")     ||
+						   ($$$INRECSummaryDiscountRate(objSummLine)="")     ||
+						   ($$$INRECSummaryCostDistribution(objSummLine)="")   {
+							   
+							set strStatus = $$$MakeStatus("WWW00042")  ; "Not all mandatory fields have been entered"
+							quit
+						}  ; FIXME : Are these mandatory if no GL is in use? <GRF>
+					}
+					
+					if $$$IsItemLine && ($$$INRECSummaryDiscountCode(objSummLine)'="") {   ; SR17244
+						if ($$$INRECSummaryCostAllocation(objSummLine)="")   ||
+						   ($$$INRECSummaryGLAccount(objSummLine)="")        ||
+						   ($$$INRECSummaryDiscountType(objSummLine)="")     ||
+						   ($$$INRECSummaryDiscountRate(objSummLine)="")     ||
+						   ($$$INRECSummaryCostDistribution(objSummLine)="")   {
+							   
+							set strStatus = $$$MakeStatus("WWW00042")  ; "Not all mandatory fields have been entered"
+							quit
+						}  ; FIXME : Are these mandatory if no GL is in use? <GRF>
+					}
+				} else {   ; SR17244  FIXME : improve text - specific to in-line discounts
+					if $$$IsItemLine && ($$$INRECSummaryDiscountCode(objSummLine)'="") {
+						if +$$$INFIBPARAttachedGL(objFINParam)'=0 {  ; Don't process if No GL for this location
+							set strStatus = $$$MakeStatus("IN01083")
+						}   ; "Charge lines exist. Invoice number required to process receipt."
+					}
+				} 
+				;vvvvvvvvv SR16792 vvvvvvvvvvvvv
+				if $$$ISOK(strStatus) && (($$$INRECInvoiceNumber(pobjReceipt)="") && $$$IsChargeLine)  {
+		; SR17244 vvv move up
+		;			set idLocn      = $$$INRECLocation(pobjReceipt)
+		;			set idSupp      = $$$INRECSupplier(pobjReceipt)
+		;		;	set objFINParam = $get(^INFIBPAR(0,0,idLocn,1))          ; SR17046/SR16871
+		;			set objFINParam = $$GetGLParams^WWW0121Utils(idLocn)
+					
+					if +$$$INFIBPARAttachedGL(objFINParam)'=0 {  ; Don't process if No GL for this location ; SR16792
+						set strStatus = $$$MakeStatus("IN01083")
+					}   ; "Charge lines exist. Invoice number required to process receipt."
+				}
+				;^^^^^^^^^ SR16792 ^^^^^^^^^^^^
+				if $$$ISOK(strStatus) && (enumLineType=$$$EnumTypeBonus) && $$$INRECSummaryExtendedCost(objSummLine) { ; SR16689
+					set strStatus = $$$MakeStatus("IN01075",idSummary)
+				}  ; "Line %1 : Bonus item cannot have a cost - change to Standard or clear cost"
+				quit:$$$ISERR(strStatus)
+			}
+		}
+		
+		if $$$ISOK(strStatus) {								
+			if ($$$INRECInvoiceNumber(pobjReceipt)'="") {
+				if ($$$INRECInvoiceTotal(pobjReceipt)="") {
+					set strStatus = $$$MakeStatus("IN01033")    ; "Invoice Total required"
+				
+				} elseif ($$$INRECInvoiceTotal(pobjReceipt)'=$$$INRECSummaryTotal(pobjReceipt)) {
+					set strStatus = $$$MakeStatus("IN01034")    ; "Invoice total and calculated total do not match"
+				
+				} elseif ($$$INRECInvoiceDate(pobjReceipt))="" {
+					set strStatus = $$$MakeStatus("Fin00641")   ; "Invoice Date Required"
+				}
+			}
+		}
+		if $$$ISOK(strStatus) set strStatus = $$CheckForDeletedOrder^INReceiptButton(pidReceipt)   ; SR16649
+		
+		//SR18011:Check for Duplicate Supplier/Invoice No.
+		if $$$ISOK(strStatus) {
+			set strStatus = $$CheckInvoiceNum^INRECBPost(pidReceipt)
+		}
+		
+	}
+	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	
+CheckDiscounts(pidReceipt,pidSummary,pobjSummLine)
+	;-------------------------------------------------------------------------------
+	; If an item line has discounts -
+	;  - the rate discount amount cannot exceed the unit cost
+	;  - The net result of all charges cannot be a negative value
+	; 
+	; Called By: IsReceivable
+	; 
+	; History:
+	; 30-Mar-2010	GRF		SR17244: consider in-line discount validation
+	; 01-Dec-2009	GRF		SR16605: created
+	;-------------------------------------------------------------------------------
+	new blnSurcharge,curChargeAmt,curDiscountedCost,curExtCost,curTotCharge,curUnitCost
+	new enumDiscType,fltDiscRate,fltQtyRecvd,idChargeLine,idDiscCode
+	new objCharge,objDiscount,strStatus
+	
+	$$$LogR2("CheckDiscounts",pidReceipt_","_pidSummary_"<")
+	
+	set strStatus    = $$$YES
+	set curTotCharge = 0
+	
+	; Item Line
+	;---------------------------------------
+	set curUnitCost = $$$INRECSummaryUnitCost(pobjSummLine)
+	set curExtCost  = $$$INRECSummaryExtendedCost(pobjSummLine)
+	set fltQtyRecvd = $$$INRECSummaryUnitQtyReceived(pobjSummLine)  ; Recvd Units
+	set curDiscountedCost = $$$INRECSummaryCostAfterDiscount(pobjSummLine)     ; SR17244
+	
+	; Associated Charge Lines
+	;---------------------------------------
+	set idChargeLine = pidSummary
+	for {
+		set idChargeLine = $order(^INRECSummary(0,pidReceipt,idChargeLine))
+		quit:idChargeLine\1'=pidSummary
+		quit:idChargeLine=""
+		
+		set objCharge    = $get(^INRECSummary(0,pidReceipt,idChargeLine,1))
+		set idDiscCode   = $$$INRECSummaryDiscountCode(objCharge)
+		set enumDiscType = $$$INRECSummaryDiscountType(objCharge)
+		set fltDiscRate  = $$$INRECSummaryDiscountRate(objCharge)
+		
+		if idDiscCode'="" {
+			set objDiscount = $get(^INSUPBuyingDiscount(0,idDiscCode,1))
+			set blnSurcharge = $$$INSUPBuyingDiscountSurcharge(objDiscount)
+			set curChargeAmt = $$CalcCharge^INReceiptInvoice(enumDiscType,fltDiscRate,fltQtyRecvd,curExtCost)
+			set curTotCharge = curTotCharge + (curChargeAmt * $select(blnSurcharge:-1,1:1))
+			
+	;		if (enumDiscType=2) && 'blnSurcharge && (curChargeAmt>curExtCost) {   ; SR17244
+			if (enumDiscType=2) && 'blnSurcharge && (curChargeAmt>curDiscountedCost) {
+				set strStatus = $$$MakeStatus("IN01154",curUnitCost)
+				quit
+			} ; "Discount Rate exceeds Item's Unit Cost (%1)"
+		}
+	}
+	
+	; curTotCharge will be +ve if net discounts for simple test.
+	if $$$ISOK(strStatus) {
+	;	if curExtCost<curTotCharge {     ; SR17244
+		if curDiscountedCost<curTotCharge {
+			set strStatus = $$$MakeStatus("IN01153",pidSummary)
+		} ; "Net charges exceed extended cost for line %1"
+	}
+	quit strStatus
+	
+	
+Post(pidReceipt)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 26-Jun-2013	SCR		CORE-93: COMTransaction, turn on error processing
+	; 08-Apr-2010	FIS		SR17268: Call to barcode printing software for receipt label
+	; 10-Dec-2009	GRF		SR16667: ReturnError already called in COMTransaction -
+	; 							apply to verification message only
+	; 27-Jul-2009	DWR		SR16766: Get INREC record instead of WWWDATEN
+	; 21-Jul-2009	GRF		SR16766: get objReceipt from WWWDATEN rather than as
+	; 							parameter - general re-write
+	; 17-Jul-2009	GRF		SR16766: Stop posting on IE back button
+	; 19-Mar-2009	GRF		SR16361: Rename to be consistent with other processes;
+	;							ditto use of objReceipt
+	; 13-Mar-2009	GRF		SR16363: removed invalid prefix
+	; 03-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new objReceipt,strStatus
+	
+	$$$LogR("Post",pidReceipt)
+	
+	set strStatus  = $$$OK
+	;set objReceipt = $get(^WWWDATEN(0,+$horolog,YUSER,"INReceipt","D",1))   ; SR16766
+	set objReceipt = $get(^INREC(0,pidReceipt,1))
+	
+	if ($$$INRECStatus(objReceipt) '= $$$EnumINSTATUSUnprocessed) {  ; SR16766 17-Jul-2009
+		set strStatus = $$$MakeStatus("IN00377")  ; "Record already processed"
+		do ReturnError^COMUtilError(strStatus)    ; SR16667 10-Dec-2009
+		
+	} else {
+		if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+		   (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+		    if $$$ISOK(strStatus) {
+		    	set strStatus = $$HasFullyReceived^VARINRECSummary(pidReceipt)
+		    	if ($$$ISERR(strStatus)){
+				    do AlertOnProcessMessage^VARINReceipt(pidReceipt)
+			    	do GoToForm^COMUtilForm(YFORM,pidReceipt)
+			    	quit
+		    	}
+		    }
+			if $$$ISOK(strStatus) {
+				if $$getEnviarEmailRecebimentoProdReq^VARParametroCliente(YM) = $$$YES job AlertaRecebimentoProdReq^VARAbastecimentoAlerta(pidReceipt)
+			}
+		}   
+		//FIXME : objReceipt is passed as a string of the contents rather than as a variable - what if it gets too long? <GRF>
+		if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+			;set strStatus = $$Transaction^COMTransaction("PostTxn^INReceiptButtonP("""_pidReceipt_""","""_objReceipt_""")") // SR17466
+			set strStatus = $$Transaction^COMTransaction("PostTxn^INReceiptButtonP("""_pidReceipt_""","""_objReceipt_""")",$$$YES) ; CORE-93
+		}
+		else {
+			set strStatus = $$Transaction^COMTransaction("PostTxn^INReceiptButtonP("""_pidReceipt_""","""_objReceipt_""")",$$$YES)
+		}
+		
+		
+	; perhaps replace with
+	;	set strStatus = $$Transaction^COMTransaction("PostTxn^INReceiptButtonP("""_pidReceipt_""",$get(^INREC(0,"""_pidReceipt_""",1)))",$$$YES)
+	}
+	
+	if $$$ISOK(strStatus) {   ; SR17268
+		if ($get(^SysSetup("LabelPrint"))=1) && (##class(%Dictionary.ClassDefinition).%ExistsId("alBarc.Barcode")) {
+			JOB PrintLabel(0,YLOCATION,pidReceipt)::1
+		}
+		do ReloadForm^COMUtilForm()
+	
+	;} else {   ; SR16667
+	;	do ReturnError^COMUtilError(strStatus)
+	}
+	
+	quit
+	
+	
+PostTxn(pidReceipt,pobjReceipt="")
+	;-------------------------------------------------------------------------------
+	; Processes a INREC record
+	;  1.  ProcessAllocations	: Based on INRECLine
+	;  2.  ProcessSummary		: Based on INRECSummary - with pro rata over INRECLine
+	;  3.  Update header		: INREC
+	; 
+	; Inputs:
+	;	pidReceipt	: ^INREC key  (YKEY from form INReceipt)
+	;	pobjReceipt	: ^INREC record : If have obtained earlier can pass in otherwise
+	;	                  don't include in parameter list and will be obtained here.
+	; 
+	; History:
+	; 07-Sep-2009	GRF		SR16875: attempted to move order line update from
+	; 							ProcessSummary / Receipt - unsuccessful - removed
+	; 07-Jul-2009	GRF		SR16689: Separated ProcessAllocations and ProcessSummary
+	;							for clarity
+	; 24-Jun-2009	GRF		SR16672: Check General Ledger Parameters to see if a
+	;							General Ledger is being used - don't create FINAPInv
+	;							if it isn't - this means 3WM is not available under
+	;							that scenario.
+	; 11-Jun-2009	GRF		SR16508: Check for Receipt Without Order
+	; 10-Jun-2009	GRF		SR16508: set RecDate array if Invoice No is present
+	;							(self-processing Invoice); Parameter mis-match in
+	;							call to Receive^INReceiptLinePost
+	; 05-Jun-2009	GRF		SR16508: Add ReceiptDate & UnitCost to dMovement object
+	; 21-May-2009	GRF		SR16363: Don't call Summary Item processing for charge
+	;							lines
+	; 20-May-2009	SH/DWR	SR16526: Removed last parameter from call to UpdateINAUF
+	; 01-May-2009	DWR		SR16363: call to Post^FINAPInvPost (3WM) if FINAPInv 
+	;							records created. 
+	; 15-Apr-2009	GRF		SR16363: Call INReceiptInvoice
+	; 07-Apr-2009	GRF		SR16363: Update INWEAUF for 3WM Invoicing
+	; 19-Mar-2009	GRF		SR16361: Rename to be consistent with other processes
+	; 05-Mar-2009	HQN		SR16363: Update header
+	; 03-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new blnInvPresent,strStatus
+	
+	$$$LogR("PostTxn",pidReceipt)
+	set strStatus = $$$OK
+	if pobjReceipt="" set pobjReceipt = $get(^INREC(0,pidReceipt,1)) 
+	set blnInvPresent = ($$$INRECInvoiceNumber(pobjReceipt)'="")
+	
+	set strStatus = $$ProcessAllocations(pidReceipt,blnInvPresent)
+	
+	if $$$ISOK(strStatus) set strStatus = $$ProcessSummary(pidReceipt,pobjReceipt,blnInvPresent)
+	
+	; Update INREC header     (cf UpdateHeader^INRECPost)
+	;---------------------------------------
+	if $$$ISOK(strStatus) {
+		set $$$INRECStatus(pobjReceipt)        = $$$EnumINSTATUSProcessed
+		set $$$INRECProcessedDate(pobjReceipt) = $horolog
+		set $$$INRECProcessedBy(pobjReceipt)   = $get(YBED,"UNKNOWN")
+		set strStatus = $$$Save("INREC",pidReceipt,pobjReceipt,$$$YES)
+	}
+
+	if (+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) {
+		if ($$$ISOK(strStatus)) {
+			set strStatus = $$PostTxn^VARINReceiptButtonP(pidReceipt, pobjReceipt)
+		}
+	}
+
+	quit strStatus
+	
+	
+ProcessAllocations(pidReceipt,pblnInvPresent) private
+	;-------------------------------------------------------------------------------
+	; Create movement record
+	; 
+	; 1.  CalculateCostIncSC^INReceiptButtonP   to build arrLineIncSC() 
+	; 
+	; 2.  [Loop Receipt Allocation Lines]
+	; 	SR16361  vvv REPLACE
+	; 			   -    Receipt Date from INWECounter            [uses ^INWECounter and ^INWE]
+	; 			        If deferred invoicing and Receipt *WITH* Order
+	; 			            Update^INReceiptLinePost  -  Create/Replace ^INWEAUF
+	; 			                (WWWSPEI : DCM Event INWEAUFSave => $$ReceiptSave^FINAPInvDCM)  [FINAPInvMatchCache : "Receipted"]
+	; SR16361  ^^^ WITH vvv
+	;    -    CacheReceiptSave^INRECReceive
+	; SR16361  ^^^
+	;             
+	;    -    Receipt Date from INReceiptLinePost into &INRECLine    [uses ^INWEAUF]
+	;         
+	;    -    Receive^INReceiptLinePost [using arrLineIncSC]
+	;            Construct Movement record from INRECLine and arrLineIncSC
+	;													alREC.dMovement - ChangeState(4)
+	;			 - alDRP.dMovementType.Receipt::Confirm()
+	;				 1  $$^INARTAVG       : Update V1 Average Cost (ReceiptWithOrder)    Create ^INARTAVG
+	;				 2  alSOH.piSOH::Post : Create alSOH.dStockHistory                           [Simple sequential key]
+	;				 3  alSOH.dPeriodBalance::UpdateViaStockHistory : 
+	;				        Update alSOH.dPeriodBalance (creating if required)   [Locn, Item, PeriodID]
+	;				 4	ConfirmMovement^INStockMovementRec 	Create INWE , INARTHIST/L, INStockVal, INFIBBUCH
+	;				  a) ReceiptWithOutOrderMovement
+	;				  b) ReceiptWithOrderMovement
+	;
+	;     -   [if Receipt without Order]
+	;             CreateInvoice^FINAPInvMatchCache      Create ^FINAPInvMatchCache for Receipt without Order
+	;--------------------------------------
+	; 
+	; Inputs:
+	;	pidReceipt      : ^INREC key  (YKEY from form INReceipt)
+	;	pblnInvPresent  : Has an invoice number been specified? if not, need to post
+	;	                  invoice through 3WM if GL used.
+	; 
+	; History:
+	; 12-May-2014	SCR		SESDF-1387: Stop the loop if Error
+	; 15-Jun-2011	GRF		SR17716: Auto-Close based on LP Status Codes
+	; 06-May-2011	GRF		SR17753: Automatically close a Temporary Storage unit on
+	;							posting; cleanup
+	; 02-Oct-2009	GRF		SR16361: Implement changed code; use blnWithOrder; call
+	; 							ReadyForDelivery
+	; 30-Sep-2009	GRF		SR16361: Add call to Receive^INRECReceive - incorporates
+	; 							call to CacheReceiptSave
+	; 16-Sep-2009	GRF		SR16361: Remove INWEAUF(VOR) processing
+	; 06-Aug-2009	GRF		SR16602: Revert 05-Aug-2009 change
+	; 05-Aug-2009	GRF		SR16602: Turn FINAPInvMatchCache Receipted back "off"
+	; 							temporarily after INWEAUFSave processing
+	; 09-Jul-2009	GRF		SR16689: INWEAUF sequence date is not the same as INWE
+	;							sequence date - generate "date.seq" and pass to
+	;							INWEAUF processing - may override date.seq if
+	;							already exists
+	; 07-Jul-2009	GRF		SR16689: Separated from PostTxn for clarity
+	; 11-Jun-2009	GRF		SR16508: Check for Receipt Without Order
+	; 10-Jun-2009	GRF		SR16508: set RecDate array if Invoice No is present
+	;							(self-processing Invoice); Parameter mis-match in
+	;							call to Receive^INReceiptLinePost
+	; 05-Jun-2009	GRF		SR16508: Add ReceiptDate & UnitCost to dMovement object
+	; 20-May-2009	SH/DWR	SR16526: Removed last parameter from call to UpdateINAUF
+	;-------------------------------------------------------------------------------
+	new arrLineIncSC,arrRecDate,blnWithOrder,dteReceived,enumSetOnReceipt,fltRecvdQty
+	new fltUnitCost,idItem,idLocn,idOrdLine,idOrder,idRecLine,idStore,idSupp,objDummyOrder
+	new objRECLine,objStorage,strStatus
+	
+	$$$LogR("ProcessAllocations",pidReceipt_"<"_pblnInvPresent)
+	$$$LogRx("PS1:"_$order(^FINAPInvMatchCache(0,""),-1))
+	
+	set strStatus = $$$OK
+	
+	;Create array of IncludingSC per INRECLine for receipt (for Avg Cost Calc in Receive^INReceiptLinePost)
+	do CalculateCostIncSC(pidReceipt,.arrLineIncSC)
+	
+	set idRecLine = ""
+	for {
+		set idRecLine = $order(^INRECLine(0,pidReceipt,idRecLine))
+		quit:idRecLine=""
+		
+		set objRECLine = $get(^INRECLine(0,pidReceipt,idRecLine,1))
+		
+		set idOrder   = $$$INRECLineOrder1(objRECLine)
+		set idOrdLine = $$$INRECLineOrderLine(objRECLine)
+		set idItem    = $$$INRECLineItem(objRECLine)
+		set idLocn    = $$$INRECLineLocation(objRECLine)
+		set idStore   = $$$INRECLineStockLocation(objRECLine)
+		
+		set blnWithOrder = ((idOrder'="") && (idOrdLine'=""))
+		
+		set dteReceived = $horolog
+		set arrRecDate(idRecLine) = +dteReceived
+		if blnWithOrder {
+			set ^WWW126(0,"INAUF",YBED,1,1) = idOrder
+			set objDummyOrder = ""
+			do ReadyForDelivery^INRECReceive(idOrder,idOrdLine,objRECLine,.objDummyOrder,$$$YES)
+		}
+		if $$$ISOK(strStatus) { 
+			set strStatus = $$CacheReceiptSave^INRECReceive(pidReceipt,idRecLine,idOrder,idOrdLine,dteReceived,objRECLine)
+		}
+		
+		; Close TSU if open
+		; If a TSU is present on multiple lines, it will be closed on first found but the other
+		; lines will be accepted in the IsReceivable validation and not then be rechecked.
+		;-----------------------------------
+	; SR17716 vvv
+	;	if $$$ISOK(strStatus) {                  ; SR17753
+	;		if (idLocn'="") && (idStore'="") {
+	;			set objStorage = $get(^INLP(0,idLocn,idStore,1))
+	;			if $$$INLPTemporaryStorageUnit(objStorage) && '$$$INLPClosed(objStorage) {
+	;				set $$$INLPClosed(objStorage) = $$$YES
+	;				set strStatus = $$$Save("INLP",idLocn_$$$COMMA_idStore,objStorage,$$$YES)
+	;			}
+	;		}
+	;	}
+		; For TSU Storages Only -
+		;       if existing status indicates NOT closed
+		; AND   if there is a default Set On Receipt status code set
+		; THEN  Change the status for the TSU storage to be the Set On Receipt code.
+		if $$$ISOK(strStatus) {                  ; SR17753
+			if (idLocn'="") && (idStore'="") {
+				set objStorage = $get(^INLP(0,idLocn,idStore,1))
+				if $$$INLPTemporaryStorageUnit(objStorage) && $$IsTSUOpen^INLPStatus($$$INLPStatus(objStorage)) {
+					set enumSetOnReceipt = $$GetDefaultReceiptStatus^INLPStatus()
+					if enumSetOnReceipt'="" {
+						set $$$INLPStatus(objStorage) = enumSetOnReceipt
+						set strStatus = $$$Save("INLP",idLocn_$$$COMMA_idStore,objStorage,$$$YES)
+					}
+				}
+			}
+		}
+	; SR17716 ^^^
+	
+	; Create Movement  alDRP.dMovementType.Receipt
+	;---------------------------------------
+		if $$$ISOK(strStatus) set strStatus = $$Receive^INReceiptLinePost(pidReceipt,idRecLine,.arrLineIncSC,objRECLine,.arrRecDate)
+		quit:$$$ISERR(strStatus)
+		
+	;	Create FINAPINVMatchCache for Receipt without Order (Order Units will = Inventory Units in this case)
+		if idOrder="" {
+			set fltRecvdQty = $$$INRECLineQuantity(objRECLine)       ; In  Inv Unit
+			set fltUnitCost = $$$INRECLineEach(objRECLine)           ; For Inv Unit
+			set idSupp      = $$$INRECLineSupplier(objRECLine)
+			set strStatus = $$CreateInvoice^FINAPInvMatchCache(pidReceipt,idRecLine,idItem,idLocn,idStore,dteReceived,idSupp,fltRecvdQty,fltUnitCost)
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+	
+ProcessSummary(pidReceipt,pobjReceipt,pblnInvPresent) private
+	;-------------------------------------------------------------------------------
+	; update INRECSummary with costings
+	; 
+	;     [Loop Summary Lines]
+	; 1.    --- [if item-based line]
+	;             ***  Receive^INReceiptButtonP
+	;              - Total Qty Received & Total Cost
+	;                    [loop Receipt Lines]
+	;                        $$GetHistory^INReceiptLine [from alSOH.dStockHistory - has this been built yet?]
+	;              
+	;              - Update Order Line for standard items - Qty Received and Line Completed flag
+	;                    { UpdateOrderLine^INReceiptLinePost }
+	;													^INAUFP : IncomingGoodsQuantity & PosCompleted
+	;              
+	;              - Update Unit Price in Inv Match Cache
+	;                    { UpdatePrice^FINAPInvMatchCache }
+	;													^FINAPInvMatchCache : Each
+	;              
+	;              - Update INRECSummary status & cost
+	;													^INRECSummary : QuantityReceived, AverageCost, Status "Processed"
+	;			
+	; 2.    --- [Moved to ProcessAllocations]
+	;         
+	; 3.    --- [if Inv# specified and GL processing required]
+	;             Get next FINAP Invoice Number
+	;             ***  PostInvoice^INReceiptInvoice
+	;              
+	;              - If no FINAPInv record yet - create one
+	;					 { CreateInvoice^FINAPInv }
+	;													^FINAPInvLine("Total") : create
+	;													^FINAPInv : create
+	;              
+	;              - Standard lines converted to Invoice Line
+	;					 { CreateInvoice^FINAPInvLine }
+	;													^FINAPInvLine(line) : create
+	;              
+	;              - Charge-based lines converted to Charge Line
+	;					 { CreateInvoice^FINAPInvCharge }
+	;             
+	; 4.    [if Inv# specified and GL required]			[ vvv Doco is not complete vvv ]
+	;         ***  Post^FINAPInvPost
+	;					 < Postable^FINAPInvPost >
+	;              - If repeat voucher
+	;					 { MakeChildInvoice^FINAPVoucher }
+	;													^FINAPInv, ^FINAPInvCharge, ^FINAPInvChargeDivision
+	;              - If not a voucher
+	;					 { Update^FINAPInv2 }			^FINAPInvLine (?)
+	;					 { PostCostsNow^FINAPInvPostCost }	<<<
+	;						 { PostCosts^FINAPInvPostCost }
+	;						:	 { UpdateAverageCosts^FINAPInvPostCost }
+	;						:		[Loop Invoice Lines]
+	;						:			 { GetPrePostInformation^FINAPInvPrePostCost }
+	;						:			 { UpdateLine^FINAPInvPostCost }
+	;						:			- If no order no
+	;						:				 { CreateDummyOrder^FINAPInvPrePostCost }
+	;						:	
+	;						:							^INERECH1 (?)
+	;						:				 { PostINERECH^FINAPInvPrePostCost }
+	;						:				 { KillDummyOrder^FINAPInvPrePostCost }
+	;						:	[Loop Invoice Lines]
+	;						:							^INWE (Invoice No, Date)
+	;						:---
+	;                       { CloseOrders^FINAPInvPost }
+	;						:	[Loop Invoice Lines]
+	;						:		 { GetOrderDetails^FINAPInvLineGet }
+	;						:		- If Received for Order
+	;						:							^INAUFP, ^INAUF, ^INAUF1
+	;						:---
+	;						 { Post^FINAPInvMatchCache }
+	;							[Loop Invoice Lines]
+	;							
+	;					 { Populate^FINAPInvPrePopulate }
+	;					
+	;              -
+	;					 { Allocate^FININTBatch }
+	;					 { Allocate^FININTBatch }
+	;					 { AddCharges^FINAPInvPostCharge }
+	;					 { AddLines^FINAPInvPost }
+	;					 { AddInvoice^FINAPInvPost }
+	;					 { PostBlock^FININTBatch }
+	;
+	;              ^^^                                  ^FINAPInv
+	;
+	;
+	; Inputs:
+	;	pidReceipt     : ^INREC key  (YKEY from form INReceipt)
+	;	pobjReceipt    : ^INREC data
+	; 
+	; History:
+	; 18-Nov-2009	GRF		SR17046/SR16871: base INFIBPAR on location hierarchy
+	; 28-Oct-2009	GRF		SR16871: Pass idLocn to Receive for new average cost
+	; 06-Aug-2009	GRF		SR16602: Revert 05-Aug-2009 change
+	; 05-Aug-2009	GRF		SR16602: Ensure FINAPInvMatchCache Receipted is $$$YES
+	; 							after INAUFPSave processing
+	; 07-Jul-2009	GRF		SR16689: Separated from PostTxn for clarity; test for
+	;							bonus with cost
+	; 24-Jun-2009	GRF		SR16672: Check General Ledger Parameters to see if a
+	;							General Ledger is being used - don't create FINAPInv
+	;							if it isn't - this means 3WM is not available under
+	;							that scenario.
+	; 21-May-2009	GRF		SR16363: Don't call Summary Item processing for charge
+	;							lines
+	; 01-May-2009	DWR		SR16363: call to Post^FINAPInvPost (3WM) if FINAPInv 
+	;							records created. 
+	; 19-Mar-2009	GRF		SR16361: Rename to be consistent with other processes
+	;-------------------------------------------------------------------------------
+	new blnMakeInv,curExtCost,enumLineType,idFINAPInv,idLocn,idSummary,idSupp,objFINParam
+	new objSummLine,strStatus
+	
+	$$$LogR("ProcessSummary",pidReceipt_"<"_pblnInvPresent_"<"_pobjReceipt_"<")
+	$$$LogRx("PS0:"_$order(^FINAPInvMatchCache(0,""),-1))
+	
+	
+	set idLocn      = $$$INRECLocation(pobjReceipt)
+	set idSupp      = $$$INRECSupplier(pobjReceipt)
+	;et objFINParam = $get(^INFIBPAR(0,0,idLocn,1))          ; SR17046/SR16871
+	set objFINParam = $$GetGLParams^WWW0121Utils(idLocn)
+	set blnMakeInv  = (+$$$INFIBPARAttachedGL(objFINParam)'=0)  ; Don't process if No GL for this location ; SR16672
+	set blnMakeInv  = blnMakeInv && pblnInvPresent  ; Also ignore if processing invoice through 3WM later
+	
+	set strStatus = $$$OK
+	if blnMakeInv {
+		set idFINAPInv  = $$$NextKey("FINAPInv")   ; get the next FINAPInv Key to create the 3WM records
+	}
+	
+	set idSummary = ""
+	for {
+		set idSummary = $order(^INRECSummary(0,pidReceipt,idSummary))
+		quit:idSummary=""
+		
+		set objSummLine  = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+		set enumLineType = $$$INRECSummaryLineType(objSummLine)
+	    set curExtCost   = $$$INRECSummaryExtendedCost(objSummLine)
+		
+		if (enumLineType=$$$EnumTypeBonus) && curExtCost {          ; Bonus with Extended Cost
+			set strStatus = $$$MakeStatus("IN01075",idSummary)
+		}  ; "Line %1 : Bonus item cannot have a cost - change to Standard or clear cost"
+		
+		if $$$ISOK(strStatus) && $$$IsItemLine {
+			set strStatus = $$Receive(pidReceipt,idSummary,objSummLine,idLocn)   ; SR16871
+		}
+		
+		if $$$ISOK(strStatus) && blnMakeInv {  ; perform invoice matching to finance
+			set strStatus = $$PostInvoice^INReceiptInvoice(pidReceipt,idSummary,idFINAPInv)
+			; update INREC status if necessary
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	
+	if $$$ISOK(strStatus) && blnMakeInv {
+		set strStatus = $$Post^FINAPInvPost(idFINAPInv)
+	}
+	
+	;if $$$ISOK(strStatus) {     ; SR16602 vvv            ]]><![CDATA[           ; REVERTED 06-Aug-2009
+	;	; Set FINAPInvMatchCache Receipted to $$$YES now processing finished
+	;	set idSummary = ""
+	;	for {
+	;		set idSummary = $order(^INRECSummary(0,pidReceipt,idSummary))
+	;		quit:idSummary=""
+	;		
+	;		set objSummLine = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+	;		set idOrder     = $$$INRECSummaryPurchaseOrder(objSummLine)
+	;		set idOrdLine   = $$$INRECSummaryPurchaseOrderLine(objSummLine)
+	;		
+	;		if (idOrder'="") && (idOrdLine'="") {
+	;			set idInvMatch  = $order(^FINAPInvMatchCaches(0,1,$$$Index(idOrder),$$$Index(idOrdLine),""),-1)
+	;			if idInvMatch'="" {
+	;				set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+	;				set $$$FINAPInvMatchCacheReceipted(objInvMatch) = $$$YES
+	;				set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+	;			}
+	;		}
+	;		quit:$$$ISERR(strStatus)
+	;	}
+	;}                           ; SR16602 ^^^
+	quit strStatus
+	
+	
+Receive(pidReceipt,pidSummary,pobjSummary="",pidLocn)
+	;-------------------------------------------------------------------------------
+	; Called By: ProcessSummary
+	; 
+	; Inputs:
+	;	pidReceipt,pidSummary	INRECSummary keys
+	;	pobjSummary				INRECSummary data
+	;					If have obtained earlier can pass in otherwise
+	;					don't include in parameter list and will be obtained here.
+	;	pidLocn			Location for INAvgCost processing
+	; 
+	; History:
+	; 28-Oct-2009	GRF		SR16871: Pass idLocn to Receive for new average cost
+	; 							(INItemCost based in INAvgCost with cost centre
+	; 							replaces INARTKOST based in INARTAVG)
+	; 17-Aug-2009	GRF		SR16815: missed variable added to new list
+	; 07-Aug-2009	PPP		SR16815: Get the Rec Quantity in Order Units to be updated 
+	;								 on Order Line
+	; 31-Jul-2009	GRF		SR16602: Moved from INReceiptSummary
+	; 17-Jun-2009	DWR		SR16602: set unit cost from summary line to be used in
+	;							reinstated call to Update^FINAPInvMatchCache record.
+	;							removed not needed variable.
+	; 20-May-2009	SH/DWR	SR16526: Removed last parameter from call to UpdateINAUF
+	; 20-Apr-2009	DWR		SR16363: Commented out setting of unit price, was reverting
+	;							price back to standard price, not what was invoiced.
+	; 17-Apr-2009	DWR		SR16363: call to update FINAPInvMatchCache record
+	; 31-Mar-2009	GRF		SR16363: INARTAVG doesn't return the value that we need
+	;							with two NO flags was simply returning curUnitCost
+	; 04-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new curTotalCost,enumLineType,fltOrderUnitQty,fltQtyReceived,fltRecPrice,idOrdLine
+	new idOrder,idRecptLine,objHistory,objRECLine,strStatus
+	
+	$$$LogR("Receive",pidReceipt_","_pidSummary)
+	
+	if pobjSummary="" set pobjSummary = $get(^INRECSummary(0,pidReceipt,pidSummary,1))
+	if pidLocn=""     set pidLocn     = $get(YLOCATION)   ; SR16871
+	
+	set strStatus      = $$$OK
+	set curTotalCost   = 0
+	set fltQtyReceived = 0
+	set idOrder        = $$$INRECSummaryPurchaseOrder(pobjSummary)
+	set idOrdLine      = $$$INRECSummaryPurchaseOrderLine(pobjSummary)
+	set enumLineType   = $$$INRECSummaryLineType(pobjSummary)
+	set fltRecPrice    = $$$INRECSummaryUnitCost(pobjSummary)   // SR16602
+	
+	; Update Costs - lookup costs for the RECLine history record
+	;---------------------------------------
+	;set idRecptLine = ""
+	set idRecptLine = $order(^INRECLine(0,pidReceipt,pidSummary),-1)
+	for {
+		set idRecptLine = $order(^INRECLine(0,pidReceipt,idRecptLine))
+		quit:idRecptLine=""
+	;	continue:(idRecptLine\1'=pidSummary)
+		quit:(idRecptLine\1'=pidSummary) ; Not a receipt line belonging to this record
+		
+		set objRECLine     = $get(^INRECLine(0,pidReceipt,idRecptLine,1))
+		set objHistory     = $$GetHistory^INReceiptLine(pidReceipt,idRecptLine)          ; FIXME : deprecated due to following FIXME <GRF>
+		set curTotalCost   = curTotalCost + objHistory.TxValue                           ; FIXME : not used <GRF>
+	;	set curUnitCost    = objHistory.StdPrice                     ; 20-Apr-2009
+		set fltQtyReceived = fltQtyReceived + $$$INRECLineQuantity(objRECLine)    ; in Inventory Units
+	}
+	
+	; Update Quantities from lines    ; FIXME : Why is this required? INRECLine totals must match INRECSummary qty to permit posting <GRF>
+	;---------------------------------------
+	set $$$INRECSummaryQuantityReceived(pobjSummary) = fltQtyReceived
+	;set $$$INRECSummaryUnitCost(pobjSummary)     = curUnitCost ;20-Apr-2009
+	
+	;set $$$INRECSummaryAverageCost(pobjSummary) = $$^INARTAVG($$$INRECSummaryItem(pobjSummary),fltQtyReceived,curUnitCost,"",$$$NO,$$$NO)
+	;set $$$INRECSummaryAverageCost(pobjSummary) = $$^INARTKOST($$$INRECSummaryItem(pobjSummary),,$$$enumAverageCost)   ; SR16878
+	;set $$$INRECSummaryAverageCost(pobjSummary) = $$GetCost^INARTCOST($$$INRECSummaryItem(pobjSummary),$$$enumAverageCost)    ; SR16871
+	set $$$INRECSummaryAverageCost(pobjSummary) = $$GetCost^INItemCost($$$INRECSummaryItem(pobjSummary),pidLocn,$$$enumAverageCost)
+	set $$$INRECSummaryStatus(pobjSummary)      = 1          ; Update Status = "Processed"
+	
+	//set strStatus = $$UpdateINAUF^INReceiptLinePost("INAUFP",idOrder,idOrdLine,enumLineType,fltQtyReceived) ; SR16526 SR16363
+	
+	//SR16815 - Get the Rec Quantity in Order Units
+	set fltOrderUnitQty = $$GetRecInOrderUnits^INRECSummaryUtil(idOrder,idOrdLine,fltQtyReceived)
+	//set strStatus = $$UpdateOrderLine^INReceiptLinePost(idOrder,idOrdLine,enumLineType,fltQtyReceived)	//SR16815
+	set strStatus = $$UpdateOrderLine^INReceiptLinePost(idOrder,idOrdLine,enumLineType,fltOrderUnitQty)
+	
+	; vvvv SR16602 vvv
+	
+	if $$$ISOK(strStatus) {     //SR16837 (added parameters pidReceipt,pidSummary,Receipt Unit)
+		set strStatus =  $$UpdatePrice^FINAPInvMatchCache(idOrder,idOrdLine,fltRecPrice,pidReceipt,pidSummary,$$$INRECSummaryReceivedUnit(pobjSummary)) ; 17-Apr-2009   ,fltQtyReceived
+	}
+	; ^^^^ SR16602 ^^^
+	if $$$ISOK(strStatus) {
+		set strStatus = $$$Save("INRECSummary",pidReceipt_$$$COMMA_pidSummary,pobjSummary,$$$YES)
+	}
+	
+	quit strStatus
+	
+	
+OldPostTxn(pidReceipt,pobjReceipt="")
+	;-------------------------------------------------------------------------------
+	; Processes a INREC record
+	; 
+	; Inputs:
+	;	pidReceipt	: ^INREC key  (YKEY from form INReceipt)
+	;	pobjReceipt	: ^INREC record : If have obtained earlier can pass in otherwise
+	;	                  don't include in parameter list and will be obtained here.
+	; 
+	; History:
+	; 24-Jun-2009	GRF		SR16672: Check General Ledger Parameters to see if a
+	;							General Ledger is being used - don't create FINAPInv
+	;							if it isn't - this means 3WM is not available under
+	;							that scenario.
+	; 11-Jun-2009	GRF		SR16508: Check for Receipt Without Order
+	; 10-Jun-2009	GRF		SR16508: set RecDate array if Invoice No is present
+	;							(self-processing Invoice); Parameter mis-match in
+	;							call to Receive^INReceiptLinePost
+	; 05-Jun-2009	GRF		SR16508: Add ReceiptDate & UnitCost to dMovement object
+	; 21-May-2009	GRF		SR16363: Don't call Summary Item processing for charge
+	;							lines
+	; 20-May-2009	SH/DWR	SR16526: Removed last parameter from call to UpdateINAUF
+	; 01-May-2009	DWR		SR16363: call to Post^FINAPInvPost (3WM) if FINAPInv 
+	;							records created. 
+	; 15-Apr-2009	GRF		SR16363: Call INReceiptInvoice
+	; 07-Apr-2009	GRF		SR16363: Update INWEAUF for 3WM Invoicing
+	; 19-Mar-2009	GRF		SR16361: Rename to be consistent with other processes
+	; 05-Mar-2009	HQN		SR16363: Update header
+	; 03-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new arrRecDate,arrLineIncSC,blnInvPresent,blnMakeInv,enumLineType
+	new idFINAPInv,idItem,idLocn,idOrder,idOrdLine,idRecLine,idStore,idSummary
+	new objFINParam,objRECLine,objSummLine,strStatus
+	
+	$$$LogR("OldPostTxn",pidReceipt)
+	
+	set strStatus  = $$$OK
+	if pobjReceipt = "" set pobjReceipt = $get(^INREC(0,pidReceipt,1)) 
+	set blnInvPresent = ($$$INRECInvoiceNumber(pobjReceipt)'="")
+	
+	;Create array of IncludingSC per INRECLine for receipt (for Avg Cost Calc in Receive^INReceiptLinePost)
+	do CalculateCostIncSC(pidReceipt,.arrLineIncSC)
+	
+	; Create movement record
+	set idRecLine = ""
+	for {
+		set idRecLine = $order(^INRECLine(0,pidReceipt,idRecLine))
+		quit:idRecLine=""
+		
+		set objRECLine = $get(^INRECLine(0,pidReceipt,idRecLine,1))
+		
+		set idOrder   = $$$INRECLineOrder1(objRECLine)             ; SR16508 vvv  11-Jun-2009
+		set idOrdLine = $$$INRECLineOrderLine(objRECLine)
+		set idItem    = $$$INRECLineItem(objRECLine)
+		set idLocn    = $$$INRECLineLocation(objRECLine)
+		set idStore   = $$$INRECLineStockLocation(objRECLine)      ; SR16508 ^^^
+		
+		if 'blnInvPresent {     ; to generate ^INWEAUF for 3WM Invoicing
+		;	set strStatus = $$Update^INReceiptLinePost($$$GetClass($$$GRIDYFELDContainer),pidReceipt,idRecLine) ; SR16526
+		;	set strStatus = $$Update^INReceiptLinePost("INWEAUF",pidReceipt,idRecLine,objRECLine)               ; SR16508
+			if (idOrder="") || (idOrdLine="") {        ; SR16508 11-Jun-2009
+				set arrRecDate(idRecLine) = $$Increment^INWECounter(idItem,idLocn,idStore,+$horolog)
+			} else {
+				set strStatus = $$Update^INReceiptLinePost("INWEAUF",pidReceipt,idRecLine,objRECLine,.arrRecDate)
+			}
+		
+		} else {
+		;	set strStatus = $$UpdateINAUF^INReceiptLinePost("INAUF",pidReceipt,idRecLine)
+		;} ; SR16363 : This line ^^^ will *NEVER* work - now UpdateOrderLine^INReceiptLinePost - specifically INAUFP <GRF>
+		;	set arrRecDate(idRecLine) = +$horolog    ; SR16508 10-Jun-2009
+			set arrRecDate(idRecLine) = $$Increment^INWECounter(idItem,idLocn,idStore,+$horolog) ; SR16508 11-Jun-2009
+		}
+		
+	;	if $$$ISOK(strStatus) set strStatus = $$Receive^INReceiptLinePost(pidReceipt,idRecLine,.arrLineIncSC)   ; SR16508
+		if $$$ISOK(strStatus) set strStatus = $$Receive^INReceiptLinePost(pidReceipt,idRecLine,.arrLineIncSC,objRECLine,.arrRecDate)
+		quit:$$$ISERR(strStatus)
+	}
+	
+	; SR16672
+	set objFINParam = $get(^INFIBPAR(0,0,idLocn,1))   ; FIXME : comes from last INRECLine record processed <GRF>
+	set blnMakeInv  = (+$$$INFIBPARAttachedGL(objFINParam)'=0)  ; Don't process if No GL for this location
+	
+	; update INRECSummary with costings
+	if $$$ISOK(strStatus) {
+		if blnMakeInv {                                ; SR16672
+			set idFINAPInv  = $$$NextKey("FINAPInv")   ; get the next FINAPInv Key to create the 3WM records
+		}
+		set idSummary = ""
+		for {
+			set idSummary = $order(^INRECSummary(0,pidReceipt,idSummary))
+			quit:idSummary=""
+			
+		;	set objRECSummary = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+			; FIXME : Exclude charge lines from Receive - possibly also bypass PostInvoice^INReceiptInvoice? <GRF>
+			
+		;	set strStatus = $$Receive(pidReceipt,idSummary)   ; 21-May-2009 SR16363
+			set objSummLine  = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+			
+			set enumLineType = $$$INRECSummaryLineType(objSummLine)
+			if (enumLineType=0) || (enumLineType=2) { ; standard or bonus
+				set strStatus = $$Receive(pidReceipt,idSummary,objSummLine)
+			}
+			
+		;	if $$$ISOK(strStatus) && blnInvPresent {     ; SR16361     ; SR16672
+			if $$$ISOK(strStatus) && blnInvPresent && blnMakeInv {
+				set strStatus = $$PostInvoice^INReceiptInvoice(pidReceipt,idSummary,idFINAPInv) ; perform invoice matching to finance
+				; update INREC status if necessary
+			}
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	
+	;if $$$ISOK(strStatus) && blnInvPresent {  ;01-May-2009   ; SR16672
+	if $$$ISOK(strStatus) && blnInvPresent && blnMakeInv {
+		set strStatus = $$Post^FINAPInvPost(idFINAPInv)  
+	}
+	; update INREC (cf UpdateHeader^INRECPost)
+	; 05-Mar-2009	vvvv
+	if $$$ISOK(strStatus) {
+		set $$$INRECStatus(pobjReceipt)        = $$$EnumINSTATUSProcessed
+		set $$$INRECProcessedDate(pobjReceipt) = $horolog
+		set $$$INRECProcessedBy(pobjReceipt)   = $get(YBED,"UNKNOWN")
+	; 05-Mar-2009	^^^^
+		set strStatus = $$$Save("INREC",pidReceipt,pobjReceipt,$$$YES)
+	}
+	
+	quit strStatus
+	
+	
+CalculateCostIncSC(pidReceipt,&parrLineIncSC) ;
+	;-------------------------------------------------------------------------------
+	; Use the INRECSummary Record and calculate the cost after SC for all the INRECLine 
+	; records. This value can then be used in the movement transaction to update AVG Cost.
+	;	
+	; History:
+	; 21-May-2012	GRF		SR18012: should only add curCost to parrLineIncSC once
+	; 14-May-2009:	DWR/GRF	SR16363: Created
+	;-------------------------------------------------------------------------------
+	new arrCharge,arrLine,arrQty,blnBaseLine,curApplied,curCost,curLine,curMax
+	new curProRata,curTotal,enumLineType,fltAddCost,idLine,idMax,idSCLine,idSummary,objSummLine
+	
+	kill parrLineIncSC
+	set curTotal = 0
+	
+	set idSummary = ""
+	for {
+		set idSummary= $order(^INRECSummary(0,pidReceipt,idSummary))
+		quit:idSummary=""
+		
+		set objSummLine = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+		set enumLineType= $$$INRECSummaryLineType(objSummLine)
+		set blnBaseLine = (idSummary\1=idSummary)
+		
+		set curCost = $$$INRECSummaryCostAfterDiscount(objSummLine)
+		if blnBaseLine {
+		;	if ((enumLineType= 0) || (enumLineType= 2)) { ; Stock Item
+			if $$$IsItemLine {
+				set arrQty(idSummary)  = $$$INRECSummaryQuantityReceived(objSummLine)
+				set arrLine(idSummary) = curCost
+				set curTotal           = curTotal + curCost
+			 
+			} else {   ; Receipt Service Charge
+				set arrCharge(idSummary) = curCost
+			}
+			
+		} else {       ; Line Charge
+			set arrLine(idSummary\1) = $get(arrLine(idSummary\1)) + curCost
+			set curTotal = curTotal + curCost
+		} 
+	}	
+	
+	merge parrLineIncSC = arrLine     ; SR18012
+	
+	if curTotal {
+		set curMax   = 0
+		set idMax    = ""
+		set idSCLine = ""
+		for {
+			set idSCLine = $order(arrCharge(idSCLine))
+			quit:idSCLine=""
+			
+			set fltAddCost = $get(arrCharge(idSCLine))
+			set curApplied = 0
+			
+			set idLine = ""
+			for {
+				set idLine = $order(arrLine(idLine))
+				quit:idLine=""
+				
+				set curLine = $get(arrLine(idLine))
+				if curLine > curMax {
+					set idMax  = idLine
+					set curMax = curLine
+				}
+				set curProRata = $justify(curLine * fltAddCost / curTotal,0,2)
+				set curApplied = curApplied + curProRata
+			;	set parrLineIncSC(idLine) = $get(parrLineIncSC(idLine)) + (curLine + curProRata)     ; SR18012
+				set parrLineIncSC(idLine) = $get(parrLineIncSC(idLine)) + curProRata
+			}
+			if curApplied'=fltAddCost {
+				; Allocate difference somehow - here add to biggest line
+				if idMax'="" set parrLineIncSC(idMax) = parrLineIncSC(idMax) + (fltAddCost-curApplied)
+			}	
+		}
+	}
+	set idLine = ""
+	for {
+		set idLine = $order(arrLine(idLine))
+		quit:idLine=""
+		
+	;	if $piece($get(parrLineIncSC(idLine)),Y,1)="" {                   ; SR18012 vvv covered by merge
+	;		set $piece(parrLineIncSC(idLine),Y,1) = $get(arrLine(idLine))
+	;	}		
+		set $piece(parrLineIncSC(idLine),Y,2) = $get(arrQty(idLine))
+	}
+	quit
+	
+	
+PrintLabel(YM,YLOCATION,pidReceipt) ; FIXME : YM is deprecated
+	;-------------------------------------------------------------------------------
+	; Print Receipt Label (barcode)
+	; (requires custom installation of barcode printing software (ie. Bartender)
+	;	
+	; History:
+	; 08-April-2010:	FIS: SR17268: Created
+	;-------------------------------------------------------------------------------
+	//JOB START^INTAGES(YM,SPRACHE,YBED)::1    ;JOB STARTEN ;launching 
+	
+	new (YM,YLOCATION,pidReceipt)
+	
+	set $ZTRAP = "^WWWERROR"
+	set blnSessionLoginOK = $$^WWWLicenseAllocation("BackgroundJob")
+	do LOW^%PRIO
+	do
+	. new YM,YLOCATION
+	. do ^WWWVAR
+	
+	if ##class(%Dictionary.ClassDefinition).%ExistsId("alBarc.Barcode") {
+		set idLine = ""
+		for {
+			set idLine = $order(^INRECLine(YM,pidReceipt,idLine))
+			quit:idLine=""
+			
+			set objLine = $get(^INRECLine(YM,pidReceipt,idLine,1))
+			
+			set objItem = $get(^INART(YM,$$$INRECLineItem(objLine),1))
+			set intNum = +$$$INARTLabelPerQuantity(objItem)
+			if (intNum '> 0) && ($$$INARTItemPolicy(objItem)=4) set intNum = 1
+			if (intNum > 0) {
+	    		do ##class(alBarc.Barcode).PrintReceipt(YLOCATION,$$$INRECLineItem(objLine),$$$INRECLineLotNumber(objLine),$$$INRECLineExpirationDate(objLine),$$$INRECLineQuantity(objLine),($$$INRECLineQuantity(objLine)*intNum))
+		  	}
+	  	}
+	}
+	halt
+	
+]]></Routine>
+</Export>

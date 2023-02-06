@@ -1,0 +1,289 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRNStockUpdate" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRNStockUpdate
+#include COMSYS
+#include INConst
+#include %occInclude  
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+ 
+UpdateSOH(penumTransitType,pidItem,pidLocn,pidStore,pdteINWE,pidToLocn="",pidToStorage="",pfltQty,pidReference="",pidLine="")
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; Update SOH if the item or item->location is accountable
+	; 	(Not :
+	; 		Consumable
+	; 		Service Item
+	; 		Phantom Item
+	; 		Performance Item
+	; 		Configuration Item
+	; 	)
+	; 
+	; Called By : CreateMovement^INTRNShip (penumTransitType = 1 "ISS")
+	;             MoveStock^INRECTFR       (penumTransitType = 2 "REC")
+	;             UpdateStock^INTFRRev     (penumTransitType = 3 "REV"?)
+	; 
+	; Inputs :
+	;	penumTransitType		In Transit Types
+	;								0 - Reservations (no FIN and History updates)
+	;								1 - Send    (Into Intransit)
+	;								2 - Receive (Out of Intransit)
+	;								3 - Reversal(Out of Intransit)
+	;  pidLine: 
+	;   Called from INRECTFR = null
+	;  	Called from INTRNShip = INTFRPickLine
+	;  	Called from INTFRRev = INTFRRevLine_$$$COMMA_INTFRPickLine
+	;  	Called from INTRNReserve = null
+	;
+	; ByRef :
+	;
+	;
+	; Returns : Status
+	;
+	; Called by :
+	; 
+	; History :
+	; 25-Sep-2008	HQN		SR15862: History taken care of in V2 back-populate,
+	; 							No need to execute BUCH
+	; 24-Sep-2008	HQN		SR15862: Only update if V2 successful
+	; 09-Sep-2008	HQN		SR15862: Create Movement based on state of TFR record
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------	
+ 	new blnConsumableRecvLocn,blnConsumableSendLocn,idDelLocn,idType,intNo
+	new objINART,objINVORG,objSOH,strStatus,TAG,UHR,YKEY
+ 	
+	set strStatus = $$$OK
+ 
+	set objINART = $get(^INART(0,pidItem,1))
+	set idType   = $$$INARTItemType(objINART)
+	
+	if ($$$INARTItemWithoutInventoryMaint(objINART)=$$$YES) ||
+	   ($$$INARTItemType(objINART)=2)                       || 
+	   ($$$INARTItemType(objINART)=5)                       ||
+	   ($$$INARTItemType(objINART)=6)                       ||
+	   ($$$INARTItemType(objINART)=7)	                       {
+		// No inventory maintenance
+		// Service Item or Phantom Item or Performance Item or Configuration Item
+		quit strStatus
+	}
+	
+ 	
+ 		set strStatus = $$CreateMovement(penumTransitType,pidItem,pidLocn,pidStore,$get(pidToLocn),$get(pidToStorage),pfltQty,$get(pidReference)_$$$COMMA_$get(pidLine)) ; SR15862
+ 
+		
+	quit strStatus
+	
+MovementType(pstrValue)
+	;-------------------------------------------------------------------------------
+	; In Cache2008 query condition could be...	 MovementType_MovementTypeId=:intMovementTypeId
+	; But in Ensemble2010 this will fail with SQLCODE=100
+	; Ensemble2010 will accept...				 MovementType_MovementTypeId=$listbuild(30)
+	; but this won't compile in Cache2008
+	;
+	; History:
+	; 08-Jul-2014	shobby	SMERECIFE-53: Creation
+	;-------------------------------------------------------------------------------
+	quit $listbuild(pstrValue)
+		
+CreateMovement(penumTransitType,pidItem,pidLocn,pidStorage,pidToLocn="",pidToStorage="",pfltQty,pidRefKey="")
+	;-------------------------------------------------------------------------------
+	; Creates a V2 dMovement record for this transfer state
+	;
+	; Params:
+	;	penumTransitType		In Transit Types
+	;								0 - Reservations (no FIN and History updates)
+	;								1 - Send    (Into Intransit)
+	;								2 - Receive (Out of Intransit)
+	;								3 - Reversal(Out of Intransit)
+	;								
+	;	pidRefKey					= 	IntransitType=1: INTFRPickLine
+	; 								IntransitType=2: INRECLine
+	; 								IntransitType=3: INTFRRevLine
+	; 								
+	; ByRefs: None
+	;
+	; Returns: strStatus, status code of operation
+	; 
+	; History:
+	; 08-Jul-2014	shobby	SMERECIFE-53: Problem with SQL in Ensemble2010
+	; 09-Oct-2013	SCR		CORE-266: Bug Fix
+	; 03-Oct-2013	SCR		CORE-273: Create NewBundle if Receiving from Non Lot > Lot Controlled
+	; 25-Mar-2011	GRF		SR17667: Transfer Reversal was including idReverseLine
+	;							in both Reference and LineNumber; Change comma to
+	;							"||" to keep #pieces in Ref string same so can
+	;							extract later pieces; include TransferDate
+	; 05-Now-2009	GRF		SR16871: consolidate new lists; standard prefixes;
+	; 							missing prefix added
+	; 03-Feb-2009	HQN		RevLine reference now points directly to TFRRev record
+	; 04-Dec-2008	GRF		SR16182: Readability; KEY macros
+	; 26-Nov-2008	HQN		SR16182: Upgrading to V2 SOH can have records in a 
+	; 							partial state, attempt to rectify
+	; 01-Oct-2008	HQN		SR15969: Set ToStorage/ToLocn at last possible moment
+	; 							Would have been set at Pick time but may have been
+	; 							updated since.
+	; 26-Sep-2008	HQN		SR15862: Implemented movement creation for reversal
+	; 25-Sep-2008	HQN		SR15862: Changed arguments to be more complete
+	; 							Created movement for receipt
+	; 24-Sep-2008	HQN		SR15862: Process movement after its found
+	; 							Depending on penumTransitType, process reservation
+	; 							or create MovementReceipt
+	; 09-Sep-2008	HQN		SR15862: Created
+	;-------------------------------------------------------------------------------
+	new idBundle,idInTransit,idLine,idPickLine,idREC,idRECLine,idReservation
+	new idReverseLine,idTransfer,idTransitLocn,idTransitStore,intMovementTypeId
+	new objInTransit,objMove,objReceipt,objRecLine,objReservation,objReversal,objTransfer
+	new sc,SQLCODE,strStatus
+	new idItem,blnLotNo,blnUseByDate,blnLotUnique,intBrand,intOwner,intProgram,objBundle
+	
+	; FIXME : Merge new commands into a common block unless overriding - check why in that case <GRF>
+	
+	set strStatus = $$$OK
+	set SQLCODE   = 0
+ 	set sc        = $$$OK
+ 	
+	; 1 : alDRP.dPlannedMovement
+	;---------------------------------------
+	if penumTransitType = 1 {
+		set idReservation = ""
+		set idTransfer    = $$$KEY1(pidRefKey)
+		set idLine        = $$$KEY2(pidRefKey)
+ 		set objTransfer   = $get(^INTFR(0,idTransfer,1))   ; SR16871
+ 		
+		//each pickline has a 1:1 relationship to a dPlannedMovement
+		set intMovementTypeId = $listbuild(30)
+		; FIXME: Embedded Serial classes with CLASSNAME param set to retain subtype
+		;        info builds storage in a manner that can't be queried correctly
+ 
+		&sql(SELECT ID INTO :idReservation FROM alDRP.dPlannedMovement
+		     WHERE Reference=:idTransfer AND
+		           LineNumber=:idLine    AND
+		           MovementType_MovementTypeId=$$MovementType^INTRNStockUpdate(30)
+		)
+		if SQLCODE = 0 {
+			set objReservation = ##class(alDRP.dPlannedMovement).%OpenId(idReservation)
+			set objReservation.ToLocn       = ##class(alLOC.iULOC).GetLocation(pidToLocn)
+			set objReservation.ToStorage    = ##class(alLOC.iULOC).GetStorage(pidToLocn,pidToStorage)
+			set objReservation.TransferDate = +$$$INTFRShipped(objTransfer)   ; SR16871
+			
+			set sc = objReservation.ChangeState(4)
+			set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+		}
+		
+		
+	; 2: alTFR.dMovementReceipt
+	;---------------------------------------
+	} elseif penumTransitType = 2 {
+		set idREC       = $$$KEY1(pidRefKey)
+		set idRECLine   = $$$KEY2(pidRefKey)
+		set objRecLine  = $get(^INRECLine(0,idREC,idRECLine,1))
+		set objMove     = ##class(alTFR.dMovementReceipt).%New()
+		
+		set objMove.Item         = ##class(alINV.iUINV).GetItem(pidItem)
+		set objMove.Bundle       = ##class(alSOH.dBundle).%OpenId($$$INRECLineBundle(objRecLine))
+		set objMove.TransferDate = +$$$INRECProcessedDate(objRecLine)   ; SR17667
+		
+		; Specific overide for Receipts, could be done on a partial record due to upgrading to V2 SOH
+		; Trust sourcing algorithm to determine bundle.
+		if objMove.Bundle = "" {
+			; Ensure that this actually is only a receipt from a transfer
+			; regular receipts cannot source!
+			; need the intransit location:
+			set objReceipt     = $get(^INREC(0,idREC,1))
+			set idTransfer     = $$$INRECTransferNumbers(objReceipt)
+			set objTransfer    = $get(^INTFR(0,idTransfer,1))
+			set idInTransit    = $$$INTFRDispatch(objTransfer)
+			set objInTransit   = $get(^INDRPUMLKW(0,idInTransit,1))
+			set idTransitLocn  = $$$INDRPUMLKWLocation(objInTransit)
+			set idTransitStore = $$$INDRPUMLKWStockLocation(objInTransit)
+			
+			; get first bundle at the location
+			&sql(SELECT Bundle INTO :idBundle FROM alSOH.dBundleStock
+			     WHERE Item=:pidItem                     AND
+			           Storage->Code=:idTransitStore     AND
+			           Storage->Location=:idTransitLocn
+			     ORDER BY PickSequence
+			)
+			
+			if SQLCODE '= 0 {  ; "Can not reserve quantity requested: Item ´%1´, Site ´%2´, Bin ´%3´, Qty ´%4´, insufficient stock on hand."
+				set sc = $$$ERROR(5001,$$$Text($listbuild("IN00501",pidItem,idTransitLocn,idTransitStore,pfltQty)))
+			} else {
+				set objMove.Bundle = ##class(alSOH.dBundle).%OpenId(idBundle,,.sc)
+			}			
+		}
+		
+		set objMove.FromLocn    = ##class(alLOC.iULOC).GetLocation(pidLocn)
+		set objMove.FromStorage = ##class(alLOC.iULOC).GetStorage(pidLocn,pidStorage)
+		set objMove.ToLocn      = ##class(alLOC.iULOC).GetLocation(pidToLocn)
+		set objMove.ToStorage   = ##class(alLOC.iULOC).GetStorage(pidToLocn,pidToStorage)
+		set objMove.QtyReceived = pfltQty
+		set objMove.QtyPicked   = pfltQty
+		set objMove.Reference   = idREC
+		set objMove.LineNumber  = idRECLine
+		; CORE-273 vvvv
+		; If Receiving Non Lot > Lot Controlled 
+		if $$$ISOK(sc) && $$OnlyTrackPrograms^INBundleUtils(objMove.FromLocn.Code) &&
+				'$$OnlyTrackPrograms^INBundleUtils(objMove.ToLocn.Code) {
+			do GetAttributes^INItemPolicyUtils(pidItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,objMove.ToLocn.Code)
+			
+			if blnLotNo  {
+				set arrAttributes("Lot Number")  =  $$$INRECLineLotNumber(objRecLine)
+			}
+			if blnUseByDate {
+				set arrAttributes("Use By Date") =  $$$INRECLineExpirationDate(objRecLine)
+			}
+			//		NEW ATTRIBUTES BASED ON THE ITEM (values can be 1-Yes, 2-No, 3-Optional)
+			if (intBrand=1) || (intBrand=3) {
+				set arrAttributes("Brand")       =  $$$INRECLineBrand(objRecLine)
+			}
+			if (intOwner=1) || (intOwner=3) {
+				set arrAttributes("Owner")       =  $$$INRECLineBrand(objRecLine)
+			}
+			if (intProgram=1) || (intProgram=3) {
+				set arrAttributes("Program")     =  $$$INRECLineProgram1(objRecLine)
+			}
+	
+			//Create a new bundle if required
+			set sc = ##class(alSOH.iBundle).GetItemBundle(objMove.Item ,.arrAttributes,,.objBundle,objMove.ToLocn.Code)
+			set:$$$ISOK(sc) objMove.NewBundle	= objBundle
+			
+
+		}
+			; CORE-273 ^^^^
+
+		set:$$$ISOK(sc) sc = objMove.ChangeState(4) ; SR16182 Added sc check
+		set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+		
+		
+	; 3 : alTFR.dMovementReverse
+	;---------------------------------------
+	} elseif penumTransitType = 3 {
+ 
+		set idTransfer    = $$$KEY1(pidRefKey)
+		set idReverseLine = $$$KEY2(pidRefKey)
+		set idPickLine    = $$$KEY3(pidRefKey)
+		set objReversal    = $get(^INTFRRevLine(0,idTransfer,idReverseLine,idPickLine,1))
+ 
+		set objMove = ##class(alTFR.dMovementReverse).%New()
+		set objMove.Item         = ##class(alINV.iUINV).GetItem(pidItem)
+		set objMove.Bundle       = ##class(alSOH.dBundle).%OpenId($$$INTFRRevLineBundle(objReversal))
+		set objMove.FromLocn     = ##class(alLOC.iULOC).GetLocation(pidLocn)
+		set objMove.FromStorage  = ##class(alLOC.iULOC).GetStorage(pidLocn,pidStorage)
+		set objMove.ToLocn       = ##class(alLOC.iULOC).GetLocation(pidToLocn)
+		set objMove.ToStorage    = ##class(alLOC.iULOC).GetStorage(pidToLocn,pidToStorage)
+		set objMove.QtyReceived  = pfltQty
+		set objMove.QtyPicked    = pfltQty
+	;	set objMove.Reference    = idTransfer                          ; 03-Feb-2009
+	;	set objMove.Reference    = idTransfer_$$$COMMA_idReverseLine   ; SR17667
+		set objMove.Reference    = idTransfer_"||"_idReverseLine
+	;	set objMove.LineNumber   = idReverseLine_$$$COMMA_idPickLine   ; SR17667
+		set objMove.LineNumber   = idPickLine
+		set objMove.TransferDate = +$$$INTFRRevShipped(objReversal)   ; SR17667
+		
+		set sc = objMove.ChangeState(4)
+		set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	}
+ 
+	quit strStatus
+	
+]]></Routine>
+</Export>

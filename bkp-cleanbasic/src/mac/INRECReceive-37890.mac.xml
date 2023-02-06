@@ -1,0 +1,579 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INRECReceive" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INRECReceive
+	;-------------------------------------------------------------------------------
+	;  Copied from INWEAUFV2 to handle updating without INWEAUF(VOR)
+	;  Mainly INREC Post processing - some calls from INReceipt Post
+	;-------------------------------------------------------------------------------
+	
+#include COMSYS
+#include FINConst
+#include INConst
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#define LogR(%1,%2)	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INRECReceive("_%2_") : "_$zh $$$JournalOn
+#define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Receive(pidReceipt,pidRecLine) ; previously Receive^INWEAUFV2 based on INWEAUF
+	;-------------------------------------------------------------------------------
+	; Update order line and related classes on posting Supplier Receipt
+	;
+	; Params:		pidReceipt,pidRecLine - keys for ^INRECLine record
+	;
+	; ByRefs:		YBED
+	; 
+	; Called By :	PostTxn^INRECPost
+	; 
+	; Returns:		nothing
+	;
+	; Updates :		^INDRPNETCHANGE		(Create)
+	; 				^INAUFP				(Modify)
+	; 				^INWEBUCH			(Create)
+	;
+	; History:
+	; 13-Oct-2009	GRF		SR16932: keep qty in inventory units separate for
+	; 							Purchase Journal
+	; 02-Oct-2009	GRF		SR16361: split off ReadyForDelivery for separate call
+	; 01-Oct-2009	GRF		SR16361: add blnWithOrder
+	; 22-Sep-2009	GRF		SR16361: Derived from Receive^INWEAUFV2, removing INWE
+	; 							& INWEAUF* processing; INARTAVG/INARTHIST elsewhere.
+	;-------------------------------------------------------------------------------
+	new blnDone,blnWithOrder,dteRecvd,fltConvFactor,fltPrevQtyRecvd,fltRecvdQty,fltRecvdQtyIU
+	new idItem,idLocn,idOrder,idOrdLine,idSupplier
+	new objOrderLine,objRecLine,strStatus
+	
+	$$$LogR("Receive",$get(YKEY))
+  	
+	set objRecLine = $get(^INRECLine(0,pidReceipt,pidRecLine,1))
+	set idItem     = $$$INRECLineItem(objRecLine)
+	
+	if idItem'="" {
+		set idOrder    = $$$INRECLineOrder1(objRecLine)
+		set idOrdLine  = $$$INRECLineOrderLine(objRecLine)
+		set idSupplier = $$$INRECLineSupplier(objRecLine)
+		set idLocn     = $$$INRECLineLocation(objRecLine)
+		set dteRecvd   = $horolog   ; $$$INRECProcessedDate($get(^INREC(0,pidReceipt,1)))   not set yet!
+		
+		set blnWithOrder = ((idOrder'="") && (idOrdLine'=""))
+		
+		if blnWithOrder {
+			set objOrderLine = $get(^INAUFP(0,idOrder,idOrdLine,1))
+		} else {
+			set objOrderLine = ""
+		}
+		
+		set ^WWW126(0,"INAUF",YBED,1,1) = idOrder
+		
+		if $$$INVORGDRPOnlyForNetChange($get(^INVORG(0,0,1)))=$$$YES set ^INDRPNETCHANGE(0,idItem,1) = ""
+		
+		if blnWithOrder do ReadyForDelivery(idOrder,idOrdLine,objRecLine,.objOrderLine,$$$YES)
+		
+		set fltRecvdQtyIU = $$$INRECLineQuantity(objRecLine)                   ; Inventory Units
+		if fltRecvdQtyIU>0 {
+			set fltConvFactor   = $$GetUOMConversion^INUOMConversion(idItem,$$$INRECLineOrderedUnit(objRecLine))
+			set fltRecvdQty     = fltRecvdQtyIU / fltConvFactor                ; Conversion Inventory to Order
+			set fltPrevQtyRecvd = $$$INAUFPIncomingGoodsQuantity(objOrderLine) ; Order Units
+			
+			if blnWithOrder {
+				set $$$INAUFPIncomingGoodsQuantity(^INAUFP(0,idOrder,idOrdLine,1)) = fltRecvdQty+fltPrevQtyRecvd  ; DIRECT WRITE - avoids save hooks
+				
+				; Update order line if the Delivery should be sent directly to the Customer for a Supplier Order
+				; (Specified at order line or at order level)
+				if ($$$INAUFPCustomerIsDeliveryAddress(^INAUFP(0,idOrder,idOrdLine,1))=$$$YES) ||
+				   ($$$INAUFCustomerAddressinOrder($get(^INAUF(0,idOrder,1)))         =$$$YES)    {
+					
+					do ReceiveToCustomer(idOrder,idOrdLine,objRecLine)
+				}
+			}
+			do PurchaseJournal(idSupplier,idItem,idOrder,idOrdLine,pidReceipt,idLocn,dteRecvd,fltRecvdQtyIU,$$$INRECLineFlag(objRecLine))
+		}
+		set strStatus = $$CacheReceiptSave(pidReceipt,pidRecLine,idOrder,idOrdLine,dteRecvd,objRecLine)
+	}
+	quit
+	
+	
+ReadyForDelivery(pidOrder,pidOrdLine,pobjRecLine,&pobjOrderLine,pblnUpdate=$$$NO)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 02-Oct-2009	GRF		SR16361: split off for separate call
+	;-------------------------------------------------------------------------------
+	new blnReceivable,idGoodsFlag,objQualityCheck
+	
+	set idGoodsFlag = $$$INRECLineFlag(pobjRecLine)
+	if idGoodsFlag="" {
+		set blnReceivable = $$$YES
+	} else {
+		set objQualityCheck = $get(^INWEMERKER(0,idGoodsFlag,1))
+		if ($$$INWEMERKERReceivingOK(objQualityCheck)=$$$YES) ||
+		   (+$$$INWEMERKERHandover(objQualityCheck)=0)          {     ; "Receiving O.K." or "Handover Can Take Place"
+		
+			set blnReceivable = $$$YES
+		} else {
+			set blnReceivable = $$$NO
+		}
+	}
+	if blnReceivable {
+		set $$$INAUFPReadyForDelivery(pobjOrderLine) = $$$YES
+		if pblnUpdate set $$$INAUFPReadyForDelivery(^INAUFP(0,pidOrder,pidOrdLine,1)) = $$$YES
+	}     ; DIRECT WRITE WITHOUT $$$Save - avoids save hooks
+	quit
+	
+	
+ReceiveToCustomer(pidOrder,pidOrdLine,pidReceipt)
+	;-------------------------------------------------------------------------------
+	; Update order line if the Delivery should be sent directly to the Customer for a Supplier Order
+	;    (Specified at order line or at order level)
+	; 
+	; Called By : RevOrderLine^INRECReverse
+	;             Receive
+	;             Reverse  (deprecated)
+	; 
+	; History:
+	; 07-Oct-2009	GRF		SR16928: remove "private"
+	; 11-Sep-2009	GRF		SR16361: Extracted as separate tag
+	;-------------------------------------------------------------------------------
+	new objOrderLine,strStatus,YFORM,YVOR
+	
+	set objOrderLine = $get(^INAUFP(0,pidOrder,pidOrdLine,1))
+	
+	set $$$INAUFPDeliveryNoteNumber(objOrderLine)      = pidReceipt
+	set $$$INAUFPDeliveryNotePrintedDate(objOrderLine) = +$horolog
+	set $$$INAUFPDeliveryNotePrintedTime(objOrderLine) = $piece($horolog,",",2)
+	set $$$INAUFPDeliveryNotePrintedBy(objOrderLine)   = YBED
+	
+	set strStatus = $$$Save("INAUFP",pidOrder_","_pidOrdLine,objOrderLine,$$$YES)
+	quit
+	
+	
+PurchaseJournal(pidSupplier,pidItem,pidOrder,pidOrdLine,pidReceipt,pidLocn,pdteRecvd,pfltRecvdQty,penumFlag)
+	;-------------------------------------------------------------------------------
+	;   Create Purchase Journal : ^INWEBUCH
+	; 
+	; Called By : RevOrderLine^INRECReverse
+	;             Receive
+	;             Reverse  (deprecated)
+	; 
+	; History:
+	; 07-Oct-2009	GRF		SR16928: remove "private"
+	; 23-Sep-2009	DWR		SR16361: INWEBUCH Macros
+	; 22-Sep-2009	GRF		SR16361: Extracted as separate tag
+	;-------------------------------------------------------------------------------
+	new dteToday,tmeProcessed,objJournal,strBatchNo,strDeliveryNote,strStatus
+	new YFORM,YVOR
+	
+	quit:pidSupplier=""
+	
+	set strBatchNo      = ""         ; originally INWEAUF D2 - based on ^INLOT
+	set strDeliveryNote = $$$INRECDeliveryNoteNumber($get(^INREC(0,pidReceipt,1))) ; originally INWEAUF D14
+	
+	; FIXME : perhaps tmeProcessed could be a simple sequence
+	
+	set dteToday = +$horolog
+	for tmeProcessed = $piece($horolog,",",2):1 {
+		continue:$data(^INWEBUCH(0,dteToday,tmeProcessed,pidSupplier))
+		
+		set $$$INWEBUCHAccountsPayableNumber(objJournal) = $$$INLIEFAccountNo($get(^INLIEF(0,pidSupplier,1)))
+		set $$$INWEBUCHDeliveryNote(objJournal)          = strDeliveryNote
+		set $$$INWEBUCHIncomingGoodsDate(objJournal)     = pdteRecvd
+		set $$$INWEBUCHOrderNumber(objJournal)           = pidOrder
+		set $$$INWEBUCHLineItem(objJournal)              = pidOrdLine
+		set $$$INWEBUCHItemNumber(objJournal)            = pidItem
+		set $$$INWEBUCHIncomingGoodsQuantity(objJournal) = pfltRecvdQty
+		set $$$INWEBUCHIncomingGoodsFlags(objJournal)    = penumFlag        ; FIXME : penumFlag is based on ^INWEMERKER not ^INPARA(0,"WE-MERKER") <GRF>
+		set $$$INWEBUCHBatchNumber(objJournal)           = strBatchNo
+		set $$$INWEBUCHIncomingGoodsNumber(objJournal)   = pidReceipt
+		set $$$INWEBUCHLocation(objJournal)              = pidLocn
+		set $$$INWEBUCHItemGroup(objJournal)             = $$$INARTItemGroup($get(^INART(0,pidItem,1)))
+		
+		set strStatus = $$$Save("INWEBUCH",dteToday_","_tmeProcessed_","_pidSupplier,objJournal,$$$YES)
+		quit
+	}
+	quit
+	
+	
+Reverse(pidReceipt,pidRecLine,pobjRECLine,pstrRecptRef) ; DEPRECATED - Moved to RevOrderLine^INRECReverse SR16928
+	;-------------------------------------------------------------------------------
+	; Reverses a ReceiptOrderLine generated from a prior ReceiptLine
+    ;
+    ; ByRef: blnREVERSE
+    ; 
+    ; Called From: ReverseTxn^INRECReverse()
+    ;              (prev. SAVE^INWEAUFVORS() => Reverse^INWEAUFV2 based on INWEAUF
+    ; 
+    ; History:
+	; 02-Oct-2009	GRF		SR16361: split off ReadyForDelivery for separate call
+	; 14-Sep-2009	PPP		SR16888: Added the Location parameter to $$INARTAVG call
+    ; 09-Sep-2009	GRF		SR16875: mixing qty in order units & cost in inventory
+    ; 							units
+    ; 01-Sep-2008	HQN		Documenting ByRef variables used
+	; 28-Aug-2008	HQN		SR15829: Code cleanup, removing all logic not applicable
+	; 							supplier receipts
+	; 27-Aug-2008	HQN		SR15829: Copied from INWEAUF
+	;-------------------------------------------------------------------------------
+	new blnWithOrder,dteRecvd,fltConvFactor,fltPrevQtyRecvd,fltRecvdQty
+	new idItem,idLocn,idOrder,idOrdLine,idStore,idSupplier
+	new objOrderLine,objRecLine
+	
+	$$$LogR("Reverse",$get(YKEY))
+	
+	set objRecLine = pobjRECLine   ; FIXME : Recreate rather than pass in?
+	set idItem     = $$$INRECLineItem(pobjRECLine)
+	
+	if idItem'="" {
+		set idOrder    = $$$INRECLineOrder1(objRecLine)
+		set idOrdLine  = $$$INRECLineOrderLine(objRecLine)
+		set idSupplier = $$$INRECLineSupplier(objRecLine)
+		set idLocn     = $$$INRECLineLocation(objRecLine)
+		set dteRecvd   = $$$INRECLineReceiptDate(objRecLine)
+		
+		set blnWithOrder = ((idOrder'="") && (idOrdLine'=""))
+		
+		if blnWithOrder {
+			set objOrderLine = $get(^INAUFP(0,idOrder,idOrdLine,1))
+		} else {
+			set objOrderLine = ""             ; FIXME : what are implications?
+		}
+		
+		if $$$INVORGDRPOnlyForNetChange($get(^INVORG(0,0,1))) set ^INDRPNETCHANGE(0,idItem,1)=""
+		
+		if blnWithOrder do ReadyForDelivery(idOrder,idOrdLine,pobjRECLine,.objOrderLine,$$$NO)
+		
+		set fltRecvdQty     = $$$INRECLineQuantity(pobjRECLine)            ; in Inventory Units [Negative for reversal]
+		set fltConvFactor   = $$GetUOMConversion^INUOMConversion(idItem,$$$INRECLineOrderedUnit(objRecLine))
+		set fltRecvdQty     = fltRecvdQty / fltConvFactor                  ; Conversion Inventory to Order
+		set fltPrevQtyRecvd = $$$INAUFPIncomingGoodsQuantity(objOrderLine) ; in Order Units
+		
+		if blnWithOrder {
+			set $$$INAUFPIncomingGoodsQuantity(^INAUFP(0,idOrder,idOrdLine,1)) = fltRecvdQty+fltPrevQtyRecvd  ; DIRECT WRITE - avoids save hooks
+			
+			; Update order line if the Delivery should be sent directly to the Customer for a Supplier Order
+			; (Specified at order line or at order level)
+			if ($$$INAUFPCustomerIsDeliveryAddress(^INAUFP(0,idOrder,idOrdLine,1))=$$$YES) ||
+			   ($$$INAUFCustomerAddressinOrder($get(^INAUF(0,idOrder,1)))         =$$$YES)    {
+			
+				do ReceiveToCustomer(idOrder,idOrdLine,objRecLine)
+			}
+		}
+		; FIXME : If this is being done elsewhere then shouldn't need to get cost and qty in Inv Units.
+	;	set fltUnitCost = ""
+	;	set curDummy = $$^INARTAVG(idItem,fltRecvdQtyIU,fltUnitCost,pstrRecptRef,$$$NO,$$$YES,idLocn)
+		do PurchaseJournal(idSupplier,idItem,idOrder,idOrdLine,pidReceipt,idLocn,dteRecvd,fltRecvdQty,$$$INRECLineFlag(objRecLine))
+	}	
+	quit
+	
+	
+	;***************************************
+	;   vvv MODIFIED FROM FINAPInvDCM vvv
+	;***************************************
+	
+CacheReceiptSave(pidReceipt,pidRecLine,pidOrder,pidOrdLine,pdteRecvd,pobjRecLine)
+	;-------------------------------------------------------------------------------
+	; Update Order Lines if receipt changes				replaces $$$Save(INWEAUF)
+	;
+	; Called by : ProcessAllocations^INReceiptButtonP
+	; 
+	; Inputs:	pidOrder
+	; 			pidOrdLine
+	; 			pobjRecLine
+	; 
+	; Returns: strStatus
+	;
+	; History:
+	; 12-May-2014	SCR		SESDF-1387: Stop the loop if Error
+	; 13-Oct-2009	GRF		SR16932: this tag no longer called when reversal being
+	; 							processed therefore negative qty not applicable
+	; 12-Oct-2009	GRF		SR16932: fix parameters for CacheReceiptReversal
+	; 25-Sep-2009	GRF		SR16361: extend strKeys with INRECLine keys
+	; 09-Sep-2009	GRF		SR16875: INWEAUF now consistently using qty in order
+	; 							units (deprec ated with SR16361)
+	; 07-Sep-2009	GRF		SR16875: was calculating using qty changed to be based
+	; 							on inventory units when FINAPInvMatchCache remains
+	; 							as order units; variable prefixes.
+	; 10-Apr-2006	JW		SR14421: Encapsulated code, updated for new INREC structure.
+	; 03-Nov-2005	JW		SR13222: Added reversals
+	; 07-Jun-2005	JW/RW	SR12484: Created
+	;-------------------------------------------------------------------------------
+	new blnIsInvoiced,fltConvFactor,fltNewOutstanding,fltPrevOutstanding,fltRecvdQty,fltUnmatchedQty
+	new idInvMatch,idItem,idLocn,idStore,idxLineNo,idxOrderNo,idInvNewMatch
+	new objInvMatch,objInvNewMatch,strKeys,strStatus
+	
+	$$$LogR("CacheReceiptSave",pidReceipt_","_pidRecLine)
+	set strStatus = $$$OK
+	quit:$get(pidOrder)="" strStatus
+	quit:$get(pidOrdLine)="" strStatus
+	quit:$get(pobjRecLine)="" strStatus
+	
+	set idxOrderNo = $$$Index(pidOrder)
+	set idxLineNo  = $$$Index(pidOrdLine)
+	
+	set idItem        = $$$INRECLineItem(pobjRecLine)
+	set fltRecvdQty   = $$$INRECLineQuantity(pobjRecLine)     ; in Inventory Units
+	set fltConvFactor = $$GetUOMConversion^INUOMConversion(idItem,$$$INRECLineOrderedUnit(pobjRecLine))
+	set fltRecvdQty   = fltRecvdQty / fltConvFactor           ; Conversion Inventory to Order
+	
+	;-----------------------------------	
+	; Loop FAIMC for order line
+	;   Completed (Invoiced) : No
+	;   - Receive more than Ordered : Yes  (use ###)   [see Note below]
+	;     + Create new FAIMC
+	;     + CacheUpdate to new FAIMC
+	;   
+	;   - Receive more than Ordered : No
+	;     + Receipted : No
+	;       - Partial Receipt : Yes
+	;         + Create new FAIMC
+	;         + Update FAIMC UnmatchedQuantity
+	;         + set FAIMC Completed depending on whether all receipted has been invoiced.
+	;         
+	;       - Full/Excess Receipt                      [Note EXCESS here may not be picked up in earlier test]
+	;         + Flag as Fully Received     (set ###)
+	;         + Update FAIMC UnmatchedQuantity for any excess
+	;     + Receipted : Yes
+	;       - NFA
+	;   
+	;   Completed (Invoiced) : Yes
+	;   - NFA
+	;-----------------------------------	
+	set idLocn  = $$$INRECLineLocation(pobjRecLine)
+	set idStore = $$$INRECLineStockLocation(pobjRecLine)
+	set strKeys = pidOrder_$$$COMMA_pidOrdLine_$$$COMMA_idLocn_$$$COMMA_idStore_$$$COMMA_(+pdteRecvd)_$$$COMMA_pidReceipt_$$$COMMA_pidRecLine
+	; no .seq on date - uniqueness is REC/RECLine
+	
+	set idInvMatch = ""
+	for {
+		set idInvMatch = $order(^FINAPInvMatchCaches(0,1,idxOrderNo,idxLineNo,idInvMatch))
+		quit:idInvMatch=""
+		
+		set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+		continue:$$$FINAPInvMatchCacheCompleted(objInvMatch)
+		
+		if '$$$FINAPInvMatchCacheCompleted(objInvMatch) {     // If not already invoiced
+			set $$$FINAPInvMatchCacheAddedToCache(objInvMatch) = $horolog
+			
+			// All ordered have been receipted, but we have more to receipt, so create new line
+			if $get(^CacheTempRecAll(YUSER,idInvMatch)) {
+				set strStatus = $$CacheSplitLine(objInvMatch,idInvMatch,fltRecvdQty,$$$NO,.idInvNewMatch,.objInvNewMatch)
+				if $$$ISOK(strStatus) {
+					set strStatus = $$CacheUpdate(idInvNewMatch,objInvNewMatch,$$$YES,
+					                              pidReceipt,pidRecLine,pobjRecLine,
+					                              pdteRecvd,fltRecvdQty,strKeys)
+				}
+				quit	// Found
+			}
+			
+			// And not receipted
+			if '$$$FINAPInvMatchCacheReceipted(objInvMatch) {
+				set fltPrevOutstanding = $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)     ; D18
+				set fltUnmatchedQty    = $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) ; D19
+				
+				// If not fully receipted, create new cache line
+				if fltPrevOutstanding > fltRecvdQty {
+					set fltNewOutstanding = fltPrevOutstanding - fltRecvdQty
+					set blnIsInvoiced     = (fltUnmatchedQty < fltNewOutstanding)
+					set strStatus         = $$CacheSplitLine(objInvMatch,idInvMatch,fltNewOutstanding,blnIsInvoiced)
+					
+					if $$$ISOK(strStatus) { // Old Line
+						set $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) = fltUnmatchedQty - fltNewOutstanding
+						set $$$FINAPInvMatchCacheCompleted(objInvMatch)         = blnIsInvoiced
+					}
+					
+				} else {   // Store the fact that we have received all, in case there are more receipt lines incoming
+					set ^CacheTempRecAll(YUSER,idInvMatch) = $$$YES
+					
+					if fltPrevOutstanding < fltRecvdQty {  // Received more than ordered
+						set $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) = fltRecvdQty - fltPrevOutstanding + fltUnmatchedQty
+					}
+				}
+				
+				if $$$ISOK(strStatus) {   // Update current FAIMC
+					set strStatus = $$CacheUpdate(idInvMatch,objInvMatch,$$$YES,
+					                              pidReceipt,pidRecLine,pobjRecLine,
+					                              pdteRecvd,fltRecvdQty,strKeys)
+				}
+				quit	// Quit when found and updated line
+			}
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+	
+CacheReceiptReversal(pidReceipt,pidRecLine,pidxOrderNo,pidxLineNo,pdteRecvd,pobjRecLine,pidOrigRecNo,pidOrigLine)
+	;-------------------------------------------------------------------------------
+	; Process a receipt reversal
+	;
+	; Called By : ReverseTxn^INRECReverse
+	;             CacheReceiptSave^INRECReceive [left over from FINAPInvDCM? No longer functional?]
+	; 
+	; Params: pidxOrderNo,pidxLineNo - order line keys
+	;
+	; ByRefs:
+	;
+	; Returns: status
+	;
+	; History:
+	; 13-Oct-2009	GRF		SR16932: Reverse Receipts without Order as well; uses
+	; 							original receipt ids; set FAIMC Completed for Rw/oO
+	; 							that has been reversed 
+	; 07-Apr-2006	JW		SR14421: Created - separated code from ReceiptSave
+	;-------------------------------------------------------------------------------
+	new fltPrevOutstanding,fltUnmatchedQty,idInvMatch,objInvMatch,strStatus
+	
+	$$$LogR("CacheReceiptReversal",pidReceipt_","_pidRecLine_","_pidxOrderNo_","_pidxLineNo)
+	
+	set strStatus = $$$OK
+	
+	if (pidxOrderNo'=" ") && (pidxLineNo'=" ") {
+		set idInvMatch = ""
+		for {
+			set idInvMatch = $order(^FINAPInvMatchCaches(0,1,pidxOrderNo,pidxLineNo,idInvMatch),-1)
+			quit:idInvMatch=""
+			
+	$$$LogRx("CRR:1:"_idInvMatch)
+			set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+			
+			// If not already invoiced
+			if '$$$FINAPInvMatchCacheCompleted(objInvMatch) {
+				set $$$FINAPInvMatchCacheAddedToCache(objInvMatch) = $horolog    
+			
+					// Reversal - remove (complete) non-receipted record, but store quantities
+				if '$$$FINAPInvMatchCacheReceipted(objInvMatch) {
+					set fltPrevOutstanding = $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)      ; D18
+					set fltUnmatchedQty    = $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch)  ; D19
+			
+					set $$$FINAPInvMatchCacheCompleted(objInvMatch) = $$$YES
+					set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+			
+					// Reversal. If receipted and quantities match (will be the last receipt for this item)
+				} elseif ($$$FINAPInvMatchCachePreviouslyInvoicedValue(objInvMatch)="") {
+					// Remove receipt details and add quantities if necessary
+					if $get(fltPrevOutstanding) {
+						set $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)		= $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)     + fltPrevOutstanding
+						set $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch)	= $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) + fltUnmatchedQty
+					}
+					set strStatus = $$CacheUpdate(idInvMatch,objInvMatch,$$$NO,
+					                              pidReceipt,pidRecLine,pobjRecLine,pdteRecvd)
+					quit	// Quit when found and updated line
+				}
+			}
+			quit:$$$ISERR(strStatus)
+		}
+		
+	} else { ; single entry for receipt without order - based on ORIGINAL Receipt id
+		set idInvMatch = $order(^FINAPInvMatchCaches(0,6,$$$Index(pidOrigRecNo),pidOrigLine,""),-1)
+		if idInvMatch'="" {
+			set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+			
+	$$$LogRx("CRR:2:"_idInvMatch)
+			
+			// If not already invoiced
+			if '$$$FINAPInvMatchCacheCompleted(objInvMatch) {
+				set $$$FINAPInvMatchCacheCompleted(objInvMatch)    = $$$YES
+				set $$$FINAPInvMatchCacheAddedToCache(objInvMatch) = $horolog    
+				
+			// Reversal. If receipted and quantities match (will be the last receipt for this item)
+				if ($$$FINAPInvMatchCachePreviouslyInvoicedValue(objInvMatch)="") {    // Remove receipt details
+					set strStatus = $$CacheUpdate(idInvMatch,objInvMatch,$$$NO,
+					                              pidReceipt,pidRecLine,pobjRecLine,pdteRecvd)
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+CacheUpdate(pidInvMatch,pobjInvMatch,pblnReceipted=$$$YES,pidReceipt,pidRecLine,pobjRecLine,pdteRecvd,pfltRecvdQty,pstrKeys="")
+	;-------------------------------------------------------------------------------
+	; Update the cache line with receipt details
+	; 
+	; Called By:
+	;	CacheReceiptSave^INRECReceive
+	;	CacheReceiptReversal^INRECReceive
+	;
+	; Params:	pidInvMatch		- FINAPInvMatchCache key
+	;			pobjInvMatch	- FINAPInvMatchCache record
+	;			pblnReceipted	- whether it is being receipted or unreceipted (reversed)
+	;			pidReceipt		- INRECLine P1
+	;			pidRecLine		- INRECLine P2
+	;			pobjRecLine		- INRECLine record
+	;			ptmeRecvd		- "" or $piece($$$INRECProcessedDate(pobjReceipt),",",2)
+	;			pfltRecvdQty	- Received Qty in Order Units - left blank for Reversal
+	;			pstrKeys		- INWEAUF keys                - left blank for Reversal
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 07-Apr-2006	JW		SR14421: Created (encapsulated functionality)
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	$$$LogR("CacheUpdate",$get(pidInvMatch)_":"_pblnReceipted_"<"_pstrKeys)
+	
+	set $$$FINAPInvMatchCacheReceipted(pobjInvMatch)     = pblnReceipted
+	set $$$FINAPInvMatchCacheStockLocation(pobjInvMatch) = $$$INRECLineStockLocation(pobjRecLine)
+	set $$$FINAPInvMatchCacheReceiptDate(pobjInvMatch)   = +pdteRecvd
+	set $$$FINAPInvMatchCacheReceiptTime(pobjInvMatch)   = $piece(pdteRecvd,",",2)
+	set $$$FINAPInvMatchCacheReceiveKeys(pobjInvMatch)   = pstrKeys
+	
+	set $$$FINAPInvMatchCacheReceiptNumber(pobjInvMatch) = pidReceipt
+	set $$$FINAPInvMatchCacheReceiptLine(pobjInvMatch)   = pidRecLine
+	
+	// If receipt - update location and quantity
+	if pblnReceipted {
+		set $$$FINAPInvMatchCacheLocation(pobjInvMatch)      = $$$INRECLineLocation(pobjRecLine)
+		set $$$FINAPInvMatchCacheTotalQuantity(pobjInvMatch) = pfltRecvdQty
+	}
+	
+	$$$LogRx(pobjInvMatch)
+	
+	set strStatus = $$$Save("FINAPInvMatchCache",pidInvMatch,pobjInvMatch,$$$YES)
+	quit strStatus
+	
+	
+CacheSplitLine(pobjInvMatch,pidInvMatch,pfltRemainingQty,pblnAlreadyInvoiced=$$$NO,&pidNewInvMatch,&pobjInvNewMatch)
+	;-------------------------------------------------------------------------------
+	; Duplicate a cache line
+	;
+	; Called By: ReceiptSave^INRECReceive
+	;
+	; Params:	pobjInvMatch,pidInvMatch - data and key of current cache record
+	;			pfltRemainingQty         - total qty for new line
+	;			pblnAlreadyInvoiced      - whether already invoiced (???)
+	;
+	; ByRefs:	pidNewInvMatch,pobjInvNewMatch - data and key of new cache record
+	;
+	; Returns:	status
+	;
+	; History:
+	; 07-Apr-2006	JW		SR14421: Created (encapsulated functionality)
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	$$$LogR("CacheSplitLine",$get(pidInvMatch)_":"_pblnAlreadyInvoiced_"<"_$get(pfltRemainingQty))
+	
+	set pobjInvNewMatch = pobjInvMatch
+	
+	set $$$FINAPInvMatchCacheTotalQuantity(pobjInvNewMatch) = pfltRemainingQty
+	
+	// If receipting previously invoiced quantity, unmatched stays the same
+	// Otherwise, it becomes the remaining quantity.
+	if 'pblnAlreadyInvoiced {
+		set $$$FINAPInvMatchCacheUnmatchedQuantity(pobjInvNewMatch) = pfltRemainingQty
+	}
+	
+	set $$$FINAPInvMatchCacheLink(pobjInvNewMatch) = pidInvMatch // Save Link
+	set pidNewInvMatch = $$^WWWNEXT("FINAPInvMatchCache")
+	set strStatus      = $$$Save("FINAPInvMatchCache",pidNewInvMatch,pobjInvNewMatch,$$$YES)
+	
+	$$$LogRx("CSL:"_pidNewInvMatch_"<"_pobjInvNewMatch)
+	
+	quit strStatus
+	
+]]></Routine>
+</Export>

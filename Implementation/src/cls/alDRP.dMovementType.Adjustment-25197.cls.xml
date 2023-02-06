@@ -1,0 +1,271 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alDRP.dMovementType.Adjustment">
+<ClassType>serial</ClassType>
+<IncludeCode>INConst</IncludeCode>
+<Super>alDRP.dMovementType</Super>
+
+<Property name="MovementTypeId">
+<Description><![CDATA[
+Source of transaction]]></Description>
+<Type>alSYS.dt.dtInteger</Type>
+<InitialExpression>"40&quot;</InitialExpression>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="AL00472"/>
+</Property>
+
+
+<Method name="Validate">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; History
+	; 10-Apr-2008   GRF		SR15660: Created
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+	if pobjMove.Completed {
+		set strMessage = $$$Text("IN00711")      ; "This movement is already completed."
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="Confirm">
+<FormalSpec>pobjMove:alADJ.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+#define enumAverageCost		9
+	;-------------------------------------------------------------------------------
+	; Update the BundleStock and StockHistory plus incidentals and then back
+	; populate the V1 data.
+	;
+	;	.QtyPicked		The change quantity being applied to THIS bundle - negative
+	;					values reduce the QOH and vice versa.
+	;					Needs to be inverted for INStockMovement
+	; 
+	; History
+	; 12-Jul-2010	SCR		SR17387: Pass Source Details, Form & Rec to Finance
+	; 19-Nov-2009	GRF		SR16471: Change scope of lock by making it a global
+	; 02-Nov-2009	GRF		SR16871: INItemCost with location replaces INARTKOST;
+	; 							Remove ConfirmMovement
+	; 21-Oct-2009	GRF		SR16875: TxnValue should be extended cost
+	; 21-Sep-2009	DWR		SR16880: Call to new class alSFI.dStockFin
+	; 21-Sep-2009	GRF		SR16361: ConfirmMovement returns strStatus
+	; 27-Oct-2008	GRF		SR15802: Match input parameter type for ReasonCode; pass
+	;							ReasonCode to INStockMovement
+	; 27-Aug-2008	Luke	SR15691: Corrected the calculation of fltCost
+	; 20-Aug-2008	HQN		SR15801: Added periodbalance handling
+	; 12-Aug-2008	Luke    SR15691: Added external calls for costings 
+	; 12-Aug-2008	Luke	SR15813: added transaction types to processing
+	; 09-May-2008	HQN		SR15721: Pass bundle to ConfirmMovement^INStockMovement()
+	; 30-Apr-2008	GRF		SR15694: Source using V2Bundles so now need to back 
+	;							populate INWE, etc.
+	; 10-Apr-2008   GRF		SR15660: Created
+	;-------------------------------------------------------------------------------
+	set sc     = $$$OK
+	set idItem = pobjMove.Item.ItemId
+	
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	LOCK +^alSOHProcessing(idItem):2
+	if '$test {
+		set strMessage = $$$Text($listbuild("IN00853",idItem))
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+	; "Can not acquire a lock for Item: (%1) please try again"	
+	;+++++++++++++++++++++++++++++++++++++++
+
+	} else {
+	; Adjustment : Stock History & Period Balance
+	;---------------------------------------
+	
+		set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+		
+		set objTransType   = ##class(alSOH.dTransactionType).%OpenId(9)
+		set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove, 
+													   pobjMove.FromLocn,
+													   pobjMove.FromStorage,
+													   pobjMove.QtyPicked,
+													   fltCost,
+													   objTransType,
+													   .sc)
+		set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist)
+
+	;+++++++++++++++++++++++++++++++++++++++ ; SR16871
+		LOCK -^alSOHProcessing(idItem)
+	;+++++++++++++++++++++++++++++++++++++++
+	}	
+	
+	; Stock to Finance Interface            ; SR16880
+	;---------------------------------------
+	if $$$ISOK(sc) {
+		set idDeleteStorage = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+		
+		set objStockFin = ##class(alSFI.dStockFin).%New()
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "ADJ"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.Adjustment"
+		set objStockFin.TxnInformation = "Stock Adjustment"
+		set objStockFin.Item           = pobjMove.Item
+		
+		; FIXME : Original Adjustments only permitted a reduction in quantity.
+		;         This was later changed so source transaction reflected the
+		;         actual change direction.  Processing to Finance appears to
+		;         reflect a reduction when the quantity is +ve (so can have a
+		;         "negative reduction" when increasing SOH.
+		;         We have code that checks if the transaction type is "ADJ" and
+		;         then reverses the sign again - e.g. INStockVal update. 
+		;         May be able to retain actual source sign and remove all reversals. <GRF>
+		;         (This may make DCM record clearer by removing "negative reduction" logic.)
+		set objStockFin.Quantity       = -pobjMove.QtyPicked
+		set objStockFin.TxnValue       = -fltCost * pobjMove.QtyPicked
+		
+		set objStockFin.FromLocn       = pobjMove.FromLocn
+		set objStockFin.FromStorage    = pobjMove.FromStorage
+		set objStockFin.ToLocn         = pobjMove.FromLocn
+		set objStockFin.ToStorage      = ##class(alLOC.iULOC).GetStorage(pobjMove.FromLocn.Code,idDeleteStorage)
+		set objStockFin.Reason         = pobjMove.ReasonCode
+		set objStockFin.SourceRec      = pobjMove.Reference														; SR17387
+		set objStockFin.SourceForm     = "INADJ"																; SR17387
+		set objStockFin.SourceDetail   = 34351_","_pobjMove.Reference_","_$piece(pobjMove.LineNumber,"||",2) 	; SR17387
+		                                 ; "Adjustment %1, Line %2"
+		set sc = objStockFin.StockToFin()
+		
+		set YUSER =%("%KEY","YUSER") 
+		set:YUSER="" YUSER=" "
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		if $$$ISOK(sc) set ^CacheTemp(YUSER,"FIBURecord") = $$$YES
+		
+	}
+	
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="OldConfirm">
+<FormalSpec>pobjMove:alADJ.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	// * * *   D O   N O T   U S E   T H I S   M E T H O D   * * *
+#define enumAverageCost		9
+	;-------------------------------------------------------------------------------
+	; Update the BundleStock and StockHistory plus incidentals and then back
+	; populate the V1 data.
+	;
+	;	.QtyPicked		The change quantity being applied to THIS bundle - negative
+	;					values reduce the QOH and vice versa.
+	;					Needs to be inverted for INStockMovement
+	; 
+	; History
+	; 19-Nov-2009	GRF		SR16471: Change scope of lock by making it a global
+	; 02-Nov-2009	GRF		SR16871: INItemCost with location replaces INARTKOST;
+	; 							Remove ConfirmMovement
+	; 21-Oct-2009	GRF		SR16875: TxnValue should be extended cost
+	; 21-Sep-2009	DWR		SR16880: Call to new class alSFI.dStockFin
+	; 21-Sep-2009	GRF		SR16361: ConfirmMovement returns strStatus
+	; 27-Oct-2008	GRF		SR15802: Match input parameter type for ReasonCode; pass
+	;							ReasonCode to INStockMovement
+	; 27-Aug-2008	Luke	SR15691: Corrected the calculation of fltCost
+	; 20-Aug-2008	HQN		SR15801: Added periodbalance handling
+	; 12-Aug-2008	Luke    SR15691: Added external calls for costings 
+	; 12-Aug-2008	Luke	SR15813: added transaction types to processing
+	; 09-May-2008	HQN		SR15721: Pass bundle to ConfirmMovement^INStockMovement()
+	; 30-Apr-2008	GRF		SR15694: Source using V2Bundles so now need to back 
+	;							populate INWE, etc.
+	; 10-Apr-2008   GRF		SR15660: Created
+	;-------------------------------------------------------------------------------
+	set objTransType = ##class(alSOH.dTransactionType).%OpenId(9) //SR15813:
+	set sc = $$$OK
+	set idItem = pobjMove.Item.ItemId
+	
+	lock +^alSOHProcessing(idItem):2
+	if '$test {
+		set strMessage = $$$Text($listbuild("IN00853",idItem)) //Can not acquire a lock for Item: (%1) please try again 
+		set sc = $$$ERROR($$$GeneralError,strMessage)  
+
+	} else {
+		lock -^alSOHProcessing(idItem)
+	;	set fltCost = $$GetCostV2^INARTKOST(idItem) ; SR16871
+		set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+	}
+	
+	
+	if $$$ISOK(sc) {
+		set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove, 
+													   pobjMove.FromLocn,
+													   pobjMove.FromStorage,
+													   pobjMove.QtyPicked,
+													   fltCost,
+													   objTransType,
+													   .sc)
+		
+		set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist) ; 20-Aug-2008 HQN SR15801
+	}	
+	
+	if $$$ISOK(sc) {         ; SR16880 vvv
+		set idDeleteStorage = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+		
+		set objStockFin = ##class(alSFI.dStockFin).%New()
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "ADJ"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.Adjustment"
+		set objStockFin.TxnInformation = "Stock Adjustment"
+		set objStockFin.Item           = pobjMove.Item
+		
+		; FIXME : Original Adjustments only permitted a reduction in quantity.
+		;         This was later changed so source transaction reflected the
+		;         actual change direction.  Processing to Finance appears to
+		;         reflect a reduction when the quantity is +ve (so can have a
+		;         "negative reduction" when increasing SOH.
+		;         We have code that checks if the transaction type is "ADJ" and
+		;         then reverses the sign again - e.g. INStockVal update. 
+		;         May be able to retain actual source sign and remove all reversals. <GRF>
+		;         (This may make DCM record clearer by removing "negative reduction" logic.)
+		set objStockFin.Quantity       = -pobjMove.QtyPicked
+	;	set objStockFin.TxnValue       = -fltCost                  ; SR16875
+		set objStockFin.TxnValue       = -fltCost * pobjMove.QtyPicked
+		
+		set objStockFin.FromLocn       = pobjMove.FromLocn
+		set objStockFin.FromStorage    = pobjMove.FromStorage
+		set objStockFin.ToLocn         = pobjMove.FromLocn
+		set objStockFin.ToStorage      = ##class(alLOC.iULOC).GetStorage(pobjMove.FromLocn.Code,idDeleteStorage)
+		set objStockFin.Reason         = pobjMove.ReasonCode
+		
+		set sc = objStockFin.StockToFin()
+		
+		set YUSER =%("%KEY","YUSER") 
+		set:YUSER="" YUSER=" "
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		if $$$ISOK(sc) set ^CacheTemp(YUSER,"FIBURecord") = $$$YES
+	}                        ; SR16880 ^^^
+	
+	/* ; SR16871 remove
+	if $get(^SysSetup("KeepOldStockHistory")) && $$$ISOK(sc) {
+		set idDeleteStorage = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+		
+		set strStatus = $$ConfirmMovement^INStockMovement(idItem,
+		                                                  pobjMove.Bundle,
+		                                                 -pobjMove.QtyPicked,
+		                                                  pobjMove.FromLocn.Code,
+		                                                  pobjMove.FromStorage.Code,
+		                                                  pobjMove.FromLocn.Code,
+		                                                  idDeleteStorage,
+		                                                  pobjMove.MovementType.MovementTypeId,
+		                                                  pobjMove.Reference,
+		                                                  pobjMove.LineNumber,
+		                                                  pobjMove.ReasonCode)
+		
+		set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"Error Back Populating INWE") ///$$$Text("IN00711"))
+	}
+	*/
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="Default">
+<Type>%Library.CacheSerialState</Type>
+</Storage>
+</Class>
+</Export>

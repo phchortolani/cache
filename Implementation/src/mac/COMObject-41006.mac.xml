@@ -1,0 +1,299 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMObject" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMObject
+	;-------------------------------------------------------------------------------
+	; History:
+	; 15-Mar-2005	GRF		Boolean Macros
+	;-------------------------------------------------------------------------------
+#include COMSYS
+#include %occInclude
+#define ChunkSize 512
+#include COMDebug
+	
+Serialise(pidClass,pstrClass,strMessage)
+	;-------------------------------------------------------------------------------
+	; converts an object into a local string array which is used 
+	; for trsnsport of that object via DCM
+	;-------------------------------------------------------------------------------
+	new obj,Stream,strStatus,lngLineNumber,intReadAmount
+	
+	set strStatus = $$$OK
+	set obj = ""
+	;open up class
+ 	xecute "set obj = ##class("_pstrClass_").%OpenId("""_pidClass_""")"
+ 	set Stream=##class(%FileCharacterStream).%New()
+   	if obj '= "" {
+	   	do Stream.Write("<?xml version='1.0' ?>")
+	   	; convert class to XML string
+    	do obj.XMLExportToStream(.Stream)
+    	do Stream.Rewind()
+    	set intReadAmount=$$$ChunkSize
+		for {
+			quit:intReadAmount'=$$$ChunkSize
+	    	set strMessage($increment(lngLineNumber)) = Stream.Read(.intReadAmount)
+ 		} ;if we run out of data in the stream intReadAmount will not be the same as when we passed it in.
+ 		do obj.%Close()
+   	}
+   	
+   	do Stream.%Close()
+ 	quit "strMessage"
+   	
+	
+DeSerialise(pstrMessage,pmsgType,pmsgClassName)
+	;-------------------------------------------------------------------------------
+	; pidClass  	- Id of DCM object getting saved
+	; pstrMessage 	- Name of Loacl Array structure with the stream details in it.
+	; pmsgType 		- Node in XML structure containing the relevant class details eg. "WorkPad"
+	; pmsgClassName - Name of Class getting Saved eg "WorkPad.WorkPad"
+	; pidName 		- Name of Id property on class eg. WorkPadID
+	;-------------------------------------------------------------------------------
+	new reader,Stream,lngLineNumber,strStatus,objClass
+	
+	set reader = ##class(%XML.Reader).%New()
+	set Stream = ##class(%FileCharacterStream).%New()
+	
+	set lngLineNumber = ""
+	for {
+		set lngLineNumber = $order(@pstrMessage@(lngLineNumber))
+		quit:lngLineNumber=""
+		
+		do Stream.Write(@pstrMessage@(lngLineNumber))
+	}
+	
+	do Stream.Rewind()
+	set strStatus = reader.OpenStream(Stream)
+	if strStatus=$$$OK {
+		// Associate a class name with the XML element name
+		do reader.Correlate( pmsgType, pmsgClassName)
+	}
+	
+	while reader.Next(.objClass,.strStatus) {
+		quit:strStatus'=$$$OK
+		set strStatus=objClass.%Save()
+		quit:strStatus'=$$$OK
+	}
+	do reader.%Close()
+	do Stream.%Close()
+	quit strStatus
+	
+	
+OnBeforeSave(pblnInsert,pstrClass,pidKey,pobjRec)
+	;-------------------------------------------------------------------------------
+	;  @NM Processing for Object Save. Called from %OnBeforeSave from @NM Generated Classes
+	;  Copied from WWWSPEI to do the following
+	;		1: Call Class Hook 'On Before Save'
+	;		2: Update Create/Modified Date(Time) and User
+	;		3: Update Location field if defined by the form spec
+	;		4: Update ^WWWPRO & ^WWWLAST
+	;		5: Call DCM
+	; 
+	; Inputs: Insert flag, Class, Key, Data
+	;
+	; Returns: sc
+	;
+	; History:
+	; 25-Jun-2014	shobby	CORE-385.19: DCM routines may not exist.
+	; 05-Aug-2010	SCR		SR17471: $Get(objFormRec)
+	; 29-Jul-2010	SCR		SR17471: Created
+	;-------------------------------------------------------------------------------
+	new objClass,intMaxKey,WWWYM,strGlobal,intKey,strKey,objOriginalRec
+	new strStatus,objFormRec,strYM
+	new dteToday,strKeyTR,tmeToday
+	new blnCreated,dteDate,fldDateModified,fldModifiedBy,fldEntryDate,fldEnteredBy,fldCreateLocn
+	
+	if pstrClass="" quit 1 ; This Should never happen!
+	
+	set objClass  = $get(^WWW001(0,pstrClass,1))          ; objClass
+	set intMaxKey = +$order(^WWW002(0,pstrClass,""),-1)
+	if intMaxKey=0 set intMaxKey = 1                      ;KEIN KEY = AUTOMATISCH LFN ;no KEY automatic 
+	
+	; FIXME : Can replace this...
+	set WWWYM = $$^WWWYM(pstrClass)
+	set strYM = $$$QUOTE(WWWYM)_","
+	set WWWYM = WWWYM_","                    ; FIXME : Not used
+	set strGlobal="^"_pstrClass_"("_strYM    ;NORMALER SAVE
+	; with...
+	;set strGlobal = "^"_pstrClass_"(0," 
+	for intKey=1:1:intMaxKey { 
+		set strKey    = $piece(pidKey,",",intKey) 
+		set strGlobal = strGlobal_""""_strKey_""","
+	}
+	set strGlobal = strGlobal_"1)"
+	set YOK       = $$$SaveOkay                  ;NEUER SATZ+SPEICHERN OK
+	set objOriginalRec = $get(@strGlobal)        ; SUCHEN ALTEN WERT ; retrieve old value 
+	set blnCreated = (objOriginalRec="")                 ; if not created then has been modified     ; 02-Jan-2007
+	;
+	set strStatus = $$ExecuteHook^WWW001Hook(pstrClass,$$$EnumWWWEVENTTYPEOnBeforeSave,pidKey,.pobjRec,$get(YFORM),objOriginalRec)
+	if $$$ISERR(strStatus) set YOK = $$$HardFail  quit strStatus   ;BR014960 (remove dot level so quit is to outer level)
+	
+	if $data(YFORM) && (YFORM'="") {
+		set objFormRec = $get(^WWW120(0,YFORM,1)) do  ;ERFASSUNGSDATUM/MITARBEITER
+		if $$$WWW120ClassUsedInForm(objFormRec)=pstrClass {
+			set dteDate = $horolog
+			set fldDateModified = $$$WWW120DataFieldForDateModified(objFormRec)
+			set fldModifiedBy   = $$$WWW120DataFieldForModifiedBy(objFormRec)
+			if fldDateModified {
+				if $piece($get(^WWW003(0,pstrClass,fldDateModified,1)),Y,3)=1 set dteDate=+dteDate
+				set $piece(pobjRec,Y,fldDateModified)=dteDate
+			} 
+			if fldModifiedBy set $piece(pobjRec,Y,fldModifiedBy)=$get(YBED)
+			
+			set fldEntryDate  = $$$WWW120DataFieldEntryDate(objFormRec)
+			set fldEnteredBy  = $$$WWW120DataFieldEnteredBy(objFormRec)
+			set fldCreateLocn = $$$WWW120DataItemOfLocation(objFormRec)
+			if fldEntryDate && (($piece(pobjRec,Y,fldEntryDate)="") || blnCreated ){
+				set dteDate=$horolog
+				if $piece($get(^WWW003(0,pstrClass,fldEntryDate,1)),Y,3)=1 set dteDate=+dteDate
+				set $piece(pobjRec,Y,fldEntryDate)=dteDate
+			}
+			if fldEnteredBy && (($piece(pobjRec,Y,fldEnteredBy)="")  || blnCreated ){
+				 set $piece(pobjRec,Y,fldEnteredBy)  = $get(YBED)       ;TYBD 07.05.2002
+			}
+			if fldCreateLocn && (($piece(pobjRec,Y,fldCreateLocn)="") || blnCreated ) {
+				set $piece(pobjRec,Y,fldCreateLocn) = $get(YLOCATION)  ;TYBD;09.04.2003;23440;Speichern Betrieb
+			}
+		}
+	}
+
+	if $$$WWW120ModificationsProtocol($get(objFormRec))=$$$YES {  ;PROTOKOLLDATEI   ; $$$WWW120ModificationsProtocol
+		if (YKEY'="") && (pstrClass'="") && ($get(YBED)'="") {
+			set dteToday = $horolog                              ; 02-Jan-2007
+			set tmeToday = $piece(dteToday,",",2),dteToday = +dteToday
+			set strKeyTR = $translate(YKEY,"/",",")
+			for  {
+				quit:'$data(^WWWPRO(YM,pstrClass,dteToday,tmeToday,YBED,strKeyTR,0,1))  
+				set tmeToday=tmeToday+.1
+			}
+			set ^WWWPRO(YM,pstrClass,dteToday,tmeToday,YBED,strKeyTR,0,1) = $get(objOriginalRec)   ; old version
+			set ^WWWPRO(YM,pstrClass,dteToday,tmeToday,YBED,strKeyTR,1,1) = pobjRec                ; new version
+			set ^WWWLAST(YM,pstrClass,strKeyTR,$horolog,1)                = pobjRec
+		}
+	}
+	
+	if YOK=$$$SaveOkay {
+		do PopulateIndex^COMQuickSearch(pstrClass,pidKey) // SR12522
+		
+		set YOK=$$$OK	;CORE-385.19
+		if ##class(%Library.Routine).Exists("COMDCMControlModule") set YOK = $$handleRelevantEvents^COMDCMControlModule("INTRAPREND",pstrClass,"save",pidKey,pobjRec,,$$GetCheckSum^COMDCMUtilities($get(objOriginalRec),$get(objFormRec)))  ;INTRAPREND=KENNUNG FÜR @-NET MANAGER ;CORE-385.19
+		IF '$PIECE(YOK,Y,1) IF $GET(YBED)'="" IF $GET(YFORM)'="" SET ^WWWWV(YM,YBED,$PIECE($HOROLOG,",",1),YFORM,pidKey,1)=$PIECE($HOROLOG,",",1)_Y_$PIECE($HOROLOG,",",2)_Y_YBED_Y_$PIECE(YOK,Y,2)
+		;set strStatus = $$ExecuteHook^WWW001Hook(pstrClass,$$$EnumWWWEVENTTYPEOnAfterSave,pidKey,.pobjRec,YFORM,objOriginalRec)
+	}
+	quit YOK
+	
+	
+CreateAndCompileProject(pstrRef,pblnCompileClasses=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Get all the package names given a the starting characters  and compile them
+	;
+	; Inputs:
+	; 	pstrRef
+	;   pblnCompileClasses  ; Compile Classes
+	;
+	; ByRef:
+	; 	
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Aug-2010	SCR		SR17471: Created/Copied from zzUtlClass
+	;-------------------------------------------------------------------------------
+	new arrErrors,result,sc,strClass,strProject,objProj
+	
+	kill ^CacheTempArrClass
+	set strProject="V2CLASSES-"_$zu(5)
+	
+	if ##class(%Studio.Project).%ExistsId(strProject) {
+		set sc = ##class(%Studio.Project).%DeleteId(strProject)
+		
+		if $$$ISERR(sc) {
+			do AddMessage^COMLog("Cannot Delete Current '"_strProject_"' project, Compile aborted")
+			quit
+		}
+	}
+	
+	set result = ##class(%ResultSet).%New("%Dictionary.ClassDefinitionQuery:Summary")
+	do result.Execute()
+	
+	for {
+		quit:'result.Next()
+		
+		set strClass=result.Data("Name")
+		if $zconvert($extract(strClass,1,$length(pstrRef)),"U") = $zconvert(pstrRef,"U") {
+			set ^CacheTempArrClass($job,strClass)=""
+		}
+	}
+	
+	do result.%Close()
+	
+	// Creation of the PROJECT
+	set sc       = $$$OK
+	set objProj  = $$CreateProjectHeader(strProject)
+	set strClass = ""
+	for {
+		set strClass = $order(^CacheTempArrClass($job,strClass))
+		quit:strClass=""
+		
+		do objProj.AddItem(strClass, "CLS")
+	}
+	set sc = objProj.%Save()
+	do objProj.%Close()
+	
+	if $$$ISOK(sc) {
+		do AddMessage("Created Project : "_strProject)
+	}
+	kill arrErrors												; 17-Apr-2008 PPP
+	
+	if ($$$ISOK(sc)) && (pblnCompileClasses = $$$YES) {
+		set sc = $SYSTEM.OBJ.CompileProject(strProject,"cfrvo3byk",.arrErrors)
+	}
+	// Compiling the PROJECT
+	quit sc
+	
+	
+AddMessage(pstrMsg)
+	;-------------------------------------------------------------------------------
+	;Display Message
+	;
+	; Inputs:
+	; 	pstrMsg
+	;
+	; ByRef:
+	; 	
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Aug-2010	SCR		SR17471: Created/Copied from zzUtlClass
+	;-------------------------------------------------------------------------------
+	write !,pstrMsg
+	quit
+	
+	
+CreateProjectHeader(pstrName)
+	;-------------------------------------------------------------------------------
+	; Create the project header
+	;
+	; Inputs:
+	; 	pstrName
+	;
+	; ByRef:
+	; 	
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Aug-2010	SCR		SR17471: Created/Copied from zzUtlClass
+	;-------------------------------------------------------------------------------
+	new objProj
+	
+	set objProj=##class(%Studio.Project).%New()
+	if objProj'=$$$NULLOREF {
+		set objProj.Name=pstrName
+		set objProj.Description="All V2 Classes"
+	}
+	quit objProj
+	
+
+]]></Routine>
+</Export>

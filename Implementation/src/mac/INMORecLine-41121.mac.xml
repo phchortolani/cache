@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INMORecLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INMORecLine
+	;-------------------------------------------------------------------------------
+	; History:
+	; 30-Apr-2010	PP		SR<>: Created
+	;-------------------------------------------------------------------------------
+	
+#include COMSYS
+#include INConst
+#include INSYS
+#include COMGridEdit31
+	
+#define FORMFldINMORecLineLotNo			13
+#define FORMFldINMORecLineExpiryDate	14
+#;define FORMFldINMORecLineBrand			32
+	
+OnBeforeFormat(pstrYFIELDNAME,pstrText,pobjRECLine)
+	;-------------------------------------------------------------------------------
+	; Determine whether any special formatting needs to be applied to cells in the grid.
+	;
+	; Called By : COMGridEdit31Events
+	; 
+	; Params:
+	;	pstrYFIELDNAME	- Edit Grid field name	Yrow_col   (or Yrow_col?)
+	;	pstrText		- Not in use
+	;	pobjRECLine		- Supplier Receipt Line record
+	; 
+	; ByRefs:
+	;	YBLUE
+	;	YBACKGROUNDCOLOR
+	;	YTOOLTIP
+	;	YMANDANTCOLOR		(should new?)
+	;	
+	; Returns:
+	;
+	; History:
+	; 13-Aug-2010	PPP		SR16573/1:Added checks to control Total Qty entered
+	; 30-Apr-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new blnLotNo,blnUseByDate,blnLotUnique,fltActQty,fltQtyRec,fltTotalRec
+	new idClassField,idItem,idLineNumber,idMO,idRecNumber
+	new intBrand,intCol,intOwner,intProgram,intRow,objHeader
+	new idLoc
+	
+	set objHeader  = $$$GRIDYFELDContainer
+	quit:$$$INRECStatus(objHeader)>0             ; Processed   ; > $$$EnumINSTATUSUnprocessed
+	
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pstrYFIELDNAME,intRow,intCol)
+	set idClassField = $$$GetClassField(YFORM,intCol)
+	set idRecNumber  = $$$KEY1(YKEY)
+	set idLineNumber = $$$KEY2(YKEY)
+	
+	set idItem 		= $$$INRECLineItem(pobjRECLine)
+	set fltQtyRec 	= $$$INRECLineQuantity(pobjRECLine)
+	set idMO		= $$$INRECProductionOrder(objHeader)
+	set fltActQty	= $$$INMOMinimumQuantity($get(^INMO(0,idMO,1)))
+	set idLoc		= $$$INRECLocation(objHeader)
+	
+	if idItem'="" {
+		; Check Bundle Attribute Columns
+		;-----------------------------------   ; SR16510
+		do GetAttributes^INItemPolicyUtils(idItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,idLoc)
+		
+		//SR16573/1
+		if (idClassField = $$$FldINRECLineQuantity) {
+			set fltTotalRec = $$GetTotalRec(idLineNumber)+fltQtyRec
+			
+			if fltQtyRec = "" {
+				set YWARNING = $$$YES
+			
+			} elseif (fltTotalRec > fltActQty) {
+				set YWARNING = $$$YES
+				set YTOOLTIP = $$$Text($listbuild("IN01254",fltTotalRec,fltActQty))
+			// "Total Quantity Received (%1) cannot be more than Original Required Quantity (%2)"
+			
+			} else {
+				set YWARNING = $$$NO
+			}
+		
+		; Use By Date
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineExpirationDate) {
+			if blnUseByDate {
+				set YMANDATORY = $$$YES
+				if ($$$INRECLineExpirationDate(pobjRECLine)'="")      &&
+				   ($$$INRECLineExpirationDate(pobjRECLine)<$horolog)   { 
+					set YWARNING = $$$YES
+					set YTOOLTIP = $$$Text($listbuild("33989"))
+				} ; "Attention! Valid Until Date Exceeded "
+			} else {
+				set YENABLED = $$$NO 
+			}					
+			
+			
+		; Lot Number
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineLotNumber) {
+			set YTOOLTIP = ""
+			if blnLotNo {
+				set YMANDATORY = $$$YES
+				
+				if ($$$INRECLineLotNumber(pobjRECLine)'="") {		//Always check for Lot Uniqueness if required //SR16765
+					if blnLotUnique {           // SR17105
+						if '##class(alSOH.iUItemPolicy).IsLotUnique(idItem, $$$INRECLineLotNumber(pobjRECLine), $$$INRECLineExpirationDate(pobjRECLine)) {
+							set YWARNING = $$$YES
+							set YTOOLTIP = $$$Text("IN00880")
+						} ; "Lot Number must be unique"
+					}
+				}	
+				
+			} else {
+				set YENABLED         = $$$NO 
+			}
+			
+		; Brand  //SR16510
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineBrand) {
+			set:intBrand=1 YMANDATORY = $$$YES
+			set:intBrand=2 YENABLED   = $$$NO
+		; Owner
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineOwner) {
+			set:intOwner=1 YMANDATORY = $$$YES
+			set:intOwner=2 YENABLED   = $$$NO
+			
+		; Program
+		;-----------------------------------
+		} elseif (idClassField = $$$FldINRECLineProgram1) {
+			set:intProgram=1 YMANDATORY = $$$YES
+			set:intProgram=2 YENABLED   = $$$NO
+		}
+	}
+	quit
+	
+	
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Called by FORM INMORecLine
+	;
+	; History:
+	; 10-Sep-2013	SCR		CORE-266: Pass in Location to GetAttributes
+	; 20-Jun-2013	SCR		HEVA-1030: Disable QTY checks when Pharmacy
+	; 13-Aug-2010	PPP		SR16573/1: Added checks for Received quantity
+	; 30-Apr-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new blnLotNo,blnLotUnique,blnUseByDate,fltActQty,fltTotalRec
+	new idItem,idLine,idMO,idRec,intBrand,intOwner,intProgram,objItem,strStatus
+	new idLoc
+	
+	kill YRETVAL
+	
+	set strStatus = $$$OK
+	set idRec 	  = $$$KEY1(pYKEY)
+	set idLine	  = $$$KEY2(pYKEY)
+	; HEVA-1030 vvvv
+	set objRec		= ^INREC(YM,idRec,1)
+	set objProd		= ""
+	set idProd		= $$$INRECProductionOrder(objRec)
+	if idProd'="" {
+		set objProd		= $get(^INMO(YM,idProd,1))
+	}
+	; HEVA-1030 ^^^^
+	set idLoc	= $$$INRECLocation(objRec)
+	set idItem	= $$$INRECLineItem(pYFELD)
+	do GetAttributes^INItemPolicyUtils(idItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,idLoc)
+	
+	if idItem '="" {
+		if blnLotNo && ($$$INRECLineLotNumber(pYFELD) = "") {
+			set strStatus = $$$MakeStatus("IN01061",$$$KEY2(pYKEY)) 	// "Line (%1) Lot Number not entered"
+			
+		} elseif blnUseByDate && ($$$INRECLineExpirationDate(pYFELD) = "") {
+			set strStatus = $$$MakeStatus("IN01062",$$$KEY2(pYKEY)) 	// "Line (%1) Expiry Date not entered"
+			
+		} elseif (intBrand=1) && ($$$INRECLineBrand(pYFELD) = "") {
+			set strStatus = $$$MakeStatus("IN01063",$$$KEY2(pYKEY)) 	// "Line (%1) Brand not entered"
+			
+		} elseif (intOwner=1) && ($$$INRECLineOwner(pYFELD) = "") {
+			set strStatus = $$$MakeStatus("IN01064",$$$KEY2(pYKEY)) 	// "Line (%1) Owner not entered"
+			
+		} elseif (intProgram=1) && ($$$INRECLineProgram1(pYFELD) = "") {
+			set strStatus = $$$MakeStatus("IN01065",$$$KEY2(pYKEY)) 	// "Line (%1) Program not entered"
+		}
+	}	
+	
+	if $$$ISOK(strStatus) {
+		set idMO      = $$$INRECProductionOrder($get(^INREC(0,idRec,1)))
+		set fltActQty = $$$INMOMinimumQuantity($get(^INMO(0,idMO,1)))
+		
+		set fltTotalRec = $$GetTotalRec(idLine)+$$$INRECLineQuantity(pYFELD)
+		;if (fltTotalRec > fltActQty) {
+		if (fltTotalRec > fltActQty) && ( $$$INMOType(objProd)'=2)  { ; HEVA-1030
+			set strStatus = $$$MakeStatus("IN01254",fltTotalRec,fltActQty)
+		} ; "Total Quantity Received (%1) cannot be more than Original Required Quantity (%2)"
+	}
+	
+	if $$$ISERR(strStatus) {
+		set YRETVAL = strStatus
+	}
+	quit strStatus
+	
+	
+CanReceiveLine(pidReceipt,pidRECLine)
+	;-------------------------------------------------------------------------------
+	; Called From: IsFirmable^INMOReceipt
+	; 
+	; Inputs:
+	;	pidReceipt		Receipt ID
+	;	pidRECLine		Receipt Line ID
+	; 
+	; History:
+	; 10-Sep-2013	SCR		CORE-266: Pass in Location to ValidateItemAttributes
+	; 30-Apr-2010	PP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new fltSummaryQty,fltReceiveQty,idSummLine,objRECLine,objSummary,strStatus
+	new objHeader,idLoc
+
+	
+	set strStatus  = $$$OK
+	set objRECLine = $get(^INRECLine(YM,pidReceipt,pidRECLine,1))
+	set objHeader 	= $get(^INREC(YM,pidReceipt,1))
+	set idLoc		= $$$INRECLocation(objHeader)
+
+	set strStatus = $$ValidateItemAttributes^INItemPolicyUtils(pidRECLine,
+	                                         $$$INRECLineItem(objRECLine),
+	                                         $$$INRECLineQuantity(objRECLine),
+	                                         $$$INRECLineLotNumber(objRECLine),
+	                                         $$$INRECLineExpirationDate(objRECLine),
+	                                         $$$INRECLineBrand(objRECLine),
+	                                         $$$INRECLineOwner(objRECLine),
+	                                         $$$INRECLineProgram1(objRECLine),
+	                                         idLoc  )
+	
+	// Validate Quantities
+	if ($$$ISOK(strStatus)) {
+		if $$$INRECLineQuantity(objRECLine) = 0 {
+			set strStatus = $$$MakeStatus("alREC0005") ; "Unable to receive zero quantities"
+				
+		} elseif $$$INRECLineQuantity(objRECLine) < 0 {
+			set strStatus = $$$MakeStatus("alREC0007",pidRECLine)
+		} ; "Errors exist on lines: %1"
+	}
+	quit strStatus
+	
+	
+OnBlurCost(pidRec, &pobjRec)
+	;-------------------------------------------------------------------------------
+	; Called From: OnBlur of the Unit Cost field on INMORecLine
+	; 
+	; Inputs:
+	;	pidRec		Receipt ID
+	;	pobjRec		Receipt Line Details
+	; 
+	; History:
+	; 04-May-2010	PP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	set $$$INRECLineTotal(pobjRec) = $$$FCMult($$$INRECLineEach(pobjRec),$$$INRECLineQuantity(pobjRec))
+	
+	quit
+	
+	
+OnBeforeDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; This routine makes sure you cant delete the lines created by Sourcing
+	; CAN delete copied lines.
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Aug-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	if pYKEY '[ "." {		
+		set Q = $$$QDontDelete_$$$Text("IN00464")	// "Cannot delete a system generated line"
+	}
+	quit
+	
+	
+OnBeforeCopy(pidMORecLine,&pobjMORecLine)
+	;-------------------------------------------------------------------------------
+	; When a New lined is added through Copy remove some properties already set.
+	;
+	; Params:
+	; pidMORecLine -  Rec MO Line Id
+	; pobjMORecLine - Rec MO Line record
+	;
+	; ByRefs: pobjMORecLine
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 13-Aug-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	set $$$INRECLineQuantity(pobjMORecLine)      = ""
+	set $$$INRECLineStockLocation(pobjMORecLine) = ""
+	quit
+	
+	
+GetTotalRec(pidLn)
+	;-------------------------------------------------------------------------------
+	; Get the Sum of all Received quantity for a Line
+	; 
+	; Called By : OnBeforeFormat, OnBeforeSave
+	; ByRef :
+	;
+	; Returns : 
+	;
+	; History :
+	; 16-Aug-2010	GRF		SR16573: Correction to Edit Grid variable use & prefix
+	; 13-Aug-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new fltQtyRec,idDataLine,idGridRow,objRecLine
+	
+	set fltQtyRec = 0
+	set idDataLine = ""
+	for {
+		set idDataLine = $order($$$WWWDATEN("REFERENCEROW",idDataLine))
+		quit:idDataLine=""
+		continue:(idDataLine=pidLn)                       //Skip current line
+		continue:(idDataLine\1)'=(pidLn\1)
+		
+		set idGridRow = $get($$$WWWDATEN("REFERENCEROW",idDataLine,1))
+		continue:($get($$$WWWDATEN("KILLEDRECORD",idGridRow))=$$$YES)
+		
+		set objRecLine = $$GetYFELD^COMGridEdit31G(YFORM,idGridRow)
+		set fltQtyRec  = fltQtyRec + $$$INRECLineQuantity(objRecLine)
+	}
+	quit fltQtyRec
+	
+	/*
+	new fltQtyRec,idRecLine,idLn,strRecLine
+	
+	set fltQtyRec = 0
+	set idRecLine = ""
+	
+	for {
+		set idRecLine = $order($$$WWWDATEN("REFERENCEROW",idRecLine))
+		quit:(idRecLine = "")
+		
+		set idLn = $translate(idRecLine,"x",".")  // FIXME : check standard grid variable names - bottom of routine 
+		continue:(idLn=pidLn)                       //Skip current line
+		continue:(idLn\1)'=(pidLn\1)
+		continue:($get($$$WWWDATEN("KILLEDRECORD",$get($$$WWWDATEN("REFERENCEROW",idRecLine,1))))=1)
+		
+		set strRecLine = $$$GRIDGetYFELD(idRecLine)
+		set fltQtyRec = fltQtyRec + $$$INRECLineQuantity(strRecLine)
+	}
+	
+	quit fltQtyRec
+	*/
+
+]]></Routine>
+</Export>

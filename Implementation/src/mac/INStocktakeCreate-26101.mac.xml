@@ -1,0 +1,359 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INStocktakeCreate" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INStocktakeCreate
+#include COMSYS
+#include INConst
+#include %occInclude
+		
+#define LogItem(%L,%S,%T,%E)	if %L'="" if %T'=$h do AddMessage^COMLog(%L,$$$Text(%S),.%E) set %T=$h
+#define LogMessage(%L,%S)		if %L'="" do AddMessage^COMLog(%L,$$$Text(%S))
+	; NOTE : LogItem can only log one message per second - this needs to be reset
+	;        for each message type.
+	;        %E ensures particular record is over-written except when refreshed by
+	;        newing the variable so only notes intermittent progress rather than
+	;        recording thousands of entries.
+	
+	;---------------------------------------
+	;   SET ^INWEINVTEMP(YUSER,ART,1) = ""      Not required now - Item with SOH so don't reload from history
+	;   SET ^WWWSOR(YUSER,"YSN",SN)   = ""		Not required now - StoreSerialNumbers
+	;   set @("^WWWSOR($job,pidLocn,"_$$^WWWKEYBUILD(pstrKeys)_",pidBundle,idType)") = pobjDetails
+	;   		Replace with
+	;	set @("^CacheTempStocktake($znspace,pidStocktake,idLocn,"_$$^WWWKEYBUILD(strSortKey)_",pidBundle)") = objSTLine
+	;---------------------------------------
+	
+	;---------------------------------------
+    ;	YBEST : selection Code - *** not currently used ***
+    ;         0 = Only Items On Stock                         ; Initial Count from INWE with QOH
+	;         1 = All Items                          (ALLE)   ; Add other items
+	;         2 = Only With Changes Within one Year  (WEITER) ; Add stock with no QOH but with tx in last year
+	; 
+	; TODO : Possible enhancement to match prior code <GRF>
+	; See INWEINV :
+	;     May want to optionally execute code similar to WEITER^INWEINV if we wish
+	;     to include items without a current QOH but which have been used in the
+	;     last 12 months.
+	;     This used ^INWEINVTEMP to identify items that had already been included
+	;     in the stocktake list and that didn't need to be added again.
+	;---------------------------------------
+	
+TakeSnapshot(pidStocktake,penumSort,pidSession,pblnDisplaySOH=$$$NO,pblnSerialNo,pidLog="",pstrLocnList,pstrGroupList,pstrFromStore,pstrToStore,pidCountingList,pintDaysCount=0)
+	;-------------------------------------------------------------------------------
+    ;	BACKGROUND PROCESS called from CreateList^INWEINVP1
+    ;	
+    ;	Based on BundleStock rather than INWE
+    ;	
+    ; Inputs:
+    ;	pidStocktake	: Stocktake number
+    ;	penumSort		: Sort order for listing 
+    ;	pidSession		: Retain YUSER
+    ;	pblnDisplaySOH	: Is Actual Quantity to show a value or null (hidden count on report)
+    ;	pblnSerialNo	: $$$YES if serial numbers to be processed separately   CHECK?
+    ;	pidLog			: COMMsg message number
+    ;	pstrLocnList	: Restrict Stocktake to the locations in this list   "1;2;3"
+    ;	pstrGroup		: Restrict Stocktake to this ItemGroup               "A;B;C"
+    ;	pstrFromStore	: Range of Storages to be considered
+    ;	pstrToStore		:   ...
+    ; 	pidCountingList : SR17296
+    ;
+	; History:Added Count Message
+	; 08-Jul-2013	SCR		CORE-83: Check Locking , Set Error if any item is locked
+	; 06-Aug-2010	PPP		SR17296:2 Added pidStocktake as a parameter
+	; 28-May-2010	PPP		SR17296: Updated routine
+	;							1. Moved 'GetBundles' to GetAllItems^INStocktakeCreateUtil
+	;							2. Made 'GetBundles' Redundant
+	;							3. Include new parameter pidCountingList
+	;							4. Added Count Message - # on Stocktake Lines
+	; 02-Jul-2009	PPP		SR16510:Snapshot Timestamp to be set by the Create
+	; 19-Sep-2008	GRF		Created from START^INWEINVP1
+	;-------------------------------------------------------------------------------
+	new idUser,objStocktake,strStatus
+	new intCount
+	
+	do ^WWWVAR
+	
+	; Restore parameters passed from calling session
+	set YUSER  = pidSession
+	set idUser = $piece($get(^WWWUSER(0,YUSER,1)),Y,2)
+	set:idUser'="" YBED=idUser
+	set SPRACHE = $$^WWWLANGU(YBED)		;BR014913
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	set $ZTRAP="^WWWERROR"
+	LOCK +^INStocktake(pidStocktake):1 IF '$TEST QUIT
+	kill ^CacheTempStocktake($znspace,pidStocktake)
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	//SR17296:Moved
+	//do GetBundles(pstrGroupList,pstrLocnList,pstrFromStore,pstrToStore,pidLog,penumSort,pblnDisplaySOH)
+	//SR17296:2
+	set strStatus=$$GetAllItems^INStocktakeCreateUtil(pidStocktake,pstrGroupList,pstrLocnList,pstrFromStore,pstrToStore,pidLog,penumSort,pblnDisplaySOH,pidCountingList,pintDaysCount) ; CORE-83
+	;do GetAllItems^INStocktakeCreateUtil(pidStocktake,pstrGroupList,pstrLocnList,pstrFromStore,pstrToStore,pidLog,penumSort,pblnDisplaySOH,pidCountingList,pintDaysCount)
+	
+	;---------------------------------------
+	;  NOT REQUIRED since BundleStock is total on hand, not unreserved/unsourced like INWE.
+	;do CustomerOrders(pblnSerialNo)   ;PREPARE ORDERS / AUFBEREITEN AUFTRÄGE
+	;do Reserved()	                   ; reserved stock
+	;---------------------------------------
+		
+	set objStocktake = $get(^INWEINVP(0,pidStocktake,1))  			; CORE-83
+
+	if strStatus=$$$OK { ; CORE-83
+		$$$LogMessage(pidLog,"IN00453")                        			; "Generating Count List"
+
+		do MakeSnapList(pidStocktake,pidLog)
+	
+		;set objStocktake = $get(^INWEINVP(0,pidStocktake,1))  			; Header
+	 	set $$$INWEINVPStatus(objStocktake) 		= 2                	; "Count Open"
+		set $$$INWEINVPSystemDate(objStocktake)  	= $horolog			; SnapShot TimeStamp //SR16510
+		; CORE-83 vvv
+		set $$$INWEINVPStatusText(objStocktake)		= $$$Text("IN01424")  ;	OK
+	} else {
+		$$$LogMessage(pidLog,strStatus)                        			; "Generating Count List"
+		set $$$INWEINVPStatus(objStocktake) 		= 0  		
+		set $$$INWEINVPStatusText(objStocktake)		= $$$Text(strStatus)
+		set strLocnList  = $$$INWEINVPSiteLocation(objStocktake)
+		do UnlockSiteLocationList^INLocking(strLocnList,1,pidStocktake)
+
+
+	}
+	; CORE-83 ^^^
+	set strStatus = $$$Save("INWEINVP",pidStocktake,objStocktake,$$$YES)
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	kill ^CacheTempStocktake($znspace,pidStocktake)
+	LOCK -^INStocktake(pidStocktake)#"I"
+	;+++++++++++++++++++++++++++++++++++++++
+	//SR17296: Added Count Message
+	if $$$INWEINVPStatus(objStocktake) = 2 { ; CORE-83
+		set intCount = +$order(^INWEINV(YM,pidStocktake,""),-1)
+		$$$LogMessage(pidLog,$lb("IN01231",intCount,pidStocktake))	// Generated %1 Stocktake Lines for Stocktake %2                       ; "Stocktake Generated"
+		$$$LogMessage(pidLog,"IN00452")	                       		// "Stocktake Generated"
+	
+		; PJones 22-Oct-2007 BR014557 : 
+		; After we've created the snapshot we need to also create our first count.       ??? Why
+		do CreateFirstCount^INStocktakeCount(pidStocktake)
+	; CORE-83 vvv	
+	} else {
+		$$$LogMessage(pidLog,"IN01425")  ;Stocktake not Generated
+	}
+	; CORE-83 ^^^
+	quit
+	
+	
+	/*  OBSOLETE
+	
+GetBundles(pstrFilterGroup,pstrFilterLocn,pstrFilterFrom,pstrFilterTo,pidLog,penumSort,pblnDisplaySOH)
+	;-------------------------------------------------------------------------------
+	; Add Bundles to temporary list for creation of stocktake
+	; One line for each item/storage/bundle
+	; 
+	; History
+	; 28-May-2010	PPP		SR17296: Updated routine
+	;							1. Moved 'GetBundles' to GetAllItems^INStocktakeCreateUtil
+	;							2. Made 'GetBundles' Redundant
+	; 04-Nov-2009	GRF		SR16871: INAvgCost replaces INARTAVG
+	; 02-Jul-2009 	PPP 	SR16510: Updated routine to use INItemPolicy class
+	; 23-Oct-2008	GRF		SR15810: Change to dItem ItemGroupGet means default
+	; 							group processing no longer required.
+	; 01-Oct-2008	GRF		SR15810: Default Group if not defined
+	; 22-Sep-2008	GRF		SR15810: created
+	;-------------------------------------------------------------------------------
+	new curAvgCost,fltQty,idBundle,idGroup,idItem,idLocn,idLogEntry,idStore
+	new idxItemDesc,idxItemGroup,loopAttr,loopBundles,lstOnHand
+	new objAttr,objBundle,objBundleStock,objGroup,objItem,objResultSet,objSTLine
+	new sc,strSortKey,strStatus,tmeLastLog
+	new arrBundleAtt			//SR16510
+
+	set pstrFilterGroup = ";"_pstrFilterGroup_";"
+	set pstrFilterLocn  = ";"_pstrFilterLocn_";"
+	
+	set tmeLastLog   = ""
+	set idxItemGroup = " "
+	set idxItemDesc  = " "
+	
+	;set objSetup     = $get(^INVORG(0,0,1))              ; 23-Oct-2008
+	;set idDefGroup   = $$$INVORGDefaultItemGroup(objSetup)
+	
+	set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetBundleItems")
+	set sc = objResultSet.Execute()
+	
+	if sc {
+		while objResultSet.Next(.sc) {
+			set idItem = objResultSet.Data("Item")
+			set objItem = ##class(alINV.dItem).%OpenId(idItem)
+			
+			if objItem'=$$$NULLOREF {
+				$$$LogItem(pidLog,$listbuild("IN00448",idItem),tmeLastLog,idLogEntry)    ; ";Processing, Item %1"
+				
+			;	set curAvgCost = $$GetCostAsAtDate^INARTAVG(idItem)   ; SR16871 INAvgCost version moved down
+				set lstOnHand  = $$CreateBundleList(idItem,.sc)
+				
+				set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+				
+		;  Filter
+		; ------------------------------
+				set objGroup = objItem.ItemGroup
+				if objGroup = $$$NULLOREF {
+					set idGroup = ""    ;idDefGroup   ; 23-Oct-2008
+				} else {
+					set idGroup = objItem.ItemGroup.Name
+				}
+				continue:((pstrFilterGroup'=";;") && '$find(pstrFilterGroup,";"_idGroup_";"))
+				
+				set idxItemGroup = $$$Index(idGroup)
+				set idxItemDesc  = $$$Index(objItem.SearchName)
+				
+				for loopBundles = 1:1:lstOnHand.Count() {
+					set objBundleStock = lstOnHand.GetAt(loopBundles)
+					
+					set idLocn = objBundleStock.Storage.Location.Code
+					if pstrFilterLocn'=";;" continue:'$find(pstrFilterLocn,";"_idLocn_";")
+					
+					set idStore = objBundleStock.Storage.Code        ; V1 Storage ID
+					if pstrFilterFrom'="" continue:pstrFilterFrom]]idStore
+					if pstrFilterTo'=""   continue:idStore]]pstrFilterTo
+					
+			;		continue:$$$IsConsignment(objBundleStock)  ; TODO : Bundle equivalent of $$$INWEConsignment
+					
+		;  Use
+		; ------------------------------
+					set curAvgCost = $$GetCostForLocn^INAvgCost(idItem,idLocn)     ; SR16871
+		
+					set objBundle = objBundleStock.Bundle
+					set idBundle  = objBundle.%Id()
+					set fltQty    = objBundleStock.QtyOnHand
+					
+					set objSTLine = ""
+					set $$$INWEINVItemNumber(objSTLine)     = idItem
+					set $$$INWEINVLocation(objSTLine)       = idLocn
+					set $$$INWEINVStockLocation(objSTLine)  = idStore
+	                set $$$INWEINVTargetQuantity(objSTLine) = fltQty 
+					set $$$INWEINVBundleID(objSTLine)       = idBundle
+ 
+					if pblnDisplaySOH {
+						set $$$INWEINVActualQuantity(objSTLine) = fltQty
+					} else {
+						set $$$INWEINVActualQuantity(objSTLine) = ""
+					}
+					set $$$INWEINVUnitPrice(objSTLine)    = curAvgCost   ; D8
+					set $$$INWEINVAveragePrice(objSTLine) = curAvgCost   ; D80
+					set $$$INWEINVStockType(objSTLine)    = "A"          ; D92   Available   
+					
+					//SR16510
+					set sc = ##class(alSOH.iBundle).GetAttributesForBundle(idBundle, .arrBundleAtt)
+				
+					set $$$INWEINVLotNo(objSTLine) 		= $get(arrBundleAtt("Lot Number"))
+					set $$$INWEINVExpiryDate(objSTLine) = $get(arrBundleAtt("Use By Date"))
+					set $$$INWEINVBrand(objSTLine)      = $get(arrBundleAtt("Brand"))
+					set $$$INWEINVOwner(objSTLine)      = $get(arrBundleAtt("Owner"))
+					set $$$INWEINVProgram1(objSTLine)   = $get(arrBundleAtt("Program"))
+
+					set strSortKey = $$MakeKey(penumSort,idItem,idStore,idxItemGroup,idxItemDesc)
+					
+					if strSortKey'="" {
+						set @("^CacheTempStocktake($znspace,pidStocktake,idLocn,"_$$^WWWKEYBUILD(strSortKey)_",idBundle)") = objSTLine
+					}
+					
+					do objBundle.%Close()
+					do objBundleStock.%Close()
+				}
+				do lstOnHand.%Close()
+			}
+			do objItem.%Close()
+		}
+	}
+	quit
+	*/
+
+		
+CreateBundleList(pidItem,&sc)
+	;-------------------------------------------------------------------------------
+	; 
+	; Returns :
+	;	A list of BundleStock Objects for the specified item - sorted by Locn/Storage
+	; 
+	; History
+	; 22-Sep-2008	GRF		SR15810: created
+	;-------------------------------------------------------------------------------
+	new lstOnHand,objResultSet,objStock
+	
+	set lstOnHand = ##class(%Library.ListOfObjects).%New()	
+	
+	set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetAllBundles")
+	set sc = objResultSet.Execute(pidItem)
+	
+	if sc {
+		while objResultSet.Next(.sc) {
+			set objStock = ##class(alSOH.dBundleStock).%OpenId(objResultSet.Data("ID"))
+			do lstOnHand.Insert(objStock)
+		}
+	}
+	quit lstOnHand
+	
+	
+MakeKey(penumSort,pidItem,pidStore,pidxGroup,pidxDesc,pidPhysical="")  ;SR17541
+	;-------------------------------------------------------------------------------
+	; Generate key based on sorting type
+	;
+	; Params:
+	;	penumSort	: Sort Order
+	;	pidItem		: 
+	;	pidStore	: 
+	;	pidxGroup	: 
+	;	pidxDesc	: 
+	; 
+	; History
+	; 30-Sep-2010	shobby	SR17541: order by pidPhysical then pidStore
+	; 22-Sep-2008	GRF		SR15810: created - not basing on Customer Orders so
+	; 							don't need OrderNo/OrderLine
+	;-------------------------------------------------------------------------------
+	new strKey
+	
+	if pidPhysical="" set pidPhysical = pidStore ;SR17541
+	if penumSort = 1 {            set strKey = pidItem_","_pidPhysical_","_pidStore
+	} elseif penumSort = 2 {      set strKey = pidxGroup_","_pidItem_","_pidPhysical_","_pidStore
+	} elseif penumSort = 3 {      set strKey = pidPhysical_","_pidItem_","_pidStore    ; Note : "Pallets within Item" not "Items within Pallet"
+	} elseif penumSort = 4 {      set strKey = pidxDesc_","_pidItem_","_pidPhysical_","_pidStore
+	} else {                      set strKey = ""
+	}
+	
+	quit strKey
+	
+	
+MakeSnapList(pidStocktake,pidLog)
+	;-------------------------------------------------------------------------------
+	; Copy from the temporary SOR1 into the count list in INWEINV
+	; 
+	; Inputs:
+	; 	pidStocktake
+	;   pidLog
+	; 
+	; History: 
+	; 23-Sep-2008	GRF		SR15810: Created from COPY^INWEINVP1; AvgCost loaded in
+	; 							GetBundles; Fresh log stream
+	;-------------------------------------------------------------------------------
+	new idItem,idLogEntry,idSTLineNo,intBaseLength,objTempStore
+	new strBase,strGlobal,strStatus,tmeLastLog
+	
+	set tmeLastLog = ""
+	;kill ^INWEINV(0,pidStocktake)       ; Why is this necessary?
+	
+	set strGlobal     = "^CacheTempStocktake("""_$znspace_""","""_pidStocktake_""")"   ; Variable number of keys
+	set intBaseLength = $qlength(strGlobal)
+	set strBase       = $name(@strGlobal,intBaseLength)
+	
+	for {
+		set strGlobal = $query(@strGlobal)
+		quit:(strGlobal="")||($name(@strGlobal,intBaseLength)'=strBase)
+		
+		set objTempStore = @strGlobal
+		set idItem = $$$INWEINVItemNumber(objTempStore)
+		set strStatus = $$$Save("INWEINV",pidStocktake_","_$increment(idSTLineNo),objTempStore,$$$YES)
+		
+		$$$LogItem(pidLog,$listbuild("IN00448",idItem),tmeLastLog,idLogEntry)	; "Processing, Item %1"
+	}
+	quit
+	
+]]></Routine>
+</Export>

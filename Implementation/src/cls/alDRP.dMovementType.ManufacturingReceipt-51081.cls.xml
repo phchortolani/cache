@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alDRP.dMovementType.ManufacturingReceipt">
+<ClassType>serial</ClassType>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>alDRP.dMovementType</Super>
+
+<Property name="MovementTypeId">
+<Type>alSYS.dt.dtInteger</Type>
+<Final>1</Final>
+<InitialExpression>"36&quot;</InitialExpression>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="AL00237"/>
+</Property>
+
+
+<Method name="Validate">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; History
+	; 23-Jul-2009	PPP		SR16753: Created
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+	if pobjMove.Completed {
+		set strMessage = $$$Text("IN00711")      ; "This movement is already completed."
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="Confirm">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+#define enumAverageCost		9
+	;-------------------------------------------------------------------------------
+	;
+	; History
+	; 11-Aug-2010	GRF		SR16753/SR17387: Add Source Details
+	; 29-Apr-2010	PPP		SR16573/SR16753: Created
+	;-------------------------------------------------------------------------------
+	set sc     = $$$OK
+	set idItem = pobjMove.Item.ItemId
+	
+	set idReceipt   = pobjMove.Reference 
+	set idRecLine   = pobjMove.LineNumber
+	set idOrder     = pobjMove.OrderNumber  ; FIXME : not required? Finished Goods from INMO - no line no 
+	set idOrderLine = pobjMove.OrderLine
+	set idLocn      = pobjMove.ToLocn.Code
+	set idStore     = pobjMove.ToStorage.Code
+	set dteRecvd    = pobjMove.ReceiptDate
+	if dteRecvd = "" set dteRecvd = +$horolog
+
+	set idCostCentre = $$GetCostCentre^INCostCentre(idLocn)
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	LOCK +^alSOHProcessing(idItem):2 ; Use a timeout of 2 to help stop dead lock
+	if '$test {
+		set strMessage = $$$Text($listbuild("IN00853",idItem))
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+		; "Can not acquire a lock for Item: (%1) please try again "
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	} else {
+    
+	; Update Average Costs
+	;---------------------------------------
+	; NOTE : Receipt from Production is different from other transactions in that Tx Cost
+	;        should come from components rather than current average cost (or other
+	;        costing method as selected)
+		
+		set fltUnitCost   = pobjMove.UnitCost
+		set strReceiptRef = idOrder_","_idOrderLine_","_idLocn_","_idStore_","_dteRecvd_","_idReceipt_","_idRecLine_",M"
+		set curNewAVG     = $$UpdateCost^INAvgCost(idItem,idLocn,pobjMove.QtyReceived,fltUnitCost,strReceiptRef,idCostCentre)
+		
+		
+	; Manufacturing Receipt : Stock History & Period Balance
+	;---------------------------------------
+	//6 - Manufacturing Receipt
+		set objTransType   = ##class(alSOH.dTransactionType).%OpenId(6)
+		set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove,
+													   pobjMove.ToLocn,
+													   pobjMove.ToStorage,
+													   pobjMove.QtyReceived,
+													   fltUnitCost,
+													   objTransType,
+													   .sc)
+		if $$$ISOK(sc) set sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist)
+	
+	;+++++++++++++++++++++++++++++++++++++++ ; SR16871
+		LOCK -^alSOHProcessing(idItem)
+	;+++++++++++++++++++++++++++++++++++++++
+	}
+		
+	; Stock to Finance Interface            ; SR16880
+	;---------------------------------------
+	if $$$ISOK(sc) {
+		set objStockFin = ##class(alSFI.dStockFin).%New()
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "REC"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.ManufacturingReceipt"
+		set objStockFin.TxnInformation = "Make Receipt"
+		set objStockFin.Item           = pobjMove.Item
+		set objStockFin.Quantity       = pobjMove.QtyReceived
+		set objStockFin.TxnValue       = pobjMove.ExtendedCost  
+		set objStockFin.FromLocn       = pobjMove.ToLocn         ; FIXME : $$$NULLOREF? <GRF>
+		set objStockFin.FromStorage    = pobjMove.ToStorage      ; FIXME : $$$NULLOREF? <GRF>
+		set objStockFin.ToLocn         = pobjMove.ToLocn
+		set objStockFin.ToStorage      = pobjMove.ToStorage
+		
+		set objStockFin.OrderNo        = idOrder         ; FIXME : not required? base on INMO?
+		set objStockFin.OrderLine      = idOrderLine     ; FIXME : not required? Finished Goods from INMO - no line no 
+		
+		set objStockFin.SourceRec      = idReceipt
+		set objStockFin.SourceForm     = "INMOREC"
+		set objStockFin.SourceDetail   = "IN01243,"_idReceipt_","_idRecLine
+		                                 ; "Manufacture Receipt %1, Line %2"
+		
+		set sc = objStockFin.StockToFin()
+		
+	; Adjust Stock Values if cost centres differ - AFTER Post called so QOH updated in INStockVal
+	;---------------------------------------
+		if $$$ISOK(sc) {
+			set strStatus = $$AutoUpdate^INStockValCCAdj("Receipt",idReceipt_","_idRecLine,idItem,idCostCentre,curNewAVG)
+			if $$$ISERR(strStatus) set sc = $$$ERROR($$$GeneralError,"Error Updating Stock Values")
+		}
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		set YUSER = %("%KEY","YUSER") 
+		if YUSER="" set YUSER = " "
+		if $$$ISOK(sc) set ^CacheTemp(YUSER,"FIBURecord") = $$$YES
+	}
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="Default">
+<Type>%Library.CacheSerialState</Type>
+</Storage>
+</Class>
+</Export>

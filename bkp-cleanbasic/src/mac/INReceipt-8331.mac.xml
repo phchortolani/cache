@@ -1,0 +1,813 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReceipt" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReceipt
+	;+++++++++++++++++++++++++++++++++++++++
+	; see INRECDoco
+	;+++++++++++++++++++++++++++++++++++++++
+
+#include INConst
+#include COMConst
+#include %occInclude
+#include COMGridEdit31
+#include INSYS
+	
+#;define FORMFldINRECSummaryItem				6
+#;define FORMFldINRECSummarySuppItemCode		12
+#define FORMFldINRECSummaryUnitCost				14
+#define FOMRMFldINReceiptInvoiceTotal           19
+ 
+ 
+#define FORMFldINReceiptCalculatedTotal		30
+#;define GetClass(%1)	$select($$Editable^INREC(%1,$$$EnumINRECSupplierReceipt):"INWEAUFVOR",1:"INWEAUF")
+	
+#define FORMINReceiptSuppOrder(%obj) $piece(%obj,"~",7)
+	
+#define EnumTypeStandard	0
+#define EnumTypeBonus		2
+	
+#define IsItemLine   ((enumLineType=$$$EnumTypeStandard) || (enumLineType=$$$EnumTypeBonus))
+#define IsChargeLine ((enumLineType'="") && (enumLineType'=$$$EnumTypeStandard) && (enumLineType'=$$$EnumTypeBonus))
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReceipt("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+OnBeforeButtonLine(pidReceipt,pobjReceipt,pYSEITE)
+	;-------------------------------------------------------------------------------
+	; Set form to readonly if status not unprocessed
+	;
+	; Params:
+	;	pidReceipt	: ^INREC key  (YKEY from form INReceipt)
+	;	pobjReceipt	: ^INREC record - YFELD from form INReceipt
+	;	pYSEITE		: Tab number
+	; 
+	; Returns: Nothing
+	;
+	; History:
+	; 27-May-2009	DWR		SR16580: Problem arose when coming back from posting invoice:
+	; 							YPARA is set to the FINAPInv YKEY, which is preserved 
+	; 							even after clicking on [new button] added a function to clear
+	; 							it out of there is no key (new receipt)
+	; 26-Mar-2009	DWR		SR16363: keep the Invoice tab active if is has been posted 
+	; 							also disable the third tab if the record has not been posted
+	; 18-Mar-2009	DavidR	SR16363: added check to see if location is a storage location
+	; 							Remove the Save button if not authorised to modify
+	; 10-Mar-2009	HQN		SR16363: Default type to what was passed from menu, else
+	; 							set to Supplier Receipt
+	; 27-Feb-2009	HQN		SR16363: Copied from INREC
+	;-------------------------------------------------------------------------------
+	new idLocn,objLocn
+	
+	$$$LogRx("")
+	$$$LogRx("-------------------------------------------------------------------------------")
+	$$$LogRx("")
+	$$$LogR("OnBeforeButtonLine",pidReceipt)
+	
+	
+	if $$$NoKey(pidReceipt) {
+		if $get(YPARA)'="" set YPARA= ""
+	}
+		
+	set idLocn = YLOCATION
+	; Default Type to Supplier if not set via YPARA
+	if $get(YPARA) = "" {
+		set VORG($$$FldINRECType) = 2
+	} else {
+		set VORG($$$FldINRECType) = $get(YPARA)
+	}
+	set objLocn = $get(^WWW0121(0,0,idLocn,1))
+	if $$$WWW0121StorageLocn(objLocn)'= $$$YES {
+		if '$find(";"_$$$WWW120DoNOTDisplayStandardButto(YVOR)_";",";"_3_";") {
+			set $$$WWW120DoNOTDisplayStandardButto(YVOR) = $$$WWW120DoNOTDisplayStandardButto(YVOR)_";3"
+		}
+		set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+	
+	} elseif '$$$NoKey(pidReceipt) {
+		if '$$IsEditable(pobjReceipt,$$$RECType) {  
+			set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+
+		
+		} else {
+			do InitOrders()
+		}
+	}
+	quit
+	
+	
+OnAfterButtonLine(pidReceipt,&pYSEITE)   //SR17802
+	quit
+	
+	
+OnAfterDataFields(pidReceipt,pobjReceipt)  
+	;-------------------------------------------------------------------------------
+	; Loads correct grid/tables depending on tab
+	; 
+	; Called by : INReceipt Form OnAfterDataFields Event
+	; 
+	; Inputs:
+	;	pidReceipt	: ^INREC key  (YKEY from form INReceipt)
+	;	pobjReceipt	: ^INREC record
+	; 
+	; History:
+	; 03-Nov-2010	GRF		SR17492: remove commented code from SR15753
+	; 15-Sep-2010	shobby	SR17543: HideShowColumns is now handled inside the grid.
+	; 09-Sep-2010	PPP		SR17492: Removed 12 (Supplier Item Code) from the hidden
+	;							list on Receipts Tab
+	; 20-Apr-2010	GRF		SR17177: kill CacheTempINRECSummary rather than calling
+	; 							update tag.
+	; 06-Apr-2010	GRF		SR17177 (SR15753.1): Removed calls to redundant code (OnBlur).
+	; 31-Mar-2010	GRF		SR17177: Clear CacheTempINRECSummary
+	; 10-Feb-2010	shobby	SR15753: Remove redundant code (use 'Field Is Inactive,
+	;							If Data Field' instead)
+	; 06-Aug-2009	DWR		SR16821: Hide new Flag (INWEMERKER) F34 in Invoice Tab
+	; 06-Aug-2009	GRF		SR16815: Hide F10 rather than F33 on Invoice Tab
+	; 05-Aug-2009	PPP		Add Unit Qty Rec (F33) to Invoice Tab
+	; 17-Jun-2009	GRF		SR16598: use IsItemLine macro
+	; 26-May-2009	DWR		SR16580: modified set $$$COMGridEditParameterEnabled
+	; 							to correctly use the header Record, or check for
+	; 							firmed if on tab 1 and unprocessed for enabling 
+	; 							of that grid.
+	; 07-Apr-2009	DWR		SR16363: Disable grids according to the firmed status of 
+	; 							INREC. Disable Supplier order if has been firmed, 
+	; 							to not allow entry of any mor lines
+	; 01-Apr-2009	GRF		SR16363: Build strAffectedFldList from all fields 
+	; 31-Mar-2009	DWR		SR16363: Check for a "." in the id line before creating
+	; 							an INRECLine			
+	; 30-Mar-2009	DWR		SR16363: Add Line Type column to tab 3 (invoice)
+	; 13-Mar-2009	GRF		SR16363: simplify FldList string - single set of quotes
+	; 11-Mar-2009	HQN		SR16363: Made Supplier ReadOnly if pidReceipt valid
+	; 05-Mar-2009	HQN		SR16363: Added Invoice tab
+	; 26-Feb-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new enumLineType,idForm,idSummary,objINRECSummary,objRECLine,objTest
+	new strAffectedFldList,YAUSWAHL
+	
+	$$$LogR("OnAfterDataFields",pidReceipt)
+	
+	if '$$$NoKey(pidReceipt) {
+
+	if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1))) ||
+		+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1))) ||
+		+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+		do PrintJS^VARINReceipt
+	}
+
+		//SR17802
+		;-----------------------------------
+		if (YSEITE = 4) {
+			; Receipts Scan Tab
+			;-----------------------------------
+			set idForm = "INRECScanLine"
+			set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+			set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 400
+			set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+			set $$$COMGridEditParameterContainer(YAUSWAHL)     = YFORM
+			set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR) '= $$$EnumReadOnly)
+			
+			if $$$COMGridEditParameterEnabled(YAUSWAHL) {
+				if $$$INRECFirmed(pobjReceipt) = $$$YES {
+					set $$$COMGridEditParameterEnabled(YAUSWAHL)   = $$$NO
+				}
+			}
+			;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^	
+			set $$$COMGridEditParameterHiddenColumns(YAUSWAHL)="8;9;10"
+			set ^CacheTemp(YUSER,"GridLine") = YPARA
+			$$$GRIDStart(idForm,pidReceipt)
+
+		; Receipts Tab
+		;-----------------------------------
+		} elseif (YSEITE = 1) {
+			set idForm = "INRECSummary"
+			set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+			set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 400
+			set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+			set $$$COMGridEditParameterContainer(YAUSWAHL)     = YFORM
+			set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR) '= $$$EnumReadOnly)
+			
+			if $$$COMGridEditParameterEnabled(YAUSWAHL) {
+				if $$$INRECFirmed(pobjReceipt) = $$$YES {
+					set $$$COMGridEditParameterEnabled(YAUSWAHL)   = $$$NO
+				}
+			}
+			
+			if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) { 
+				set $$$COMGridEditParameterHiddenColumns(YAUSWAHL)="3;5;7;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30;31;32;35;36;37;38;39;40;41"	;HEVA-919
+			}
+			else {
+				;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^	
+				set $$$COMGridEditParameterHiddenColumns(YAUSWAHL)="3;5;7;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30;31;32;39;40"
+			}
+			set ^CacheTemp(YUSER,"GridLine") = YPARA
+			$$$GRIDStart(idForm,pidReceipt)
+			
+		
+		; Inspection Tab
+		;-----------------------------------
+		} elseif (YSEITE = 2) {
+			set idForm = "INReceiptLine"
+			set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+			set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 400
+			set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+			set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+			set $$$COMGridEditParameterContainer(YAUSWAHL)     = YFORM
+			
+			if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1))) ||
+				+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1))) ||
+				+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+				if $$$COMGridEditParameterEnabled(YAUSWAHL) {
+					if $$$INRECFREE30(pobjReceipt) = $$$YES {
+						set $$$COMGridEditParameterEnabled(YAUSWAHL)   = $$$NO
+					}
+				}
+			}
+			
+			set ^CacheTemp(YUSER,"GridLine") = YPARA
+			
+			$$$GRIDStart(idForm,pidReceipt)
+			$$$StartScript()
+			
+			; FIXME : obsolete now Inspection tab only appears AFTER firming?  $translate logic error see SR16834 <GRF>
+			
+			; The following code copies *** WWWDATEN *** INRECSummary details over into
+			; INReceiptLine *** BEFORE *** a save has occurred so that lines on one tab
+			; are present on both.
+			set idSummary = ""
+			for {
+				set idSummary = $order(^WWWDATEN(0,+$horolog,YUSER,"INRECSummary","V","REFERENCEROW",idSummary))
+				quit:idSummary=""
+				continue:$$$KilledRecord($translate(idSummary,".","x"),"INRECSummary")
+				continue:$data($$$WWWDATEN("REFERENCEROW",idSummary))     ; FIXME : This is based on YFORM - may be looking at container - INReceipt ???
+				
+				set objINRECSummary = $$GetYFELDEX^COMGridEdit31G("INRECSummary",idSummary)
+				set enumLineType    = $$$INRECSummaryLineType(objINRECSummary)
+				set objTest = objINRECSummary
+				set $$$INRECSummaryLineType(objTest)     = ""
+				set $$$INRECSummaryExtendedCost(objTest) = ""
+				
+				if ($translate(objTest,Y,"")'="") && $$$IsItemLine {
+					set objRECLine = $$CreateINRECLine^INRECSummary(pidReceipt,idSummary,objINRECSummary)
+					do AddLine^COMGridEdit31Add(objRECLine,idSummary,"INReceiptLine",$$$NO)
+				}
+			}
+
+			$$$EndScript()
+			
+			
+		; Invoice Tab
+		;-----------------------------------
+		} elseif YSEITE = 3 {
+			set idForm = "INRECSummary"
+			set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+			set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 300
+			set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+			set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR) '= $$$EnumReadOnly)
+			set $$$COMGridEditParameterContainer(YAUSWAHL)     = YFORM
+			
+			set ^CacheTemp(YUSER,"GridLine") = YPARA
+			
+			set $$$COMGridEditParameterHiddenColumns(YAUSWAHL)="3;4;7;8;9;10;12;13;17;18;19;22;23;24;25;29;31;32;34"
+			$$$GRIDStart(idForm,pidReceipt)
+			kill ^CacheTempINRECSummary(YUSER,"Total")
+		}
+		elseif (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+			if YSEITE = 50 {
+				do AlertarNoRecebimento^VARCompraEntrega(pidReceipt,pobjReceipt)
+			}
+		}
+	}
+	quit
+	
+	
+OnAfterPrimaryKey(YKEY="",&YFELD="") 
+	;-------------------------------------------------------------------------------
+	; Build combo-box selections for 
+	; 
+	; 
+	; Params: Standard interface. Not required
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Aug-2009	DWR		SR16669: Peer: added "&" on YFELD variable 
+	; 29-Jun-2009	GRF		SR16669: Created
+	;-------------------------------------------------------------------------------
+	$$$LogR("OnAfterPrimaryKey",YKEY_":"_YUSER)
+	do CreateCombo($get(SPRACHE,"EN"))
+	quit
+	
+	
+CreateCombo(SPRACHE)
+	;-------------------------------------------------------------------------------
+	; Create a list of charges applicable for each line type
+	; 
+	; LineType : 0 Standard     Item		^WWW101(0,"INPURCHASEORDERLINE")
+	;            1 Discount   Charge
+	;            2 Bonus        Item
+	;            3 Tax        Charge
+	;            4 Freight    Charge
+	;            5 Surcharge  Charge
+	;            
+	; History:
+	; 30-Mar-2010	GRF		SR17244.1: Bonus lines have no charge so can't have
+	; 							in-line discounts
+	; 25-Mar-2010	GRF		SR17244: Duplicate Discount charges for item-based lines
+	; 							to allow in-line discounts as well as line-based and
+	; 							invoice-based charges.
+	; 29-Jun-2009	GRF		SR16669: Created
+	;-------------------------------------------------------------------------------
+	new enumType,idSuppDisc,idxLineType,objSuppDisc
+	
+	$$$LogR("CreateCombo",SPRACHE)
+	kill ^COMTempList(0,YUSER,"DISCTYPE")
+	
+	;^WWW101(0,"INSUPBUYINGDISCOUNTAMOUNTCALC")
+	;		0	Fixed Amount
+	;		1	Percentage of value
+	;		2	Rate per unit
+	
+	set enumType = ""
+	for {
+		set enumType = $order(^WWW101(0,"INPURCHASEORDERLINE",SPRACHE,enumType))
+		quit:enumType=""
+		continue:(enumType=0)||(enumType=2)      ; skip item-based line types
+		
+		set idxLineType = $$$Index(enumType)
+		set idSuppDisc = ""
+		for {
+			set idSuppDisc = $order(^INSUPBuyingDiscounts(0,1,idxLineType,idSuppDisc))
+			quit:idSuppDisc=""
+			
+			set objSuppDisc = $get(^INSUPBuyingDiscount(0,idSuppDisc,1))
+			set ^COMTempList(0,YUSER,"DISCTYPE",enumType,idSuppDisc,1) = $$$INSUPBuyingDiscountDescription(objSuppDisc)
+			
+			if enumType=1 {   ; SR17244
+				set ^COMTempList(0,YUSER,"DISCTYPE",$$$EnumTypeStandard,idSuppDisc,1) = $$$INSUPBuyingDiscountDescription(objSuppDisc)
+			}
+		}
+	}
+	
+	
+	; TODO : If it is possible to identify "L" and "I" based on whether this is a       ; SR17177 ?
+	;        line-based charge or an invoice-based one then could use something like:
+	;		
+	;		set objList = $$$INSUPBuyingDiscountDescription(objSuppDisc)
+	;		set ^COMTempList(0,YUSER,"DISCTYPE","L",enumType,idSuppDisc,1) = objList
+	;		if $$$INSUPBuyingDiscountAmountCalculation(objSuppDisc)=0 {             ; Fixed Amount
+	;			set ^COMTempList(0,YUSER,"DISCTYPE","I",enumType,idSuppDisc,1) = objList
+	;		}
+ 	;   ;   with the relation then being defined as
+ 	;   ;   	COMTempList
+ 	;   ;   	YUSER,"DISCTYPE",CHARGELINE,LINETYPE
+	;	;   CHARGELINE would be based on (idDataLine\1=idDataLine)    0:"L", 1:"I"    <GRF>
+ 	
+ 	; NOTE : If planning on extending discount types for invoice-based charges then this may not be needed.
+ 	
+	quit
+	
+	
+OnBeforeSave(pidReceipt,pobjReceipt)
+	;-------------------------------------------------------------------------------
+	; Saves Correct Grid depending on tab ; now saves both grids??
+	; 
+	; Called from INReceipt Form OnBeforeSave Event
+	; 
+	; ByRef:	Q
+	; 
+	; History:
+	; 04-Jul-2013	SCR		CORE-86: Reverse last Change
+	; 11-Jun-2013	SCR		CORE-86: Only check "INReceiptLine" when that grid is loaded
+	; 21-May-2012	PPP		SR18011:Check for Duplicate Supplier/Invoice No.
+	; 13-Nov-2011	shobby	SR17910: Validate grid even if unchanged.	
+	; 01-Dec-2009	DWR		SR17064: only save INReceiptLine if firmed
+	; 27-Mar-2009	DWR		SR16363: Save both grids
+	; 11-Mar-2009	HQN		SR16363: Only save active grid
+	; 26-Feb-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	$$$LogR("OnBeforeSave",pidReceipt)
+	
+	if ((+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+		set strStatus = $$OnBeforeSaveHook^VARINReceipt(pidReceipt)
+		if $$$ISERR(strStatus) {
+			$$$Alert(strStatus)
+			set Q=$$$QDontSave
+			quit
+		}
+	}
+	
+	if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1))))||
+		(+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1))))||
+		(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))){
+		if (pidReceipt '= ""){
+			set objRec = $get(^INREC(YM,pidReceipt,1))
+		
+			if ( ($$$INRECStatus(objRec) > 0) && (objRec '= "") ){
+				$$$Alert("Este registro j?? foi processado.")
+				set Q=$$$QDontSave
+				quit
+			}
+		}
+	}
+	
+	set Q = $$$QSave
+	
+	set strStatus = $$$GRIDSave(pidReceipt,"INRECSummary")
+	
+	if ($$$ISOK(strStatus)) && ($$$INRECFirmed(pobjReceipt)=$$$YES) {
+		set strStatus = $$$GRIDSave(pidReceipt,"INReceiptLine",$$$YES) ;SR17910
+	}
+	
+	/*if $$$ISOK(strStatus) {
+		set fltCalcCost=""
+		
+		set idLine = ""
+		for {
+			set idLine = $order(^INRECSummary(0,pidReceipt,idLine))
+			quit:idLine=""
+			
+			;continue:idLine'["."
+			set objSummary = $get(^INRECSummary(0,pidReceipt,idLine,1))
+			set fltCalcCost = fltCalcCost + $$$INRECSummaryCostAfterDiscount(objSummary) 
+		}
+		do UpdateHeaderField^COMGridEdit31G("M30",fltCalcCost)
+	}*/
+	
+	//SR18011:Check for Duplicate Supplier/Invoice No.
+	if $$$ISOK(strStatus) {
+		set strStatus = $$CheckInvoiceNum^INRECBPost(pidReceipt)
+	}
+
+ 	//SR17802
+	if ($$$ISOK(strStatus)) && ($$$INRECStatus(pobjReceipt)=0) {
+		set strStatus = $$$GRIDSave(pidReceipt,"INRECScanLine")
+	}
+
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError(strStatus)
+		set Q = $$$QDontSave		
+	}
+	quit
+	
+	
+NewOnBeforeSave(pidReceipt,pobjReceipt) ; UNDER DEVELOPMENT - If implemented, rename
+	; NewCalculateSummTotal^INRECSummary her and in INRECSummary.
+	;-------------------------------------------------------------------------------
+	; Saves Correct Grid depending on tab ; now saves both grids??
+	; 
+	; Called from INReceipt Form OnBeforeSave Event
+	; 
+	; ByRef:	Q
+	; 
+	; History:
+	; 15-Sep-2011	GRF		SR17547: Revision from Guilherme 
+	; 01-Dec-2009	DWR		SR17064: only save INReceiptLine if firmed
+	; 27-Mar-2009	DWR		SR16363: Save both grids
+	; 11-Mar-2009	HQN		SR16363: Only save active grid
+	; 26-Feb-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,fltSummaryTotal,idGridRow,idSummary,objSummary,strStatus
+	new idLine
+	
+	$$$LogR("OnBeforeSave",pidReceipt)
+	
+	set Q = $$$QSave
+	
+	set strStatus = $$$GRIDSave(pidReceipt,"INRECSummary")
+
+	; vvvvv SR17547
+	// Version consistent with normal for loop operation - better maintainability
+	if $$$ISOK(strStatus){
+		set fltSummaryTotal = ""
+		set idGridRow = 0
+		
+		set idLine = ""
+		for {
+			set idLine = $order(^INRECSummary(0,pidReceipt,idLine))
+			quit:idLine=""
+			
+			set objSummary = $get(^INRECSummary(0,pidReceipt,idLine,1))
+			do OnBlur^INRECSummary(YKEY,.objSummary,$increment(idGridRow),$$$FORMFldINRECSummaryUnitCost)
+			set strStatus = $$$Save("INRECSummary",pidReceipt_$$$COMMA_idLine,objSummary,$$$YES)
+			quit:$$$ISERR(strStatus)
+			
+			set arrGrid(pidReceipt,idLine) = objSummary
+		}
+		if $$$ISOK(strStatus){  ; This includes update of INRECSummaryTotal - check where
+			do NewCalculateSummTotal^INRECSummary(pidReceipt,"","",.arrGrid,.fltSummaryTotal)
+			set $$$INRECSummaryTotal(pobjReceipt) = fltSummaryTotal
+		}
+	}
+	
+	/*
+	// Version proposed by Guilherme (with modified variables)
+	if $$$ISOK(strStatus) {
+		set fltSummaryTotal = ""
+		set idSummary = $order(^INRECSummary(0,pidReceipt,""))
+		set idGridRow = 1
+		while ($length(idSummary)>0) && ($$$ISOK(strStatus)) {
+			set objSummary = ^INRECSummary(0,pidReceipt,idSummary,1)
+			do OnBlur^INRECSummary(YKEY,.objSummary,idGridRow,$$$FORMFldINRECSummaryUnitCost)
+			set strStatus = $$$Save("INRECSummary",pidReceipt_$$$COMMA_idSummary,objSummary,$$$YES)
+			if $$$ISOK(strStatus) {
+				set arrGrid(pidReceipt,idSummary) = objSummary
+				set idSummary = $order(^INRECSummary(0,pidReceipt,idSummary))
+				set idGridRow = idGridRow+1
+			}
+		}
+		if $$$ISOK(strStatus) {  ; This includes update of INRECSummaryTotal - check where
+			do NewCalculateSummTotal^INRECSummary(pidReceipt,"","",.arrGrid,.fltSummaryTotal)
+			set $$$INRECSummaryTotal(pobjReceipt) = fltSummaryTotal
+		}
+	}
+	*/
+	; ^^^^^ SR17547
+	
+	if ($$$ISOK(strStatus)) && ($$$INRECFirmed(pobjReceipt)=$$$YES) {
+		set strStatus = $$$GRIDSave(pidReceipt,"INReceiptLine")
+	}
+	
+ 	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError(strStatus)
+		set Q = $$$QDontSave		
+	}
+	quit
+	
+	
+IsEditable(pobjReceipt,penumType="")
+	;-------------------------------------------------------------------------------
+	; Params:
+	;
+	; ByRef :
+	;	YLOCATION
+	;	YRETVAL		(status returned)
+	;
+	; Returns:	Status
+	; 
+	; History:
+	; 27-Feb-2009	HQN		SR16363: Copied from INREC
+	;-------------------------------------------------------------------------------
+    new strStatus
+    
+	$$$LogR("IsEditable","")
+	
+    set strStatus = $$$OK 
+    
+	if $$$INRECStatus(pobjReceipt) '= $$$EnumINSTATUSUnprocessed {
+		set strStatus 	= $$$MakeStatus("IN00377")  ; "Record already processed"
+		
+	} elseif (penumType'="") && ($$$INRECType(pobjReceipt)'=penumType) {
+		set strStatus 	= $$$MakeStatus("IN00407","("_penumType_") "_($$$AppEnum("INREC",penumType)))
+		; "Wrong record type, expecting %1"
+		
+	} elseif ($$$INRECLocation(pobjReceipt)'=YLOCATION) && $$LocationRestricted^INRECTFR() {
+		set strStatus = $$$MakeStatus("IN00678")
+		; "You must be logged in to the receiving location to process this receipt"
+	
+	} elseif $$$MultiPass(YLOCATION) {
+		set strStatus = $$$MakeStatus("IN01060",YLOCATION)
+	}   ; "Location %1 parameter, "Goods Receipt" set to Multi Pass" 
+	
+	set:$$$ISERR(strStatus) YRETVAL = strStatus
+	quit strStatus
+	
+	
+InitOrders()
+	;-------------------------------------------------------------------------------
+	; Changes required pending changeover to INPO
+	; (OrderLineReceipts^INRECLine returns Quantity in Inventory Units)
+	;
+	; 06-Mar-2009	GRF		SR16363: Calculate Current Receipted Qty
+	;-------------------------------------------------------------------------------
+	new idOrder,idOrderLine,objOrderLine
+	
+	$$$LogR("InitOrders","")
+	
+	kill ^COMTempList(0,YUSER,"OpenOrders")
+	
+	set idOrder = ""
+	for {
+		set idOrder = $order(^INAUF1(0,idOrder))
+		quit:idOrder=""
+		
+		set idOrderLine = ""
+		for {
+			set idOrderLine = $order(^INAUFP(0,idOrder,idOrderLine))
+			quit:idOrderLine=""
+			
+			set objOrderLine = $get(^INAUFP(0,idOrder,idOrderLine,1))
+			continue:$$OrderLineReceipts^INRECLine(idOrder,idOrderLine)>=$$$INAUFPQuantity(objOrderLine)
+			
+			set ^COMTempList(0,YUSER,"OpenOrders",idOrder,1) = idOrder_Y_idOrderLine
+		}
+	}
+	quit
+	
+	
+HideTab1(pidReceipt, pobjReceipt)
+	;-------------------------------------------------------------------------------
+	;  $$HideTab1^INReceipt($get(YFELD)) 
+	;   
+	; History:
+	; 23-Jun-2011	PPP		SR17802: Created
+	;-------------------------------------------------------------------------------
+	new blnHide
+	
+	set blnHide = 0
+	if '$$$NoKey(pidReceipt) {
+		if $$$INRECFirmed(pobjReceipt) '= $$$YES {
+			if $$IsScanReq^WWW120Scan("INRECScanLine") {
+				set blnHide = 1
+			}
+		}
+	}
+	quit blnHide
+	
+	
+HideTab4(pidReceipt, pobjReceipt)
+	;-------------------------------------------------------------------------------
+	;  $$HideTab1^INReceipt($get(YFELD)) 
+	;   
+	; History:
+	; 23-Jun-2011	PPP		SR17802: Created
+	;-------------------------------------------------------------------------------
+	new blnHide
+	
+	set blnHide = 0
+	if '$$IsScanReq^WWW120Scan("INRECScanLine") {
+		set blnHide = 1
+	}
+	quit blnHide
+	
+	
+HideTab2(pobjReceipt)
+	;-------------------------------------------------------------------------------
+	;  $$HideTab2^INReceipt($get(YFELD)) 
+	;   
+	; History:
+	; 07-Apr-2009	GRF		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new blnHide
+	
+	set blnHide = ($$$INRECFirmed(pobjReceipt)'=$$$YES)
+	quit blnHide
+	
+	
+ClearGrid(pidForm)
+	;-------------------------------------------------------------------------------
+	; WIP: Clears grid including default line
+	; 
+	; History:
+	; 05-Nov-2010	GRF		-: Use dteToday for efficiency
+	; 05-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new dteToday,idField
+	
+	$$$LogR("ClearGrid",pidForm)
+	
+	set dteToday = +$horolog
+	
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","DISPLAYED")
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","DISPLAYLIST")
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","FOCUSFIELD")
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","KILLEDRECORD")
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","LASTADDED")
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","REFERENCEROW")
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","REFERENCEVALUE")
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","REFERENCESELECT")
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","STATUS")
+	kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","YFELD")
+	
+	set idField=""
+	for {
+		set idField = $order(^WWWDATEN(0,dteToday,YUSER,pidForm,"V",idField))
+		quit:idField=""
+		continue:'(idField?1"Y"1.N1"_"1.N)
+		
+		kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V",idField)
+	}
+	set idField = ""
+	for {
+		set idField = $order(^WWWDATEN(0,dteToday,YUSER,pidForm,"V","REFERENCEKEY",idField))
+		quit:idField=""
+		
+		kill ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","REFERENCEKEY",idField)
+	}
+	
+	set ^WWWDATEN(0,dteToday,YUSER,pidForm,"V","ROWCOUNT") = 0
+	quit
+	
+	
+CanLoadOrder(pYFELD)   ; Not used?
+	;-------------------------------------------------------------------------------
+	;
+	;
+	;-------------------------------------------------------------------------------
+	new idOrderSup,strStatus
+	
+	set strStatus = $$$OK
+	
+	set idOrderSup = $$$INRECSupplier($get(^WWWDATEN(0,+$horolog,YUSER,"INReceipt","D",1)))
+	
+	if $$$INRECSupplier(pYFELD)'= idOrderSup {
+		set strStatus = $$$MakeStatus("Bad Order")
+	}
+	
+	quit strStatus
+	
+	
+TotalsEqual(pYFELD)
+	quit (+$$$INRECSummaryTotal(pYFELD)=+$$$INRECInvoiceTotal(pYFELD))
+	
+	
+GetDiscount(pYFELD)
+	new fltDiscount
+	
+	set fltDiscount = ($$$INRECDiscountPercent(pYFELD)/100)*($$$INRECSummaryTotal(pYFELD))
+	if +fltDiscount=0 set fltDiscount = ""
+	quit fltDiscount
+	
+	
+OnBlur(pidField,&pobjRecord="")     ; DEPRECATED - see immediate quit ; SR15753
+	; FIXME : Still present on INReceipt form for fields 4, 17, 19, 30, and 32
+	quit
+
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	;                          DEPRECATED - CALL DIRECTLY
+	; History:
+	; 31-Jul-2009	GRF		SR16602: Split "Post Receipt" tags to INReceiptButtonP
+	; 03-Jul-2009	GRF		SR16649: Split to INReceiptButton
+	;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+CanSearchOrders(pidReceipt,pobjReceipt)          ; Button 1, 2
+	quit $$CanSearchOrders^INReceiptButton($get(pidReceipt),$get(pobjReceipt))
+	
+ListOrders()                                     ; Button 1
+	do ListOrders^INReceiptButton()
+	quit
+	
+SelectOrder()                                    ; Button 2
+	do SelectOrder^INReceiptButton()
+	quit
+	
+IsReceivable(pidReceipt,pobjReceipt="")          ; Button 3
+	quit $$IsReceivable^INReceiptButtonP($get(pidReceipt),$get(pobjReceipt))
+	
+Post(pidReceipt)  ;,pobjReceipt)                 ; Button 3
+	quit $$Post^INReceiptButtonP($get(pidReceipt))    ;,$get(pobjReceipt))
+		
+PostTxn(pidReceipt,pobjReceipt="")               ; 
+	quit $$PostTxn^INReceiptButtonP($get(pidReceipt),$get(pobjReceipt))
+	
+IsFirmable(pidReceipt,pobjReceipt="")            ; Button 4
+	quit $$IsFirmable^INReceiptButton($get(pidReceipt),$get(pobjReceipt))
+	
+FirmReceipt(pidReceipt)                          ; Button 4
+	quit $$FirmReceipt^INReceiptButton($get(pidReceipt))
+	
+CanUnFirm(pidReceipt,pobjReceipt="")             ; Button 5
+	quit $$CanUnFirm^INReceiptButton($get(pidReceipt),$get(pobjReceipt))
+	
+ReverseFirm(pidReceipt)                          ; Button 5
+	do ReverseFirm^INReceiptButton($get(pidReceipt))
+	quit
+	
+CheckOrderNo(pidOrder,pidReceiptNo)              ; 
+	do CheckOrderNo^INReceiptButton($get(pidOrder),$get(pidReceiptNo))
+	quit
+	
+CalculateCostIncSC(pidReceipt,&parrLineIncSC)    ; 
+	do CalculateCostIncSC^INReceiptButtonP($get(pidReceipt),.parrLineIncSC)
+	quit
+	
+ListSuppliers()                                  ; Not used?
+	do ListSuppliers^INReceiptButton()
+	quit
+	
+HideTab3(pidReceipt)
+	;-------------------------------------------------------------------------------
+	;  $$HideTab3^INReceipt(YKEY) 
+	;   
+	; History:
+	; 20-Jan-2011	Petik		Created
+	;-------------------------------------------------------------------------------
+	
+	new blnHide
+	
+	set blnHide = $$$NO
+
+	if $$$NoKey(pidReceipt) quit blnHide
+	
+	if ((+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) 
+		&& '(+$$$WWWClientParamCoreChangesTCI($get(^WWWClientParam(YM,YM,1))))){
+		set blnHide = $$EsconderAbaNotaFiscal^VARINReceipt(pidReceipt)			
+	}
+
+	quit blnHide
+	
+]]></Routine>
+</Export>

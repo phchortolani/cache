@@ -1,0 +1,1108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMDistOut6" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMDistOut6
+#include %occInclude
+#include %occErrors 
+#include COMSYS
+#include COMConst
+#include WWWConst
+	;-------------------------------------------------------------------------------
+	; COMDistOut6 has been created to fulfil SR14015 where machine names and namespaces
+	; are no longer being hardcoded in this routine.
+	; 
+	; History:
+	; 
+	; 04-May-2006	RPW			SR14354: Rewrote to be horizontal
+	;-------------------------------------------------------------------------------
+ 
+ 
+AutoBuild(pstrVersion,pstrCacheVersion,pidLog)
+    ;/*------------------------------------------------------------------------------
+    ; Prepare the log and data for the automatic upgrade
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 11-Mar-2009	PPP			SR: Send an Email on Build completion
+    ; 29-Mar-2006	SC			SR13942: Comment out environment setup. Done on
+    ; 								call(JobWrapper).
+    ; 23-Mar-2006	RPW			SR14354: Do the PreBuild automatically
+    ; 09-Jan-2005	RPW			SR13942: Get and store the YBED, do WWWVAR then
+    ; 								restore the stored YBED.
+    ; 19-Dec-2005	RPW			SR13942: If Y is defined, do not do WWWVAR
+    ; 14-Dec-2005	grf			SR13942 : block comments
+    ; 15-Jul-2005	RobertW		SR12981: Store the log id into CacheTempLog, so the 
+    ; 								error handler can code check
+    ; 03-Jul-2005	RobertW		Modified call to get the status
+    ; 23-Jun-2005	RobertW		Created SR12022,12280
+    ;-----------------------------------------------------------------------------*/
+	new strStatus,strUser
+	new strStart
+	new arrDisp
+	new strEmail
+	new strText
+	
+	set $ztrap="AutoBuildError"
+	
+	set strUser=YBED
+	do ^WWWVAR
+	set YBED=strUser
+	set strStart = $zdt($horolog,3)
+	
+	set ^CacheTempLog($job)=pidLog
+	do AddMessage^COMLog(pidLog,"Starting Version: "_pstrVersion_" Job Number: "_$job)
+	//do PreBuild(pidLog) // SR14354
+	// SR14354: Add the cache version number
+	set strStatus=$$DoBuild(pstrVersion,pstrCacheVersion,$$$YES,$$$YES,$$$NO,pidLog)
+	kill ^CacheTempLog($job)
+ 
+	// vvvvvv PP
+	set strEmail = $$$WWW012EMailForHelp($get(^WWW012(0,YM,1)))
+	set arrDisp(1)="Build Start time : "_$get(strStart)
+	set arrDisp(2)="Build Completed time : "_$zdt($horolog,3)
+	set arrDisp(3)="Build Status : "_$get(strStatus)
+	set strText = $select(strStatus=$$$OK:"OK ",1:"*ERROR* ")
+	do SendEmail^COMUtilMail(strEmail,"DEV",strText_"Nightly DEV Build "_pstrVersion_" for "_$zdt(+$h,3),.arrDisp)
+	// ^^^^^^
+	quit
+	
+AutoBuildError
+	;-------------------------------------------------------------------------------
+	;    pidLog is retrieved from above, otherwise it is zero.
+	;-------------------------------------------------------------------------------
+	set $ztrap=""
+	do AddMessage^COMLog($get(^CacheTempLog($job)),$zcvt($zerror,"o","HTML"))
+	quit
+ 
+DoBuild(pstrVersion,pstrCacheVersion,pblnCreateHelpText=$$$YES,pblnReleaseCandidate=$$$YES,pblnJustCreateHelpText=$$$NO,pidLog=0)
+	;-------------------------------------------------------------------------------
+    ; Get the list of modules that are in the build and the orders they are to be built.
+    ; Then call build.
+    ;
+    ; Returns: Status of the build
+    ;
+    ; History:
+    ; 07-Jan-2009	GRF		SR16273: Refactor to include all modules in
+    ; 							COMApplicationList (will remove duplications later);
+    ; 							don't reprocess pstrVersion
+	; 23-Mar-2006	RPW		SR14354: Added cache version number
+    ; 23-Jun-2005	RPW		Created SR12022,12280
+	;-------------------------------------------------------------------------------
+	new arrModule,blnSale,idxBuildOrder,application,strModule
+	
+	kill ^YFORMDOING
+	kill ^YFORMS
+	if $get(Y)="" do ^WWWVAR
+	
+	kill arrModule
+	set blnSale=$$$NO
+	
+	set idxBuildOrder=""
+	for {
+		set idxBuildOrder=$order(^COMApplicationLists(YM,1,1,idxBuildOrder))
+		quit:idxBuildOrder=""
+		continue:idxBuildOrder=" "
+		
+		set application=""
+		for {
+			set application=$order(^COMApplicationLists(YM,1,1,idxBuildOrder,application))
+			quit:application=""
+			
+			set strModule=$$$COMApplicationListModule1($get(^COMApplicationList(YM,application,1)))
+			if strModule="SAL" set blnSale=$$$YES
+			set arrModule(idxBuildOrder,application) = strModule	       ; SR16273
+		}
+	}
+	
+	quit $$Build(.arrModule,pblnCreateHelpText,pblnReleaseCandidate,blnSale,pblnJustCreateHelpText,pstrVersion,pstrCacheVersion,pidLog)
+	
+	
+Build(parrModules,pblnCreateHelpText=$$$YES,pblnReleaseCandidate=$$$YES,pblnSale=$$$NO,pblnJustCreateHelpText=$$$NO,pstrVersion,pstrCacheVersion,pidLog=0)
+	;-------------------------------------------------------------------------------
+    ; Wrapper for Creating builds:
+    ;  - Confirms check lists
+    ;  - Compiles Classes
+    ;  - Generates pictures and places them in the Modules\Forms directory
+    ;    NOTE : This involves executing the form with default keys (1,1,1,...)
+    ;           If there are problems generating the forms, error messages will
+    ;           be displayed.  Those forms should be repaired or removed.
+    ;  - Creates build
+    ;  - Creates Zip
+    ;  - Creates Exe
+    ;  - Moves Exe the the Webserver.
+    ;  - Makes beeps when user action required and finished. 
+    ;
+    ; Note : also has a bit of file checking.
+    ; 
+    ; Returns:Status (successful or not) 
+ 	; 
+	; History:
+	; 01-Jun-2011	shobby	SR17720: If IsFastBuild export the CACHE.DAT
+	; 12-Jul-2010	PPP		SR17423: Create an file with the Current Build Details (NextBuild.txt)
+	; 01-Jun-2010	PPP		SR17344: Added Prerequisite Build Checks funtionality
+	;								 Dataset is PREFORMDAT.TXT
+	;								 Data will be set by $$CreatePreBuildFile^COMPreUpgradeOut
+	; 23-Feb-2010	shobby	SR17180: Some unicode issues.
+    ; 07-Jan-2009	GRF		SR16273: Refactor to include all modules in
+    ; 							COMApplicationList (will remove duplications later);
+    ; 							don't reprocess pstrVersion; simplify strStatus checks
+  	; 06-Jan-2009	GRF		SR16273: Don't pass idEntry - was causing earlier
+  	; 							messages to be overwritten
+	; 23-Dec-2008	GRF		SR15868/16253: idConfig may not be defined - error exit
+	; 22-Jan-2008	GRF		SR15623: apply redirection
+	; 15-Nov-2007	shobby	SRBR014797: Change rekey global to ^COMBuildRekey.
+	; 							Refer to SR if this seems stupid.
+    ; 15-Oct-2007	GRF		Standard Error Prefixes
+	; 20-Feb-2007	RPW		SR15444: Get the drives for Backup from
+	; 							^SysSetup("Backup","CopyTo",strDrive)
+	; 14-Nov-2006	JW		SR14550: Do not create language texts; may not be in DEV
+	; 04-May-2006	RPW		SR14354: Do not do the images at all.
+	; 23-Mar-2006	RPW		SR14354: Cleaned out old code. Added version check file.
+	; 21-Feb-2006	FrankF	SR14323: Option to check if the images should be created
+	; 							or not.
+	; 06-Feb-2005	shobby	SR14048: Include the CSP.ZIP file in the distribution
+	; 							file (this will include html files and js files that
+	; 							are required in the csp directory)
+	; 23-Dec-2005	PO		SR14015: Moved a number of hardcoded settings out to
+	; 							System > Developer Only > Build Configuration
+	; 18-Jul-2005	RPW		SR12981: Moved CheckEnums to COMDistUtilities
+	; 18-Jul-2005	SS		SR12960: Distribute report files
+	; 08-Jul-2005	RPW		Removed UNC path names.
+	; 02-Jul-2005	RPW		Modified zip command to use %Library.FileBinaryStream
+	; 							which seems to work ok.  Removed hardcoding the
+	; 							machine name use $zu(110), use original copying
+	; 							command to get to the webserver, this seems to work
+	; 							correctly.
+	; 23-Jun-2005	RPW 	SR12022,12280: Update to only handle the build in the
+	; 							automatic fashion.  Added logging
+	; 09-May-2005	RPW		SR12022: Updated so that it can handle doing all the
+	; 							files into 1 build instead of multiple
+	; 03-Mar-2005	shobby/pk/rw*	SR11789: Removed files after placing them in zip.
+	; 03-Mar-2005	shobby/pk		added j flag to remove path storage in zip file.
+	; 28-Feb-2005	shobby/paul		Use unzipsfx to create a self extracting exe.
+	; 25-Feb-2005	shobby/paul		Corrected rename command.
+	; 13-Jan-2005	?		CHANGE TO AUTOMATE BUILD AS MUCH AS POSSIBLE
+    ; 05-Jan-2005	GRF		SR10591 : Clarify status value; remove unnecessary +;
+    ; 							missed variable in new list
+	; 29-Sep-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new blnDeletePictures,blnGenerate,blnPatch,blnRegeneratePictures,idConfig
+	new idxBuildOrder,intCount,Loop,objCOMDistOutConf,objCOMDistOutConfDef
+	new objOutput,objTemp,objVersion,objWWW012,objZip,strBuildx,strDrive
+	new strFileName,strFileToCopy,strFileType,strFormdat,strMenuName,strModule,strModuleList,strPath
+	new strPhysical,strReports,strRepPath,strSep,strStatus,strWeb,strZIP,strZIPSFX
+	new strPreFormdat
+	
+	set objCOMDistOutConfDef = $get(^COMDistOutConfDef(0,0,1))
+	set idConfig = $$$COMDistOutConfDefDefaultconfiguration(objCOMDistOutConfDef)
+	if idConfig="" {                                                           ; SR16253
+		set strStatus = $$$MakeStatus("Com00320")  ; "Build Configuration has not been set up"
+		quit strStatus
+	}
+	
+	set objCOMDistOutConf = $get(^COMDistOutConf(0,idConfig,1))
+	
+	set strPath    = ##class(%File).NormalizeDirectory($$$COMDistOutConfBuildPath(objCOMDistOutConf))
+	set strRepPath = ##class(%File).NormalizeDirectory($$$COMDistOutConfReportPath(objCOMDistOutConf))
+	set strWeb     = ##class(%File).NormalizeDirectory($$$COMDistOutConfBuildDestination(objCOMDistOutConf))
+	
+	set strSep     = $extract(strPath,$length(strPath))
+	set strBuildx  = $$$COMDistOutConfGenericbuildfolder(objCOMDistOutConf)
+	set strReports = $$$COMDistOutConfReportssubfolder(objCOMDistOutConf)
+	
+	if $extract(strBuildx,$length(strBuildx))'=strSep   set strBuildx  = strBuildx_strSep
+	if $extract(strReports,$length(strReports))'=strSep set strReports = strReports_strSep
+	
+	set blnDeletePictures = +$$$COMDistOutConfDeleteformpictures(objCOMDistOutConf)
+	
+	set strPhysical  = $translate($$$WWW012PhysicalFTPDirectory($get(^WWW012(0,YM,1))),"\Ö/","\\\\")   ;SR17180
+	set strFormdat	 = strPhysical_"Formdat.txt"
+	set strPreFormdat= strPhysical_"PreFormdat.txt"		//SR17344
+	
+	set strZIP    = strPath_strBuildx_"zip.exe"
+	set strZIPSFX = strPath_strBuildx_"unzipsfx.exe" ;
+	
+	set strFileName = "AlphaLinc_V"_$translate(pstrVersion,".","_")
+	if 'pblnReleaseCandidate set strFileName=strFileName_"_Not_for_release"
+	
+	kill ^COMBuildRekey($job)
+	
+	; set idEntry = $order(^COMMsgLog(0,pidLog,""),-1)+1     ; SR16273
+	
+	do Command("del /q "_strPath_strReports_"*.*",pidLog)
+	
+	set strStatus     = $$$OK
+	set strModuleList = ""
+	
+	set idxBuildOrder = ""
+	for {
+		quit:$$$ISERR(strStatus)
+		set idxBuildOrder=$order(parrModules(idxBuildOrder))
+		quit:idxBuildOrder=""
+		
+		set strMenuName = ""                                         ; SR16273 vvv refactored
+		for {
+			set strMenuName = $order(parrModules(idxBuildOrder,strMenuName))
+			quit:strMenuName=""
+			
+			set strModule     = parrModules(idxBuildOrder,strMenuName)
+			set strModuleList = strModuleList_","_strModule
+			
+			if 'pblnJustCreateHelpText {
+				do AddMessage^COMLog(pidLog,"Checking Enums for "_strMenuName)
+				set strStatus=$$CheckEnums^COMDistUtilities(strModule)         ; FIXME : See notes - Deprecated function? Always $$$OK <GRF>
+				
+				/*	SR14550
+				if (strStatus=$$$OK) {
+					do AddMessage^COMLog(pidLog,"Converting Form Groups for "_strMenuName,idEntry)
+					set strStatus=$$ConvertFormGroups^COMLanguage(strModule,"EN",1)
+				}
+				*/
+				
+				if $$$ISOK(strStatus) {
+					set $$$WWWVERSIONActualVersionNo(^WWWVERSION(0,strMenuName,1)) = pstrVersion
+				}
+				
+				do AddMessage^COMLog(pidLog,"Copying Reports for "_strMenuName)
+				do CopyFiles(strRepPath_strModule_"*.*",strPath_strReports,"")
+			}
+		}                                                            ; SR16273 ^^^
+	}
+	
+	set $$$WWWVERSIONActualVersionNo(^WWWVERSION(0,"AlphaLincSuite",1)) = pstrVersion
+	
+	if 'pblnJustCreateHelpText {
+		
+		//SR17344
+		if $$$ISOK(strStatus) {
+			set strStatus=$$CreatePreBuildFile^COMPreUpgradeOut(pidLog,strPreFormdat)
+			do AddMessage^COMLog(pidLog,"Create PreFormdat.txt Status:"_strStatus)
+		}
+
+		if $$$ISOK(strStatus) {
+			set strStatus=$$DeleteAndCopy(strPath_strBuildx_"noforms.zip",strPath_strBuildx_"files.zip")
+			do AddMessage^COMLog(pidLog,"copied noforms.zip to files.zip Status:"_strStatus)
+		}
+		
+		if $$$ISOK(strStatus) {
+			set blnPatch = $$$NO
+			if $piece(pstrVersion,$$$COMMA,4)'="" set blnPatch = $$$YES
+			
+			set strModuleList = $extract(strModuleList,2,99999)
+			set objWWW012 = $get(^WWW012(0,YM,1))
+			
+			do AddMessage^COMLog(pidLog,"Creating Directory "_strPath_pstrVersion_"\")
+			do ##class(%Library.File).CreateDirectoryChain(strPath_pstrVersion_"\")
+			
+			if '$$CreatePackage(strModuleList,blnPatch,pidLog) {
+				set strStatus = "Com00280"
+			}      ; "Build Failed to Recompile Code, aborting..."
+		}
+		if $$$ISOK(strStatus) {
+			if '##class(%File).Exists(strFormdat) {
+				set strStatus = $listbuild("Com00303",strFormdat)
+			}  ; "File '%1' does not exist. Contact Support"
+		}	
+		if $$$ISOK(strStatus) {
+		//	do AddMessage^COMLog(pidLog,"Creating Directory "_strPath_pstrVersion_"\")
+		//	do ##class(%Library.File).CreateDirectoryChain(strPath_pstrVersion_"\")
+			
+			do AddMessage^COMLog(pidLog,strPath_strBuildx_"files.zip PRE-INIT COPY Exist:"_##class(%File).Exists(strPath_strBuildx_"files.zip"))
+			
+			do Command(strZIP_" -uj "_strPath_pstrVersion_"\Reports.zip "_strPath_strReports_"*.*",pidLog)
+			do AddMessage^COMLog(pidLog,"Returned from Reports "_strPath_pstrVersion_"\")
+ 		}
+	 	
+		if $$$ISOK(strStatus) {
+			set strStatus = $$DeleteAndCopy(strPath_strBuildx_"files.zip",strPath_pstrVersion_"\files.zip")
+			do AddMessage^COMLog(pidLog,"DeleteAndCopy 'files' Status:"_strStatus)
+		}
+		if $$$ISOK(strStatus) {
+			set strStatus = $$DeleteAndCopy(strPath_strBuildx_"CSP.zip",strPath_pstrVersion_"\CSP.zip") 
+			do AddMessage^COMLog(pidLog,"DeleteAndCopy 'CSP' Status:"_strStatus)
+		}
+		if $$$ISOK(strStatus) {
+			set strStatus = $$DeleteAndCopy(strPath_strBuildx_"install.bat",strPath_pstrVersion_"\install.bat")
+			do AddMessage^COMLog(pidLog,"DeleteAndCopy 'install' Status:"_strStatus)
+		}
+		if $$$ISOK(strStatus) {
+			set strStatus = $$DeleteAndCopy(strPath_strBuildx_"UNZIP.EXE",strPath_pstrVersion_"\UNZIP.EXE")
+			do AddMessage^COMLog(pidLog,"DeleteAndCopy 'UNZIP' Status:"_strStatus)
+		}
+		if $$$ISOK(strStatus) {
+			set strStatus = $$DeleteAndCopy(strPath_strBuildx_"unzipsfx.exe",strPath_pstrVersion_"\unzipsfx.exe")
+			do AddMessage^COMLog(pidLog,"DeleteAndCopy 'unzipsfx' Status:"_strStatus)
+		}
+
+		if $$$ISOK(strStatus) {
+			set strStatus = $$DeleteAndCopy(strPreFormdat,strPath_pstrVersion_"\PreFormdat.txt")
+			do AddMessage^COMLog(pidLog,"DeleteAndCopy 'PreFormdat' Status:"_strStatus)
+		}
+		if $$$ISOK(strStatus) {
+			set strStatus = $$DeleteAndCopy(strFormdat,strPath_pstrVersion_"\Formdat.txt")
+			do AddMessage^COMLog(pidLog,"DeleteAndCopy 'Formdat' Status:"_strStatus)
+		}
+		
+		; FIXME : see "do Delete(...)" FIXME vvv
+		if $$$ISOK(strStatus) {
+			set strStatus = $$Delete(strPath_pstrVersion_"\"_strFileName_".exe")
+			do AddMessage^COMLog(pidLog,"Delete "_strPath_pstrVersion_"\"_strFileName_".exe"_" Status:"_strStatus)
+		}
+		
+		if $$$ISOK(strStatus) {
+			do Command(strZIP_" -j " _strPath_pstrVersion_"\temp.zip "_strPath_pstrVersion_"\install.bat",pidLog)
+			do Command(strZIP_" -uj "_strPath_pstrVersion_"\temp.zip "_strPath_pstrVersion_"\UNZIP.EXE"  ,pidLog)
+			do Command(strZIP_" -uj "_strPath_pstrVersion_"\temp.zip "_strPath_pstrVersion_"\Reports.zip",pidLog)
+			do Command(strZIP_" -uj "_strPath_pstrVersion_"\temp.zip "_strPath_pstrVersion_"\files.zip"  ,pidLog)
+			do Command(strZIP_" -uj "_strPath_pstrVersion_"\temp.zip "_strPath_pstrVersion_"\CSP.zip"    ,pidLog)
+			//SR17344
+			if ##class(%File).Exists(strPath_pstrVersion_"\PreFormdat.txt") {
+				do Command(strZIP_" -uj "_strPath_pstrVersion_"\temp.zip "_strPath_pstrVersion_"\PreFormdat.txt",pidLog)
+			}
+			do Command(strZIP_" -uj "_strPath_pstrVersion_"\temp.zip "_strPath_pstrVersion_"\Formdat.txt",pidLog)
+			;SR17720 if $$IsFastBuild^UPGUTILS() do Command(strZIP_" -uj "_strPath_pstrVersion_"\temp.zip "_strPath_pstrVersion_"\CACHE.DAT",pidLog) ;SR17720
+			if $$IsFastBuild^UPGUTILS() do Command(strZIP_" -uj "_strPath_pstrVersion_"\temp.zip "_$$GetCodePath^UPGOUT($zu(5))_"CACHE.DAT",pidLog) ;SR17720
+			
+			if '##class(%File).Exists(strPath_pstrVersion_"\temp.zip") {
+				set strStatus=$listbuild("Com00303",strPath_pstrVersion_"\temp.zip")
+			}  ; "File '%1' does not exist. Contact Support"
+		}
+		
+		if $$$ISOK(strStatus) {
+		;	FIXME : <GRF> should we be returning and testing strStatus?  Is this simply a copy of the call above? ^^^
+			do Delete(strPath_pstrVersion_"\"_strFileName_".exe")
+			set objZip             = ##class(%Library.FileBinaryStream).%New()
+			set objZip.Filename    = strPath_pstrVersion_"\unzipsfx.exe"
+			set objTemp            = ##class(%Library.FileBinaryStream).%New()
+			set objTemp.Filename   = strPath_pstrVersion_"\temp.zip"
+			set objOutput          = ##class(%Library.FileBinaryStream).%New()
+			set objOutput.Filename = strPath_pstrVersion_"\"_strFileName_".exe"
+			do objOutput.Clear()
+						
+		;	NOTE: Concantenating unzipsfx.exe with temp.zip in the one file, resultant file can be
+		;	executed as it begins with the executable file unzipsfx.exe.
+						
+			do objOutput.CopyFrom(objZip)
+			do objOutput.CopyFrom(objTemp)
+			do objOutput.SaveStream()
+						
+		; Create a filename.ver file which contains the current Cache version number
+			set objVersion = ##class(%Library.FileCharacterStream).%New()
+			set objVersion.Filename = strPath_pstrVersion_"\"_strFileName_".ver"
+			do objVersion.WriteLine(pstrCacheVersion)
+			do objVersion.WriteLine($$^WWWDATE($horolog))
+			do objVersion.SaveStream()
+		}
+		
+		if $$$ISOK(strStatus) {
+			if '##class(%File).Exists(strPath_pstrVersion_"\"_strFileName_".exe") {
+				set strStatus = $listbuild("Com00303",strPath_pstrVersion_"\"_strFileName_".exe")
+			}  ; "File '%1' does not exist. Contact Support"
+		}
+		
+		if $$$ISOK(strStatus) {
+		;	FIXME : <GRF> should we be returning and testing strStatus?
+			do Delete(strPath_pstrVersion_"\temp.zip")
+			do Delete(strPath_pstrVersion_"\files.zip")
+			do Delete(strPath_pstrVersion_"\CSP.zip")
+			do Delete(strPath_pstrVersion_"\formdat.txt")
+			do Delete(strPath_pstrVersion_"\unzip.exe")
+			do Delete(strPath_pstrVersion_"\install.bat")
+			do Delete(strPath_pstrVersion_"\Reports.zip")
+			do Delete(strPath_pstrVersion_"\unzipsfx.exe")
+			if $$IsFastBuild^UPGUTILS() do Delete(strPath_pstrVersion_"\CACHE.DAT") ;SR17720
+			do Delete(strPath_strBuildx  _"files.zip")
+			//SR17344
+			do Delete(strPath_pstrVersion_"\PreFormdat.txt")
+		}
+
+		if $$$ISOK(strStatus) {
+			; Terminal session runs with current user's windows credentials and the following commands
+			; will work.
+			; However when running as a scheduled process, doing the nightly builds, this will fail
+			; as cache service installs with credentials 'Local System' which cannot access UNC shares
+			; or mapped drive letters.
+			; 
+ 			; Change the settings of the services from 'Local System' to another account
+ 			; that has UNC privileges.
+			; XP - Control Panel -> Administrative Tools -> Services
+			;      Select 'Caché Controller for CACHE'
+			;      In the 'Logon' tab change 'Log on As' to 'This Account' (supplier uname/pwd)
+			;	   Then Apply and restart the service.
+			; The following block will now run successfully.
+			;
+			do AddMessage^COMLog(pidLog,"Copying "_strPath_pstrVersion_"\"_strFileName_".exe"_" to "_strWeb)
+			set strStatus=##class(%Library.File).CopyFile(strPath_pstrVersion_"\"_strFileName_".exe",strWeb)
+			;SR17720 set strStatus = $$Copy^COMCommand(strPath_pstrVersion_"\"_strFileName_".exe",strWeb)
+			if $$$ISERR(strStatus) {
+				do AddMessage^COMLog(pidLog,"Unable to copy "_strPath_pstrVersion_"\"_strFileName_".exe to "_strWeb)
+			
+			} else {     ; Copy the .ver file to the webserver.
+				do AddMessage^COMLog(pidLog,"Copying "_strPath_pstrVersion_"\"_strFileName_".ver"_" to "_strWeb)
+				set strStatus=##class(%Library.File).CopyFile(strPath_pstrVersion_"\"_strFileName_".ver",strWeb)
+				;SR17720 set strStatus=$$Copy^COMCommand(strPath_pstrVersion_"\"_strFileName_".ver",strWeb)
+				if $$$ISERR(strStatus) {
+					do AddMessage^COMLog(pidLog,"Unable to copy "_strPath_pstrVersion_"\"_strFileName_".ver to "_strWeb)
+				}
+			}
+		}
+	}
+
+	//SR17423:Create the NextBuild.txt file
+	set strStatus = $$CreateNextBuildTXT(strWeb,strFileName)
+	
+	kill ^COMBuildRekey($job)
+	
+	if $$$ISERR(strStatus) {
+		do AddMessage^COMLog(pidLog,"Error:"_strStatus)
+		do AddMessage^COMLog(pidLog,$$DecodeError^COMUtilError(strStatus))
+	} else {
+		do AddMessage^COMLog(pidLog,"Successful")
+	}
+	
+	quit strStatus
+	
+	
+CreatePackage(pstrBaseModuleList,pblnPatch=$$$NO,pidLog)
+	;-------------------------------------------------------------------------------
+	; Create an export data set for the specified modules
+	; Plus optionally update level 4 version numbers
+	; 
+	; Inputs:
+	;	pstrModuleList
+	;	pblnPatch			Update Level 4	(Version details)
+	;	pidLog
+	; 
+	; History:
+    ; 07-Jan-2009	GRF		SR16273: Refactor - remove module duplications (arrDone)
+	; 19-Dec-2008	GRF		SR16253: VARTRK removed from Known Module list; deprecate
+	; 							comma removal.
+	; 04-Sep-2007	PPP		SRAdHoc:ad (Alphalinc V2) module added.
+	; 29-Aug-2007	shobby	SRAdHoc:OCC (Optional Core Code) module added.
+	; 14-May-2007	RPW		SR: No longer compile the code here.
+	; 14-Feb-2007	RPW		SR14900: Attempt to recompile the code and file if we can't.
+	; 11-Jan-2006	Frank	SR14111: Tools module exporting: Fixing routines to make
+ 	; 							the Alphalinc Suite Builder work.
+ 	; 19-Jul-2005	RPW		SR12981: Moved Level4Version and CreateSecurityModules
+ 	; 							to COMDistUtilities
+	; 23-Jun-2005	RobertW	SR12022,12280:Shrink the code signifcantly, we already
+	; 							know most of the information anyway.
+	; 31-May-2005	RobertW	SR12498: Added REP
+	; 07-Apr-2004	lw		Changed WWW module to distribute all User.WWW* classes
+	; 07-Apr-2004	lw		Changed IN module to distribute all User.IN* classes
+	; 05-Apr-2004	lw		Added WF
+	; 25-Feb-2004	lwaugh	Added VAR
+	; 20-Jan-2004	lwaugh	Added AEP
+	; 04-Dec-2003   lwaugh	Added User classes to distribution for COM,FIN,SAL
+	; 27-Oct-2003   lwaugh	Split IN & WWW
+	; 25-Sep-2003	lwaugh	Created
+	;-------------------------------------------------------------------------------
+	new arrDone,arrVersions,blnSuccess,loop,strModule,strModuleList,strSystemList
+	
+	set blnSuccess = $$$YES
+	
+	set pstrBaseModuleList = $zconvert($get(pstrBaseModuleList),"u")
+	
+	set strModuleList = ""
+	set strSystemList = ""
+	
+	for loop=1:1:$length(pstrBaseModuleList,",") {
+		set strModule = $piece(pstrBaseModuleList,",",loop)
+	;	set blnKnown = $case(Module,"IN":1,"TER":1,"WWW":1,"COM":1,"FIN":1,"REP":1,"SAL":1,"AEP":1,"VARTRK":1,"CST":1,"WE":1,"STK":1,"OCC":1,"TS":1,"AL":1,:0) ;SR14111 ; SR16253
+	;	set blnKnown = $case(Module,"IN":1,"TER":1,"WWW":1,"COM":1,"FIN":1,"REP":1,"SAL":1,"AEP":1,"CST":1,"WE":1,"STK":1,"OCC":1,"TS":1,"AL":1,:0)
+	;	if blnKnown {
+		if $find(",AEP,AL,COM,CST,FIN,IN,OCC,REP,SAL,STK,TER,TS,WE,WWW,",$$$COMMA_strModule_$$$COMMA) {
+			set strSystemList = strSystemList_$$$COMMA_$$GetSystems(strModule)      ; retain ALL Menu Names even if modules are duplicated
+			
+			if '$data(arrDone(strModule)) {
+				set arrDone(strModule) = ""
+				set strModuleList = strModuleList_$$$COMMA_strModule  ; only include modules once
+			}
+		} else {
+			do AddMessage^COMLog(pidLog,"Invalid module specified: "_strModule_" not adding to the build")
+		}
+	}
+	
+	set strModuleList = $extract(strModuleList,2,99999)   ; strip leading commas
+	set strSystemList = $extract(strSystemList,2,99999)
+	
+	/* SR16253 : strModuleList can not have a trailing comma according to the code above.
+	;            strSystemList is unlikely to have one but could theoretically - retained cleanup.
+	if $extract($reverse(strModuleList))="," {
+		set strModuleList = $extract(strModuleList,1,$length(strModuleList)-1)
+	}
+	*/
+	if $extract($reverse(strSystemList))="," {
+		set strSystemList = $extract(strSystemList,1,$length(strSystemList)-1)
+	}
+	
+	if (strModuleList'="") {
+		; ready for the export
+		do CreateSecurityModules^COMDistUtilities()
+		
+		; initialise and save version numbers
+		if pblnPatch {
+			do Level4Version^COMDistUtilities(strSystemList,1)
+			merge arrVersions = ^WWWVERSION
+		}
+		
+		; Now do the export
+		do AddMessage^COMLog(pidLog,"Start Output Modules: "_strModuleList_" SystemList:"_strSystemList)
+		do OUTPUT^WWWOUT("",1,"#"_strModuleList,"","",1,strSystemList,"","","")
+		do AddMessage^COMLog(pidLog,"End Output Modules")
+		
+		; Reinstate the version numbers
+		if pblnPatch {
+			merge ^WWWVERSION = arrVersions
+			do Level4Version^COMDistUtilities(strSystemList)
+		}
+	}
+	
+	quit blnSuccess
+	
+	
+RecompileCode(pstrModules,pblnForce=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Recompile the Code before distribution
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-May-2007	RPW		SRadhoc: Allows compilations
+	; 14-May-2007	RPW		SR: No longer do this, would have to create a list of
+	; 							routines to ignore. Should do this as a part of the
+	; 							prebuild code.
+	; 14-Feb-2007	RPW		SR14900: Created
+	;-------------------------------------------------------------------------------
+	new arrError,loop,objCode,objResultSet,strErrors,strModule,strName,strStatus
+	
+	quit:('pblnForce)&&(($zu(110)="ORION")||($zu(110)="MORENA")) $$$OK
+	
+	write !,"Recompiling Code before Build"
+	
+	set strName=""
+	
+	for loop=1:1:$length(pstrModules,",") {
+		set strModule = $piece(pstrModules,",",loop)
+ 
+		set objResultSet = ##class(%ResultSet).%New("%Library.Routine:RoutineList")
+		if objResultSet'=$$$NULLOREF {
+			if $$$ISOK(objResultSet.Execute($$$UPPER(strModule)_"*,"_$$$LOWER(strModule)_"*",0,0)) {
+				for {
+					quit:'objResultSet.Next()
+					set strName = objResultSet.Data("Name")
+					continue:$extract($reverse(strName),1,3)="TNI"
+					continue:$piece(strName,".",1)=$zname
+					
+					set objCode   = ##class(%Library.Routine).%New(strName)
+					set strStatus = objCode.Compile("k")
+					quit:$$$ISERR(strStatus)
+				}
+			}
+		}
+	}
+	
+	if $$$ISERR(strStatus) {
+		set arrError=""
+		do $System.Status.DecomposeStatus(strStatus,.arrError)
+		write !,"Build failed when attempting to compile routine: ",arrError(1)
+	
+	} else {
+		write !,"CompileAll"
+		do CompileAll^COMUtilClass($$$NO)
+		write !,"Compiling Modules"
+		for loop=1:1:$length(pstrModules,",") {
+			set strErrors=""
+			set strModule = $piece(pstrModules,",",loop)
+			do $System.OBJ.CompilePackage(strModule,"-lfuckevro1o2o3o4",.strErrors)
+			if strErrors'=0 {
+				write !,"Build failed when attempting to compile classes: "_strErrors_" for module: "_strModule
+				set strStatus = $$Error^%apiOBJ($$$GeneralError,strErrors)
+				quit
+			}
+		}
+	}
+	 
+	quit strStatus
+	
+	
+GetSystems(pstrModule)
+    ;-------------------------------------------------------------------------------
+    ; The get's the systems for a module if it's in the build.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 20-Jun-2005	RobertW		Created SR12022,12280
+    ;-------------------------------------------------------------------------------
+	new system,systemlist
+	
+	set system=""
+	set systemlist=""
+	for {
+		set system=$order(^COMApplicationLists(YM,2,pstrModule,system))
+		quit:system=""
+					
+		if $$$COMApplicationListIncludeInBuild($get(^COMApplicationList(YM,system,1)))=1 {
+			set systemlist=systemlist_system_","
+		}
+	}		
+	
+	set systemlist=$extract(systemlist,1,$length(systemlist)-1)
+	
+	quit systemlist
+	
+	
+Command(pstrCommand,pidLog)
+	;-------------------------------------------------------------------------------
+    ; Perform a dos command
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 23-Jun-2005	RobertW		Created SR12022,12280
+	;-------------------------------------------------------------------------------
+	do AddMessage^COMLog(pidLog,pstrCommand)
+	do $zf(-1,pstrCommand)
+	quit
+	
+	
+Copy(pstrFromFile,pstrNewFile)
+	;-------------------------------------------------------------------------------
+    ; Copy a file using %Library.File instead of $zf(-1)
+    ;
+    ; Returns: boolean success
+    ;
+    ; History:
+    ; 23-Jun-2005	RobertW		Created SR12022,12280
+	;-------------------------------------------------------------------------------
+	quit ##class(%Library.File).CopyFile(pstrFromFile,pstrNewFile)
+	
+	
+Delete(pstrFile)
+	;-------------------------------------------------------------------------------
+    ; Delete a file using %Library.File instead of $zf(-1)
+    ;
+    ; Returns: boolean success or error message
+    ;
+    ; History:
+    ; 15-Oct-2007	GRF		Standard Error Prefixes
+    ; 23-Jun-2005	RPW		Created SR12022,12280
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	
+	if ##class(%Library.File).Exists(pstrFile) {
+		set strStatus = ##class(%Library.File).Delete(pstrFile)
+	}
+	
+	if strStatus = $$$NO {
+		set strStatus = $listbuild("Com00303",pstrFile)   ; "File '%1' does not exist. Contact Support"
+	}
+	
+	quit strStatus
+	
+	
+DeleteAndCopy(pstrFromFile,pstrNewFile)
+	;-------------------------------------------------------------------------------
+    ; Handle deleting the new file and then copy the from file to the newfile.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 23-Jun-2005	RobertW		Created SR12022,12280
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	do AddMessage^COMLog(pidLog,pstrNewFile_" Pre Delete Exist:"_##class(%File).Exists(pstrNewFile))
+	set strStatus = $$Delete(pstrNewFile)
+	do AddMessage^COMLog(pidLog,pstrNewFile_" Deleted:"_strStatus)
+	
+	if $$$ISOK(strStatus) {
+		do AddMessage^COMLog(pidLog,pstrFromFile_" PreCopy Exist:"_##class(%File).Exists(pstrFromFile))
+		do AddMessage^COMLog(pidLog,pstrNewFile _" PreCopy Exist:"_##class(%File).Exists(pstrNewFile))
+		set strStatus = $$Copy(pstrFromFile,pstrNewFile)
+		do AddMessage^COMLog(pidLog,pstrFromFile_" to "_pstrNewFile_" Copied:"_strStatus)
+	}
+	do AddMessage^COMLog(pidLog,pstrFromFile_" PostCopy Exist:"_##class(%File).Exists(pstrFromFile))
+	do AddMessage^COMLog(pidLog,pstrNewFile _" PostCopy Exist:"_##class(%File).Exists(pstrNewFile))
+	
+	quit strStatus
+	
+CopyFiles(pstrFromString,pstrToDirectory,pidLog)
+	;-------------------------------------------------------------------------------
+    ; Copies files to another directory. can use wildcards.
+    ; eg:"\\Galileo\Inetpub\Development\Form_sal*.jpg"
+    ;
+    ; Shows what is going on on the screen.
+    ; 
+    ; Returns:Integer (Number of files copied)
+	;
+	; History:
+	; 23-Jun-2005	RPW		SR12022,12280: Use create dir chain instead of Command
+    ; 28-Sep-2004	PK		Created
+	;-------------------------------------------------------------------------------
+    new file,count
+    
+    set count=0
+    
+	if pstrToDirectory'="" {
+		do ##class(%Library.File).CreateDirectoryChain(pstrToDirectory)
+		set file=$zsearch(pstrFromString)
+		for count=1:1 {
+			quit:file=""
+			
+			do Command("copy "_file_" "_pstrToDirectory,pidLog)
+			Set file=$zsearch("")
+		}
+	}
+	quit count
+	
+	
+Version(pstrSystemList)
+	;-------------------------------------------------------------------------------
+    ; Set the versions based on the system list passed in.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 18-Jul-2005	RPW		SR12981: Moved KillSet/Set/Kill Commands to COMDistUtilities
+    ; 23-Jun-2005	RPW		Created SR12022,12280
+	;-------------------------------------------------------------------------------
+	new i,strMenu
+ 
+	for i=1:1:$length(pstrSystemList,",") {
+ 
+		set strMenu=$piece(pstrSystemList,",",i)
+		do Set^COMDistUtilities("^WWWVERSION(0,",strMenu)
+		//do KillSet^COMDistUtilities("^WWW004(0,",strMenu)
+		//do KillSet^COMDistUtilities("^WWW0041(0,",strMenu)
+	}
+ 
+	quit
+	
+	
+AlphaLincVersion()
+	;-------------------------------------------------------------------------------
+    ; Set the AlphaLinc version.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 18-Jul-2005	RobertW		SR12981: Moved KillSet/Set/Kill Commands to COMDistUtilities
+    ; 23-Jun-2005	RobertW		Created SR12022,12280
+	;-------------------------------------------------------------------------------
+	do Set^COMDistUtilities("^WWWVERSION(0,","AlphaLincSuite")
+ 	
+	quit
+	
+	
+Out(Modules,pstrSystemList,pidConfig)
+	;-------------------------------------------------------------------------------
+	; Export Module based code based on a list modules
+	; Called from WWWOUT & WWWIN
+	; 
+	; ByRef: VORG(3)
+	; 
+	; History:
+	; 01-Jun-2011	shobby	SR17720: Don't export code if IsFastBuild
+	; 04-Mar-2009	PPP		SR16405 Added subroutine - ForceCompile which adds lines to recompile relevant
+	; 						routines as part of the FORMDAT.TXT load
+	; 23-Dec-2008	GRF		SR15868/16253: use pidConfig rather than copyin]]><![CDATA[g; may
+	; 							not be defined.
+    ; 08-Oct-2008	PPP		SR15868: New Parameter pidConfig; If pidConfig is not
+    ; 							null, use that as the Configuration Definition
+	; 18-Jun-2007	RPW		SRBR014520: Hide code to remove distributed favourites
+	; 							as VAR favourites may be marked for distribution and
+	; 							this would incorrectly kill them
+	; 06-Feb-2007	RPW		SR15394: Rekey the classes in WWWOUT not here.
+	; 04-May-2006	RPW		SR14354: Update to determine if it should send the 
+	; 							source and to make the system horizontal instead of
+	; 							vertical, ie All the routines, instead of all of
+	; 							COM, then WWW etc.
+	; 15-Jul-2005	RobertW	SR12981: Use CacheTempLog
+	; 23-Jun-2005	RobertW	SR12022,12280: Added Logging and call to set the
+	; 							AlphaLinc Version number.
+	; 02-May-2003	SCR		Reset VORG(3)
+	;-------------------------------------------------------------------------------
+	new Count,Module,idLog,objCOMDistOutConf,objCOMDistOutConfDef,blnSendSource,idEntry
+	//new KILL       ; SRBR014520
+	
+	set idLog=$get(^CacheTempLog($job))
+	set VORG(3)=""            ; This is used in UMS^WWWOUT (Class/Form updates through LoopThroughAndExecute)
+	set Modules=$extract(Modules,2,99) ; Remove '#'
+	
+	//set idEntry=$order(^COMMsgLog(0,idLog,""),-1)+1
+	//SR15868
+	set pidConfig = $get(pidConfig)
+	if pidConfig="" {
+		set objCOMDistOutConfDef = $get(^COMDistOutConfDef(0,0,1)) ; v SR14015
+		set pidConfig = $$$COMDistOutConfDefDefaultconfiguration(objCOMDistOutConfDef)
+	}
+	if pidConfig="" {       ; SR16253
+		do AddMessage^COMLog(idLog,$$$Text("Com00320"))    ; "Warning : Build Configuration has not been set up"
+		set blnSendSource = $$$NO
+	} else {
+		set objCOMDistOutConf = $get(^COMDistOutConf(0,pidConfig,1))
+		set blnSendSource     = +$$$COMDistOutConfSendSource(objCOMDistOutConf)
+	}	
+	do LoopThroughAndExecute(idLog,Modules,"set Code=""CustomDistributionStart^""_Module_""Distribution"" if (Module?1.a)&&($text(@Code)'="""") do @Code","Start Distribution")
+	
+	if '$$IsFastBuild^UPGUTILS() {
+		do LoopThroughAndExecute(idLog,Modules,"do Routine^COMDistOutRoutine(Module)","Routines") ;SR17720
+	}
+	do LoopThroughAndExecute(idLog,Modules,"do Class^COMDistOutClass(Module)","Class")
+	do LoopThroughAndExecute(idLog,Modules,"do Form^COMDistOutForm(Module)","Form")
+	do LoopThroughAndExecute(idLog,Modules,"do Text^COMDistOutText(Module)","Text")
+	;do LoopThroughAndExecute(idLog,Modules,"do Help(Module)","Help")
+	do LoopThroughAndExecute(idLog,Modules,"do Param^COMDistOutParam(Module)","Param")
+	do LoopThroughAndExecute(idLog,Modules,"do Report^COMDistOutReport(Module)","Report")
+	if '$$IsFastBuild^UPGUTILS() do LoopThroughAndExecute(idLog,Modules,"do Object^COMDistOutObject(Module,blnFirst,blnLast)","Object") ;SR17720
+	do LoopThroughAndExecute(idLog,Modules,"do DCM^COMDistOutDCM(Module)","DCM")
+	do LoopThroughAndExecute(idLog,Modules,"do HealthCheck^COMDistOutHealthCheck(Module)","HealthCheck")
+	;  SRBR014520
+	;$$$KILLOUT("set strQuery=""^COMView(0)"" for { set strQuery=$query(@strQuery) quit:strQuery=""""  if $piece(@strQuery,""~"",5)=1 { set idClass=$qsubscript(strQuery,2),idView=$qsubscript(strQuery,3) do KILL^COMUtils(""COMView"",idClass_"",""_idView),KILL^COMUtils(""COMViewFilter"",idClass_"",""_idView),KILL^COMUtils(""COMViewColumn"",idClass_"",""_idView) } } quit")
+	do LoopThroughAndExecute(idLog,Modules,"do Distribute^COMViewDistribute(Module)","COMView Distribution")
+	do LoopThroughAndExecute(idLog,Modules,"do Distribution^COMDistOut6(Module)","Distribution")
+	do LoopThroughAndExecute(idLog,Modules,"set Code=""CustomDistributionEnd^""_Module_""Distribution"" if (Module?1.a)&&($text(@Code)'="""") do @Code","End Distribution")
+	;
+	do ForceCompile()		//SR16405
+	;do Rebuild // SR15394
+	do Version(pstrSystemList)
+	do AlphaLincVersion()
+	//set KILL="set ^COMUpgrade="_blnSendSource       ; SRBR014520
+	do AddMessage^COMLog(idLog,"Please wait... The next phase may not respond for awhile, creating the formdat.txt")
+		
+	quit
+	
+Rebuild()
+	;-------------------------------------------------------------------------------
+	;
+	; History:
+	; 15-Nov-2007	shobby	SRBR014797: Change rekey global to ^COMBuildRekey.  Refer to SR if this seems stupid.
+	; 13-Mar-2007	RPW		SR15408: Use the KILLOUT macro
+	; 19-Jun-2005	SCR		SR12696 Added SetIndexDirty Code
+	; 23-May-2005	SCR		SR12040	Removed ReIndex
+	; 08-Apr-2005	SCR		SR12040	ReIndex all Sent Classes
+	; 04-Apr-2005	SCR/PK	SR12015 Code Moved to COMUPGHabdler
+	; 
+	; 14-Feb-2005	PO		SR11483 Now setting KILL^WWWOUT to run new
+	; 						CheckAll^COMClassCompile
+	; 04-May-2004	LW		Changed rebuild index to use class method
+	; 20-May-2003	SCR		Changed Rekey Class from local to global
+	;-------------------------------------------------------------------------------
+	new KILL,Class
+	
+	set Class=""
+	for {
+		;set Class=$order(^mtemp("RekeyClass",$job,Class));BR014797
+		set Class=$order(^COMBuildRekey($job,Class)) ;BR014797	
+ 
+		quit:Class=""
+		
+		if $data(^WWW001(0,Class)) {
+			$$$KILLOUT("d SetIndexDirty^COMIndex("""_Class_""")")
+		}
+	}
+ 
+	;kill ^mtemp("RekeyClass",$job) ;BR014797
+	kill ^COMBuildRekey($job)		;BR014797
+	quit
+	
+ 
+Distribution(pstrModule)
+	;-------------------------------------------------------------------------------
+	; Perform the distribution code
+	;
+	; Params:
+	; 	pstrModule: The module to distribute.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Dec-2008	GRF		SR16253: pstrModule not Module (missed - SR16184 review)
+	; 18-Dec-2008	GRF		SR16253: correct $text on CustomUpgradeEnd processing
+	; 05-Dec-2008	GRF		SR16184: @strCode not @Code
+	; 27-Nov-2008	SCR		SR16184: Added call to "CustomUpgradeEnd^"_pstrModule_"Distribution(Log)" 
+	; 05-Feb-2007	RPW		SR14900: Most of the work is not needed to be done here.
+	; 04-May-2006	RPW		SR14354: Created
+	;-------------------------------------------------------------------------------
+	new KILL,strCode
+	
+	if pstrModule="COM" {
+		;set KILL="d ROUTINE^%R(""COMSTARTUtils.MAC"",.r,.e,""LCS"")"  do KILL^WWWOUT //SR14900
+		;set KILL="d ROUTINE^%R(""COMSTARTZstart.MAC"",.r,.e,""LCS"")" do KILL^WWWOUT //SR14900
+		;set KILL="d ROUTINE^%R(""COMSTARTZstop.MAC"",.r,.e,""LCS"")"  do KILL^WWWOUT //SR14900
+		;set KILL="i $text(InstallRoutines^COMSTARTUtils)'="""" d InstallRoutines^COMSTARTUtils" do KILL^WWWOUT //SR14900
+	
+	} elseif pstrModule="SAL" {
+		;do Distribute^SALCSTTemplate() // This is okay to be run here, only uses SAL.
+	
+	} elseif pstrModule="IN" {
+		;set KILL="d ROUTINE^%R(""INSoapFix.MAC"",.r,.e,""LCS"")" do KILL^WWWOUT //SR14900
+		;set KILL="if $text(FixWebService^INSoapFix)'="""" do FixWebService^INSoapFix()" do KILL^WWWOUT //SR14900
+	
+	} elseif pstrModule="VAR" {
+		;set KILL="d ROUTINE^%R(""VARInstall.MAC"",.r,.e,""LCS"")" do KILL^WWWOUT //SR14900
+		;set KILL="i $text(Install^VARInstall)'="""" d Install^VARInstall" do KILL^WWWOUT //SR14900
+	
+	} elseif pstrModule="REP" { ;SR11267
+		do Distribute^REPUtilities()	
+	}
+	
+	set strCode="CustomUpgradeEnd^"_pstrModule_"Distribution"   ; SR16184
+	;if (Module?1.a) && ($text(@strCode)'="""") {               ; SR16253
+	;	set KILL="i $text("_strCode_")="""" do "_strCode_"(Log)"
+	
+	;if (Module?1.a) && ($text(@strCode)'="") {
+	if (pstrModule?1.a) && ($text(@strCode)'="") {
+		set KILL="i $text("_strCode_")'="""" do "_strCode_"(Log)"
+		do KILL^WWWOUT
+	}
+	
+	quit
+	
+ 
+	;-------------------------------------------------------------------------------
+	; Horizontally perform the code for each module, ie all routines, classes etc
+	;
+	; Params:
+	;	pidLog		The log file to send the messages to
+	;	pModules	The list of modules to work on
+	;	pstrCode	The code to execute
+	;	pstrType	The type of component being generated
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-May-2008	GRF		SR15782: Clarify source of boolean values; p suffix
+	; 21-Feb-2007	RPW		SR14900: Setup First and Last entries.
+	; 04-May-2006	RPW		SR14354: Created
+	;-------------------------------------------------------------------------------
+LoopThroughAndExecute(pidLog,pModules,pstrCode,pstrType)
+	new blnFirst,blnLast,intCount,intLength,Module
+	
+	set $ztrap="LTAEError"
+	
+	set Module=""
+	set intLength=$length(pModules,$$$COMMA)
+	for intCount=1:1:intLength {
+		set Module = $piece(pModules,$$$COMMA,intCount)
+		
+		do AddMessage^COMLog(pidLog,"Generating "_Module_" "_pstrType)
+		set blnFirst = (intCount=1)
+		set blnLast  = (intCount=intLength)
+		
+		if Module'="" {
+			set Module = $zconvert(Module,"u")
+			xecute pstrCode
+			
+		}
+	}
+	
+	quit
+	
+LTAEError	; Internal Tag
+	set $ztrap=""
+	do AddMessage^COMLog(pidLog,"Generating "_Module_" "_pstrType_" failed. "_$zcvt($zerror,"o","HTML"))
+	quit
+	
+PreBuild(pidLog="")
+	;-------------------------------------------------------------------------------
+	; Perform a couple of steps in the build in 1 hit
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Mar-2006	RPW		SR14354: Added pidLog so that we can run this automatically.
+	; 14-Feb-2006	RPW		SR14294: Created
+	;-------------------------------------------------------------------------------
+ 	if ($zu(110)="CODESPLIT") && ($get(^SysSetup("Build"))'="") {
+		kill ^Developer
+		kill ^GridDeveloper
+		kill ^Development
+		kill ^GridDevelopment
+		kill ^SysSetup
+		
+		kill ^COMHCResult
+		kill ^COMHCResults
+	
+		do:pidLog'="" AddMessage^COMLog(pidLog,"Performing PreBuild Processing.")
+	
+		//merge ^WWW012(0,0,1)=^|"DEVELOPMENT"|BUILD  // This line fails code check. Code check does NOT handle this correctly
+	}
+	
+	if '(($zu(110)="ORION") && ($zu(5)="DEV")) {
+		set ^IsInBuild=1
+	}
+	
+	do Purge^%apiSQL(0)
+	do RecompileCode("WWW,COM,IN,TER,FIN,CST,SAL,STK,AEP,TS,REP")
+	
+	write:pidLog="" !,"Please login as BUILD and perform the build."
+	
+	quit
+ 
+ 
+ForceCompile()
+	;-------------------------------------------------------------------------------
+	; Force a Routine Compile of necessary routines required for the Build Process
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Mar-2008	PPP		SR16405: Created
+	;-------------------------------------------------------------------------------
+	new idRoutine
+ 
+	for idRoutine="COMUpgradeHandler.MAC","COMDistOutObject.MAC" {
+		set KILL="if ##class(%Library.Routine).Exists("""_idRoutine_""") do ROUTINE^%R("""_idRoutine_""",,,""LCS"")"
+		do KILL^WWWOUT
+	}
+	
+	quit
+	
+	
+CreateNextBuildTXT(pstrPath,pstrFileName)
+	;-------------------------------------------------------------------------------
+	; Create an file with the Current Build Details (NextBuild.txt)
+	; 
+	; Called By: Build^COMDistOut6
+	; 
+	; History
+	; 12-Aug-2010	GRF		SR17423: return strStatus rather than sc
+	; 13-Jul-2010	PPP		SR17423: Rewrote using %File instead of %Library.FileCharacterStream
+	; 12-Jul-2010	PPP		SR17423: Created
+	;-------------------------------------------------------------------------------
+	new objFile,sc,strStatus
+	
+	set strStatus = $$$OK
+
+	set objFile = ##class(%Library.File).%New(pstrPath_"NextBuilds.txt")
+	do objFile.Open("WSN")
+	set sc = objFile.WriteLine(pstrFileName_".exe")
+	set sc = objFile.WriteLine(pstrFileName_".ver")
+	do objFile.Close()
+	
+	if $$$ISERR(sc) set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	
+	quit sc
+	
+]]></Routine>
+</Export>

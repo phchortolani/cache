@@ -1,0 +1,464 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvCharge" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvCharge
+	
+#include COMSYS
+#include FINConst
+ 
+#define IsOnChargePage(%p)	(%p=2)
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^FINAPInvCharge("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1) 		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+OnBlur(pCol,pYFELD)
+    ;-------------------------------------------------------------------------------
+    ; To execute on blur of line cells.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 12-Aug-2005	JW		Use LineIncludeTax check
+    ; 23-Feb-2005	JW		Created
+    ;-------------------------------------------------------------------------------
+	new blnIncTax,objInv
+	
+	// Update Tax, headers
+	set objInv = $$$GRIDYFELDContainer
+ 	
+	do CalculateTax(.pYFELD,objInv, $$$FINAPInvLinesIncludeTax(objInv) )
+	
+	quit
+	
+	
+UpdateContainer(pidField="",pobjGrid,pHeadYFELD,pHeadYMFELD)
+    ;-------------------------------------------------------------------------------
+    ; Calculates Header Totals
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 30-Jan-2006	Steve S	SR13497: Update discount stuff
+    ; 30-Sep-2005	JW		SR11573: Param is now class field not form col
+    ; 16-Mar-2005	JW		SR11916: Created
+    ;-------------------------------------------------------------------------------
+	new curInvTotal,idFINAPInv,idFINAPInvLine,onChargeTotal,total,tax
+	
+	// Update if not on blur, or if blurred from specified cells.
+	if (pidField="") || ($listfind($lb($$$FldFINAPInvChargeTaxCode,$$$FldFINAPInvChargeAmount,$$$FldFINAPInvChargeAmountTaxEx),pidField)) {
+		
+		do InvoiceTotals^FINAPVoucher2(.pobjGrid,.onChargeTotal,.total,.tax)
+		
+		// Update Headers
+		if $$$FINAPInvLinesIncludeTax(pHeadYFELD) {
+			set $$$FINAPInvTaxTotal(pHeadYFELD) = tax
+		} else {
+			set tax = $$$FINAPInvTaxTotal(pHeadYFELD)
+		}
+		
+		set curInvTotal = $$$FCAdd(tax,total)
+		
+		if $$$IsOnChargePage($get(^CacheTemp(YUSER,"FINAPVoucher","Page"))) {
+			set $piece(pHeadYMFELD,Y,20) = onChargeTotal
+			set $piece(pHeadYMFELD,Y,16) = curInvTotal // Invoice Total
+		
+		} else {
+			set $piece(pHeadYMFELD,Y,10) = curInvTotal
+			set $piece(pHeadYMFELD,Y,11) = total
+			set $piece(pHeadYMFELD,Y,12) = onChargeTotal
+		}
+		// NOTE JW: This is terrible, it ends up calling InvoiceTotals again!!
+		do UpdateDiscount^FINAPVoucher2(pHeadYFELD) ;SR13497
+	}
+	quit
+	
+	
+OnAfterDataFields(pYSEITE)
+    ;-------------------------------------------------------------------------------
+    ; Calculate headers and toggle grid.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 19-Oct-2005	JW		SR11573: Extra params for hiding rows
+    ; 12-Jan-2005	JW		Created
+    ;-------------------------------------------------------------------------------
+	new blnKeepCharges,objInvoice
+	
+	if ($get(pYSEITE)=1) do ToggleHeader^FINAPInvLine()
+	
+	// Hide either normal Charges or On Charges, depending on page.
+	set blnKeepCharges = '$$$IsOnChargePage($get(pYSEITE))
+	//do HideShowRows^COMGridEdit31Interface(8,blnKeepCharges)
+	$$$GRIDHideShowRows(8,blnKeepCharges,$$$NO,$$$NO)	// SR11573
+	
+	if blnKeepCharges {
+		do OnAfterDataFields^FINAPInvChargeIC($$$KEY1(YKEY))
+	}
+	
+	set objInvoice = $$$GRIDYFELDContainer
+ 	do UpdateTaxFields^FINAPVoucher(objInvoice)
+	quit
+	
+	
+GetChargeDescription(pYKEY,pYFELD="")
+    ;-------------------------------------------------------------------------------
+    ; Return the charge number and reference for a specified FINAPInvCharge
+    ;
+    ; Returns: string
+    ;
+    ; History:
+    ; 24-Feb-2005	JW		Created
+    ;-------------------------------------------------------------------------------
+	new description,ref
+	
+	set description = ""	
+	if ($get(pYKEY)'="") {
+		set description = $piece(pYKEY,",",2)
+		set ref = $$$FINAPInvChargeReference(pYFELD)
+		if (ref'="") {
+			set description = description_" - "_ref
+		}
+	}
+	quit description
+	
+	
+OnAfterSave(pYKEY,pYFELD="")
+	;-------------------------------------------------------------------------------
+    ; Create FINAPInvChargeDivisions for a FINAPInvCharge
+    ; 
+    ; Note: For now, update divisions here. In future, may do it on blur...
+    ; 
+    ; Returns:
+    ;
+    ; History:
+    ; 17-Jun-2005	JW		Removed call to GetKeys
+    ; 15-Apr-2005	JW		SR12136: Changed from OnBeforeSave.
+    ; 							Removed complete check - now calculated.
+    ; 24-Feb-2005	JW		Created
+    ;-------------------------------------------------------------------------------
+	new idInvoice,idCharge,idGroup,idAccount,strClass,strStatus
+	new chargeAmount,objDiv,objLine,oldAmount,newAmount
+	
+	$$$LogR("OnAfterSave",pYKEY_","_pYFELD)
+	
+	quit:pYKEY=""
+	
+	;do GetKeys(pYKEY,.idInvoice,.idCharge)
+	set idInvoice = $$$KEY1(pYKEY)
+	set idCharge  = $$$KEY2(pYKEY)
+	
+	set strClass = "FINAPInvChargeDivision"
+	
+	set idGroup      = $$$FINAPInvChargeAccountGroup(pYFELD)
+	set chargeAmount = $$$FINAPInvChargeAmountTaxEx(pYFELD)
+	
+	// JW: This can probably be done better
+	
+	set idAccount=""
+	for {
+		set idAccount = $order(^FINAPInvChargeDivision(0,idInvoice,idCharge,idAccount))
+		quit:idAccount=""
+		
+		// Remove account if not in group (shouldn't have to new YFELD...)
+		if (idGroup="") || '$data(^FINSYSAccountGroups(0,50,idAccount,idGroup)) {         ; FIXME : $$$Index
+			new YFELD
+			do KILL^FINSYS(strClass,idInvoice_","_idCharge_","_idAccount)
+		}
+	}
+		
+	// Update lines and add new ones
+	
+	;set divTotal = 0
+	set strStatus=$$$OK
+ 
+	if (idGroup'="") {
+		set idAccount = ""
+		for {
+			set idAccount = $order(^FINSYSAccountGroupLine(0,idGroup,idAccount))
+			quit:idAccount=""
+			
+			if $data(^FINAPInvChargeDivision(0,idInvoice,idCharge,idAccount)) {
+				// Data already exists - update
+				set objDiv = $get(^FINAPInvChargeDivision(0,idInvoice,idCharge,idAccount,1))
+				set oldAmount = $$$FINAPInvChargeDivisionAmount(objDiv)
+				
+			} else {
+				// New record
+				set objLine = $get(^FINSYSAccountGroupLine(0,idGroup,idAccount,1))
+				set objDiv=""
+				set oldAmount=""
+				set $$$FINAPInvChargeDivisionPercent(objDiv) = $$$FINSYSAccountGroupLinePercent(objLine)
+			}
+			
+			set newAmount = $$GetAmount^FINAPInvChargeDivision(objDiv,chargeAmount)
+			set $$$FINAPInvChargeDivisionAmount(objDiv) = newAmount
+			
+			;set divTotal = $$$FCAdd(divTotal,newAmount)
+			
+			if (oldAmount'="") || (newAmount'=oldAmount) {
+				set strStatus = $$$Save(strClass,idInvoice_","_idCharge_","_idAccount,objDiv,$$$YES)
+			}
+			
+			quit:$$$ISERR(strStatus)
+		}
+		
+		;if $$$ISOK(strStatus) {
+			// check total - completed?
+		;	set $$$FINAPInvChargeComplete(pYFELD) = $$$FCZero($$$FCSub(divTotal,chargeAmount))
+		;}
+	;} else { // Has account, not account group.
+	;	set $$$FINAPInvChargeComplete(pYFELD)= $$$YES
+	
+	}
+	
+	;if $$$ISOK(strStatus) {
+	;	set Q=$$$QSave
+	;} else {
+	;	set Q=$$$QDontSave
+	;}
+	
+	quit
+	
+	
+IsComplete(pidInvoice,pidCharge)
+    ;-------------------------------------------------------------------------------
+    ; Does apportioned = total
+    ;
+    ; Returns: boolean - is complete
+    ;
+    ; History:
+    ; 15-Apr-2005	JW		SR12136: Created
+    ;-------------------------------------------------------------------------------
+	new complete,objInvoice,apportioned,idAccount,objDiv
+	
+	set complete = $$$NO
+	
+	if (pidInvoice'="") && (pidCharge'="") {
+		
+		set objInvoice = $get(^FINAPInvCharge(0,pidInvoice,pidCharge,1))
+		if $$$FINAPInvChargeAccount(objInvoice)'="" {
+			set complete = $$$YES
+			
+		} else {
+			set apportioned = 0
+			set idAccount   = ""
+			for {
+				set idAccount = $order(^FINAPInvChargeDivision(0,pidInvoice,pidCharge,idAccount))
+				quit:idAccount=""
+		
+				set objDiv      = $get(^FINAPInvChargeDivision(0,pidInvoice,pidCharge,idAccount,1))
+				set apportioned = $$$FCAdd(apportioned,$$$FINAPInvChargeDivisionAmount(objDiv))
+			}
+			set complete = $$$FCZero($$$FCSub(apportioned,$$$FINAPInvChargeAmountTaxEx(objInvoice)))
+		}
+	}
+	quit complete
+	
+	
+CalculateApportioned(pstrKey)
+    ;-------------------------------------------------------------------------------
+    ; Calculate apportioned amount
+    ;
+    ; Returns:
+    ;
+    ; History:
+	; 10-Apr-2010	GRF		SR17177: arrGrid rather than pobjGrid; GRID Macros
+    ; 25-Feb-2005	JW		Created
+    ;-------------------------------------------------------------------------------
+	new arrGrid,curApportioned,idInvoice,idLine,idDiv,objDiv
+	
+	$$$GRIDGetContents(.arrGrid)
+	
+	set curApportioned = 0
+	
+	set idInvoice = $order(arrGrid(""))
+	if idInvoice'="" {
+		set idLine = $order(arrGrid(idInvoice,""))    ; FIXME : if null?
+		set idDiv  = ""
+		for {
+			set idDiv = $order(arrGrid(idInvoice,idLine,idDiv))
+			quit:idDiv=""
+					
+			set objDiv = $get(arrGrid(idInvoice,idLine,idDiv))
+			set curApportioned = $$$FCAdd(curApportioned,$$$FINAPInvChargeDivisionAmount(objDiv))
+		}
+	}
+	quit curApportioned
+	
+	
+CalculateTax(pobjLine="",pobjInvoice="",pblnIncTax=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Calculate the tax amount for a given line and supplier.
+    ; 
+    ; Params:	pobjLine - line data (is updated with amounts)
+    ; 			pobjInvoice - invoice data
+    ; 			pblnIncTax - whether to calculate from TaxInc or TaxEx amount
+    ;
+    ; Returns: pobjLine as parameter
+    ; 
+    ; History:
+    ;  8-Jul-2005	JW		SR12939: Added '+'
+    ;  8-Mar-2005	JW		Created (copied from FINARInv)
+    ;-------------------------------------------------------------------------------
+	new itemTaxCode,tax,location,transDate,taxRate,taxCode
+	
+	set itemTaxCode = $$$FINAPInvChargeTaxCode(pobjLine)
+	set location    = $$$FINAPInvTaxLocation(pobjInvoice)
+	
+	set taxCode = $$IsTaxable^COMTAX(itemTaxCode,+$$$FINAPInvTaxInvoice(pobjInvoice),,location)	//SR12939
+	
+	if (taxCode = 0) || (location = "") {
+		set tax = ""
+	} else {
+		set transDate = $$$FINAPInvEnteredDate(pobjInvoice)
+		set taxRate   = $$CombinedTaxRate^COMTAX(taxCode,location,transDate,1)
+		
+		if 'pblnIncTax {
+			set tax = $$$FCMult($$$FINAPInvChargeAmountTaxEx(pobjLine),taxRate/100)
+		} else {
+			if taxRate {
+				set tax = $$$FCDivd($$$FINAPInvChargeAmount(pobjLine),(100/taxRate)+1)
+			} else {
+				set tax = 0
+			}
+		}
+		set tax = $$$FCRound(tax)
+	}
+	
+	if pblnIncTax {
+		set $$$FINAPInvChargeAmountTaxEx(pobjLine) = $$$FCSub($$$FINAPInvChargeAmount(pobjLine),tax)
+	} else {
+		set $$$FINAPInvChargeAmount(pobjLine)      = $$$FCAdd($$$FINAPInvChargeAmountTaxEx(pobjLine),tax)
+	}
+	set $$$FINAPInvChargeTax(pobjLine) = tax
+	
+	quit tax
+	
+	
+SetIsOnCharge()
+    ;-------------------------------------------------------------------------------
+    ; Set IsOnCharge field depending which page currently on.
+    ;
+    ; Returns: blnOnCharge value
+    ;
+    ; History:
+    ; 10-Mar-2005	JW		Created
+    ;-------------------------------------------------------------------------------
+	quit $$$IsOnChargePage($get(^CacheTemp(YUSER,"FINAPVoucher","Page")))
+	
+	
+GetDefaultAccount()
+    ;-------------------------------------------------------------------------------
+    ; Get the default expense account for the invoice supplier
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 27-Apr-2005	JW		Created SR12143
+    ;-------------------------------------------------------------------------------
+	new idAccount,idSupplier,strInvoiceData
+	
+	set idAccount = ""
+	set strInvoiceData = $$$GRIDYFELDContainer
+	
+	set idSupplier = $$$FINAPInvInvoiceSupplier(strInvoiceData)
+	if idSupplier'="" {
+		set idAccount = $$$FINAPSupplierDefaultExpenseAccount($get(^FINAPSupplier(0,idSupplier,1)))
+	}
+	quit idAccount
+	
+	
+OnLineAdded(pintRowCount,pstrKey)
+    ;-------------------------------------------------------------------------------
+    ; If this is the first line added lock the inter company field
+    ; 
+    ; Parameters:
+    ; pintRowCount: The number of rows added
+    ; pstrKey     : The key to the line added
+    ;
+    ; History:
+    ; 23-Jan-2005	RPW		SR13087: Added to handle intercompany locking.
+    ;-------------------------------------------------------------------------------  
+    if pintRowCount=1 {
+	    do ToggleReadOnly^COMUtilForm($$$FldFINAPInvInterCompany,$$$YES,"FINAPVoucher")
+    }
+	quit
+	
+	
+OnLineDeleted(pstrYKEY,pintRowCount)
+    ;-------------------------------------------------------------------------------
+    ; If this is the last line removed unlock the inter company field
+    ; 
+    ; Parameters:
+    ; pintRowCount: The number of rows added
+    ; 
+    ; History:
+    ;  2-Mar-2006	JW		SR13305: Added pstrYKEY parameter
+    ; 23-Jan-2005	RPW		SR13087: Added to handle intercompany locking.
+    ;-------------------------------------------------------------------------------
+	if pintRowCount=0 {
+		do ToggleReadOnly^COMUtilForm($$$FldFINAPInvInterCompany,$$$NO,"FINAPVoucher")
+	}
+	quit
+	
+	
+	;CreateInvoice(pidInvoice,pidSummLine,penumLineType,pfltAdjCost,pfltCost,penumCDist,penumBud,penumDisc,penumGenLed) ; SR16689
+CreateInvoice(pidInvoice,pidSummLine,penumLineType,pfltAdjCost,pfltCost,penumCDist,pidGenLed,penumDisc,penumAllocn)
+	;-------------------------------------------------------------------------------
+	; Create the FINAPInvCharge record as needed to do 3WM.
+	; 
+	; Called by PostInvoice^INReceiptInvoice - creates the records directly from 
+	; INRECSummary, and posts to the ledger directly from the INReceipt form using 
+	; the Invoice Tab.
+	; 
+	; Params:
+	; pidInvoice	= next primary key for FINAPInv
+	; pidSummLine	= INRECSummary Line Number
+	; penumLineType	= Line Type >>	0. Standard		3. Tax 
+	; 								1. Discount		4. Freight
+	; 								2. Bonus		5. Surcharge
+	; pfltAdjCost	= Line Cost After Discount								
+	; pfltCost		= calculated cost of line to adjust total by
+	; penumCDist	= Cost Distribution
+	; pidGenLed	    = General Ledger Account
+	; penumDisc		= Discount Code
+	; penumAllocn	= Cost Allocation
+	; 
+	; History:
+	; 15-Jul-2009	GRF		SR16689: Correct parameter names to match actual use
+	; 							(actual data passed through each position unchanged)
+	; 14-Jul-2009	GRF		SR16363: unused variables removed
+	; 20-Apr-2009	DWR		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new idBaseLine,idChargeLine,objCharge,strStatus
+	
+	$$$LogR("CreateInvoice",pidInvoice_","_pidSummLine_":"_penumLineType_","_pfltAdjCost_","_pfltCost_","_penumCDist_","_pidGenLed_","_penumDisc_","_penumAllocn)
+ 
+	set strStatus = $$$OK
+	set idBaseLine = pidSummLine\1
+	
+	set idChargeLine = $order(^FINAPInvCharge(0,pidInvoice,""),-1) + 1   ; get the next number
+	
+	set objCharge = ""
+	set $$$FINAPInvChargeAmountTaxEx(objCharge)      = pfltCost
+	set $$$FINAPInvChargeCostDistribution(objCharge) = penumCDist
+	set $$$FINAPInvChargeAccount(objCharge)          = pidGenLed    ; penumBud    ; SR16689
+	set $$$FINAPInvChargeBuyingDiscount(objCharge)   = penumDisc
+	set $$$FINAPInvChargeCostAllocation(objCharge)   = penumAllocn  ; penumGenLed ; SR16689
+	
+	if idBaseLine = pidSummLine {
+		set $$$FINAPInvChargeParent(objCharge) = "Total"
+	
+	} else {
+		set $$$FINAPInvChargeParent(objCharge) = idBaseLine
+	}
+	
+	set strStatus = $$$Save("FINAPInvCharge",pidInvoice_$$$COMMA_idChargeLine,objCharge,$$$YES)
+	$$$LogRx("FINAPInvCharge :"_idChargeLine_"<"_objCharge)
+	quit strStatus
+	
+]]></Routine>
+</Export>

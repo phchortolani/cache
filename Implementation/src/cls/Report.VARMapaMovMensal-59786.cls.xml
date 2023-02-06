@@ -1,0 +1,572 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="Report.VARMapaMovMensal">
+<ClassType/>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%Persistent</Super>
+
+<Method name="VARMapaMovMensalClose">
+<Description><![CDATA[************************************************************************
+	Relatório Mapa de Movimentação Mensal
+
+2014-12-15	Henrique Dias	HEVA-1667	Correções na query após realização do merge
+2014-09-30	Henrique Dias	HEVA-1606	Lentidão no relatório de Mapa de Movimentação
+************************************************************************]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;QHandle:%Binary</FormalSpec>
+<PlaceAfter>VARMapaMovMensalExecute</PlaceAfter>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[// Clean up by purging the temporary node in ^CacheTemp global
+	Set reportId = $List(QHandle,2)
+
+	Kill ^CacheTemp("REPORTSP",reportId)
+	Quit $$$OK]]></Implementation>
+</Method>
+
+<Method name="VARMapaMovMensalExecute">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;QHandle:%Binary,mes:%Integer,ano:%Integer,local:%String,grupo:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[#define mtTransferencia 30
+	#define mtAceiteTransferencia 31
+	#define mtEstornoTransferencia 32	
+	
+	#define mtRequisicao 11
+	#define mtDispensacaoPaciente 21
+	#define mtRecebimentoProducao 35
+
+	// Get reportid i.e. use $INCREMENT to add another node to ^CacheTemp global. 
+	// We use ^CacheTemp global because it will always use memory before disk
+
+	// Use $Increment to get the next node
+	Set reportId = $Increment(^CacheTemp("REPORTSP"))
+	Kill ^CacheTemp("REPORTSP",reportId)
+
+	set dataInicial = $zdateh(mes_"/01/"_ano)
+	set dataFinal  	= $$SQLGetUltimoDiaMes^VARSQL(mes,ano)
+	
+	if (local = $char(0)) {
+		set local = ""
+	}
+	if (grupo = $char(0)) {
+		set grupo = ""
+	}
+	
+	&sql(
+		DECLARE MapaMovMensal CURSOR FOR
+		SELECT	Item,
+				DateConfirmed,
+				Location,
+				QtyMoved,
+				TxValue,
+				$LISTGET(MovementType,1) as MovementType,
+				MovementType as MovementTypeList,
+				Reference,
+				Storage->Code,
+				Location
+		INTO	:item,
+				:dateConfirmed,
+				:location,
+				:qtyMoved,
+				:txValue,
+				:movementType,
+				:movementTypeList,
+				:reference,
+				:storage,
+				:location
+		FROM	alSOH.dStockHistory
+		WHERE	$$IsProdutoForaFechamentoContabil^VARFechamentoContabil(Item) = 0
+		AND		DateConfirmed BETWEEN TO_DATE(:dataInicial, 'DD/MM/YYYY') AND TO_DATE(:dataFinal, 'DD/MM/YYYY')
+		AND		((:local IS NULL)
+				 OR (((Location = :local) AND (:local IS NOT NULL))
+				     OR (($LISTGET(MovementType,1) = 30) AND (:local IS NOT NULL))))
+		AND		((:grupo IS NULL) OR ($$SQLGetGrupoPai^VARSQL($$SQLGetGrupoItem^VARSQL(Item)) = $$SQLGetGrupoPai^VARSQL(:grupo))))
+
+
+	&sql(OPEN MapaMovMensal)
+	&sql(FETCH MapaMovMensal)
+	While (SQLCODE = 0){
+		
+		set movmtVetor            = $$GetMovmtVetor^VARStockHistory(movementType, qtyMoved)
+		set natureza              = $$GetNatureza^VARFechamentoContabil(movementTypeList, reference, qtyMoved)
+		set fornRecebimento       = $$GetFornecedorRecebimento^VARFechamentoContabil(reference)
+		set fornEstorno           = $$GetFornecedorEstorno^VARFechamentoContabil(reference)
+		set fornFechamentoCont    = $$GetFornFechamentoContabil^VARSQL()
+		set tipoRecebimento       = $$GetTipoRecebimento^VARFechamentoContabil(reference)
+		set tipoEstorno           = $$GetTipoEstorno^VARFechamentoContabil(reference)
+		set reasonCode            = $$GetReasonCode^VARMapaMovMensal(reference)
+		set tipoINADJ             = $$GetTipoINADJ^VARMapaMovMensal(reference)
+		set possuiCompraAssoc     = $$IsRecebimentoPossuiCompraAssociada^VARFechamentoContabil(reference)
+		set grupoPai              = $$SQLGetGrupoPai^VARSQL($$SQLGetGrupoItem^VARSQL(item))
+		set txValueFormatado      = $fnumber($$GetValorPositivo^VARSQL(txValue),"",4)
+		;Não tem necessidade de popular essas rotinas agora, transferidas para dentro do "if" logo abaixo
+		;O ideal é fazer o mesmo com as demais, para melhorar a performance da Stored Procedure (mas não vou fazer isso agora)
+		;vvvvv
+		;set isRouteFromReq        = $$IsRouteFromRequisitante^VARFechamentoContabil(reference)
+		;set isLocalDestinoTransf  = $$IsLocalDestinoTransfArmazenagem^VARFechamentoContabil(reference)
+		;set isLocalAceiteTransf   = $$IsLocalAceiteTransfArmazenagem^VARFechamentoContabil(reference)
+		;set isRouteFromAbast      = $$IsRouteFromAbastecedor^VARFechamentoContabil(reference)
+		;2014-12-15	Henrique Dias	HEVA-1667	Correções na query após realização do merge
+		;set tipoProducao           = $$GetTipoProducao^VARFechamentoContabil(reference, movementType)
+		set tipoProducao           = $$GetTipoProducao^VARFechamentoContabil(reference)
+		set tipoProducaoEstornada  = $$GetTipoProducaoEstornada^VARFechamentoContabil(reference)
+		set blnSaidaParaManipulacaoMagistral = $$IsSaidaParaManipulacaoMagistral^VARFechamentoContabil(reference, movementType)
+
+		//DEVOLUCAO
+		if (((movementType = 22)
+			 && (movmtVetor = "Entrada"))
+			||((movementType = 1)
+			   && (fornRecebimento = fornFechamentoCont)
+			   && (tipoRecebimento = 4)
+			   && (movmtVetor = "Entrada"))
+			||((movementType = 7)
+			   && (natureza = "DB")
+			   && (tipoEstorno = 4)
+			   && (fornEstorno = fornFechamentoCont)
+			   && (movmtVetor = "Saída"))
+			|| ((movementType = 37)
+		 	   && (tipoProducaoEstornada = 2)
+			   && (movmtVetor = "Entrada")))
+		 {
+			 if (movmtVetor = "Entrada") {
+				 set Devolucao(grupoPai) = +$get(Devolucao(grupoPai)) + txValueFormatado
+			 }
+			 else {
+				 set Devolucao(grupoPai) = +$get(Devolucao(grupoPai)) - txValueFormatado
+			 }
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //REQUISICAO
+		 ;vvvvvvvvvv Movido para o final da rotina vvvvvvvvvv
+		 ;Pois precisa das mesmas validações da Transferência
+		 
+		 //DOACAO-ENTRADA
+		 elseif (((movementType = 1)
+			   && (natureza = "DB")
+			   && (tipoRecebimento = 2)
+			   && (fornRecebimento = fornFechamentoCont)
+			   && (movmtVetor = "Entrada"))
+			  ||((movementType = 7)
+				 && (natureza = "DB")
+				 && (tipoEstorno = 2)
+				 && (fornEstorno = fornFechamentoCont)
+				 && (movmtVetor = "Saída")))
+		 {
+			 if (movmtVetor = "Entrada") {
+				 set DoacaoEntrada(grupoPai) = +$get(DoacaoEntrada(grupoPai)) + txValueFormatado
+			 }
+			 else {
+				 set DoacaoEntrada(grupoPai) = +$get(DoacaoEntrada(grupoPai)) - txValueFormatado
+			 }
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //DOACAO-SAIDA
+		 elseif ((movementType = 40)
+			  && (movmtVetor = "Saída")
+			  && (reasonCode = 5)
+			  && (tipoINADJ = 1))
+		 {
+			 set DoacaoSaida(grupoPai) = +$get(DoacaoSaida(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //EMPRESTIMO
+		 elseif ((movementType = 40)
+			  && (movmtVetor = "Saída")
+			  && (reasonCode = 5)
+			  && (tipoINADJ = 2))
+		 {
+			 set Emprestimo(grupoPai) = +$get(Emprestimo(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //MONT-KIT
+		 elseif ((movementType = 36)
+			  && (movmtVetor = "Entrada")
+		 	  &&  ((tipoProducao = 0) || (tipoProducao = 1)))
+		 {
+			 set MontKit(grupoPai) = +$get(MontKit(grupoPai)) + txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //ORDEM-PRODUÇÃO
+		 // Apesar de não ser mostrado no relatório, esse valor é calculado para evitar que o valor contábil apareça na coluna
+		 // de arredondamento.
+		 elseif ((movementType = 36)
+			  && (movmtVetor = "Entrada")
+			  ; 2014-12-15	Henrique Dias	HEVA-1667	Correções na query após realização do merge
+		 	  ;&&  ((tipoProducao = 2) || blnManipulacaoMagistral))
+		 	  &&  ((tipoProducao = 2) || blnSaidaParaManipulacaoMagistral))
+		 {
+			 set OrdemProd(grupoPai) = +$get(OrdemProd(grupoPai)) + txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //DESMONT-KIT
+		 elseif ((movementType = 38)
+			  && (movmtVetor = "Saída")
+		 	  &&  (tipoProducao = 1))
+		 {
+			 set DesmontKit(grupoPai) = +$get(DesmontKit(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //ESTORNO ORDEM-PRODUÇÃO
+		 elseif ((movementType = 38)
+			  && (movmtVetor = "Saída")
+		 	  &&  (tipoProducao = 2))
+		 {
+			 set EstornoOrdemProd(grupoPai) = +$get(EstornoOrdemProd(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //ESTORNO-ITEM-KIT
+		 elseif ((movementType = 37)
+		 	  && (tipoProducaoEstornada '= 2)
+			  && (movmtVetor = "Entrada"))
+		 {
+			 set EstornoItemKit(grupoPai) = +$get(EstornoItemKit(grupoPai)) + txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //SAIDA-ITEM-KIT
+		 elseif ((movementType = 35)
+		 	  && (tipoProducao '= 2) && 'blnSaidaParaManipulacaoMagistral
+			  && (movmtVetor = "Saída"))
+		 {
+			 set SaidaItemKit(grupoPai) = +$get(SaidaItemKit(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //NF-RECEBIMENTO
+		 elseif (((movementType = 1)
+			   && (natureza = "DB")
+			   && (movmtVetor = "Entrada"))
+			  && (((tipoRecebimento = 1)
+			 	  && ((fornRecebimento '=  fornFechamentoCont)
+			 	      ||(possuiCompraAssoc = 1)))
+			 	  || ((tipoRecebimento '= 1)
+			 	      && (tipoRecebimento '= 2)
+			 	      && (tipoRecebimento '= 4))))
+		 {
+			 set NfRecebimento(grupoPai) = +$get(NfRecebimento(grupoPai)) + txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //NF-ESTORNO
+		 elseif ((movementType = 7)
+			  && (tipoEstorno = 1)
+			  && (fornEstorno '=  fornFechamentoCont)
+			  && (movmtVetor = "Saída"))
+		 {
+			 set NfEstorno(grupoPai) = +$get(NfEstorno(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //AJUSTE
+		 elseif ((movementType = 40)
+			  && ((reasonCode = 0)
+			      ||(reasonCode = 1)
+			      ||(reasonCode = 2)
+			      ||(reasonCode = 4)
+			      ||(reasonCode = 9)))
+		 {
+			 if (movmtVetor = "Entrada") {
+				 set Ajuste(grupoPai) = +$get(Ajuste(grupoPai)) + txValueFormatado
+			 }
+			 else {
+				 set Ajuste(grupoPai) = +$get(Ajuste(grupoPai)) - txValueFormatado
+			 }
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //INVENTARIO-ENTRADA
+		 elseif (((movementType = 41)
+		       && (movmtVetor = "Entrada"))
+			  || ((movementType = 1)
+			      && (fornRecebimento =  fornFechamentoCont)
+			      && (tipoRecebimento = 1)
+			      && (possuiCompraAssoc = 0)
+			      && ($$GetMesAnoInicialFechamento^VARMapaMovMensal(mes, ano) = 1)))
+		 {
+			 set InventarioEntrada(grupoPai) = +$get(InventarioEntrada(grupoPai)) + txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		 //INVENTARIO-SAIDA
+		 elseif ((movementType = 41)
+		      && (movmtVetor = "Saída"))
+		 {
+			 set InventarioSaida(grupoPai) = +$get(InventarioSaida(grupoPai)) - txValueFormatado
+			 set arrGrupoPai(grupoPai) = ""
+		 }
+		//ACEITE DE TRANSFERÊNCIA
+		elseif ((movementType = $$$mtAceiteTransferencia) && (storage '= "EmTransito"))
+		{
+			set isLocalAceiteTransf = $$IsLocalAceiteTransfArmazenagem^VARFechamentoContabil(reference)
+			if (isLocalAceiteTransf = $$$YES) {
+				//Registra a saída da transferencia quando a mesma é recebida
+				set TfrSaida(grupoPai)    = +$get(TfrSaida(grupoPai)) - txValueFormatado
+				set arrGrupoPai(grupoPai) = ""
+				
+				//Registra entrada do aceite
+				set TfrEntrada(grupoPai)  = +$get(TfrEntrada(grupoPai)) + txValueFormatado
+			}		
+			;Se o Local de Destino NÃO é de Armazenagem, deve considerar como Requisição
+			else{
+				set Requisicao(grupoPai)   = +$get(Requisicao(grupoPai)) - txValueFormatado
+				set arrGrupoPai(grupoPai)  = ""
+			}
+		}
+		/* HEVA-1968
+			Toda essa validação foi retirada pois é para considerar apenas quando é feito o aceite. 
+			Quando é feita a saída e não é feito o aceite ele iria travar na data e que está em transito
+			Quando é feito o estorno ele estava calculando uo saída ou entrada, mas o estorno não pode ser contabilizado
+			pois após feito o estorno teoricamente não foi feito a transferencia. 
+		elseif ( (movementType = $$$mtTransferencia) || (movementType = $$$mtAceiteTransferencia) || (movementType = $$$mtEstornoTransferencia) )
+		{
+			
+			;Se o usuário escolheu algum Local específico no filtro, e o lançamento não for desse local, então continua 
+			;Teoricamente não precisa dessa verificação pois o local já está sendo filtrado no SQL
+			; 2014-09-30	Henrique Dias	HEVA-1606	Remoção de validação desnecessária
+			;if ($length($get(local)) > 0) && (location '= local){
+			;	continue
+			;}
+
+			;Desconsidera as movimentações para o endereço EmTransito
+			if (storage '= "EmTransito") {
+				//Transferência
+				if (movementType = $$$mtTransferencia){
+					if (movmtVetor = "Saída"){
+						set isLocalDestinoTransf = $$IsLocalDestinoTransfArmazenagem^VARFechamentoContabil(reference)
+						;Se o Local de Destino é de Armazenagem, considera como Transferência (SAÍDA)
+						if (isLocalDestinoTransf = $$$YES){
+							set isRouteFromReq = $$IsRouteFromRequisitante^VARFechamentoContabil(reference)
+							;Verifica se o Aceite foi processado no mesmo mês da Transferência
+							if ($$AceiteProcessMesmoMesTransf^VARFechamentoContabil(reference) = $$$YES)
+							;Verifica pela rota definida na Transferência se o produto que está EmTransito pertence ao local de destino (Requisitante)
+							;Necessário para evitar problema de Transferência feita em um mês e Aceite no mês seguinte
+							|| (($$AceiteProcessMesmoMesTransf^VARFechamentoContabil(reference) = $$$NO) && (isRouteFromReq = $$$YES)){
+								set TfrSaida(grupoPai)    = +$get(TfrSaida(grupoPai)) - txValueFormatado
+								set arrGrupoPai(grupoPai) = ""
+							}
+						}
+						;Se o Local de Destino NÃO é de Armazenagem, deve considerar como Requisição
+						else{
+							set Requisicao(grupoPai)   = +$get(Requisicao(grupoPai)) - txValueFormatado
+							set arrGrupoPai(grupoPai)  = ""
+						}
+					}
+					elseif (movmtVetor = "Entrada"){
+						;Teoricamente nunca vai existir movimentação do tipo 30-Transferência como Entrada
+						;(exceto para o EmTransito, já filtrado acima)
+						;Copiado da rotina anterior por garantia
+						
+						set isLocalDestinoTransf = $$IsLocalDestinoTransfArmazenagem^VARFechamentoContabil(reference)
+						;Se o Local de Destino é de Armazenagem, considera como Transferência
+						if (isLocalDestinoTransf = $$$YES){
+							set isRouteFromReq = $$IsRouteFromRequisitante^VARFechamentoContabil(reference)
+							;Verifica se o Aceite foi processado no mesmo mês da Transferência
+							if ($$AceiteProcessMesmoMesTransf^VARFechamentoContabil(reference) = $$$YES)
+							;Verifica pela rota definida na Transferência se o produto que está EmTransito pertence ao local de destino (Requisitante)
+							;Necessário para evitar problema de Transferência feita em um mês e Aceite no mês seguinte
+							|| (($$AceiteProcessMesmoMesTransf^VARFechamentoContabil(reference) = $$$NO) && (isRouteFromReq = $$$YES)){
+									set TfrEntrada(grupoPai)  = +$get(TfrEntrada(grupoPai)) + txValueFormatado
+									set arrGrupoPai(grupoPai) = ""
+							}
+						}
+					}
+					
+				}
+				//Aceite de Transferência
+				elseif (movementType = $$$mtAceiteTransferencia){
+					if (movmtVetor = "Entrada"){
+						set isLocalAceiteTransf = $$IsLocalAceiteTransfArmazenagem^VARFechamentoContabil(reference)
+						;Se o Local do Aceite é de Armazenagem, considera como Transferência (ENTRADA)
+						if (isLocalAceiteTransf = $$$YES){
+							//set isRouteFromAbast = $$IsRouteFromAbastecedor^VARFechamentoContabil(reference)
+							;Verifica pela rota definida na Transferência se o produto que está EmTransito pertence ao local de origem (Abastecedor)
+							;Necessário para evitar problema de Transferência feita em um mês e Aceite no mês seguinte
+							//Removi essa validação porque acho que no Aceite não precisa verificar,
+							//também porque com essa validação o valor de arredondamento continuou alto
+							//if (isRouteFromAbast = $$$YES){
+								set TfrEntrada(grupoPai)   = +$get(TfrEntrada(grupoPai)) + txValueFormatado
+								set arrGrupoPai(grupoPai)  = ""
+							//}
+						}
+						;Se o Local do Aceite NÃO é de Armazenagem, não precisa considerar, pois a entrada será para o endereço X - Consumo
+					}
+				}
+				//Estorno de Transferência
+				elseif (movementType = $$$mtEstornoTransferencia) {
+					if (movmtVetor = "Saída") {
+						set TfrSaida(grupoPai)    = +$get(TfrSaida(grupoPai)) - txValueFormatado
+						set arrGrupoPai(grupoPai) = ""
+					}
+					elseif (movmtVetor = "Entrada"){
+						set TfrEntrada(grupoPai)  = +$get(TfrEntrada(grupoPai)) + txValueFormatado
+						set arrGrupoPai(grupoPai) = ""
+					}
+				}
+			}
+		}
+		*/
+		
+		//REQUISIÇÃO - DISPENSAÇÃO AO PACIENTE - RECEBIMENTO DE PRODUÇÃO
+		elseif (movementType = $$$mtRequisicao) || (movementType = $$$mtDispensacaoPaciente) || (movementType = $$$mtRecebimentoProducao)
+		{
+			//Requisição
+			if (movementType = $$$mtRequisicao) {
+				set isLocalDestinoRequis = $$IsLocalDestinoRequisArmazenagem^VARFechamentoContabil(reference)
+				;Se o Local de Destino é de Armazenagem, considera como Transferência (SAÍDA)
+				if (isLocalDestinoRequis = $$$YES){
+					;O Tipo de Movimento 11 - Requisicao é usado tanto para Entrada como para Saída
+					;portanto é necessário verificar para gravar no vetor correto
+					if (movmtVetor = "Saída") {
+						set TfrSaida(grupoPai)    = +$get(TfrSaida(grupoPai)) - txValueFormatado
+						set arrGrupoPai(grupoPai) = ""
+					}
+					elseif (movmtVetor = "Entrada"){
+						set TfrEntrada(grupoPai)   = +$get(TfrEntrada(grupoPai)) + txValueFormatado
+						set arrGrupoPai(grupoPai)  = ""
+					}
+				}
+				;Se o Local de Destino NÃO é de Armazenagem, deve considerar como Requisição
+				else{
+					if (movmtVetor = "Saída") {
+						set Requisicao(grupoPai)   = +$get(Requisicao(grupoPai)) -]]><![CDATA[ txValueFormatado
+						set arrGrupoPai(grupoPai)  = ""
+					}
+				}
+			}
+			//Dispensação ao Paciente
+			elseif (movementType = $$$mtDispensacaoPaciente){
+				if (movmtVetor = "Saída"){
+					set Requisicao(grupoPai)   = +$get(Requisicao(grupoPai)) - txValueFormatado
+					set arrGrupoPai(grupoPai)  = ""
+				}
+			}
+			//Recebimento de Produção
+			elseif (movementType = $$$mtRecebimentoProducao){
+				if (movmtVetor = "Saída"){
+					;Só considera o Recebimento de Produção se o Tipo for igual a 2 - Manipulação Oficinal, ou manipulação magistral.
+					if (tipoProducao = 2) || blnSaidaParaManipulacaoMagistral {
+						set Requisicao(grupoPai) = +$get(Requisicao(grupoPai)) - txValueFormatado
+						set arrGrupoPai(grupoPai) = ""
+					}
+				}
+			}
+		}
+		
+		&sql(FETCH MapaMovMensal)
+	}
+	&sql(CLOSE MapaMovMensal)
+	
+	
+	;for i=1:1:100 hang 1
+	Set line = 1
+	
+	;HEVA-1429: Exibir saldo dos grupos que possuem estoque mas que não houveram movimentação
+	&sql(DECLARE GruposPai CURSOR FOR
+		SELECT DISTINCT ParentGroup,
+		NVL((SELECT SUM(+alSOH.dBundleStock.QtyOnHand) 
+			 FROM alSOH.dBundleStock 
+			 WHERE $$SQLGetGrupoPai^VARSQL(Item->ItemGroup) = ParentGroup 
+			 GROUP BY $$SQLGetGrupoPai^VARSQL(Item->ItemGroup)
+		),0)  AS EstoqueGrupo
+		INTO :grupoPai, :estoqueGrupo
+		FROM SQLUser.INItemGroup WHERE ParentGroup IS NOT NULL			
+	)
+	
+	&sql(OPEN GruposPai)
+	&sql(FETCH GruposPai)
+	
+	while (SQLCODE = 0) {
+		if (('$data(arrGrupoPai(grupoPai))) && (+estoqueGrupo = 0)) {
+			&sql(FETCH GruposPai)
+			continue
+		}
+
+		set descGrupoPai = grupoPai_" - "_$$SQLGetDescGrupoItem^VARSQL(grupoPai)
+		if ($length($get(local)) > 0) {
+			set saldoInicialGrupo = $$GetSaldoInicial^VARMapaMovMensal(mes, ano, grupoPai, local)
+		}
+		else {
+			set saldoInicialGrupo = $$GetSaldoInicial^VARMapaMovMensal(mes, ano, grupoPai)
+		}
+		set saldoAtualGrupo = $fnumber(saldoInicialGrupo,"",2) +$fnumber($get(Devolucao(grupoPai)),"",2) +$fnumber($get(Requisicao(grupoPai)),"",2) +$fnumber($get(DoacaoEntrada(grupoPai)),"",2) +$fnumber($get(DoacaoSaida(grupoPai)),"",2) +$fnumber($get(Emprestimo(grupoPai)),"",2) +$fnumber($get(MontKit(grupoPai)),"",2) +$fnumber($get(DesmontKit(grupoPai)),"",2) +$fnumber($get(EstornoItemKit(grupoPai)),"",2) +$fnumber($get(SaidaItemKit(grupoPai)),"",2) +$fnumber($get(NfRecebimento(grupoPai)),"",2) +$fnumber($get(NfEstorno(grupoPai)),"",2) +$fnumber($get(Ajuste(grupoPai)),"",2) +$fnumber($get(InventarioEntrada(grupoPai)),"",2) +$fnumber($get(InventarioSaida(grupoPai)),"",2) +$fnumber($get(TfrEntrada(grupoPai)),"",2) +$fnumber($get(TfrSaida(grupoPai)),"",2) +$fnumber($get(OrdemProd(grupoPai)),"",2) +$fnumber($get(EstornoOrdemProd(grupoPai)),"",2)
+		
+		;HEVA-1429: Exibir saldo dos grupos que possuem estoque mas que não houveram movimentação
+		if ($data(arrGrupoPai(grupoPai))) {
+			set saldoAtualGrupo = $fnumber(saldoInicialGrupo,"",2) +$fnumber($get(Devolucao(grupoPai)),"",2) +$fnumber($get(Requisicao(grupoPai)),"",2) +$fnumber($get(DoacaoEntrada(grupoPai)),"",2) +$fnumber($get(DoacaoSaida(grupoPai)),"",2) +$fnumber($get(Emprestimo(grupoPai)),"",2) +$fnumber($get(MontKit(grupoPai)),"",2) +$fnumber($get(DesmontKit(grupoPai)),"",2) +$fnumber($get(EstornoItemKit(grupoPai)),"",2) +$fnumber($get(SaidaItemKit(grupoPai)),"",2) +$fnumber($get(NfRecebimento(grupoPai)),"",2) +$fnumber($get(NfEstorno(grupoPai)),"",2) +$fnumber($get(Ajuste(grupoPai)),"",2) +$fnumber($get(InventarioEntrada(grupoPai)),"",2) +$fnumber($get(InventarioSaida(grupoPai)),"",2) +$fnumber($get(TfrEntrada(grupoPai)),"",2) +$fnumber($get(TfrSaida(grupoPai)),"",2)
+		
+			;Adicionado o cálculo do Arredondamento aqui na rotina
+			;para calcular corretamente o Saldo Atual para cada grupo
+			;pois no relatório estava ficando errado, quando tinha mais de um grupo
+		
+			set valorLivroGrupo     = $$SQLGetSaldoFinalLivroReg^VARSQL(mes,ano,local,grupoPai)
+			set arredondamentoGrupo = saldoAtualGrupo - $fnumber(valorLivroGrupo,"",4)
+		
+		} else {
+			set saldoAtualGrupo 	= saldoInicialGrupo
+			set arredondamentoGrupo = 0
+			
+		}
+		
+		set ^CacheTemp("REPORTSP",reportId,line) = $ListBuild(grupoPai, descGrupoPai,  $fnumber(saldoInicialGrupo,"",2), $fnumber(+$get(Devolucao(grupoPai)),"",2), $fnumber(+$get(Requisicao(grupoPai)),"",2), $fnumber(+$get(DoacaoEntrada(grupoPai)),"",2), $fnumber(+$get(DoacaoSaida(grupoPai)),"",2), $fnumber(+$get(Emprestimo(grupoPai)),"",2), $fnumber(+$get(MontKit(grupoPai)),"",2), $fnumber(+$get(DesmontKit(grupoPai)),"",2), $fnumber(+$get(EstornoItemKit(grupoPai)),"",2), $fnumber(+$get(SaidaItemKit(grupoPai)),"",2), $fnumber(+$get(NfRecebimento(grupoPai)),"",2), $fnumber(+$get(NfEstorno(grupoPai)),"",2), $fnumber(+$get(Ajuste(grupoPai)),"",2), $fnumber(+$get(InventarioEntrada(grupoPai)),"",2), $fnumber(+$get(InventarioSaida(grupoPai)),"",2), $fnumber(+$get(TfrEntrada(grupoPai)),"",2), $fnumber(+$get(TfrSaida(grupoPai)),"",2), $fnumber(arredondamentoGrupo,"",2), $fnumber(saldoAtualGrupo,"",2))
+		;Corrigido para pegar o arrGrupoPai, pois do jeito que estava só mostrava o primeiro registro
+		;set grupoPai = $order(movMensal(grupoPai))
+		
+		&sql(FETCH GruposPai)
+		Set line = line +1
+	}
+	&sql(CLOSE GruposPai)
+	
+	// Build QHandle (AtEnd,ReportID,Index)
+	Set QHandle = $ListBuild(0,reportId,0)
+
+	Quit $$$OK]]></Implementation>
+</Method>
+
+<Method name="VARMapaMovMensalFetch">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>&amp;QHandle:%Binary,&amp;Row:%List,&amp;AtEnd:%Integer=0</FormalSpec>
+<PlaceAfter>VARMapaMovMensalExecute</PlaceAfter>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[// This fetch method should never have to change. 
+
+	// reportId - Report ID
+	// line   - sequence lineex which represents each row
+
+	// Restore QHandle
+	Set AtEnd = $List(QHandle,1)
+	Set reportId = $List(QHandle,2)
+	Set line = $List(QHandle,3)
+	Set line = $Order(^CacheTemp("REPORTSP",reportId,line))
+
+	If (line = "") {	// if there are no more rows, finish fetching
+	 Set AtEnd = 1
+	 Set Row = ""
+	}
+	Else {	// fetch row
+		Set Row = ^CacheTemp("REPORTSP",reportId,line)
+	}
+
+	// Save QHandle
+	Set QHandle = $ListBuild(AtEnd,reportId,line)
+	
+	Quit $$$OK]]></Implementation>
+</Method>
+<Query name="VARMapaMovMensal">
+<Type>%SQLQuery</Type>
+<FormalSpec>mes:%Integer,ano:%Integer,local:%String,grupo:%String</FormalSpec>
+<SqlProc>1</SqlProc>
+
+<Parameter name="CONTAINID" value="0"/>
+
+<Parameter name="ROWSPEC" value="GrupoPai:%String(MAXLEN=255), DescGrupoPai:%String(MAXLEN=255), SaldoInicialGrupo:%Double,  Devolucao:%Double, Requisicao:%Double, DoacaoEntrada:%Double, DoacaoSaida:%Double, Emprestimo:%Double, MontKit:%Double, DesmontKit:%Double, EstornoItemKit:%Double, SaidaItemKit:%Double, NfRecebimento:%Double, NfEstorno:%Double, Ajuste:%Double, InventarioEntrada:%Double, InventarioSaida:%Double, TfrEntrada:%Double, TfrSaida:%Double, Arredondamento:%Double, SaldoAtualGrupo:%Double"/>
+</Query>
+<Storage name="Default">
+<Type>%Library.CacheStorage</Type>
+<DataLocation>^Report.VARMapaMovMensalD</DataLocation>
+<DefaultData>VARMapaMovMensalDefaultData</DefaultData>
+<IdLocation>^Report.VARMapaMovMensalD</IdLocation>
+<IndexLocation>^Report.VARMapaMovMensalI</IndexLocation>
+<StreamLocation>^Report.VARMapaMovMensalS</StreamLocation>
+<ExtentSize>100000</ExtentSize>
+<Data name="VARMapaMovMensalDefaultData">
+<Value name="1">
+<Value>%%CLASSNAME</Value>
+</Value>
+</Data>
+</Storage>
+</Class>
+</Export>

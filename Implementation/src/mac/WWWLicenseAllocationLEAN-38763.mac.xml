@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWWLicenseAllocationLEAN" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+#include COMSYS
+ 
+WWWLicenseAllocationLEAN(pstrProcess="", pblnShowError=$$$YES)    ; FIXME : Separate routine and tag <GRF>
+	;-------------------------------------------------------------------------------
+	; Allocate sessions and processes to license   
+	;
+	;	set blnSessionLoginOK=$$^WWWLicenseAllocation("BackgroundJob")
+	;
+	; Inputs: pstrProcess = "" if normal entry (www.cls, COMLogin.cls)
+	;                      "BackgroundJob" in case of a backgoundJob
+	;                      
+	;         pblnShowError = 1 if a error message should appear
+	;
+	; Returns:  1 = OK  0 = Error
+	;
+	; History:
+	; 21-Oct-2008	FIS		SR16065: re-written
+	; 05-Jul-2007	GRF		SR15550: Boolean Macros; default arguments rather than
+	; 						$get
+	; 21-Jun-2007	ANDREAS	SR15550: Created
+	; 29-Nov-2016	CARLOS  Changes for LEAN control license model (without Caché license linkage)
+	;-------------------------------------------------------------------------------
+	new idClient, strStatus, intMaxCon, intAddNo, blnCSPSession, blnNewCon
+		
+	set strStatus     = '$$$OK   ;return status     ; FIXME : Why no error message in this case? <GRF>
+	set blnCSPSession =  $$$YES   ;is CSP session
+	set blnNewCon     =  $$$NO   ;is New Connection
+	set namespace     = $zutil(5)
+	set (msgErro, ativos, dataExpiracao) = ""
+	
+	if ($get(YBED) = "") {
+		set YBED = $zcvt($get(%request.Data("YBED",1)),"U")
+	}
+	
+	// Set ClientId
+	// Check the Caché configuration at ^|"%SYS"|SYS("UserIdentification"))
+	// if ($$isExplicitLicenseUserIdentification^COMSTARTZstart()) {
+
+	set idClient      = $get(%request.CgiEnvs("REMOTE_ADDR"), "unknown")
+
+	// Increase ClientId if max. connection are reached
+	set intAddNo  = 0
+	set intMaxCon = $System.License.MaxConnections() - 1  ; no. of available connections less 1 (just in case)
+ 	while ($System.License.ConnectionCount(idClient) > intMaxCon) {
+	 	set idClient = $piece(idClient, "_", 1)_"_"_$increment(intAddNo)
+	}
+	if ($System.License.ConnectionCount(idClient) = 0) set blnNewCon = $$$YES
+
+	set strStatus = %session.Login(idClient, , 1)    ; FIXME : Do we need sc to strStatus conversion? <GRF?
+
+	// ==================================================================
+	// License Control do LEAN
+	set licencaExpirada = $$LicencaExpirada^WWWLICENSEEncr(namespace, .dataExpiracao)
+	set limiteLicenca	= $$LimiteLicenca^WWWLICENSEEncr(namespace)
+	set licencaEmUso	= $$InUse^WWWLICENSEEncr(namespace, .ativos)
+	
+	if ($get(YBED) '= "") && ($get(YBED) '= "UNKNOWN") {
+		// Licença irá expirar
+		if ((licencaExpirada <= 0) && ((+dataExpiracao - $h) < 30)) {
+			if ('$data(^CacheTempLicenseExpire($zn,+$h,$get(YBED)))) {
+				set ^CacheTempLicenseExpire($zn,+$h,$get(YBED)) = ""
+				set msgErro = "<script type='text/javascript'>window.open('LicenseInfo.csp?TYPE=LICENCAEXPIRADA','popupLicenca','width=400,height=250');</script>"
+				set strStatus = '$$$OK
+			}
+		}
+		elseif licencaExpirada > 0 {
+			set msgErro = "<script type='text/javascript'>window.location.href = 'LicenseInfo.csp?TYPE=LICENCAEXPIRADA';</script>"
+			set strStatus = '$$$OK
+		}
+		
+		;Se a licença não está expirada e o número de usuários ativos atingiu o limite
+		if 'licencaExpirada, limiteLicenca <= licencaEmUso {
+			set msgErro = ativos
+			s msgErro = "<script type='text/javascript'>window.location.href = 'LicenseInfo.csp?TYPE=LIMITEEXCEDIDO';</script>"
+			set strStatus = '$$$OK
+		}
+	}
+	// License Control do LEAN
+	// ==================================================================
+	
+ 	// Log Login
+ 	if ($$$ISOK(strStatus)) {
+		do Log(idClient, blnNewCon)
+ 	}
+ 	
+ 	// Display Error Message on screen
+ 	if (('$$$ISOK(strStatus)) && (pblnShowError = $$$YES)) {
+		write $get(msgErro)
+ 	}
+
+ 	quit strStatus
+
+AllocWebLicense(YBED)
+ 	quit $$allocWebLicense^COMSTARTZstart($$GetLicenseIdFromUser(YBED))
+
+AllocWebServiceLicense(YBED)
+ 	quit $$allocWebServiceLicense^COMSTARTZstart($$GetLicenseIdFromUser(YBED))
+
+AllocServiceLicense(YBED)
+ 	quit $$allocServiceLicense^COMSTARTZstart($$GetLicenseIdFromUser(YBED))
+
+GetLicenseIdFromUser(YBED)
+	new strLicenseUserId
+
+	if ($length(YBED) > 0) {
+		set strLicenseUserId = $$$WWW013LicenseUserId($get(^WWW013(0, YBED, 1)))
+		if ($length(strLicenseUserId) = 0) {
+			set strLicenseUserId = YBED
+		}
+	}
+	else {
+		set strLicenseUserId = ""
+	}
+
+	quit strLicenseUserId
+
+Log(pidClient="unknown", pblnNewCon=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Log CSP License Logins   
+	; 
+	; Inputs: pidClient    = Client Id
+	;         pblnNewCon   = New Connection (force log)
+	;
+	; History:
+	; 22-Oct-2008	FIS		SR16065: Created
+	;-------------------------------------------------------------------------------
+	new intLogin, intHrs
+
+	set intHrs = $piece($horolog, ",", 2) / 60 \ 60  ; current hour
+
+	if ((pblnNewCon = $$$YES) ||
+		('$data(^CacheTempLicenseLogin(+$horolog,pidClient)))) {
+		set intLogin = $order(^CacheTempLicenseLogin(+$horolog, pidClient, ""), -1) + 1
+		set ^CacheTempLicenseLogin(+$horolog, pidClient, intLogin) =
+			$listbuild($piece($horolog, ",", 2), intHrs)
+	}
+
+	quit 1
+
+Snapshot()
+	;-------------------------------------------------------------------------------
+	; Log Snapshot of License Usage   
+	; 
+	; History:
+	; 22-Oct-2008	FIS		SR16065: Created
+	;-------------------------------------------------------------------------------
+	new intHrs, intNext, intSum
+
+	set intHrs = $piece($horolog, ",", 2) / 60 \ 60  ; current hour
+
+	// Save current license usage
+	set intNext = $order(^CacheTempLicenseUsage(+$horolog, intHrs, ""), -1) + 1
+	set ^CacheTempLicenseUsage(+$horolog, intHrs, intNext) =
+		$System.License.LUConsumed()  // current license consumption
+
+	quit $$$OK
+
+GetHourConsumption(pdteDay, pintHrs, pblnGetMax=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Calculate Maximum / Average License Usage per Hour  
+	; 
+	; Inputs:
+	; pdteDay   = Day
+	; pintHrs   = Hour (0-23, where 0= 0:00am-0:59am, 1= 1:00am-1:59am, ... 23= 11:00pm-11:59pm)
+	; blnGetMax = Return Max. Consumption per Hour (default = Return Average Consumption)
+	; 
+	; History:
+	; 22-Oct-2008	FIS		SR16065: Created
+	;-------------------------------------------------------------------------------
+	new intCounts, intNext, intSum, intMax, intNumber
+
+	set intMax    = 0
+	set intSum    = 0
+	set intCounts = 0
+
+	set pdteDay = +$get(pdteDay)
+	if (pdteDay = 0) set pdteDay = +$horolog
+
+	// Calculate maximum / average License Usage per hour
+	if ((pintHrs '< 0) && (pintHrs '> 23)) {
+		set intNext = ""
+		for {
+			set intNext = $order(^CacheTempLicenseUsage(pdteDay, pintHrs, intNext))
+			if (intNext = "") quit
+
+			set intCounts = intCounts +1
+			set intNumber = $get(^CacheTempLicenseUsage(pdteDay, pintHrs, intNext))
+			set intSum = intSum + intNumber
+			if (intNumber > intMax) set intMax = intNumber
+		}
+	}
+
+	if (intCounts '= 0) {
+		if (pblnGetMax = $$$YES) {             // Return Max. Number
+			set intSum = intMax
+		}
+		else {
+			set intSum = (intSum \ intCounts)  // Return Average Number
+		}
+	}
+
+	quit intSum
+
+GetDayConsumption(pdteDay, pblnGetMax=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Calculate Maximum / Average License Usage per Day  
+	; 
+	; Inputs:
+	; pdteDay   = Day
+	; blnGetMax = Return Max. Consumption (default = Return Average Consumption)
+	; 
+	; History:
+	; 22-Oct-2008	FIS		SR16065: Created
+	;-------------------------------------------------------------------------------
+	new intSum, intMax, intNumber
+
+	set intSum = 0
+	set intMax = 0
+
+	set pdteDay = +$get(pdteDay)
+	if (pdteDay = 0) set pdteDay = +$horolog
+
+	for intHrs = 0:1:23 {
+		set intNumber = $$GetHourConsumption(pdteDay, intHrs, pblnGetMax)
+		set intSum = intSum + intNumber
+		if (intNumber > intMax) set intMax = intNumber
+	}
+
+	if (pblnGetMax) {
+		set intSum = intMax
+	}
+	elseif (intSum '= 0) {
+		if ((intSum \ 24) > 0) {
+			set intSum = (intSum \ 24)
+		}
+		else {
+			set intSum = 1
+		}
+	}
+
+	quit intSum
+
+GetMaxConsumption()
+	;-------------------------------------------------------------------------------
+	; Return Maximum License Usage since installation 
+	; 
+	; History:
+	; 22-Oct-2008	FIS		SR16065: Created
+	;-------------------------------------------------------------------------------
+	quit $System.License.LUMaxConsumed()  //current license consumption
+
+LimpaTodasLicencas()
+	; do LimpaTodasLincencas^WWWLicenseAllocationLEAN()
+	kill ^WWWUSER
+	kill ^CacheTempSessionStart
+	kill ^CacheTempSessionEnd
+	kill ^CacheTempSessionLastAction
+	kill ^CacheTempSession
+			
+	quit
+]]></Routine>
+</Export>

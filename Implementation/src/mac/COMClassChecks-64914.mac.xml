@@ -1,0 +1,306 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMClassChecks" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMClassChecks
+#include COMConst
+#include WWWConst
+#include COMSYS
+#include %occInclude
+	
+	
+CheckAllV2Classes(pblnUpdate,pidLog)
+    ;-------------------------------------------------------------------------------
+    ; Check all the AL classes for changes
+    ; 
+    ; Inputs:
+    ;         pblnUpdate 	    = Update Saved Class
+    ;         pidLog			= name of
+    ;
+    ; Returns: 0 = No Change, 1 = Changed
+    ;
+    ; History:
+    ; 15-Dec-2008	GRF		SR16113: variable prefixes to standard
+    ; 03-Nov-2008	PPP		SR16113: Added code for Deleted & Changed Indices
+    ; 03-Nov-2008	PPP		SR16113: Created
+    ;-------------------------------------------------------------------------------
+	new arrList,blnResp,idClass,intCount,intIndexChanged,objResult,strRef
+	
+	do AddMessage^COMLog(pidLog,"Checking All V2 Classes for Index Changes")
+	
+	set strRef = "AL"
+	
+	set objResult = ##class(%ResultSet).%New("%Dictionary.ClassDefinitionQuery:Summary")
+	do objResult.Execute()
+	
+	for {
+		quit:'objResult.Next()
+		
+		set idClass = objResult.Data("Name")
+	
+		if $zconvert($extract(idClass,1,$length(strRef)),"U") = strRef {
+			//Check for Persistant Classes
+			if $$CheckPersistent(idClass) {
+				set blnResp = $$CheckV2Class(idClass,$$$YES,.arrList,.intIndexChanged)
+				
+				if ($io["|TNT|") || ($io["/dev/pts/") && blnResp {
+					write !,idClass," = Changed ",$select(intIndexChanged:"ReIndex Required",1:"")
+					for intCount=1:1:arrList {
+						write !,arrList(0,intCount)
+					}
+				}
+	
+				if blnResp && (pidLog'="") {
+					do AddMessage^COMLog(pidLog,"Class "_idClass_" Changed ("_$select(intIndexChanged=1:"ReIndex Required",intIndexChanged=2:"ReIndex Required [Dirty]",1:"")_")")
+					
+					for intCount=1:1:arrList {
+						do AddMessage^COMLog(pidLog,arrList(0,intCount))
+					}
+				}
+		
+				if intIndexChanged {
+					set intCount = $$CheckExtent(idClass)
+					if intCount {
+						do ReIndexV2Class(idClass,$$$YES,pidLog,intCount)
+					} else {
+						do AddMessage^COMLog(pidLog,"No Records Found for Class "_idClass)					
+					}
+				}
+			}
+		}
+	}
+ 
+	do objResult.%Close()
+	do AddMessage^COMLog(pidLog,"Completed Checking All V2 Classes for Index Changes")
+	
+	quit
+	
+	
+CheckV2Class(pidClass,pblnUpdate=$$$NO,&parrList,&pintIndexChanged)
+    ;-------------------------------------------------------------------------------
+    ; Check an AL Class for changes
+    ; 
+    ; Inputs:
+    ;	pidClass 		    		= @NM Class 
+    ;	pblnUpdate	    			= Update Saved Class
+    ; 
+    ; 	ByRef : parrList		    = Pass back list of changes
+    ;	ByRef : pintIndexChanged	= Index Changed pass back Status
+    ;									0 = Not Required, 1 = Required, 2 = Dirty
+    ;
+    ; Returns: 0 = No Change, 1 = Changed
+    ;
+    ; History:
+    ; 15-Dec-2008	GRF		SR16113: variables in new list that aren't used;
+    ; 							duplicate initialisation of blnChanged
+    ; 03-Nov-2008	PPP		SR16113: Created
+    ;-------------------------------------------------------------------------------
+	new arrIndexProperties,blnChanged,intCnt,intMaxCnt,objClass,objIndex
+	new strName,strProperties
+	
+	kill parrList
+	set parrList=0
+	
+	if $get(Y)="" do ^WWWVAR
+	
+	set blnChanged       = $$$NO ; Assume no change
+	set pintIndexChanged = $$$NO
+	
+	if pidClass="" quit blnChanged
+ 
+	set objClass = ##class(%Library.ClassDefinition).%OpenId(pidClass)
+ 
+	if objClass'=$$$NULLOREF {
+		set intMaxCnt = objClass.Indices.Count()
+		for intCnt = 1:1:intMaxCnt {
+			set objIndex = objClass.Indices.GetAt(intCnt)
+			set strProperties = objIndex.Properties
+			set strName       = objIndex.Name
+			set arrIndexProperties(strName) = strProperties
+ 
+			if '$data(^COMClassIndexSave(pidClass,strName)) {
+				set pintIndexChanged = 1
+				set blnChanged = $$$YES
+				set parrList   = parrList+1
+				set parrList(0,parrList) = "Index "_strName_"("_strProperties_") Added "
+			}
+		}
+		
+		//Check for Changed and Removed Indices
+		set strName=""
+		for {
+			set strName = $order(^COMClassIndexSave(pidClass,strName))
+			quit:strName=""
+			
+			if $get(arrIndexProperties(strName))'=$get(^COMClassIndexSave(pidClass,strName)) {
+				set pintIndexChanged = 1
+				set blnChanged = $$$YES
+				set parrList   = parrList+1
+				set parrList(0,parrList) = "Index "_strName_" Changed from "_$get(^COMClassIndexSave(pidClass,strName))_" to "_$get(arrIndexProperties(strName))
+			
+			} elseif '$data(arrIndexProperties(strName)) {
+				set pintIndexChanged = 1
+				set blnChanged = $$$YES
+				set parrList   = parrList+1
+				set parrList(0,parrList) = "Index "_strName_" Deleted "
+			}
+		}
+	}
+	
+	if blnChanged {
+		if pblnUpdate {
+			kill ^COMClassIndexSave(pidClass)
+ 
+			set strName = ""
+			for {
+				set strName = $order(arrIndexProperties(strName))
+				quit:strName=""
+				
+				set ^COMClassIndexSave(pidClass,strName)=$get(arrIndexProperties(strName))
+			}
+		}
+	}
+ 
+	quit blnChanged
+	
+	
+CheckPersistent(pidClass)
+    ;-------------------------------------------------------------------------------
+    ; Check an Class if it is persistent
+    ; 
+    ; Inputs:
+    ;	pidClass = @NM Class 
+    ;
+    ; Returns: boolean : is class persistent? (1 = Yes, 0 = No)
+    ;
+    ; History:
+    ; 03-Nov-2008	PPP		SR16113:Created
+    ;-------------------------------------------------------------------------------
+	new blnTrue
+	
+	set blnTrue = $$$NO
+	set $ztrap = "CheckPersistentError"
+	
+	if $zobjClassMethod(pidClass,"%IsA","%Persistent") {
+		set blnTrue = $$$YES
+	}
+	
+	quit blnTrue
+	
+CheckPersistentError  ; Internal Tag
+    ;-------------------------------------------------------------------------------
+    ; History:
+    ; 10-Dec-2008	HQN		SR16220: Stop $ecode from continually getting appended
+    ; 							to, potentiallty reaches max variable size during
+	; 							bulk operations
+    ;-------------------------------------------------------------------------------
+	set $ECODE=""     ; SR16220
+	quit $$$NO
+	
+	
+CheckExtent(pidClass)
+    ;-------------------------------------------------------------------------------
+	; Check an Class and Returns No of Records
+    ; 
+    ; Inputs:
+    ;         pidClass
+    ;
+    ; Returns: intCount
+    ;
+    ; History:
+    ; 05-Dec-2008	HQN		SR16220: Newed strSQL
+    ; 03-Nov-2008	PPP		SR16113: Created
+    ;-------------------------------------------------------------------------------
+	new intCount,objResultSet,SQLCODE,strSQL
+	
+	set intCount = 0
+	set strSQL = "SELECT COUNT(%ID) AS COUNT FROM "_pidClass
+	
+	set objResultSet = ##class(%Library.ResultSet).%New()
+	if objResultSet.Prepare(strSQL) {
+		if objResultSet.Execute() {
+			if objResultSet.Next() {
+				set intCount = objResultSet.Data("COUNT")
+			}
+		}
+	}
+	
+	quit intCount
+	
+	
+ReIndexV2Class(pidClass,pblnVerbose=$$$NO,pidLog="",pintCount)
+    ;-------------------------------------------------------------------------------
+    ; ReIndex a V2 Class
+    ;
+    ; Inputs 
+    ; pidClass 		= Class Name
+    ; pblnVerbose   = Show output
+    ; pidLog		= Log Number for logging
+    ; pintCount		= 
+    ;
+    ; Returns: nothing
+    ;
+    ; History:
+    ; 15-Dec-2008	GRF		SR16113: variable prefixes to standard
+	; 03-Nov-2008	PPP		SR16113:Created
+    ;-------------------------------------------------------------------------------
+	new fltDuration,idEntry,idLogEntry,objHistory,objIndex,strCommand,tmsIndexDirty,tmsStartTime
+	
+ 	quit:$get(pidClass)=""       ; SR16113 15-Dec-2008
+ 	
+	set tmsStartTime = $horolog
+	set fltDuration  = $zhorolog
+	
+	set objIndex = $get(^COMIndex(YM,pidClass,1))
+	set $$$COMIndexLastIndexStartTime(objIndex) = tmsStartTime
+	set $$$COMIndexStatus(objIndex)             = "Index Started"
+	set tmsIndexDirty = $$$COMIndexIndexDirty(objIndex)	; get the Index Dirty flag
+	
+	set objHistory=""
+	set $$$COMIndexHistStartTime(objHistory) = tmsStartTime
+	set $$$COMIndexHistUser1(objHistory)     = $get(YBED)
+	set $$$COMIndexHistStatus(objHistory)    = "Index Started"
+	set $$$COMIndexHistType(objHistory)      = "Index"
+	set idEntry = $order(^COMIndexHist(YM,pidClass,""),-1)+1
+ 
+	set ^COMIndexHist(YM,pidClass,idEntry,1) = objHistory
+	set ^COMIndex(YM,pidClass,1) = objIndex
+ 
+	if pidLog'="" do AddMessage^COMLog(pidLog,"ReIndexing Class "_pidClass_" Started",.idLogEntry)
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	set strCommand = "do ##class("_pidClass_").%PurgeIndices()"
+	xecute strCommand
+	
+	set strCommand = "do ##class("_pidClass_").%BuildIndices()"
+	xecute strCommand
+	;+++++++++++++++++++++++++++++++++++++++
+	set fltDuration=+$justify($zhorolog-fltDuration,0,2)
+	 
+	set objIndex=$get(^COMIndex(YM,pidClass,1))
+	set $$$COMIndexLastIndexEndTime(objIndex)  = $horolog
+	set $$$COMIndexDurationInSeconds(objIndex) = fltDuration
+	set $$$COMIndexNumberofRecords(objIndex)   = pintCount
+	set $$$COMIndexStatus(objIndex)            = "Complete"
+	
+	if $$$COMIndexIndexDirty(objIndex)=tmsIndexDirty {	; Check for no change in Index Dirty 
+		set $$$COMIndexIndexDirty(objIndex)  = ""	; Clear Index Dirty
+		set $$$COMIndexHistType(objHistory)  = "Index,Clean"
+	}
+	set ^COMIndex(YM,pidClass,1) = objIndex
+	
+	set $$$COMIndexHistEndTime(objHistory)           = $horolog
+	set $$$COMIndexHistDurationInSeconds(objHistory) = fltDuration
+	set $$$COMIndexHistNumberofRecords(objHistory)   = pintCount
+	set $$$COMIndexHistUser1(objHistory)             = $get(YBED)
+	set $$$COMIndexHistStatus(objHistory)            = "Complete"
+	set ^COMIndexHist(YM,pidClass,idEntry,1) = objHistory
+	
+	if pidLog'="" do AddMessage^COMLog(pidLog,"ReIndexing Class "_pidClass_" in "_fltDuration_" Seconds",.idLogEntry)
+	If pblnVerbose {
+		write pidClass_" Index Count("_pintCount_") Complete in ",fltDuration," Seconds",!
+	}
+	
+	quit
+	
+]]></Routine>
+</Export>

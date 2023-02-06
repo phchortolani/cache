@@ -1,0 +1,348 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPVoucherLoad" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPVoucherLoad
+#include COMSYS
+#include WWWConst
+#include FINConst
+ 
+OnAfterSave(pYMFELD) 
+    ;-------------------------------------------------------------------------------
+    ; Save inputs and attempt to generate invoices from file
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 10-Aug-2005	JW		SR12410: Created
+    ;-------------------------------------------------------------------------------
+	new idField,intColumn,strStatus,columns,numInvoices
+	set strStatus=$$$OK
+	
+	for idField=3:1:16 {
+		// Save inputs
+		set $$$WWW122DDefaultVariableInput(^WWW122D(0,YFORM,idField,YM,1))=+$piece(pYMFELD,Y,idField)
+	}
+	
+	for idField=5:1:16 {
+		set intColumn = $piece(pYMFELD,Y,idField)
+		if +intColumn {
+			if $data(columns(intColumn)) {
+				set strStatus = "Fin00863"  ; Each column number must be unique.
+			} else {
+				set columns(intColumn) = idField
+			}
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$GenerateInvoices(YMFELD,.numInvoices)
+	}
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$$Text($listbuild("Fin00869",numInvoices))  ;File load successful. %1 voucher(s) loaded.
+		do GoToForm^COMUtilForm("FINAPInvBatch",$piece(YMFELD,Y,1),,strStatus)
+		
+	} else {
+		do ReturnError^COMUtilError(strStatus)
+	}
+		
+	quit
+ 
+ 
+GenerateInvoices(pYMFELD,pintInv)
+    ;-------------------------------------------------------------------------------
+    ; Loads file and generates invoices
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+    ; 03-Nov-2005	JW		SR13156: On Charge GL Effective date
+	; 10-Aug-2005	JW		SR12410: Created (Copied from FINAPVoucherLoad)
+    ;-------------------------------------------------------------------------------
+	new strFile,strDelim,intLine,strStatus,fileStream,strLine,strReason,intfirstRow
+	new idThisSupInv,idPrevSupInv,objInv,objLine,idInvLine,arrVouchers,errorCount,dteToday
+	
+	set strFile			= $piece(pYMFELD,Y,2)
+	set intfirstRow		= $piece(pYMFELD,Y,4)
+	set strDelim		= $char($piece(pYMFELD,Y,3))
+	if strDelim="" set strDelim = $$$COMMA
+	
+	set strStatus = $$$OK
+	set pintInv = 0
+	
+	if strFile="" {
+		set strStatus = "Fin00383"  ;No File Specified.
+		
+	} else {
+	 	if '##class(%File).Exists(strFile) {
+		 	set strStatus=$listBuild("Com00224",strFile)  ; Cannot open file %1
+	 		
+	 	} else {
+			set fileStream=##class(%FileCharacterStream).%New()
+			set fileStream.Filename = strFile
+			
+			set dteToday = +$horolog
+			
+			// Defaults
+			set $$$FINAPInvIsVoucher(objInv) 				= $$$YES
+			set $$$FINAPInvBatchNumber(objInv)				= $piece(pYMFELD,Y,1)
+			set $$$FINAPInvEnteredDate(objInv)				= dteToday
+			set $$$FINAPInvStatus(objInv) 					= $$$EnumFINSYSSTATUSUnposted
+			set $$$FINAPInvCreatedBy(objInv)				= YBED
+			set $$$FINAPInvCreatedDate(objInv)				= dteToday
+			set $$$FINAPInvOnChargeInvoiceDate(objInv)		= dteToday
+			set $$$FINAPInvOnChargeGLEffectiveDate(objInv)	= dteToday		//SR13156
+			if '$$IsGLEffectiveDateInvoiceDate^FINGeneralSetup() {
+				set $$$FINAPInvGLEffectiveDate(objInv)		= $$GetGLEffectiveDate^FINAPUserSessionDate()
+			}
+			
+			// GET DATA //
+			
+			set intLine=0
+			set idPrevSupInv=""
+			set errorCount=0
+			set strReason=""
+			
+			while 'fileStream.AtEnd {
+				set strLine = fileStream.ReadLine()
+				set intLine=intLine+1
+				continue:intLine<intfirstRow
+				continue:$translate(strLine,strDelim)=""
+				
+				// Get data and store in arrVouchers
+				set strStatus=$$$OK
+				set idThisSupInv = $piece(strLine,strDelim,$piece(pYMFELD,Y,6))
+				if idPrevSupInv="" || (idPrevSupInv'=idThisSupInv) {	// If not on same voucher
+					set idPrevSupInv = idThisSupInv
+					set idInvLine = 0
+					
+					// Get Header Fields
+					set $$$FINAPInvSuppliersInvoiceNumber(objInv)	= idThisSupInv
+					set $$$FINAPInvInvoiceSupplier(objInv) 			= $piece(strLine,strDelim,$piece(pYMFELD,Y,5))
+					set $$$FINAPInvInvoiceDate(objInv) 				= $$TranslateDate^COMUtilFileLoad($piece(strLine,strDelim,$piece(pYMFELD,Y,7)))
+					set $$$FINAPInvActualTotal(objInv) 				= $piece(strLine,strDelim,$piece(pYMFELD,Y,8))
+					set $$$FINAPInvDueDate(objInv) 					= $$TranslateDate^COMUtilFileLoad($piece(strLine,strDelim,$piece(pYMFELD,Y,9)))
+					set $$$FINAPInvTaxInvoice(objInv) 				= $$TranslateBoolean^COMUtilFileLoad($piece(strLine,strDelim,$piece(pYMFELD,Y,10)))
+					set $$$FINAPInvLinesIncludeTax(objInv) 			= $$TranslateBoolean^COMUtilFileLoad($piece(strLine,strDelim,$piece(pYMFELD,Y,11)))
+					set $$$FINAPInvTaxTotal(objInv) 				= $piece(strLine,strDelim,$piece(pYMFELD,Y,12))
+					
+					set $$$FINAPInvTaxLocation(objInv) 				= $$GetTaxLocation^FINAPSupplier($$$FINAPInvInvoiceSupplier(objInv))
+					
+					set arrVouchers($i(pintInv)) = objInv
+					set strStatus = $$ValidateVoucher(objInv)
+				}
+				
+				if $$$ISOK(strStatus) {
+					// Line data
+					set objLine=""
+					set $$$FINAPInvChargeTaxCode(objLine) 		= $piece(strLine,strDelim,$piece(pYMFELD,Y,13))
+					set $$$FINAPInvChargeAmount(objLine) 		= $piece(strLine,strDelim,$piece(pYMFELD,Y,14))	// Store in both pieces,
+					set $$$FINAPInvChargeAmountTaxEx(objLine)	= $piece(strLine,strDelim,$piece(pYMFELD,Y,14)) // and update later
+					set $$$FINAPInvChargeAccount(objLine) 		= $piece(strLine,strDelim,$piece(pYMFELD,Y,15))
+					set $$$FINAPInvChargeReference(objLine) 	= $piece(strLine,strDelim,$piece(pYMFELD,Y,16))
+					
+					set arrVouchers(pintInv,$i(idInvLine)) = objLine
+					set strStatus = $$ValidateLine(objLine,objInv)
+				}
+				if $$$ISERR(strStatus) {
+					set strReason = strReason_"|"_$$$Text($listbuild("Fin00385",intLine,$$$Text(strStatus)))  ;Line %1 failed. Reason: %2
+					set errorCount=errorCount+1
+				}
+				quit:errorCount>=10	// only show 10 errors
+			}
+			
+			if pintInv=0 {
+				set strStatus = "Fin00870"  ;No invoice data was found.
+				
+			} elseif errorCount {
+				set strStatus = $listbuild("Fin00865",strReason)  ;Voucher load failed due to the following: %1
+								
+			} else {
+				// Save Vouchers
+				set strStatus = $$SaveVouchers(.arrVouchers)
+			}
+	 	}
+	}
+	quit strStatus
+	
+ 
+ 
+ 
+ValidateVoucher(pobjInv="") 
+    ;-------------------------------------------------------------------------------
+    ; Validate header data
+    ; 
+    ; Params: pobjInv - header data
+    ;
+    ; Returns: status
+    ;
+    ; History:
+    ; 11-Aug-2005	JW		SR12410: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,idSupplier
+	
+	set strStatus = $$$OK
+	set idSupplier = $$$FINAPInvInvoiceSupplier(pobjInv)
+	
+		// Check mandatory fields
+	if (idSupplier="")
+	 ||($$$FINAPInvSuppliersInvoiceNumber(pobjInv)="")
+	 ||($$$FINAPInvInvoiceDate(pobjInv)="")
+	 ||($$$FINAPInvActualTotal(pobjInv)="") {
+		set strStatus = "Fin00867"  ;Mandatory fields - Supplier, Invoice Number, Date and Amount.
+		
+	} elseif '$$ValidSupplier^FINAPInv(idSupplier) {
+		set strStatus = $listbuild("Fin00268",idSupplier)  ;´%1´ is not a valid Supplier.
+	}
+	
+	quit strStatus
+ 
+ 
+ 
+ValidateLine(pobjLine="",pobjInv="")
+    ;-------------------------------------------------------------------------------
+    ; Validate line data
+    ;
+    ; Params: 	pobjLine - line data
+    ; 			pobjInv - header data
+    ;
+    ; Returns: status
+    ;
+    ; History:
+    ; 11-Aug-2005	JW		SR12410: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,idAccount
+	
+ 	set idAccount = $$$FINAPInvChargeAccount(pobjLine)
+ 	
+ 	if idAccount="" || ($$$FINAPInvChargeAmount(pobjLine)="") {
+ 		set strStatus = "Fin00866"  ;Mandatory fields - Expense Account and Expense Amount.
+ 		
+	} elseif '$$ValidTaxCode^COMTAX($$$FINAPInvChargeTaxCode(pobjLine),$$$FINAPInvTaxLocation(pobjInv)) {
+		set strStatus = $listbuild("Fin00868",$$$FINAPInvChargeTaxCode(pobjLine),$$$FINAPInvTaxLocation(pobjInv))  ;Tax Code %1 is not valid for Tax Location %2
+		
+	} else {
+		set strStatus = $$ValidateAccount^FINGLAccountTran(idAccount)
+	}
+ 	
+	quit strStatus
+ 
+ 
+SaveVouchers(parrVouchers) 
+    ;-------------------------------------------------------------------------------
+    ; Save the array of vouchers
+    ;
+    ; Params:	parrVouchers - array of vouchers:	parrVouchers(x) = invoice data
+    ; 												parrVouchers(x,n) = charge data
+    ; Returns: status
+    ;
+    ; History:
+    ; 10-Aug-2005	JW		SR12410: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,intCount,arrVoucher
+	
+	tstart
+	
+	set strStatus=$$$OK
+	
+	set intCount = ""
+	for {
+		set intCount = $order(parrVouchers(intCount))
+		quit:intCount=""
+		
+		kill arrVoucher
+		merge arrVoucher = parrVouchers(intCount)
+		
+		set strStatus = $$SaveVoucher(.arrVoucher)
+		quit:$$$ISERR(strStatus)
+	}
+	
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+	} else {
+		trollback
+	}
+	
+	quit strStatus
+	
+	
+SaveVoucher(parrVoucher)
+    ;-------------------------------------------------------------------------------
+    ; Update and save a voucher and its lines
+    ;
+    ; Params: parrVoucher - voucher array: 	parrVoucher = invoice data
+    ; 										parrVoucher(n) = charge data
+    ;
+    ; Returns: status
+    ;
+    ; History:
+    ; 11-Aug-2005	JW		SR12410: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,idInv,objInv,idSupplier,objSupplier,sumTax,idLine,objLine
+ 	
+ 	set strStatus=$$$OK
+ 	
+	set idInv=$$^WWWNEXT("FINAPInv")
+	set objInv = $get(parrVoucher)
+	
+	set idSupplier = $$$FINAPInvInvoiceSupplier(objInv)
+	set objSupplier=$get(^FINAPSupplier(YM,idSupplier,1))
+	
+	// Update voucher record
+	set $$$FINAPInvDiscountTerm(objInv) = $$GetTerm^FINAPSupplier(idSupplier)
+	
+	if $$$FINAPInvDiscountTerm(objInv)'="" {
+		if $$$FINAPInvDueDate(objInv)="" {
+			set $$$FINAPInvDueDate(objInv) = $$GetDueDate^FINAPSupplier(idSupplier,$$$FINAPInvInvoiceDate(objInv),$$$FINAPInvDiscountTerm(objInv))
+		}
+	}
+	
+	if $$$FINAPInvGLEffectiveDate(objInv)="" {	// Hasn't been stored yet so must be invoice date
+		set $$$FINAPInvGLEffectiveDate(objInv) = $$$FINAPInvInvoiceDate(objInv)
+	}
+	
+	if $$$FINAPInvTaxInvoice(objInv)="" {
+		set $$$FINAPInvTaxInvoice(objInv) = $$$FINAPSupplierIssuesTaxInvoices(objSupplier)
+	}
+	
+	if $$$FINAPInvTaxInvoice(objInv) {		// Update other tax fields if tax invoice
+		set $$$FINAPInvDefaultTaxCode(objInv) = $$$FINAPSupplierDefaultTaxCode(objSupplier)
+		
+		if $$$FINAPInvLinesIncludeTax(objInv)="" {
+			set $$$FINAPInvLinesIncludeTax(objInv) = $$$FINAPSupplierInvoiceLinesContainTax(objSupplier)
+		}
+	} else {
+		set $$$FINAPInvLinesIncludeTax(objInv) = ""
+	}
+	
+	// Update lines, save and calculate total tax
+	set sumTax=0
+	set idLine = ""
+	for {
+		set idLine = $order(parrVoucher(idLine))
+		quit:idLine=""
+		
+		set objLine = $get(parrVoucher(idLine))
+		set sumTax = sumTax + $$CalculateTax^FINAPInvCharge(.objLine,objInv,$$$FINAPInvLinesIncludeTax(objInv))
+		
+		set strStatus=$$$Save("FINAPInvCharge",idInv_","_idLine,objLine,1)
+		quit:$$$ISERR(strStatus)
+	}
+	
+	if $$$ISOK(strStatus) {
+		// Update total tax
+		if $$$FINAPInvLinesIncludeTax(objInv) {
+			set $$$FINAPInvTaxTotal(objInv) = sumTax
+		}
+		// Save Header
+		set strStatus=$$$Save("FINAPInv",idInv,objInv,1)
+	}
+	
+	quit strStatus
+ 
+ 
+]]></Routine>
+</Export>

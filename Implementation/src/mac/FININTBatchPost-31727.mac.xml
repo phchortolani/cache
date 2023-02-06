@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FININTBatchPost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FININTBatchPost
+	
+#include COMSYS
+#include FINConst
+ 
+PostBatches(pstrBatchType)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 22-Feb-2005	Paul K		Reduce incidence of calling WWWVAR
+	; 10-Aug-2004	shobby		Removed transaction commands.  Already done inside
+	; 							PostBatch. (SR10138)
+	;-------------------------------------------------------------------------------
+	new idBatch,strStatus,lngProcessed,lngUnProcessed,strMessage
+	
+	if $get(Y)="" do ^WWWVAR // TODO: MUST NOT be here, if for dev purposes put in DEV code
+	set idBatch=""
+	set lngProcessed   = 0
+	set lngUnProcessed = 0
+	for {
+		set idBatch=$order(^FININTBatchs(0,2,pstrBatchType," ",idBatch))  ; FIXME : $$$Index?
+		quit:idBatch=""
+		
+		set strStatus=$$PostBatch(idBatch)
+		if strStatus=$$$OK {
+			do RemoveError^COMUtilError("FININTBatch",idBatch)
+			set lngProcessed=lngProcessed+1
+		}
+		if strStatus'=$$$OK {
+			do RaiseError^COMUtilError(strStatus,"FININTBatch",idBatch)
+			set lngUnProcessed=lngUnProcessed+1
+		}
+	}
+	set strMessage=$$$Text($listbuild("Fin00092",pstrBatchType,lngProcessed,lngUnProcessed))  ; For Batch Type %1. %2 successful. %3 unsuccessful.
+	quit strMessage
+	
+	
+Post(Batch) ; DOES NOT APPEAR TO BE IN USE - PROCEDURE IN FININTBatch
+    ;-------------------------------------------------------------------------------
+    ; Post Batch from @ net manager form.
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+    ; 30-Mar-2004	Paul K	Remove associated errors if successful.
+    ;-------------------------------------------------------------------------------
+	new Status
+	
+	set Status=$$PostBatch(Batch)
+	if Status'=$$$OK {
+		do ^WWWINFO($$$Text(Status))
+	}
+	
+	if Status=$$$OK {
+		do RemoveError^COMUtilError("FININTBatch",Batch)
+		do ^WWWFORM
+	}
+	quit Status
+ 
+IsBatchPostable(pidBatch)
+	;-------------------------------------------------------------------------------
+	; Check whether a batch can be posted before attempting to Post the batch,
+	; so as not to rely so much on Transaction Rollback if something goes wrong.
+	;
+	; History
+	; 10-Aug-2004	shobby	Creation (SR10138) 
+	;-------------------------------------------------------------------------------
+	new objFININTBatch,Posted,strStatus,intLineNumber,idInterfaceType,objFININTBatchLine
+	
+	set strStatus=$$$OK
+	set objFININTBatch=$get(^FININTBatch(0,pidBatch,1))
+	set Posted=$$$FININTBatchPostedDate(objFININTBatch)
+	if Posted'="" {
+		set strStatus=$listbuild("Fin00176",pidBatch)  ; Interface Batch ´%1´ already Posted
+	} else {
+		set intLineNumber=""
+		for {
+			quit:$$$ISERR(strStatus)
+			set intLineNumber=$order(^FININTBatchLine(0,pidBatch,intLineNumber))  ; FININTBatchLine Index 1
+			quit:intLineNumber=""
+			
+			set objFININTBatchLine=$get(^FININTBatchLine(0,pidBatch,intLineNumber,1))
+			set idInterfaceType=$$$FININTBatchLineInterfaceType(objFININTBatchLine)  ;interface type
+			if '$data(^FININTInterfaceType(0,idInterfaceType,1)) {
+				set strStatus=$listbuild("Fin00083",idInterfaceType)  ;Interface Type %1 does not exist. Contact support.
+			}
+		}
+	}
+	quit strStatus
+ 
+PostBatch(pidBatch)
+	;-------------------------------------------------------------------------------
+	; Post Batch to GL
+	; 
+	; History:
+	; 30-Nov-2005	Steve S	SR13936: Ensure tran line is stored, otherwise return error
+	; 18-Oct-2005	Steve S	SR13216: Store the tran line number as well
+	; 24-May-2005	Paul K	SR12244: call to GetTransactionDate - history added by PO
+	; 21-Jun-2005	SCR		SR12692: Change Call to CreateLine^FINGLTran (Reason parameter deleted)
+	; 17-Jun-2005	SCR		SR12670: Clear off FC amount when GL Account is not an FC
+	; 10-Jun-2005	PO		SR12523: Pass through interface type when posting
+	; 24-May-2005	Paul K	Set the TransactionDate Property SR:12244
+	; 11-Aug-2004	shobby	Check whether a batch can be posted before attempting
+	; 						to post (SR10138)
+	; 25-Jun-2004	shobby	Foreign Currency.
+	; 30-Jul-2003	shobby	Quit out of the for loop when an error is found.
+	; 29-Jul-2003	SCR		Bug Fix on Posted Check
+	; 13-Jun-2003	shobby	Defined variables
+	; 12-Jun-2003	SCR		already posted check & Transaction processing &
+	; 						^FININTInterfaceType Update fix
+	;-------------------------------------------------------------------------------
+	set $ztrap="PostBatchError"
+	new blnConsolidate,curAmount,curCredit,curDebit,dteTransDate
+	new idAccount,idInterfaceType,intLineNumber,idTran
+	new objBatch,objFININTBatchLine,Posted,strReference,strStatus
+	new FCCode,idTranLine
+	
+	set strStatus=$$$OK
+	set strStatus=$$IsBatchPostable(pidBatch)
+	if $$$ISOK(strStatus) {
+		tstart
+		set objBatch=$get(^FININTBatch(0,pidBatch,1))
+		set $$$FININTBatchTransactionDate(objBatch)=$$GetTransactionDate^FININTBatch($$$FININTBatchBatchDate(objBatch),$$$FININTBatchBatchType(objBatch))  ;Batch Date
+		
+		if strStatus=$$$OK set strStatus=$$Create^FINGLTran(.idTran,pidBatch_",FININTBatch",$$$FININTBatchTransactionDate(objBatch),"BATCH","BAL")
+		if strStatus=$$$OK {
+			set intLineNumber=""
+			for {
+				quit:strStatus'=$$$OK
+				set intLineNumber=$order(^FININTBatchLine(0,pidBatch,intLineNumber))
+				quit:(intLineNumber="")||($$$ISERR(strStatus))
+				
+				set objFININTBatchLine = $get(^FININTBatchLine(0,pidBatch,intLineNumber,1))
+				set idAccount    = $$$FININTBatchLineAccount(objFININTBatchLine)
+				set strReference = $$$FININTBatchLineReference(objFININTBatchLine)
+				set curDebit     = 0
+				set curCredit    = 0
+				set curAmount    = $$$FININTBatchLineAmount(objFININTBatchLine)
+				set FCCode 		 = $$GetFCCode^FINGLFC(idAccount)
+				if FCCode="" set curAmount=+curAmount  			; SR12670
+				if curAmount>0 set curDebit  = curAmount
+				if curAmount<0 set curCredit = $$$FCSign(curAmount)
+				
+				set idInterfaceType = $$$FININTBatchLineInterfaceType(objFININTBatchLine)  ;interface type
+				set blnConsolidate  = $$$FININTInterfaceTypeConsolidate($get(^FININTInterfaceType(0,idInterfaceType,1)))  ;whether consolidate this line or not.
+				set strStatus = $$CreateLine^FINGLTran(idTran,idAccount,curDebit,curCredit,strReference,blnConsolidate,,idInterfaceType) ; SR12523: SR12692
+				
+				if $$$ISOK(strStatus) {
+					set idTranLine = $get(^CacheTempTranLine(YUSER))
+					if idTranLine="" {
+						set strStatus = $listbuild("Fin00942",pidBatch,intLineNumber)  ;No transaction line data - Batch %1, Line %2.	
+					} else {
+						set $$$FININTBatchLineTranLine(objFININTBatchLine)=idTranLine
+						set strStatus = $$$Save("FININTBatchLine",pidBatch_","_intLineNumber,objFININTBatchLine,$$$YES)
+					}
+				}
+			}
+		}
+		
+		if strStatus=$$$OK set strStatus = $$Post^FINGLTran(idTran)
+		if strStatus=$$$OK {
+			set $$$FININTBatchPostedDate(objBatch)=$horolog
+			set $$$FININTBatchLedgerTransaction(objBatch)=idTran
+			set strStatus=$$$Save("FININTBatch",pidBatch,objBatch,1)
+		}
+		if strStatus=$$$OK {
+			if $tlevel>0 tcommit
+		} else {
+			trollback
+		}
+	}
+	quit strStatus
+	
+PostBatchError
+	quit $listbuild($zerror)
+	
+	
+Postable(Batch) ; DOES NOT APPEAR TO BE IN USE - PROCEDURE IN FININTBatch
+    ;-------------------------------------------------------------------------------
+    ; Checks to see if a batch can be posted or not.
+    ;
+    ; Returns:Status (also sets the "Q" variable)
+    ;
+    ; History:
+    ; 01-Aug-2005	Steve S	Return 'No Record Selected' for blank key
+    ; 16-Feb-2005	GRF		QSave macros provide better clue to function
+    ; 20-Apr-2004	Paul K	Added DecodeError
+  	; 29-Jun-2003	SCR		Corrected test
+    ;-------------------------------------------------------------------------------
+	new Status,Rec,Posted
+	
+	set Status = $$$OK
+	
+	if $$$NoKey(Batch) {
+		set Status = $listbuild("Fin00089")  ; "No Record Selected."
+	} else {
+		set Rec    = $get(^FININTBatch(0,Batch,1))
+		set Posted = $$$FININTBatchPostedDate(Rec)
+		if Posted'="" {
+			set Status = $listbuild("Fin00176",Batch)  ; "Interface Batch ´%1´ already Posted"
+		}
+	}
+	
+	$$$YQHandler(Status)
+	
+	quit Status
+	
+]]></Routine>
+</Export>

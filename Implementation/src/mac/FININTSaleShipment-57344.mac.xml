@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FININTSaleShipment" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FININTSaleShipment
+	;-------------------------------------------------------------------------------
+	;  Code split of FININTSale
+	; 
+	; CST Matrix Account Types for "ISS"
+	; ----------------------------------
+	;	1   Stock on Hand
+	;	2   Order Contra (GINI)
+	;-------------------------------------------------------------------------------
+	#include COMSYS
+	
+CusShipTxn(Ship)
+	;-------------------------------------------------------------------------------
+	; Process a Customer Shipment Message
+	; All Issues currently come through here - branch off as required based on
+	; Order Type
+	; 
+	; Returns:DCM Status (0/1_Y_Message)
+	;
+	; History:
+	; 12-Oct-2005	GRF		SR13545 : Common Matrices for Cash Sale & Customer Order.
+	; 07-Jul-2005	GRF		SR12863 : Production Orders handled elsewhere 
+	;-------------------------------------------------------------------------------
+	new OrderType,Prefix,Status
+	
+	set Status  = $$$OK
+	set Prefix  = "@Ship@("
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("OrderType",.OrderType,Prefix,1)
+	if Status=$$$OK {
+		if OrderType=3 set OrderType=0    ; Use same matrices as "Customer Order" if "Cash Sale" SR13545
+	
+		if OrderType = 1 {
+			set Status = $$ProdIssue^FININTProd(Ship,OrderType)
+		} else {
+			set Status = $$CusShipIssue(Ship,OrderType)
+		}
+	}
+	quit Status
+	
+CusShipIssue(Ship,OrderType)
+	;-------------------------------------------------------------------------------
+	; Post a Customer Shipment
+	;
+	; Returns:DCM Status (0/1_Y_Message)
+	;
+	; History:
+	; 07-Jul-2005	GRF		SR12863 : CusShipTxn split so Production Orders can be
+	; 						handled elsewhere 
+	; 01-Jul-2005	GRF		SR12843 : Added new Application Parameters (PRWIP &
+	; 						PREXP) to FININTBatchType to provide better distinction
+	; 						from reused "INPROD".  Applied here.
+	; 16-Jun-2005	GRF		SR12585 : Temporary ADRAD reassignment of Location for
+	; 						CST Matrix Calc
+	; 03-Jun-2005	Paul K	Moved this code to this routine.
+	; 18-May-2005	GRF		SR10478 : not passing different source locations to
+	; 						audit; Clear out unrequired accounts
+	; 12-May-2005	GRF		SR10478 : GINILocn
+	; 05-May-2005	shobby	SR11875.  Managed transactions to handle rollback after
+	; 						cache errors.
+	; 19-Apr-2005	GRF		Differentiate between other "Error in Post" messages
+	; 11-Apr-2005	GRF		SR10478 : Revision to Location means SourceLocn not reqd;
+	; 						Move CST check to outer if test
+	; 16-Mar-2005	GRF		SR10478 : Preserve original location and item group for
+	; 						profile resolution after cost matrix extraction
+	; 10-Mar-2005	GRF		SR10478 : Module independence
+	; 16-Feb-2005	GRF		SR10478 : Store Matrix Keys and Values with
+	; 						FININTBatchLine as audit link
+	; 10-Feb-2005	GRF		SR11273 : Apply TLEVEL test to TCOMMIT instead of TROLLBACK
+	; 10-Feb-2005	GRF		SR10478 : Characteristic Matrix; own error exit
+	; 15-Dec-2004	shobby	SOH replace Invoice with Order,Customer
+	; 11-Nov-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new arrAccts,arrChars,arrCSTKey,Batch,BlockNo,CSTVals,Customer,Date,GINILocn
+	new idx,InterfaceType,Invoice,Line,LineRef,Location,Order,Prefix,Profile
+	new ShipAccount,ShipAmount,SOHAccount,SourceGroup,SourceLocn,Status,TranType
+	
+	set Status  = $$$OK
+	set Batch   = ""
+	set BlockNo = ""
+	set Prefix  = "@Ship@("
+	
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Date",     .Date,     Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("TranType", .TranType, Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("GINILocn", .GINILocn, Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Customer", .Customer, Prefix)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Order",    .Order,    Prefix)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Invoice",  .Invoice,  Prefix)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Location", .Location, Prefix)
+	
+	if (Status=$$$OK)&&(Location="") set Location="None"         ; Default Location
+	
+	if Status=$$$OK set Status=$$Allocate^FININTBatch(.Batch,.BlockNo,"INSHIP",Location,Date)
+	
+	set SourceLocn(1) = Location
+	set SourceLocn(2) = GINILocn
+	;	; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv TEMPORARY CODE FOR ADRAD start
+		if ($zu(5)["ADRAD") {
+			if Location [ "SA-AS" {
+				set SourceLocn(1) = "SA-WH"		; SOH		"SOH"		InCusShip
+				set SourceLocn(2) = "SA-WH"		; GINI		"INSHIP"
+			}
+		}
+	;	; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ TEMPORARY CODE FOR ADRAD end	
+	set CSTVals=""
+	if Status=$$$OK {
+		set Line=""
+		for {
+			set Line=$order(@Ship@("Lines",Line))
+			quit:(Line="")||(Status'=$$$OK)
+			
+			set Prefix="@Ship@(""Lines"",Line,"
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineSOHAccount", .SOHAccount, Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineShipAccount",.ShipAccount,Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineShipAmount", .ShipAmount, Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineRef",        .LineRef,    Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("SourceGroup",    .SourceGroup,Prefix,1)
+			
+			; Extract Characteristic Values
+			if Status=$$$OK {
+				kill arrChars
+				merge arrChars=@Ship@("Lines",Line,"CharVal")
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			if (Status=$$$OK)&&($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+				kill arrAccts,CSTVals
+				set arrAccts(1) = SOHAccount
+				set arrAccts(2) = ShipAccount
+				
+ 
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+			;	set CSTVals = CSTVals_Y_Location_Y_SourceGroup
+				set CSTVals(1) = CSTVals_Y_Location_Y_SourceGroup
+				set CSTVals(2) = CSTVals_Y_GINILocn_Y_SourceGroup
+	
+	;	; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv TEMPORARY CODE FOR ADRAD start
+		if ($zu(5)["ADRAD") {
+			if Location [ "SA-AS" {
+				set CSTVals(1) = CSTVals_Y_"SA-WH"_Y_SourceGroup	; SOH		"SOH"		InCusShip
+				set CSTVals(2) = CSTVals_Y_"SA-WH"_Y_SourceGroup	; GINI		"INSHIP"
+			}
+		}
+	;	; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ TEMPORARY CODE FOR ADRAD end	
+				kill arrAccts(3)
+				
+			;	set Status = $$ExtractProfile(.arrAccts,Location,SourceGroup)
+				set Status = $$ExtractProfile^FININTSale(.arrAccts,.SourceLocn,SourceGroup)
+				
+				set SOHAccount  = arrAccts(1)
+				set ShipAccount = arrAccts(2)
+			}
+			
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			; Stock Issued
+			; 
+			;   Debit         Goods Issued Not Invoiced
+			;              or Stock On Hand (Interwarehouse Transfer)
+			;      Credit        Stock On Hand
+			;      
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			
+			if Status=$$$OK {
+				set Status=$$AddLine^FININTBatch(Batch,BlockNo,SOHAccount,-ShipAmount,"SOH",LineRef,Order_","_Customer,Customer_","_Invoice,,,,$get(arrCSTKey(1)),CSTVals(1))
+			}
+			if OrderType=4 {               ; Interwarehouse Transfer
+				set InterfaceType = "SOH"
+			} else {
+				set InterfaceType = "INSHIP"
+			}
+			if Status=$$$OK {
+				set Status=$$AddLine^FININTBatch(Batch,BlockNo,ShipAccount,ShipAmount,InterfaceType,LineRef_","_Customer_","_Invoice,Order,Customer_","_Invoice,,,,$get(arrCSTKey(2)),CSTVals(2))
+			}
+		}
+	}
+	if Status=$$$OK set Status=$$PostBlock^FININTBatch(Batch,BlockNo)
+	if Status=$$$OK set Status=$$$OK_Y_Batch_","_BlockNo
+	quit Status
+ 
+]]></Routine>
+</Export>

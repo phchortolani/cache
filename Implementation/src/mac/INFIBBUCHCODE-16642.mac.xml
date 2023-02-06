@@ -1,0 +1,436 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INFIBBUCHCODE" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INFIBBUCHCODE
+	
+#include COMSYS
+#include INConst
+	
+	;***************************************
+	; DEPRECATED ROUTINES - still called in a few places  - required for supplier/customer invoices?
+	; replaced by INFINInterface calling INFINPostChar
+	;***************************************
+	
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		POSTING CHARACTERISTICS MATCHING
+	; 
+	; Inputs  :
+	;   BETRIEB
+	;   BUCHUNG
+	;   BUCHART
+	;   TYPE
+	;   KEY
+	;   
+	; History :
+	; 24-Mar-2005	GRF		SR10478 : Split code into -
+	;						1) extraction of Char Values from masterfile & order
+	;					 	2) health check to see if all required values are present
+	;						This allows the LOAD code to be called separately
+	; 02.12.2004	FIS
+	;-------------------------------------------------------------------------------
+	DO LOAD
+	DO HEALTHCHECK
+	QUIT
+	
+LOAD
+	;-------------------------------------------------------------------------------
+	; Load Characteristic values into BUCHUNG (Booking/Reservation) record
+	; if not already present.
+	; 
+	; History :
+	; 12-Apr-2005	GRF		SR10478 : Need Item Group recursion - common code for
+	; 						both items and parent items; group structure delimiter;
+	; 						Populate #85/86 from To Location for MVI/MVO (includes
+	; 						correction to interpretation of Location storage)
+	; 30-Mar-2005	GRF		SR10478 : Add Supplier and Customer Group definitions
+	; 						Reduce duplication of code
+	;-------------------------------------------------------------------------------
+	new ART,AUF,BET,DEP,FromLocn,FromStockLocn,KUN,LAP,LIEF,ToLocn,ToStockLocn
+	
+	set BUCHUNG=$get(BUCHUNG)
+	quit:BUCHUNG=""
+	;-------------------------------------------------------------------------------
+	;SET TRANTYPE=$PIECE(BUCHUNG,Y,50)  ;TRANSACTION TYPE (ISS, REC, ADJ, ...)
+	;-------------------------------------------------------------------------------
+	
+	; ITEMS & Recursive ITEM GROUPS with COMPONENT & PARENT ITEMS
+	;------------------------------------------------------------
+	set ART=$piece(BUCHUNG,Y,29)
+	if ART="" {
+		if ($piece(BUCHUNG,Y,27)'="")&&($piece(BUCHUNG,Y,28)'="") {
+			set ART = $piece($get(^INAUFP(YM,$piece(BUCHUNG,Y,27),$piece(BUCHUNG,Y,28),1)),Y,1)
+		}
+	}
+	
+	do ProcessItem(ART,.BUCHUNG)
+ 
+	; STOCK LOCATIONS & DEPARTMENTS & LOCATIONS
+	;------------------------------------------
+	set FromLocn      = $piece(BUCHUNG,Y,16)       ; (BET)
+	set FromStockLocn = $piece(BUCHUNG,Y,30)       ; (LAP)
+	set ToLocn        = $piece(BUCHUNG,Y,33)
+	set ToStockLocn   = $piece(BUCHUNG,Y,31)
+	
+	do GetLocationChars(FromLocn,FromStockLocn,.BUCHUNG,80)
+	do GetLocationChars(ToLocn,  ToStockLocn,  .BUCHUNG,85)
+	
+	; SUPPLIERS & SUPPLIER GROUPS FOR SUPPLIER INVOICES (TYPE 1) ONLY
+	;----------------------------------------------------------------
+	SET LIEF=$PIECE(BUCHUNG,Y,5)
+	if $get(TYPE)=1 do GetSupplierChars(LIEF,.BUCHUNG)
+	
+	; CUSTOMERS & CUSTOMER GROUPS FOR CUSTOMER INVOICES (TYPE 2) ONLY
+	;----------------------------------------------------------------
+	SET KUN=$PIECE(BUCHUNG,Y,4)
+	if $get(TYPE)=2 do GetCustomerChars(KUN,.BUCHUNG)
+	
+	; SUPPLIERS OR CUSTOMERS (WITH GROUPS) FOR INVENTORY CHANGE (TYPE 3) ONLY
+	;----------------------------------------------------------------
+	
+	IF $GET(TYPE)=3 IF $PIECE(BUCHUNG,Y,27)'="" DO
+	. IF $PIECE($GET(^INAUF(YM,$PIECE(BUCHUNG,Y,27),1)),Y,2)=0 DO
+	. . IF $PIECE(BUCHUNG,Y,9)=0 DO  QUIT                            ;RECEIVING
+	. . . QUIT:$PIECE(BUCHUNG,Y,28)=""
+	. . . SET LIEF=$PIECE($GET(^INAUFP(YM,$PIECE(BUCHUNG,Y,27),$PIECE(BUCHUNG,Y,28),1)),Y,12)
+	. . . do GetSupplierChars(LIEF,.BUCHUNG)
+	. . ;
+	. . SET KUN=$PIECE($GET(^INAUF(YM,$PIECE(BUCHUNG,Y,27),1)),Y,1)  ;SHIPPING
+	. . do GetCustomerChars(KUN,.BUCHUNG)
+	. ;
+	. IF $PIECE($GET(^INAUF(YM,$PIECE(BUCHUNG,Y,27),1)),Y,2)=2 DO       ;RECEIVING
+	. . SET LIEF=$PIECE($GET(^INAUF(YM,$PIECE(BUCHUNG,Y,27),1)),Y,12)
+	. . do GetSupplierChars(LIEF,.BUCHUNG)
+ 
+	; ORDERS
+	;-------
+	SET AUF=$PIECE(BUCHUNG,Y,27)
+	;SET POS=$P(BUCHUNG,Y,28)
+	IF AUF'="" {
+		SET AUF(1)=$GET(^INAUF(YM,AUF,1))                                           ;Order
+		IF $PIECE(BUCHUNG,Y,100)="" SET $PIECE(BUCHUNG,Y,100)=$PIECE(AUF(1),Y,330)  ;Posting Characteristic 1
+		IF $PIECE(BUCHUNG,Y,101)="" SET $PIECE(BUCHUNG,Y,101)=$PIECE(AUF(1),Y,331)  ;Posting Characteristic 2
+	}
+	
+	; REASON CODE
+	;------------
+	;
+	;  TODO : add once source transaction includes this <GRF>
+	;  Already covered in INARTHIST for Adjustments - may need modified
+	;  version here for OTHER Reason types but probably need different piece.
+	
+	;set objINWE = $get(^INWE(YM,ART,Locn,StockLocn,1))
+	;IF $PIECE(BUCHUNG,Y,103)="" SET $PIECE(BUCHUNG,Y,103)=$PIECE(objINWE,Y,47)
+	QUIT
+	
+ProcessItem(ART="",&BUCHUNG="")
+	;-------------------------------------------------------------------------------
+	; ByRef : BUCHUNG
+	; 
+	; History :
+	;  1-Dec-2006	JW		BR014285: Item group change
+	; 26-May-2005	GRF		SR12430 : Separate for external call for service charges
+	;-------------------------------------------------------------------------------
+	//new Delim
+	//set Delim = $$Delim()	// BR014285
+	
+	if ART'="" {
+		//do GetItemChars(ART,.BUCHUNG,70,Delim)
+		do GetItemChars(ART,.BUCHUNG,70)	// BR014285
+		
+		; COMPONENT ITEM CODE (C-IC#)	COMPONENT ITEM = ITEM
+		if $piece(BUCHUNG,Y,73)="" set $piece(BUCHUNG,Y,73)=$piece(BUCHUNG,Y,70)
+		if $piece(BUCHUNG,Y,74)="" set $piece(BUCHUNG,Y,74)=$piece(BUCHUNG,Y,71)
+		if $piece(BUCHUNG,Y,75)="" set $piece(BUCHUNG,Y,75)=$piece(BUCHUNG,Y,72)
+	}
+	
+	; PARENT ITEM CODE (P-IC#)
+	set ART = $piece(BUCHUNG,Y,42)
+	if ART'="" {
+		//do GetItemChars(ART,.BUCHUNG,76,Delim)
+		do GetItemChars(ART,.BUCHUNG,76)	// BR014285
+	} else {
+		; NO PARENT ITEM -> PARENT ITEM = ITEM
+		if $piece(BUCHUNG,Y,76)="" set $piece(BUCHUNG,Y,76)=$piece(BUCHUNG,Y,70)
+		if $piece(BUCHUNG,Y,77)="" set $piece(BUCHUNG,Y,77)=$piece(BUCHUNG,Y,71)
+		if $piece(BUCHUNG,Y,78)="" set $piece(BUCHUNG,Y,78)=$piece(BUCHUNG,Y,72)
+	}
+	quit
+	
+	
+GetSupplierChars(pidSupplier="",&BUCHUNG)
+	;-------------------------------------------------------------------------------
+	; Load Supplier Characteristic Codes 1, 2 and 3 into #90-92 of BUCHUNG record.
+	; 
+	; ByRef : BUCHUNG
+	; 
+	; History :
+	; 16-Sep-2009	DWR		SR16880: Doco only
+	; 30-Mar-2005	GRF		SR10478 : Extracted
+	;-------------------------------------------------------------------------------
+	new objSupGroup,objSupplier,SupGroup
+	
+	quit:pidSupplier=""
+	
+	set objSupplier = $get(^INLIEF(YM,pidSupplier,1))                               ; Supplier 
+	if $piece(BUCHUNG,Y,90)="" set $piece(BUCHUNG,Y,90)=$piece(objSupplier,Y,235)   ; Posting Characteristic 1
+	if $piece(BUCHUNG,Y,91)="" set $piece(BUCHUNG,Y,91)=$piece(objSupplier,Y,236)   ; Posting Characteristic 2
+	if $piece(BUCHUNG,Y,92)="" set $piece(BUCHUNG,Y,92)=$piece(objSupplier,Y,237)   ; Posting Characteristic 3
+	
+	set SupGroup    = $piece(objSupplier,Y,31)
+	if SupGroup'="" {
+		set objSupGroup = $get(^INFIBSUPGROUP(YM,SupGroup,1))                       ; Supplier Group
+		if $piece(BUCHUNG,Y,90)="" set $piece(BUCHUNG,Y,90)=$piece(objSupGroup,Y,1) ; Posting Characteristic 1
+		if $piece(BUCHUNG,Y,91)="" set $piece(BUCHUNG,Y,91)=$piece(objSupGroup,Y,2) ; Posting Characteristic 2
+		if $piece(BUCHUNG,Y,92)="" set $piece(BUCHUNG,Y,92)=$piece(objSupGroup,Y,3) ; Posting Characteristic 3
+	}
+	quit
+	
+	
+GetCustomerChars(pidCustomer="",&BUCHUNG)
+	;-------------------------------------------------------------------------------
+	; Load Customer Characteristic Codes 1, 2 and 3 into #95-97 of BUCHUNG record.
+	; 
+	; ByRef : BUCHUNG
+	; 
+	; History :
+	; 30-Mar-2005	GRF		SR10478 : Extracted
+	;-------------------------------------------------------------------------------
+	new CustGroup,objCustGroup,objCustomer
+	
+	quit:pidCustomer=""
+	
+	set objCustomer = $get(^INKUNDE(YM,pidCustomer,1))                              ; Customer
+	if $piece(BUCHUNG,Y,95)="" set $piece(BUCHUNG,Y,95)=$piece(objCustomer,Y,235)   ; Posting Characteristic 1
+	if $piece(BUCHUNG,Y,96)="" set $piece(BUCHUNG,Y,96)=$piece(objCustomer,Y,236)   ; Posting Characteristic 2
+	if $piece(BUCHUNG,Y,97)="" set $piece(BUCHUNG,Y,97)=$piece(objCustomer,Y,237)   ; Posting Characteristic 3
+	
+	set CustGroup    = $piece(objCustomer,Y,31)
+	if CustGroup'="" {
+		set objCustGroup = $get(^INFIBCUSTGROUP(YM,CustGroup,1))                     ; Customer Group
+		if $piece(BUCHUNG,Y,95)="" set $piece(BUCHUNG,Y,95)=$piece(objCustGroup,Y,1) ; Posting Characteristic 1
+		if $piece(BUCHUNG,Y,96)="" set $piece(BUCHUNG,Y,96)=$piece(objCustGroup,Y,2) ; Posting Characteristic 2
+		if $piece(BUCHUNG,Y,97)="" set $piece(BUCHUNG,Y,97)=$piece(objCustGroup,Y,3) ; Posting Characteristic 3
+	}
+	
+	quit
+	
+	
+GetItemChars(pidItem="",&BUCHUNG,pData=70)
+	;-------------------------------------------------------------------------------
+	; Load Item Characteristic Codes 1, 2 and 3 into BUCHUNG record.
+	; Items        => #70-72
+	; Parent Items => #76-78
+	; 
+	; ByRef : BUCHUNG
+	; 
+	; History :
+	; 01-Dec-2006	JW		BR014285: Item group change
+	; 12-Apr-2005	GRF		SR10478 : Extracted
+	;-------------------------------------------------------------------------------
+	new blnFinished,objGroup,objItem,Group
+	
+	if pidItem'="" {
+		set objItem=$get(^INART(YM,pidItem,1))
+		if $piece(BUCHUNG,Y,pData)=""   set $piece(BUCHUNG,Y,pData)   = $$$INARTPostingCharacteristic1(objItem)
+		if $piece(BUCHUNG,Y,pData+1)="" set $piece(BUCHUNG,Y,pData+1) = $$$INARTPostingCharacteristic2(objItem)
+		if $piece(BUCHUNG,Y,pData+2)="" set $piece(BUCHUNG,Y,pData+2) = $$$INARTPostingCharacteristic3(objItem)
+		
+		set Group=$$$INARTItemGroup(objItem)
+		if Group="" set Group = $$$INVORGDefaultItemGroup($get(^INVORG(YM,YM,1)))
+		
+		; Continue searching up Item Category Chain until we have a value for each Char Type
+		; or reach top of chain
+		; e.g. Item 123 => Item Group A-AA-5 => Group A-AA => Group A [stops]
+		;      If all three characteristic types have values earlier, don't check further.
+		for {
+			set blnFinished=(($piece(BUCHUNG,Y,pData)'="")   &&
+			                 ($piece(BUCHUNG,Y,pData+1)'="") &&
+			                 ($piece(BUCHUNG,Y,pData+2)'="")   )
+			quit:blnFinished
+			quit:Group=""
+			
+			set objGroup=$get(^INFIBITEMGROUP(YM,Group,1))
+			if $piece(BUCHUNG,Y,pData)=""   set $piece(BUCHUNG,Y,pData)   = $piece(objGroup,Y,1)
+			if $piece(BUCHUNG,Y,pData+1)="" set $piece(BUCHUNG,Y,pData+1) = $piece(objGroup,Y,2)
+			if $piece(BUCHUNG,Y,pData+2)="" set $piece(BUCHUNG,Y,pData+2) = $piece(objGroup,Y,3)
+			
+			set Group = $$$INItemGroupParentGroup($get(^INItemGroup(YM,Group,1)))
+			/*	BR014285
+			if Group[pDelim {
+				set Group = $piece(Group,pDelim,1,$length(Group,pDelim)-1)
+			} else {
+				set Group = ""
+			} */
+		}
+	}
+	quit
+	
+	
+GetLocationChars(pidLocn,pidStorage,&BUCHUNG,pData=80)
+	;-------------------------------------------------------------------------------
+	; Load Location Characteristic Codes 1 and 2 into BUCHUNG record.
+	;    Location From  => #80-81
+	;    Location To    => #85-86
+	;    
+	; Check Stock Location then Department then Warehouse Location
+	; 
+	; ByRef : BUCHUNG
+	; 
+	; History :
+	; 20-Apr-2005	shobby	SR10478 : Change the test on pidStorage to not equal.
+	; 20-Apr-2005	GRF		SR10478 : Still process from Locn if Storage is null
+	; 12-Apr-2005	GRF		SR10478 : Extracted
+	;-------------------------------------------------------------------------------
+	new Dept,objDept,objLocn,objStore
+	
+	quit:pidLocn=""
+	
+	if pidStorage'="" {
+		set objStore = $get(^INLP(YM,pidLocn,pidStorage,1))
+		if $piece(BUCHUNG,Y,pData)=""   set $piece(BUCHUNG,Y,pData)   = $piece(objStore,Y,16)
+		if $piece(BUCHUNG,Y,pData+1)="" set $piece(BUCHUNG,Y,pData+1) = $piece(objStore,Y,17)
+		
+		set Dept = $piece(objStore,Y,14)
+		if Dept'="" {
+			set objDept = $get(^WWW0124(YM,Dept,1))
+			if $piece(BUCHUNG,Y,pData)=""   set $piece(BUCHUNG,Y,pData)   = $piece(objDept,Y,5)
+			if $piece(BUCHUNG,Y,pData+1)="" set $piece(BUCHUNG,Y,pData+1) = $piece(objDept,Y,6)
+		}
+	}
+	
+	set objLocn = $get(^WWW0121(0,YM,pidLocn,1))
+	if $piece(BUCHUNG,Y,pData)=""   set $piece(BUCHUNG,Y,pData)   = $piece(objLocn,Y,70)
+	if $piece(BUCHUNG,Y,pData+1)="" set $piece(BUCHUNG,Y,pData+1) = $piece(objLocn,Y,71)
+	
+	quit
+	
+	
+HEALTHCHECK
+	;-------------------------------------------------------------------------------
+	;CHECK FOR REQUIRED CHARACTERISTICS
+	;
+	; History :
+	; 26-Aug-2005	GRF		Dot level realignment
+	; 01-Apr-2005	GRF		SR10478 : Include To Location codes and Reason Code
+	;-------------------------------------------------------------------------------
+	NEW Length1,LFN,List1,List2,MATRIX,MISSING,TRANTYPE,VALID,YII
+	
+	SET TRANTYPE=$PIECE(BUCHUNG,Y,50)  ;TRANSACTION TYPE (ISS, REC, ADJ, ...)
+	
+	; vvvvv Disabled Block vvvvv   TODO : Should consider restoring this sort of validation <GRF>
+	;IF TRANTYPE="" IF $GET(TYPE)=3 DO  ;INVENTORY TRANSACTION  ;KANN EVTL. SPÄTER GELÖSCHT WERDEN ??
+	;. IF $PIECE(BUCHUNG,Y,9)=3 SET TRANTYPE="ADJ" QUIT  ;ADJUSTMENT, NOT ORDER RELATED
+	;. IF $PIECE(BUCHUNG,Y,9)=0 SET TRANTYPE="REC" QUIT  ;RECEIVING,  RELATED TO PURCHASE ORDER
+	;. IF $PIECE(BUCHUNG,Y,9)=1 SET TRANTYPE="ISS" QUIT  ;SHIPPING,   RELATED TO CUSTOMER ORDER
+	;. IF $PIECE(BUCHUNG,Y,9)=2 DO
+	;. . SET TRANTYPE="MVI"                           ;STOCK MOVEMENT, NOT ORDER RELATED
+	;. . IF $PIECE(BUCHUNG,Y,30)=""                                                      QUIT  ;FROM STOCK MISSING
+	;. . IF $PIECE(BUCHUNG,Y,16)=""                                                      QUIT  ;LOCATION MISSING
+	;. . IF $PIECE($GET(^INLP(YM,$PIECE(BUCHUNG,Y,16),$PIECE(BUCHUNG,Y,30),1)),Y,8)'=1   QUIT  ;STOCK NOT BLOCKED
+	;. . IF ($PIECE(BUCHUNG,Y,27)="")||($PIECE(BUCHUNG,Y,28)="")                         QUIT  ;NO SOURCE ORDER
+	;. . IF $PIECE($GET(^INAUFP(YM,$PIECE(BUCHUNG,Y,27),$PIECE(BUCHUNG,Y,28),1)),Y,2)'=2 QUIT  ;SOURCE NOT PURCHASE ORDER
+	;. . SET TRANTYPE="MVO"                           ;RELEASE RECEIVING, RELATED TO PURCHASE ORDER
+	; ^^^^^ Disabled Block ^^^^^
+	
+	SET MISSING=0
+	;GRF;01-Apr-2005 ;Include To Location codes and Reason Code
+	IF TRANTYPE'="" DO               ;GRF;27-Jan-2005
+	. NEW YI1,YI2
+	. IF $DATA(^INFIBCHARMATRIX(YM,TRANTYPE)) DO
+	. . SET VALID=$ORDER(^INFIBCHARMATRIX(YM,TRANTYPE,+$HOROLOG+1),-1)
+	. . QUIT:VALID=""
+	. . SET MATRIX=$GET(^INFIBCHARMATRIX(YM,TRANTYPE,VALID,1))
+	. . IF $PIECE(MATRIX,Y,1)="" QUIT  ;NO REQUIRED CHARACTERISTICS
+	. . ;
+	. . set List1 = "70,71,72,73,74,75,76,77,78,80,81,85,86,90,91,92,95,96,97,100,101,103"
+	. . set List2 = "IC1,IC2,IC3,C-IC1,C-IC2,C-IC3,P-IC1,P-IC2,P-IC3,LC1,LC2,T-LC1,T-LC2,SC1,SC2,SC3,CC1,CC2,CC3,OC1,OC2,RC"
+	. . set Length1 = $length(List1,",")
+	. . FOR YII=1:1:Length1 DO  QUIT:MISSING=1
+	. . . SET YI1=$PIECE(List1,",",YII)      ; Data Position
+	. . . SET YI2=$PIECE(List2,",",YII)      ; CV Code
+	. . . SET YI2=";"_YI2_";"
+	. . . IF $PIECE(BUCHUNG,Y,YI1)="" IF $FIND(";"_$PIECE(MATRIX,Y,1)_";",YI2) SET MISSING=1
+	
+	IF MISSING=1 DO  ;CHARACTERISTICS MISSING, DO NOT POST
+	. NEW LOCATION
+	. SET LOCATION=$GET(BETRIEB)
+	. IF LOCATION="" SET LOCATION=YLOCATION
+	. SET LFN=$ORDER(^INFIBBUCHHOLD(YM,LOCATION,+$HOROLOG,""),-1)+1
+	. SET $PIECE(BUCHUNG,Y,45)=$GET(TYPE)
+	. SET $PIECE(BUCHUNG,Y,46)=$GET(BUCHART)
+	. SET $PIECE(BUCHUNG,Y,47)=$GET(KEY)
+	. SET ^INFIBBUCHHOLD(YM,LOCATION,+$HOROLOG,LFN,1)=BUCHUNG
+	. SET BUCHUNG=""
+	
+	QUIT
+	
+	
+REPROCESS
+	;-------------------------------------------------------------------------------
+	;  Try to reprocess Transaction that has been put on hold for some reason
+	;
+	; Called by : INTAGES8
+	;             Form INFIBBUCHHOLD Button 1
+	;             
+	; 04-Dec-2009	GRF		SR16871: ensure enumAttachedGL is available for BUCH;
+	; 							Brace syntax
+	;-------------------------------------------------------------------------------
+	new BETRIEB,BTR1,BUCHART,enumAttachedGL,FDAT,FLFN,FLOC,KEY,TYPE,YFPARA
+	
+	kill ^WWWSOR(YUSER)
+	set FLOC = YLOCATION
+	
+	set FDAT = ""
+	for {
+		set FDAT = $order(^INFIBBUCHHOLD(YM,FLOC,FDAT))
+		quit:FDAT=""
+		
+		set FLFN = ""
+		for {
+			set FLFN = $order(^INFIBBUCHHOLD(YM,FLOC,FDAT,FLFN))
+			quit:FLFN=""
+			
+			set ^WWWSOR(YUSER,FLOC,FDAT,FLFN) = ""
+		}
+	}
+	
+	set FLOC = ""
+	for {
+		set FLOC = $order(^WWWSOR(YUSER,FLOC))
+		quit:FLOC=""
+		
+		set FDAT = ""
+		for {
+			set FDAT = $order(^WWWSOR(YUSER,FLOC,FDAT))
+			quit:FDAT=""
+			
+			set FLFN = ""
+			for {
+				set FLFN = $order(^WWWSOR(YUSER,FLOC,FDAT,FLFN))
+				quit:FLFN=""
+				
+				set BETRIEB = FLOC
+			 	set BTR1    = FLOC
+			 	set YFPARA  = $get(^INFIBPAR(0,YM,BTR1,1))
+			 	if $piece(YFPARA,Y,3)'="" set BTR1 = $piece(YFPARA,Y,3)
+			 	
+			 	set BUCHUNG = $get(^INFIBBUCHHOLD(YM,FLOC,FDAT,FLFN,1))
+			 	
+			 	if BUCHUNG'="" {
+					set enumAttachedGL = $$$INFIBPARAttachedGL(YFPARA)   ; SR16871 ; FIXME - may need to inherit - see INFIBBUCH
+			 		set TYPE    = $piece(BUCHUNG,Y,45)
+			 		set BUCHART = $piece(BUCHUNG,Y,46)
+			 		set KEY     = $piece(BUCHUNG,Y,47)
+					do BUCH^INFIBBUCH
+					kill ^INFIBBUCHHOLD(YM,FLOC,FDAT,FLFN)
+			 	}
+			}
+		}
+	}
+	
+	kill ^WWWSOR(YUSER)
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,931 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VAREstoqueConsEndereco" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[VAREstoqueConsEndereco
+#include COMSYS
+#include INConst
+
+OnBeforeFormConstruction(pYKEY)
+	if ($piece($get(^VARTempConsEndereco(YM,YBED,1)),Y,6) = ""){
+		set $piece(^VARTempConsEndereco(YM,YBED,1),Y,6) = 1
+	}
+	
+	quit:(pYKEY = "")
+	
+	if ($$$KEY1(pYKEY) = "ExternalEndereco") {
+		do VARLogAfterSave^VARUtil(YBED,YFORM)
+		set $piece(^VARTempConsEndereco(YM,YBED,1),Y,7) = $$$KEY2(pYKEY)
+		set $piece(^VARTempConsEndereco(YM,YBED,1),Y,2) = $$$KEY3(pYKEY)
+	}
+
+	quit
+
+OnAfterSave
+	new IniciaCom, Quebra, De, Ate, OrdenarPor, TipoConsulta, Endereco, Formato
+	
+	kill ^VARTempConsEndereco(YM,YBED)
+	
+	set IniciaCom   	= $get(VORG(1))
+	set Quebra 			= $get(VORG(2))
+	set De		 		= $get(VORG(3))
+	set Ate		 		= $get(VORG(4))
+	set OrdenarPor  	= $get(VORG(5))
+	set TipoConsulta  	= $get(VORG(6))
+	set Endereco  		= $get(VORG(7))
+	set Formato  		= $get(VORG(8))
+	
+	set $piece(^VARTempConsEndereco(YM,YBED,1),Y,1) = IniciaCom
+	set $piece(^VARTempConsEndereco(YM,YBED,1),Y,2) = Quebra	
+	set $piece(^VARTempConsEndereco(YM,YBED,1),Y,3) = De	
+	set $piece(^VARTempConsEndereco(YM,YBED,1),Y,4) = Ate	
+	set $piece(^VARTempConsEndereco(YM,YBED,1),Y,5) = OrdenarPor	
+	set $piece(^VARTempConsEndereco(YM,YBED,1),Y,6) = TipoConsulta
+	set $piece(^VARTempConsEndereco(YM,YBED,1),Y,7) = Endereco
+	set $piece(^VARTempConsEndereco(YM,YBED,1),Y,8) = Formato
+
+	if (TipoConsulta '= ""){
+		if (TipoConsulta = 1){
+			set $piece(^VARTempConsEndereco(YM,YBED,1),Y,1) = ""
+			set $piece(^VARTempConsEndereco(YM,YBED,1),Y,3) = ""
+			set $piece(^VARTempConsEndereco(YM,YBED,1),Y,4) = ""
+		}
+		if (TipoConsulta = 2){
+			set $piece(^VARTempConsEndereco(YM,YBED,1),Y,1) = ""
+			set $piece(^VARTempConsEndereco(YM,YBED,1),Y,7) = ""
+		}
+		if (TipoConsulta = 3){
+			set $piece(^VARTempConsEndereco(YM,YBED,1),Y,3) = ""
+			set $piece(^VARTempConsEndereco(YM,YBED,1),Y,4) = ""			
+			set $piece(^VARTempConsEndereco(YM,YBED,1),Y,7) = ""
+		}
+	}
+
+	do VARLogAfterSave^VARUtil(YBED,YFORM)	
+ 	do GoToForm^COMUtilForm("VAREstoqueConsEndereco",1) 	
+	
+	quit
+
+OnAfterDataFields
+	new filterEndereco, filterQuebra
+	
+	do PrintJS
+	
+	//Só apresenta os resultados da consulta caso o usuário tenha clicado no botão 'Ok' do form.
+	quit:('$$isAfterSaveLogged^VARUtil(YBED,YFORM))
+	do ClearVARLogAterSave^VARUtil(YBED,YFORM)
+
+	set filterEndereco = $get(VORG(1))
+	set filterQuebra   = $get(VORG(2))
+	
+	if filterEndereco = "" set filterEndereco = $piece($get(^VARTempConsEndereco(YM,YBED,1)),Y,1)
+	if filterQuebra   = "" set filterQuebra = $piece($get(^VARTempConsEndereco(YM,YBED,1)),Y,2)
+	
+	do MontaGrid(filterEndereco,filterQuebra)
+	
+	quit
+	
+MontaGrid(pfilterEndereco="",pfilterQuebra="")
+	;-------------------------------------------------------------------------------
+	; Called By : VAREstoqueConsEndereco
+	; 
+	; History :
+	; 2015-03-11	FC			Alteração para recuperar o intervalo de endereços de forma correta
+	; 2011-08-20	RGB			Alteração para verificar se o endereço de armazenagem é um paciente.
+	;							Previamente ele validava apenas se o local era uma farmacia judicial,
+	;							alterando o header incorretamente para "Paciente", independente do 
+	;							endereço de armazenagem. Colocando o cabeçalho de acordo com o padrão	
+	;
+	; 2010-05-24	Sósthenes	Adicionado filtro automático de local corrente.
+	;	?				?		Created
+	;-------------------------------------------------------------------------------
+	;Histórico
+	;2010-05-24	Sósthenes	Adicionado filtro automático de local corrente.	
+	
+	new filterLocal, filterLike, Item, Local, Storage, Quantidade, Lote, Validade, totalQty, 
+		isBlockedStorage, prefixStyle, posfixStyle, reasonBlocked, descBlocked, idMarca, nomeMarca,
+		objStorage, EndFisico, blnTSU, Cabecalho, blnEndFisicoBloqueado, EnderecoAnterior,
+		nomePaciente, externalKey
+		
+	set filterLocal = YLOCATION
+	set filterLike  = ""
+	set:(pfilterEndereco '= "") filterLike  = pfilterEndereco_"%"
+	
+	if (pfilterQuebra '= "") {
+		do MontaGridSemQuebra(filterLocal,filterLike)
+		quit
+	}
+	
+	set filterDe 		 = $piece(^VARTempConsEndereco(YM,YBED,1),Y,3)
+	set filterAte 		 = $piece(^VARTempConsEndereco(YM,YBED,1),Y,4)
+	set filterOrdenarPor = $piece(^VARTempConsEndereco(YM,YBED,1),Y,5)
+	set filterTipo		 = $piece(^VARTempConsEndereco(YM,YBED,1),Y,6)
+	set filterEndereco   = $piece(^VARTempConsEndereco(YM,YBED,1),Y,7)
+	set pfilterFormato   = $piece(^VARTempConsEndereco(YM,YBED,1),Y,8)
+	
+	if (filterTipo '= ""){
+		if (filterTipo = 1){
+			if (filterEndereco = "") $$$Alert("Endereço: Campo obrigatório") quit
+		}
+		if (filterTipo = 2){
+			if ((filterDe = "") || (filterAte = "")) $$$Alert("Desde o endereço / Até: Campos obrigatórios") quit
+		}
+		if (filterTipo = 3){
+			if (filterLike = "") $$$Alert("Endereço inicia com: Campo obrigatório") quit
+		}
+	}
+
+	set rsStockSemQuebra = ##class(%ResultSet).%New()  ;Create Result Set Object
+	
+		
+	set meuSQL = ""
+	set meuSQL = meuSQL_" SELECT Item, "
+	set meuSQL = meuSQL_" Location, "
+	set meuSQL = meuSQL_" Code, "
+	if ((pfilterFormato = 1) || (pfilterFormato = "")) { ;HEVA-1921
+		set meuSQL = meuSQL_" QtyOnHand, "
+	}
+	else {
+		set meuSQL = meuSQL_" SUM(QtyOnHand) as QtyOnHand, "
+	}
+	set meuSQL = meuSQL_" LotNumber, "
+	set meuSQL = meuSQL_" UseByDate, "
+	set meuSQL = meuSQL_" Brand, "
+	set meuSQL = meuSQL_" PhysicalCode "
+	set meuSQL = meuSQL_" FROM Report.VAREstoqueConsEndereco "
+	set meuSQL = meuSQL_" WHERE Location = '"_filterLocal_"' "
+
+	if (filterTipo = 1) {
+		set meuSQL = meuSQL_" AND (Code = '"_filterEndereco_"' OR PhysicalCode = '"_filterEndereco_"') "
+	}
+	
+	
+	;HEVA-1921
+	if (filterTipo = 2){
+		if (filterDe '= ""){
+			set meuSQL = meuSQL_" AND ""A""||Code  >= ""A"_filterDe_"' "
+		}
+		if (filterAte '= ""){
+			set meuSQL = meuSQL_" AND ""A""||Code  <= ""A"_filterAte_"' "
+		}
+	}
+		
+	/*
+	if (filterTipo = 2){
+		if (filterDe '= ""){
+			if (($find(filterDe,"-") || ($length(filterDe) < 4))) {
+				set meuSQL = meuSQL_" AND EnderecoFinalNumero  >= '"_$$SQLGetNoEnderecoDe(filterDe)_"' "
+			}
+			else {
+				set meuSQL = meuSQL_" AND Code  >= '"_filterDe_"' "
+			}
+		}
+		if (filterAte '= ""){
+			if (($find(filterAte,"-") || ($length(filterAte) < 4))) {
+				set meuSQL = meuSQL_" AND EnderecoFinalNumero  <= '"_$$SQLGetNoEnderecoAte(filterAte)_"' "
+			}
+			else {
+				set meuSQL = meuSQL_" AND Code  <= '"_filterAte_"' "
+			}
+		}
+	}
+	*/
+	
+	if (filterTipo = 3){
+		set meuSQL = meuSQL_" AND (Code like '"_filterLike_"' OR PhysicalCode like '"_filterLike_"') "
+	}
+	
+	if (pfilterFormato = 2) {
+		set meuSQL = meuSQL_" GROUP BY Code, Item "
+	}
+	
+	set meuSQL = meuSQL_" ORDER BY Code, Item " ;HEVA-1921
+	
+	
+	do rsStockSemQuebra.Prepare(meuSQL)  ;Prepare Query
+	do rsStockSemQuebra.Execute()  	     ;Execute Query
+	
+	set EnderecoAnterior = ""
+	
+	//Tabela
+   	new lstHeader
+ 	set lstHeader = ""
+  	;set lstHeader = lstHeader_$listbuild("Endereço","Produto","Descricão","Quantidade","Unidade","Lote","Validade")
+	
+	if $$Start^COMTable(lstHeader) {	
+	
+		while (rsStockSemQuebra.Next()) {
+
+			set Item 			= rsStockSemQuebra.GetDataByName("Item")
+			set Local			= rsStockSemQuebra.GetDataByName("Location")
+			set Storage			= rsStockSemQuebra.GetDataByName("Code")
+			set Quantidade		= rsStockSemQuebra.GetDataByName("QtyOnHand")
+			set Lote			= rsStockSemQuebra.GetDataByName("LotNumber")
+			set Validade		= rsStockSemQuebra.GetDataByName("UseByDate")
+			set idMarca			= rsStockSemQuebra.GetDataByName("Brand")
+			set EndFisico		= rsStockSemQuebra.GetDataByName("PhysicalCode")
+
+			if (EnderecoAnterior '= Storage){
+				
+				if (EnderecoAnterior '= "") {
+					;Encerra a tabela anterior
+					//do Stop^COMTable()
+					do NewLine^COMTable("lightgrey")
+					do InsertCell^COMTable("",,,,,,8)
+					do EndLine^COMTable()					
+				
+				}
+			
+				set objStorage = $get(^INLP(YM,Local,Storage,1))
+				
+				set EnderecoAnterior = Storage
+				set Modulo = $piece(Storage,"-",1)
+				set Rua    = $piece(Storage,"-",2)
+				set Predio = $piece(Storage,"-",3)
+				set Andar  = $piece(Storage,"-",4)
+				set Apto   = $piece(Storage,"-",5)
+				
+				set blnTSU = $piece(objStorage,Y,21)
+				
+				set isBlockedStorage = $$checkIfBlockedStorage^VARStock(Local,Storage)
+				
+				if filterLocal = $$getFarmaciaAcoesJudiciais^VARParametroCliente(YM) {
+					//Validar se o endereço de armazenagem é um paciente
+					set nomePaciente=""
+					set nomePaciente=$$GetNomePaciente^VARMEDPatient(Local,Storage)
+
+						if nomePaciente'="" {
+							set Cabecalho = "Paciente: "_nomePaciente
+					}
+				
+				} elseif ( $length(Storage,"-") = 5 ) {
+					
+					if (isBlockedStorage = $$$YES) {					
+						set Cabecalho = "<span title='Endereço Bloqueado.'><font color='gray' style='text-decoration:line-through'>"
+					} else {
+						set Cabecalho = "<font size='2'>"
+					}
+					
+					set Cabecalho = Cabecalho_"Módulo: "_Modulo_"&nbsp;&nbsp;-&nbsp;&nbsp;"
+					set Cabecalho = Cabecalho_"Rua: "_Rua_"&nbsp;&nbsp;-&nbsp;&nbsp;"
+					set Cabecalho = Cabecalho_"Prédio: "_Predio_"&nbsp;&nbsp;-&nbsp;&nbsp;"
+					set Cabecalho = Cabecalho_"Andar: "_Andar_"&nbsp;&nbsp;-&nbsp;&nbsp;"
+					set Cabecalho = Cabecalho_"Apto: "_Apto_"</font></span>"
+				
+				} elseif (blnTSU = $$$YES) {
+					set EndFisico = $piece(objStorage,Y,22)
+					
+					if (EndFisico '= "") {					
+						set blnEndFisicoBloqueado = $$checkIfBlockedStorage(Local,EndFisico)						
+						if (blnEndFisicoBloqueado = $$$YES) {						
+							set Cabecalho = "Palete: "_Storage_"&nbsp;&nbsp;<span title='Endereço Bloqueado.'>Endereço Físico: <font color='gray' style='text-decoration:line-through'>"_EndFisico_"</font></span>"
+						} else {
+							set Cabecalho = "Palete: "_Storage_"&nbsp;&nbsp;Endereço Físico: "_EndFisico
+						}
+					} else {
+						set Cabecalho = "Palete: "_Storage
+					}
+					
+				} else {
+					set Cabecalho = "Endereço: "_Storage
+					
+				}
+				
+				do NewLine^COMTable("darkgray")
+				do InsertCell^COMTable("<b>"_"Endereço"_"</b>")
+				do InsertCell^COMTable("<b>"_"Detalhe"_"</b>",,,,,,7)
+				do EndLine^COMTable()					
+				
+				;do NewLine^COMTable("lightsteelblue")
+				do NewLine^COMTable("lightgoldenrodyellow")
+				do InsertCell^COMTable(Storage)
+				do InsertCell^COMTable(Cabecalho,,,,,,7)
+				do EndLine^COMTable()
+
+				do NewLine^COMTable("darkgray")
+				do InsertCell^COMTable("")
+				do InsertCell^COMTable("<b>"_"Produto"_"</b>")
+				do InsertCell^COMTable("<b>"_"Descricão"_"</b>")
+				do InsertCell^COMTable("<b>"_"Quantidade"_"</b>")
+				do InsertCell^COMTable("<b>"_"Unidade"_"</b>")
+				
+				if ((pfilterFormato = 1) || (pfilterFormato = "")) { ;HEVA-1921
+					do InsertCell^COMTable("<b>"_"Lote"_"</b>")
+					do InsertCell^COMTable("<b>"_"Validade"_"</b>")
+					do InsertCell^COMTable("<b>"_"Marca"_"</b>")
+				}
+				
+				do EndLine^COMTable()
+				
+				;Inicia a grid para o Endereço
+				//if $$Start^COMTable(lstHeader,Cabecalho) {
+
+				//}
+
+			
+			
+			} ;end (EnderecoAnterior '= Storage)
+		
+		
+  	
+	  	
+	  	
+		  	//if $$Start^COMTable(lstHeader) {
+			
+				 	set objItem = $get(^INART(YM,Item,1))
+ 	
+					set descItem  = $piece(objItem,Y,1)
+					set idUnit    = $piece(objItem,Y,40)
+					set descUnit  = $$SQLGetDescCompletaUnit^VARSQL(idUnit) ;$piece($get(^WWW101(YM,"EINHEIT",SPRACHE,idUnit,1)),Y,1)
+					set idGroup   = $piece(objItem,Y,30)
+					set descGroup = $piece($get(^INItemGroup(YM,idGroup,1)),Y,2)
+					;Petik 28/12/2009
+					;Alterado para o novo campo Conta Contábil (D278)
+					;set conta     = $piece(objItem,Y,276)					
+					set conta     = $$$INARTFREE3(objItem)
+					if (conta '= "") {
+						set descConta = $piece($get(^INPARA(YM,"VARTCICONTACONTABIL","PT",conta,1)),Y,1)
+					}
+					set avgCost   = $$GetCost^INItemCost(Item)
+					
+					set nomeMarca = $$GetBrandName^VARSQL(idMarca)
+			
+			
+					//set totalQty = totalQty + Quantidade
+			
+					//set isBlockedStorage = ""
+					//set isBlockedStorage = $$checkIfBlockedStorage(Local,Storage)
+			
+					set prefixStyle = ""
+					set posfixStyle = ""
+			
+					/*
+					if (isBlockedStorage = 1) {
+						set reasonBlocked = $piece($get(^INLP(YM,Local,Storage,1)),Y,20)
+						set descBlocked = ""
+						if reasonBlocked '= "" {
+							set descBlocked = $piece($get(^INPARA(YM,"LPSPERRGRUND",SPRACHE,reasonBlocked,1)),Y,1)
+						}
+						set prefixStyle = "<font color=red style=text-decoration:line-through><span title = 'Endereço indisponível. Motivo: "_descBlocked_"'>"
+						set posfixStyle = "</span></font>"
+					}
+					*/
+				 
+
+					if (( (Validade < $horolog) && (Validade '= "") && (pfilterFormato = 1) ) || ( (Validade < $horolog) && (Validade '= "") && (pfilterFormato = "") )) { ;HEVA-1921
+						set prefixStyle = "<font color=red style=text-decoration:line-through><span title = 'Produto vencido.'>"
+						set posfixStyle = "</span></font>"
+					}
+					
+					if Validade '= "" set Validade = $zdate(Validade,4)
+					
+					set externalKey = "External"_$$$COMMA_Item_$$$COMMA_filterLocal
+			
+					do NewLine^COMTable()
+			    	do InsertCell^COMTable("")
+			    	do InsertCell^COMTable(prefixStyle_Item_posfixStyle,"VARStock",externalKey)
+			    	do InsertCell^COMTable(prefixStyle_descItem_posfixStyle,,,,,,,,,1)
+			    	do InsertCell^COMTable(prefixStyle_$$^WWWTR(0,12,Quantidade)_posfixStyle,,,,"RIGHT")	    	
+			    	do InsertCell^COMTable(prefixStyle_descUnit_posfixStyle)
+			    	
+			    	if (pfilterFormato = 1) || (pfilterFormato = "") { ;HEVA-1921
+			    		do InsertCell^COMTable(prefixStyle_Lote_posfixStyle)
+			    		do InsertCell^COMTable(prefixStyle_Validade_posfixStyle)
+			    		do InsertCell^COMTable(prefixStyle_nomeMarca_posfixStyle,,,,,,,,,1)
+			    	}
+			    	
+			    	;do InsertCell^COMTable($$^WWWTR(0,12,avgCost,4),,,,"RIGHT")
+	    	
+
+			    	do EndLine^COMTable()
+				//} //if $$Start^COMTable(lstHeader)
+		
+				//do Stop^COMTable()	
+  	
+  	
+	  	}	;end for
+	
+		do Stop^COMTable()	
+		
+	}
+	
+	do rsStockSemQuebra.Close()
+	
+	quit
+
+checkIfBlockedStorage(pidLocal,pidStorage)
+	if pidStorage = "" quit ""
+	quit $piece($get(^INLP(YM,pidLocal,pidStorage,1)),Y,8)
+	
+	
+Imprimir()
+	;do Imprimir^VAREstoqueConsEndereco()
+	new pfilterLike, filterDe, filterAte, filterOrdenarPor, filterTipo, filterEndereco
+	set pfilterLike = $get(VORG(1))
+	
+	if (pfilterLike = "") {
+		set pfilterLike = $piece(^VARTempConsEndereco(YM,YBED,1),Y,1)
+	}
+
+	set filterDe 		 = $piece(^VARTempConsEndereco(YM,YBED,1),Y,3)
+	set filterAte 		 = $piece(^VARTempConsEndereco(YM,YBED,1),Y,4)
+	set filterOrdenarPor = $piece(^VARTempConsEndereco(YM,YBED,1),Y,5)
+	set filterTipo		 = $piece(^VARTempConsEndereco(YM,YBED,1),Y,6)
+	set filterEndereco   = $piece(^VARTempConsEndereco(YM,YBED,1),Y,7)
+
+	if (filterTipo '= ""){
+		if (filterTipo = 1){
+			if (filterEndereco = "") $$$Alert("Endereço: Campo obrigatório") do GoToForm^COMUtilForm("VAREstoqueConsEndereco",1) 
+		}
+		if (filterTipo = 2){
+			if ((filterDe = "") || (filterAte = "")) $$$Alert("Desde o endereço / Até: Campos obrigatórios") do GoToForm^COMUtilForm("VAREstoqueConsEndereco",1) 
+		}
+		if (filterTipo = 3){
+			if (pfilterLike = "") $$$Alert("Endereço inicia com: Campo obrigatório") do GoToForm^COMUtilForm("VAREstoqueConsEndereco",1) 
+		}
+	}
+	
+	do RunReportEstoqueConsEndereco^VARJasperRunReport()
+	
+	quit
+	
+MontaGridSemQuebra(pfilterLocal,pfilterLike)
+	;---------------------------------------------------------------------------------------
+	; Called By : VAREstoqueConsEndereco
+	; 
+	; History :
+	; 2012-04-24	Lucas	Adicionado filtro para exibir resultado sem quebra/agrupamento.
+	;---------------------------------------------------------------------------------------
+	;quit:( (pfilterLocal = "") || (pfilterLike = "") )
+	
+	new objItem, idUnit, descUnit, nomeMarca, objStorage, blnTSU, EndFisico, Validade,
+		prefixStyle, posfixStyle, externalKey
+	
+	set filterDe 		 = $piece(^VARTempConsEndereco(YM,YBED,1),Y,3)
+	set filterAte 		 = $piece(^VARTempConsEndereco(YM,YBED,1),Y,4)
+	set filterOrdenarPor = $piece(^VARTempConsEndereco(YM,YBED,1),Y,5)
+	set filterTipo		 = $piece(^VARTempConsEndereco(YM,YBED,1),Y,6)
+	set filterEndereco   = $piece(^VARTempConsEndereco(YM,YBED,1),Y,7)
+	set pfilterFormato   = $piece(^VARTempConsEndereco(YM,YBED,1),Y,8)
+	
+	if (filterTipo '= ""){
+		if (filterTipo = 1){
+			if (filterEndereco = "") $$$Alert("Endereço: Campo obrigatório") quit
+		}
+		if (filterTipo = 2){
+			if ((filterDe = "") || (filterAte = "")) $$$Alert("Desde o endereço / Até: Campos obrigatórios") quit
+		}
+		if (filterTipo = 3){
+			if (pfilterLike = "") $$$Alert("Endereço inicia com: Campo obrigatório") quit
+		}
+	}
+	
+	set:(filterOrdenarPor = "") filterOrdenarPor ]]><![CDATA[= 3
+	
+	set rsStockSemQuebra = ##class(%ResultSet).%New()  ;Create Result Set Object
+	
+		
+	set meuSQL = ""
+	set meuSQL = meuSQL_" SELECT Item, "
+	set meuSQL = meuSQL_" Location, "
+	set meuSQL = meuSQL_" Code, "
+	if ((pfilterFormato = 1) || (pfilterFormato = "")) { ;HEVA-1921
+		set meuSQL = meuSQL_" QtyOnHand, "
+	}
+	else {
+		set meuSQL = meuSQL_" SUM(QtyOnHand) as QtyOnHand, "
+	}
+	set meuSQL = meuSQL_" LotNumber, "
+	set meuSQL = meuSQL_" UseByDate, "
+	set meuSQL = meuSQL_" Brand, "
+	set meuSQL = meuSQL_" PhysicalCode "
+	set meuSQL = meuSQL_" FROM Report.VAREstoqueConsEndereco "
+	set meuSQL = meuSQL_" WHERE Location = '"_pfilterLocal_"' "
+
+	if (filterTipo = 1) {
+		set meuSQL = meuSQL_" AND (Code = '"_filterEndereco_"' OR PhysicalCode = '"_filterEndereco_"') "
+	}
+	
+	
+	;HEVA-1921
+	if (filterTipo = 2){
+		if (filterDe '= ""){
+			set meuSQL = meuSQL_" AND ""A""||Code  >= ""A"_filterDe_"' "
+		}
+		if (filterAte '= ""){
+			set meuSQL = meuSQL_" AND ""A""||Code  <= ""A"_filterAte_"' "
+		}
+	}
+	
+	/*
+	if (filterTipo = 2){
+		if (filterDe '= ""){
+			if (($find(filterDe,"-") || ($length(filterDe) < 4))) {
+				set meuSQL = meuSQL_" AND EnderecoFinalNumero  >= '"_$$SQLGetNoEnderecoDe(filterDe)_"' "
+			}
+			else {
+				set meuSQL = meuSQL_" AND Code  >= '"_filterDe_"' "
+			}
+		}
+		if (filterAte '= ""){
+			if (($find(filterAte,"-") || ($length(filterAte) < 4))) {
+				set meuSQL = meuSQL_" AND EnderecoFinalNumero  <= '"_$$SQLGetNoEnderecoAte(filterAte)_"' "
+			}
+			else {
+				set meuSQL = meuSQL_" AND Code  <= '"_filterAte_"' "
+			}
+		}
+	}
+	*/
+
+	if (filterTipo = 3){
+		set meuSQL = meuSQL_" AND (Code like '"_filterLike_"' OR PhysicalCode like '"_filterLike_"') "
+	}
+	
+	if (pfilterFormato = 2){
+		set meuSQL = meuSQL_" GROUP BY Code, Item "
+	}
+	
+	if (filterOrdenarPor = 1){
+		set meuSQL = meuSQL_ " ORDER BY Item "
+	}
+	elseif (filterOrdenarPor = 2) {
+		set meuSQL = meuSQL_ " ORDER BY $$SQLGetTextoSemAcento^VARSQL($$SQLGetDescricaoProduto^VARSQL(Item)) "
+	}
+	else {
+		set meuSQL = meuSQL_" ORDER BY EnderecoFinalNumero, Item "
+	}
+	
+	
+		
+	do rsStockSemQuebra.Prepare(meuSQL)  ;Prepare Query
+	do rsStockSemQuebra.Execute()  	     ;Execute Query
+	
+	//Tabela
+   	new lstHeader
+  	if ((pfilterFormato = 1) || (pfilterFormato = "")) { ;HEVA-1921
+  		set lstHeader = $listbuild("Endereço","Produto","Descrição","Quantidade","Unidade","Lote","Validade","Marca")
+   	} elseif (pfilterFormato = 2){
+	   	set lstHeader = $listbuild("Endereço","Produto","Descrição","Quantidade","Unidade")
+   	}
+	
+	if $$Start^COMTable(lstHeader) {	
+
+		while (rsStockSemQuebra.Next()) {
+			
+			set Item 			= rsStockSemQuebra.GetDataByName("Item")
+			set Local			= rsStockSemQuebra.GetDataByName("Location")
+			set Storage			= rsStockSemQuebra.GetDataByName("Code")
+			set Quantidade		= rsStockSemQuebra.GetDataByName("QtyOnHand")
+			set Lote			= rsStockSemQuebra.GetDataByName("LotNumber")
+			set Validade		= rsStockSemQuebra.GetDataByName("UseByDate")
+			set idMarca			= rsStockSemQuebra.GetDataByName("Brand")
+			set EndFisico		= rsStockSemQuebra.GetDataByName("PhysicalCode")
+			
+			set objItem   = $get(^INART(YM,Item,1))
+			set idUnit    = $piece(objItem,Y,40)
+			set descUnit  = $$SQLGetDescCompletaUnit^VARSQL(idUnit) ;$piece($get(^WWW101(YM,"EINHEIT",SPRACHE,idUnit,1)),Y,1)
+			set nomeMarca = $$GetBrandName^VARSQL(idMarca)
+		
+			set objStorage = $get(^INLP(YM,Local,Storage,1))
+			set blnTSU     = $piece(objStorage,Y,21)
+			set EndFisico  = ""
+		
+			if (blnTSU = $$$YES) {
+				set EndFisico = $piece(objStorage,Y,22)
+			}
+		
+			if ( (Validade < $horolog) && (Validade '= "") ) {
+				set prefixStyle = "<font color=red style=text-decoration:line-through><span title = 'Produto vencido.'>"
+				set posfixStyle = "</span></font>"
+			}
+			else {
+				set prefixStyle = ""
+				set posfixStyle = ""
+			}
+			if Validade '= "" set Validade = $zdate(Validade,4)
+			
+			set externalKey = "External"_$$$COMMA_Item_$$$COMMA_filterLocal
+		
+			do NewLine^COMTable()
+			do InsertCell^COMTable(prefixStyle_Storage_posfixStyle,,,,"CENTER")
+			;do InsertCell^COMTable(prefixStyle_EndFisico_posfixStyle,,,,"CENTER") ;HEVA-1921
+			do InsertCell^COMTable(prefixStyle_Item_posfixStyle,"VARStock",externalKey,,"CENTER")
+			do InsertCell^COMTable(prefixStyle_$$SQLGetDescricaoProduto^VARSQL(Item)_posfixStyle,,,,,,,,,$$$YES)
+			do InsertCell^COMTable(prefixStyle_$$^WWWTR(0,12,Quantidade)_posfixStyle,,,,"RIGHT")
+			do InsertCell^COMTable(prefixStyle_descUnit_posfixStyle,,,,"CENTER")
+			
+			if ((pfilterFormato = 1) || (pfilterFormato = "")) { ;HEVA-1921
+				do InsertCell^COMTable(prefixStyle_Lote_posfixStyle,,,,"CENTER")
+				do InsertCell^COMTable(prefixStyle_Validade_posfixStyle,,,,"CENTER")
+				do InsertCell^COMTable(prefixStyle_nomeMarca_posfixStyle,,,,"CENTER",,,,,1)
+			}
+				
+			do EndLine^COMTable()		   
+	   
+	  	}	;end for
+	
+		do Stop^COMTable()	
+		
+	}
+	
+	do rsStockSemQuebra.Close()
+	
+	quit
+	
+SQLGetModulo(pEndereco)
+	
+	new Result, Modulo
+	
+	set Result = ""
+	if (pEndereco '= ""){
+		if ($piece(pEndereco,"-",3) '= ""){ //checar se é palete ou endereço com traço
+			set Modulo = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,1),3,"0")
+			set Result = +Modulo
+		} else {
+			set Result = pEndereco 
+		}
+	}
+	quit Result
+	
+SQLGetRua(pEndereco)
+	
+	new Result, Rua
+	
+	set Result = ""
+	if (pEndereco '= ""){
+		if ($piece(pEndereco,"-",3) '= ""){ //checar se é palete ou endereço com traço
+			set Rua = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,2),3,"0")
+			set Result = +Rua
+		} else {
+			set Result = pEndereco 
+		}
+	}
+	quit Result
+	
+SQLGetPredio(pEndereco)
+	
+	new Result, Predio
+	
+	set Result = ""
+	if (pEndereco '= ""){
+		if ($piece(pEndereco,"-",3) '= ""){ //checar se é palete ou endereço com traço
+			set Predio = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,3),3,"0")
+			set Result = +Predio
+		} else {
+			set Result = pEndereco 
+		}
+	}
+	quit Result
+	
+SQLGetAndar(pEndereco)
+	
+	new Result, Andar
+	
+	set Result = ""
+	if (pEndereco '= ""){
+		if ($piece(pEndereco,"-",3) '= ""){ //checar se é palete ou endereço com traço
+			set Andar = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,4),3,"0")
+			set Result = +Andar
+		} else {
+			set Result = pEndereco 
+		}
+	}
+	quit Result
+	
+SQLGetApto(pEndereco)
+	
+	new Result, Apto
+	
+	set Result = ""
+	if (pEndereco '= ""){
+		if ($piece(pEndereco,"-",3) '= ""){ //checar se é palete ou endereço com traço
+			set Apto = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,5),3,"0")
+			set Result = +Apto
+		} else {
+			set Result = pEndereco 
+		}
+	}
+	quit Result
+	
+SQLGetNoEnderecoDe(pEndereco)
+	
+	new Result, Modulo, Rua, Predio, Andar, Apto
+	
+	;if ('$find(pEndereco,"-")) quit pEndereco
+	
+	set Result = ""
+	if (pEndereco '= ""){
+		set Modulo = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,1),3,"0")
+		set Rua    = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,2),3,"0")
+		set Predio = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,3),3,"0")
+		set Andar  = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,4),3,"0")
+		set Apto   = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,5),3,"0")
+		set Result = Modulo_"-"_Rua_"-"_Predio_"-"_Andar_"-"_Apto
+	} 
+	
+	quit +$replace(Result,"-","")
+	
+SQLGetNoEnderecoAte(pEndereco)
+	
+	new Result, Modulo, Rua, Predio, Andar, Apto
+	new fillModulo, fillRua, fillPredio, fillAndar, fillApto
+	
+	;if ('$find(pEndereco,"-")) quit pEndereco
+	
+	set Result 		= ""
+	set fillModulo  = 0
+	set fillRua 	= 0
+	set fillPredio 	= 0
+	set fillAndar 	= 0
+	set fillApto 	= 0
+	
+	if (pEndereco '= ""){
+		set:($$SQLGetParteDoEndereco^VARSQL(pEndereco,1) = "") fillModulo = 9
+		set Modulo = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,1),3,fillModulo)
+		
+		set:($$SQLGetParteDoEndereco^VARSQL(pEndereco,2) = "") fillRua = 9
+		set Rua    = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,2),3,fillRua)
+		
+		set:($$SQLGetParteDoEndereco^VARSQL(pEndereco,3) = "") fillPredio = 9
+		set Predio = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,3),3,fillPredio)
+		
+		set:($$SQLGetParteDoEndereco^VARSQL(pEndereco,4) = "") fillAndar = 9
+		set Andar  = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,4),3,fillAndar)
+		
+		set:($$SQLGetParteDoEndereco^VARSQL(pEndereco,5) = "") fillApto = 9
+		set Apto   = $$FillChar^VARSQL($$SQLGetParteDoEndereco^VARSQL(pEndereco,5),3,fillApto)
+		
+		set Result = Modulo_"-"_Rua_"-"_Predio_"-"_Andar_"-"_Apto
+	} 
+	
+	quit +$replace(Result,"-","")
+
+GetEndFisicoFinal(pLocal,pStorage)
+
+	$$$VAR
+	new blnTSU, EndFisico, objStorage 
+	
+	set objStorage = $get(^INLP(YM,pLocal,pStorage,1))
+	set blnTSU     = $piece(objStorage,Y,21)
+	set EndFisico  = ""
+
+	if (blnTSU = $$$YES) {
+		set EndFisico = $piece(objStorage,Y,22)
+	}
+	quit EndFisico
+	
+PrintJS
+	write !, "<script language=""javascript"">"
+	
+	&js<
+	
+		function OnLoadEstoqueConsEndereco() {
+			OnBlurTipoConsulta();
+			OnBlurQuebra();	
+		}
+		
+		function OnBlurTipoConsulta() {
+			if (document.getElementById('Y#(YFORM)#M6').value == '') {
+				// Desabilita todos os filtros
+				document.getElementById('Y#(YFORM)#M1').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M3').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M4').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M7').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M1').readOnly = true;
+				document.getElementById('Y#(YFORM)#M3').readOnly = true;
+				document.getElementById('Y#(YFORM)#M4').readOnly = true;
+				document.getElementById('Y#(YFORM)#M7').readOnly = true;
+				
+				// Limpa os filtros 
+				document.getElementById('Y#(YFORM)#M1').value = '';
+				document.getElementById('Y#(YFORM)#M3').value = '';
+				document.getElementById('Y#(YFORM)#M4').value = '';				
+				document.getElementById('Y#(YFORM)#M7').value = '';				
+			}
+
+			if (document.getElementById('Y#(YFORM)#M6').value == 1) {
+
+				// Habilita os filtros necessários
+				document.getElementById('Y#(YFORM)#M7').disabled = false;
+				document.getElementById('Y#(YFORM)#M7').style.backgroundColor="palegoldenrod";
+				document.getElementById('Y#(YFORM)#M7').readOnly = false;
+
+				// Desabilita os filtros necessários
+				document.getElementById('Y#(YFORM)#M1').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M3').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M4').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M1').readOnly = true;
+				document.getElementById('Y#(YFORM)#M3').readOnly = true;
+				document.getElementById('Y#(YFORM)#M4').readOnly = true;
+				
+				// Limpa os filtros 
+				document.getElementById('Y#(YFORM)#M1').value = '';
+				document.getElementById('Y#(YFORM)#M3').value = '';
+				document.getElementById('Y#(YFORM)#M4').value = '';
+				
+			} 
+			if (document.getElementById('Y#(YFORM)#M6').value == 2) {
+
+				// Habilita os filtros necessários
+				document.getElementById('Y#(YFORM)#M3').disabled = false;
+				document.getElementById('Y#(YFORM)#M4').disabled = false;
+				document.getElementById('Y#(YFORM)#M3').style.backgroundColor="palegoldenrod";
+				document.getElementById('Y#(YFORM)#M4').style.backgroundColor="palegoldenrod";
+				document.getElementById('Y#(YFORM)#M3').readOnly = false;
+				document.getElementById('Y#(YFORM)#M4').readOnly = false;
+
+				// Desabilita os filtros necessários
+				document.getElementById('Y#(YFORM)#M1').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M7').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M1').readOnly = true;
+				document.getElementById('Y#(YFORM)#M7').readOnly = true;
+				
+				// Limpa os filtros 
+				document.getElementById('Y#(YFORM)#M1').value = '';
+				document.getElementById('Y#(YFORM)#M7').value = '';
+				
+			} 
+			if (document.getElementById('Y#(YFORM)#M6').value == 3) {
+
+				// Habilita os filtros necessários
+				document.getElementById('Y#(YFORM)#M1').disabled = false;
+				document.getElementById('Y#(YFORM)#M1').style.backgroundColor="palegoldenrod";
+				document.getElementById('Y#(YFORM)#M1').readOnly = false;
+
+				// Desabilita os filtros necessários
+				document.getElementById('Y#(YFORM)#M3').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M4').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M7').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M3').readOnly = true;
+				document.getElementById('Y#(YFORM)#M4').readOnly = true;
+				document.getElementById('Y#(YFORM)#M7').readOnly = true;
+				
+				// Limpa os filtros 
+				document.getElementById('Y#(YFORM)#M3').value = '';
+				document.getElementById('Y#(YFORM)#M4').value = '';
+				document.getElementById('Y#(YFORM)#M7').value = '';
+				
+			}
+		}			
+
+		function OnBlurQuebra() {
+			if (document.getElementById('Y#(YFORM)#M2').checked == false) {
+				// Desabilita ordenamento
+				document.getElementById('Y#(YFORM)#M5').style.backgroundColor="gainsboro";
+				document.getElementById('Y#(YFORM)#M5').value = 3; //HEVA-1921
+				document.getElementById('Y#(YFORM)#M5').readOnly = true;
+				document.getElementById('Y#(YFORM)#M5').disabled = true;	
+			}
+			else {
+				// Habilita ordenamento
+				if(navigator.appName.indexOf('Internet Explorer')&gt;0){
+					document.getElementById('Y#(YFORM)#M5').style.backgroundColor = '';
+				}else{
+					document.getElementById('Y#(YFORM)#M5').style.backgroundColor = null;
+				}
+				document.getElementById('Y#(YFORM)#M5').readOnly = false;				
+				document.getElementById('Y#(YFORM)#M5').disabled = false;	
+			}
+		}
+		
+		function addEvent(obj, evType, fn) {
+ 			if (obj.addEventListener) {
+   				obj.addEventListener(evType, fn, false);
+   				return true;
+ 			} else if (obj.attachEvent){
+   				var r = obj.attachEvent('on'+evType, fn);
+   				return r; 
+ 			} else {
+   				return false;
+ 			}
+		}		
+
+		addEvent(document.forms[1].YVAREstoqueConsEnderecoM6, 'blur', OnBlurTipoConsulta);
+		addEvent(document.forms[1].YVAREstoqueConsEnderecoM2, 'blur', OnBlurQuebra);
+		addEvent(window,'load', OnLoadEstoqueConsEndereco);
+			
+	>
+	
+	write !, "</script>"
+	
+	quit
+	
+GetValorPadraoFormato()
+	new Formato
+	set Formato = $piece($get(^VARTempConsEndereco(YM,YBED,1)),Y,8)
+	
+	if (Formato = ""){
+		set Formato = 1 ;Completo
+	}
+	
+	quit Formato
+	
+GetValorPadraoOrdenarPor()
+	new OrdenarPor
+	set OrdenarPor = $piece($get(^VARTempConsEndereco(YM,YBED,1)),Y,5)
+	
+	if (OrdenarPor = ""){
+		set OrdenarPor = 1 ;código de produto
+	}
+	
+	quit OrdenarPor]]></Routine>
+</Export>

@@ -1,0 +1,854 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWWFieldValidation" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWWFieldValidation
+	
+#include COMSYS
+#include WWWConst
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#define LogR2(%1,%2) 	;
+#define LogR2x(%1)		;
+#define LogR2m(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^WWWFieldValidation("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogR2(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^WWWFieldValidation("_%2_") : "_$zh $$$JournalOn
+#;define LogR2x(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogR2m(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+ValidRelation(YART,YDATEI="",YFORM,YLFN,YINHALT="",pblnOnBlur=$$$YES,&pstrReason,pid="",pobj="")
+    ;-------------------------------------------------------------------------------
+    ; Validate a field's relation
+    ; 
+    ; WARNING: If a composite index is used for the Sort Keys, this will FAIL miserably.
+    ; Also @net allows you to enter 5.1 for a sort keys, obviously this doesn't exist as
+    ; a separate index, so this will FAIL miserably, but not due to its own issues, but
+    ; because @net should flag this value as an error. Only integer index keys can be allowed.
+    ;
+    ;-------------------------------------------------------------------------------
+    ; Operation :
+    ;   1.	GetDetails : build array of class fields that associate with the
+    ;       specified class field (i.e. if field is UoM then list all Qty fields
+    ;       based on that unit)
+    ;       e.g. INRECSummary : F8  (Qty Ordered) is associated with D9 (Ordered Unit)
+    ;   2.	NeedToCheck - tests display and COMView properties
+    ;   3.	Only continue when there is data to check
+    ;   4.	DataAccess - Perform ClassHook checks
+    ;   5.	Call $$AssociatedValidation^YFORM if it exists - returns *TRUE* if data
+    ;   	is acceptable (e.g. if unit specified is defined under item's INARTPACK.)
+    ;   6.	Recursively call ValidRelation for the fields in arrAssociatedTo
+    ;		NOTE : doesn't pass pstrReason (error) back from recursive calls and
+    ;		doesn't stop further processing if error found at sublevel; doesn't make
+    ;		recursive call as a function
+    ;   7. FieldFormat - changes background colour if validation error or based on
+    ;   	CheckRules^WWWFORMD
+    ;-------------------------------------------------------------------------------
+    ; Params:	YART	- data type
+    ; 			YDATEI	- class
+    ; 			YFORM	- form
+    ; 			YLFN	- data field (class # for "D", form # for "M", will be same for "P")
+    ; 			YINHALT	- data (internal!)
+    ; 			pblnOnBlur - whether a form field needs to be updated (on blur)
+    ; 
+    ; By Ref:	pstrReason - invalid reason
+    ; 
+    ; Returns: nil
+    ;
+    ; History:
+    ; 04-Sep-2012	shobby	SR18102: Don't continue testing if an invalid thing is found.    
+    ; 27-Jan-2011	GRF		SR17579: pass back errors from recursive calls & quit
+    ; 05-Jan-2011	GRF		SR17579: GetFormField macro; doco
+    ; 07-May-2009	GRF		SR16523: Better reporting of Relation Key issues;
+    ; 							clean up old corrections.
+    ; 25-Oct-2007	GRF		SR15563: DataAccess already dequotes strGlobalKey;
+    ; 							strRelKeys should be byRef
+	; 18-Sep-2007	shobby	SRBR014619: Use standard interface to WWW122 to consider
+	; 							customisation as well.
+    ; 26-Apr-2007	RPW		SRBR014310: If we have an associated field, check that I
+    ; 							am valid for it.
+    ; 26-Mar-2007	JW		SR15384: Changed name from GetValidationDetails. Don't
+    ; 							update %TXT
+    ; 14-Aug-2006	JW		SR14604: Don't test actual node. Could be "parent"
+    ; 05-Jul-2006	RPW		SR12522: Break out the information gathering for the
+    ; 							details of the relation
+    ; 15-Jun-2006	JW		SR12775: Check cache
+    ; 01-Sep-2005	JW		SR13360: Use %TXT, not alert.
+    ; 01-Sep-2005	JW		SR13387: No commas or double quotes allowed
+    ; 15-Aug-2005	JW		SR12290: Call back for data access
+    ; 14-Jul-2005	JW		SR12615: Created
+    ;-------------------------------------------------------------------------------
+	set pstrReason = ""
+	
+	$$$LogR("ValidRelation",$get(YART)_"<"_$get(YFORM)_"<"_$get(YLFN)_"<"_YDATEI_"<"_pblnOnBlur_"<")
+	
+	quit:($get(YFORM)="")||($get(YLFN)="")||($get(YART)="") $$$YES
+	quit:'$$$DEVMODE&&($get(^CacheTempCheckRelation(YUCI,YART,YFORM,YLFN))=$$$NO) $$$YES
+	
+	new arrAssociatedTo,blnHasData,blnTest,blnValid
+	new idAssociated,idDisplay,idField,idRelation,idxKey,idxKeys,objClassFld,objFormFld
+	new strCallBack,strColour,strExecute,strGlobal,strGlobalIdx,strGlobalKey
+	new strRelKeys,strSortKeys,strText,strValue,strYFELD,thisYM
+	
+	set blnValid = $$$YES
+	
+	
+	; For "M"         get form def only.
+	; For "D" and "P" get form def. If no relation, get class def.
+	; NOTE : "C" represents Calculated field in WWW003Calc
+
+	;						"D"	: $$Get^WWW122(YFORM,+$order(^WWW122s(0,4,YLFN,YFORM,""))),  ; SR17579
+	
+	set objFormFld = $case(YART,
+							"D"	: $$Get^WWW122(YFORM,+$$$GetFormField(YFORM,YLFN)),
+							"P"	: $get(^WWW121(0,YFORM,YLFN,1)),
+							"M"	: $$Get^WWW122(YFORM,YLFN),
+								: "")
+	
+	$$$LogRx("VR:1:"_objFormFld)
+	if objFormFld'="" {
+		; Check if we have an association or things are associated with us.
+		do GetDetails(YART,YFORM,YDATEI,YLFN,objFormFld,.blnTest,.idRelation,.idDisplay,.strRelKeys,.strSortKeys,.idAssociated,.arrAssociatedTo)
+		
+	$$$LogRx("VR:2:"_$get(blnTest)_"<"_YINHALT_"<"_$get(idRelation)_"<"_$get(idDisplay)_"<"_$get(idAssociated))
+	$$$LogRx("VR:3:"_$get(strRelKeys)_"<"_$get(strSortKeys)_"<")
+	$$$LogRm(arrAssociatedTo)
+	
+		if blnTest && $$NeedToCheck(idRelation,idDisplay,YART,YDATEI,YLFN,idAssociated,.arrAssociatedTo) {
+			if YINHALT'="" {                        ; FIXME : test first to skip analysis for blank fields?  OK if from OnBlur
+				if $find(YINHALT,$$$DBLQUOTE) || $find(YINHALT,$$$COMMA) {
+					set blnValid = $$$NO	; No commas, double quotes allowed in key
+					
+				} else {
+					set strGlobalKey = $$$DBLQUOTE_YINHALT_$$$DBLQUOTE
+					
+					if strRelKeys'="" {
+						;set blnValid = $$DefineKeys(YFORM,.strRelKeys,"","")
+						set blnValid = $$DefineKeys(YFORM,.strRelKeys,pid,pobj) ; CORE-86
+						set strGlobalKey = strRelKeys_","_strGlobalKey
+						if 'blnValid set pstrReason = $$$Text("WWW00115")
+					}        ; "Error when validating Relationship. Please contact our support team!"
+					
+					
+					if blnValid {                // Index record must not be blank
+						if idRelation'="" { 
+							set thisYM = $$$DBLQUOTE_$$$WWWYM(idRelation)_$$$DBLQUOTE_","   ; FIXME : simply 0, now - hardcode below
+							set strGlobal = "^"_idRelation_"("_thisYM_strGlobalKey_")"
+ 	$$$LogRx("VR:4:"_strGlobal_"<")
+
+							if strSortKeys'="" { // Index - sort keys
+								if $find(strSortKeys,",") {
+									set strGlobal = "^"_idRelation_"s("_thisYM_strSortKeys_","_strGlobalKey_")"
+								
+								} else {         // Index record must not be blank
+									set strGlobalIdx = "^"_idRelation_"s("_thisYM_strSortKeys_","" "","_strGlobalKey_")"
+									if $data(@strGlobalIdx)#2=1 {
+										set blnValid = $$$NO
+									}
+								}
+							}
+						
+							if '$data(@strGlobal) set blnValid = $$$NO
+							
+							if blnValid {
+								set strCallBack = $$$WWW001DataAccess($get(^WWW001(0,idRelation,1)))
+	; *** EXECUTE # ***
+								if strCallBack'="" {
+									set blnValid = $$DataAccess(strCallBack,strGlobalKey,YFORM,YART,YLFN,.pstrReason,idRelation) ;SR17034
+	$$$LogRx("VR:5:"_blnValid_"<"_strCallBack)
+								}
+							}
+						}
+						if blnValid {  ;SR18102
+
+							set blnHasData = ''$data(arrAssociatedTo)
+							if (idAssociated'="") || blnHasData {
+								; CORE-86 vvvv
+								;set strYFELD = $$GetFormData^COMUtilForm(YFORM)         ; WWWDATEN record for current form data
+								set strYFELD = pobj
+								if strYFELD="" {
+									set strYFELD = $$GetFormData^COMUtilForm(YFORM)         ; WWWDATEN record for current form data
+								}
+								if strYFELD="" {
+									set strYFELD = $$$GRIDGetYFELD()
+								}
+								; CORE-86 ^^^^
+							if strYFELD="" {
+								set strYFELD = $$$GRIDGetYFELD()
+							}
+	; *** EXECUTE # ***
+							if idAssociated'="" {  ; FIXME : Doesn't return error message if not valid - results in default "is invalid" message
+								set strExecute = "set blnValid=$$AssociatedValidation^"_YFORM_"(strYFELD,$piece(strYFELD,Y,YLFN),idAssociated)"
+								if '$$$ExecuteCode(strExecute) {
+									set blnValid = $$$YES
+								}
+							}
+		$$$LogRx("VR:6:"_blnValid)
+								if blnHasData && blnValid {  ;SR18102
+									set idField = ""
+									for {
+										set idField = $order(arrAssociatedTo(idField))  ; based on class #
+										quit:idField=""			
+									
+										set strValue = $piece(strYFELD,Y,idField)
+									;	do ValidRelation(YART,YDATEI,YFORM,idField,strValue,pblnOnBlur,pstrReason) ; SR17579
+										;set blnValid = $$ValidRelation(YART,YDATEI,YFORM,idField,strValue,pblnOnBlur,.pstrReason)
+										set blnValid = $$ValidRelation(YART,YDATEI,YFORM,idField,strValue,pblnOnBlur,.pstrReason,pid,pobj) ; CORE-86
+										quit:'blnValid
+		$$$LogRx("VR:7:"_idField_"<"_blnValid_"<"_$get(pstrReason))
+									}
+								}
+							}
+						}
+					}
+				}
+			}  ; * YINHALT *
+			
+			if pblnOnBlur do FieldFormat(blnValid,"Y"_YFORM_YART_YLFN)
+			
+		} else {
+			set ^CacheTempCheckRelation(YUCI,YART,YFORM,YLFN) = $$$NO
+		}
+	}
+	quit blnValid
+	
+	
+GetDetails(pstrFieldType="D",pidForm,pidClass,pidField,pobjFormFld="",
+			&pblnTest,&pidRelation,&pidDisplay,&pstrRelKeys,&pstrSortKeys,&pidAssocFld,&parrAssociatedTo)
+	;-------------------------------------------------------------------------------
+	; Get the validation information to determine whether a validation should happen
+	;
+	; Params:
+	; 	pstrFieldType		The field type, defaults to D for Data Field other values,
+	; 							P for Primary Key or M for manual field.
+	; 						NOTE : "C" represents Calculated field in WWW003Calc
+	; 	pidForm				The id of the Form
+	; 	pidClass			The id of the class
+	; 	pidField			The id of the *CLASS* field
+	; 	pobjFormFld			The form field data (or "")
+	; 	pblnTest			(ByRef) Should we test for validation
+	; 	pidRelation			(ByRef) The name of the validation class
+	; 	pidDisplay			(ByRef) The display options - ^WWW100(0,"RELATION")
+	; 								0 = "Display All Relations"
+	; 								1 = "Display Relations After Input"
+	; 								2 = "Don´t Display Relations (just Test)"
+	; 								3 = "Only Marked Relationfields"
+	; 	pstrRelKeys			(ByRef) Relation Primary Keys
+	; 	pstrSortKey			(ByRef) Display if Sort Key Equals
+	; 	pidAssocFld			(ByRef) 
+	; 	parrAssociatedTo	(ByRef) Class Fields with association links to this form field.
+	; 						e.g. If WWW122 entries for F10 (D25 Qty Ordered) and F12
+	; 						(D26 Qty Received) are defined to have a relationship
+	; 						with F14 (D27 Unit of Measure) then this subroutine will
+	; 						return the array,
+	; 							parrAssociatedTo(25) = ""
+	; 							parrAssociatedTo(26) = ""
+	; 						when checking pidField 27.
+	; Returns:
+	;
+	; History:
+	; 03-Nov-2011	shobby	SR17725: Type 18 (FAT Search)
+	; 14-Apr-2011	shobby	SR17719: Don't put manual fields into arrAssociatedTo
+	;							(crashes because SequenceNumber is a blank string)
+    ; 05-Jan-2011	GRF		SR17579: GetFormField macro; doco
+	; 18-Sep-2007	shobby	SRBR014619: Use standard interface to WWW122 to consider
+	; 							customisation as well.
+	; 24-May-2007	RPW		SR15513: Fixed class v form field information
+	; 26-Apr-2007	RPW		SRBR014310: If we have an associated field, check that
+	; 							I am valid for it.
+	; 26-Mar-2007	JW		SR15384: Changed name
+	; 22-Aug-2006	JW		SR14929: Check data type
+	; 05-Jul-2006	RPW		SR12522: Created
+	;-------------------------------------------------------------------------------
+	quit:($get(pidForm)="")||($get(pidField)="")||(pstrFieldType="")
+	
+	$$$LogR2("GetDetails",pstrFieldType_"<"_pidForm_"<"_pidField_"<")
+	
+	new idAssociatedField,idField,objClassFld,objWWW122
+	
+	set pidAssocFld = ""
+	
+	if pobjFormFld="" {
+	;	set pobjFormFld = $$Get^WWW122(pidForm,+$order(^WWW122s(0,4,pidField,pidForm,"")))   ; SR17579
+		set pobjFormFld = $$Get^WWW122(pidForm,+$$$GetFormField(pidForm,pidField))
+	}
+	
+	if pobjFormFld'="" {
+		set pblnTest    = $$$NO
+		set pidRelation = $$$WWW122RelationClass(pobjFormFld)	// Get form field relation
+		
+		if pidRelation'="" {
+			set pblnTest = '$$$WWW122NoRelationValidation(pobjFormFld)
+			
+			if pblnTest {
+				set pidDisplay   = $$$WWW122RelationDisplayOptions(pobjFormFld)
+				set pstrRelKeys  = $$$WWW122RelationalPrimaryKey(pobjFormFld)
+				set pstrSortKeys = $$$WWW122DisplayIfSortCodes(pobjFormFld)
+			}
+			
+		} elseif pidClass'="" {	// Check class definition
+			set objClassFld = $case(pstrFieldType,
+									"D"	: $get(^WWW003(0,pidClass,pidField,1)),
+									"P"	: $get(^WWW002(0,pidClass,pidField,1)),
+										: "")
+			
+			set pidRelation = $$$WWW003RelationDatabase(objClassFld)	// Get class field relation
+			if pidRelation'="" {
+				set pblnTest = '$$$WWW003NoRelationValidation(objClassFld)
+				
+				if pblnTest {
+					if $$$WWW003InputType(objClassFld)=3 {			// Don't test Memo fields
+						set pblnTest = $$$NO
+					} else {
+						set pidDisplay   = $$$WWW003RelationDisplayOptions(objClassFld)
+						set pstrRelKeys  = $$$WWW003RelationalPrimaryKeys(objClassFld)
+						set pstrSortKeys = $$$WWW003DisplayIfSortKeyEqual(objClassFld)
+					}
+				}
+			}
+		}
+		
+		//  only test Auto/Text/Select for now.
+		if $case(+$$$WWW122DataInputType(pobjFormFld),0:$$$NO,1:$$$NO,4:$$$NO,18:$$$NO,:$$$YES) { ;SR17725
+			set pblnTest = $$$NO
+		}
+		
+		set idAssociatedField = $$$WWW122AssociatedwithField(pobjFormFld)
+		if idAssociatedField'="" {
+			set pblnTest     = $$$YES
+			set pidAssocFld  = idAssociatedField
+			set pidDisplay   = $get(pidDisplay)
+			set pstrRelKeys  = $get(pstrRelKeys)
+			set pstrSortKeys = $get(pstrSortKeys)
+			set pidRelation  = $get(pidRelation)
+		}
+		
+		if $data(^WWW122s(0,7,pidField,pidForm)) {
+			set pidDisplay   = $get(pidDisplay)
+			set pstrRelKeys  = $get(pstrRelKeys)
+			set pstrSortKeys = $get(pstrSortKeys)
+			set pidRelation  = $get(pidRelation)
+			
+			set idField = ""
+			for {
+				set idField = $order(^WWW122s(0,7,pidField,pidForm,idField))
+				quit:idField=""
+				
+				set objWWW122 = $$Get^WWW122(pidForm,idField)		;SR17719
+				if $$$WWW122SequenceNumber(objWWW122)'="" set parrAssociatedTo($$$WWW122SequenceNumber(objWWW122))="" ;SR17719
+			}
+			set pblnTest=''$data(parrAssociatedTo)
+		}
+	}
+	$$$LogR2x("parrAssociatedTo...")
+	$$$LogR2m(parrAssociatedTo)
+	quit
+	
+	
+NeedToCheck(pidRelation,pidDisplay,YART,YDATEI,YLFN,pidAssociated,&parrAssociatedTo) private
+    ;-------------------------------------------------------------------------------
+    ; Whether we need to check the relation
+    ; 
+    ; Test the relation if 
+    ;   relational display is 
+	;       1 = "Display Relations After Input"
+	;       2 = "Don´t Display Relations (just Test)"
+    ;   OR  select can change to combo 
+    ; unless
+    ; 	exceptions below
+    ; 
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+	; 19-Oct-2010	shobby	SR17565: Call to common ComboToSearch routine.
+    ; 22-Aug-2006	JW		SR?????: Added $get
+    ; 14-Aug-2006	JW		SR14604: Also check ComboToSearch
+    ; 19-Jul-2005	JW		SR12615: Created
+    ;-------------------------------------------------------------------------------
+	new blnCheck
+	
+	set blnCheck = ((pidAssociated'="") || $data(parrAssociatedTo))
+	
+	if 'blnCheck {
+	;SR17565 set blnCheck = $case(pidDisplay,1:$$$YES,2:$$$YES,:$$$NO) || $$$WWW001ComboToSearch($get(^WWW001(0,pidRelation,1)))
+		set blnCheck = $case(pidDisplay,1:$$$YES,2:$$$YES,:$$$NO) || $$ComboToSearch^WWWFOR71("",pidRelation)  ;SR17565
+		
+		if blnCheck {          // EXCEPTIONS //
+			; If it's the last primary key, and has its own relation
+			if (YART="P") && (pidRelation=YDATEI) && ($order(^WWW002(0,YDATEI,""),-1)=YLFN) {
+				set blnCheck = $$$NO
+				
+			; The following classes are not checked
+			} elseif $case(pidRelation,"WWW013":$$$YES,"INPLZ":$$$YES,:$$$NO) {
+				 set blnCheck = $$$NO
+			}
+		}
+	}
+	quit blnCheck
+ 
+ 
+DefineKeys(YFORM,&pstrRelKeys="",pid="",pobj="")
+    ;-------------------------------------------------------------------------------
+    ; Define variables if not already defined
+    ;
+    ; Note: This function does the same checking on the string as @net does.
+    ; 		See Parser below for better checking
+    ;
+    ; Params:	YFORM - related form
+    ; 			pid - current key (optional - may take from form)
+    ; 			pobj - current object (optional - may take from form)
+    ; 
+    ; ByRefs:	pstrRelKeys		string we want to define
+    ; 			
+    ; Returns:	blnValid
+    ;
+    ; History:
+    ; 25-Oct-2007	GRF		SR15563: replace i with loop; preserve key values and
+    ; 							return in pstrRelKeys
+    ; 23-Nov-2006	PO		SR15217: Handle global references in relational primary
+    ; 							keys and if volatile variables set contents back in
+    ; 							to relational primary keys
+    ; 14-Aug-2006	JW		SR14604: Check stored variables
+    ;  9-Feb-2006	JW		Removed private. Added pid and pobj params. Just in case
+    ;  							we're not on form
+    ; 10-Nov-2005	JW		SR13812: Move defined check after the field check,
+    ; 						as value may need to be updated.
+    ; 15-Jul-2005	JW		SR12615: Created
+    ;-------------------------------------------------------------------------------
+	new blnValid,dte,idClsFld,idKey,idStep,idType,idVarFld,idxKey,loop
+	
+	set dte      = +$horolog
+	set blnValid = $$$YES
+	
+	if YFORM=$$$GRIDName {
+		if pid=""  set pid  = $$$GRIDGetCurrentYKEY	    ; Get from grid if blank
+		if pobj="" set pobj = $$$GRIDGetYFELD(pid)
+		
+	} else {
+		if pid=""  set pid  = $get(^WWWDATEN(0,dte,YUSER,YFORM,"P",1))     // Get from form if blank
+		if pobj="" set pobj = $get(^WWWDATEN(0,dte,YUSER,YFORM,"D",1))
+	}
+	
+	if ($extract(pstrRelKeys) = "^") && ($data(@pstrRelKeys)#2=1) { ; Should the $data check be included?
+		; Do nothing - already defined
+		
+	} else {
+		for loop=1:1:$length(pstrRelKeys,",") {
+			set idKey = $piece(pstrRelKeys,",",loop)
+		
+			continue:$extract(idKey)=$$$DBLQUOTE	// Is a string
+			continue:idKey=+idKey					// Is a number
+		
+			set idxKey = $$$Index(idKey)						// Check primary keys
+			if $data(^WWW121s(0,2,idxKey,YFORM)) {
+				set idVarFld = $order(^WWW121s(0,2,idxKey,YFORM,""))
+				set @idKey = $piece(pid,",",idVarFld)
+			
+			} elseif $data(^WWW122s(0,2,idxKey,YFORM)) {		// Check data fields
+				set idVarFld = +$order(^WWW122s(0,2,idxKey,YFORM,""))
+				set idClsFld = $$$WWW122SequenceNumber($get(^WWW122(0,YFORM,idVarFld,1)))
+				if idClsFld="" {
+					set @idKey = $piece($get(^WWWDATEN(0,dte,YUSER,YFORM,"M",1)),Y,idVarFld)	// Is this necessary?
+				} else {
+					set @idKey = $piece(pobj,Y,idClsFld)
+				}
+			}
+		
+			if $get(@idKey)="" {            ; Check stored variables from last step
+				set idStep = $order(^WWWZWS(0,dte,YUSER," "),-1)	// Last number
+				if idStep'="" {
+					set @idKey = $get(^WWWZWS(0,dte,YUSER,idStep,idKey,1))
+				}
+			
+				if $get(@idKey)="" {
+					set blnValid = $$$NO    ; Quit if relation key is not defined or is ""
+					quit
+				}
+			}
+			set $piece(pstrRelKeys,",",loop) = $$$DBLQUOTE_@idKey_$$$DBLQUOTE
+		}
+	}
+	quit blnValid
+	
+ 
+FieldFormat(pblnValid=$$$YES,pidField)
+    ;-------------------------------------------------------------------------------
+    ; Update the field format based on validity.
+    ; 
+    ; Called By: ValidRelation^WWWFieldValidation, (Deprecated: OnBlur^INWEFREI & VAR version)
+    ; 
+    ; Params: 	pblnValid - valid or not
+    ; 			pidField  - field number ("Y"_YFORM_YART_YLFN e.g. "YINItemGroupD3" )
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 26-Aug-2010	GRF		SR17513: variable naming
+    ; 24-Aug-2010	shobby	SR17513: If a Regular Field, YLFN is class field.  If a
+    ;							Manual Field, YLFN is form field.
+    ; 03-Dec-2009	shobby	SR17070: Don't use ResetFieldFormat as the 'default'
+    ; 							colour may no longer be the one it was when the form
+    ; 							was first loaded.
+    ; 18-Jul-2005	JW		SR12615: Created
+    ;-------------------------------------------------------------------------------
+	new bgColour,idFormField,strNewFieldColor,YFELD
+	
+	$$$LogR("FieldFormat",$get(pidField)_"<")
+	
+	quit:$get(pidField)=""
+	
+	if pblnValid {
+		set YFELD = $$GetFormData^COMUtilForm(YFORM)    ; idClassFld
+		set strNewFieldColor=""
+		if ($get(YLFN)'="") {
+			set idFormField = $$$GetFormField(YFORM,YLFN)                                  ;SR17513
+			if idFormField="" set idFormField = YLFN                                       ;SR17513
+			do CheckRules^WWWFORMD(YFORM,idFormField,.YFELD,,,,,,.strNewFieldColor,,,,,,,) ;SR17513
+	;SR17513 if $get(YLFN)'="" do CheckRules^WWWFORMD(YFORM,$$$GetFormField(YFORM,YLFN),.YFELD,,,,,,.strNewFieldColor,,,,,,,)
+            if $$MenuType^WWW013()'=14{
+				do UpdateFieldFormat^COMUtils(pidField_".style","backgroundColor",strNewFieldColor)
+            }else{
+            	do UpdateFieldFormat^COMUtils(pidField_".style","borderColor",strNewFieldColor)
+            }
+		}
+	;	do ResetFieldFormat^COMUtils(pidField_".style","backgroundColor")
+		
+	} else {
+		set bgColour = $$$SysEnum("FARBE",+$$$WWW012ColorforWarnings($get(^WWW012(0,0,1))))
+		do UpdateFieldFormat^COMUtils(pidField_".style","backgroundColor",bgColour)
+	}
+	quit
+	
+	
+DataAccess(pstrCallBack,YKEY,YFORM="",YART="",YLFN="",&pstrError="",YDATEI="",&pblnCheckFound,YKEYCONTAINER="")
+	;-------------------------------------------------------------------------------
+	; Call data access function
+	;
+	; Called By : ValidRelation^WWWFieldValidation, 
+	;				DataAccess^COMViewFilter
+	;				GetWarehouseLocations^INReqTable
+	;				PARAM^WWWFOR71
+	;				ANZEIGE^WWWSEAR3
+	;
+	; Params:
+	; 	YKEY, YFORM, YART, YLFN are all available as parameters to the function
+	; 	pstrCallBack		function to call
+	; 	pstrError			byRef: error message
+	; 	pblnCheckFound		byRef: Used when looping through items for a list.
+	; 						If no callouts are found, don't keep looking.
+	;	YKEYCONTAINER		Check keys
+	;	
+	; Returns:	valid - yes/no
+	;
+	; History:
+	; 18-Nov-2011	PPP		SR17955: Ensure that YFELD always exists
+	; 11-Dec-2007	GM		SRBR014601: Included new parameter "YKEYCONTAINER"
+	; 07-Dec-2007	GRF		Clarify pblnSkipCheck purpose and document calling use
+	; 09-Oct-2007	shobby	SRBR014744: Pass the class that is being used to populate
+	; 							the list in to the DataAccess call
+	; 28-Sep-2007	shobby	SRBR014731: Get the YFELD of the on screen data.
+	; 15-Aug-2005	JW		SR12290: Created
+	;-------------------------------------------------------------------------------
+	; Calling routine
+	; 	set blnCheckFound = $$$YES
+	; 	for {
+	;		(getting record)
+	;		
+	;		if blnCheckFound {
+	;			set blnValid = $$DataAccess^WWWFieldValidation( ... ,.blnCheckFound)
+	;		}
+	;		if blnValid {
+	;			(action on valid record)
+	;		}
+	; 	}
+	; 
+	; If $$DataAccess^WWWFieldValidation does not find a call back or either of the
+	; hooks then the pblnFoundCheck flag will not be set to $$$YES and this routine
+	; will not be recalled again for the remaining records detected by the for loop.
+	;-------------------------------------------------------------------------------
+	new blnValid,strStatus
+	new YFELD
+	
+	$$$LogR("DataAccess",YFORM_"<"_YART_"<"_YLFN_"<"_$get(pstrCallBack)_"<")
+	
+	set strStatus = $$$OK
+	
+	set YFELD = $$GetFormData^COMUtilForm(YFORM)  ; note that the YFELD variable may be a parameter in the pstrCallBack variable.
+	//SR17955
+	if YFELD="" {
+		set YFELD = $$$GRIDGetYFELD()
+	}
+	set YKEY  = $translate(YKEY,"""","")
+	set pblnCheckFound = $$$NO
+		
+	; *** EXECUTE # ***
+	if pstrCallBack'="" {
+		xecute "set strStatus="_pstrCallBack
+		set pblnCheckFound = $$$YES
+	}
+	
+	if ($$$ISOK(strStatus) && (YDATEI'="")) {
+		if $data(^WWW001Hook(0,YDATEI,$$$EnumWWWEVENTTYPEOnBeforeDataAccess)) {
+	; *** EXECUTE # ***
+			xecute "set strStatus="_$piece(^WWW001Hook(0,YDATEI,$$$EnumWWWEVENTTYPEOnBeforeDataAccess,1),Y,1)
+			set pblnCheckFound = $$$YES
+		}
+		
+		if $$$ISOK(strStatus) {
+			if $data(^WWW001VARHooks(0,YDATEI,$$$EnumWWWEVENTTYPEOnBeforeDataAccess)) {
+	; *** EXECUTE # ***
+				xecute "set strStatus="_$piece(^WWW001VARHooks(0,YDATEI,$$$EnumWWWEVENTTYPEOnBeforeDataAccess,1),Y,1)		
+				set pblnCheckFound = $$$YES
+			}
+		} 
+	}
+	
+	set blnValid = $$$ISOK(strStatus)
+	
+	if 'blnValid {
+		if strStatus=$$$NO {	// Default error message
+			if (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) {
+				if (($get(YDATEI) = "INART") && ($data(^INART(YM,YKEY,1)))){
+					set pstrError = $listbuild("WWWVAR00027",YINHALT)
+				} else {
+					set pstrError = $listbuild("WWW00027",YINHALT)  ; "`%1` cannot be used at this time."
+				}
+			} else {
+				set pstrError = $listbuild("WWW00027",YINHALT)  ; "`%1` cannot be used at this time."
+			}
+		} else {
+			set pstrError = strStatus
+		}
+	}
+	
+	quit blnValid
+	
+	
+GetRelation(pstrFieldType="D",pidForm,pidClass,pidField,pobjFormFld="",&pblnTest,&pidRelation)
+	;-------------------------------------------------------------------------------
+	; Get the validation relation information to determine whether a validation should happen
+	;
+	; Called by:	FIELD^WWWEVENT
+	; Params:
+	; 	pstrFieldType		The field type, defaults to D for Data Field other values,
+	; 							P for Primary Key or M for manual field.
+	; 						NOTE : "C" represents Calculated field in WWW003Calc
+	; 	pidForm				The id of the Form
+	; 	pidClass			The id of the class
+	; 	pidField			The id of the field on the form/class
+	; 	pobjFormFld			The form field data (or "")
+	; 	pblnTest			(ByRef) Should we test for validation
+	;
+	;
+	; Returns:
+	;
+	; History:
+    ; 05-Jan-2011	GRF		SR17579: GetFormField macro; doco
+	; 25-Feb-2010	GRF		SR16521: parrAssociatedTo => arrAssociatedTo & new;
+	; 							remove unused pidAssociatedField
+	; 06-May-2009	PPP		SR16521: Barcode Scanning to identify Item
+	;-------------------------------------------------------------------------------
+	new arrAssociatedTo,idAssociatedField,idField,objClassFld
+	
+	
+	$$$LogR("GetRelation",$get(pidForm)_"<"_$get(pidClass)_"<"_pstrFieldType_"<"_$get(pidField)_"<")
+	
+	
+	quit:($get(pidForm)="")||($get(pidField)="")||($get(pstrFieldType)="")
+	
+	if pobjFormFld="" {
+	;	set pobjFormFld = $$Get^WWW122(pidForm,+$order(^WWW122s(0,4,pidField,pidForm,"")))  ; SR17579
+		set pobjFormFld = $$Get^WWW122(pidForm,+$$$GetFormField(pidForm,pidField))
+	}
+	/*
+	; FIXME : Why aren't we performing full D/P/C/M check here - if we do then don't need to pass
+	;         from WWWEVENT - only require to send if checking WWWDATEN info.
+	
+	; e.g. (from WWEVENT)
+	if pobjFormFld="" {
+		set pobjFormFld = $case(pstrFieldType,
+								"D"	: $$Get^WWW122(YFORM,+$$$GetFormField(pidForm,pidField)),
+								"P"	: $get(^WWW121(0,pidForm,pidField,1)),
+								"M"	: $$Get^WWW122(pidForm,pidField),
+									: "")
+	*/
+	if pobjFormFld'="" {
+		set pblnTest    = $$$NO
+		set pidRelation = $$$WWW122RelationClass(pobjFormFld)	// Get form field relation
+		
+		if pidRelation'="" {
+			set pblnTest = '$$$WWW122NoRelationValidation(pobjFormFld)
+					
+		} elseif pidClass'="" {	// Check class definition
+			set objClassFld = $case(pstrFieldType,
+									"D"	: $get(^WWW003(0,pidClass,pidField,1)),
+									"P"	: $get(^WWW002(0,pidClass,pidField,1)),
+										: "")
+			
+			set pidRelation = $$$WWW003RelationDatabase(objClassFld)	// Get class field relation
+			if pidRelation'="" {
+				set pblnTest = '$$$WWW003NoRelationValidation(objClassFld)
+				
+				if pblnTest {
+					if $$$WWW003InputType(objClassFld)=3 {			// Don't test Memo fields
+						set pblnTest = $$$NO
+					}
+				}
+			}
+		}
+		
+		//Only test Auto/Text/Select for now.
+		if $case(+$$$WWW122DataInputType(pobjFormFld),0:$$$NO,1:$$$NO,4:$$$NO,:$$$YES) {
+			set pblnTest=$$$NO
+		}
+		
+		set idAssociatedField = $$$WWW122AssociatedwithField(pobjFormFld)
+		if idAssociatedField'="" {
+			set pblnTest    = $$$YES
+			set pidRelation = $get(pidRelation)
+		}
+		
+		if $data(^WWW122s(0,7,pidField,pidForm)) {
+			set pidRelation  = $get(pidRelation)
+			set idField = ""
+			for {
+				set idField = $order(^WWW122s(0,7,pidField,pidForm,idField))
+				quit:idField=""
+			
+				set arrAssociatedTo($$$WWW122SequenceNumber($get(^WWW122(0,pidForm,idField,1))))="" //SR15513
+			}
+			set pblnTest=''$data(arrAssociatedTo) 
+		}
+	}
+	quit
+	
+	
+	//////////////////////////////////////////////////////////
+	//														//
+	//      THE FOLLOWING 4 ROUTINES ARE NOT IN USE 		//
+	// 														//
+	// It would have parsed the relational primary keys,	//
+	// but there is no point as @Net doesn't do it.			//
+	// (See SR13031)										//
+	// 														//
+	//	To reinstate, swap the line above:					//
+	//		set blnValid = $$DefineKeys(.strRelKeys)		//
+	//	to													//
+	//		set blnValid = $$ParseKeys(.strRelKeys)			//
+	//														//
+	//////////////////////////////////////////////////////////		
+	/*
+ParseKeys(pstrToParse="")
+	new lenParse,i,j,count,strToParse,strParsed,strParseNow,blnValid
+	
+	set lenParse = $length(pstrToParse,",")
+	set i = 1
+	
+	do {
+		for j=i:1:lenParse {
+			set strParseNow = $piece(pstrToParse,",",i,j)
+			
+			set blnValid = $$ParseKey(.strParseNow)
+			quit:strParseNow=""
+			quit:blnValid
+		}
+		quit:'blnValid
+		
+		set $piece(strParsed,",",$i(count)) = strParseNow
+		set i=j+1
+		
+	} while (i <= lenParse)
+	
+	set pstrToParse = strParsed
+	
+	quit blnValid
+	
+	
+ParseKey(pstrToParse="")
+	new lenParse,i,j,count,strToParse,strParsed,strParseNow,blnValid
+	
+	set lenParse = $length(pstrToParse,",")
+	set i = 1
+	
+	do {
+		for j=i:1:lenParse {
+			set strParseNow = $piece(pstrToParse,"_",i,j)
+			
+			set blnValid = $$ParseExpr(.strParseNow)
+			quit:strParseNow=""
+			quit:blnValid
+		}
+		quit:'blnValid
+		
+		set $piece(strParsed,"_",$i(count)) = strParseNow
+		set i=j+1
+		
+	} while (i <= lenParse)
+	
+	set pstrToParse = strParsed
+	
+	quit blnValid
+	
+	
+ParseExpr(pstrToParse="")
+	new blnValid,strParseNow
+	
+	set blnValid=$$$YES
+	
+	if '$isvalidnum(pstrToParse) {		// Is a number
+		if '($extract(pstrToParse)=$$$DBLQUOTE && ($extract($reverse(pstrToParse))=$$$DBLQUOTE)) {	// Is a string
+			
+			if $find(pstrToParse,"(") {
+				set strParseNow = $piece(pstrToParse,"(",2,999)
+				set $extract(strParseNow,$length(strParseNow)) = ""		// Remove ")"
+				
+				set blnValid = $$ParseKeys(strParseNow)
+				
+				set $piece(pstrToParse,")",2,999) = strParseNow_")"
+			}
+			
+			if blnValid {
+				if $extract(pstrToParse) '= "$" {
+					if '$data(@pstrToParse) {					// Is defined
+						// Look it up
+						set blnValid = $$DefineVar(.pstrToParse)
+					}
+				}
+			}
+		}
+	}
+	quit blnValid
+	
+ 
+DefineVar(pstrVar="") private
+	new idVarFld,idClsFld,idxKey,idxVar
+	
+	set idxVar = $$$Index(pstrVar)	// Loop through primary keys
+	
+	if $data(^WWW121s(0,2,idxVar,YFORM)) {
+		set idVarFld = $order(^WWW121s(0,2,idxVar,YFORM,""))
+		set pstrVar = $piece($get(^WWWDATEN(0,+$horolog,YUSER,YFORM,"P",1)),",",idVarFld)
+		
+	} else {						// Loop through data fields
+		set idVarFld = $order(^WWW122s(0,2,idxVar,YFORM,""))
+		if idVarFld'="" {
+			set idClsFld = $$$WWW122SequenceNumber($get(^WWW122(0,YFORM,idVarFld,1)))
+			if idClsFld="" {
+				set pstrVar = $piece($get(^WWWDATEN(0,+$horolog,YUSER,YFORM,"M",1)),"~",idVarFld)
+			} else {
+				set pstrVar = $piece($get(^WWWDATEN(0,+$horolog,YUSER,YFORM,"D",1)),"~",idClsFld)
+			}
+		} else {
+			set pstrVar=""
+		}
+	}
+	set pstrVar = $$^WWWKEYBUILD(pstrVar)		; Define variable
+	
+	quit (pstrVar'="")
+ 	*/
+]]></Routine>
+</Export>

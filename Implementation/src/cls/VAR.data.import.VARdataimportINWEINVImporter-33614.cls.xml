@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="VAR.data.import.VARdataimportINWEINVImporter">
+<ClassType/>
+<IncludeCode>INConst</IncludeCode>
+<ProcedureBlock>0</ProcedureBlock>
+<Super>AbstractImporter</Super>
+
+<Parameter name="DEBUG">
+<Description><![CDATA[
+
+Command:
+> do ##class(VAR.data.import.INWEINVImporter).importFile()
+
+Fields
+	DateOfStocktaking;StocktakingCountingNumber;ItemNumber;Location;StockLocation;ActualQuantity;
+	GoodsReceiptDate;LotNo;ExpiryDate;TargetQuantity;Posted;CalculatedDifferenceQty;PostedDifferenceQty;
+	LastCount;Notes;Difference;Brand;Owner;Program1
+]]></Description>
+<Type>%Integer</Type>
+<Default>0</Default>
+</Parameter>
+
+
+<Method name="importFile">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	quit ..import(##class(DirectoryFile).GetNamespaceSubdir("files")_
+		"INWEINV_DASA.csv")
+]]></Implementation>
+</Method>
+
+<Method name="%OnNew">
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	$$$VAR
+	set ..ignoreHeaderLine = 1
+	if (..#DEBUG) set ..printProgress = 0
+
+	quit ##super()
+]]></Implementation>
+</Method>
+
+<Method name="process">
+<FormalSpec>pintRegistros:%Integer,pstrLinha:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	new strStatus, obj, key
+	
+	if ($get(sequence) = "") { 
+		set sequence = 1
+	}
+	else {
+		set sequence = sequence + 1
+	}
+	
+	set $ztrap = "exceptionProcINWEINV"
+	set strStatus = $$$OK
+	
+	set stocktackNumber						= ..getField(pstrLinha, 8)
+		
+	set obj 								= ""
+	set key									= stocktackNumber _ $$$COMMA _ sequence ;Código do inventário e código do produto
+		
+	set $$$INWEINVItemNumber(obj)			= ..getField(pstrLinha, 1) // Código do produto
+	set $$$INWEINVActualQuantity(obj)		= ..getField(pstrLinha, 2) // Quantidade de produtos
+	set $$$INWEINVLotNo(obj)				= ..getField(pstrLinha, 3) // Número do lote / série
+	
+	set GoodsReceiptDate 					= ..getField(pstrLinha, 4)
+	set GoodsReceiptDate					= $zdateh(GoodsReceiptDate, 4) // Data no padrão PT-Br
+	set $$$INWEINVGoodsReceiptDate(obj)		= GoodsReceiptDate // Validade do produto
+	
+	set $$$INWEINVBrand(obj)				= ..getField(pstrLinha, 5) // Marca do produto
+	set $$$INWEINVStockLocation(obj)		= ..getField(pstrLinha, 6) // Endereço de armazenagem
+	set $$$INWEINVLocation(obj)				= ..getField(pstrLinha, 7) // Local
+		
+	set $$$INWEINVFREE1(obj)				= $HOROLOG //Data e hora do inventário
+	set $$$INWEINVFREE2(obj)				= YBED // Usuário
+	set $$$INWEINVFREE3(obj)				= YBED // Usuário
+	
+	/// Valida a consistência do registro que foi passado
+	Set strStatus = ..ValidateRegister(obj, pintRegistros)
+	if ('strStatus) {
+		set $zerror = strStatus
+		Goto exceptionProcINWEINV
+	}
+	
+	if (..#DEBUG) {
+		do ..print(..lineBreak_"key="_key_", obj="_obj)
+	}
+	else {
+		set strStatus = $$$Save("INWEINV", key, obj, $$$YES)
+	}
+	
+	// Feito via set pois não tem indice
+	if ($$$ISOK(strStatus)) {
+		set ^INWEINVCount(YM,stocktackNumber,sequence,1,1) = $$$INWEINVActualQuantity(obj)_Y_$horolog
+	}
+
+
+finallyProcINWEINV
+	quit strStatus
+
+exceptionProcINWEINV
+ 	set $ztrap = ""
+	set strStatus = $$$CUSTOMERROR($zerror)
+
+	goto finallyProcINWEINV
+]]></Implementation>
+</Method>
+
+<Method name="ValidateRegister">
+<Description><![CDATA[
+Valida a consistência do registro INWEINV]]></Description>
+<FormalSpec>obj:%String,pIntReg:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	New status, codProd, strErro, count, avgCost, itemGroup, groupStatus, locCode, stockLocCode
+	
+	Set status 			= 1
+	Set codProd 		= $$$INWEINVItemNumber(obj)
+	Set locCode 		= $$$INWEINVLocation(obj)
+	Set stockLocCode	= $$$INWEINVStockLocation(obj)
+	Set codLote			= $$$INWEINVLotNo(obj)
+	Set brandCode		= $$$INWEINVBrand(obj)
+	Set strErro			= "Linha: "_ pIntReg _", Produto: " _ codProd _ ", Lote: " _ codLote
+	
+	// Valida se o produto existe
+	Set count = 0
+	&SQL(SELECT COUNT(*) INTO :count FROM SQLUser.INART WHERE ItemNumber LIKE :codProd)
+	If (count = 0) {
+		Set status = 0
+		Set strErro = strErro _ "~Não existe na tabela INART."
+	}
+	
+	// Valida se o produto tem custo médio
+	Set avgCost = 0
+	/*&SQL(SELECT AverageCost INTO :avgCost FROM SQLUser.INART WHERE ItemNumber = :codProd)
+	If (avgCost = "") {
+		Set status = 0
+		Set strErro = strErro _ "~Produto sem custo médio."
+	}*/
+	
+	// Valida se o grupo do produto está ativo
+	Set groupStatus = 0
+	&SQL(
+		SELECT DISTINCT InItemGroup.Active1, InItemGroup.Code INTO :groupStatus, :itemGroup
+		FROM SQLUser.INART INART
+		INNER JOIN SQLUser.InItemGroup InItemGroup
+		ON INART.Company = InItemGroup.Company 
+		AND INART.ItemGroup = InItemGroup.ID1
+		AND INART.ItemNumber = :codProd)
+	If (groupStatus '= 1) {
+		Set status = 0
+		Set strErro = strErro _ "~Grupo " _ itemGroup _ " está inativo ou não existe"
+	}
+	
+	// Valida se o endereço de armazenagem existe
+	Set count = 0
+	&SQL(SELECT COUNT(*) INTO :count FROM SQLUser.INLP WHERE LocationName = :locCode AND StockLocation LIKE :stockLocCode)
+	If (count = 0) {
+		Set status = 0
+		Set strErro = strErro _ "~O endereço de armazenagem " _ stockLocCode _ " no local " _ locCode _ " não existe"
+	}
+	
+	// Valida se a marca do produto existe
+	If (brandCode '= "") {
+		&SQL(SELECT COUNT(*) INTO :count FROM SQLUser.INBrand WHERE ID1 = :brandCode)
+		If (count = 0) {
+			Set status = 0
+			Set strErro = strErro _ "~A marca " _ brandCode _ " não existe."
+		}
+	}
+	
+	If ('status) {
+		Set ^CacheTempImportErrors("MARKANTI","VAR.data.import.INWEINVImporter","ErroValidacao",pIntReg) = strErro
+	}
+	
+	Quit status
+]]></Implementation>
+</Method>
+</Class>
+</Export>

@@ -1,0 +1,227 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDAdmission" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDAdmission
+
+#include COMSYS
+#include INConst
+#include MEDConst
+
+GetAdmission(pidPatient,pdtRx="")
+	;-------------------------------------------------------------------------------
+	; Get Admission details for the patient. If no record is found or the patient has beed dischaged , null is returned
+	; Called By : Form MEDPrescription
+	; 
+	; History :
+	; 13-Nov-2012	SCR		SR18141: Reverted back to Working with Addmission Date and Time 
+	; 09-Nov-2012	SCR		SR18141: Handle Admission without discharge time
+	; 05-Nov-2012	SCR		SR18141: Use Rx data & time
+	; 23-Oct-2012	SCR		SR18141: Exclude Admissions after the Rx Date
+	; 12-Oct-2012	SCR		SR18141: Retain Admission details (Use Rx Date)
+	; 24-Feb-2012	SCR		SR17979 Corrected newed vars
+	; 10-Feb-2012	SCR		SR17979 Created
+	;-------------------------------------------------------------------------------
+	new idAdmission,objAdmission,idRetAdmission,objRetAdmission,dtCurrent,idxPatient,dtAdmission,dtDischarge
+	new dtRx,tmRx,tmDischarge,tmAdmission
+	set idAdmission		= ""
+	set objAdmission	= ""
+	set idRetAdmission	= ""
+	set objRetAdmission = ""
+	set dtCurrent 		= $piece($horolog,",",1)
+	set idxPatient		= $$$Index(pidPatient)
+	set dtRx			= $piece(pdtRx,",",1) ; SR18141
+	set tmRx			= $piece(pdtRx,",",2) ; SR18141
+	
+	;if pdtRx="" d ##class(Common.Dump).DumpFile()
+	if pidPatient '= "" { 
+			
+		for {
+			set idAdmission	= $order(^MEDAdmissions(0,1,idxPatient,idAdmission))
+			quit:idAdmission="" 
+			set objAdmission= $get(^MEDAdmission(0,idAdmission,1))
+			set dtAdmission = $$$MEDAdmissionDateAdmitted(objAdmission)
+			set dtDischarge = $$$MEDAdmissionDateDischarged(objAdmission)
+			set tmAdmission = $$$MEDAdmissionTimeAdmitted(objAdmission)
+			set tmDischarge = $$$MEDAdmissionTimeDischarged(objAdmission)			
+			if (dtRx) && (dtRx'>dtDischarge) { ; SR18141 
+			;if (pdtRx) && (pdtRx'>dtDischarge) {
+				if ((tmRx) && (tmDischarge) && (dtRx=dtDischarge) && (tmRx'>tmDischarge)) || ( dtRx'=dtDischarge){
+					set dtDischarge = "" ; SR18141 reset discharge date
+				}
+			}
+			if dtDischarge = "" {  ; Patient was not discharged
+				if (dtAdmission'>dtCurrent) { ; Valid admission date , Not future admit date
+					if ('dtRx) || (dtRx'<dtAdmission) { ; SR18141 
+						if ('tmRx) || (dtRx'=dtAdmission) || (tmRx'<tmAdmission) { ; SR18141 
+						;if ('pdtRx) || (pdtRx'<dtAdmission) { ; SR18141 
+							if ('tmRx) || (dtDischarge="") || ((dtRx=dtDischarge) && (tmRx'<tmAdmission)) {
+								set idRetAdmission  = idAdmission
+							}
+						}
+					}
+				}	
+			}	
+		}	
+	}		
+ 
+	quit idRetAdmission	
+
+OnAfterSave(pidAdmission)
+	;-------------------------------------------------------------------------------
+	; Called by OnAfterSave of the MEDAddmission Class
+	; Get Patient Admission Details and save them on the Patient Record
+	;
+	; Inputs: pidAdmission
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Oct-2012	shobby	SR18130: Set the 'Admitted' flag.
+	; 17 Sep-2012	SCR 	SR18118: Changed from form based to class based
+	; 18-May-2012	PPP		SR17993: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idPatient,dtCurrent,objAdmission,idOpenAdm,objPatient,dtAdmission,dtDischarge
+	
+	set objAdmission	= $get(^MEDAdmission(YM,pidAdmission,1))
+	set idPatient 		= $$$MEDAdmissionPatient(objAdmission)
+	set strStatus		= $$$OK
+	if idPatient'="" {
+		set idOpenAdm = $$GetOpenAdmission(idPatient) 
+		set objPatient = $get(^MEDPatient(0,idPatient,1))	;SR18130 
+		if idOpenAdm'="" {
+			set objAdmission	= $get(^MEDAdmission(YM,idOpenAdm,1))
+			;SR18130 set objPatient = $get(^MEDPatient(0,idPatient,1))
+	
+			set dtAdmission = $$$MEDAdmissionDateAdmitted(objAdmission)
+			set dtDischarge = $$$MEDAdmissionDateDischarged(objAdmission)
+
+			set $$$MEDPatientAdmissionDate(objPatient)=$$$MEDAdmissionDateAdmitted(objAdmission)
+			set $$$MEDPatientLocation(objPatient)=$$$MEDAdmissionLocation(objAdmission)
+			set $$$MEDPatientRoom(objPatient)=$$$MEDAdmissionRoom(objAdmission)
+			set $$$MEDPatientBed(objPatient)=$$$MEDAdmissionBed(objAdmission)	
+			set $$$MEDPatientCurrentlyAdmitted(objPatient)=$$$YES	;SR18130
+		} else {
+			set $$$MEDPatientCurrentlyAdmitted(objPatient)=$$$NO		;SR18130
+		}
+		set strStatus = $$$Save("MEDPatient",idPatient,objPatient,$$$YES)
+	}
+
+	quit strStatus
+	
+OnBeforeSave(pidKey,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Validate Addmission
+	; Copied from 	; do OnBeforeSave^VARMEDAdmission(YFELD)
+	; Called By : Class MEDAdmission
+	; 
+	; History :
+	; 17-Sept-2012	SCR		SR18118 Created	
+	;-------------------------------------------------------------------------------
+	new idOpenAdm,strStatus,dtAdmit,tmAdmit,dtDis,tmDis,idPat,dtActual,tmActual
+
+	set idOpenAdm = ""
+	
+	set strStatus = $$$OK
+	
+	if pYFELD '= "" {
+		set dtAdmit = $$$MEDAdmissionDateAdmitted(pYFELD)
+		set tmAdmit = $$$MEDAdmissionTimeAdmitted(pYFELD)
+		set dtDis	= $$$MEDAdmissionDateDischarged(pYFELD)
+		set tmDis	= $$$MEDAdmissionTimeDischarged(pYFELD)
+		set idPat	= $$$MEDAdmissionPatient(pYFELD)
+		
+		set dtActual 	=  $piece($h,",",1)
+		set tmActual	=  $piece($h,",",2)
+		
+		if '(+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+			if ((dtAdmit = dtActual) && (tmAdmit > tmActual ))  {
+				set strStatus =  "MED01292"  ;Save not possible.|Admission time cannot be greater than the current time.|Please revise it.
+			}
+			elseif (dtAdmit > dtActual) {
+				set strStatus =  "MED01293"  ;Save not possible.|Admission date cannot be greater than the date.|Please revise it.
+			}
+	
+		
+			if dtDis '= "" {	
+				if $$$ISOK(strStatus) {			
+					if (dtDis < dtAdmit) {
+						set strStatus =  "MED01294"  ;Save not possible.|Discharge date cannot be earlier than the admission date.|Please revise it.
+					}
+					elseif (dtDis = dtAdmit) && (tmDis < tmAdmit ){
+						set strStatus = "MED01295"  ;Save not possible.|Discharge time cannot be earlier than the admission time.|Please revise it
+					}	
+					elseif ( dtDis = dtActual) && (tmDis > tmActual) {
+						set strStatus =  "MED01296"  ;Save not possible.|Discharge time cannot be later than the current time.|Please revise it.
+					}
+					elseif ( dtDis > dtActual) {
+						set strStatus =  "MED01297"  ;Save not possible.|Discharge date cannot be later than the current date.|Please revise it.
+					}	
+				}
+			}
+		}
+		
+		if $$$ISOK(strStatus) {
+			if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+				if ($$$MEDAdmissionDateDischarged(pYFELD) = "") {
+					set idOpenAdm = $$GetOpenAdmission(idPat)
+					if (idOpenAdm '= "") && (idOpenAdm '= pidKey) {
+						;set strStatus =  $listbuild("MED01298",idOpenAdm)  ;This patient already has an admission record.|Admission: %1 .
+					}
+				}
+			}
+			else {
+				set idOpenAdm = $$GetOpenAdmission(idPat)
+				if (idOpenAdm '= "") && (idOpenAdm '= pidKey) {
+					;set strStatus =  $listbuild("MED01298",idOpenAdm)  ;This patient already has an admission record.|Admission: %1 .
+				}
+			}
+		}
+		
+	;if $$$ISERR(strStatus) {
+	;	set Q=$$$QDontSave
+	;	do ^WWWINFO(strStatus)
+	;}
+	
+	}
+	
+	quit strStatus
+
+GetOpenAdmission(pidPat)
+	;-------------------------------------------------------------------------------
+	; Get Open Admission (if there is one) for the patient
+	; 
+	; History :
+	; 23-Apr-2013	SCR		HEVA-811: Added $$$VAR
+	; 06-Jul-2011	Karine	Created
+	; @$$getRegInternacaoValida^VARMEDAdmission(idPaciente)
+	;-------------------------------------------------------------------------------
+	
+	new idOpenAdm,idAdm,idxPat,objAdm,dtAdm,dtDis,dtActual
+	
+	$$$VAR
+	
+	set idOpenAdm	= ""
+	set idAdm		= ""
+	set idxPat		= $$$Index(pidPat)
+	
+	if pidPat '= "" {
+		
+		$$$Order4(^MEDAdmissions,YM,1,idxPat,idAdm)
+			set objAdm=$get(^MEDAdmission(YM,idAdm,1))
+			set dtAdm = $$$MEDAdmissionDateAdmitted(objAdm)
+			set dtDis =  $$$MEDAdmissionDateDischarged(objAdm)
+			set dtActual = $piece($h,",",1)
+				
+			if dtDis = "" {  ;If Patient still Admitted
+				if (dtAdm < dtActual) || (dtAdm = dtActual) { ;if not future admission
+				set idOpenAdm = idAdm
+				}	
+			}	
+		$$$End	
+	}		
+
+	quit idOpenAdm
+	;
+
+]]></Routine>
+</Export>

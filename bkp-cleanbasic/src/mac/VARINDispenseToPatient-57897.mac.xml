@@ -1,0 +1,885 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARINDispenseToPatient" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARINDispenseToPatient
+#include COMSYS
+#include COMConst
+#include INConst
+#include VARConst
+#include MEDConst
+#include COMGridEdit31
+
+OnBeforeFormConstruction
+	if YPARA = "" set YPARA = YAUSWAHL	
+	
+	kill ^CacheTempAlertaPaciente
+			
+	if (YOPTION = "") && (YPARA '= "") {
+		set YOPTION = YPARA	
+		kill ^VARTempPatientYOPTION(YBED)
+		set ^VARTempPatientYOPTION(YBED) = YPARA
+	
+	} elseif (YOPTION = "") && (YPARA = "") {
+		set YOPTION = $get(^VARTempPatientYOPTION(YBED))
+		set YPARA = $get(^VARTempPatientYOPTION(YBED))
+	}
+	
+	quit
+	
+OnBlurProduto(pYM,pYFORM,pYKEY,&pYFELD,pGridRow,pGridCol,pYINHALT)	
+	;do OnBlurProduto^VARINDispenseToPatient(YM,YFORM,YKEY,.YFELD,GROW,GCOL,.YINHALT)
+	;
+	;Petik 08/06/2010
+	;Rotina criada para validar se o produto pode ser usado por determinado paciente
+	;Só será executada se o local for 18.1 - Farmácia de Ações Judiciais
+	;Caso contrário, só chama a rotina core normalmente
+	
+	;Esta rotina está sendo chamada no evento OnBlur do campo Item do form INDispenseToPatientLine
+	;
+	; History
+	; 22-Sep-2014	shobby	ALPHAUP-293: Get correct header form.
+	
+	;seta o YPARA do INDispenseToPatientLine igual a do INDispenseToPatient
+	set YPARA = $piece(^WWWDATEN(YM,$$$KEY1($horolog),YUSER,$$$GRIDContainer,"D",1),"~",24) ;ALPHAUP-293
+	
+	if ((YLOCATION = $$getFarmaciaAcoesJudiciais^VARParametroCliente(0))&&(pYINHALT '= ""))&&(YPARA = 3){
+		;Verifica se tem estoque para o produto no endereço do paciente
+		set Produto  = pYINHALT
+		set objDispensacao = $$$GRIDYFELDContainer
+		set Paciente = $$$INIssueCustomerName(objDispensacao)
+		
+		set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleStock:GetViaLocation")
+		//if objResultSet.Execute(objItem.%Id(),objLocn.%Id()) {
+		if objResultSet.Execute(Produto,YLOCATION) {
+			
+			set idLine = 0
+			set Achou = $$$NO
+			;Trecho de código copiado da rotina BuildDynTableRows^INDispenseToPatientTable
+			;++++++++++
+			while objResultSet.Next() {
+				set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(objResultSet.Data("ID"))
+
+				set dteVal=objBundleStock.Bundle.UseByDate
+				if dteVal'=""	{
+					continue:(dteVal < $horolog)	//SR16540
+				}
+				continue:($get(arrBundleStock(objBundleStock.%Id())) >= objBundleStock.QtyOnHand)
+				set fltQtyAvailable = objBundleStock.QtyOnHand-$$GetQtyPlanned^INDispenseToPatientTable(objBundleStock.Item.%Id(),objBundleStock.Storage.Location.%Id(),objBundleStock.Storage.%Id(),objBundleStock.Bundle.%Id())
+				continue:(fltQtyAvailable<=0)
+				
+				;Se achar o produto no Endereço igual ao código do cliente
+				;altera variável Achou para $$$YES
+				if (objBundleStock.Storage.Code = Paciente){
+					set Achou = $$$YES
+					quit	;quit do while
+				}
+
+			}	;end while
+			
+			;++++++++++++ Fim do trecho copiado
+			
+			if (Achou = $$$NO) {
+				set strMessage = "O produto "_Produto_" não está disponível para esse paciente!"
+				&js<
+					alert("<%=strMessage%>");
+				>
+				;Limpa o campo Produto
+				set $piece(pYFELD,Y,8)  = ""
+				quit
+					
+			}
+			
+			
+		}	;end if
+		
+	}
+	
+	;Se o YLOCATION não for 18.1 ou se tiver passado pela rotina acima,
+	;chama a rotina core normalmente
+	
+	do OnBlur^INDispenseToPatientLine(pYM,pYFORM,pYKEY,.pYFELD,pGridRow,pGridCol,pYINHALT)
+	
+	quit
+
+OnBlurPaciente(pYFELD="")
+	quit:(pYFELD = "")
+	
+	new objAdm,idAdm,idPaciente,idAuta,idFIA,idBAA,idUnidade,found
+	
+	if ($$Lower^COMUtilStr($extract($piece(pYFELD,Y,23),1,5)) = "90i01"){
+		set $piece(pYFELD,Y,23) = $extract($piece(pYFELD,Y,23),6,*)
+		set $piece(YFELD,Y,23)  = $piece(pYFELD,Y,23)
+		if ($piece(pYFELD,Y,23) = ""){
+			set $piece(pYFELD,Y,23) = ""
+		}
+	}
+
+	set idPaciente = $piece(pYFELD,Y,23)
+	quit:(idPaciente="")
+	set found=0
+	set idAdm = $order(^MEDAdmissions(YM,100,idPaciente,""),-1)
+		
+	while ((idAdm'="") && (found=0)) {
+
+		set objAdm 		= $get(^MEDAdmission(0,idAdm,1))
+		set idAlta 		= $$$MEDAdmissionDateDischarged(objAdm)
+		set idUnidade 	= $$$MEDAdmissionLocation(objAdm)
+		set idFIA 		= $$$MEDAdmissionFREE4(objAdm)
+		set idBAA 		= $$$MEDAdmissionFREE5(objAdm)
+
+		if (idAlta = "") {
+			set found=1
+			set $piece(YFELD,Y,14) = idUnidade
+			set $piece(YFELD,Y,15) = idFIA
+			set $piece(YFELD,Y,16) = idBAA
+			set $piece(YFELD,Y,17) = idAdm
+		}
+		set idAdm = $order(^MEDAdmissions(YM,100,idPaciente,idAdm),-1)
+	}
+
+	if '$Data(^CacheTempAlertaPaciente(YUSER)){
+		set ^CacheTempAlertaPaciente(YUSER) = 0
+	}
+
+	if ($$CheckVincularPacAdmAtivas^VARINDispenseToPatient()){
+	
+		if ('found) && (($piece(YFELD,Y,17) '= "") ||($piece(YFELD,Y,23) '= ""))  {
+			if (^CacheTempAlertaPaciente(YUSER)'=$piece(YFELD,Y,17)){
+				$$$Alert("Por favor, selecione um paciente que possua uma admissão aberta.")
+			}
+			set ^CacheTempAlertaPaciente(YUSER) = $piece(YFELD,Y,17)		
+			set $piece(YFELD,Y,17) = ""
+			set $piece(YFELD,Y,23) = ""
+			set $piece(YFELD,Y,14) = ""
+			set $piece(YFELD,Y,15) = ""
+			set $piece(YFELD,Y,16) = ""
+			quit
+		}
+	
+		new idPaciente, noProcessoJudicial, noAutorizacao, objAutorizacao, position
+	
+		kill ^COMTempList(YM,YBED,"PacienteProcessoJudicial")
+		kill ^COMTempList(YM,YBED,"RetiradaAutorizadaPaciente")
+
+		set idPaciente = $piece(pYFELD,Y,23)
+		quit:(idPaciente = "")
+
+		set %TXT(1) = ""	
+		set %TXT(1)=%TXT(1)_"#YINDispenseToPatientD11~REMOVE"
+		set %TXT(1)=%TXT(1)_"#YINDispenseToPatientD12~REMOVE"	
+	
+		set position = 0
+		//09-Nov-11  Karine: alterado para funcionar a relação de classe
+		;$$$Order3(^VARProcessoJudicial,YM,idPaciente,noProcessoJudicial)
+		$$$Order4(^VARProcessoJudicials,YM,1,idPaciente,noProcessoJudicial)
+	
+			set position = $i(position)
+	
+			set %TXT(1) = %TXT(1)_"#YINDispenseToPatientD11"_"~"_noProcessoJudicial_"~"_noProcessoJudicial_"~"_position
+			set ^COMTempList(YM,YBED,"PacienteProcessoJudicial",noProcessoJudicial,1) = noProcessoJudicial
+		$$$End
+
+		set position = 0
+	
+		$$$Order3(^VARPacienteAutorizacao,YM,idPaciente,noAutorizacao)		
+			set objAutorizacao = $get(^VARPacienteAutorizacao(YM,idPaciente,noAutorizacao,1))		
+			set nomeResponsavel = $piece(objAutorizacao,Y,1)
+		
+			set position = $i(position)
+	
+			set %TXT(1) = %TXT(1)_"#YINDispenseToPatientD12"_"~"_noAutorizacao_"~"_nomeResponsavel_"~"_position
+			set ^COMTempList(YM,YBED,"RetiradaAutorizadaPaciente",noAutorizacao,1) = nomeResponsavel
+		$$$End
+	}
+	
+	else {
+		
+		if (idAdm = "") {
+			set idAdm = $order(^MEDAdmissions(YM,100,idPaciente,idAdm),-1)
+			
+			while ((idAdm'="") && (found=0)) {
+			
+				set objAdm 		= $get(^MEDAdmission(0,idAdm,1))
+				set idAlta 		= $$$MEDAdmissionDateDischarged(objAdm)
+				set idUnidade 	= $$$MEDAdmissionLocation(objAdm)
+				set idFIA 		= $$$MEDAdmissionFREE4(objAdm)
+				set idBAA 		= $$$MEDAdmissionFREE5(objAdm)
+				
+				if ($$$MEDAdmissionDateAdmitted(objAdm) >= (+$horolog-3)){
+					set found=1
+					set $piece(YFELD,Y,14) = idUnidade
+					set $piece(YFELD,Y,15) = idFIA
+					set $piece(YFELD,Y,16) = idBAA
+					set $piece(YFELD,Y,17) = idAdm					
+				}
+				set idAdm = $order(^MEDAdmissions(YM,100,idPaciente,idAdm),-1)
+			}
+		}
+		
+		if ('found) && (($piece(YFELD,Y,17) '= "") ||($piece(YFELD,Y,23) '= ""))  {
+			if (^CacheTempAlertaPaciente(YUSER)'=$piece(YFELD,Y,17)){
+				$$$Alert("Por favor, selecione um paciente que possua uma admissão aberta ou que foi aberta nas últimas 72 horas.")
+			}
+			set ^CacheTempAlertaPaciente(YUSER) = $piece(YFELD,Y,17)		
+			set $piece(YFELD,Y,17) = ""
+			set $piece(YFELD,Y,23) = ""
+			set $piece(YFELD,Y,14) = ""
+			set $piece(YFELD,Y,15) = ""
+			set $piece(YFELD,Y,16) = ""
+			quit
+		}
+	
+		new idPaciente, noProcessoJudicial, noAutorizacao, objAutorizacao, position
+	
+		kill ^COMTempList(YM,YBED,"PacienteProcessoJudicial")
+		kill ^COMTempList(YM,YBED,"RetiradaAutorizadaPaciente")
+
+		set idPaciente = $piece(pYFELD,Y,23)
+		quit:(idPaciente = "")
+
+		set %TXT(1) = ""	
+		set %TXT(1)=%TXT(1)_"#YINDispenseToPatientD11~REMOVE"
+		set %TXT(1)=%TXT(1)_"#YINDispenseToPatientD12~REMOVE"	
+	
+		set position = 0
+		//09-Nov-11  Karine: alterado para funcionar a relação de classe
+		;$$$Order3(^VARProcessoJudicial,YM,idPaciente,noProcessoJudicial)
+		$$$Order4(^VARProcessoJudicials,YM,1,idPaciente,noProcessoJudicial)
+	
+			set position = $i(position)
+	
+			set %TXT(1) = %TXT(1)_"#YINDispenseToPatientD11"_"~"_noProcessoJudicial_"~"_noProcessoJudicial_"~"_position
+			set ^COMTempList(YM,YBED,"PacienteProcessoJudicial",noProcessoJudicial,1) = noProcessoJudicial
+		$$$End
+
+		set position = 0
+	
+		$$$Order3(^VARPacienteAutorizacao,YM,idPaciente,noAutorizacao)		
+			set objAutorizacao = $get(^VARPacienteAutorizacao(YM,idPaciente,noAutorizacao,1))		
+			set nomeResponsavel = $piece(objAutorizacao,Y,1)
+		
+			set position = $i(position)
+	
+			set %TXT(1) = %TXT(1)_"#YINDispenseToPatientD12"_"~"_noAutorizacao_"~"_nomeResponsavel_"~"_position
+			set ^COMTempList(YM,YBED,"RetiradaAutorizadaPaciente",noAutorizacao,1) = nomeResponsavel
+		$$$End
+		
+	}
+ 
+	quit
+	
+PrintDevolucoes(pYKEY)
+	quit:(pYKEY = "")
+	quit:( '$data(^INIssueRevs(YM,2,9,$$$Index(pYKEY))) )
+
+	write "<br /><br />"
+			
+   	new lstHeader, count, idIssueRev, objIssueRev, dteIssueRev, idIssueRevLine, objINIssueRevLine, 
+   		idItem, fltQty, reason
+   	
+	set lstHeader=""
+	set lstHeader=lstHeader_$listbuild("Seq.","No. Devolução","Data","Produto","Quant. Devolvida","Motivo")
+
+  	if $$Start^COMTable(lstHeader,"&nbsp;Devoluções feitas para esta dispensação",,,$$$NO) {
+
+		$$$Order5(^INIssueRevs,YM,2,9,$$$Index(pYKEY),idIssueRev)
+			set objIssueRev = $get(^INIssueRev(YM,idIssueRev,1))
+			set dteIssueRev = $$$INIssueRevPosted(objIssueRev)
+			
+			$$$Order3(^INIssueRevLine,YM,idIssueRev,idIssueRevLine)
+				
+				set objINIssueRevLine = $get(^INIssueRevLine(YM,idIssueRev,idIssueRevLine,1))
+				
+				set idItem = $$$INIssueRevLineItemNo(objINIssueRevLine)
+				set fltQty = $$$INIssueRevLineQuantityReturned(objINIssueRevLine)
+				set reason = $$$INIssueRevLineReason(objINIssueRevLine)
+				
+				set count = $i(count)
+			
+				do NewLine^COMTable()
+				do InsertCell^COMTable(count)
+				do InsertCell^COMTable(idIssueRev,"INIssueRev",idIssueRev)
+				do InsertCell^COMTable($zdate(dteIssueRev,4),"INIssueRev",idIssueRev)
+				do InsertCell^COMTable(idItem_" - "_$$SQLGetDescricaoProduto^VARSQL(idItem),"INIssueRev",idIssueRev,,,,,,,$$$YES)
+				do InsertCell^COMTable($$^WWWTR(0,12,fltQty),"INIssueRev",idIssueRev,,"RIGHT")
+				do InsertCell^COMTable(reason,"INIssueRev",idIssueRev,,,,,,,$$$YES)
+				do EndLine^COMTable()   
+			
+			$$$End
+
+		$$$End
+
+	  }
+
+	quit
+	
+	
+ImprimeRelatorio(YKEY)
+	if ($$GetPreferencia^VARPreferenciasUsuario($$$FldVARPreferenciasUsuarioTelaFiltroRelatorio) = 1){
+		do GotoFiltrosRelatorio^VARFiltrosRelatorio("RunReportDispPaciente",0,1,,YKEY)
+	} else {
+		do RunReportDispPaciente^VARJasperRunReport(YKEY)
+	}
+		
+	quit
+	
+CanImprimirEtiqueta(pYKEY)
+	quit:pYKEY="" $$$YQDisable("Selecione um registro.")
+	
+	new objDispense,idPaciente
+	
+	set YQ = $$$YQEnable
+	
+	set objDispense = $get(^INIssue(0,pYKEY,1))
+	set idPaciente 	= $$$INIssueCustomerName(objDispense)
+
+	set:idPaciente="" YQ = $$$YQDisable("Não há paciente para essa dispensação.")
+	
+	quit 
+	
+ImprimirEtiqueta(pYKEY)
+	new objDispense,idPaciente,idSaida
+	
+	set objDispense = $get(^INIssue(0,pYKEY,1))
+	set idPaciente 	= $$$INIssueCustomerName(objDispense)
+	set idSaida     = pYKEY
+
+	if ('$data(^MEDPatient(YM,idPaciente,1))) {
+		$$$Alert("Informe um registro válido de paciente.")
+		do ReloadForm^COMUtilForm
+	}else{
+		do RunReportPacienteEtqDisp^VARJasperRunReport(idPaciente,idSaida)
+	}
+	
+	quit
+
+ImprimeRelatorioDispensacao(YKEY)
+	new objDispense,idSaida
+	
+	set objDispense = $get(^MEDDispense(0,YKEY,1))
+	set idSaida		= $$$MEDDispenseIssue(objDispense)
+	
+	if (idSaida = "") {
+		$$$Alert("É necessário processar a dispensação.")
+		do ReloadForm^COMUtilForm
+	}else{
+		set ^VARTempMEDDispenseSeparacao(YM,YBED) = $$$NO
+		do RunReportDispPaciente^VARJasperRunReport(idSaida)
+	}
+	
+	quit
+
+ImprimirEtiquetaDispensacao(pYKEY)
+	new objDispense,idPaciente,idSaida,prescricao,objPrescription
+	
+	set objDispense = $get(^MEDDispense(0,pYKEY,1))
+	set prescricao 	= $$$MEDDispensePrescription(objDispense)
+	set idSaida		= $$$MEDDispenseIssue(objDispense)
+	
+	
+	if prescricao'=""{
+		set objPrescription = $get(^MEDPrescription(0,prescricao,1))
+		set idPaciente 	= $$$MEDPrescriptionPatientID(objPrescription)
+	}
+
+	if ('$data(^MEDPatient(YM,idPaciente,1))) {
+		$$$Alert("Informe um registro válido de paciente.")
+		do ReloadForm^COMUtilForm
+	}else{
+		set ^VARTempMEDDispenseSeparacao(YM,YBED) = $$$NO
+		do RunReportPacienteEtqDisp^VARJasperRunReport(idPaciente,idSaida)
+	}
+	
+	quit
+	
+CheckVincularPacAdmAtivas()
+	$$$VAR
+	set status = $$$NO
+	set objParametroCliente = $get(^VARParametroCliente(YM,YM,1))
+	if ($find($$$VARParametroClienteVincularPacAdmAtiva(objParametroCliente),YLOCATION)){
+		set status = $$$YES
+	}
+	quit status
+	
+Postable(pidIssue)
+	quit:$$$NoKey(pidIssue) '$$$OK
+	set strStatus = $$$OK
+	set objIssue = $get(^INIssue(0,pidIssue,1))
+	set objAdm = $get(^MEDAdmission(0, $$$INIssueFREE7(objIssue),1))
+	quit:($$$MEDAdmissionDateDischarged(objAdm) = "") strStatus
+	if ($$CheckVincularPacAdmAtivas^VARINDispenseToPatient()){
+		if ($$$MEDAdmissionDateDischarged(objAdm) '= "") {
+			set strStatus = $$$MakeStatus("Por favor, selecione um paciente que possua uma admissão aberta.")
+		}
+	}
+	else {
+		if (($$$MEDAdmissionDateDischarged(objAdm) '= "") && ($$$MEDAdmissionDateAdmitted(objAdm) < (+$horolog-3))){
+			set strStatus = $$$MakeStatus("Por favor, selecione um paciente que possua uma admissão aberta ou que foi aberta nas últimas 72 horas.")				
+		}	
+	}
+	quit strStatus
+	
+OnBlurAdmissao(pYFELD="")
+	quit:(pYFELD = "")
+
+	if '($$CheckVincularPacAdmAtivas^VARINDispenseToPatient()){
+		new objAdm,idAdm,idAlta,idFIA,idBAA,idUnidade
+	
+		set idAdm = $piece(pYFELD,Y,17)
+		quit:(idAdm = "")
+		set objAdm 		= $get(^MEDAdmission(0,idAdm,1))
+		set idAlta 		= $$$MEDAdmissionDateDischarged(objAdm)
+		set idUnidade 	= $$$MEDAdmissionLocation(objAdm)
+		set idFIA 		= $$$MEDAdmissionFREE4(objAdm)
+		set idBAA 		= $$$MEDAdmissionFREE5(objAdm)
+	
+		set $piece(YFELD,Y,14) = idUnidade
+		set $piece(YFELD,Y,15) = idFIA
+		set $piece(YFELD,Y,16) = idBAA
+		set $piece(YFELD,Y,17) = idAdm					
+	}
+	else {
+		new objAdm,idAdm,idAlta,idFIA,idBAA,idUnidade
+	
+		set idAdm = $piece(pYFELD,Y,17)
+		quit:(idAdm = "")
+		set objAdm 		= $get(^MEDAdmission(0,idAdm,1))
+		set idAlta 		= $$$MEDAdmissionDateDischarged(objAdm)
+		set idUnidade 	= $$$MEDAdmissionLocation(objAdm)
+		set idFIA 		= $$$MEDAdmissionFREE4(objAdm)
+		set idBAA 		= $$$MEDAdmissionFREE5(objAdm)
+	
+		if (idAlta = ""){
+			set $piece(YFELD,Y,14) = idUnidade
+			set $piece(YFELD,Y,15) = idFIA
+			set $piece(YFELD,Y,16) = idBAA
+			set $piece(YFELD,Y,17) = idAdm			
+		}
+		else {
+			$$$Alert("Por favor, selecione uma admissão aberta.")	
+			set $piece(YFELD,Y,14) = ""
+			set $piece(YFELD,Y,15) = ""
+			set $piece(YFELD,Y,16) = ""
+			set $piece(YFELD,Y,17) = ""
+		}
+	}
+	quit
+	
+searchMedico()
+ 
+	;for i=1:1:100 hang 1
+	set strFormData = $$$GetFormData(YFORM,"D")
+	set dado = $piece(strFormData,Y,26)
+ 
+	quit:$get(^CacheTempVARSESCONSUMOPACIENTEMEDICO(YUSER))=dado $$$OK
+ 
+	set ^CacheTempVARSESCONSUMOPACIENTEMEDICO(YUSER) = dado
+ 
+	kill ^COMTempList(YM,YUSER,"VARSESCONSUMOPACIENTEMEDICO")
+ 
+	set dadoMAX = $$^WWWUMLAU(dado,1)
+	
+	set medico = ""
+	set idxNome = ""
+ 
+	set idxNome = $order(^MEDProviders(0,201,dadoMAX))
+	// Se o nome entrado coincidir com o nome inteiro registrado.
+	if $order(^MEDProviders(0,201,dadoMAX,"")) '= "" {
+		set idxNome = dadoMAX
+	} else {
+		set idxNome = $order(^MEDProviders(0,201,dadoMAX))
+	}
+ 
+	set i = 1
+	set blnMaxNumberResults = $$$NO
+	set blnNamePrefix = (dadoMAX = $extract(idxNome, 1, $length(dadoMAX)))
+	
+	while blnNamePrefix && 'blnMaxNumberResults {
+	;while blnNamePrefix {
+		
+		set medico = $order(^MEDProviders(0, 201, idxNome, ""))
+		set medicodado = $get(^MEDProvider(YM, medico, 1))
+		
+		;continue:('$$IsActive^MEDProviderDataAccess(medico,""))
+		
+		if ((dadoMAX = $extract($$^WWWUMLAU($piece(medicodado, Y, 1), 1), 1, $length(dadoMAX))) && ($$IsActive^MEDProviderDataAccess(medico,""))) {
+ 
+			set ^COMTempList(YM,YUSER,"VARSESCONSUMOPACIENTEMEDICO",dado,medico,1) = $piece(medicodado,Y,1)
+			set i = i + 1
+			if i = 100 {
+				
+				set blnMaxNumberResults = $$$YES
+				
+				write "alert('Número máximo de 100 profissionais de saúde retornado na pesquisa. Refine mais sua pesquisa.');"
+			}
+		}
+ 
+		set idxNome = $order(^MEDProviders(0,201,idxNome))
+		set blnNamePrefix = (dadoMAX = $extract(idxNome, 1, $length(dadoMAX)))
+	}
+ 
+	quit $$$OK
+ 
+search()
+	set strFormData 	= $$$GetFormData("VARINDispenseToPatient","D")
+	set strFormManual 	= $$$GetFormData("VARINDispenseToPatient","M")
+	
+	quit:(($piece(strFormManual,Y,49) '= "") || ($piece(strFormData,Y,23) '= "")) $$$OK
+	
+	set dado = $piece(strFormData,Y,58)
+ 
+	quit:$get(^CacheTempVARSESCONSUMOPACIENTE(YUSER))=dado $$$OK
+ 
+	set ^CacheTempVARSESCONSUMOPACIENTE(YUSER) = dado
+ 
+	kill ^COMTempList(YM,YUSER,"VARSESCONSUMOPACIENTE")
+ 
+	set dadoMAX = $$^WWWUMLAU(dado,1)
+	
+	set idxNome = ""
+	
+	// Se o nome entrado coincidir com o nome inteiro registrado.
+	if $order(^MEDPatients(0,3,dadoMAX,"")) '= "" {
+		set idxNome = dadoMAX
+	} else {
+		set idxNome = $order(^MEDPatients(0,3,dadoMAX))
+	}
+	
+	set i = 1
+	set blnMaxNumberResults = $$$NO
+	set blnNamePrefix = (dadoMAX = $extract(idxNome, 1, $length(dadoMAX)))
+	
+	while blnNamePrefix && 'blnMaxNumberResults {
+	;while blnNamePrefix {
+		
+		set paciente = ""
+		for {
+			set paciente = $order(^MEDPatients(0, 3, idxNome, paciente))
+			quit:(paciente = "")
+			
+			set pacientedado = $get(^MEDPatient(YM, paciente, 1))
+			if dadoMAX = $extract($$^WWWUMLAU($piece(pacientedado, Y, 23), 1), 1, $length(dadoMAX)) {
+				
+				set ^COMTempList(YM,YUSER,"VARSESCONSUMOPACIENTE",dado,paciente,1) = $zdate($piece(pacientedado,Y,4),4,,4)_" - "_$piece(pacientedado,Y,23)_" - "_$piece(pacientedado,Y,9)
+
+				set i = i + 1
+				if i = 100 {
+					
+					set blnMaxNumberResults = $$$YES
+
+					write "alert('Número máximo de 100 pacientes retornado na pesquisa. Refine mais sua pesquisa.');"
+				}
+			}
+			quit:blnMaxNumberResults
+		}
+		
+		set idxNome = $order(^MEDPatients(0,3,idxNome))
+		set blnNamePrefix = (dadoMAX = $extract(idxNome, 1, $length(dadoMAX)))
+	}
+	
+	set dado=$order(^MEDPatients(0,3,$$^WWWUMLAU($piece(YFELD,Y,58),1),""))
+	set $piece(YFELD,Y,59)=dado
+	
+	quit $$$OK
+	
+OnBeforeEditAccess()
+ 
+	if YFORM = "VARINDispenseToPatient" {
+	//Bloqueia o form para usuários que não estejam lotados em locais de Farmácia
+		set TipoLocal = $PIECE($GET(^WWW0121(0,YM,YLOCATION,1)),Y,63) //(Almoxarifado, Farmácia ou Centro de Custo)
+		
+		if (TipoLocal'="FARMACIA") {
+			$$$StartScript()
+			w "alert('Essa tela só pode ser utilizada por usuários lotados em locais de FARMACIA! Seu local é do tipo "_$PIECE($GET(^WWW0121(0,YM,YLOCATION,1)),Y,63)_".'); "
+			$$$EndScript()
+			quit 0
+		}
+			
+		
+		if (YKEY'="") {		
+			if ((YLOCATION'=$PIECE($GET(^INIssue(YM,YKEY,1)),Y,3)) && ($data(^INIssue(YM,YKEY,1)))) {
+			//Bloqueia o form se o registro for referente a um local que não o do usuário
+				$$$StartScript()
+				w "alert('Esse documento é do local "_$PIECE($GET(^INIssue(YM,YKEY,1)),Y,3)_"!  Seu local é "_YLOCATION_". A tela ficará disponível apenas para consulta de documentos.'); "
+				$$$EndScript()
+				QUIT 0
+			}
+		}
+	} elseif YFORM = "INDispenseToPatient" {
+		set TipoLocal = $PIECE($GET(^WWW0121(0,YM,YLOCATION,1)),Y,63) //(Almoxarifado, Farmácia ou Centro de Custo)
+		
+		if (TipoLocal="CENTRODECUSTO") {
+			$$$StartScript()
+			w "alert('Essa tela não pode ser utilizada por usuários lotados em locais do tipo CENTRO DE CUSTO!'); "
+			$$$EndScript()
+			quit 0
+		}
+	}
+	quit 1
+	
+OnBlurCNS()
+	new objConsumoPaciente, strCNS, idPaciente, objPaciente, strNome, dteNascimento, strNomeMae
+ 
+	set objConsumoPaciente = $$$GetFormData("VARINDispenseToPatient","M")
+	set strCNS 			   = $piece(objConsumoPaciente,Y,46)
+	
+	quit:(strCNS = "")
+	
+	if '$data(^MEDPatients(YM, 2, strCNS)) {
+	
+		$$$Alert("CNS '"_strCNS_"' não encontrado no sistema.")
+ 
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 46, "", "M")
+	} else {
+		
+		set idPaciente  = $order(^MEDPatients(YM, 2, strCNS, ""))
+		set objPaciente = $get(^MEDPatient(YM, idPaciente, 1))
+		set strNome 	   = $$$MEDPatientName(objPaciente)
+		set dteNascimento  = $$^WWWDATE($$$MEDPatientDOB(objPaciente))
+		set strNomeMae	   = $$$MEDPatientMothersName(objPaciente)
+		
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 58, strNome, "D")
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 23, idPaciente, "D")
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 51, strNomeMae, "M")
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 50, dteNascimento, "M")
+		
+		write "window.setTimeout('document."_YHTMFORM_".Y"_YFORM_"D23.focus()',1);"
+	}
+
+	quit
+ 
+OnBlurNumeroProntuario()
+	new objConsumoPaciente, strNumeroProntuario, idPaciente, objPaciente,
+		strNome, dteNascimento, strNomeMae
+ 
+	set objConsumoPaciente = $$$GetFormData("VARINDispenseToPatient","M")
+	set strNumeroProntuario = $piece(objConsumoPaciente,Y,49)
+	if ($length(strNumeroProntuario) = 0) quit
+ 
+	if '$data(^MEDPatients(YM, 205, strNumeroProntuario)) {
+		$$$Alert("Número do prontuário '"_strNumeroProntuario_"' não encontrado no sistema.")
+ 
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 49, "", "M")
+	} else {
+		
+		set idPaciente  = $order(^MEDPatients(YM, 205, strNumeroProntuario, ""))
+		set objPaciente = $get(^MEDPatient(YM, idPaciente, 1))
+		set strNome 	   = $$$MEDPatientName(objPaciente)
+		set dteNascimento  = $$^WWWDATE($$$MEDPatientDOB(objPaciente))
+		set strNomeMae	   = $$$MEDPatientMothersName(objPaciente)
+		
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 58, strNome, "D")
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 23, idPaciente, "D")
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 51, strNomeMae, "M")
+		do PopulateDataField^COMUtils("VARINDispenseToPatient", 50, dteNascimento, "M")
+		
+		write "window.setTimeout('document."_YHTMFORM_".Y"_YFORM_"D23.focus()',1);"
+	}
+ 
+	quit
+	
+getCNS(pPaciente)
+	quit:pPaciente="" ""
+	
+	new idCNS, objPaciente
+	
+	set idCNS 		= ""
+	set objPaciente	= $get(^MEDPatient(0,pPaciente,1))
+	
+	set idCNS = $$$MEDPatientExternalCode(objPaciente)
+	
+	quit idCNS
+	
+getProntuario(pPaciente)
+	quit:pPaciente="" ""
+	
+	new idProntuario, objPaciente
+	
+	set idProntuario 	= ""
+	set objPaciente		= $get(^MEDPatient(0,pPaciente,1))
+	
+	set idProntuario = $$$MEDPatientPID(objPaciente)
+	
+	quit idProntuario
+ 
+getNomeMae(pPaciente)
+	quit:pPaciente="" ""
+	
+	new strNomeMae, objPaciente
+	
+	set strNomeMae 	= ""
+	set objPaciente	= $get(^MEDPatient(YM,pPaciente,1))
+	
+	set strNomeMae = $$$MEDPatientMothersName(objPaciente)
+	
+	quit strNomeMae
+	 
+getNascimento(pPaciente)
+	quit:pPaciente="" ""
+	
+	new idNascimento, objPaciente
+	
+	set idNascimento = ""
+	set objPaciente	 = $get(^MEDPatient(0,pPaciente,1))
+	
+	set idNascimento = $$$MEDPatientDOB(objPaciente)
+	
+	quit:idNascimento="" ""
+	
+	quit $$^WWWDATE(idNascimento)
+	
+getCRM(pMedico)
+	quit:pMedico="" ""
+	
+	new idCRM, objMedico
+	
+	set idCRM 		= ""
+	set objMedico	= $get(^MEDProvider(0,pMedico,1))
+	
+	set idCRM = $$$MEDProviderLicenseNumber(objMedico)
+	
+	quit idCRM
+	
+getEspecialidade(pMedico)
+	quit:pMedico="" ""
+	
+	new idEspecialidade, objMedico, descEspecialidade
+	
+	set idEspecialidade	= ""
+	set objMedico		= $get(^MEDProvider(0,pMedico,1))
+	
+	set idEspecialidade = $$$MEDProviderSpeciality(objMedico)
+	
+	if (idEspecialidade '= ""){
+		set idEspecialidade = idEspecialidade_" - "_$$SQLGetEspMed^VARSQL(idEspecialidade)
+	}
+	
+	quit idEspecialidade
+
+OnAfterDataFields(pidForm,pidKey,pobjDispense)
+	new idForm,YAUSWAHL,blnEnabled
+	
+	kill ^CacheTempVARSESCONSUMOPACIENTEMEDICO(YUSER)
+	kill ^CacheTempVARSESCONSUMOPACIENTE(YUSER)
+	
+	set idForm     = "INDispenseToPatientLine"
+	set blnEnabled = ($$$INIssueStatus(pobjDispense) '= 9)
+ 
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 400
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)     = "VARINDispenseToPatient"
+ 
+	$$$GRIDStart(idForm,pidKey)
+	
+	set idPatient = $$$INIssueCustomerName(pobjDispense)
+	if (idPatient '= "") {
+		set objPatient = $get(^MEDPatient(0, idPatient, 1))
+		set patientName = $piece(objPatient, Y, 23)
+		do printPatientsAll^VARSESPatientConsumptionUI(idPatient,$$$NO,$$$OK,$$$NO,patientName)
+		do PrintJSAlertConsumptions^VARSESPatientConsumptionUI(idPatient)
+	}
+
+	do PrintDevolucoes^VARINDispenseToPatient(pidKey)
+
+	quit 
+
+PostableFavoritos(pYKEY)
+ 
+	new status, LocalAbastecedor, objConsumo
+	
+	set objConsumo =  $get(^INIssue(YM,pYKEY,1))
+	
+	set status           = $piece(objConsumo,Y,1)
+	set LocalAbastecedor = $piece(objConsumo,Y,3)
+	
+	if status > 1 {
+		set YQ = 1_"Esse consumo já foi processado e não é mais possível inserir produtos."	
+		quit
+	}
+			
+	elseif LocalAbastecedor '= YLOCATION {
+		set YQ = 1_"O seu local é diferente do local abastecedor desse consumo. Não é possível alterá-lo."	
+	}
+	
+	quit
+	
+checkCodigoPaciente()
+	if (($piece(YFELD,Y,58)'= "") && ($PIECE(YFELD,Y,23)="")) quit 1
+	quit 0
+	
+validarPaciente()
+	if $piece(YFELD,Y,23)'="" {
+		if $get(^MEDPatient(YM,$PIECE(YFELD,Y,23),1))'="" {
+			quit $$$NO
+		}
+		quit $$$YES
+	}
+	quit $$$NO
+	
+OnAfterPrimaryKey(pidIssue,pobjIssue)
+	quit:(YFORM'="INDispenseToPatient")
+	
+	new idFromLoc,objVORG,idCalc,keyWWW0121,objWWW0121,issueLocations,idAbastecedor,supplyingLocations
+	
+	set idFromLoc = $$$INIssueFromLocn(pobjIssue)
+	
+	set:idFromLoc="" idFromLoc=YLOCATION
+	
+	set objVORG	= $get(^INVORG(YM,YM,1))
+	set idCalc 	= +$$$INVORGTransferorIssueCalc(objVORG)
+	
+	kill ^COMTempList(YM,YUSER,"INDispenseToPatientSolicitante")
+	
+	if (idCalc = 4) {
+		set keyWWW0121 	= ""
+		set objWWW0121 	= ""
+		
+		for {
+			set keyWWW0121 = $order(^WWW0121(YM,YM,keyWWW0121))
+			quit:keyWWW0121=""
+			
+			set objWWW0121 		= $get(^WWW0121(YM,YM,keyWWW0121,1))
+			set issueLocations 	= $$$WWW0121IssueLocations(objWWW0121)
+			
+			continue:issueLocations=""
+			
+			for cnt = 1:1:$length(issueLocations,";") {
+				set idAbastecedor = $piece(issueLocations,";",cnt)
+				continue:idAbastecedor=""
+				
+				if (idAbastecedor = idFromLoc){
+					set ^COMTempList(YM,YUSER,"INDispenseToPatientSolicitante",keyWWW0121,1)=$piece($get(^WWW0121(YM,YM,keyWWW0121,1)),Y,1)
+				}
+				
+			}
+		}
+		
+	} else {
+		set keyWWW0121 	= ""
+		set objWWW0121 	= ""
+		
+		for {
+			set keyWWW0121 = $order(^WWW0121(YM,YM,keyWWW0121))
+			quit:keyWWW0121=""
+			
+			set objWWW0121 			= $get(^WWW0121(YM,YM,keyWWW0121,1))
+			set supplyingLocations 	= $$$WWW0121FREE11(objWWW0121)
+			
+			continue:supplyingLocations=""
+			
+			for cnt = 1:1:$length(supplyingLocations,";") {
+				set idAbastecedor = $piece(supplyingLocations,";",cnt)
+				continue:idAbastecedor=""
+				
+				if (idAbastecedor = idFromLoc){
+					set ^COMTempList(YM,YUSER,"INDispenseToPatientSolicitante",keyWWW0121,1)=$piece($get(^WWW0121(YM,YM,keyWWW0121,1)),Y,1)
+				}
+			}
+		}
+	}
+	
+	quit
+]]></Routine>
+</Export>

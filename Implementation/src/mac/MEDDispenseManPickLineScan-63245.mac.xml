@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDDispenseManPickLineScan" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDDispenseManPickLineScan
+	
+#include COMGridEdit31
+#include INConst
+#include %occInclude
+#def1arg WWWDATEN(%args) ^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V",%args)
+#include WWWConst
+#include COMSYS
+#include MEDConst
+	
+AddScanLine(pidScan)
+    ;-------------------------------------------------------------------------------
+    ; Routine to Add a new line to a Grid after a Scan is validated
+    ;
+    ; Assumptions :
+    ;  YFORM	-	 Form Name
+    ; 
+    ; Returns:
+    ; 	Status
+    ;
+    ; History:
+	; 03-Jun-2014	SCR		HEVA-1505: Created
+    ;-------------------------------------------------------------------------------
+	new arrBundle,arrFields,blnItemExists,idBundle,idClass,idDisp,idFromLocn,idItem
+	new idLine,idLot,idOriginalLine,idStorage,idToLocn,objBundle,objHeader,objLine
+	new objOldData,sc,strBundleValues,strDelim,strKey,strStatus
+ 	
+ 	set strDelim = $$$ScanDelim
+ 	
+	set idItem = ""	
+	if $get(YFORM)'="" {
+		set idClass       = $$$GetClass(YFORM)
+		set objLine       = ""
+		set idItem        = $piece(pidScan,strDelim,1)
+		set idLot         = $piece(pidScan,strDelim,2)
+		set objHeader     = $$$GRIDYFELDContainer
+	 	set idFromLocn    = $$$MEDDispenseSupplyingLocation(objHeader)
+	 	set idToLocn      = $$$MEDDispenseDestinationLocation(objHeader)
+  		set blnItemExists = $$$NO
+		
+		set idDisp       = $$$KEY1($$$GRIDYKEYContainer)
+ 		// For Picking Screens Only
+ 		// arrBundle(Bundle ID ,Storage ID) = Qty
+ 		set sc = $$GetBundleForAttData^WWW120Scan(idItem,idFromLocn,pidScan,.arrBundle,.idBundle,.idStorage)
+ 		if $$$ISERR(sc) set strStatus = $$ISStatusToDLStatus^COMUtilError(sc) quit strStatus    //EARLY EXIT
+		
+		//Process only if Bundle Exist for the Item/Lot combination and has Qty
+		if $get(idBundle)'="" {
+ 
+			//Get the data for the Item if it already exists
+			//Need to update arrBundle if lines already exist
+			; SR18198 vvvv
+			set idLine = $$GetRow(idDisp,idItem,.idBundle,.idStorage,.arrBundle,.blnItemExists)
+			if idLine {
+				set (objLine,objOldData) = $$$GRIDGetYFELD(idLine)
+				set $$$MEDDispensePickLinePickQty(objLine)		= $$$MEDDispensePickLinePickQty(objLine) + 1 ; SR18198
+				set $$$MEDDispensePickLineItem(objLine)			= idItem
+				set $$$MEDDispensePickLineBundle(objLine)		= idBundle
+				set $$$MEDDispensePickLineFromStorage(objLine)	= idStorage
+				
+				kill arrFields
+				//set the array for the fields that are updated
+				set arrFields($$$FldMEDDispensePickLinePickQty)	= $$$MEDDispensePickLinePickQty(objLine)	
+				set arrFields($$$FldMEDDispensePickLineItem)	= $$$MEDDispensePickLineItem(objLine)
+				set arrFields($$$FldMEDDispensePickLineBundle)		= $$$MEDDispensePickLineBundle(objLine)	
+				set arrFields($$$FldMEDDispensePickLineFromStorage)= $$$MEDDispensePickLineFromStorage(objLine)
+				do UpdateRow^COMGridEdit31Scan(YFORM, idLine, .arrFields, objOldData)
+				if idBundle'="" {
+					set objBundle       = ##class(alSOH.dBundle).%OpenId(idBundle)
+					set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundle,SPRACHE)
+					do UpdateManualField^COMGridEdit31Interface(idLine,7,strBundleValues) 
+				}
+	 
+			} else {
+				if $get(idBundle)'="" {
+					if (blnItemExists = $$$YES) {
+						set idOriginalLine = $$GetLine(idDisp,idItem)
+						
+						if idOriginalLine'="" {
+							// This is specific to INIssue , Copy the original Data and Update Relevant details
+							// Cannot create new data records only copies, has important info DEMAND NO, REFERENCE etc.
+							set strStatus = $$DuplicateOnly^COMGridEdit31Scan(idDisp_$$$COMMA_idOriginalLine,.objLine,.strKey)
+							// Create line with quantity 0 to after call AddScanLine and increment quantity and update data fields <<< HEVA-1207 >>>
+							set $$$MEDDispensePickLinePickQty(objLine)   	= 0
+							do OnBlurPickQty^MEDDispensePickLine(YKEY, "",$$$MEDDispensePickLinePickQty(objLine), .objLine) 			; SR18198 init qty
+
+							;set $$$MEDDispensePickLineIssueQty(objLine)   	= 1
+							set $$$MEDDispensePickLineRequestedQty(objLine) = $$$MEDDispensePickLineRequestedQty($get(^MEDDispensePickLine(0,idDisp,idOriginalLine,1)))
+							set $$$MEDDispensePickLineFromStorage(objLine) 	= idStorage
+							set $$$MEDDispensePickLineBundle(objLine)      	= idBundle
+							do AddLine^COMGridEdit31Add(objLine,strKey,,$$$YES,"",$$$YES,$$$NO,$$$NO)
+							do UpdateContainer^COMGridEdit31G()
+							// call AddScanLine to increment quantity and update data fields <<< HEVA-1207 >>>
+							do AddScanLine(pidScan)
+						}
+						
+					} else {
+						set strStatus = $$$MakeStatus("IN01039")
+					}   ; "Cannot Add Lines to Current Record"
+				}
+			}		
+			
+		} else {
+			set strStatus = $$$MakeStatus("IN01040",idItem,idFromLocn)
+		}   ; "Stock Unavailable for Item %1 at Location %2"
+ 
+	}
+	
+	quit $$$OK
+	
+	
+GetLine(pidDisp, pidItem)
+    ;-------------------------------------------------------------------------------
+    ; Get the IssueLine associated with the given Item
+    ; Assumptions :
+    ;  YFORM	-	 Form Name
+    ; 
+    ; Returns:
+    ; 	idLine
+    ;
+    ; History:
+	; 10-May-2012	PPP		SR18002: Created
+    ;-------------------------------------------------------------------------------
+	new idLine,objLine
+
+	set idLine = ""
+	for {
+		set idLine = $order(^MEDDispensePickLine(0,pidDisp,idLine))
+		quit:idLine=""
+
+		set objLine = $get(^MEDDispensePickLine(0,pidDisp,idLine,1))
+		if $$$MEDDispensePickLineItem(objLine) = pidItem quit
+	}
+
+	quit idLine
+	
+GetRow(pidDisp,pidItem,&pidBundle="",&pidStorage="",&parrBundles,&pblnItemExists,pidFldLotNumber,pidLot="") //UPDATE
+    ;-------------------------------------------------------------------------------
+    ; Get the Row & Details for a given Item if it exists,
+    ; also check if the given Bundle & Storage have enough stock to cater for the
+    ; requirements
+    ;
+    ; Returns:
+    ; 	line
+    ;
+    ; History:
+    ; 04-Jun-2014	SCR		HEVA-1505: Created
+    ;-------------------------------------------------------------------------------
+	new arrLines,blnOK,fltPickQty,idLine,idManDisp,idManLine,idRx,idRxItem,idUOM
+	new objAlt,objDisp,objDispLine,objLine,objManDisp,objManDispLine,objRxLine
+	new strKey
+	
+	do GetGridContents^COMGridEdit31G(.arrLines,"MEDDispenseManPickLine")
+	set idLine = "" 
+	for {
+		set idLine = $order(arrLines(pidDisp,idLine))
+		quit:idLine=""
+		set objLine = $get(arrLines(pidDisp,idLine))
+		set strKey	= pidDisp _","_idLine
+		set blnOK	= $$GetVars^MEDDispenseManPickLine(strKey,.idManDisp,.idManLine,.objManDisp,.objManDispLine,.objDisp,.objDispLine,.idRx,.objRxLine,.idRxItem)
+		set objAlt	= $get(^INARTA(YM,idRxItem,pidItem,1))
+		set objLine = $$$GRIDGetYFELD(idLine)
+
+		continue:objAlt=""  ; not defined or no conversion
+		set fltPickQty	= $$$MEDDispensePickLinePickQty(objLine)+1
+		set idUOM	= $$GetUOM(strKey,objLine)
+		
+		continue:'$$QtyOK^MEDDispenseManPickLine(strKey,fltPickQty)
+
+		quit  ; Valid line found
+		
+	}
+	quit idLine
+	
+	
+GetUOM(pstrKey,pobjLine) //UPDATE
+    ;-------------------------------------------------------------------------------
+    ; Get the Unit Of Measure for a new pick line 
+    ;  1 Use existing if not null
+    ;  2 Use Dispense Line
+    ;  3 Use try the Rx UOM if there is a conversion
+    ;  4 Use the base unit of measure
+    ;
+    ; Returns:
+    ; 	UOM
+    ;
+    ; History:
+    ; 05-Jun-2014	SCR		HEVA-1505: Created
+    ;-------------------------------------------------------------------------------
+	new blnOK,idDispUOM,idItem,idManDisp,idManLine,idRx,idRxItem,idRxUOM,idUOM
+	new objDisp,objDispLine,objItem,objManDisp,objManDispLine,objRxLine
+
+	set idUOM	= $$$MEDDispensePickLineIssueUOM(pobjLine)
+	quit:idUOM'="" idUOM
+	set blnOK	= $$GetVars^MEDDispenseManPickLine(pstrKey,.idManDisp,.idManLine,.objManDisp,.objManDispLine,.objDisp,.objDispLine,.idRx,.objRxLine,.idRxItem)
+	if blnOK {
+		set idDispUOM	= $$$MEDDispenseLineIssueUOM(objDispLine)
+		if idDispUOM'="" { ; This should always happen
+			quit idDispUOM
+		}
+		set idRxUOM	= $$$MEDPrescriptionLineDoseUOM(objRxLine)
+		if idRxUOM'="" {
+			quit idRxUOM
+		}
+	}
+	set idItem	= $$$MEDDispensePickLineItem(pobjLine)
+	set objItem	= $get(^INART(YM,idItem,1))
+	quit $$$INARTUnitofMeasure(objItem)
+	
+]]></Routine>
+</Export>

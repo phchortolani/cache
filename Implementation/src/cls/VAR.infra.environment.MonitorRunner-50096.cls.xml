@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Class name="VAR.infra.environment.MonitorRunner">
+<ClassType/>
+<Import>VAR.infra.mail,VAR.infra.util,VAR.infra.log</Import>
+<IncludeCode>COMSYS,VARErros,VARLog,VARService</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>VAR.infra.services.ServiceRunner</Super>
+
+<Method name="Register">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit ..RegisterRunner($$$ServiceIdEnvironmentMonitor, $$$ServiceFrequencyHourly, $$$ServicePriorityHigh, ..%ClassName(1), "Environment Monitor")]]></Implementation>
+</Method>
+
+<Method name="Unregister">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit ..UnregisterRunner($$$ServiceIdEnvironmentMonitor, "Environment Monitor")]]></Implementation>
+</Method>
+
+<Method name="Execute">
+<ProcedureBlock>0</ProcedureBlock>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	$$$VAR
+
+	set partitionIds = $$getParticoesAMonitorar^VARParametroCliente(YM)
+	if ($length(partitionIds) = 0) quit $$$OK
+
+	set percMaxAcceptUse = $$getPercMaxAceitUsoParticao^VARParametroCliente(YM)
+	if ((percMaxAcceptUse = 0) || (percMaxAcceptUse > 100)) quit $$$OK
+
+	set diskAlertUsers = $$getUsuariosAlertaDisco^VARParametroCliente(YM)
+	if ($length(diskAlertUsers) = 0) quit $$$OK
+
+	if (('##class(Api).IsDllAvailable()) && ('##class(Api).IsDllAvailable(1))) {
+		$$$VARLOGERROR("Não foi possível acessar a DLL de monitoramento de ambiente")
+		quit $$$OK
+	}
+	elseif ('$isObject(##class(Api).GetInstance())) {
+		$$$VARLOGERROR("Não foi possível carregar a DLL de monitoramento de ambiente")
+		quit $$$OK
+	}
+
+	set status = ##class(Api).GetInstance().Refresh()
+	if ($$$ISERR(status)) {
+		$$$VARLOGERROR("Não foi possível atualizar uso da DLL: '"_##class(Errors).GetErrorFromErrorStatus(status)_"'")
+		quit status
+	}
+
+	set now = $horolog
+
+	for i = 1:1:$length(partitionIds, ";") {
+		set id = $piece(partitionIds, ";", i)
+
+		if (##class(Api).GetInstance().GetPartitionInfo(id, .type, .size, .used)) {
+			if (size > 0) {
+				set percUsed = ((used / size) * 1000 \ 1) / 10
+			}
+			else {
+				set percUsed = ((used / 1) * 1000 \ 1) / 10
+			}
+
+			if (percUsed > percMaxAcceptUse) {
+				$$$VARLOGWARNING("A partição de id '"_id_"' atingiu "_percUsed_"% de uso, sendo que o máximo aceitável é "_percMaxAcceptUse_"%")
+
+				set status = ..SendMail(diskAlertUsers, id, percUsed, percMaxAcceptUse)
+				if ('status) $$$VARLOGERROR("Não foi possível encaminhar email de notificação de falta de espaço em disco: '"_##class(Errors).GetErrorFromErrorStatus(status)_"'")
+			}
+
+			set objPartLog = ##class(User.VAREnvPartitionLog).%New()
+			set objPartLog.LogDate			= $piece(now, ",", 1)
+			set objPartLog.LogTime 			= $piece(now, ",", 2)
+			set objPartLog.PartitionId		= id
+			set objPartLog.PercMaxAcceptUse	= percMaxAcceptUse
+			set objPartLog.PercUsed 		= percUsed
+			set status = objPartLog.%Save()
+		}
+	}
+
+	quit $$$OK]]></Implementation>
+</Method>
+
+<Method name="SendMail">
+<FormalSpec>pstrDiskAlertUsers:%String,pstrPartitionId:%String,pfltPercUsed:%Float,pfltPercMaxAcceptUse:%Float</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	set from = "no-reply@disclinc.com" //admin@disclinc.com
+	set to = ..GetEmails(pstrDiskAlertUsers)
+	set subject = "["_##class(Util).GetComputerName()_":"_##class(Util).GetNamespace()_"] "_
+		"Monitor de Ambiente - Espaço em Disco ("_$zdate($horolog, 4)_")"
+	set message = "<BR>A partição de id '"_pstrPartitionId_"' atingiu "_
+		pfltPercUsed_"% de uso, sendo que o máximo aceitável é "_
+		pfltPercMaxAcceptUse_"%."_"<BR><BR>Obs: Esta mensagem  é automática "_
+		"e não deve ser respondida."
+
+	set info = ##class(SmtpServerRetriever).RetrieveInfo()
+	set server = $piece(info, "~", 1)
+	set port = $piece(info, "~", 2)
+	set user = $piece(info, "~", 3)
+	set password = $piece(info, "~", 4)
+	set smtp = ##class(MailSender).%New(server, port, user, password)
+	if ('$isObject(smtp)) quit $$$CUSTOMERROR("Não foi possível instanciar classe de e-mail, provavelmente por falta de dados na WWW012")
+
+	set status = smtp.SendMail(from, to, "", "", subject, message)
+	quit status]]></Implementation>
+</Method>
+
+<Method name="GetEmails">
+<FormalSpec>pstrUsuarios:%String</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[	set strEmails = ""
+
+	for i = 1:1:$length(pstrUsuarios, ";") {
+		set idUser   = $piece(pstrUsuarios, ";", i)
+
+		set objUser  = $get(^WWW013(0, idUser, 1))
+		set strNome  = $$$WWW013Name(objUser)
+		set strEmail = $$$WWW013EMailAddress(objUser)
+
+		if ($length(strEmail) > 0) {
+			if ($length(strEmails) > 0) {
+				set strEmails = strEmails_";"
+			}
+
+			set strEmails = strEmails_strNome_" <"_strEmail_">"
+		}
+	}
+
+ 	quit strEmails]]></Implementation>
+</Method>
+
+<Method name="%OnClose">
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	if ($isObject(##class(Api).GetInstance())) {
+		do ##class(Api).GetInstance().Clear()
+	}
+
+	quit $$$OK]]></Implementation>
+</Method>
+</Class>
+</Export>

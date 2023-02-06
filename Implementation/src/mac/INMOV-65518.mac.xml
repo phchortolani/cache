@@ -1,0 +1,1203 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INMOV" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INMOV	; Stock Movement
+#include COMSYS
+#include INConst
+#include COMConst
+#include %occInclude
+	
+	;-------------------------------------------------------------------------------
+	; 26-Feb-2009	GRF		SR16396: Replace hardcoded values with enums for clarity
+	;							and to avoid ClassFld/FormFld errors
+	;-------------------------------------------------------------------------------
+#define FORMFldINMOVLineItem        1
+#define FORMFldINMOVLineFromStorage 2
+#define FORMFldINMOVLineQtyRequired 3
+#define FORMFldINMOVLineToStorage   6
+#define FORMFldINMOVLineUnit        7
+#define FORMFldINMOVLineLineBundle  8
+#define FORMFldINMOVLineIssueLine   9
+#define FORMFldINMOVLineLotNo       10
+	
+OnBeforeButtonLine(pidMove,pobjAdj,&pobjForm)
+	;-------------------------------------------------------------------------------
+	; Set form to readonly if not editable
+	;
+	; Params:	pidMove		Mov id
+	;			pobjMov		Mov object
+	;
+	; Returns:	pobjForm	Form object (WWW120)
+	;
+	; History:
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	if '$$$NoKey(pidMove) {
+		if '$$Editable(pidMove) {
+			set $$$WWW120AuthorizationToModifyData(pobjForm) = $$$EnumReadOnly
+		}
+	}
+	quit
+	
+	
+Editable(pidMove) 
+	;-------------------------------------------------------------------------------
+	; Is form editable (unprocessed) ?
+	;
+	; Params:	pidMove		Move id
+	;
+	; Returns:	status
+	;
+	; History:
+	; 09-Sep-2008	Luke	SR15897 Reverted SR15800:
+	; 17-Jul-2008   Luke    SR15800: Add check if the Conversion has been run
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new blnOK,objMov
+	
+	set blnOK  = $$$YES
+	set objMov = ##class(alMOV.dUMov).%OpenId("0||"_pidMove)
+	if (objMov'=$$$NULLOREF) {
+		if objMov.Status.StatusCode=2 {
+			set blnOK = $$$NO
+		}
+	}
+	quit blnOK
+	
+	
+OnBeforeSave(pidMove)
+	;-------------------------------------------------------------------------------
+	; Saves Grid
+	; 
+	; Called From:
+	;	INMOV FORM, OnBeforeSave event
+	; 
+	; Params:	pidMove - INMOV id
+	; 
+	; Returns: 
+	;
+	; History:
+	; 26-Feb-2009	HQN		SRAdHoc: Called from Form now, set Y* variables
+	;							Updated Doco
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$GRIDSave(pidMove)
+	
+	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	
+LoadGrid(pidMove,pobjMove)
+	;-------------------------------------------------------------------------------
+	; Code for Grid Edit 
+	;
+	; Inputs:
+	;	pidMove,pobjMove	key and obj for INMOV
+	; 
+	; Returns: Nothing
+	;
+	; History:
+	; 21-Aug-2009	GRF		SR16855: standard variable - pidMove & pobjMove (were
+	; 							pYKEY & pYFELD)
+	; 05-Jan-2009	DavidR	SR16267: Added check using pobjMove (added) to make
+	;							 records with a status of 1 (In Progress) editable,
+	;							 all other statuses are read only
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new blnEnabled,idForm,YAUSWAHL
+	set idForm     = "INMOVLine"
+	set blnEnabled = $$$NO
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)     = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL)  = 400
+	set $$$COMGridEditParameterGridName(YAUSWAHL)       = idForm
+	//set $$$COMGridEditParameterUpdateFields(YAUSWAHL) = "D2=7"
+	
+	if $$$ISERR($$EnableButtons(pidMove)) {
+			set blnEnabled = $$$NO
+	}
+	if ($$$INMOVStatus(pobjMove)=1) {     ; In Progress							
+		set blnEnabled = $$$YES
+	}
+	set $$$COMGridEditParameterEnabled(YAUSWAHL) = blnEnabled
+	set $$$COMGridEditParameterContainer(YAUSWAHL) = "INMOV"
+	
+	$$$GRIDStart(idForm,pidMove)
+	quit 
+	
+	
+OnAfterDataFields(pidMove,pintTab,pobjMove)
+	;-------------------------------------------------------------------------------
+	; Code to run when called by the AfterDataField event on the @netManager form.
+	;
+	; History:
+	; 21-Aug-2009	GRF		SR16855: standard variable - pidMove & pobjMove (were
+	; 							pYKEY & pYFELD)
+	; 05-Jan-2009	DavidR	SR16267: added parameter pobjMove to check for status of
+	;							of form to make grid ReadOnly if status is other
+	;							than 1 (In Progress)
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	;Clear Cached Errors for Line Data
+	kill ^CacheTempMOVLineError(YUSER)          ; FIXME : Are these globals OBSOLETE? <GRF>
+	kill ^CacheTempMOVItemError(YUSER)
+	
+	if pintTab = 1 {
+		do LoadGrid(pidMove,pobjMove)
+		; Populate DynTable if required fields contain data
+		; Fields: Location, Storage, Item
+	}
+	quit
+	
+	
+Post(pidMove,pblnReloadForm=$$$YES)
+	;-------------------------------------------------------------------------------
+	; Post Movement
+	;
+	; Called By :
+	;	Form INMOV Button "Post" - Execute On Click
+	; 
+	; Returns:Status
+	;
+	; History:
+	; 21-Aug-2009	GRF		SR16855: standard variable - pidMove
+	; 31-Jul-2008	Luke	SR15814: correct the status usage 
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new objMov,strStatus,sc 
+	
+	set sc        = $$$OK 
+	set strStatus = $$CanPost(pidMove)
+	
+	if YQ = $$$YQEnable {
+		set objMov = ##class(alMOV.dUMov).%OpenId("0||"_pidMove)	
+		set sc =  objMov.FirmMove()
+		
+		if $$$ISOK(sc) {
+			do ^WWWFORM
+		
+		} else {
+			set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+			do ReturnError^COMUtilError(strStatus)
+		}
+	
+	} else {
+		do ReturnError^COMUtils($$$YQMessage)
+	}
+	quit strStatus
+	
+	
+EnableLoadLineButton(pidMove)
+	;-------------------------------------------------------------------------------
+	; Determine whether LoadLines Button can be enabled.
+	; Reasons for preventing firming from being allowed
+	;  - Movement Record is completed
+	;
+	; Called By :
+	;	Form INMOV Button "Load All Items at Storage" - Check for Disabled
+	; 
+	; Params:
+	; pidMove - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing (changes @NM variable YQ)
+	;
+	; History:
+	; 21-Aug-2009	GRF		SR16855: standard variable - pidMove
+	; 28-Jul-2009	PPP		SR16769: Creation
+	;-------------------------------------------------------------------------------
+	new objMov,objOpenStatus,sc,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidMove) {
+		set objMov = $get(^INMOV(0,pidMove,1))
+		
+		if $$$INMOVStatus(objMov) = 2 {
+			set strStatus = $$$MakeStatus("INMOV01")
+		} ; "This Stock Move is already completed"
+	}
+	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	
+EnableButtons(pidMove)
+	;-------------------------------------------------------------------------------
+	; Determine whether Move Firm Button can be enabled.
+	; Reasons for preventing firming from being allowed
+	;  - Movement Record is completed
+	;
+	; Called By :
+	;	Form INMOV Button "Load Requisition Lines"    - Check for Disabled
+	;	           Button "Load All Items at Storage" - Check for Disabled
+	; 
+	; Params:
+	; pidMove - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing (changes @NM variable YQ)
+	;
+	; History:
+	; 21-Aug-2009	GRF		SR16855: standard variable - pidMove
+	; 08-Jan-2009	GRF		SR16252: Test for "InProgress" status missing
+	; 14-Oct-2008	Luke	SR15910: added an "isfirmable" call to the object 
+	; 18-Sep-2008	Luke	SR15918: Correct check on the pidMove to include '+'
+	; 09-sep-2008	Luke	SR15897: Reverted SR15800:
+	; 17-Jul-2008   Luke    SR15800: Add check if the Conversion has been run
+	; 30-Jan-2008	LB		SR15626: Changed the signature of dStatus to dUStatus
+	; 27-Dec-2007	LB		SR15597: use objects
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new objMov,objOpenStatus,sc,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidMove) {
+		set objMov = $get(^INMOV(0,pidMove,1))
+		
+		if $$$INMOVStatus(objMov) = 2 {
+			set strStatus = $$$MakeStatus("INMOV01")
+		} ; "This Stock Move is already completed"
+	}
+	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	
+CanPost(pidMove)
+	;-------------------------------------------------------------------------------
+	; Determine whether Movement can be firmed.
+	; Reasons for preventing firming from being allowed
+	;  - No key / record
+	;  - Due date is invalid
+	;  - There are no Movement lines
+	;  - Movement status is not created
+	;  - There is an error with Movement line(s) 
+	;    - There is no item detailed on a Movement line
+	;    - There is no quantity detailed on a Movement line
+	;    - Negative quantity detailed on Movement line
+	;    - Non stock item selected for Movement
+	; 
+	; Called By :
+	;	Form INMOV Button "Post" - Check for Disabled
+	;	
+	; Params:
+	;	pidMove - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing (changes @NM variable YQ)
+	;
+	; History:
+	; 21-Aug-2009	GRF		SR16855: standard variable - pidMove
+	; 02-Mar-2009	GRF		SR16396: Perform EnableButtons validation first - checks
+	; 							if already posted this way.
+	; 23-Dec-2008	DavidR	SR16258: reinstated alDRP.PlannedMovement (was removed)
+	; 30-Oct-2008	HQN		SR16101: Check line validity
+	; 22-Oct-2008	PPP		SR16064: Should not post a Stock Move when Stocktake is
+	;							in progress.
+	; 09-sep-2008	Luke	SR15897 Reverted SR15800:
+	; 17-Jul-2008   Luke    SR15800: Add check if the Conversion has been run
+	; 07-May-2008	HQN		Not checking line validity?
+	; 03-Dec-2007	LB		SR15597: clean up and use the dMov Object as needed
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new idItem,loopLines,objTFR,objItem,objLine,objMov,objMovV1,sc,strStatus
+	
+	quit:$$$NoKey(pidMove) $$$NO
+	
+	set strStatus =  $$EnableButtons(pidMove)
+	
+	if $$$ISOK(strStatus) {
+		set objMovV1 = $get(^INMOV(0,pidMove,1))
+		set objMov   = ##class(alMOV.dUMov).%OpenId("0||"_pidMove)
+		
+		if objMov'=$$$NULLOREF {
+			if $$$ISOK(strStatus) && (objMov.MovLines.Count() <= 0) {
+				set strStatus = $$$MakeStatus("INMOV02")        ; "No lines to move"
+			}
+			if $$$ISOK(strStatus) {
+				for loopLines=1:1:objMov.MovLines.Count() {
+					set sc = objMov.MovLines.GetAt(loopLines).IsFirmable()
+					quit:$$$ISERR(sc)
+				}
+				if $$$ISERR(sc) set strStatus = $$$MakeStatus("IN00432")
+			}   ; "Please fix all errors before firming."
+			
+			if $$$ISOK(strStatus) {
+				if $data(^CacheTempMOVLineError(YUSER)) {  ; FIXME : Is this global OBSOLETE? <GRF>
+					set strStatus = $$$MakeStatus("IN00432")
+				} ; "Please fix all errors before firming."
+				
+				if $$$ISOK(strStatus) {
+					if $$IsLockedSiteLocation^INLocking($$$INMOVLocation(objMovV1)) {
+						set strStatus = $$ReasonLocked^INLocking($$$INMOVLocation(objMovV1))
+					}
+				}
+			}
+			
+		} else {
+			set strStatus = $$$MakeStatus("INMOV02")
+		} ; "No lines to move"
+	}
+	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	 
+LoadReqLines(pidMove)
+	;-------------------------------------------------------------------------------
+	;
+	; Called By :
+	;	Form INMOV Button "Load Requisition Lines" - Function On Click
+	;
+	; Params:	pidMove      The Stock Move Number
+	;
+	; ByRefs:	none
+	;
+	; Returns:	none
+	;
+	; History:
+	; 06-Dev-2007	GRF		SR15597: idReq,idReqIssue not newed
+	; 28-Nov-2007   LB      SR15597: split repetitive code up; Changed the params to
+	;							blackbox code; change the params to get the stock
+	;							Move Number; Change the order of the IF statement -
+	;							Issue takes precedence over Req
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new blnAdded,idOrder,idReq,idReqIssue,objMov,strStatus
+	
+	set objMov     = $$$GRIDYFELDContainer
+	set idReq      = $$$INMOVRequisition(objMov)
+	set idReqIssue = $$$INMOVRequisitionIssue(objMov)
+	set strStatus  = $$$OK
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	TSTART
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	if idReqIssue '= "" { 
+		set strStatus = $$LoadLinesByIss(0,pidMove,idReqIssue,YUSER)
+		
+	} elseif idReq '= "" {
+		set strStatus = $$LoadLinesByReq(0,pidMove,idReq,YUSER)
+		
+	} else {
+		set strStatus = $$$MakeStatus("IN00527")
+	} ; "There are no applicable lines to receipt"
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 TCOMMIT
+	} else {
+		TROLLBACK
+		do ReturnError^COMUtilError(strStatus)
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+	quit
+	
+	
+LoadLinesByReq(pYM,pidMove,pidReq,YUSER)
+	;-------------------------------------------------------------------------------
+	; Add all valid lines to the INMOVLine grid. for a 'Req or Req Issue'
+	;
+	; Params:	pYM			The YM variable, The company 
+	;           pidMove		The (alMOV.dMov) index 
+	;           pidReq		Requisition Number to search for.
+	;			YUSER		The user variable 
+	;
+	; ByRefs:	none
+	;
+	; Returns:	boolean - whether any lines were added
+	;
+	; History:
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than objGrid
+	; 21-Aug-2009	GRF		SR16855: standard variable - pidMove & idLine
+	; 29-Sep-2008	Luke	SR15968 Corrected the Line check and some code cleanup
+	; 25-Sep-2008	Luke	SR15895 Correct Line check to disregard blank lines 
+	; 24-Jan-2008	HQN		SR15625 Changed class signature dREQ to dUReq
+	; 06-Dev-2007	GRF		SR15597: "p" missing in pidMove"
+	; 28-Nov-2007   LB      SR15597: split repeatitive code up and made call to $$LoadLines
+	;                                 Changed the params to blackbox code 
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new arrGrid,blnFound,idLine,objMov,objReq,strLine,strStatus
+	
+	set strStatus = $$$OK
+	
+	set objMov = ##class(alMOV.dUMov).%OpenId("0||"_pidMove)	
+	set objReq = ##class(alREQ.dUReq).%OpenId("0||"_pidReq)
+	
+	if objMov.MovLines.Count()>0 {
+		set strStatus = $$$MakeStatus("INMOV03")
+	} ; "This Move record has lines"
+	
+	if $$$ISOK(strStatus) {
+		$$$GRIDGetContents(.arrGrid)
+		set blnFound = $$$NO
+		set idLine   = ""
+		for {
+			set idLine = $order(arrGrid(pidMove,idLine))
+			quit:idLine=""
+			
+			set strLine  = $get(arrGrid(pidMove,idLine))
+			if ($$$INMOVLineItem(strLine) '= "") {
+				set blnFound = $$$YES
+				quit
+			}
+		}
+		if blnFound set strStatus = $$$MakeStatus("INMOV03")
+	} ; "This Move record has lines"
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$LoadLines(0,objMov,objReq,YUSER)
+	}
+	quit strStatus
+	
+	
+LoadLinesByIss(pYM,pidMove,pidReqIssue,YUSER)
+	;-------------------------------------------------------------------------------
+	; Add all valid lines to the INMOVLine grid. for a 'Req or Req Issue'
+	;
+	; Params:	pYM				The YM variable, The company 
+	;           pidMove			The (alMOV.dUMov) index 
+	;           pidReqIssue		Requisition Issue Number to search for.
+	;			YUSER			The user's process id variable 
+	;
+	; ByRefs:	none
+	;
+	; Returns:	boolean - whether any lines were added
+	;
+	; History:
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than objGrid
+	; 21-Aug-2009	GRF		SR16855: standard variable - pidMove & idLine
+	; 25-Sep-2008	Luke	SR15895: Correct Line check to disregard blank lines 
+	; 24-Jan-2008	HQN		SR15625: Changed class signature dINIssue to dUIssue
+	; 28-Nov-2007	LB		SR15597: split repeatitive code up and made call to
+	;							$$LoadLines; Changed the params to blackbox code 
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new arrGrid,blnFound,idLine,objIss,objMov,strLine,strStatus
+	
+	set strStatus = $$$OK
+	
+	set objMov = ##class(alMOV.dUMov).%OpenId("0||"_pidMove)	
+	set objIss = ##class(alISS.dUIssue).GetInstance("0||"_pidReqIssue)
+	
+	if objIss = $$$NULLOREF	 set strStatus = $$$MakeStatus("INMOV04")  ; "Not a valid Issue for the current location"
+	
+	if $$$ISOK(strStatus) {
+		if objMov.MovLines.Count()>0 {
+			set strStatus = $$$MakeStatus("INMOV03")
+		}  ; "This Move record has lines"
+	}
+	
+	if $$$ISOK(strStatus) {
+		$$$GRIDGetContents(.arrGrid)
+		set blnFound = $$$NO
+		set idLine   = ""
+		for {
+			set idLine = $order(arrGrid(pidMove,idLine))
+			quit:idLine=""
+			
+			set strLine  = $get(arrGrid(pidMove,idLine))
+			if ($$$INMOVLineItem(strLine) '= "") {
+				set blnFound = $$$YES
+				quit
+			}
+		}
+		if blnFound set strStatus = $$$MakeStatus("INMOV03")
+	} ; "This Move record has lines"
+	
+	if $$$ISOK(strStatus) {
+		if objMov.Location.Location '= objIss.ToLocn.Location {
+			set strStatus = $$$MakeStatus("INMOV04")
+		} ; "Not a valid Issue for the current location"
+	}
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$LoadLines(0,.objMov,objIss,YUSER)
+	}
+	quit strStatus
+	
+	
+LoadLines(pYM,&objMov,objLine,YUSER)
+	;-------------------------------------------------------------------------------
+	; Load the IssueLines onto the grid 
+	; calls the createMoveline on the Mov object to correctly format the. 
+	; this is generic as Reqs will have Issues, thus we only deal with issue lines.  
+	; 
+	; NOTE:
+	; I have tried to black box this method. All variables needed to be passed in (YM, YUSER)
+	;
+	; Params:
+	;	pYM			The YM variable, The company 
+	;	objLine		The object we are playing with (Req or Issue), this gets
+	;					checked in the CreateMoveLine of Mov
+	;	YUSER	    The user process id variable 
+	; 
+	; ByRefs:
+	;	objMov		The created Mov object (see alMOV.dMov) 
+	;
+	; Returns:
+	;	blnAdded	If a line has been added to the grid or not, used for
+	;					messages to the user strStatus
+	; 
+	; History:
+	; 03-Dec-2009	DWR		SR17043: Reverted change from below 17006, call to simulate 
+	; 							blur if has been adde to line one, otherwise not
+	; 							formatting correctly
+	; 03-Nov-2009	DWR		SR17006: Commented out call to LoadUnitsOfMeasure, this 
+	; 							now handled in OnBeforeDisplayCombo
+	; 03-Mar-2009	GRF		SR16396: use FORMFld macros rather than hardcoded
+	; 							values; INMOVLine2
+	; 12-Jan-2009	GRF		SR16247: variable prefixes to match coding standard
+	; 03-Oct-2008	Luke	SR15979; add issues link
+	; 25-Sep-2008	Luke	SR15895: Allows the load to handle blank lines on screen 
+	; 05-Aug-2008	Luke	SR15814: Corrected logic flow to Object for status 
+	; 18-Dec-2007	LB		ToStorage may not be defined
+	; 06-Dev-2007	GRF		SR15597: idItem,indexLine,IssueLine,lstLines,objMOVLine,
+	;							tempqty not newed
+	; 28-Nov-2007   LB      SR15597: Creation
+	;-------------------------------------------------------------------------------	
+	new arrLines,blnAdded,idBase,idCell,idItem,idParentLocn,idRowNum,idToStorage
+	new indexLine,intBaseLen,intLineNum,intRowCount
+	new loopLines,lstLines,objBundle,objMOVLine,previousLine
+	new sc,strMessage,strMOVLine,strStatus,strTempCell,tempUnit,tempYFORM
+	
+	set blnAdded  = $$$NO
+	set strStatus = $$$OK
+	set sc        = $$$OK
+	
+	if (objLine'= $$$NULLOREF) {
+		set intRowCount = ($$$GRIDGetRowCount("INMOVLine",YKEY))
+		
+		set lstLines = objMov.CreateMoveLineV2(objLine,intRowCount,.sc)
+		
+		set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+		/// maybe leave this in .... allows user feedback 
+		if $$$ISERR(strStatus) {
+			set strMessage = $$^WWWTEXT("IN00734")  ; "To Storage needs to be specified"
+			write "alert("""_strMessage_""");"
+		}
+		
+		if lstLines.Count() >0 {
+			set arrLines= ##class(%ListOfDataTypes).%New()
+			
+			set intLineNum   = 1
+			set previousLine = 0
+			set idCell = ""
+			for {
+				set idCell = $order(^WWWDATEN(0,+$horolog,YUSER,"INMOVLine","V",idCell))
+				quit:idCell=""
+			
+				set strTempCell = idCell                ; "Ynn_nn"   or "Ynnxnn_nn"  (Y row x copy _ field)
+				if $find(strTempCell,"Y")=2 {
+					if $find(strTempCell,"x")=0 { 
+						set strTempCell = $extract(strTempCell,2,9999999)
+						
+						set idRowNum = $piece(strTempCell,"_",1)
+						if +idRowNum = 0 continue
+						if previousLine '= idRowNum {
+							do arrLines.Insert(intLineNum)
+							set previousLine = idRowNum 
+							set intLineNum = intLineNum + 1	
+						}
+					}
+				}
+			}
+			$$$GRIDAddBatchStart
+			
+			for loopLines = 1:1:lstLines.Count() {
+				set objMOVLine = lstLines.GetAt(loopLines)
+				
+				set objMOVLine.Number = objMov.MovLines.Count()+1  
+				set strMOVLine = ""
+				set idParentLocn = objMOVLine.Movement.Location	
+				if objMOVLine.ToStorage = $$$NULLOREF {
+					set idToStorage = ""
+				} else {
+					set idToStorage = objMOVLine.ToStorage.StockLocation
+				}
+				
+				if arrLines.Count() >0 {
+					set indexLine = arrLines.GetAt(1)
+					set strStatus = $$CreateLine^INMOVLine(idParentLocn,
+					                                       objMOVLine.Item,
+					                                       objMOVLine.Unit,
+					                                       objMOVLine.FromStorage.StockLocation,
+					                                       idToStorage,
+					                                       objMOVLine.QtyRequired,
+					                                       objMOVLine.Bundle,
+					                                       objMOVLine.IssueLine,
+					                                       .strMOVLine)
+	 				
+					set objBundle = ##class(alSOH.dBundle).%OpenId(objMOVLine.Bundle)
+					set tempUnit = $$$INARTUnitofMeasure($get(^INART(0,$$$INMOVLineItem(strMOVLine),1)))
+					
+					do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineItem,       $$$INMOVLineItem(strMOVLine))
+					do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineFromStorage,$$$INMOVLineFromStorage(strMOVLine))
+					do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineQtyRequired,$$$INMOVLineQtyRequired(strMOVLine))
+					do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineToStorage,  $$$INMOVLineToStorage(strMOVLine))
+					do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineUnit,       tempUnit)
+					do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineLineBundle, $$$INMOVLineBundle(strMOVLine))
+					do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineIssueLine,  $$$INMOVLineIssueLine(strMOVLine))
+					do SimulateBlurOnAdd^COMGridEdit31Scan(1,strMOVLine,"","INMOVLine")
+					
+					
+				;   set strBundleValues = "..."
+				;	do UpdateManualField^COMGridEdit31Interface(indexLine,10,strBundleValues)  ; SR16328 - Do we need to add these lines <GRF>
+					set tempYFORM  = YFORM
+					set YFORM      = "INMOVLine"
+					set idBase     = "Y"_indexLine_"_"
+					set intBaseLen = $length(idBase)
+					set idCell     = idBase
+					for {
+						set idCell = $order(^WWWDATEN(0,+$horolog,YUSER,"INMOVLine","V",idCell))
+						quit:idCell=""
+						quit:$extract(idCell,1,intBaseLen)'=idBase
+						
+						do OnBeforeFormat^INMOVLine2(idCell,"",strMOVLine)
+					}
+					set YFORM = tempYFORM
+					do arrLines.RemoveAt(1)
+					
+				} else {
+					set strStatus = $$CreateLine^INMOVLine(idParentLocn.Location,
+														   objMOVLine.Item,
+														   objMOVLine.Unit,
+														   objMOVLine.FromStorage.StockLocation,
+														   idToStorage,
+														   objMOVLine.QtyRequired,
+														   objMOVLine.Bundle,
+														   objMOVLine.IssueLine,
+														   .strMOVLine)
+					do AddLine^COMGridEdit31Add(strMOVLine,,,,,,,$$$YES)
+				}
+			}
+			$$$GRIDAddBatchStop
+		} 
+	}
+	quit strStatus
+	
+	
+GetDefaultReqLocation(idItem,pidLocn)
+	quit ""
+	
+	
+CanLoadStorageLines(pidMove)
+	;-------------------------------------------------------------------------------
+	; Determine whether Storage Lines can be loaded for a Storage
+	; Reasons for preventing loading from being allowed
+	;  - No Storage entered
+	;  - Invalid Storage
+	;  - There is no Header
+	;  - Movement status is completed
+	;
+	; Params:
+	; pidMove - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing (changes @NM variable YQ)
+	;
+	; History:
+	; 20-Jul-2009	PPP		SR16769: Donot check for Enabled Buttons when loading
+	; 							Lines from Storage
+	; 12-Jan-2009	GRF		SR16247: variable prefixes to match coding standard
+	; 14-Oct-2008	Luke	SR15910: corrected the check for already loaded lines 
+	; 22-Sep-2008	Luke	SR15938: corrected null check on storage for unknown store
+	; 17-Sep-2008	Luke	SR15910: Add extra checks for 
+	; 06-Dev-2007	GRF		SR15597: idLocn,idStorage,objStorage not newed
+	; 05-Dec-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new idBundle,idGridStore,idLocn,idStorage,intLineNum,intRowCount
+	new objBundleStock,objFromStore,objLineStore,objMov,rs,sc,strSQL,strStatus
+	
+	set sc        = $$$OK
+	set strStatus = $$$OK
+	
+	set objMov    = $$$GRIDYFELDContainer 
+	set idLocn    = $$$INMOVLocation(objMov)
+	set idStorage = $$$INMOVStorage(objMov)
+	
+	if idStorage = $$$NULLOREF set strStatus = $$$MakeStatus("INMOV05") ; "No storage selected"
+	
+	if $$$ISOK(strStatus) {
+		set objFromStore = ##class(alLOC.iLOC).GetStorage(idLocn,idStorage,.sc)
+		if objFromStore = $$$NULLOREF {
+			set strStatus=$$$MakeStatus("INMOV06")             ; "Invalid storage selected"
+			
+		} else {
+			set rs=##class(%ResultSet).%New()
+			set strSQL = "select id from alSOH.dBundleStock where storage = '"_objFromStore.%Id()_"'"
+			
+			if $$$ISOK(rs.Prepare(strSQL)) {
+				if $$$ISOK(rs.Execute()) {		
+					for {
+						quit:'rs.Next()
+						
+						set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(rs.Data("ID"))
+						
+						if objBundleStock '= "" {
+							set intRowCount = $get(^WWWDATEN(0,+$horolog,YUSER,"INMOVLine","V","ROWCOUNT"))
+							for intLineNum=1:1:intRowCount {
+								set idBundle    = $get(^WWWDATEN(0,+$horolog,YUSER,"INMOVLine","V","Y"_intLineNum_"_8",1))
+								set idGridStore = $get(^WWWDATEN(0,+$horolog,YUSER,"INMOVLine","V","Y"_intLineNum_"_2",1))
+								if (idBundle = objBundleStock.Bundle.%Id()) && (idStorage = idGridStore) {
+									set strStatus = $$$MakeStatus("INMOV08")   ; "This Move has items from this storage"
+									quit
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	$$$YQHandler(strStatus)
+	quit strStatus
+	
+	
+LoadStorageLines(pidMove,pidItem="")
+	;-------------------------------------------------------------------------------
+	; Search INWE by Item & Storage
+	; Add all valid lines to the INMOVLine grid.
+	; Called by the Button on Movements - INMOV
+	;
+	; Called By :
+	;	Form INMOV Button "Load All Items at Storage" - Function On Click
+	;
+	; Params:	none
+	;
+	; ByRefs:	none
+	;
+	; Returns:	none 
+	;
+	; History:
+	; 03-Dec-2009	DWR		SR17043: reverted change below in SR17006. call to simulate
+	; 							Blur to get the line to format corectly on the first
+	; 							line only
+	; 03-Nov-2009	DWR		SR17006: Commented out call to LoadUnitsOfMeasure, this 
+	; 							now handled in OnBeforeDisplayCombo
+	; 23-Oct-2009	shobby	SR16975: Removed some unnecessary extra processing.
+	; 03-Mar-2009	GRF		SR16396: use FORMFld macros rather than hardcoded
+	; 							values; INMOVLine2
+	; 24-Feb-2009	GRF		SR16394: Clarify idFormField rather than idFieldNum
+	; 12-Jan-2009	GRF		SR16247: variable prefixes to match coding standard; sc
+	;							is output in ::CreateMovLines
+	; 08-Oct-2008	Luke	SR15910 rewrote and corrected the loop for items at a
+	;							storage 
+	; 26-Sep-2008	Luke	SR15909 corrected Line check
+	; 19-Sep-2008	Luke	SR15909 Search for blank Lines prior to loading lines 
+	;							and fill them first, and validate each cell
+	; 10-Sep-2008	Luke	SR15894 Changed the error handling for objStorage
+	; 24-Jan-2008	HQN		SR15625 Changed class signature dStorage to dUStorage
+	; 06-Dev-2007	GRF		SR15597: strStatus not newed
+	; 28-Nov-2007   LB      SR15597: Calls to object, error checks 
+	; 31-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new arrLines,fltItemQty,idBase,idCell,idFieldNum,idFromStorage,idItemI,idItem,idLocn
+	new idMov,idRowNum,idStorage,idToStorage,idUnit,indexLine,intBaseLen,intLineNum,intRowCount
+	new loopLines,lstLines,objBundle,objFromStor,objMov,objMOVLine,objStorage,previousLine
+	new rs,sc,strMOVLine,strStatus,strTempCell,tempUnit,tempYFORM
+	
+	set sc         = $$$OK
+	set strStatus  = $$$OK
+	
+	set objMov     = $$$GRIDYFELDContainer
+	set idLocn     = $$$INMOVLocation(objMov)
+	set idStorage  = $$$INMOVStorage(objMov)
+	set strStatus  = $$CanLoadStorageLines(pidMove)
+	
+	set objMov = ##class(alMOV.dUMov).%OpenId("0||"_pidMove)	
+	if objMov=$$$NULLOREF quit                                  ; *** EARLY EXIT ***
+	
+	if $$$ISOK(strStatus) {	
+		set objStorage = ##class(alLOC.dUStorage).%OpenId("0||"_idLocn_"||"_idStorage)
+		if objStorage = $$$NULLOREF {
+			set strStatus = $$$MakeStatus("INMOV06")
+		} ; "Invalid storage selected"
+	}
+	if $$$ISOK(strStatus) {
+		;+++++++++++++++++++++++++++++++++++++++
+		TSTART
+		;+++++++++++++++++++++++++++++++++++++++
+		
+		$$$GRIDAddBatchStart
+		set objFromStor = ##class(alLOC.iLOC).GetStorage(idLocn,idStorage)
+		set lstLines   = objMov.CreateMovLines(0,objFromStor,"",.sc)
+	;	FIXME : check sc? <GRF>
+		
+		// list of blank lines To fill first when populating 
+		set intLineNum   = 1
+		set arrLines     = ##class(%ListOfDataTypes).%New()
+		set idCell       = ""
+		set previousLine = 0
+		
+		for {
+			set idCell = $order(^WWWDATEN(0,+$horolog,YUSER,"INMOVLine","V",idCell))
+			quit:idCell=""
+			
+			set strTempCell = idCell
+			if $find(strTempCell,"Y") = 2 {
+				if $find(strTempCell,"x") =0 { 
+					set strTempCell = $extract(strTempCell,2,9999999)
+					
+					set idRowNum = $piece(strTempCell,"_",1)
+					continue:+idRowNum=0
+					
+					set idFieldNum = $piece(strTempCell,"_",2)            ; <<< FIXME : idCol = FORMField see SR16394
+					
+					if idFieldNum = $$$FldINMOVLineItem {    ; F1=D1      ; <<< FIXME : comparing with class #
+						if $get(^WWWDATEN(0,+$horolog,YUSER,"INMOVLine","V",idCell,1))="" {
+							if previousLine '= idRowNum {
+								do arrLines.Insert(intLineNum)
+								set previousLine = idFieldNum 
+								set intLineNum   = intLineNum + 1	
+							}
+						}
+					}
+				}
+			}
+		}
+		for loopLines = 1:1:lstLines.Count() {
+			set objMOVLine = lstLines.GetAt(loopLines)
+			if arrLines.Count() >0 {
+				set indexLine = arrLines.GetAt(1)
+				set strStatus = $$CreateLine^INMOVLine(idLocn,
+				                                       objMOVLine.Item,
+				                                       objMOVLine.Unit,
+				                                       objMOVLine.FromStorage.StockLocation,
+				                                       objMOVLine.ToStorage.StockLocation,
+				                                       objMOVLine.QtyRequired,
+				                                       objMOVLine.Bundle,
+				                                       "",
+				                                       .strMOVLine)
+				
+				set tempUnit = $$$INARTUnitofMeasure($get(^INART(0,$$$INMOVLineItem(strMOVLine),1)))
+
+				do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineItem,       $$$INMOVLineItem(strMOVLine))
+				do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineQtyRequired,$$$INMOVLineQtyRequired(strMOVLine))
+				do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineIssueLine,  $$$INMOVLineIssueLine(strMOVLine))
+				do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineLineBundle, $$$INMOVLineBundle(strMOVLine))
+				do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineUnit,       tempUnit)
+				do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineToStorage,  $$$INMOVLineToStorage(strMOVLine))
+				do UpdateManualField^COMGridEdit31Interface(indexLine,$$$FORMFldINMOVLineFromStorage,$$$INMOVLineFromStorage(strMOVLine))
+				do SimulateBlurOnAdd^COMGridEdit31Scan(1,strMOVLine,"","INMOVLine")
+
+				;   set strBundleValues = "..."
+				;	do UpdateManualField^COMGridEdit31Interface(indexLine,10,strBundleValues)  ; SR16328 - Do we need to add these lines <GRF>
+				
+				set tempYFORM = YFORM
+				set YFORM = "INMOVLine"
+				set idBase = "Y"_indexLine_"_"
+				set intBaseLen = $length(idBase)
+				set idCell = idBase
+				for {
+					set idCell = $order(^WWWDATEN(0,+$horolog,YUSER,"INMOVLine","V",idCell))
+					quit:idCell=""
+					quit:$extract(idCell,1,intBaseLen)'=idBase
+									
+					do OnBeforeFormat^INMOVLine2(idCell,"",strMOVLine)
+				}
+				set YFORM = tempYFORM
+				do arrLines.RemoveAt(1) 
+				
+			} else {
+				set idToStorage = 0 //objLocn.GetDefaultOnHandStorage(objMOVLine.Item,.sc)
+				set strStatus = $$CreateLine^INMOVLine(idLocn,
+				                                       objMOVLine.Item,
+				                                       objMOVLine.Unit,
+				                                       objMOVLine.FromStorage.StockLocation,
+				                                       objMOVLine.ToStorage.StockLocation,
+				                                       objMOVLine.QtyRequired,
+				                                       objMOVLine.Bundle,
+				                                       "",
+				                                       .strMOVLine)
+				do AddLine^COMGridEdit31Add(strMOVLine,,,,,,,$$$YES)     ; FIXME : see AddNewLine wrapper <GRF>
+			}
+		}
+		$$$GRIDAddBatchStop
+		
+	;++++++++++++++++++++++++++++++++++]]><![CDATA[+++++
+		if $$$ISOK(strStatus) {
+			if $tlevel>0 TCOMMIT
+		} else {
+			TROLLBACK
+		}
+	;+++++++++++++++++++++++++++++++++++++++
+	}
+	if $$$ISERR(strStatus) {
+			do ReturnError^COMUtilError(strStatus)
+	}
+	quit 
+	
+CombineErrorText(ErrorNo,sc)
+	; TODO : This should be moved into COMUtilError
+	; FIXME : Use appropriate variable prefixes - see coding standards
+	;-------------------------------------------------------------------------------
+	;-------------------------------------------------------------------------------
+	new txtlist
+	
+	$$$DecomposeStatus(sc)
+	set txtlist = $listbuild(ErrorNo,sc)
+	quit txtlist	
+	
+	
+ItemStoreExists(pidKey="",&LineValue)
+	;-------------------------------------------------------------------------------
+	; Check if the Item from the store is on the grid (if so add to the QTY)
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than objGrid
+	; 21-Aug-2009	GRF		SR16855: standard variable - idMove
+	; 06-Dev-2007	GRF		SR15597: stItem rather than strItem; strItem;
+	;							,strLine,strStore not newed
+	;-------------------------------------------------------------------------------
+	new arrGrid,idLine,idMove,idReturn,strItem,strLine,strNewItem,strNewFromStore,strStore
+	
+	set idReturn = -1
+	$$$GRIDGetContents(.arrGrid)
+	
+	set idMove = $order(arrGrid(""))
+	
+	if idMove'="" {
+		set strNewItem      = $$$INMOVLineItem(pidKey)
+		set strNewFromStore = $$$INMOVLineFromStorage(pidKey)
+		
+		set idLine = ""
+		for {
+			set idLine = $order(arrGrid(idMove,idLine))
+			quit:(idLine="")
+			
+			set strLine  = $get(arrGrid(idMove,idLine))
+			set strItem  = $$$INMOVLineItem(pidKey)
+			set strStore = $$$INMOVLineFromStorage(strLine)
+			
+			if (strItem=strNewItem) && (strNewFromStore=strStore) {
+				set idReturn  = idLine
+				set LineValue = strLine
+				quit:idReturn
+			}
+		}
+	}
+	quit idReturn
+	
+	
+OnGridExists(pidKey="")
+	;-------------------------------------------------------------------------------
+	; Does the line exist in the grid yet? (copied from CacheLinkExists FINAPInvSearch)
+	;
+	; Called By: Does not appear to have been used anywhere
+	; 
+	; Returns:
+	;
+	; History:
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than objGrid
+	; 21-Aug-2009	GRF		SR16855: standard variable - idMove; tag ONGridExists
+	;							changed to OnGridExists - neither found anywhere
+	;-------------------------------------------------------------------------------
+	new arrGrid,idLine,idMove
+	
+	$$$GRIDGetContents(.arrGrid)
+	set idMove = $order(arrGrid(""))
+	set idLine = ""
+	if idMove'="" {
+		for {
+			set idLine = $order(arrGrid(idMove,idLine))
+			quit:(idLine="")
+			quit:$get(arrGrid(idMove,idLine))=pidKey
+		}
+	}
+	quit (idLine'="")
+	
+	
+GetItemUnit(pidItem)
+	new objItem,idUnit
+	
+	set objItem = $get(^INART(0,pidItem,1))
+	set idUnit = $$$INARTUnitofMeasure(objItem) ; inventory unit
+	
+	quit idUnit
+	
+	
+OnAfterPrimaryKey(pYM,pYFORM,pYSEITE,pstrKey,&pYFELD,&pobjForm) ; DEPRECATED - using OnFilter classhook instead
+	;-------------------------------------------------------------------------------
+	; Show Stock Movements on appropriate form
+	;			
+	; Called By : Form INMOV
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 06-May-2011	GRF		SR17751: Copied from INDispenseToPatient
+	;-------------------------------------------------------------------------------
+	if (pstrKey'="") && (pstrKey'="+") && ($$$INMOVMoveType(pYFELD)=1) {
+		do RedirectForm^COMUtils("INMOVByPallet",pstrKey)
+	}
+	quit
+	
+	
+OnFilter(YKEY,YFELD,YFORM="")
+	;-------------------------------------------------------------------------------
+	; Restricts the list of records that are visible to a particular form.
+	; 
+	; Called By: Class Hook for Class INMOV (On Filter Event)
+	; 
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Jul-2011	GRF		SR17751: Copied from INIssue
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	if YFORM="INMOV" {
+		if +$$$INMOVMoveType(YFELD)'=0 {     ; Stock Movement
+			set strStatus = $$$MakeStatus("IN01304")  ; "This record is not a Stock Movement."
+		}
+		
+	} elseif YFORM="INMOVByPallet" {
+		if $$$INMOVMoveType(YFELD)'=1 {      ; Pallet Movement
+			set strStatus = $$$MakeStatus("IN01305")  ; "This record is not a Movement by Temporary Storage Unit."
+		}
+	}
+	quit strStatus
+	
+	
+	; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DEPRECATED CODE
+	
+PostTxn(pidMove)
+	;-------------------------------------------------------------------------------
+	; Post Movement Transaction
+	; *** May be obsolete (Only called by Post and has been commented out there ***
+	;
+	; Returns:Status
+	;
+	; History:
+	; 12-Jan-2009	GRF		SR16247: Purge variables from new command
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new idLine,idLocn,objMov,objMovLine,strStatus
+	
+	set strStatus = $$Editable(pidMove)
+	
+	if $$$ISOK(strStatus) {
+		set objMov=$get(^INMOV(0,pidMove,1))
+		
+		set idLocn = $$$INMOVLocation(objMov)
+		
+		set idLine = ""
+		for {
+			set idLine = $order(^INMOVLine(0,pidMove,idLine))
+			quit:idLine=""
+			
+			set objMovLine = $get(^INMOVLine(0,pidMove,idLine,1))    ; FIXME : Not used - for loop is pointless <GRF>
+		}
+			/*
+			set idItem			= $$$INMOVLineItem(objMovLine)
+			set idFromStorage	= $$$INMOVLineFromStorage(objMovLine)
+			set fltQty			= $$$INMOVLineBaseQuantity(objMovLine)
+			set idToStorage		= $$$INMOVLineToStorage(objMovLine)
+			
+			set strStatus=$$Move(pidMove,idItem,idLocn,idFromStorage,idToStorage,fltQty)
+		}
+			*/
+			
+		if $$$ISOK(strStatus) {
+			set $$$INMOVStatus(objMov) = $$$EnumINSTATUSProcessed
+			set strStatus = $$$Save("INMOV",pidMove,objMov,$$$YES)
+		}
+	}
+	quit strStatus
+	
+	
+Move(pidMove,pidItem,pidLocn,pidFromStorage,pidToStorage,pfltQty)
+	;-------------------------------------------------------------------------------
+	; !!!!	OBSELETE	!!!!
+	; Process the Move Line
+	;
+	; Params:	pidMove,pidItem,pidLocn,pidFromStorage,pidToStorage,pfltQty
+	;
+	; ByRefs:
+	;
+	; Returns: status
+	;
+	; History:
+	; 06-Dev-2007	GRF		SR15597: "idSOH" not newed
+	; 19-Oct-2007	PPP		SR15597: Creation
+	;-------------------------------------------------------------------------------
+	new arrStockOnHand,dteRec,fltInitialSOH,fltRestQty,fltStockOnHand,idSOH
+	new objSOH,strStatus
+	
+	set strStatus  = $$$OK
+	set fltRestQty = pfltQty
+	
+	set dteRec = ""
+	for {
+		set dteRec = $order(^INWE(0,pidItem,pidLocn,pidFromStorage,dteRec)) // What is rec?
+		quit:dteRec=""  
+		quit:fltRestQty'>0
+		
+		set objSOH=$get(^INWE(0,pidItem,pidLocn,pidFromStorage,dteRec,1))  // CALL SOH
+		set fltInitialSOH = $$$INWEQuantity(objSOH)
+		
+		set fltStockOnHand = $get(arrStockOnHand(pidItem,pidLocn,pidFromStorage,dteRec))
+		if fltStockOnHand = "" {
+			set arrStockOnHand(pidItem,pidLocn,pidFromStorage,dteRec) = fltInitialSOH
+			set fltStockOnHand = fltInitialSOH
+		}
+		
+		if fltRestQty'>fltStockOnHand {
+			set arrStockOnHand(pidItem,pidLocn,pidFromStorage,dteRec) = fltStockOnHand - fltRestQty
+			set idSOH = pidItem_","_pidLocn_","_pidFromStorage_","_dteRec
+			set $piece(objSOH,Y,32) = pidLocn               ; In-Transit Site Locn
+			set $piece(objSOH,Y,33) = pidToStorage          ; In-Transit Storage
+			set $piece(objSOH,Y,34) = fltRestQty
+			set $piece(objSOH,Y,28) = pidMove
+			set $$$INWEInTransitLocn(objSOH)="TO"			; Required for FIN Interface  (ISS)
+			
+			new YKEY,YFELD,YDATEI     ; FIXME : behaves differently from within dot syntax <GRF>
+			set YDATEI="INWE"
+			set YKEY=idSOH
+			set YFELD=objSOH
+			do ^INWE1
+			
+			set fltRestQty=0
+		}
+		
+		if (fltRestQty>fltStockOnHand) && (fltStockOnHand>0) {
+			set arrStockOnHand(pidItem,pidLocn,pidFromStorage,dteRec) = fltStockOnHand - fltRestQty
+			set idSOH=pidItem_","_pidLocn_","_pidFromStorage_","_dteRec
+			set $piece(objSOH,Y,32) = pidLocn               ; In-Transit Site Locn
+			set $piece(objSOH,Y,33) = pidToStorage          ; In-Transit Storage
+			set $piece(objSOH,Y,34) = fltStockOnHand
+			set $piece(objSOH,Y,28) = pidMove
+			set $$$INWEInTransitLocn(objSOH)="TO"			; Required for FIN Interface  (ISS)
+			
+			new YKEY,YFELD,YDATEI     ; FIXME : behaves differently from within dot syntax <GRF>
+			set YDATEI="INWE"
+			set YKEY=idSOH
+			set YFELD=objSOH
+			do ^INWE1
+			
+			set fltRestQty = fltRestQty-fltStockOnHand
+		}
+	}
+	quit strStatus
+	
+	; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DEPRECATED CODE
+	
+]]></Routine>
+</Export>

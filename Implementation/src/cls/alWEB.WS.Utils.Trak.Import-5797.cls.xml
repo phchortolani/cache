@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alWEB.WS.Utils.Trak.Import">
+<ClassType/>
+<IncludeCode>COMSYS,COMConst,INConst,WWWConst</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%RegisteredObject</Super>
+
+<Method name="ImportFile">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pstrFile:%String</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Imports the data file containing MIMS data that has been exported from Trakcare.
+	; Tab delimited file
+	;	idItem:Name:UOM:Locn:Group
+	; Creates (* overwrites)
+	; 	^INART					Item Master Data1		(*)
+	; 	^WWW101(0,"EINHEIT")	Unit
+	; 	^INItemGroup			Item Group
+	; 	^WWW0121				Location
+	; 	^INDRPITEM				Location/Item
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Nov-2008	shobby		SR16131 Created
+	;-------------------------------------------------------------------------------
+	; Char 184 rather than 44
+	#define FAKECOMMA "¸"
+
+	kill ^zzImportFileErrorLog
+	$$$VAR
+	set strStatus=$$$OK
+	open pstrFile:"R"
+	set previousIO=$IO
+	use pstrFile
+
+	do $ZUTIL(68,40,1)
+	; ^^ Eliminates the <ENDOFFILE> error for sequential files for the current process:
+	; Read Caché documentation:
+	; http://localhost:1972/csp/docbook/DocBook.UI.Page.cls?KEY=RCOS_vzeof
+	
+	for {
+		quit:$ZEOF=-1
+		read line
+		quit:$ascii(line)=-1
+		set idINART = $piece(line,$char(9),1)
+
+		if $find(idINART,",") {
+			set ^zzImportFileErrorLog("Error",",",$increment(^zzImportFileErrorLog("Error")),idINART)="Disallowed Characters"
+		}
+		if $find(idINART,"(") {
+			set ^zzImportFileErrorLog("Error","(",$increment(^zzImportFileErrorLog("Error")),idINART)="Disallowed Characters"
+		}
+		if $find(idINART,")") {
+			set ^zzImportFileErrorLog("Error",")",$increment(^zzImportFileErrorLog("Error")),idINART)="Disallowed Characters"
+		}
+		if $find(idINART,"""") {
+			set ^zzImportFileErrorLog("Error","""",$increment(^zzImportFileErrorLog("Error")),idINART)="Disallowed Characters"
+		}
+		if $find(idINART,".") {
+			set ^zzImportFileErrorLog("Error",".",$increment(^zzImportFileErrorLog("Error")),idINART)="Disallowed Characters"
+		}
+		set idINART = $translate(idINART,",",$$$FAKECOMMA)  ;commas disallowed in Alphalinc
+		set objINART = $get(^INART(0,idINART,1))
+		set $$$INARTSearchName(objINART) = $piece(line,$char(9),2)
+		
+		set strUOM = $piece(line,$char(9),3)
+		set $$$INARTUnitofMeasure(objINART)	=$translate(strUOM,",",$$$FAKECOMMA) ;commas disallowed in Alphalinc
+		set strStatus=..AddUOM($$$INARTUnitofMeasure(objINART),strUOM) 
+		
+		; what about location???    = $piece(line,$char(9),4)
+		set strStatus=..AddLocation(idINART,$piece(line,$char(9),4),$$$INARTUnitofMeasure(objINART))
+		
+		set strItemGroup = $piece(line,$char(9),5)
+		set $$$INARTItemGroup(objINART)=$translate(strItemGroup,",")	;commas disallowed in Alphalinc
+		set strStatus=..AddItemGroup($$$INARTItemGroup(objINART),strItemGroup)
+		
+		set $$$INARTHoldReason(objINART) = 0 ;Active
+		set ^zzImportFileData(idINART)=objINART
+		;set strStatus=$$$Save("INART",idINART,objINART,1)
+		if $$$ISERR(strStatus) {
+			set ^zzImportFileErrorLog("Error","Save",$increment(^zzImportFileErrorLog("Error")),idINART)=strStatus
+		}
+		set ^zzImportFileErrorLog(0)=idINART
+	}
+	use previousIO
+	close pstrFile
+	
+	; Validation in OnAfterSave may attempt to write javascript to the screen.  Disable this.
+	set previousIO=$IO
+	open "//./nul":"W"
+	use "//./nul"
+	set idINART=""
+	for {
+		set idINART=$order(^zzImportFileData(idINART))
+		quit:idINART=""
+
+		set objINART=^zzImportFileData(idINART)
+		set strStatus=$$$Save("INART",idINART,objINART,1)		
+	}
+	use previousIO
+	close "//./nul"
+
+	;kill ^zzImportFileErrorLog
+	if $data(^zzImportFileErrorLog("Error")) {
+		write !,"Errors importing Items.  Refer to ^zzImportFileErrorLog."
+	}
+	quit
+]]></Implementation>
+</Method>
+
+<Method name="AddUOM">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidCode,pstrDescription</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Creates the UOM application parameter if not already defined.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Nov-2008	shobby		SR16131 Created
+	;-------------------------------------------------------------------------------
+	set strStatus=$$$OK
+	if pidCode'="" {
+		if '$data(^WWW101(0,"EINHEIT","EN",pidCode)) {
+			set idWWW101="EINHEIT,EN,"_pidCode	
+			set $$$WWW101Text(objWWW101)=pstrDescription
+			set strStatus=$$Save^COMUtils("WWW101",idWWW101,objWWW101,1)
+			if $$$ISOK(strStatus) {
+				set ^zzImportFileErrorLog("Update","UOM",$increment(^zzImportFileErrorLog("Update")))="UOM '"_pidCode_"' added."
+			} else {
+				set ^zzImportFileErrorLog("Error","Save","UOM",$increment(^zzImportFileErrorLog("Error")))="UOM '"_pidCode_"' failed to save."
+			}
+		}
+	}
+	quit strStatus
+]]></Implementation>
+</Method>
+
+<Method name="AddItemGroup">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidCode,pstrDescription</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Creates the INItemGroup if not already defined.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Nov-2008	shobby		SR16131 Created
+	;-------------------------------------------------------------------------------
+	set strStatus=$$$OK
+	if pidCode'="" {
+		set idINItemGroup=pidCode
+		if '$data(^INItemGroup(0,idINItemGroup)) {
+			set $$$INItemGroupDescription(objINItemGroup)=pstrDescription
+			set strStatus=$$Save^COMUtils("INItemGroup",idINItemGroup,objINItemGroup,1)
+			if $$$ISOK(strStatus) {
+				set ^zzImportFileErrorLog("Update","ItemGroup",$increment(^zzImportFileErrorLog("Update")))="ItemGroup '"_idINItemGroup_"' added."
+			} else {
+				set ^zzImportFileErrorLog("Error","Save","ItemGroup",$increment(^zzImportFileErrorLog("Error")))="ItemGroup '"_idINItemGroup_"' failed to save."
+			}
+		}
+	}
+	quit strStatus
+]]></Implementation>
+</Method>
+
+<Method name="AddLocation">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidINART,pidWWW0121,pidUOM</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Creates the Location and INDRPITEM if not already defined.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Nov-2008	shobby		SR16131 Created
+	;-------------------------------------------------------------------------------
+	set strStatus=$$$OK
+	if pidWWW0121'="" {
+		if '$data(^WWW0121(0,pidWWW0121)) {
+			set $$$WWW0121LocationName(objWWW0121)=pidWWW0121
+			set $piece(objWWW0121,"~",78)=pidWWW0121  ;FREE Field customised as 'Supplying Locations'  *******
+			set strStatus=$$Save^COMUtils("WWW0121",0_","_pidWWW0121,objWWW0121,1)
+			if $$$ISOK(strStatus) {
+				set ^zzImportFileErrorLog("Update","Location",$increment(^zzImportFileErrorLog("Update")))="Location '"_pidWWW0121_"' added."
+			} else {
+				set ^zzImportFileErrorLog("Error","Save","Location",$increment(^zzImportFileErrorLog("Error")))="Location '"_pidWWW0121_"' failed to save."
+			}
+		}
+		if '$data(^INDRPITEM(0,pidWWW0121,pidINART)) {
+			set $$$INDRPITEMItemStatus(objINDRPITEM)=1 ;Active
+			set $$$INDRPITEMUnitOfMeasure(objINDRPITEM)=pidUOM
+			set strStatus=$$Save^COMUtils("INDRPITEM",pidWWW0121_","_pidINART,objINDRPITEM,1)
+			if $$$ISOK(strStatus) {
+				set ^zzImportFileErrorLog("Update","INDRPITEM",$increment(^zzImportFileErrorLog("Update")))="INDRPITEM '"_pidWWW0121_","_pidINART_"' added."
+			} else {
+				set ^zzImportFileErrorLog("Error","Save","INDRPITEM",$increment(^zzImportFileErrorLog("Error")))="INDRPITEM '"_pidWWW0121_","_pidINART_"' failed to save."
+			}
+		}
+	}
+	quit strStatus
+]]></Implementation>
+</Method>
+</Class>
+</Export>

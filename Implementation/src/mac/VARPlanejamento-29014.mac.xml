@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARPlanejamento" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARPlanejamento
+#include COMSYS
+#include INConst
+
+AtualizaPlanejamento
+	;do AtualizaPlanejamento^VARPlanejamento
+	;
+	;**ATENÇÃO: antes de rodar essa rotina, certifique-se de rodar a rotina que executa o CMM
+	;  na VARCMM.MAC
+	;	
+	;-------------------------------------------------------------------------------------
+    ; Atualiza todos os campos referentes aos parâmetros de reabastecimento na INART e 
+    ; na INDRPITEM.
+    ; 	
+    ; 	1. CMM  - Consumo Médio Mensal
+    ;	2. CMML - Consumo Médio Mensal Local
+    ;	3. ES   - Estoque de Segurança
+    ;	4. PR   - Ponto de Ressuprimento
+    ;	5. EM   - Estoque Máximo
+    ;------------------------------------------------------------------------------------- 			 
+	$$$VAR
+	
+	new idItem, strStatus
+	set strStatus = $$$OK
+	
+	$$$Order2(^INART,YM,idItem)
+				
+		//Atualiza o CMM (INART - Piece 276)
+		;set strStatus = $$AtualizaCMM(idItem)
+		
+		//Atualiza o CMML (INDRPITEM - Piece 120)
+		if $$$ISOK(strStatus) {
+			set strStatus = $$AtualizaCMML(idItem)
+		}
+		
+		//Atualiza os Parâmetros de Reabastecimento (INDRPITEM - ES = Piece 23, PR = Piece 25 e EM = Piece 110)
+		if $$$ISOK(strStatus) {
+			set strStatus = $$AtualizaParamReabastecimentoLocal(idItem)
+		}
+	$$$End
+ 
+	if $$$ISOK(strStatus) {
+		w "Dados atualizados com sucesso",!
+	} else {
+		w "Erro ao salvar os dados",!
+	}
+
+	quit
+
+AtualizaCMML(pidItem)
+	;-------------------------------------------------------------------------------------
+    ; Atualiza o CMML de todos os locais de estoque para um determinado produto.
+    ;------------------------------------------------------------------------------------- 		
+	new strStatus, fltCMML, objINDRPITEM, fltCMMLOld, idLocation, key
+	
+	set strStatus = $$$OK
+	
+	$$$Order5(^WWW0121s,YM,3,1,YM,idLocation)	
+		quit:($$$ISERR(strStatus))
+
+		// * Caso queira rodar somente para um local, defina abaixo.
+		;continue:(idLocation '= "")
+		
+		set fltCMML = 0
+		set fltCMML = $$CalculateCMML(pidItem,idLocation)
+		
+ 		set objINDRPITEM = $get(^INDRPITEM(YM,idLocation,pidItem,1))
+		set fltCMMLOld = $piece(objINDRPITEM,Y,120)
+		
+		//No need to save if value is not going to change anyway
+		continue:(fltCMMLOld = fltCMML)
+		
+		//No need to save if didn't have any value AND new calculated value is 0.
+		continue:( (fltCMMLOld = "") && (fltCMML = 0) )
+		
+		//Saving in INDRPITEM
+		set key = idLocation_","_pidItem
+		set $piece(objINDRPITEM,Y,120) = fltCMML
+		set strStatus = $$$Save("INDRPITEM",key,objINDRPITEM,$$$YES)
+ 
+		w "Produto: "_pidItem_", Local: "_idLocation_", CMML Old: "_fltCMMLOld_" CMML New: "_fltCMML,!
+		
+	$$$End
+	
+	quit strStatus	
+
+CalculateCMML(pidItem,pidLocation)
+	;-------------------------------------------------------------------------------------
+    ; Calcula o CMML para um determinado produto/local com base nos dados gerados para cada 
+    ; mês/ano na tabela VARCMMLinha.
+    ;------------------------------------------------------------------------------------- 		
+	
+	$$$VAR
+	
+	new year, month, qtyMonth, qty, divisor, qtyTotal, CMML
+	
+	set qtyTotal = 0
+	set divisor  = 0
+	
+	$$$Order3(^VARCMMLinha,YM,pidItem,year)
+	
+		$$$Order4(^VARCMMLinha,YM,pidItem,year,month)
+		
+			set qtyMonth = 0
+			
+			$$$Order6(^VARCMMLinha,YM,pidItem,year,month,pidLocation,idTransaction)				
+					set qty = 0
+					set qty = $piece($get(^VARCMMLinha(YM,pidItem,year,month,pidLocation,idTransaction,1)),Y,1)
+					set qtyMonth = qtyMonth + qty
+			$$$End
+			
+			;w "Período: "_year_"/"_month_"    Consumo do Produto no Local: "_$$^WWWTR(0,12,qtyMonth),!
+			
+			if (qtyMonth > 0) {
+				set divisor = divisor + 1
+			}
+			
+			set qtyTotal = qtyTotal + qtyMonth
+		
+		$$$End
+	$$$End
+	
+	if ((qtyTotal = 0) || (divisor = 0)) {
+		set CMML = 0
+	
+	} else {
+		set CMML = qtyTotal / divisor
+	}
+	
+	set CMML = $fnumber(CMML,"",0)
+	
+	quit CMML
+	
+	
+AtualizaParamReabastecimentoLocal(pidItem)
+	;-------------------------------------------------------------------------------------
+    ; Atualiza para todos os locais de estoque os parâmetros de reabastecimento (ES, PR, EM)
+    ; para um determinado produto. Como é por local, o parâmetro base utilizado é o CMML.
+    ;------------------------------------------------------------------------------------- 		
+	new idLocation, objINDRPITEM, fltCMM, fltCMML, fltES, fltPR, fltEM, key, fltESOld,
+		fltPROld, fltEMOld
+	
+	set objINDRPITEM = ""
+	
+	$$$Order5(^WWW0121s,YM,3,1,YM,idLocation)	
+		quit:($$$ISERR(strStatus))
+		
+		set objINDRPITEM = $get(^INDRPITEM(YM,idLocation,pidItem,1))
+		
+		if (objINDRPITEM '= "") {			
+			set fltESOld = $$$INDRPITEMSafetyStock(objINDRPITEM)
+			set fltPROld = $$$INDRPITEMReOrderPoint(objINDRPITEM)
+			set fltEMOld = $$$INDRPITEMDefaultStockQuantity(objINDRPITEM)			
+		}
+		
+		set fltCMML = $$CalculateCMML(pidItem,idLocation)
+		
+		//No need to continue if there is no CMML defined for the location/item
+		continue:( (fltCMML = 0) || (fltCMML = "") )
+		
+		set fltES = fltCMML * 0.5  ;Estoque para 15 dias   ;Estoque de Segurança
+		set fltPR = fltCMML * 1    ;Estoque para 30 dias   ;Ponte de Ressumprimento
+		set fltEM = fltCMML * 1.5  ;Estoque para 45 dias   ;Estoque máximo
+		
+		set $$$INDRPITEMSafetyStock(objINDRPITEM)  		   = fltES
+		set $$$INDRPITEMReOrderPoint(objINDRPITEM) 		   = fltPR
+		set $$$INDRPITEMDefaultStockQuantity(objINDRPITEM) = fltEM
+
+		//No need to save if values are not going to change anyway
+		continue:( (fltESOld = fltES) && (fltPROld = fltPR) && (fltEMOld = fltEM) )
+		
+		//No need to save if all values are empty or zero
+		continue:( (fltES = "") && (fltPR = 0) && (fltEM = 0) )	
+		
+		//Salvando na INDRPITEM
+		set key = idLocation_","_pidItem
+		set strStatus = $$$Save("INDRPITEM",key,objINDRPITEM,$$$YES)
+		
+		//Salvando na tabela de alerta por local
+		if $$$ISOK(strStatus) {
+			set strStatus = $$$Save("VARAlertaLocalLinha",key,"",$$$YES)
+		}
+ 
+		w "Produto: "_pidItem_", Local: "_idLocation_", ES: "_fltES_" PR: "_fltPR_" EM: "_fltEM,!		
+	
+	$$$End
+	
+	quit strStatus	
+
+
+
+]]></Routine>
+</Export>

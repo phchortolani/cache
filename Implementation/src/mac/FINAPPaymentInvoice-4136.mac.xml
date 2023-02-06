@@ -1,0 +1,829 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPPaymentInvoice" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPPaymentInvoice
+	
+#include COMSYS
+#include FINConst
+	
+GetPaying(pKey,OriginalAmount)
+	;-------------------------------------------------------------------------------
+	;returns the amount of money allocated to each invoice that is getting paid.
+	; 15-Jul-2005	RPW			SR12981: Moved ^FINAPPaymentLine calls to FINAPUtilities
+	; 25-Jun-2004	shobby		Fixed an $$$FCAdd
+	; 09-Jun-2004	SCR			Pass Back Total of the original Invoices being Paid ( for FC Gain / Loss )
+	; 31-May-2004	SCR			FC Upgrade
+	; 02-Dec-2003	shobby		Include the amount payed to Accounts when calculating the 'Total Payments'
+	; 10-Nov-2003	shobby		Take discounts into consideration
+	; 08-Jul-2003	SCR			Corrected use of GetKey
+	;-------------------------------------------------------------------------------
+	new idPayInvoice,objPayInvoice,curAmount,idPay,idPayLine,curDiscount,objFINAPPaymentLine
+	new curTotalAccount
+	
+	set curAmount=0
+	set curDiscount=0
+	set curTotalAccount=0
+	set OriginalAmount=0
+	
+	if $$GetKey^FINAPUtilities(pKey,.idPay,.idPayLine) {
+		set idPayInvoice=""
+		for {
+			set idPayInvoice=$order(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice))
+			quit:idPayInvoice=""
+			set objPayInvoice=$get(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice,1))
+			set curAmount=$$$FCAdd(curAmount,$$$FINAPPaymentInvoicePayAmount(objPayInvoice))
+		}
+		set curTotalAccount=$$GetTotalAccount^FINAPPaymentAccount(idPay,idPayLine)
+		set curAmount=$$$FCAdd(curAmount,curTotalAccount)
+		if ('$data(^FINAPPaymentInvoice(0,idPay,idPayLine)))&(curTotalAccount=0) {
+			; No invoices assume any payment is going to unallocated
+			set objFINAPPaymentLine=$get(^FINAPPaymentLine(0,idPay,idPayLine,1))
+			set curAmount=$$$FINAPPaymentLineTotal(objFINAPPaymentLine)
+			set OriginalAmount=$$$FCAdd(OriginalAmount,curAmount)
+		}
+	}
+	quit $$$FCAdd(curAmount,curDiscount)
+	
+	
+GetOwing(pKey,pblnOnHold=$$$NO,ShowFC=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Returns : the amount of money allocated to each invoice that is getting paid.
+	; 
+	; NOTE: No longer using ShowFC (SR:12050) TODO / FIXME
+	; 
+	; 15-Jul-2005	RPW			SR12981: Moved ^FINAPPaymentLine calls to FINAPUtilities
+	; 14-Jun-2005	shobby	Reverse the Pay flag when testing for 'On Hold' SR12632
+	; 02-Jun-2005	PO		SR:12050 Either return FC or base amount
+	; 29-May-2005	SCR		SR12220: Invoice Filter
+	; 01-Jun-2004	SCR		Show FC amount for FC Suppliers & ShowFC Flag
+	; 31-May-2004	SCR		FC Upgrade
+	; 02-Mar-2004	shobby	Put in a flag to mark whether to do the calculation
+	; 						on OnHold invoices. (TR006583)
+	; 10-Jul-2003	shobby	Exclude on hold invoices from calculations (TR005572)
+	; 08-Jul-2003	SCR		Corrected use of GetKey
+	;-------------------------------------------------------------------------------
+	new idPayInvoice,objPayInvoice,curAmount,idPay,idPayLine,idSupplier
+	new objFINAPInvoice
+	new blnPay,strLocation,strGroup,objPay ; Invoice Filter
+	
+	set idPayInvoice=""
+	set curAmount=0
+ 
+	if $$GetKey^FINAPUtilities(pKey,.idPay,.idPayLine) {
+		if idPay="" set idPay=" "
+		set objPay=$get(^FINAPPayment(0,idPay,1))
+		set strLocation=$$$FINAPPaymentLocation(objPay)
+		set strGroup=$$$FINAPPaymentGroup1(objPay)
+		set idSupplier=$$GetSupplierNumber^FINAPPaymentLine(idPay,idPayLine)
+		for {
+			set idPayInvoice=$order(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice))
+			quit:idPayInvoice=""
+			
+			set blnPay=$$$YES  ; Pay Flag
+			set objFINAPInvoice=$get(^FINAPInvoice(0,idSupplier,idPayInvoice,1))
+			if (+$$$FINAPInvoiceOnHold(objFINAPInvoice))'=(+pblnOnHold) {
+				set blnPay=$$$NO ;SR12632
+			} elseif (strLocation'="")&&(strLocation'=$$$FINAPInvoiceLocation(objFINAPInvoice)) {
+				set blnPay=$$$NO 	; Location Filter
+			} elseif (strGroup'="")&&(strGroup'=$$$FINAPInvoiceDepartment(objFINAPInvoice)) {
+				set blnPay=$$$NO		; Group Filter
+			}
+			if blnPay=$$$YES {	
+				set objPayInvoice=$get(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice,1))
+				set curAmount=$$$FCAdd(curAmount,$$$FINAPPaymentInvoiceAmountOwing(objPayInvoice))
+			}
+		}
+		if $$GetFCCode^FINAPSupplier(idSupplier)="" {
+			set curAmount = $$$FCBase(curAmount)
+		} else {
+			set curAmount = $$$FCAmount(curAmount)_"@"_$$$FCAmount(curAmount)
+		}
+	}
+ 
+	quit curAmount
+	
+	
+KillInvoices(pidPay,pidPayLine,pblnZero)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+    ; 19-Oct-2006	JW		SR15134: Look at kill status. Added return value.
+	;-------------------------------------------------------------------------------
+	new idPayInvoice,objPayInvoice,strStatus
+	set strStatus = $$$OK
+	
+	set idPayInvoice=""
+	for {
+		set idPayInvoice=$order(^FINAPPaymentInvoice(0,pidPay,pidPayLine,idPayInvoice))
+		quit:idPayInvoice=""
+		set objPayInvoice=$get(^FINAPPaymentInvoice(0,pidPay,pidPayLine,idPayInvoice,1))
+		if (+$$$FINAPPaymentInvoicePayAmount(objPayInvoice)=0) || pblnZero {
+			set strStatus = $$$Kill("FINAPPaymentInvoice",pidPay_","_pidPayLine_","_idPayInvoice)		//SR15134
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+	
+GetDiscountTotal(pidPay,pidPayLine)
+	;-------------------------------------------------------------------------------
+	; 23-Sep-2005	PO		SR13558: Do not include discounts for invoices that are not being paid
+	; 31-May-2004	SCR		FC Upgrade	
+	;-------------------------------------------------------------------------------
+	new idPayInvoice,objPayInvoice,curAmount
+	set idPayInvoice=""
+	set curAmount=0
+	if (pidPay'="")&(pidPayLine'="") {
+		for {
+			set idPayInvoice=$order(^FINAPPaymentInvoice(0,pidPay,pidPayLine,idPayInvoice))
+			quit:idPayInvoice=""
+			set objPayInvoice=$get(^FINAPPaymentInvoice(0,pidPay,pidPayLine,idPayInvoice,1))
+			if $$$FINAPPaymentInvoiceDiscountApplied(objPayInvoice) && $$$FINAPPaymentInvoicePay(objPayInvoice) {
+				set curAmount=$$$FCAdd(curAmount,$$$FINAPPaymentInvoiceDiscount(objPayInvoice))
+			}
+		}
+	}
+	quit curAmount
+	
+	
+BuildMessage(pidPay,pidPayLine,pPaymentMessage)
+	new idPayInvoice,objPayInvoice,curAmount
+ 
+	set idPayInvoice=""
+	for {
+		set idPayInvoice=$order(^FINAPPaymentInvoice(0,pidPay,pidPayLine,idPayInvoice))
+		quit:idPayInvoice=""
+		set objPayInvoice=$get(^FINAPPaymentInvoice(0,pidPay,pidPayLine,idPayInvoice,1))
+		set curAmount=$$$FINAPPaymentInvoicePayAmount(objPayInvoice)
+		if +curAmount'=0 {
+			set @pPaymentMessage@("Payments",pidPayLine,"Invoice",idPayInvoice,"PayAmount")=curAmount
+			if $$$FINAPPaymentInvoiceDiscountApplied(objPayInvoice) set @pPaymentMessage@("Payments",pidPayLine,"Invoice",idPayInvoice,"Discount")=$$$FINAPPaymentInvoiceDiscount(objPayInvoice)
+		}
+	}
+	quit
+	
+	
+OnBeforeFormat(pYFIELDNAME,pYTEXT,pYFELD)
+	;-------------------------------------------------------------------------------
+	; If Payment details are different from Invoice details highlight the cell
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Feb-2006	SteveS	SR13497: Show Disc GL Account as tool tip
+	; 24-Nov-2005	PO		SR13912: Compare discounts in appropriate currency, also
+	; 							display tool tip in FC if amt FC
+	; 20-Jun-2005	shobby	Created SR12632
+	;-------------------------------------------------------------------------------
+	new curAmount,idInvoice,idSupplier,intCol,intRow
+	new objFINAPInvoice,objFINAPPaymentLine,strDueDate,strText,YKEY
+	
+	set intRow = $piece($piece(pYFIELDNAME,"_",1),"Y",2)
+	set intCol = $$$GetClassField(YFORM,$piece(pYFIELDNAME,"_",2))
+	
+	if (intCol=$$$FldFINAPPaymentInvoiceDueDate) || (intCol=$$$FldFINAPPaymentInvoiceDiscount) {
+		set objFINAPPaymentLine = $$$GRIDYFELDContainer
+		set YKEY       = $$GetYKEY^COMGridEdit31Interface(intRow)
+		set idInvoice  = $$$KEY3($get(YKEY))
+		set idSupplier = $$$FINAPPaymentLineSupplierNumber(objFINAPPaymentLine)
+		
+		if (idInvoice'="") && (idSupplier'="") {
+			set objFINAPInvoice = $get(^FINAPInvoice(0,idSupplier,idInvoice,1))
+			if intCol=$$$FldFINAPPaymentInvoiceDueDate {
+				if $$$FINAPPaymentInvoiceDueDate(pYFELD)'=$$$FINAPInvoiceDueDate(objFINAPInvoice) {
+					set YBACKGROUNDCOLOR = "red"
+					set strDueDate       = $$$FINAPInvoiceDueDate(objFINAPInvoice)
+					set strDueDate       = $$^WWWDATE(strDueDate)
+					set YTOOLTIP         = $$$Text($listbuild("Fin00809",strDueDate))
+				}  ; "Due Date has been changed from '%1'."
+			
+			} elseif intCol=$$$FldFINAPPaymentInvoiceDiscount {
+				;if +$$$FINAPPaymentInvoiceDiscount(pYFELD)'=+$$$FINAPInvoiceSettlementDiscount(objFINAPInvoice) {
+				if +$$$FCAmount($$$FINAPPaymentInvoiceDiscount(pYFELD))'=+$$$FCAmount($$$FINAPInvoiceSettlementDiscount(objFINAPInvoice)) { ; SR13912
+					set YBACKGROUNDCOLOR = "red"
+					set curAmount        = $$$FINAPInvoiceSettlementDiscount(objFINAPInvoice) ; SR13912
+					set YTOOLTIP         = $$$Text($listbuild("Fin00810",$$FormatCurrency^COMTable(+$$$FCAmount(curAmount),,$$$FCur(curAmount)))) ; SR13912
+				}  ; "Discount has been changed from '%1'."
+				
+				set strText = $$GetDiscAccountToolTip^FINAPPaymentInvoice2(idSupplier,idInvoice)
+				if ($get(YTOOLTIP)'="") {
+					if strText'="" set YTOOLTIP = YTOOLTIP_$$$CRLF_strText
+				} else {
+					set YTOOLTIP = strText
+				}
+			}
+		}
+	}
+	quit
+	
+	
+CreatePaymentInvoices(pidPay="",pidPayLine="",parrInvoices)
+	;-------------------------------------------------------------------------------
+	; Method Usage
+	;
+	; Returns:
+	; pidPay     - Suppliers Payment identifier
+	; pidPayLine - Suppliers Payment Line identifier
+	;
+	; History:
+	; 17-May-2006	Steve S		SR14648: Store credit index
+	; 13-Sep-2005	PO			SR12943: Allow payments to be broken up by department and only set InvoiceBalance if lines being created.
+	; 09-Aug-2005	Steve S		SR12830: Apply discount where applicable
+	; 20-Jun-2005	shobby		Preserve some details from existing FINAPInvoicePayments.  SR12632
+	; 02-Jun-2005	shobby		Removed YFELD in call to CheckForUnpostedSupplierPayments, not used and causes error when doing autopay. SR12245
+	; 01-Jun-2005	shobby		Don't include if already in an unpaid Payment. SR12245
+	; 29-May-2005	SCR			SR12220: Invoice Filter
+	; 11-Mar-2005	JW			SR11871: Reverted SR11731 change.
+	; 18-Feb-2005	JW			SR11731: Added check for Unallocated invoice.
+	; 08-Feb-2005	Shobby		'Notes' field.
+	;-------------------------------------------------------------------------------
+	new strStatus,idSupplier,idInvoice,dtePayment,intGraceDays
+	new objPayLine,objInvoice,objPayInvoice,objInvoiceTax
+	new curTotalTax,intInvoiceTax,dteNewDueDate
+	new blnPay,strLocation,strGroup,objPay,blnAlreadyExists ; Invoice Filter
+	
+	set strStatus=$$$OK
+	if pidPay="" set pidPay=" "
+	if pidPayLine="" set pidPayLine=" "
+	set objPayLine=$get(^FINAPPaymentLine(0,pidPay,pidPayLine,1))
+	
+	set objPay=$get(^FINAPPayment(0,pidPay,1))
+	set strLocation=$$$FINAPPaymentLocation(objPay)
+	set strGroup=$$$FINAPPaymentGroup1(objPay)
+	
+	;SR12830: Get payment Date
+	set dtePayment=$$$FINAPPaymentPaymentDate(objPay)
+	if dtePayment="" set dtePayment=+$horolog
+	
+	set idSupplier=$$$FINAPPaymentLineSupplierNumber(objPayLine)
+	set intGraceDays=$$GetGraceDays^FINAPSupplier(idSupplier)
+	set strStatus=$$RemoveUnusedInvoices(pidPay,pidPayLine,idSupplier)
+	
+	if idSupplier'="" {
+		set idInvoice=""
+		for {
+			set idInvoice = $order(parrInvoices(idInvoice)) ; SR12943
+			;set idInvoice=$order(^FINAPInvoice(0,idSupplier,idInvoice))
+			quit:idInvoice=""
+			;continue:idInvoice["Unallocated" ;SR11731
+			
+			set objInvoice = $get(parrInvoices(idInvoice)) ; SR12943
+			
+			;set objInvoice=$get(^FINAPInvoice(0,idSupplier,idInvoice,1))
+			if '$data(^FINAPPaymentInvoice(0,pidPay,pidPayLine,idInvoice)) {  ;if the invoice does not exist yet...
+				set objPayInvoice=""
+				set $$$FINAPPaymentInvoiceAmountOwing(objPayInvoice)=$$$FINAPInvoiceBalance(objInvoice)
+				set $$$FINAPPaymentInvoiceDueDate(objPayInvoice)=$$$FINAPInvoiceDueDate(objInvoice)
+				set dteNewDueDate=$$$FINAPPaymentInvoiceDueDate(objPayInvoice)+intGraceDays
+				if dteNewDueDate>=dtePayment { ;SR12830
+					set $$$FINAPPaymentInvoiceDiscountApplied(objPayInvoice)=$$$YES
+				}
+				set $$$FINAPPaymentInvoiceDiscount(objPayInvoice)=$$$FINAPInvoiceSettlementDiscount(objInvoice)
+				set blnAlreadyExists = $$$NO
+			
+			} else {
+				set objPayInvoice=$get(^FINAPPaymentInvoice(0,pidPay,pidPayLine,idInvoice,1))
+				set blnAlreadyExists = $$$YES
+			}
+			
+			set blnPay=$$$YES  ; Pay flag
+			if $$$FCZero($$$FINAPInvoiceBalance(objInvoice)) {
+				set blnPay=$$$NO 							; if the outstanding amount of the invoice <> 0
+			
+			} elseif (strLocation'="")&&(strLocation'=$$$FINAPInvoiceLocation(objInvoice)) {
+				set blnPay=$$$NO 	; Location Filter
+			
+			} elseif (strGroup'="")&&(strGroup'=$$$FINAPInvoiceDepartment(objInvoice)) {
+				set blnPay=$$$NO		; Group Filter
+			
+			} elseif $$CheckForUnposted(pidPay_","_pidPayLine_","_idInvoice) {
+				set blnPay=$$$NO
+			}
+			if blnPay=$$$YES {
+				if 'blnAlreadyExists set $$$FINAPPaymentInvoiceInvoiceBalance(objPayInvoice)=$$$FINAPInvoiceBalance(objInvoice)
+				set $$$FINAPPaymentInvoiceInvoiceDate(objPayInvoice)=$$$FINAPInvoiceInvoiceDate(objInvoice)
+				set $$$FINAPPaymentInvoiceOriginalInvoiceAmount(objPayInvoice)=$$$FINAPInvoiceOriginalInvoiceAmount(objInvoice)
+				
+				if $$$FINAPPaymentInvoiceAmountOwing(objPayInvoice)<0 { //SR14648
+					set $$$FINAPPaymentInvoiceCredit(objPayInvoice)=$$$YES	
+				}
+				
+				set strStatus = $$$Save("FINAPPaymentInvoice",pidPay_","_pidPayLine_","_idInvoice,objPayInvoice,$$$YES)
+			}
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	quit strStatus
+	
+	
+GetInvoices(pidSupplier,pblnAutoPay=$$$NO)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	; pidSupplier  - suppliers identifier
+	; parrInvoices - returns suppliers invoices (by reference)
+	;
+	; History:
+	; 30-Nov-2005	RPW		SR13933: Use CacheTempInvoices for all the invoices
+	; 							instead of passing the huge structure around.
+	; 24-Nov-2005	Steve S	SR13902: General code clean up, only one 'for' loop
+	; 24-Oct-2005	PO		SR12943: Only split by supplier if auto paying
+	; 23-Sep-2005	PO		SR12943: Corrected handling of manual payments
+	; 13-Sep-2005	PO		SR12943: Created
+	;-------------------------------------------------------------------------------
+	new idDepartment,objInvoice,idInvoice,blnSplit
+	
+	kill ^CacheTempInvoice(YUSER)
+ 
+	if (pidSupplier'="") {
+		set blnSplit=$$SplitSupPaysByDepartment^FINGeneralSetup()
+		set idInvoice = ""
+		for {
+			set idInvoice = $order(^FINAPInvoice(0,pidSupplier,idInvoice))
+			quit:idInvoice=""
+			
+			set objInvoice = $get(^FINAPInvoice(0,pidSupplier,idInvoice,1))
+			set idDepartment=""
+			
+			if pblnAutoPay && blnSplit {
+				set idDepartment = $$$FINAPInvoiceDepartment(objInvoice)
+			}
+			
+			//Using a character that is unlikely to be entered by the user
+			if idDepartment="" set idDepartment = "ÿ"
+			
+			set ^CacheTempInvoice(YUSER,idDepartment,idInvoice) = objInvoice
+		}
+	}
+	quit
+	
+	
+CheckForUnposted(YKEY="",pidSupplier="")
+	;-------------------------------------------------------------------------------
+	; Checks whether this invoice is already in an unposted supplier payment.
+	;
+	; Returns:
+	;
+	; History:
+	;  4-Aug-2005	JW		SR13106: Use better index. Filtering not required.
+	; 01-Aug-2005	PO		SR13106 Check that suppliers of the two invoices are the same
+	; 02-Jun-2005	shobby	Code Check.
+	; 02-Jun-2005	shobby	Removed YFELD, not used and causes error when doing autopay. SR12245
+	; 01-Jun-2005	shobby	Created SR12245
+	;-------------------------------------------------------------------------------
+	new idPaymentThis,idLineThis,idInvoiceThis,objFINAPPaymentLine,idPayment,idLine
+	new blnFound,idxSupplier
+	
+	set idPaymentThis =$piece(YKEY,$$$COMMA,1)
+	set idLineThis	  =$piece(YKEY,$$$COMMA,2)
+	set idInvoiceThis =$piece(YKEY,$$$COMMA,3)
+	
+	if pidSupplier = "" {
+		set objFINAPPaymentLine = $get(^FINAPPaymentLine(0,idPaymentThis,idLineThis,1))
+		set idxSupplier = $$$Index($$$FINAPPaymentLineSupplierNumber(objFINAPPaymentLine))
+	} else {
+		set idxSupplier = $$$Index(pidSupplier)
+	}
+	set blnFound=$$$NO
+ 	
+	set idPayment=""
+	for {
+		set idPayment=$order(^FINAPPaymentLines(0,50,idxSupplier,idPayment))
+		quit:idPayment=""
+		continue:$$$FINAPPaymentStatus($get(^FINAPPayment(0,idPayment,1)))'=$$$EnumFINSYSSTATUSUnposted
+		
+		set idLine=""
+		for {
+			set idLine=$order(^FINAPPaymentLines(0,50,idxSupplier,idPayment,idLine))
+			quit:idLine=""
+			
+			if (idPayment'=idPaymentThis)||(idLine'=idLineThis) {
+			
+				if $data(^FINAPPaymentInvoice(0,idPayment,idLine,idInvoiceThis,1)) {
+					set blnFound=$$$YES
+				}
+			}
+			quit:blnFound
+		}
+		quit:blnFound
+	}
+	quit blnFound
+	
+	
+RemoveUnusedInvoices(pidPay,pidPayLine,pidSupplier)
+	;-------------------------------------------------------------------------------
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Oct-2005	PO		SR13760: Introduced clearall.
+	; 20-Jun-2005	shobby	Replace WWWKILL with KILL^COMUtils (SR12632)
+	; 20-Jun-2005	shobby	Remove invoices that have been put on hold. (Created SR12632)
+	;-------------------------------------------------------------------------------
+	new strStatus,idPayInvoice,objFINAPInvoice
+	set strStatus=$$$OK
+	if (pidPay'="")&(pidPayLine'="") {
+		set idPayInvoice=""
+		for {
+			set idPayInvoice=$order(^FINAPPaymentInvoice(0,pidPay,pidPayLine,idPayInvoice))
+			quit:idPayInvoice=""
+			if pidSupplier="" set pidSupplier=" "
+			if '$data(^FINAPInvoice(0,pidSupplier,idPayInvoice)) {
+				do KILL^COMUtils("FINAPPaymentInvoice",pidPay_","_pidPayLine_","_idPayInvoice)
+			} else {
+				set objFINAPInvoice=$get(^FINAPInvoice(0,pidSupplier,idPayInvoice,1))
+				if $$$FINAPInvoiceOnHold(objFINAPInvoice) {
+					do KILL^COMUtils("FINAPPaymentInvoice",pidPay_","_pidPayLine_","_idPayInvoice)
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+AnyInvoicesToPay(pKey,plngType)
+	;-------------------------------------------------------------------------------
+	; Determine whether there are any invoices that can be assigned payments.
+	;
+	; History:
+	; 15-Jul-2005	RPW		SR12981: Moved ^FINAPPaymentLine calls to FINAPUtilities
+	; 16-Jun-2005	RPW		SR12056 All statuses are put through $$$Text once, we do
+	; 							not need to do them again
+	; 17-Jan-2005	PO		SR10916 Created
+	;-------------------------------------------------------------------------------
+	new idPay,idPayLine,objPay,objPayLine,objFINAPPaymentInvoice,idPayInvoice,dtePayDate
+	new intGraceDays,dteDueDate,idSupplier,objFINAPInvoice,strStatus,dtePayDueDate
+	new intLineStatus
+ 
+	if $piece(pKey,",",2)="" {
+		set strStatus=$$$Text("Fin00089")  ;No record selected
+	} else {
+		if plngType=0 {
+			set strStatus=$$$Text("Fin00582")  ;There are no overdue unpaid invoices.
+		} elseif plngType=1 {
+			set strStatus=$$$Text("Fin00583")  ;There are no due unpaid invoices.
+		} elseif plngType=2 {
+			set strStatus=$$$Text("Fin00584")  ;There are no unpaid invoices.
+		}
+	}
+ 
+	if $$GetKey^FINAPUtilities(pKey,.idPay,.idPayLine) {
+		set objPay=$get(^FINAPPayment(0,idPay,1))
+		set objPayLine=$get(^FINAPPaymentLine(0,idPay,idPayLine,1))
+		
+		set intLineStatus=$$$FINAPPaymentLineStatus(objPayLine)
+		
+		if intLineStatus=$$$EnumFINSYSSTATUSPosted {
+			set strStatus=$$$Text("Fin00365")  ;Record already posted.
+		} elseif intLineStatus=$$$EnumFINSYSSTATUSCancelled {
+			set strStatus=$$$Text("Fin00893")  ;Record has been cancelled.
+		} else {
+			set idSupplier=$$$FINAPPaymentLineSupplierNumber(objPayLine)
+			set intGraceDays=$$GetGraceDays^FINAPSupplier(idSupplier)
+			
+			set dtePayDate=$$$FINAPPaymentPaymentDate(objPay)
+			set dtePayDueDate=$$$FINAPPaymentDueDate(objPay)
+	 
+			set idPayInvoice=""
+			for {
+				set idPayInvoice=$order(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice))
+				quit:idPayInvoice=""
+				set objFINAPInvoice=$get(^FINAPInvoice(0,idSupplier,idPayInvoice,1))
+				set objFINAPPaymentInvoice=$get(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice,1))
+	 
+		 		; Check whether this invoice is able to be assigned a payment.
+				if '$$$FINAPInvoiceOnHold(objFINAPInvoice) {
+					set dteDueDate=$$$FINAPPaymentInvoiceDueDate(objFINAPPaymentInvoice)
+					if (dteDueDate+intGraceDays<dtePayDate)&(plngType=0)&($$$FINAPPaymentInvoiceInvoiceBalance(objFINAPPaymentInvoice)'=0) {
+						set strStatus=$$$OK
+					} elseif (dteDueDate'>dtePayDueDate)&(plngType=1)&($$$FINAPPaymentInvoiceInvoiceBalance(objFINAPPaymentInvoice)'=0) {
+						set strStatus=$$$OK
+					} elseif (plngType=2)&($$$FINAPPaymentInvoiceInvoiceBalance(objFINAPPaymentInvoice)'=0) {
+						set strStatus=$$$OK
+					}
+				}
+			}
+		}
+	}
+	 
+	if strStatus=$$$OK {
+		set YQ=0
+	} else {
+		set YQ="1 "_strStatus
+	}
+	
+	quit strStatus
+	
+	
+AutoPay(pKey,plngType,pblnNegatives=$$$YES)
+	;-------------------------------------------------------------------------------
+	; This method pays invoices according to whether they
+	; plngType can be 0 - Over due, 1 - Due, 2 - All
+	; 
+	; 17-May-2006	SteveS	SR14648: Use an index for adding credits/debits (avoids
+	; 							double-sweeping the entire global)  Updated doco,
+	; 							general cleanup (! => ||, & => &&, etc.)
+	; 24-Nov-2005	SteveS	SR13902: During auto pay, make negatives => zero.  Doco
+	; 22-Sep-2005	PO		SR13555: Always set prepayment to zero
+	; 15-Jul-2005	RPW		SR12981: Moved ^FINAPPaymentLine calls to FINAPUtilities
+	; 20-May-2005	MS		SR12399: Uncommented Redirect at end of tag, screen was not redisplaying
+	; 20-May-2005	JW		SR12309: Added Prepayment field.
+	; 31-May-2004	SCR		FC Upgrade
+	; 03-Dec-2003	shobby	Prevented AutoPay from creating negative payments.
+	; 							If credits exceed amounts owing then the payment is
+	; 							set to 0 and the rest sent to unallocated. Still
+	; 							need to process a 0 payment because discounts will
+	; 							be affected if the invoices aren't processed against
+	; 							the credits here. (TR006370)
+	; 02-Dec-2003	shobby	Exclude credits that have been put on hold (TR6516.3)
+	; 02-Dec-2003	shobby	Handle the case when previous overpayments are treated as credits (TR6516)
+	; 02-Dec-2003	shobby	Removed the discount from the Total calculation (TR6516)
+	; 10-Nov-2003	shobby	Rewritten the AutoPay procedure. TR006370
+	; 07-Nov-2003	shobby	Changed some calculations for the amount of money to be auto allocated.
+	; 08-Jul-2003	SCR		Corrected use of GetKey
+	;-------------------------------------------------------------------------------
+	new idPay,idPayLine,objPay,objPayLine,objFINAPPaymentInvoice,dtePayDate,dtePayDueDate,curAmount,idPayInvoice,blnAdd
+	new intGraceDays,dteDueDate,curAmountDiscount,curTotalPayments,curTotalDiscounts
+	new idSupplier,objFINAPInvoice,strIndex,blnCreditRun,strIndexVal,strStatus
+	
+	if $$GetKey^FINAPUtilities(pKey,.idPay,.idPayLine) {
+		set objPay				= $get(^FINAPPayment(0,idPay,1))
+		set objPayLine			= $get(^FINAPPaymentLine(0,idPay,idPayLine,1))
+		
+		set idSupplier			= $$$FINAPPaymentLineSupplierNumber(objPayLine)
+		set intGraceDays		= $$GetGraceDays^FINAPSupplier(idSupplier)
+		set dtePayDate			= $$$FINAPPaymentPaymentDate(objPay)
+		set dtePayDueDate		= $$$FINAPPaymentDueDate(objPay)
+		set curTotalPayments	= 0
+		set curTotalDiscounts	= 0
+		
+		; +++++++++++++++++++++++++++++++++++++++++++++++
+		; Add all the credit invoices to the auto pay,
+		; and only add debits if they are not negative.
+		; +++++++++++++++++++++++++++++++++++++++++++++++
+		
+		;for i=1:1:2 {
+		for strIndexVal=$$$YES,$$$ANINO { //SR14648
+			set blnCreditRun=$select(strIndexVal=$$$ANINO:$$$NO,1:$$$YES) //SR14648
+			set idPayInvoice=""
+			for {
+				set curAmount=0
+				//SR14648
+				;set idPayInvoice=$order(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice))
+				set idPayInvoice=$order(^FINAPPaymentInvoices(0,5,strIndexVal,idPay,idPayLine,idPayInvoice))
+				quit:(idPayInvoice="")
+				
+				set objFINAPInvoice=$get(^FINAPInvoice(0,idSupplier,idPayInvoice,1))
+				set objFINAPPaymentInvoice=$get(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice,1))
+		 
+		 		; Test whether to include this invoice.
+				set blnAdd=$$$NO
+				
+				if ('$$$FINAPInvoiceOnHold(objFINAPInvoice)) {
+					//SR14648
+					;if (($$$FINAPPaymentInvoiceAmountOwing(objFINAPPaymentInvoice)>=0)&(i=2)) {
+					if 'blnCreditRun {
+						set dteDueDate=$$$FINAPPaymentInvoiceDueDate(objFINAPPaymentInvoice)
+						if (dteDueDate+intGraceDays<dtePayDate)&&(plngType=0) {
+							set blnAdd=$$$YES
+						} elseif (dteDueDate<=dtePayDueDate)&&(plngType=1) {
+							set blnAdd=$$$YES
+						} elseif (plngType=2) {
+							set blnAdd=$$$YES
+						}
+					//SR14648
+					;} elseif (($$$FINAPPaymentInvoiceAmountOwing(objFINAPPaymentInvoice)<0)&(i=1)) {
+					} else { // is a credit, always add it
+						set blnAdd=$$$YES
+					}
+				}
+				
+				if blnAdd {
+					set curAmountDiscount=$$GetDiscount(idPay,idPayLine,idPayInvoice)
+					set curAmount=$$$FCAdd(curAmount,$$$FINAPPaymentInvoiceAmountOwing(objFINAPPaymentInvoice))
+					set curTotalPayments=$$$FCAdd(curTotalPayments,curAmount) ;TR6516
+					do PayInvoice(idPay,idPayLine,idPayInvoice,curAmount,curAmountDiscount)
+					set curTotalDiscounts=$$$FCSub(curTotalDiscounts,curAmountDiscount)
+				} else {
+					//SR14648
+					;if ((curAmount>=0)&(i=1))||((curAmount<0)&(i=2)) {
+					if ((curAmount>=0)&&(blnCreditRun))||((curAmount<0)&&('blnCreditRun)) {
+						do PayInvoice(idPay,idPayLine,idPayInvoice,0,0)
+					}
+				}
+			}
+		}
+		set curAmount=$$$FCAdd(curTotalPayments,curTotalDiscounts)
+		
+		if (curAmount<=0) && 'pblnNegatives { ;SR13902
+			set curAmount=0
+			set idPayInvoice=""
+			for {
+				set idPayInvoice=$order(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice))
+				quit:idPayInvoice=""
+				
+				set objFINAPPaymentInvoice = $get(^FINAPPaymentInvoice(0,idPay,idPayLine,idPayInvoice,1))
+				set $$$FINAPPaymentInvoicePay(objFINAPPaymentInvoice)       = $$$NO
+				set $$$FINAPPaymentInvoicePayAmount(objFINAPPaymentInvoice) = 0
+				
+				set strStatus = $$$Save("FINAPPaymentInvoice",idPay_","_idPayLine_","_idPayInvoice,objFINAPPaymentInvoice,$$$YES)
+			}	
+		}
+		
+		set $$$FINAPPaymentLineTotal(objPayLine)=curAmount
+		set $$$FINAPPaymentLinePrepayment(objPayLine)=0
+		set $$$FINAPPaymentLineAutoAllocate(objPayLine)=$$$YES
+		
+		set strStatus = $$$Save("FINAPPaymentLine",idPay_","_idPayLine,objPayLine,$$$YES)
+	}
+	
+	do RedirectForm^COMUtils(YFORM,YKEY,"FINAPPayment,",YPARA,YSEITE)  ;SR12399 uncommented this line of code.
+	quit
+	
+	
+PayInvoice(pidPay,pidPayLine,pidPayInvoice,pcurAmountToPay,pcurAmountDiscount)
+	;-------------------------------------------------------------------------------
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Feb-2005	JW		SR11687: Added Pay field
+	;-------------------------------------------------------------------------------
+	new objFINAPPaymentInvoice,curBalance,blnApplyDiscount
+	
+	set blnApplyDiscount=''pcurAmountDiscount
+	set objFINAPPaymentInvoice=$get(^FINAPPaymentInvoice(0,pidPay,pidPayLine,pidPayInvoice,1))
+	set $$$FINAPPaymentInvoiceDiscountApplied(objFINAPPaymentInvoice)=blnApplyDiscount
+	set $$$FINAPPaymentInvoicePayAmount(objFINAPPaymentInvoice)=pcurAmountToPay
+	set curBalance=$$$FCSub($$$FINAPPaymentInvoiceAmountOwing(objFINAPPaymentInvoice),$$$FINAPPaymentInvoicePayAmount(objFINAPPaymentInvoice))
+	set $$$FINAPPaymentInvoiceInvoiceBalance(objFINAPPaymentInvoice)=curBalance
+	set $$$FINAPPaymentInvoicePay(objFINAPPaymentInvoice) = (pcurAmountToPay'=0) ; SR11691
+	
+	do Save^FINSYS("FINAPPaymentInvoice",pidPay_","_pidPayLine_","_pidPayInvoice,objFINAPPaymentInvoice,1)
+	quit
+	
+	
+GetDiscount(pidPay,pidPayLine,pidInvoice)
+	;-------------------------------------------------------------------------------
+	;determine whether this settlement discount should be applied in for the payment date
+	;-------------------------------------------------------------------------------
+	new objPay,objPayInvoice,dtePayDate,dteDueDate,curDiscount,objPayLine
+	
+	set objPay        = $get(^FINAPPayment(0,pidPay,1))
+	set objPayLine    = $get(^FINAPPaymentLine(0,pidPay,pidPayLine,1))
+	set objPayInvoice = $get(^FINAPPaymentInvoice(0,pidPay,pidPayLine,pidInvoice,1))
+	
+	set dtePayDate  = $$$FINAPPaymentPaymentDate(objPay)
+	set dteDueDate  = $$$FINAPPaymentInvoiceDueDate(objPayInvoice)
+	set curDiscount = 0
+	if dtePayDate'>dteDueDate {
+		set curDiscount = $$$FINAPPaymentInvoiceDiscount(objPayInvoice)
+	
+	} elseif dtePayDate'>(dteDueDate+$$GetGraceDays^FINAPSupplier($$$FINAPPaymentLineSupplierNumber(objPayLine))) {
+		set curDiscount = $$$FINAPPaymentInvoiceDiscount(objPayInvoice)
+	
+	} else {
+		set curDiscount = 0
+	}
+ 
+	quit curDiscount
+	
+	
+GetPayMinusDiscount(pYFELD="")
+	;-------------------------------------------------------------------------------
+	; Gets the amount of the payment less any discount
+	;
+	; Returns: The Amount
+	;
+	; History:
+	; 23-Sep-2005		PO			SR13558: Do not include discounts for invoices that are not being paid
+	; 10-May-2005		JW			SR12309 - Use YFELD instead of YKEY
+	;  7-Feb-2005		JW			SR11505 - add checks
+	; 31-May-2004		SCR			FC Upgrade
+	; 03-May-2004   	shobby   	Replaced YKOMMA with ","
+	; 02-Dec-2003		shobby		Creation (TR6516)
+	;-------------------------------------------------------------------------------
+	new curAmount,objFINAPPaymentInvoice,idBankNumber,idBankLineNumber,idInvoiceNumber
+	
+	set curAmount=$$$FINAPPaymentInvoicePayAmount(pYFELD)
+	if $$$FINAPPaymentInvoiceDiscountApplied(pYFELD) && $$$FINAPPaymentInvoicePay(pYFELD) { 
+		set curAmount=$$$FCSub(curAmount,$$$FINAPPaymentInvoiceDiscount(pYFELD))
+	}
+	
+	quit curAmount
+	
+	
+OnBeforeDisplayLine(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Grid has requested information about whether to show this invoice or not
+	;
+	; Returns: $$$NO if invoice on hold, otherwise $$$YES
+	;
+	; History:
+	; 20-Oct-2005	PO		Changed YKOMMA to $$$COMMA
+	; 15-Feb-2005	Paul K	removed GHIGHLIGHT
+	; 16-Dec-2004	shobby	newed objFINAPInvoice (code check)
+	; 06-Dec-2004	JW		SR10541: Created
+	;-------------------------------------------------------------------------------
+	new blnFlag,idPayInvoice,idSupplier,objInvoice,objFINAPInvoice
+	
+	set blnFlag=$$$NO
+	
+	set idPayInvoice = $piece($get(pYKEY),$$$COMMA,3)
+	if ($get(idPayInvoice)'="") {
+		set idSupplier = ^mtemp(YUSER,"PaymentLine","Supplier")
+		if idSupplier'="" {
+			set objFINAPInvoice=$get(^FINAPInvoice(0,idSupplier,idPayInvoice,1))
+			
+			if (objFINAPInvoice'="") && '$$$FINAPInvoiceOnHold(objFINAPInvoice) {
+				set blnFlag=$$$YES
+			}
+		}
+	}
+	quit blnFlag
+	
+	
+OnBlur(pCOL="",pROW="",pYFELD="")
+	;-------------------------------------------------------------------------------
+	; Update line and header fields
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Nov-2005	PO		SR13912: Commented out exchange rate updates.
+	; 11-Oct-2005	Steve S	SR13192: Permit over/under payments
+	; 26-Sep-2005	PO		SR13558: Do not call UpdateHeaders
+	; 02-Jun-2005	PO		SR:12050 Make Pay Amount and Discount have the same conv rate as Amount Owing
+	; 18-May-2005	JW		SR12309: Removed validation
+	; 18-Mar-2005	JW		Updated Pay-Discount Field properly.
+	;  8-Feb-2005	JW		SR11687: Update 'Pay' checkbox. Added amount validation
+	; 20-Dec-2004	JW		SR11344: Update fields for all 3 columns.
+	; 14-Dec-2004	JW		SR10541: Created
+	;-------------------------------------------------------------------------------
+	new strStatus, fltConvRate
+	
+	if (pCOL=5) || (pCOL=12) { ; pay checkbox or pay amount field
+		; update balance
+		set $$$FINAPPaymentInvoiceInvoiceBalance(pYFELD) = $$$FCSub($$$FINAPPaymentInvoiceAmountOwing(pYFELD),$$$FINAPPaymentInvoicePayAmount(pYFELD))
+		if (pCOL=5) { ; Pay Amount
+			
+			; paying full amount -> check (SR11687)
+			; Permit over/under payments (SR13192)
+			set $$$FINAPPaymentInvoicePay(pYFELD) = (+$$$FINAPPaymentInvoicePayAmount(pYFELD)'=0)
+		}
+	}
+ 	
+	do UpdateManualField^COMGridEdit31Interface(pROW,10,$$GetPayMinusDiscount(pYFELD))
+	do UpdateHeaderField^COMGridEdit31Interface("D7",$$$NO) ; Auto Allocate
+ 
+	quit
+	
+	
+UpdateContainer(pidField="",pobjGrid,pstrHeadYFELD="",pstrHeadYMFELD="") 
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Sep-2005	JW			SR11573: Param is now class field not form col
+	; 26-Sep-2005	JW & PO		SR13558: Created
+	;-------------------------------------------------------------------------------
+	if (pidField="") {
+		do PopulateFields^FINAPPaymentLine("",pstrHeadYFELD,pstrHeadYMFELD)
+	} elseif (pidField=3) || (pidField=5) || (pidField=8) || (pidField=11) {
+		do PopulateFields^FINAPPaymentLine($$$FldFINAPPaymentLinePrepayment,pstrHeadYFELD,pstrHeadYMFELD)
+	}
+	
+	quit
+	
+	
+OnClick(pCol="",pDATA="",pblnShift=$$$NO,pblnCtrl)
+	;-------------------------------------------------------------------------------
+	; Update the Pay Amount value if Pay checkbox clicked.
+	;
+	; Returns: nil
+	;
+	; History:
+	; 02-Sep-2009	shobby	SRAdhoc: pblnCtrl parameter
+	; 08-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	if (pCol=12) { ; Pay checkbox
+		if $$$FINAPPaymentInvoicePay(pDATA) {
+			set $$$FINAPPaymen]]><![CDATA[tInvoicePayAmount(pDATA) = $$$FINAPPaymentInvoiceAmountOwing(pDATA)
+		} else {
+			set $$$FINAPPaymentInvoicePayAmount(pDATA) = 0
+		}
+	}
+	
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,891 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARPedidoCompra" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARPedidoCompra
+	#include COMSYS
+	#include COMConst
+	#include VARConst
+	#include INConst
+	#include VARErros
+	#import VAR.infra.integracao
+	quit
+
+OnAfterDataFields(pYKEY,pYFELD,pYSEITE)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnAfterDataFields do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	do OnAfterPrimaryKey(pYKEY)
+	
+	do OnAfterDataFields^VARPedidoCompraLinha(YKEY,YFELD,YSEITE)
+	
+	if ($get(YSEITE)=1) { do LoadGrid^VARPedidoCompraLinha(pYKEY)
+						  do LoadTableCompras(pYKEY)					  }		;Principal
+	
+	if ($get(YSEITE)=2) { do ListarEntregas^VARPedidoCompraEntrega(pYKEY) }		;Entregas
+	if ($get(YSEITE)=4) { do LoadGridHistAlt(pYKEY) }							;Histórico
+	if ($get(YSEITE)=5) { do LoadGridPaciente^VARPedidoCompraPaciente(pYKEY) }  ;Paciente
+	
+	set YVOR = $get(^WWW120(0,YFORM,1))
+	
+	do PrintJS(YVOR)
+	do PrintJS^VARPedidoCompraLinha(YVOR)
+	
+	quit
+
+GetNaturezaEntrada(pidPedidoCompra)
+	quit:(pidPedidoCompra = "") ""
+	set objPedidoCompra	= $get(^VARPedidoCompra(YM,pidPedidoCompra,1))
+	quit $$$VARPedidoCompraFontedeNatureza(objPedidoCompra)
+
+	
+OnAfterPrimaryKey(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Atualiza os campos CMM e Estoque, se o pedido de compra estiver em aberto.
+    ;
+    ; Chamado por:
+    ;	Campo OnAfterPrimaryKey do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new statusPedidoCompra, idLinha, objLinha, idProduto
+	
+	set statusPedidoCompra = $$getStatusPedidoCompra(pYKEY)	
+	quit:(statusPedidoCompra '= 0) ;0 = Em Aberto
+	
+	$$$Order3(^VARPedidoCompraLinha,YM,pYKEY,idLinha)
+		set objLinha  = $G(^VARPedidoCompraLinha(YM,pYKEY,idLinha,1))
+		set idProduto = $piece(objLinha,Y,1)
+		set $piece(^VARPedidoCompraLinha(YM,pYKEY,idLinha,1),Y,5) = $$GetCMMRede^VARAlertaLinha(idProduto)			;CMM para a empresa
+		set $piece(^VARPedidoCompraLinha(YM,pYKEY,idLinha,1),Y,6) = $$GetEstoqueDisponivel^VARReposicao(idProduto, YLOCATION)   	;Estoque para a empresa
+	$$$End
+ 
+	quit
+	
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnBeforeSave do form VARPedidoCompra
+    ; 
+    ; Histórico:
+    ; 	05-Out-2010		Updated
+    ;	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new strStatus, idPedidoCompra, noProcesso, noProcessoAtual, objCompra
+	
+	set strStatus = $$$OK
+	set objCompra = ""
+	
+	if (pYKEY '= ""){
+		set objCompra = $get(^VARPedidoCompra(YM,pYKEY,1))
+		
+		if ( ($$$VARPedidoCompraStatus(objCompra) = 1) && (objCompra '= "") ){
+			$$$Alert("Este registro já foi processado.")
+			set Q=$$$QDontSave
+			quit
+		}
+	}
+	
+	//Caso não permita o mesmo processo em mais de um pedido
+	if ($$getPermiteProcessoMultiplosPedidos^VARParametroCliente '= $$$YES) {
+		
+		set noProcessoAtual = $piece(pYFELD,Y,5)		
+		if (noProcessoAtual '= "") {
+				
+			$$$Order2(^VARPedidoCompra,YM,idPedidoCompra)
+			
+				continue:(idPedidoCompra = pYKEY)
+			
+				set noProcesso = $$getNoProcesso(idPedidoCompra)
+							
+				if (noProcesso = noProcessoAtual) {
+					set strStatus = "Já existe um pedido de compra cadastrado com o processo "_noProcessoAtual_". O número do pedido de compra é o "_idPedidoCompra_"."
+					quit
+				}
+		
+			$$$End
+		}		
+	}
+	
+	if $$$ISOK(strStatus) {
+		do OnBeforeSave^VARPedidoCompraLinha(YKEY,YFELD)
+	
+	} else {		
+		set Q=$$$QDontSave
+		do ReturnError^COMUtilError(strStatus)	
+	}	
+	
+	quit
+	
+OnAfterSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnAfterSave do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new entregaPadrao
+	set entregaPadrao = $piece(YFELD,Y,12)
+
+	; Se a entrega é 0-Conforme Solicitação, não deve ter definição de entregas	
+	quit:(entregaPadrao = 0)
+	
+	; Se não tiver linha no pedido, não cria as entregas ainda
+	quit:('$data(^VARPedidoCompraLinha(YM,pYKEY)))	
+	
+	if ($get(entregaPadrao) '= "") {
+		do CriaEntregasPadrao^VARPedidoCompraEntrega(pYKEY,pYFELD)
+	}
+	quit
+	
+OnBeforeEditAcessHook(objPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Deixa o formulário somente leitura caso o pedido de compra não esteja em aberto.
+    ;	Se estiver no form VARPedidoCompraProcesso, o usuário pode editar.
+    ;
+    ; Chamado por:
+    ;	Hook OnBeforeEditAccess da classe VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	if ( ($$$VARPedidoCompraStatus(objPedidoCompra) > 0) && (YFORM '= "VARPedidoCompraProcesso") ){
+		quit $$$NO
+	}
+		
+	quit $$$YES
+	
+OnAfterSaveHook(pYKEY, pYFELD, pYFELDOLD)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Registra o histórico de alterações no pedido de compra.
+    ;
+    ; Chamado por:
+    ;	Hook OnAfterSave da classe VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	
+	if ($length($get(pYFELDOLD)) = 0) && ($length($get(pYFELD)) > 0) {
+		do RegistrarAlteracao^VARPedidoCompraHistorico(YKEY, 1,0,"","")  //1 = #define HistAlterCriar 1
+	}
+	
+	quit $$$OK
+	
+OnBeforeDelete(pidPedidoCompra)
+	;-------------------------------------------------------------------------------
+	; Descrição:
+	;	Antes de deletar o registro pai, deleta as linhas e as tabelas filhas para que
+	;	não hajam registros órfãos nestas.
+	;
+	; Chamado por:
+	;	Campo OnBeforeDelete do form VARPedidoCompra.
+	; 
+	; Histórico:
+	; 	05-Jul-2010		Criado
+	;-------------------------------------------------------------------------------	
+	new strStatus		
+	set strStatus = $$$OK
+	set strStatus = $$Transaction^COMTransaction("OnBeforeDeleteTxn^VARPedidoCompra("""_pidPedidoCompra_""")",$$$YES)
+ 
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontDelete
+		do ReturnError^COMUtilError(strStatus)
+	}
+ 
+	quit strStatus
+	
+OnBeforeDeleteTxn(pidPedidoCompra)	
+	;-------------------------------------------------------------------------------
+	; Chamado por:
+	;	Função OnBeforeDelete^VARPedidoCompra.mac
+	; 
+	; Histórico:
+	; 	05-Jul-2010		Criado
+	;-------------------------------------------------------------------------------	
+	new idPedidoCompraLinha, idPedidoCompraEntrega, idPedidoCompraEntregaLinha, idPedidoCompraHistorico,
+		idPedidoCompraPaciente
+ 
+	//Deletando as linhas do pedido de compra
+	$$$Order3(^VARPedidoCompraLinha,YM,pidPedidoCompra,idPedidoCompraLinha)
+		set strStatus = $$$Kill("VARPedidoCompraLinha",pidPedidoCompra_$$$COMMA_idPedidoCompraLinha)
+		quit:($$$ISERR(strStatus))		
+	$$$End
+	
+	if $$$ISOK(strStatus) {
+		//Deletando as entregas programadas do pedido
+		$$$Order3(^VARPedidoCompraEntrega,YM,pidPedidoCompra,idPedidoCompraEntrega)
+			set strStatus = $$$Kill("VARPedidoCompraEntrega",pidPedidoCompra_$$$COMMA_idPedidoCompraEntrega)
+			quit:($$$ISERR(strStatus))
+		$$$End
+	}
+	
+	if $$$ISOK(strStatus) {
+		//Deletando as linhas das entregas programadas do pedido
+		$$$Order3(^VARPedidoCompraEntregaLinha,YM,pidPedidoCompra,idPedidoCompraEntrega)
+			$$$Order4(^VARPedidoCompraEntregaLinha,YM,pidPedidoCompra,idPedidoCompraEntrega,idPedidoCompraEntregaLinha)
+				set strStatus = $$$Kill("VARPedidoCompraEntregaLinha",pidPedidoCompra_$$$COMMA_idPedidoCompraEntrega_$$$COMMA_idPedidoCompraEntregaLinha)
+				quit:($$$ISERR(strStatus))
+			$$$End
+		$$$End
+	}
+	
+	if $$$ISOK(strStatus) {
+		//Deletando o histórico do pedido
+		$$$Order3(^VARPedidoCompraHistorico,YM,pidPedidoCompra,idPedidoCompraHistorico)
+			set strStatus = $$$Kill("VARPedidoCompraHistorico",pidPedidoCompra_$$$COMMA_idPedidoCompraHistorico)
+			quit:($$$ISERR(strStatus))
+		$$$End
+	}
+	
+	if $$$ISOK(strStatus) {
+		//Deletando os pacientes do pedido (só em caso judicial)
+		$$$Order3(^VARPedidoCompraPaciente,YM,pidPedidoCompra,idPedidoCompraPaciente)
+			set strStatus = $$$Kill("VARPedidoCompraPaciente",pidPedidoCompra_$$$COMMA_idPedidoCompraPaciente)
+			quit:($$$ISERR(strStatus))
+		$$$End
+	}
+	
+	quit strStatus
+	
+CanViewReport(pidPedidoCompra,pobjPedidoCompra)	
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Botão (3)-Relatório do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	set YQ = $$$YQEnable
+	if (($$$VARPedidoCompraStatus(pobjPedidoCompra) '= 1) && ($$$VARPedidoCompraStatus(pobjPedidoCompra) '= 3)) {
+		set YQ = 1_"O relatório só fica disponível após a solicitação ter sido processada."	
+	}
+
+	quit
+	
+CanEditarEntregas(pYFELD)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Botão (2)-Entregas do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new idModeloEntrega
+	set YQ = $$$YQEnable
+	
+ 	if YKEY = "" {
+	 	set YQ = 1_"O pedido de compra não foi salvo."
+	 	quit
+ 	}
+ 	
+ 	set idModeloEntrega = $piece(pYFELD,Y,12)
+ 	if ($get(idModeloEntrega) '= "") {
+ 	 	set YQ = 1_"Uma entrega padrão foi escolhida. Não é possível editar as entregas."
+	 	quit
+	}
+	
+	quit
+	
+CanRevisarDoc(idPedidoCompra,objPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Botão (4)-Revisar Pedido de Compra do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	30-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+ 	do IsApenasProcessado(idPedidoCompra,objPedidoCompra,1,0)
+ 	quit
+ 	
+CanArquivarDoc(idPedidoCompra,objPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Botão (5)-Arquivar Pedido de Compra do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	01-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+ 	do IsApenasProcessado(idPedidoCompra,objPedidoCompra,0,1)
+	quit
+
+CanProcess(pidPedidoCompra,pobjPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Botão (1)-Processar do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new idPedidoCompraLinha, objCompraLinha, idItem, fltQty
+	quit:(pidPedidoCompra = "")
+	
+	set YQ = $$$YQEnable
+	
+	// Verifica o status do pedido de compra
+	if ($$$VARPedidoCompraStatus(pobjPedidoCompra) = 1) {
+		set YQ = 1_"O pedido de compra já foi processado."
+		quit	
+	}
+	elseif ($$$VARPedidoCompraStatus(pobjPedidoCompra) = 2) {
+		set YQ = 1_"O pedido de compra foi cancelado e não pode ser processado."
+		quit
+	}
+	elseif ($$$VARPedidoCompraStatus(pobjPedidoCompra) = 3) {
+		set YQ = 1_"O pedido de compra foi arquivado e não pode ser processado."
+		quit
+	}
+	
+	// Verifica se o pedido possui linhas	
+	if ($data(^VARPedidoCompraLinha(YM,pidPedidoCompra)) = 0) {
+		set YQ = 1_"Não foi inserido nenhum produto no pedido de compra. Favor verificar."
+		quit
+	}
+
+	// Verifica as linhas do pedido	
+	$$$Order3(^VARPedidoCompraLinha,YM,pidPedidoCompra,idPedidoCompraLinha)			
+		set objCompraLinha = $get(^VARPedidoCompraLinha(YM,pidPedidoCompra,idPedidoCompraLinha,1))
+	
+		set idItem = $piece(objCompraLinha,Y,1)
+		set fltQty = $piece(objCompraLinha,Y,4)
+		
+		if (idItem = "") {
+			set YQ = 1_"Toda linha requer um produto. Favor verificar a linha "_idPedidoCompraLinha_"."
+			quit
+		}
+		
+		if (fltQty = "") || (fltQty <= 0) {
+			set YQ = 1_"Toda linha requer uma quantidade. Favor verificar a linha "_idPedidoCompraLinha_"."
+			quit
+		}
+	$$$End
+	
+	quit
+
+Process(pidPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Botão (1)-Processar do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new strStatus, listaStatusEntregas, idPedidoCompraLinha, errMsg, errMsgLinhas
+	set strStatus = $$$OK
+
+	set strStatus = $$EntregasValidas^VARPedidoCompraEntrega(pidPedidoCompra,.listaStatusEntregas)
+
+	if $$$ISERR(strStatus) {
+		set idPedidoCompraLinha = ""
+		set errMsg = $piece(strStatus,Y,2)
+		set:($get(errMsg) = "") errMsg = "Erro na validação das entregas."
+		set errMsgLinhas = ""
+		
+		for {
+			set idPedidoCompraLinha = $order(listaStatusEntregas(idPedidoCompraLinha))
+			quit:(idPedidoCompraLinha = "")
+			if (listaStatusEntregas(idPedidoCompraLinha) '= $$$OK) {
+				set:($get(errMsgLinhas) = "") errMsgLinhas = "Situação das entregas para cada linha da PAM:"
+				set errMsgLinhas = errMsgLinhas_$char(10)_idPedidoCompraLinha_": "_$piece(listaStatusEntregas(idPedidoCompraLinha),Y,2)
+			}
+		}
+		
+		set:($get(errMsgLinhas) '= "") errMsg = errMsg_$char(10)_errMsgLinhas
+		do AlertInScript^COMConst(errMsg)
+		do GoToForm^COMUtilForm("VARPedidoCompra", pidPedidoCompra)	
+		quit
+	}
+ 	
+	set strStatus = $$Transaction^COMTransaction("ProcessTxn^VARPedidoCompra("""_pidPedidoCompra_""")", $$$YES)
+	
+	do GoToForm^COMUtilForm("VARPedidoCompra",pidPedidoCompra)
+	
+	quit	
+	
+ProcessTxn(pidPedidoCompra)	
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Process^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new objPedidoCompra
+	set objPedidoCompra = $get(^VARPedidoCompra(0,pidPedidoCompra,1))
+	
+	do CanProcess(pidPedidoCompra,objPedidoCompra)
+	if YQ '= $$$YQEnable {
+		set strStatus = YQ
+	}
+
+	if $$$ISOK(strStatus) {
+		set $$$VARPedidoCompraStatus(objPedidoCompra) = 1
+		set $$$VARPedidoCompraDatadeEmissao(objPedidoCompra) = $horolog
+
+		set strStatus = $$$Save("VARPedidoCompra",pidPedidoCompra,objPedidoCompra,1)
+	}
+	
+	if $$$ISERR(strStatus) {
+		set $zerror = "Erro ao processar o pedido. => "_$$DecodeError^COMUtilError(strStatus)
+		zquit 1 GOTO @$ZTRAP
+	}
+	else {
+		if ($length($$$VARPedidoCompraNDocIntegrado(objPedidoCompra)) = 0) {
+			do ##class(GerenciaFilaPendencias).RegistraEvento(
+				##class(GerenciaFilaPendencias).%GetParameter("ENTIDADEPEDIDOCOMPRA"),
+				pidPedidoCompra,
+				##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+				##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+				##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+				##class(GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+				##class(GerenciaFilaPendencias).%GetParameter("ACAOPROCESSAR"))
+		}
+
+		do RegistrarAlteracao^VARPedidoCompraHistorico(YKEY, 2,0,"","") //2 = #define HistAlterProcessar 2
+	}
+	
+	quit strStatus
+
+
+RevisarDocOnClickJS(idPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função PrintJS^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	30-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new objPedidoCompra, strStatus
+ 
+	if ($length($get(idPedidoCompra)) = 0) {
+		set objPedidoCompra = ""
+	} else {
+		set objPedidoCompra = $get(^VARPedidoCompra(0, idPedidoCompra, 1))
+	}
+	
+	set YQ = $$$YQEnable	
+	do CanRevisarDoc(idPedidoCompra, objPedidoCompra)
+	
+	if ($extract(YQ, 1, 1) '= $$$YQEnable) {
+		&js<
+		    alert('#($piece(YQ,"1",2))#');
+		>
+		quit
+	}
+ 
+	set strStatus = $$Transaction^COMTransaction("RevisarDoc^VARPedidoCompra("""_idPedidoCompra_""")", $$$YES)
+	
+	if $$$ISOK(strStatus) {
+		do GoToForm^COMUtilForm(YFORM,idPedidoCompra,1,$get(YPARA),$$$NO)
+	}
+	else {
+		$$$StartScript()
+		write "alert('Erro ao revisar o pedido de compra. => "_$$DecodeError^COMUtilError(strStatus)_"');"
+		$$$EndScript()
+	}
+	
+	quit
+	
+RevisarDoc(idPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função Javascript OnClick do Botão (4)-Revisar Pedido de Compra do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	30-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new objPedidoCompra, strStatus
+ 
+	set objPedidoCompra = $get(^VARPedidoCompra(YM, idPedidoCompra, 1))
+	set $$$VARPedidoCompraStatus(objPedidoCompra) = 0	
+	set $$$VARPedidoCompraDatadeEmissao(objPedidoCompra) = ""
+
+	set strStatus = $$$Save("VARPedidoCompra",idPedidoCompra,objPedidoCompra,1)
+	
+	if $$$ISERR(strStatus) {
+		set $zerror = "Erro ao revisar o pedido de compra. => "_$$DecodeError^COMUtilError(strStatus)
+		zquit 1 GOTO @$ZTRAP
+	}
+	else {
+		do RegistrarAlteracao^VARPedidoCompraHistorico(idPedidoCompra,4,0,"","") //4 = #define HistAlterRevisar 4
+	}
+	quit $$$OK
+	
+ArquivarDocOnClickJS(idPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função PrintJS^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	01-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new objPedidoCompra
+ 
+	if ($length($get(idPedidoCompra)) = 0) {
+		set objPedidoCompra = ""
+	}
+	else {
+		set objPedidoCompra = $get(^VARPedidoCompra(0,idPedidoCompra,1))
+	}
+	set YQ = 0
+	do CanArquivarDoc(idPedidoCompra, objPedidoCompra)
+	if ($extract(YQ, 1, 1) '= $$$YQEnable) {
+		&js<
+		    alert('#($piece(YQ, "1", 2))#');
+		>
+		quit
+	}
+ 
+	&js<
+	    var motivo = iePrompt('Favor inserir o motivo do arquivamento do pedido de compra:');
+		if (motivo) {
+			CallBackNow("ArquivarDocOnClick^VARPedidoCompra", '#(idPedidoCompra)#', motivo);
+		}
+	> 
+	quit
+
+ArquivarDocOnClick(idPedidoCompra,strMotivoArquivamento)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função ArquivarDocOnClickJS^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	01-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new objPedidoCompra,strMotivoArquivamentoFormatado,i,strStatus,YSEITE
+	
+	set objPedidoCompra = $$GetFormData^COMUtilForm(YFORM)
+	quit:($$$VARPedidoCompraStatus(objPedidoCompra) '= 1)
+ 
+	if ($length(strMotivoArquivamento) = 0) {
+		$$$StartScript()
+		write "alert('Favor inserir o motivo do arquivamento do pedido de compra.');"
+		$$$EndScript()
+	}
+	else {
+		if ($length(strMotivoArquivamento, """") = 1) {
+			set strMotivoArquivamentoFormatado = strMotivoArquivamento
+		}
+		else {
+			set strMotivoArquivamentoFormatado = ""
+			for i = 1:1:$length(strMotivoArquivamento, """") {
+				set strMotivoArquivamentoFormatado = strMotivoArquivamentoFormatado_
+					$piece(strMotivoArquivamento, """", i)_""""""
+			}
+		}
+ 
+		set strStatus = $$Transaction^COMTransaction("ArquivarDoc^VARPedidoCompra("""_idPedidoCompra_""","""_strMotivoArquivamentoFormatado_""")", $$$YES)
+		if $$$ISOK(strStatus) {
+			$$$StartScript()
+			write "alert('Pedido de compra arquivado com sucesso!');"
+			$$$EndScript()
+ 
+			set YSEITE = 3
+			do GoToForm^COMUtilForm(YFORM, idPedidoCompra, 4, $get(YPARA), $$$NO)
+		}
+		else {
+			$$$StartScript()
+			write "alert('Erro ao arquivar o pedido de compra. => "_$$DecodeError^COMUtilError(strStatus)_"');"
+			$$$EndScript()
+		}
+	}
+	quit ""
+	
+ArquivarDoc(pidPedidoCompra,pstrMotivoArquivamento)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função ArquivarDocOnClick^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	01-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new blnCancelar, idPedidoCompraLinha, strStatus, objPedidoCompra
+ 
+	set blnCancelar = $$$YES
+	$$$Order3(^VARPedidoCompraLinha,YM,pidPedidoCompra,idPedidoCompraLinha)
+	
+		if ($$GetQuantidadeAtendida^VARPedidoCompraLinha(pidPedidoCompra, idPedidoCompraLinha) > 0) {
+			set blnCancelar = $$$NO
+			quit
+		}
+ 
+	$$$End
+ 
+	$$$Order3(^VARPedidoCompraLinha,YM,pidPedidoCompra,idPedidoCompraLinha)
+	
+		set strStatus = $$ArquivarIndividual^VARPedidoCompraLinha(pidPedidoCompra,idPedidoCompraLinha,1,blnCancelar,0)
+		if $$$ISERR(strStatus) {
+			set $zerror = "Erro ao arquivar linha do pedido de compra. => "_$$DecodeError^COMUtilError(strStatus)
+			zquit 1 GOTO @$ZTRAP
+		}
+ 
+	$$$End
+ 
+	set objPedidoCompra = $get(^VARPedidoCompra(YM,pidPedidoCompra,1))
+	if (blnCancelar) {
+		set $$$VARPedidoCompraStatus(objPedidoCompra) = 3
+	}
+	
+	set strStatus = $$$Save("VARPedidoCompra",pidPedidoCompra,objPedidoCompra,1)
+	if $$$ISERR(strStatus) {
+		set $zerror = "Erro ao arquivar o pedido de compra. => "_$$DecodeError^COMUtilError(strStatus)
+		zquit 1 GOTO @$ZTRAP
+	}
+	else {
+		do RegistrarAlteracao^VARPedidoCompraHistorico(pidPedidoCompra,3,0,"",pstrMotivoArquivamento) //3 = #define HistAlterArquivar  3
+	}
+	quit $$$OK	
+
+IsApenasProcessado(idPedidoCompra, objPedidoCompra, blnRevisar, blnArquivar)
+	;-------------------------------------------------------------------------------
+	; Descrição:
+	;	Verifica se o pedido de compra pode ser revisado ou arquivado.
+	;	Um pedido só pode ser revisado caso não exista nenhuma ordem de compra para ele.
+	;
+    ; Chamado por:
+    ;	Função CanRevisarDoc^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	30-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new objPedidoCompraLinha, idPedidoCompraLinha, disableArquivar
+ 
+ 	set YQ = $$$YQEnable
+ 	 	
+	if ($$$VARPedidoCompraStatus(objPedidoCompra) = 3) {
+		set YQ = 1_"Esse pedido de compra já está arquivado. Favor verificar."
+	
+	} elseif (($length(idPedidoCompra) = 0) || ($$$VARPedidoCompraStatus(objPedidoCompra) '= 1)) {
+		set YQ = 1_"Esse pedido de compra ainda não foi processado. Favor verificar."
+
+	} elseif $data(^INAUFs(YM,100,$$$Index(idPedidoCompra))) && (blnRevisar) {
+			set YQ = 1_"Esse pedido de compra já possui uma ou mais ordens de compra. Não é possível revisá-lo."
+	
+	} else {
+		
+		if (blnRevisar) {		
+			$$$Order3(^VARPedidoCompraLinha,YM,idPedidoCompra,idPedidoCompraLinha)
+				set objPedidoCompraLinha = $get(^VARPedidoCompraLinha(YM,idPedidoCompra,idPedidoCompraLinha,1))
+				if ($$$VARPedidoCompraLinhaQuantidadeArquivada(objPedidoCompraLinha) > 0) {				
+					set YQ = 1_"Esse pedido de compra possui um ou mais produtos com saldo arquivado. Não é possível revisá-lo."
+					quit					
+				}
+			$$$End
+		
+		} elseif (blnArquivar) {			
+			set disableArquivar = $$$YES			
+			$$$Order3(^VARPedidoCompraLinha,YM,idPedidoCompra,idPedidoCompraLinha)				
+				if ($$GetQuantidadeAAtender^VARPedidoCompraLinha(idPedidoCompra,idPedidoCompraLinha) > 0) {
+					set disableArquivar = $$$NO
+					quit
+				}
+				
+			$$$End			
+			if disableArquivar = $$$YES {
+				set YQ = 1_"Não existem saldos pendentes no pedido de compra para serem arquivados."
+			}
+		}
+	}
+	
+	quit
+
+getNoProcesso(pidPedidoCompra)
+	quit:(pidPedidoCompra = "") ""
+	 
+	$$$VAR
+	new noProcesso
+	if pidPedidoCompra '= "" 
+	set noProcesso = $piece($get(^VARPedidoCompra(YM,pidPedidoCompra,1)),Y,5)
+	quit noProcesso
+
+getStatusPedidoCompra(pidPedidoCompra)
+	new statusPedido	
+	set statusPedido = $piece($get(^VARPedidoCompra(YM,pidPedidoCompra,1)),Y,6)
+	quit statusPedido
+
+getTipoPedido(pidPedidoCompra)
+	quit:(pidPedidoCompra = "") ""
+	
+	new tipoPedido	
+	set tipoPedido = $piece($get(^VARPedidoCompra(YM,pidPedidoCompra,1)),Y,1)
+	quit tipoPedido	
+
+getDescEntrega(pobjPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Regra core do campo (13)-Descrição da Entrega do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	25-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new descEntrega, descEntPadrao, idEntregaModelo, primEntDiasUteis, primEntPodeSerAnt
+	
+	set descEntrega = ""
+	
+	quit:( $get(pobjPedidoCompra) = "" ) ""
+	
+	set idEntregaModelo = $piece(pobjPedidoCompra,Y,12)
+	
+	set descEntPadrao = $$getDescricao^VARCompraEntregaModelo(idEntregaModelo)
+	
+	if ( $get(descEntPadrao) '= "" ) {
+		set descEntrega = descEntPadrao
+	}
+	else {
+		set descEntrega = "Veja entregas personalizadas item a item."
+	}
+	
+	quit descEntrega
+	
+LoadGridHistAlt(pid="")
+	new YFORM,YKEY,YAUSWAHL,YFELD
+	
+	set YFORM = "VARPedidoCompraHistorico"
+	set YFELD = ""
+	set YKEY  = $get(pid)
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)	= 1
+	set $$$COMGridEditParameterGridName(YAUSWAHL)	= YFORM
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)	= 0
+	set $$$COMGridEditParameterContainer(YAUSWAHL)	= "VARPedidoCompra"
+	
+	do ^COMGridEdit31	
+	quit
+	
+PrintJS(pobjForm)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Função OnAfterDataFields^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	30-Jun-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new idClass, strP1Name
+ 
+	set idClass = $$$WWW120ClassUsedInForm(pobjForm)
+	set strP1Name = "Y"_idClass_"P1"
+	
+	write !, "<script language=""javascript"">"
+	&js<
+	var idPedidoCompra = document.#(YHTMFORM)#.#(strP1Name)#.value;
+ 
+	function iePrompt(message) {
+		var settings = "dialogWidth: 420px; dialogHeight: 200px; center: yes; " +
+			"edge: raised; scroll: no; status: no";		
+		return window.showModalDialog("#(YGIF)#VARPromptSize.html", message,settings);
+	}
+	
+	function revisarDoc() {
+		CallBackNow("RevisarDocOnClickJS^VARPedidoCompra", idPedidoCompra);
+	}
+ 	
+	function arquivarDoc() {
+		CallBackNow("ArquivarDocOnClickJS^VARPedidoCompra", idPedidoCompra);
+	}
+	>
+	write !, "</script>"
+	quit
+	
+	
+LoadTableCompras(pidPedidoCompra)	
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Lista as ordens de compra criadas para o pedido de compra.
+    ;
+    ; Chamado por:
+    ;	Função OnAfterDataFields^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:($$getStatusPedidoCompra(pidPedidoCompra) '= 1)
+	
+	new lstHeader, idCompra, count, objCompra, dteEmissao, idFornecedor, descFornecedor, dteEmissao, empenho
+	
+	set lstHeader = ""
+	;set lstHeader = lstHeader_$listbuild("Seq.","Ordem de Fornecimento","Data de Emissão","Empenho","Fornecedor")
+	set lstHeader = lstHeader_$listbuild("Seq.","Ordem de Compra","Data de Emissão","Fornecedor")
+	set count = 0
+	
+	if $$Start^COMTable(lstHeader,"Ordens de Compra criadas para o Pedido de Compra",,,$$$NO) {
+	
+		$$$Order4(^INAUFs,YM,100,$$$Index(pidPedidoCompra),idCompra)
+		
+			set count = $i(count)
+		
+			set objCompra = $get(^INAUF(YM,idCompra,1))
+		
+			set dteEmissao = $$$INAUFOrderDate(objCompra)
+			if dteEmissao '= "" set dteEmissao = $zdate(dteEmissao,4)
+			if dteEmissao = "" set dteEmissao = "<font color=red>Em aberto</font>"
+		
+			set empenho = $$$INAUFApproval1(objCompra)
+		
+			set idFornecedor   = $$$INAUFSupplierNumber(objCompra)
+			set descFornecedor = $$SQLGetDescFornecedor^VARSQL(idFornecedor)
+		
+			do NewLine^COMTable()
+			do InsertCell^COMTable(count,"VARCompra",idCompra)
+			do InsertCell^COMTable(idCompra,"VARCompra",idCompra)
+			do InsertCell^COMTable(dteEmissao,"VARCompra",idCompra)
+			;do InsertCell^COMTable(empenho,"VARCompra",idCompra) 			**Não existe Empenho no HEVA
+			do InsertCell^COMTable(descFornecedor,"VARCompra",idCompra)
+	      	do EndLine^COMTable()
+	
+		$$$End
+	
+		if (count = 0) {
+			do NewLine^COMTable()
+			do InsertCell^COMTable("")
+			do InsertCell^COMTable("Nenhuma ordem de fornecimento criada para o pedido de compra.",,,,,,4)
+	      	do EndLine^COMTable()
+		}
+
+		do Stop^COMTable
+	}
+
+	quit
+	
+HideAbaPaciente(pidPedidoCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Esconde a aba paciente caso o tipo de pedido de compra seja diferente de
+    ;	3 - Ação Judicial.
+    ;
+    ; Chamado por:
+    ;	Campo CheckExecuteToHide da aba 5-Paciente do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	10-Ago-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:(pidPedidoCompra = "") $$$YES
+	new tipo
+	set tipo = $$getTipoPedido(pidPedidoCompra)
+	
+	if (tipo = 3) { //3-Ação Judicial
+		quit $$$NO
+	}
+
+	quit $$$YES
+	
+ImprimeRelatorio(YKEY)
+	if ($$GetPreferencia^VARPreferenciasUsuario($$$FldVARPreferenciasUsuarioTelaFiltroRelatorio) = 1){
+		do GotoFiltrosRelatorio^VARFiltrosRelatorio("RunReportPedidoCompra",0,1,,YKEY)
+	} else {
+		do RunReportPedidoCompra^VARJasperRunReport(YKEY)
+	}
+		
+	quit
+
+]]></Routine>
+</Export>

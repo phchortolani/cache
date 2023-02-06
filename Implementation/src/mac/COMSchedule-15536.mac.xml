@@ -1,0 +1,573 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMSchedule" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMSchedule
+	
+#include COMConst
+#include COMSYS
+	
+GetSecondsToWait()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	new lngSeconds
+	
+	set lngSeconds = $get(^COMScheduler("Wait"))
+	if lngSeconds'>0 set lngSeconds = 1
+	quit lngSeconds
+	
+	
+GetStart()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	quit $get(^COMScheduler("Start"))
+	
+	
+KILL(pidClass,pstrRef)
+    ;-------------------------------------------------------------------------------
+    ; Kills any schedules associated with a record from any class
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 19-Oct-2006	JW			SR15134: Look at kill status. Return status
+    ; 22-Nov-2005	Steve S		SR13853: Created
+    ;-------------------------------------------------------------------------------
+	new idClassIdx,idKeyIdx,idSchedule,strStatus
+ 	
+ 	set strStatus = $$$OK
+ 	
+	if ($get(pidClass)'="") && ($get(pstrRef)'="") {
+		set idClassIdx = $$$Index(pidClass)
+		set idKeyIdx   = $$$Index(pstrRef)
+		
+		set idSchedule = ""
+		for {
+			set idSchedule = $order(^COMSchedules(YM,1,idClassIdx,idKeyIdx,idSchedule))
+			quit:idSchedule=""
+			
+			set strStatus = $$$Kill("COMSchedule",idSchedule)
+			quit:$$$ISERR(strStatus)
+		}	
+	}
+	quit strStatus
+	
+	
+GetScheduleStatus()
+	;-------------------------------------------------------------------------------
+	;determines whether the scheduler is currently running
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	new intStatus
+	
+	set intStatus = $$$EnumCOMSHEDULESTATUSStopped
+	lock ^COMScheduler:1 else  set intStatus = $$$EnumCOMSHEDULESTATUSRunning
+	lock  ;release the lock if we get it.
+	; FIXME : Should we be releasing ALL locks? <GRF>
+	quit intStatus
+	
+	
+ReStart
+	;-------------------------------------------------------------------------------
+	; used for debugging
+	;-------------------------------------------------------------------------------
+	do Stop()
+	do Start
+	quit
+	
+	
+StopButton
+	;-------------------------------------------------------------------------------
+	; run by front end to try and stop schedule. lets the user know if it can't
+	;-------------------------------------------------------------------------------
+	do Stop()
+	do RedirectForm^COMUtils(YFORM,YKEY,YBACK,YPARA,YSEITE)
+	quit
+	
+	
+StartButton
+	;-------------------------------------------------------------------------------
+	; run by front end to try and start schedule
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	set ^COMScheduler("Wait")=$piece($get(^WWWDATEN(YM,+$horolog,YUSER,"COMScheduleSetup","M",1)),Y,2)
+	do Start
+	do RedirectForm^COMUtils(YFORM,YKEY,YBACK,YPARA,YSEITE)
+	quit
+	
+	
+Start
+	;-------------------------------------------------------------------------------
+	;	starts scheduler in background.
+	;	
+	; History:
+	; 26-Mar-2007	GRF		SR15485: relocate 'lock -^COMScheduler' to prevent other
+	; 							processes from "stealing" it before background job
+	; 							can start; and make 'hang 5' a common exit point so
+	; 							won't clash with 2 sec lock attempt in COMScheduleRun
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(0,0,1)))) {
+			quit
+	}
+	new code,strCurrentNamespace
+ 
+	lock +^COMStartSchedule:1
+	if $TEST {
+		lock +^COMScheduler:1 //SR10754
+		if $TEST {
+			; Lock was successful - therefore ok to start
+			job Process^COMScheduleRun    ; Environment created for new job NFA
+			lock -^COMScheduler#"I"
+		}
+		lock -^COMStartSchedule#"I"
+		hang 5
+	}
+	quit
+	
+	
+StartFore
+	;-------------------------------------------------------------------------------
+	; used by a terminal session for debuging purposes
+	;-------------------------------------------------------------------------------
+	do Process^COMScheduleRun
+	quit
+	
+	
+Stop()
+	;-------------------------------------------------------------------------------
+	; Tries and stops the scheduler. Returns a status indicating whether it was successful or not..
+	; 
+	; History:
+	; 26-Mar-2007	GRF		SR15485: match lock in Start, unlock COMScheduler if we got it.
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	new intStatus
+	
+	set ^COMScheduler("Start") = 0
+	set intStatus              = $$$EnumCOMSHEDULESTATUSStopped
+	
+	;wait for up to 10 seconds for the process to stop.
+	lock ^COMScheduler:10 else  set intStatus = $$$EnumCOMSHEDULESTATUSRunning
+	lock -^COMScheduler#"I"  ;release lock
+	
+	quit intStatus
+	
+	
+GetNextRunDate(pidCompany,pidSchedule)
+	;-------------------------------------------------------------------------------
+	; Get the next run date for the schedule -
+	; determines the next run date for a schedule based on the type of time increment
+	; 
+	; Params:
+	;
+	; History:
+	; 19-May-2006	RPW		SR14606: Sunday is Day 7 in the enum, but treated as Day
+	; 							0 in code, there is a major mismatch which causes 
+	; 							schedules for Sunday to scheduling incorrectly.
+	; 02-Jun-2003	PaulK	newed variable
+	;-------------------------------------------------------------------------------
+	new objSchedule,dteLastRunDate,dteNext,intLoop,intTimeIncrement
+	new lngDayofMonth,lngDaysInMonth,lngMonth,lngNextDay,lngYear,strMonths
+	
+	set objSchedule = ^COMSchedule(pidCompany,pidSchedule,1)
+	
+	set dteNext        = ""
+	set dteLastRunDate = $horolog
+	
+	set intTimeIncrement = $$$COMScheduleTimeIncrement(objSchedule)
+	
+	if intTimeIncrement=$$$EnumCOMTIMEINCREMENTSeconds {
+		set dteNext = $$AddSeconds^COMUtilDate(dteLastRunDate,$$$COMScheduleIncrementValue(objSchedule))
+	
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTMinutes {
+		set dteNext = $$AddSeconds^COMUtilDate(dteLastRunDate,$$$COMScheduleIncrementValue(objSchedule)*60)
+	
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTHours {
+		set dteNext = $$AddSeconds^COMUtilDate(dteLastRunDate,$$$COMScheduleIncrementValue(objSchedule)*60*60)
+	
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTDaysofWeek {
+		new lngCurrentDay,strDays,lngDaysToAdd,lngDay                     ; FIXME: combine new?
+		
+		set lngCurrentDay = dteLastRunDate+4#7   ;+4 offsets days of week from 31/12/1840
+		set strDays       = ";"_$$$COMScheduleDaysOfWeek(objSchedule)_";"
+		
+		// Make the days mod 7 of each other
+		for intLoop=2:1:$length(strDays,";")-1 {
+			set $piece(strDays,";",intLoop)=$piece(strDays,";",intLoop)#7
+		}
+		for lngDaysToAdd=1:1:7 {
+			set lngDay=";"_(lngCurrentDay+lngDaysToAdd#7)_";"
+			quit:$find(strDays,lngDay)
+		}
+		set dteNext = (dteLastRunDate+lngDaysToAdd)_","_$$$COMScheduleTimeToRun(objSchedule)
+	
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTDaysofMonth {
+		set dteNext = dteLastRunDate
+		set strDays = ";"_$$$COMScheduleMultiDaysOfMonth(objSchedule)_";"
+		set lngDaysInMonth = $$GetDaysInMonth^COMUtilDate(dteLastRunDate)
+		
+		for {
+			set dteNext       = dteNext+1
+			set lngDayofMonth = +$piece($zdate(dteNext,3),"-",3)
+			quit:$find(strDays,";"_lngDayofMonth_";")
+			quit:(lngDayofMonth=lngDaysInMonth)&&($find(strDays,";32;"))
+			quit:(lngDayofMonth=lngDaysInMonth)&&(lngDaysInMonth<31)&&($find(strDays,";31;"))  ; current month has less than 31 days & 31 is selected
+			quit:(lngDayofMonth=lngDaysInMonth)&&(lngDaysInMonth<30)&&($find(strDays,";30;"))  ; current month has less than 30 days & 30 is selected
+			quit:(lngDayofMonth=lngDaysInMonth)&&(lngDaysInMonth<29)&&($find(strDays,";29;"))  ; current month has less than 29 days & 29 is selected
+		}
+		
+		set dteNext=dteNext_","_$$$COMScheduleTimeToRun(objSchedule)
+	
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTMonthsofYear {
+		set lngMonth  = $piece($zdate(dteLastRunDate,3),"-",2)
+		set lngYear   = $piece($zdate(dteLastRunDate,3),"-",1)
+		set strMonths = ";"_$$$COMScheduleMonthsOfYear(objSchedule)_";"
+		for {
+			set lngMonth = lngMonth+1
+			if lngMonth>12 {
+				set lngMonth=1
+				set lngYear=lngYear+1
+			}
+			quit:$find(strMonths,";"_lngMonth_";")
+		}
+		set dteNext=lngYear_"-"_lngMonth_"-01"  ;need to determine how many days in the month in case the day of month>current month
+		set lngDaysInMonth = $$GetDaysInMonth^COMUtilDate($zdateh(dteNext,3))
+		set lngNextDay     = $$$COMScheduleSingleDOM(objSchedule)
+		if lngNextDay>lngDaysInMonth set lngNextDay = lngDaysInMonth
+		
+		set dteNext = $zdateh(lngYear_"-"_lngMonth_"-"_lngNextDay,3)_","_$$$COMScheduleTimeToRun(objSchedule)
+	}
+	quit dteNext
+	
+	
+AfterDataField(pKey,pstrScheduleType,pstrCode,strHeading="",pblnReadOnly=$$$NO)
+	;-------------------------------------------------------------------------------
+	; pKey				identifies the type of data within the schedule type,e.g. 1
+	; strScheduleType	identifies the type of schedule,e.g. "COMDCMEventQueue"
+	; pstrCode			code to be run, e.g. "eventQueueManager^COMDCMControlModule()"
+	; 					- this routine should return a string message to be reported
+	; 					to the administrator
+	; strHeading		(optional) heading for the table
+	; pblnReadOnly		Display the schedule table as read only. ie, no [New] line, and
+	; 					schedule lines are non-selectable.
+	; 
+	; generic grid that shows the schedules for a particular record.
+	; can be used by journals(1),interface batches(2), etc.
+	;
+	; History:
+	; 13-Apr-2005	PaulK	SR12120: warn users if value set is less than schedule value
+	; 12-Apr-2005	SteveS	SR11669: Added parameter pblnReadOnly
+	; 18-Nov-2004	GRF		Correct alignment in code
+	; 20-Mar-2004	LW		Ensure pKey is uppercase
+	; 09-Mar-2004	SCR		Added UMUAL checking to Key & Type
+	;-------------------------------------------------------------------------------
+	new lstHeader,idSchedule,objSchedule,intTimeIncrement,intLoop
+	new strIncrementValue,strScheduleType,strTypeRef,intMinSeconds,strStatus,gColour
+	
+	set pKey = $zconvert($get(pKey),"U")		; ensure key is uppercase
+	
+	if strHeading="" set strHeading = $$$Text("Com00184")                 ; "Schedule"
+	set lstHeader = ""
+	set lstHeader = lstHeader_$listbuild($$$StrCOMScheduleTimeIncrement)
+	set lstHeader = lstHeader_$listbuild($$$StrCOMScheduleIncrementValue)
+	set lstHeader = lstHeader_$listbuild($$$StrCOMScheduleLastTimeRun)
+	set lstHeader = lstHeader_$listbuild($$$StrCOMScheduleNextRunTime)
+	set lstHeader = lstHeader_$listbuild($$$Text("Com00181"))             ; "Status"
+	
+	set strScheduleType = $$^WWWUMLAU(pstrScheduleType,1)
+	set strTypeRef		= $$^WWWUMLAU(pKey,1)
+	
+	do Start^COMTable(lstHeader,strHeading)
+	if strTypeRef'="" {
+		set idSchedule = ""
+		for {
+			set idSchedule = $order(^COMSchedules(YM,1,strScheduleType,strTypeRef,idSchedule))
+			quit:idSchedule=""
+			
+			set objSchedule = $get(^COMSchedule(YM,idSchedule,1))
+ 
+			quit:$$$COMScheduleClass(objSchedule)'=$zconvert(pstrScheduleType,"u")	; Extra Test
+			quit:$$$COMScheduleTypeReference(objSchedule)'=pKey						; Extra Test
+			
+			set strIncrementValue = $$$COMScheduleIncrementValue(objSchedule)
+			set intTimeIncrement  = $$$COMScheduleTimeIncrement(objSchedule)
+			set intMinSeconds	  = $$GetSecondsToWait()
+ 
+			set strStatus = $$$OK
+			
+			if intTimeIncrement=$$$EnumCOMTIMEINCREMENTSeconds {
+				if strIncrementValue<intMinSeconds {
+					set strStatus = $$$Text($listbuild("Com00182",intMinSeconds))
+				}  ; "Warning: Scheduler only runs every %1 seconds."
+			
+			} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTMinutes {
+				if (strIncrementValue*60)<intMinSeconds {
+					set strStatus = $$$Text($listbuild("Com00182",intMinSeconds))
+				}  ; "Warning: Scheduler only runs every %1 seconds."
+			
+			} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTHours {
+				if (strIncrementValue*60*60)<intMinSeconds {
+					set strStatus = $$$Text($listbuild("Com00182",intMinSeconds))
+				}  ; "Warning: Scheduler only runs every %1 seconds."
+			
+			} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTDaysofWeek {
+				set strIncrementValue = $$$COMScheduleDaysOfWeek(objSchedule)
+				for intLoop=1:1:$length(strIncrementValue,";") {
+					set $piece(strIncrementValue,";",intLoop) = $$GetEnumDescription^COMUtils("COMDAYSOFWEEK",$piece(strIncrementValue,";",intLoop))
+				}
+				set strIncrementValue = strIncrementValue_" @ "_$$^WWWTIME($$$COMScheduleTimeToRun(objSchedule))
+			
+			} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTDaysofMonth {
+				set strIncrementValue = $$$COMScheduleMultiDaysOfMonth(objSchedule)
+				for intLoop=1:1:$length(strIncrementValue,";") {
+					set $piece(strIncrementValue,";",intLoop) = $$GetEnumDescription^COMUtils("COMDAYSOFMONTH",$piece(strIncrementValue,";",intLoop))
+				}
+				set strIncrementValue = strIncrementValue_" @ "_$$^WWWTIME($$$COMScheduleTimeToRun(objSchedule))
+			
+			} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTMonthsofYear {
+				set strIncrementValue = $$$COMScheduleMonthsOfYear(objSchedule)
+				for intLoop=1:1:$length(strIncrementValue,";") {
+					set $piece(strIncrementValue,";",intLoop) = $$GetEnumDescription^COMUtils("COMMONTHSOFYEAR",$piece(strIncrementValue,";",intLoop))
+				}
+				set strIncrementValue = strIncrementValue_" "_$$$AppEnum("COMDAYSOFMONTH",$$$COMScheduleSingleDOM(objSchedule))
+				set strIncrementValue = strIncrementValue_" @ "_$$^WWWTIME($$$COMScheduleTimeToRun(objSchedule))
+			}
+	
+			do NewLine^COMTable()
+			if 'pblnReadOnly {
+				do InsertCell^COMTable($$$AppEnum("COMTIMEINCREMENT",intTimeIncrement),"COMSchedule",idSchedule)
+				do InsertCell^COMTable(strIncrementValue,"COMSchedule",idSchedule)
+				do InsertCellDate^COMTable($$$COMScheduleLastTimeRun(objSchedule),"COMSchedule",idSchedule)
+				do InsertCellDate^COMTable($$$COMScheduleNextRunTime(objSchedule),"COMSchedule",idSchedule)
+				if strStatus=$$$OK {
+					do InsertCell^COMTable($$$Text("Com00183"),"COMSchedule",idSchedule)  ; "OK"
+				} else {
+					set gColour = "lightcoral"
+					do InsertCell^COMTable($$$Text(strStatus),"COMSchedule",idSchedule)
+				}
+			
+			} else {
+				do InsertCell^COMTable($$$AppEnum("COMTIMEINCREMENT",intTimeIncrement))
+				do InsertCell^COMTable(strIncrementValue)
+				do InsertCellDate^COMTable($$$COMScheduleLastTimeRun(objSchedule))
+				do InsertCellDate^COMTable($$$COMScheduleNextRunTime(objSchedule))
+				if strStatus=$$$OK {
+					do InsertCell^COMTable($$$Text("Com00183"))   ; "OK"
+				} else {
+					set gColour = "lightcoral"
+					do InsertCell^COMTable($$$Text(strStatus))
+				}
+			}
+			
+			do EndLine^COMTable()
+		}
+	}
+	
+	if 'pblnReadOnly {
+		do NewLine^COMTable()
+		do InsertCell^COMTable("["_$$$Text("Com00185") _"]","COMSchedule","""+""",strScheduleType_","_strTypeRef_","_pstrCode,"","",5)   ; "New"
+		do EndLine^COMTable()
+	}
+	
+	do Stop^COMTable()
+	quit
+	
+	
+QueueNow(pidSchedule)
+	;-------------------------------------------------------------------------------
+	; sets the "run now" flag on a schedule, run by front end
+	; 
+	; History:
+	; 30-Mar-2007	GRF		SR15387: Boolean Macro
+	; 02-Jun-2003	PaulK	newed variable
+	;-------------------------------------------------------------------------------
+	new objSchedule
+	
+	set objSchedule = ^COMSchedule(YM,pidSchedule,1)
+	set $$$COMScheduleRunNow(objSchedule) = $$$YES
+	do ^WWWSPEI("COMSchedule",pidSchedule,objSchedule,1)    ; FIXME : $$$Save?
+	do ^WWWFORM
+	quit
+	
+	
+AfterScheduleSave(pidSchedule)
+	;-------------------------------------------------------------------------------
+	; Used by front end to reset the next run time if the user manual plays
+	; with the schedule
+	; 
+	; History:
+	; 07-Nov-2006	JW		SR15187: return status, use macro.	
+	; 02-Jun-2003	PaulK 	newed variable
+	;-------------------------------------------------------------------------------
+	new objSchedule,strStatus
+	
+	set objSchedule = ^COMSchedule(YM,pidSchedule,1)
+	set $$$COMScheduleNextRunTime(objSchedule) = $$GetNextRunDate(YM,pidSchedule)
+	set strStatus = $$$Save("COMSchedule",pidSchedule,objSchedule,$$$YES)
+	quit strStatus
+	
+	
+OnBeforeSave(pstrData)
+    ;-------------------------------------------------------------------------------
+    ; Code to execute before saving a schedule. Performs validation.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 22-Dec-2004	SteveS	SR11351: Created
+    ;-------------------------------------------------------------------------------
+	new enumIncrType,timeToRun,daysOfMonth,daysOfWeek,fltIncrValue,monthsOfYear
+	new dayOfMonth,strIncrDesc
+	
+	if $get(pstrData)'="" {
+		set enumIncrType = $$$COMScheduleTimeIncrement(pstrData)
+		set timeToRun    = $$$COMScheduleTimeToRun(pstrData)
+		set daysOfMonth  = $$$COMScheduleMultiDaysOfMonth(pstrData)
+		set dayOfMonth   = $$$COMScheduleSingleDOM(pstrData)
+		set daysOfWeek   = $$$COMScheduleDaysOfWeek(pstrData)
+		set fltIncrValue = $$$COMScheduleIncrementValue(pstrData)
+		set monthsOfYear = $$$COMScheduleMonthsOfYear(pstrData)
+		set strIncrDesc  = $$$AppEnum("COMTIMEINCREMENT",enumIncrType)
+ 
+		if (enumIncrType=$$$EnumCOMTIMEINCREMENTSeconds) ||
+		   (enumIncrType=$$$EnumCOMTIMEINCREMENTMinutes) ||
+		   (enumIncrType=$$$EnumCOMTIMEINCREMENTHours)      {
+			
+			if fltIncrValue="" {
+				set Q = $$$QDontSave
+				do ReturnError^COMUtils($listbuild("Com00141",strIncrDesc))	
+			}  ; "Must specify an Increment Value for '%1' Increment Type."
+			
+		} elseif (enumIncrType=$$$EnumCOMTIMEINCREMENTDaysofWeek) {
+			if (timeToRun="") {
+				set Q = $$$QDontSave
+				do ReturnError^COMUtils($listbuild("Com00142",strIncrDesc))
+			  ; "Must specify a Time to Run for Increments of type ´%1´.
+			
+			} elseif (daysOfWeek="") {
+				set Q = $$$QDontSave
+				do ReturnError^COMUtils($listbuild("Com00144",strIncrDesc))
+			}  ; "Must specify Days of Week for Increments of type ´%1´.
+			
+		} elseif (enumIncrType=$$$EnumCOMTIMEINCREMENTDaysofMonth) {
+			if (timeToRun="") {
+				set Q = $$$QDontSave
+				do ReturnError^COMUtils($listbuild("Com00142",strIncrDesc))
+			  ; "Must specify a Time to Run for Increments of type ´%1´.	"
+			
+			} elseif (daysOfMonth="") {
+				set Q = $$$QDontSave
+				do ReturnError^COMUtils($listbuild("Com00145",strIncrDesc))
+			}  ; "Must specify Days of Month for Increments of type ´%1´."
+			
+		} elseif (enumIncrType=$$$EnumCOMTIMEINCREMENTMonthsofYear) {
+			if (timeToRun="") {
+				set Q = $$$QDontSave
+				do ReturnError^COMUtils($listbuild("Com00142",strIncrDesc))
+			  ; "Must specify a Time to Run for Increments of type ´%1´."
+			
+			} elseif (monthsOfYear="") {
+				set Q = $$$QDontSave
+				do ReturnError^COMUtils($listbuild("Com00146",strIncrDesc))
+			  ; "Must specify Months of Year for Increments of type ´%1´."
+			
+			} elseif (dayOfMonth="") {
+				set Q = $$$QDontSave
+				do ReturnError^COMUtils($listbuild("Com00147",strIncrDesc))
+			}  ; "Must specify a Day of Month for Increments of type ´%1´."
+		} 
+	}
+	quit
+	
+	
+GetLastMethod()
+	;-------------------------------------------------------------------------------
+	;Used to get the 
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	quit $get(^COMScheduler("LastMethod","Code")) //SR10754
+ 
+GetLastCompany()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	quit $get(^COMScheduler("LastMethod","Company"))
+	
+	
+GetLastNameSpace()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule and return nothing
+	;-------------------------------------------------------------------------------
+	quit "" //$get(^COMScheduler("LastMethod","Namespace"))
+	
+	
+GetLastSuccessful()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	quit $get(^COMScheduler("LastMethod","Successful"))
+	
+	
+GetLastStarted()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	quit $$GetDate($get(^COMScheduler("LastMethod","Started")))
+	
+	
+GetErrorNameSpace()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule and return nothing
+	;-------------------------------------------------------------------------------
+	quit "" // $get(^COMScheduler("Error","NameSpace"))
+	
+	
+GetErrorMessage()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	quit $get(^COMScheduler("Error","Error"))
+	
+	
+GetErrorDate()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule and send out the date string
+	;-------------------------------------------------------------------------------
+	quit $$GetDate($get(^COMScheduler("Error","Date")))
+	
+	
+GetDate(pdteDate)
+	;-------------------------------------------------------------------------------
+	; Get the Date in a nice string representation
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Mar-2007	RPW		SR10754: Created
+	;-------------------------------------------------------------------------------
+	new strDate
+	
+	set strDate = ""
+	if $translate(pdteDate,",")'="" {
+		set strDate = $$^WWWDATE(pdteDate)_" "_$$^WWWTIME(pdteDate)
+	}
+	quit strDate
+	
+]]></Routine>
+</Export>

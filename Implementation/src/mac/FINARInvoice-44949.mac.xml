@@ -1,0 +1,711 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINARInvoice" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINARInvoice ; Customer Invoices
+	
+#include COMSYS
+#include FINConst
+	
+OnDisplayRightClickMenu(pYKEY="",pYFELD="",pYFORM="") 
+    ;-------------------------------------------------------------------------------
+    ; Menu item for a link to the Source Order.
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 26-Aug-2005	shobby	SR12908:The Invoice number is the primary key, don't
+    ;							need the 'Source' field.
+    ; 18-Aug-2005	shobby	SR12908: Created
+    ;-------------------------------------------------------------------------------
+	new lstNewMenuItems,blnEnabled,idInvoice
+ 
+	set lstNewMenuItems = ""
+	set idInvoice       = $$$KEY2(pYKEY)
+	set blnEnabled      = (idInvoice'="")
+	set lstNewMenuItems = lstNewMenuItems_$lb($lb("new.gif",$$$Text("Fin00875")_"...","CallBack(""DisplayOrder^FINARInvoice"","""_idInvoice_""","""_YFORM_""")",,blnEnabled))	;Language Text=Customer Order
+	quit lstNewMenuItems
+	
+	
+DisplayOrder(pYKEY="",pYFELD="") 
+    ;-------------------------------------------------------------------------------
+    ; Display the order in a popup window.
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 18-Aug-2005	shobby	SR12908: Created
+    ;-------------------------------------------------------------------------------
+	;
+	new idOrder
+	if pYKEY'="" {
+		set idOrder=$order(^INAUFs(YM,8,pYKEY,""))
+		if idOrder'="" {
+			//do WindowOpen^FINAPInvLine("INAUF",idOrder)
+			do GoToForm^COMUtilForm("INAUF",idOrder,,,$$$YES)
+		}
+	}
+	quit
+	
+	
+CreateInvoice(Batch,BatchLine)
+    ;-------------------------------------------------------------------------------
+    ; This module creates or updates an FINARInvoice and then gets all 
+    ; of the Taxes of the Block and associates them with the invoice.
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+    ; 26-Aug-2005	shobby	SR12908:Invoice number is primary key, don't need to put
+    ;							it in a 'source' field (this field was originally
+    ;							going to hold the order number).
+    ; 18-Aug-2005	shobby	SR12908:Include a 'Source' field on the invoice that
+    ;							relates back to the order this was generated from.
+    ; 26-May-2005	Paul K	Added Check Period. SR:12472
+    ; 10-May-2005	RPW		SR11845: Unfortunately the Discount is recalculated from
+    ; 							the Customer if there is none. So we check for a
+    ; 							breadcrumb and if it exists, we do not recalc the discount
+    ; 02-May-2005	RPW		SR11845: Undid Change from 20-Apr-2005. This is
+    ; 							performed by the Finance => Setup -> General
+    ; 							Parameter : Cus Inv Tab - Apply Settlement Discount
+    ; 							With Credit checkbox
+    ; 20-Apr-2005	Paul K	If balance < 0 remove settlement discount SR:11830
+    ; 19-Apr-2005	SCR		SR11476 Use FININTBatchBlock for User & Department
+	; 14-Jan-2005	PO		SR11476 Added in User, Location and Department.
+	; 24-Sep-2004	shobby	Fix InvoiceDate and DueDate to today and Invoice total
+	;							to nothing for 'Unallocated - 001' Invoice.
+	; 23-Feb-2004	shobby	Disabled previous change - not confident with it.
+	; 23-Feb-2004	shobby	Call to PackBlock to better work the two part blocks.
+	; 20-Feb-2004	shobby	Split Block into 2 parts. (ie 1.2 ->  1   2)
+	; 31-Jul-2003	SCR		Check the 'Discount on Freight' switch when calculating Discount.
+	; 01-Jul-2003	SCR		Added update Option
+	; 29-Jun-2003	SCR		Swapped Date & Freight
+	; 14-May-2003 	SCR		Added Freight & Trading Date
+    ;-------------------------------------------------------------------------------
+	new Status,LineRec,BatchRec,Param,Amount,ControlAccount,Customer,Invoice,DueDate,Discount,InvoiceDate,Freight
+	new Balance,InvoiceRec,NewInvoice,Settlement,AmountForDiscount,strUser,strLocation,strDepartment
+	new strBlock,Detail,BlockRec,BlockNumber,CheckDiscount
+	
+	set Status=$$$OK
+ 	if (Batch="")||(BatchLine="") set Status=$listbuild("Fin00173")  ; AR Interface Post Error
+ 	if Status=$$$OK {
+		set LineRec=$get(^FININTBatchLine(YM,Batch,BatchLine,1))
+		set BatchRec=$get(^FININTBatch(YM,Batch,1))
+		set BlockNumber=$$$FININTBatchLineBlockNumberMajor(LineRec)
+		if BlockNumber="" set BlockNumber=" "
+		set BlockRec=$get(^FININTBatchBlock(YM,Batch,BlockNumber,1))  ; SR11476
+ 	}
+ 	if (Status=$$$OK)&&((LineRec="")||(BatchRec="")) set Status=$listbuild("Fin00173")  ; AR Interface Post Error
+ 	if Status=$$$OK {
+		set Param		   =$$$FININTBatchLineParameters(LineRec)
+		set Amount		   =$$$FININTBatchLineAmount(LineRec)
+		set ControlAccount =$$$FININTBatchLineAccount(LineRec)
+		//
+		set Customer	   =$piece(Param,$$$COMMA,1)
+		set Invoice		   =$piece(Param,$$$COMMA,2)
+		set DueDate		   =$piece(Param,$$$COMMA,3)
+		set Discount	   =$piece(Param,$$$COMMA,4)
+		set InvoiceDate	   =$piece(Param,$$$COMMA,5)
+		set Freight		   =$piece(Param,$$$COMMA,6)
+		set Detail		   =$piece(Param,$$$COMMA,7)
+		//
+		set strLocation	   =$$$FININTBatchLocation(BatchRec)
+		set strUser		   =$$$FININTBatchBlockUser1(BlockRec)
+		set strDepartment  =$$$FININTBatchBlockDepartment(BlockRec)
+ 
+		; If Invoice Date is null use Batch Date
+		if InvoiceDate="" set InvoiceDate=$$$FININTBatchBatchDate(BatchRec)
+ 	}
+ 	if (Status=$$$OK)&&(Customer="")       set Status=$listbuild("Fin00159")           ; "Customer Number Required"
+ 	if (Status=$$$OK)&&(ControlAccount="") set Status=$listbuild("Fin00081",Customer)  ; "Customer control account not valid for customer %1"
+	if Status=$$$OK set Status=$$AddCustomer^FINARCustomer(Customer,ControlAccount)
+	if Status=$$$OK set Status=$$CheckPeriod^FINARAccount(ControlAccount,InvoiceDate)
+	if Status=$$$OK {
+		if Invoice="" set Status=$listbuild("Fin00174")  ; "Interface requires an Invoice Number"
+	}
+	if Status=$$$OK {
+		set InvoiceRec=$get(^FINARInvoice(YM,Customer,Invoice,1))
+		if DueDate="" set DueDate=$$GetDueDate^FINARCustomer(Customer,InvoiceDate)
+		
+		; Get YUSER, default to rechecking the discount, and a discount amount of 0
+		set YUSER         = $get(YUSER)
+		set CheckDiscount = $$$YES
+		set Settlement    = 0
+		if $get(YUSER)'="" {
+			; SR11845: Does the bread crumb exist?
+			if $data(^CacheTempPostSettlementDiscount(YUSER))'=0 {
+				; SR11845: Yes it does, do not check the discount, and also delete the breadcrumb
+				set CheckDiscount=$$$NO
+				kill ^CacheTempPostSettlementDiscount(YUSER)
+			}
+		}
+		
+		; SR11845: If we are checking the discount get the settlement discount and freight discount as normal.
+		if CheckDiscount {
+			if Discount="" set Discount=$$GetSettlementDiscount^FINARCustomer(Customer)
+			set AmountForDiscount=Amount
+			if '$$GetFreightDiscount^FINARCustomer(Customer) {
+				set AmountForDiscount=AmountForDiscount-Freight
+			}
+ 
+			set Settlement=$$CalculateDiscount(AmountForDiscount,Discount)
+		}
+		set Settlement=$$Round^COMUtils(Settlement)
+		set Amount=$$Round^COMUtils(Amount)
+		set NewInvoice='$$$OK
+		if InvoiceRec="" { ; New Invoice
+			set $$$FINARInvoiceInvoiceTotal(InvoiceRec) = Amount
+			set $$$FINARInvoiceInvoiceDate(InvoiceRec)  = InvoiceDate
+			set $$$FINARInvoiceDueDate(InvoiceRec)      = DueDate
+			set $$$FINARInvoiceFreight(InvoiceRec)      = Freight
+			set $$$FINARInvoiceDetail(InvoiceRec)       = Detail
+			set $$$FINARInvoiceSettlementDiscount(InvoiceRec)=Settlement  ;need to work out settlement discount
+		}
+		if Invoice[$$^WWWTEXT("Fin00057") {   ; "Unallocated"
+ 
+			set $$$FINARInvoiceInvoiceDate(InvoiceRec)  = +$horolog
+			set $$$FINARInvoiceDueDate(InvoiceRec)      = +$horolog
+			set $$$FINARInvoiceInvoiceTotal(InvoiceRec) = ""
+		}
+		set Balance=$$$FINARInvoiceBalance(InvoiceRec)
+		set $$$FINARInvoiceBalance(InvoiceRec)=Balance+Amount
+		if $$$FINARInvoiceLocation(InvoiceRec)=""   set $$$FINARInvoiceLocation(InvoiceRec)   = strLocation
+		if $$$FINARInvoiceUser1(InvoiceRec)=""      set $$$FINARInvoiceUser1(InvoiceRec)      = strUser
+		if $$$FINARInvoiceDepartment(InvoiceRec)="" set $$$FINARInvoiceDepartment(InvoiceRec) = strDepartment
+ 
+		set Status = $$Save^FINSYS("FINARInvoice",Customer_","_Invoice,InvoiceRec,$$$YES)
+	}
+	
+	if Status=1 set Status = $$AddInvoiceTran(Customer,Invoice,Amount,Batch,BatchLine,InvoiceDate)
+	if Status=$$$OK {
+		; <TODO MajMin>
+	;	set strBlock = $$PackBlock^FININTBatchLine($$$FININTBatchLineBlockNumber(LineRec),$$$FININTBatchLineBlockNumberMinor(LineRec))
+		set strBlock = $$$FININTBatchLineBlockNumber(LineRec)
+		set Status   = $$AddInvoiceTax(Customer,Invoice,Batch,strBlock)
+	}
+	quit Status
+	
+	
+CalculateDiscount(pcurAmount,pstrDiscount)
+	new curDiscount
+	
+	if $find(pstrDiscount,"%") {
+		set pstrDiscount=+pstrDiscount
+		set curDiscount=pcurAmount*pstrDiscount/100
+	
+	} else {
+		set curDiscount=pstrDiscount
+	}
+	quit curDiscount
+	
+	
+AddInvoiceTran(idCustomer,idInvoice,curAmount,pidBatch,pidBatchLine,TradingDate,pstrFix="")
+    ;-------------------------------------------------------------------------------
+	; Add Invoice Transaction
+	; 20-May-2004	shobby	added pstrFix, a note field when an InvoiceTran has been fixed.
+	; 23-Feb-2004	SCR		Added Period Totals
+	; 14-May-2003 	SCR		Added Trading Date
+    ;-------------------------------------------------------------------------------
+	new idInvoiceTran,objInvoiceTran,Status
+	
+	set Status         = $$$OK
+	set idInvoiceTran  = $order(^FINARInvoiceTran(YM,idCustomer,idInvoice,""),-1)+1
+	set objInvoiceTran = ""
+	set $$$FINARInvoiceTranTransactionAmount(objInvoiceTran)  = curAmount
+	set $$$FINARInvoiceTranInterfaceBatch(objInvoiceTran)     = pidBatch
+	set $$$FINARInvoiceTranInterfaceBatchLine(objInvoiceTran) = pidBatchLine
+	set $$$FINARInvoiceTranDate1(objInvoiceTran)              = TradingDate
+	set $$$FINARInvoiceTranFix(objInvoiceTran)                = pstrFix
+	if Status=$$$OK set Status = $$AddBalance^FINARBalance(idCustomer,curAmount)
+	if Status=$$$OK set Status = $$$Save("FINARInvoiceTran",idCustomer_","_idInvoice_","_idInvoiceTran,objInvoiceTran,$$$YES)
+	if Status=$$$OK set Status = $$UpdateInvoiceTran^FINARPeriod(idCustomer,idInvoice,idInvoiceTran) 
+	
+	quit Status
+	
+	
+AddInvoiceTax(pidCustomer,pidInvoice,pidBatch,pstrBlock)
+    ;-------------------------------------------------------------------------------
+    ; Get the tax on the block and add it to the invoice 
+    ; (if there is settlement discount, a pro-rataed amount of tax needs to be taken away)
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+	; 22-Jul-2011	GRF		-: Order macros
+    ; 24-Oct-2006	JW		SR15101: Index Batch number! Use Order macros.
+    ; 21-Apr-2005	Paul K	Reversed the sign of the tax amount as tax amount is -ve SR:11830
+    ; 10-Mar-2004	shobby	FININTBatchLines changed to FININTBatchLine
+	; 23-Feb-2004	shobby	Pass in Block as single value then split with UnpackBlock
+	; 20-Feb-2004	shobby	Split Block into 2 parts. (ie 1.2 ->  1   2)
+	; 29-Jun-2003	SCR		Bug Fix
+    ;-------------------------------------------------------------------------------
+	new arrTaxes,intLineNumber,objBatchLine,strStatus,idTaxCode,objInvoiceTax
+	new intBlockMajor,intBlockMinor,idxBatch
+ 
+	set strStatus=1
+	set intLineNumber=""
+	do UnPackBlock^FININTBatchLine(pstrBlock,.intBlockMajor,.intBlockMinor)
+	if intBlockMinor="" set intBlockMinor=" "
+	set idxBatch = $$$Index(pidBatch)
+	
+	set intLineNumber=""  ;this is the first index on FININTBatchLine
+	for {
+		set intLineNumber = $order(^FININTBatchLines(YM,1,idxBatch,intBlockMajor,intBlockMinor,pidBatch,intLineNumber))
+		quit:intLineNumber=""
+		
+		set objBatchLine=$get(^FININTBatchLine(YM,pidBatch,intLineNumber,1))
+		if $$$FININTBatchLineInterfaceType(objBatchLine)="TAX" {
+			set arrTaxes($$$FININTBatchLineReference(objBatchLine),"Account")=$$$FININTBatchLineAccount(objBatchLine)
+			set arrTaxes($$$FININTBatchLineReference(objBatchLine),"Amount")=$get(arrTaxes($$$FININTBatchLineReference(objBatchLine),"Amount"))-$$$FININTBatchLineAmount(objBatchLine)   ;PJK 21-Apr-2005 make amount +ve by subtracting.
+		}
+	}
+ 
+	set idTaxCode = ""
+	for {
+		set idTaxCode = $order(arrTaxes(idTaxCode))
+		quit:idTaxCode=""
+		
+		set objInvoiceTax=""
+		set $$$FINARInvoiceTaxAmount(objInvoiceTax)=arrTaxes(idTaxCode,"Amount")
+		set $$$FINARInvoiceTaxAccount(objInvoiceTax)=arrTaxes(idTaxCode,"Account")
+		set strStatus = $$Save^FINSYS("FINARInvoiceTax",pidCustomer_","_pidInvoice_","_idTaxCode,objInvoiceTax,$$$YES)
+		quit:strStatus'=$$$OK
+		}
+	quit strStatus
+	
+	
+GetBalance(pidCustomer)
+    ;-------------------------------------------------------------------------------
+	; 29-Jun-2003	SCR		Bug Fix
+    ;-------------------------------------------------------------------------------
+	new curAmount,idInvoice,objInvoice
+	
+	set curAmount = 0
+	set idInvoice = $order(^FINARInvoice(YM,pidCustomer,$$^WWWTEXT("Fin00057")_" - 999"),-1)
+	if $find(idInvoice,$$^WWWTEXT("Fin00057"))  {  ;an outstanding un-allocated invoice exists
+		set objInvoice = $get(^FINARInvoice(YM,pidCustomer,idInvoice,1))
+		set curAmount  = $$$FINARInvoiceBalance(objInvoice)
+		}
+	quit curAmount
+	
+	
+GetBalanceAtDate(pidCustomerNumber,pidInvoiceNumber,pstrDate,pidCompanyOverride="")
+	;-------------------------------------------------------------------------------
+	; Works out the balance outstanding for an Invoice based on the payments that have been made.
+	; 
+	; Notes:
+	; 1. Contains some redundant code to work off of FININTBatchLine can be removed if the
+	;    current code passes testing.
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Nov-2006	SteveS	SR15214: Use an Index
+	; 01-Sep-2005	SteveS	SR12483: Company Override
+	; 13-May-2004	GRF		Clarify If Test
+	; 25-Feb-2004	shobby	Removed redundant reference to FININTBatch
+	; 09-Oct-2003	shobby	Creation
+	;-------------------------------------------------------------------------------
+	new curAmount,fltBalance,idBatch,idBatchLine,idTran,intBlock,dteTran
+	new objFINARInvoice,objFINARInvoiceTran,objFININTBatchLine,strDate
+	new idxCustomer,idxInvoice
+	
+	if $get(Y)="" do ^WWWVAR // TODO: MUST NOT be here, this has been added for reporting purposes needs to be in FINRPAR...
+	if pidCompanyOverride="" set pidCompanyOverride=YM
+	set curAmount=0
+	
+	set objFINARInvoice=$get(^FINARInvoice(pidCompanyOverride,pidCustomerNumber,pidInvoiceNumber,1))
+	
+	quit:(objFINARInvoice="") curAmount
+	
+	set idxCustomer = $$$Index(pidCustomerNumber)
+	set idxInvoice	= $$$Index(pidInvoiceNumber)
+	
+	set dteTran=""
+	for {
+		set dteTran=$order(^FINARInvoiceTrans(pidCompanyOverride,5,idxCustomer,idxInvoice,dteTran))
+		quit:(dteTran="")||(dteTran>pstrDate)
+			
+		set idTran=""
+		for {
+			set idTran=$order(^FINARInvoiceTrans(pidCompanyOverride,5,idxCustomer,idxInvoice,dteTran,pidCustomerNumber,pidInvoiceNumber,idTran))
+			quit:idTran=""
+			
+			set objFINARInvoiceTran=$get(^FINARInvoiceTran(pidCompanyOverride,pidCustomerNumber,pidInvoiceNumber,idTran,1))
+			set curAmount=curAmount+$$$FINARInvoiceTranTransactionAmount(objFINARInvoiceTran)
+		}
+	}
+	quit curAmount
+	
+	
+GetUnAllocatedInvoiceNumber(Customer,InvoiceNumber,pblnReverse=$$$NO,pstrSource="")
+	;-------------------------------------------------------------------------------
+	; Assigns an Unallocated Payment Number, for unallocated ACP payments.
+	; Numbers are set per customer, and increment from "Unallocated - 001" to "Unallocated - 999" 
+	;
+	; Params: 	Customer - The customer who payment is from.
+	; 			InvoiceNumber - 
+	; 			pblnReverse - if $$$YES, payemnt is a reversal (unposting).
+	; 			pidPostedFINARBank -  
+	;
+	; Returns: Status - 
+	;
+	; History:
+	; 03-Jul-2006	SC		SR14734: Source field on FININTBatchLine changed to add BankLine (SR14559),
+	; 						as a result, need to check for new and old data when matching unalloc nums.
+	; 26-Jun-2006	SC		SR14734: Modify number allocation to increment multi-lines, and
+	; 								 look match the original number for reversals.
+	; 09-Jan-2006	SC		SR14146: Updated check for existing unallocated payments. Check in LastInvoice.
+	; 01-Jul-2003	SCR		Corrected Next Number
+	;-------------------------------------------------------------------------------
+	new LastInvoice,Number,Status,objPostedFINARBank,intPostBatch,intPostBlock,intBatchLine,objPostedBatchLine
+	new intBankLine,idPostedFINARBank,strUnalloc
+ 
+ 	set strUnalloc    = $$^WWWTEXT("Fin00057")   ; "Unallocated"
+	set Status        = $$$OK
+	set InvoiceNumber = $get(InvoiceNumber)
+	set LastInvoice   = $order(^FINARInvoice(YM,Customer,strUnalloc_" - 999"),-1)
+ 
+	//Separate bankline from idPosted.  Allows test for old data
+ 	set idPostedFINARBank = $$$KEY1(pstrSource)
+	set intBankLine       = $$$KEY2(pstrSource)
+	set pstrSource        = idPostedFINARBank_" "_intBankLine  
+ 
+	if $find(LastInvoice,strUnalloc)  {  ;an outstanding un-allocated invoice exists
+		if 'pblnReverse {
+			set Number = $piece(LastInvoice," - ",2)+1
+			
+			while $data(^CacheTempUnAlloc(YUSER,Number)) {
+				set Number = $increment(Number)
+			}
+			set ^CacheTempUnAlloc(YUSER,Number) = ""
+			
+			set Number        = $translate($justify(Number,3)," ","0")
+			set InvoiceNumber = strUnalloc_" - "_Number  ;generate new invoice number
+ 
+		} else { //SR14734 
+			set objPostedFINARBank = $get(^FINARBank(YM,idPostedFINARBank,1))
+			set intPostBatch = $$$FINARBankPostBatch(objPostedFINARBank)
+			set intPostBlock = $$$FINARBankPostBlock(objPostedFINARBank)
+ 			set intBatchLine = $order(^FININTBatchLines(YM,7,"ACP",intPostBlock,pstrSource,intPostBatch,""),-1)
+			
+			//If Source with BankLine not found, re-try with just source - ie. for old data!
+			if intBatchLine = "" {
+				set pstrSource = idPostedFINARBank
+				set intBatchLine = $order(^FININTBatchLines(YM,7,"ACP",intPostBlock,pstrSource,intPostBatch,""),-1)
+			}
+			
+			while $data(^CacheTempUnPostUnAlloc(YUSER,intBatchLine)) {
+				set intBatchLine = $order(^FININTBatchLines(YM,7,"ACP",intPostBlock,pstrSource,intPostBatch,intBatchLine))
+			}
+			set ^CacheTempUnPostUnAlloc(YUSER,intBatchLine)=""
+ 
+			set objPostedBatchLine = $get(^FININTBatchLine(YM,intPostBatch,intBatchLine,1))
+			set InvoiceNumber = $piece($$$FININTBatchLineParameters(objPostedBatchLine),",",2)
+		}
+	
+	} else {
+		set InvoiceNumber = strUnalloc_" - 001"
+	}
+	quit Status
+	
+ 
+OnPayAllChange()
+	if YINHALT'=0 {
+		set %TXT(1)="#Y"_YFORM_"M7~"_"READ"
+		set %TXT(1)=%TXT(1)_"#Y"_YFORM_"M7~"
+	} else {
+		set %TXT(1)="#Y"_YFORM_"M7~"_"WRITE"
+	}
+	quit
+	
+	
+ShowInvoiceDetail(Key)
+    ;-------------------------------------------------------------------------------
+	; List Invoice details,
+	; Scan Invoice transactions to get Interface detials
+	; Show Interface Line details for the Interface/Block/Ref
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 30-Jun-2006	SC		SR14751: Links to goto source instead of batch.
+    ; 21-Apr-2005	PaulK	Added Seperator for each transaction SR:11830
+    ; 14-Nov-2003	shobby	Some AP macros should have been AR
+    ;-------------------------------------------------------------------------------
+	new Status,Customer,Invoice,Form,lstHeader,Tran,TranRec,Batch,InvLine,InvLineRec,Block
+	new Line,LineRec,Account,AccountRec,TypeRec,Type,Ref,objBatchBlock,objBatchLine
+	
+	set Status=$$$OK
+	set Customer=$piece(Key,$$$COMMA,1)
+	set Invoice=$piece(Key,$$$COMMA,2)
+	
+	if (Customer="")!(Invoice="") set Status='$$$OK
+	set Form="FININTBatch"
+	
+	set lstHeader=""
+	set lstHeader=lstHeader_$lb($$$StrFINARInvoiceTranDate1)
+	set lstHeader=lstHeader_$lb($$$StrFININTBatchLineAccount)
+	set lstHeader=lstHeader_$lb($$$StrFININTBatchLineAmount)
+	set lstHeader=lstHeader_$lb($$$StrFININTBatchLineInterfaceType)
+	set lstHeader=lstHeader_$lb($$$StrFININTBatchLineReference)
+	
+	do Start^COMTable(lstHeader,$listbuild("Fin00195",Customer,Invoice))  ; Invoice detail for Customer %1 for Invoice %2
+	
+	if Status=$$$OK {
+		set Tran=0
+		for {
+			set Tran=$order(^FINARInvoiceTran(YM,Customer,Invoice,Tran))
+			quit:Tran=""
+			
+			do NewLine^COMTable("Honeydew")
+			do InsertCell^COMTable($$$Text($listbuild("Fin00750",Tran)),"","","","","",5) ;Transaction Number %1
+			do EndLine^COMTable()
+			
+			set TranRec=$get(^FINARInvoiceTran(YM,Customer,Invoice,Tran,1))
+			set Batch=$$$FINARInvoiceTranInterfaceBatch(TranRec)
+			set InvLine=$$$FINARInvoiceTranInterfaceBatchLine(TranRec)
+			
+			if (Batch'="")&(InvLine'="") {
+				set InvLineRec=$get(^FININTBatchLine(YM,Batch,InvLine,1))
+				set Block=$$$FININTBatchLineBlockNumber(InvLineRec)
+				set Ref=$$$FININTBatchLineReference(InvLineRec)
+				set Line=0
+				for  {
+					set Line=$order(^FININTBatchLine(YM,Batch,Line))
+					quit:Line=""
+					
+					set LineRec=$get(^FININTBatchLine(YM,Batch,Line,1))
+					continue:Block'=$$$FININTBatchLineBlockNumber(LineRec)
+					;continue:Ref'=$$$FININTBatchLineReference(LineRec)
+					
+					set Key=Batch
+					set Account=$$$FININTBatchLineAccount(LineRec)
+					if Account'="" {
+						set AccountRec=$get(^FINGLAccount(YM,Account,1))
+						set Account="("_Account_") "_$$$FINGLAccountDescription(AccountRec)
+					}
+					set Type=$$$FININTBatchLineInterfaceType(LineRec)
+					if Type'="" {
+						set TypeRec=$get(^FININTInterfaceType(0,Type,1))
+						set Type="("_Type_") "_$$$FININTInterfaceTypeDescription(TypeRec)
+					}
+ 
+					//SR14751
+					set objBatchBlock = $get(^FININTBatchBlock(YM,Batch,$piece(Block,".",1),1))
+					set objBatchLine = $get(^FININTBatchLine(YM,Batch,Line,1))
+					if ($$$FININTBatchBlockSourceForm(objBatchBlock)'="") & ($$$FININTBatchBlockSourceRec(objBatchBlock)'="") {
+						set Form=$$$FININTBatchBlockSourceForm(objBatchBlock) 
+						set Key=$$$FININTBatchBlockSourceRec(objBatchBlock) 
+					}
+					
+					do NewLine^COMTable()
+					do InsertCellDate^COMTable($$$FINARInvoiceTranDate1(TranRec),Form,Key)
+					do InsertCell^COMTable(Account,Form,Key)  ;currently not pointing to customer invoice because not implemented properly yet (all invoices are dummies)
+					do InsertCurrencyCell^COMTable($$$FININTBatchLineAmount(LineRec),0,Form,Key)
+					do InsertCell^COMTable(Type,Form,Key)  ;currently not pointing to customer invoice because not implemented properly yet (all invoices are dummies)
+					do InsertCell^COMTable($$$FININTBatchLineReference(LineRec),Form,Key)  ;currently not pointing to customer invoice because not implemented properly yet (all invoices are dummies)
+					
+					do EndLine^COMTable()
+				}
+			}
+		}
+	}
+	do Stop^COMTable()
+	quit
+	
+	
+OnBeforeDisplayLine(pYKEY,pYFELD)
+    ;-------------------------------------------------------------------------------
+    ; Grid has requested information about whether to show this invoice or not
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ;  7-Aug-2006	JW		SR14730: Sped up.
+    ; 27-May-2005	SCR		SR12220 Invoice Filter
+    ; 20-May-2005	shobby	Code Check.
+    ; 19-May-2005	JW		SR12383: If in FC, check FC amount = 0
+    ; 16-Feb-2004	sh/paul	Simplified test.
+    ; 06-Dec-2004	shobby	Include YKEY
+    ; 06-Dec-2004	Shobby	Created (SR10468)
+    ;-------------------------------------------------------------------------------
+	new intOutStanding,intOnHold,intOverDue,blnFlag,objInvoice,objManualHeader
+	
+ 	set objManualHeader = $$$GetFormData("FINARCustomer","M")	//SR14730
+ 	set intOutStanding	= $piece(objManualHeader,Y,18)
+	set intOnHold		= $piece(objManualHeader,Y,21)
+	set intOverDue		= $piece(objManualHeader,Y,23)
+ 	
+	set blnFlag=$$$NO
+	set objInvoice=$get(pYFELD)
+	
+	/* SR12383: If in FC, check FC amount.
+	/set curAmount = $$$FINAPInvoiceBalance(objInvoice)
+	if $$$AmountIsFC(curAmount) set curAmount = $$$FCAmount(curAmount)
+	*/
+	
+	if (objInvoice'="") {
+		if ((intOutStanding="")||(intOutStanding=$$$EnumFINSYSTRISTATEBoth)||((intOutStanding='$$$FCZero($$$FINARInvoiceBalance(objInvoice)))))
+		&& ((intOnHold="")     ||(intOnHold 	=$$$EnumFINSYSTRISTATEBoth)||((intOnHold     =$$$EnumFINSYSTRISTATEYes)&&($$$FINARInvoiceOnHold(objInvoice)))    ||((intOnHold     =$$$EnumFINSYSTRISTATENo)&&('$$$FINARInvoiceOnHold(objInvoice))    )) 
+		&& ((intOverDue="")    ||(intOverDue    =$$$EnumFINSYSTRISTATEBoth)||((intOverDue    =$$$EnumFINSYSTRISTATEYes)&&($$$FINARInvoiceDueDate(objInvoice)'>$h))||((intOverDue    =$$$EnumFINSYSTRISTATENo)&&($$$FINARInvoiceDueDate(objInvoice)>$h))) {
+			set blnFlag=$$QueryCheck^FINARInvoiceFilter(pYKEY,objInvoice)
+		}
+	}
+	quit blnFlag
+	
+	
+	/*
+OnBeforeDisplayLine(pYKEY,pYFELD)
+    ;-------------------------------------------------------------------------------
+    ; Grid has requested information about whether to show this invoice or not
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 27-May-2005	SCR		SR12220 Invoice Filter
+    ; 20-May-2005	shobby	Code Check.
+    ; 19-May-2005	JW		SR12383: If in FC, check FC amount = 0
+    ; 16-Feb-2004	sh/paul	Simplified test.
+    ; 06-Dec-2004	shobby	Include YKEY
+    ; 06-Dec-2004	Shobby	Created (SR10468)
+    ;-------------------------------------------------------------------------------
+	new intOutStanding,intOnHold,intOverDue,blnFlag,objInvoice,curAmount
+	
+	set intOutStanding		=$get(VORG(1,1))
+	set intOnHold			=$get(VORG(1,2))
+	set intOverDue			=$get(VORG(1,3))
+ 
+	set blnFlag=$$$YES
+	set objInvoice=$get(pYFELD)
+	
+	// SR12383: If in FC, check FC amount.
+	set curAmount = $$$FINARInvoiceBalance(objInvoice)
+	if $$$AmountIsFC(curAmount) {
+		set curAmount = $$$FCAmount(curAmount)
+	}
+	
+	if objInvoice'="" {
+		if intOutStanding=$$$EnumFINSYSTRISTATENo if curAmount'=0 set blnFlag=0
+		if intOutStanding=$$$EnumFINSYSTRISTATEYes if curAmount=0 set blnFlag=0
+		if intOnHold=$$$EnumFINSYSTRISTATENo if $$$FINARInvoiceOnHold(objInvoice) set blnFlag=0
+		if intOnHold=$$$EnumFINSYSTRISTATEYes if '$$$FINARInvoiceOnHold(objInvoice) set blnFlag=0
+		if intOverDue=$$$EnumFINSYSTRISTATENo if $$$FINARInvoiceDueDate(objInvoice)>$h set blnFlag=0
+		if intOverDue=$$$EnumFINSYSTRISTATEYes if '$$$FINARInvoiceDueDate(objInvoice)>$h set blnFlag=0
+		
+		if blnFlag=$$$YES {
+			set blnFlag=$$QueryCheck^FINARInvoiceFilter(pYKEY,objInvoice)
+		}
+	}
+	quit blnFlag
+ 	*/
+ 
+ShowInvoices(Customer="",pVORG=1)
+	;-------------------------------------------------------------------------------
+	; Show Invoices for a Customer
+	; 24-Sep-2004	shobby		DueDate selection was the wrong way around (SR10379)
+	; 20-Sep-2004	shobby		Changed invoice selection to use dropdowns rather than checkboxes. (SR10379)
+	; 28-Jun-2004	shobby		Selection controls for invoices outstanding/overdue/on hold (SR7623)
+	; 03-Mar-2004	SCR			Created / Copied
+	;
+	; not used in code exactly, just a template of a query
+	;-------------------------------------------------------------------------------
+	
+	new Header,Form,CustomerKey,DueDate,InvoiceKey,Invoice,objInvoice,Key
+	new intOutStanding,intOnHold,intOverDue
+ 
+	set intOutStanding		=$get(pVORG(1,1))
+	set intOnHold			=$get(pVORG(1,2))
+	set intOverDue			=$get(pVORG(1,3))
+ 
+	set Header=""
+	set Header=Header_$lb($$$StrFINARInvoiceInvoiceNumber)
+	set Header=Header_$lb($$$StrFINARInvoiceInvoiceDate)
+	set Header=Header_$lb($$$StrFINARInvoiceDueDate)
+	set Header=Header_$lb($$$StrFINARInvoiceInvoiceTotal)
+	set Header=Header_$lb($$$StrFINARInvoiceSettlementDiscount)
+	set Header=Header_$lb($$$StrFINARInvoiceBalance)
+	set Header=Header_$lb($$$StrFINARInvoiceOnHold)
+	set Form="FINARInvoice"
+	if Customer="" set Customer=" "
+ 
+	do Start^COMTable(Header,$$$Text($listbuild("Fin00269",Customer)))  ;Show Invoices for Customer %1
+	set CustomerKey = $$Index^FINSYS(Customer)
+	set DueDate=""
+	for {
+		set DueDate=$order(^FINARInvoices(YM,1,CustomerKey,DueDate))
+		quit:DueDate=""
+		
+		set InvoiceKey=""
+		for {
+			set InvoiceKey=$order(^FINARInvoices(YM,1,CustomerKey,DueDate,InvoiceKey))
+			quit:InvoiceKey=""
+			
+			set Invoice=""
+			for {
+				set Invoice=$order(^FINARInvoices(YM,1,CustomerKey,DueDate,InvoiceKey,Customer,Invoice))
+				quit:Invoice=""
+				
+				set objInvoice=$get(^FINARInvoice(YM,Customer,Invoice,1))
+ 
+	 			if ((intOutStanding="")||(intOutStanding=$$$EnumFINSYSTRISTATEBoth)||((intOutStanding=$$$EnumFINSYSTRISTATEYes)&&($$$FINARInvoiceBalance(objInvoice)'=0))||((intOutStanding=$$$EnumFINSYSTRISTATENo)&&($$$FINARInvoiceBalance(objInvoice)=0)  ))
+	 			&& ((intOnHold="")     ||(intOnHold 	=$$$EnumFINSYSTRISTATEBoth)||((intOnHold     =$$$EnumFINSYSTRISTATEYes)&&($$$FINARInvoiceOnHold(objInvoice)))    ||((intOnHold     =$$$EnumFINSYSTRISTATENo)&&('$$$FINARInvoiceOnHold(objInvoice))    )) 
+	 			&& ((intOverDue="")    ||(intOverDue    =$$$EnumFINSYSTRISTATEBoth)||((intOverDue    =$$$EnumFINSYSTRISTATEYes)&&($$$FINARInvoiceDueDate(objInvoice)'>$h))||((intOverDue    =$$$EnumFINSYSTRISTATENo)&&($$$FINARInvoiceDueDate(objInvoice)>$h))) {
+					set Key=Customer_","_Invoice
+					do NewLine^COMTable()
+					do InsertCell^COMTable(Invoice,Form,Key)  
+					do InsertCellDate^COMTable($$$FINARInvoiceInvoiceDate(objInvoice),Form,Key)
+					do InsertCellDate^COMTable($$$FINARInvoiceDueDate(objInvoice),Form,Key)
+					do InsertCurrencyCell^COMTable($$$FINARInvoiceInvoiceTotal(objInvoice),0,Form,Key)
+					do InsertCurrencyCell^COMTable($$$FINARInvoiceSettlementDiscount(objInvoice),0,Form,Key)
+					do InsertCurrencyCell^COMTable($$$FINARInvoiceBalance(objInvoice),0,Form,Key)
+					do InsertCellBoolean^COMTable($$$FINARInvoiceOnHold(objInvoice),Form,Key) 
+					do EndLine^COMTable()
+				}
+			}
+		}
+	}
+	do Stop^COMTable()
+	quit
+	
+	
+GetGLEffDate(pidCustomer,pidInvoice)
+	;-------------------------------------------------------------------------------
+	; For a customer invoice, retrieve its GL Effective date.
+	;
+	; Params: pidCustomer		: The customer number
+	; 		  pidInvoice		: The invoice number
+	;
+	; ByRefs:
+	;
+	; Returns: dteGLEff (date)
+	;
+	; History:
+	; 03-Mar-2006	SteveS	SR13474: Use $$GetTransactionDate^FININTBatch
+	; 03-Feb-2006	SteveS	SR13474: Created
+	;-------------------------------------------------------------------------------
+	new dteGLEff,idTran,objTran,idBatch,objBatch
+ 
+	set dteGLEff = ""
+	
+	if ($get(pidCustomer)'="") && ($get(pidInvoice)'="") {
+		set idTran = $order(^FINARInvoiceTran(YM,pidCustomer,pidInvoice,""))
+		if idTran'="" {
+			set objTran = $get(^FINARInvoiceTran(YM,pidCustomer,pidInvoice,idTran,1))
+			set idBatch = $$$FINARInvoiceTranInterfaceBatch(objTran)
+			if (idBatch'="") {
+				set objBatch = $get(^FININTBatch(YM,idBatch,1))
+				set dteGLEff = $$$FININTBatchTransactionDate(objBatch)
+				if dteGLEff="" {
+					set dteGLEff = $$GetTransactionDate^FININTBatch($$$FININTBatchBatchDate(objBatch),$$$FININTBatchBatchType(objBatch))	
+				}	
+			}		
+		}	
+	}
+	quit dteGLEff
+	
+]]></Routine>
+</Export>

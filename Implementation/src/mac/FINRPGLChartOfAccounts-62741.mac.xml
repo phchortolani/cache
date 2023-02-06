@@ -1,0 +1,455 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINRPGLChartOfAccounts" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINRPGLChartOfAccounts
+	
+#include COMSYS
+#include FINConst
+	
+#define SortIndex			$increment(^CacheTempFINGLAccountSort($zutil(5),YUSER))
+#define GetSortIndex(%1)	$get(^CacheTempFINGLAccountSort($zutil(5),YUSER,%1))
+#;define AddToRow(%1,%2)	set %1=%1_$listbuild($select(%2'="":%2,1:"---"))   ; SR15632
+ 
+ 
+ChartOfAccounts(pidCompany,pYUSER,pblnParentOnly=$$$NO,
+				pstrSortBy=$$$EnumFINGLCOASORTBYAccountNumber,pstrAccType="",pidLang)
+	;-------------------------------------------------------------------------------
+	; Do the required processing to produce the chart of accounts.
+	;
+	; Params:	pidCompany		: The company number (YM)
+	; 			pYUSER			: The session id (YUSER)
+	; 			pblnParentOnly	: Whether to just show parents
+	; 			pstrSortBy		: How to sort
+	; 			pstrAccType		: Account type filter
+	; 			pidLang			: The language
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Jan-2007	SteveS	SR15355: Use sortbegin/sortend functions
+	; 							 Use namespace subscript
+	; 31-May-2006	SteveS	SR14526: Created
+	;-------------------------------------------------------------------------------
+	new YM,YUSER,idAccount,objFINGLAccount,strType,strUsage,idx,SPRACHE
+	new ret
+
+	set YM      = $get(pidCompany)
+	set YUSER   = $get(pYUSER)
+	set SPRACHE = $get(pidLang)
+	
+	if $ascii(pstrAccType)=0 set pstrAccType = ""
+	
+	if (pstrSortBy=$$$EnumFINGLCOASORTBYTreeHierarchy) {
+		do Traverse("")
+	}
+	
+	set ret = $sortbegin(^CacheTempData)
+	
+	set idAccount = ""
+	if $data(^CacheTempAccounts(YUSER)) { // only selected accounts
+		for {
+			set idAccount=$order(^CacheTempAccounts(YUSER,idAccount))
+			quit:(idAccount="")
+			
+			set objFINGLAccount	= $get(^FINGLAccount(YM,idAccount,1))
+			set strType			= $$$FINGLAccountAccountType(objFINGLAccount)
+			set strUsage		= $$$FINGLAccountAccountUsage(objFINGLAccount)
+			
+			// usage check
+			continue:(pblnParentOnly)&&(strUsage'=$$$EnumFINGLACCOUNTUSAGEParent)
+			
+			// type check
+			continue:(pstrAccType'="")&&('$find(","_pstrAccType_",",","_strType_","))
+			
+			do Store(idAccount,pstrSortBy)
+		}
+		
+	} else { // entire GL tree
+		if pstrAccType="" {
+			for {
+				if pblnParentOnly {
+					set idAccount=$order(^FINGLAccounts(YM,3,$$$EnumFINGLACCOUNTUSAGEParent,idAccount))
+				} else {
+					set idAccount=$order(^FINGLAccount(YM,idAccount))
+				}
+				
+				quit:(idAccount="")
+				
+				do Store(idAccount,pstrSortBy)
+			}
+		} else {
+			for idx=1:1:$length(pstrAccType,",") {
+				set strType=$piece(pstrAccType,",",idx)
+				for {
+					set idAccount=$order(^FINGLAccounts(YM,4,strType,idAccount))
+					quit:(idAccount="")
+					
+					set objFINGLAccount=$get(^FINGLAccount(YM,idAccount,1))
+					
+					continue:(pblnParentOnly)&&($$$FINGLAccountAccountUsage(objFINGLAccount)'=$$$EnumFINGLACCOUNTUSAGEParent)
+					
+					do Store(idAccount,pstrSortBy)
+				}
+			}	
+		}
+	}
+	
+	set ret = $sortend(^CacheTempData) //SR15355
+	
+	do PrepareData^COMRPUtil(YUSER) //SR15355
+	
+	kill ^CacheTempFINGLAccountSort($zutil(5),YUSER)
+	
+	quit
+	
+	
+Store(pidAccount,pstrSortBy)
+	;-------------------------------------------------------------------------------
+	; Store this account number in temp storage for the report
+	;
+	; Params:	pidAccount		: The account number
+	; 			pstrSortBy		: How we're sorting
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-May-2006	Steve S		SR14526: Created
+	;-------------------------------------------------------------------------------
+	new strDesc,idx,lstRow,intRow,strNS
+	
+	set strNS  = $zutil(5)
+	set lstRow = $$BuildRow(pidAccount)
+	set intRow = $increment(^CacheTempData(strNS,YUSER))
+ 
+	if pstrSortBy=$$$EnumFINGLCOASORTBYAccountNumber {
+		set ^CacheTempData(strNS,YUSER,pidAccount,intRow) = lstRow
+		
+	} elseif pstrSortBy=$$$EnumFINGLCOASORTBYAccountDescription {
+		set strDesc=$$$FINGLAccountDescription($get(^FINGLAccount(YM,pidAccount,1)))
+		if strDesc="" set strDesc=-999999999999999 //avoid subscript problems
+		set ^CacheTempData(strNS,YUSER,strDesc,intRow)=lstRow
+		
+	} elseif pstrSortBy=$$$EnumFINGLCOASORTBYTreeHierarchy {
+		set ^CacheTempData(strNS,YUSER," ",$$$GetSortIndex(pidAccount))=lstRow
+	}
+	
+	quit
+	
+	
+BuildRow(pidAccount)
+	;-------------------------------------------------------------------------------
+	; Build an account row for the report
+	;
+	; Params: pidAccount		: The account number
+	;
+	; ByRefs:
+	;
+	; Returns: lstRow (the row)
+	;
+	; History:
+	; 14-Oct-2009	GRF		SR15632: Macro replacement
+	; 31-May-2006	SteveS	SR14526: Created
+	;-------------------------------------------------------------------------------
+	new lstRow,objFINGLAccount,enmType,strType,strUsage,enmUsage
+	new strDesc,idParent
+ 
+	set objFINGLAccount=$get(^FINGLAccount(YM,pidAccount,1))
+	
+	set enmType = $$$FINGLAccountAccountType(objFINGLAccount)
+	set strType = ""
+	if (enmType'="") set strType = $$$WWW101Text($get(^WWW101(0,"FINGLACCOUNTTYPE",SPRACHE,enmType,1)))
+	
+	set enmUsage = $$$FINGLAccountAccountUsage(objFINGLAccount)
+	set strUsage = ""
+	if (enmUsage'="") set strUsage = $extract($$$WWW101Text($get(^WWW101(0,"FINGLACCOUNTUSAGE",SPRACHE,enmUsage,1))))
+	
+	set strDesc 	= $$$FINGLAccountDescription(objFINGLAccount)
+	set idParent 	= $$$FINGLAccountParent(objFINGLAccount)
+ 
+	set lstRow=""
+	
+	/*   ; SR15632
+	$$$AddToRow(lstRow,pidAccount)
+	$$$AddToRow(lstRow,strDesc)
+	$$$AddToRow(lstRow,idParent)
+	$$$AddToRow(lstRow,strType)
+	$$$AddToRow(lstRow,strUsage)
+	*/
+	$$$AddToRow($$$Display(pidAccount))
+	$$$AddToRow($$$Display(strDesc))
+	$$$AddToRow($$$Display(idParent))
+	$$$AddToRow($$$Display(strType))
+	$$$AddToRow($$$Display(strUsage))
+ 
+	quit lstRow
+ 
+	
+Traverse(pidAccount="")
+	;-------------------------------------------------------------------------------
+	; Traverse the account tree, assigning a sort index
+	;
+	; Params: pidAccount	: The parent account to traverse under
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-May-2006	Steve S		SR14526: Created
+	;-------------------------------------------------------------------------------
+	new idAcc,idAccountIdx
+ 
+	if pidAccount="" kill ^CacheTempFINGLAccountSort($zutil(5),YUSER)
+ 
+	set idAccountIdx=$$$Index(pidAccount)
+	set idAcc=""
+	
+	for {
+		set idAcc=$order(^FINGLAccounts(YM,50,idAccountIdx,idAcc))
+		quit:(idAcc="")
+		
+		set ^CacheTempFINGLAccountSort($zutil(5),YUSER,idAcc)=$$$SortIndex
+		do Traverse(idAcc)
+	}
+ 
+	quit
+	
+AccountSearch()
+	;-------------------------------------------------------------------------------
+	; Fire up the account selection COMView
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-May-2006	Steve S		SR14526: Created
+	;-------------------------------------------------------------------------------
+	new YMFELD,strAccountTypes,blnParentOnly,idx,strType,lstTypes
+	
+	do Initialise^COMViewCustom("FINGLAccount","AccountSelected^FINRPGLChartOfAccounts")
+	
+	set YMFELD=$$GetFormData^COMUtilForm(YFORM,"M")
+	
+	set strAccountTypes=$piece(YMFELD,Y,3)
+	set blnParentOnly=$piece(YMFELD,Y,4)
+	
+	if blnParentOnly { // parents only
+		do AddFilter^COMViewCustom("D"_$$$FldFINGLAccountAccountUsage,"=",$$$EnumFINGLACCOUNTUSAGEParent)
+	}
+	
+	if strAccountTypes'="" {
+		set lstTypes=$listbuild($$$EnumFINGLACCOUNTTYPEIncome,
+								$$$EnumFINGLACCOUNTTYPEExpense,
+								$$$EnumFINGLACCOUNTTYPEAsset,
+								$$$EnumFINGLACCOUNTTYPELiability,
+								$$$EnumFINGLACCOUNTTYPETopAccount,
+								$$$EnumFINGLACCOUNTTYPEEquity,
+								$$$EnumFINGLACCOUNTTYPEStatistical)
+		for idx=1:1:$listlength(lstTypes) {
+			set strType=$list(lstTypes,idx)
+			if '$find(";"_strAccountTypes_";",";"_strType_";") {
+				do AddFilter^COMViewCustom("D"_$$$FldFINGLAccountAccountType,"'=",strType)
+			}
+		}
+	}
+	
+	do Start^COMViewCustom()
+	
+	quit $$$OK
+	
+	
+AccountSelected(pobjResultSet)
+	;-------------------------------------------------------------------------------
+	; Call back when an account is selected
+	;
+	; Params: pobjResultSet		(the result set)
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-May-2006	Steve S		SR14526: Created
+	;-------------------------------------------------------------------------------
+	new idAccount,arrData
+	
+	while pobjResultSet.Next() {
+		set idAccount=$$GetID^COMViewCustom(pobjResultSet)
+		if (idAccount'="") set ^CacheTempAccounts(YUSER,idAccount)=""
+	}
+ 
+	do UpdateSelected(.arrData)
+	
+	$$$StartScript()
+	write "document.WWW2.AccountsSelected.value="""_arrData("AccountsSelected")_""";",!
+	write "document.WWW2.AccountsSelectedCounter.value="_arrData("AccountsSelectedCounter")_";",!
+ 	$$$EndScript()
+ 	
+ 	do AccountMessage()
+ 
+	quit
+	
+	
+OnAfterDataFields()
+	;-------------------------------------------------------------------------------
+	; Routine to run after data fields of the parameter input form
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-May-2006	Steve S		SR14526: Created
+	;-------------------------------------------------------------------------------
+	new arrData
+	
+	if '$data(YMFELD) {
+		kill ^CacheTempAccounts(YUSER)
+		kill ^CacheTempView(YUSER)
+	}
+ 
+ 	if YSEITE=1 {
+	 	do UpdateSelected(.arrData)
+	 	write "<B>"_$$$Text("Fin01033")_"</B>",! ;Accounts Selected
+		write "",!
+		write "<table style='font-size:14px'>",!
+		write "<tr>",!
+		write "<td><input readonly style='background-color:lightgrey' size=10 name='AccountsSelectedCounter' value='"_arrData("AccountsSelectedCounter")_"'>",!
+		write "<div id='StatusMessage' style='display:inline;'></div>"
+		write "</td></tr>",!
+		
+		write "<tr>",!
+		write "<td><textarea readonly style='background-color:lightgrey' cols=95 rows=25 name='AccountsSelected'></textarea></td>",!
+		write "</tr>",!
+		write "</table>",!
+		
+		$$$StartScript()
+		write "document.WWW2.AccountsSelected.value="""_arrData("AccountsSelected")_""";",!
+		do AccountMessage()
+		$$$EndScript()
+	}
+	
+	quit
+	
+	
+UpdateSelected(parrData)
+	/*------------------------------------------------------------------------------
+	; Update current data selected accounts
+	;
+	; Params:
+	;
+	; ByRefs: parrData		: The array with the account data
+	;
+	; Returns:
+	;
+	; History:
+	; 31-May-2006	Steve S		SR14526: Created
+	;-----------------------------------------------------------------------------*/
+	new idAccount,intCount,strAccounts,strName,blnLimit,strText
+	
+	set intCount=0
+	set idAccount=""
+	
+	set strAccounts=""
+	set blnLimit=$$$NO
+	
+	for {
+		set idAccount=$order(^CacheTempAccounts(YUSER,idAccount))
+		quit:(idAccount="")
+		
+		set intCount=intCount+1
+		
+		if (intCount<=500) {
+			set strAccounts=strAccounts_$justify(idAccount,30)
+			set strName=$$$FINGLAccountDescription($get(^FINGLAccount(YM,idAccount,1)))
+			if strName="" set strName="---"
+			set strAccounts=strAccounts_": "_strName_"\n"
+		} else {
+			if 'blnLimit {
+				set blnLimit=$$$YES
+				set strText=$zconvert($$$Text("Fin00967"),"U")  ;Only displaying first 500 entries
+				set strAccounts=$justify(strText,5)_"\n"_strAccounts
+			}	
+		}
+	}
+	
+	set parrData("AccountsSelected")=strAccounts
+	set parrData("AccountsSelectedCounter")=intCount
+	
+	quit
+	
+	
+AccountMessage()
+	;-------------------------------------------------------------------------------
+	; Hide/show the "entire tree will be shown" message
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-May-2006	Steve S		SR14526: Created
+	;-------------------------------------------------------------------------------
+	$$$StartScript()
+	if '$data(^CacheTempAccounts(YUSER)) {
+		;No accounts selected! Entire GL Tree will be shown.
+		write "document.getElementById('StatusMessage').innerHTML='<'+'font color=\'red\'><b>"_$$$Text("Fin01036")_"</b><'+'/font>'"
+	} else {
+		write "document.getElementById('StatusMessage').innerHTML=''"
+	}
+	$$$EndScript()
+ 
+	quit
+ 
+GetAccountFilters(pidCompany,pstrTypes="",pidLang)
+	;-------------------------------------------------------------------------------
+	; Get a textual description of the account filters being used
+	;
+	; Params:	pidCompany		: The company number
+	; 			pstrTypes		: The filters (; delimited)
+	; 			pidLang			: The language being used
+	;
+	; ByRefs:
+	;
+	; Returns: strDesc
+	;
+	; History:
+	; 31-May-2006	Steve S		SR14526: Created
+	;-------------------------------------------------------------------------------
+	new YM,SPRACHE,strDesc,idx,strType,strTypeDesc
+ 
+	set YM=$get(pidCompany)
+	set SPRACHE=$get(pidLang)
+	
+	set strDesc=""
+	
+	if ($ascii(pstrTypes)=0)||(pstrTypes="") {
+		set strDesc=$$^WWWTEXT("Fin00888",,,pidLang)  ;None
+	} else {
+		for idx=1:1:$length(pstrTypes,",") {
+			set strType=$piece(pstrTypes,",",idx)
+			if (strType'="") {
+				set strTypeDesc=$$$AppEnum("FINGLACCOUNTTYPE",strType)
+				if (strDesc="") {
+					set strDesc=strTypeDesc	
+				} else {
+					set strDesc=strDesc_", "_strTypeDesc
+				}
+			}
+		}
+	}
+	
+	quit strDesc
+]]></Routine>
+</Export>

@@ -1,0 +1,305 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INPOrder" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INPOrder
+	
+#include COMSYS
+#include INConst
+	
+CreateOrderFromReq(pidReq,&pstrOrders)
+	;-------------------------------------------------------------------------------
+	; Create PO using a Req
+	;
+	; Params:pidReq - Requisition ID
+	;
+	; ByRefs: None
+	;
+	; Returns: Status
+	;
+	; History:
+	; 19-May-2011	PPP		SR17767: Created
+	;-------------------------------------------------------------------------------
+	new arrLine,arrOrdLine,dteDate,idLine,idLocn,idOrder,idSupplier
+	new intCount,objReq,objReqLine,strOrders,strStatus
+	
+	set strStatus = $$$OK
+	
+	set objReq = $get(^INReq(0,pidReq,1))
+	set idLocn = $$$INReqFromLocn(objReq)
+	set dteDue = $$$INReqDueDate(objReq)
+	if dteDue = "" set dteDue = +$horolog
+	
+	set idLine = ""
+	for {
+		set idLine = $order(^INReqLine(0,pidReq,idLine))
+		quit:idLine=""
+		
+		set objReqLine = $get(^INReqLine(0,pidReq,idLine,1))
+		set idSupplier = $piece(objReqLine,Y,14)    ; FIXME : FREE3 - change to explicit field use?
+		
+		if idSupplier '= "" {
+			set arrLine(idSupplier,dteDue,$increment(intCount)) = 	
+				$$$INReqLineItem(objReqLine)_Y_
+				$$$INReqLineUnit(objReqLine)_Y_
+                $$$INReqLineQtyOrdered(objReqLine)_Y_
+                $$$Coalesce(pidReq_"/"_idLine," ")
+		}
+	}
+	
+	set pstrOrders = ""
+	set idSupplier = ""
+	for {
+		set idSupplier = $order(arrLine(idSupplier))
+		quit:idSupplier=""
+		
+		set dteDate = ""
+		for {
+			kill idOrder
+			
+			set dteDate = $order(arrLine(idSupplier,dteDate))
+			quit:dteDate=""
+			
+			merge arrOrdLine = arrLine(idSupplier,dteDate)
+			set strStatus = $$CreateSupplierOrder(idSupplier,.arrOrdLine,idLocn,dteDate,.idOrder)			
+			if $$$ISOK(strStatus) {
+				set pstrOrders = pstrOrders_","_idOrder
+			}
+			quit:$$$ISERR(strStatus)
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+	
+CreateSupplierOrder(pidSupplier,&parrLine,pidLocn,pdteDate,&pidOrder) // SR15365
+	;-------------------------------------------------------------------------------
+	; Create the supplier orders for the products/ata numbers.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-May-2011	PPP		SR17767: Created
+	;-------------------------------------------------------------------------------
+	new arrLines,arrLocks,arrReqOrders,blnClose,blnCreated,blnPartial
+	new fltDifference,fltConv,fltQuantity,fltReqQuantity
+	new idApproval,idATA,idClass,idItem,idOrder,idLastLine,idLine,idOrderType
+	new idReqLine,idReqNo,idReqOrder,idSupplier,idSupUnit,idUnit,intCount,intLoop
+	new objINARTK,objINReqToSup,objLine,objManualFields,objOrderLine,objReq,objReqLine
+	new strClass,strLock,strProcessNumber,strQuery,strStatus
+	new AUF,POS,YAUFTRAG,YATA,YKEY,YPOSITION
+	
+	set idOrderType = 2 ; Order Type 2 = Supplier Order
+	set strStatus   = $$$OK
+	
+	set AUF      = ""
+	set YAUFTRAG = ""
+	set $$$INAUFLocation(YAUFTRAG)             = pidLocn
+	set $$$INAUFSupplierNumber(YAUFTRAG)       = pidSupplier
+	set $$$INAUFOrderType(YAUFTRAG)            = idOrderType
+ 	set $$$INAUFOrderCompleted(YAUFTRAG)       = $$$NO
+	set $$$INAUFRequiredDeliveryDate(YAUFTRAG) = pdteDate
+	
+	do AUFTRAG^INAUFANLAGE
+	
+	set idLastLine = 0
+	
+	if AUF'="" {
+		//set strQuery = "parrLine"
+		set intCount=""
+		for {
+			//set strQuery = $query(@strQuery)
+			//quit:strQuery=""
+			
+			set intCount = $order(parrLine(intCount))
+			quit:intCount=""
+			
+			set YPOSITION   = ""
+			set objLine     = $get(parrLine(intCount))
+			set idItem      = $piece(objLine,Y,1)
+			set idUnit      = $piece(objLine,Y,2)
+			set fltQuantity = $piece(objLine,Y,3)
+			set idReqNo     = $piece(objLine,Y,4)
+			
+			set $$$INAUFPItemNumber(YPOSITION)      = idItem
+			set $$$INAUFPQuantityUnit(YPOSITION)	= idUnit       ; Inventory Unit
+			set $$$INAUFPQuantity(YPOSITION)		= fltQuantity  ; in Inventory Units
+			set $$$INAUFPOrderedUnit(YPOSITION)		= idUnit
+			set $$$INAUFPOrderedQuantity(YPOSITION)	= fltQuantity
+			
+			set objINARTK = $get(^INARTK(0,idItem,pidSupplier,1))
+			set idSupUnit = $$$INARTKDeliveryQuantityUnit(objINARTK)
+			
+			//Set the Qty to be in Purchase Units 
+			;-------------------------------
+			; If require 16 Each and Supplier Unit is box (of 10 Each) then need to order 2 boxes
+			; 
+			; fltQuantity = 16   fltConv = 10   fltQuantity\fltConv = 1   $select = 1
+			; fltQuantity = 20   fltConv = 10   fltQuantity\fltConv = 2   $select = 0
+			;-------------------------------
+			if (idSupUnit'="") && (idUnit'=idSupUnit) {
+				set fltConv = $$GetUOMConversion^INUOMConversion(idItem,idSupUnit)
+				if fltConv {
+					set fltQuantity = (fltQuantity\fltConv) + $select((fltQuantity#fltConv):1,1:0)
+					set $$$INAUFPQuantity(YPOSITION)        = fltQuantity*fltConv
+					set $$$INAUFPOrderedUnit(YPOSITION)		= idSupUnit
+					set $$$INAUFPOrderedQuantity(YPOSITION)	= fltQuantity
+				}
+			}
+			
+			set $$$INAUFPRequisitionProcessNumber(YPOSITION) = idReqNo
+			
+			set POS   = "" 
+			do POSITION^INAUFANLAGE
+			
+			if '$data(^INAUFP(0,AUF,$increment(idLastLine))) {
+				set strStatus = "Unable to create Purchase Order Line "_idLastLine
+			;	set strStatus = "IN00628"  ; "Unable to create Purchase Order Line."
+			}
+		}
+	} else {
+		set strStatus = "IN00627"  ; "Unable to create Purchase Order."
+	}
+	set pidOrder = AUF
+	quit strStatus
+	
+	
+CanEmail(pidOrder)
+	;-------------------------------------------------------------------------------
+	; Called from the Button #30 on INAUF (Can the PO be emailed)
+	;
+	; Params:pidOrder - Order ID
+	;
+	; ByRefs: None
+	;
+	; Returns: None
+	;
+	; History:
+	; 24-Nov-2011	PPP		SR17966: Only for S/O
+	; 24-May-2011	PPP		SR17767: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	new idCust
+	new idSup
+	new idEmail
+	
+	set strStatus = $$$OK
+		
+	if '$$$NoKey(pidOrder) {
+		set objOrder = $get(^INAUF(0,pidOrder,1))
+		//SR17966
+		set idType = $$$INAUFOrderType(objOrder)
+		if idType = 0 {			//Customer Order
+			set idCust    = $$$INAUFCustomerNumber(objOrder)
+			//set idEmail  = $$$INKUNDEEMail($get(^INKUNDE(0,idCust,1)))
+			//if idEmail = "" 
+			//Currently for CO set it as error as there is no C/O format that can be printed only S/O format exists
+			set strStatus = $listbuild(46)      ; "No Data Available"	
+		} elseif idType = 2 {	//Supplier Order
+			set idSup    = $$$INAUFSupplierNumber(objOrder)
+			set idEmail  = $$$INLIEFEmail($get(^INLIEF(0,idSup,1)))
+			if idEmail = "" set strStatus = $listbuild(46)      ; "No Data Available"			
+		} else {
+			set strStatus = $listbuild(46)       				; "No Data Available"
+		}
+		
+	} else {
+		set strStatus = $listbuild(32072)        ; "Please select a data record first."
+	}
+	
+	$$$YQHandler(strStatus)
+	
+	quit
+	
+	
+EMailPO(pidOrder,pblnReloadForm=$$$YES)
+	;-------------------------------------------------------------------------------
+	; Print the PO 
+	;	1. using a ZENREPORTS as a HTML File
+	;	2. Attach HTML file to Email and send file to User
+	;
+	; Params:pidOrder - Order ID
+	;
+	; ByRefs: None
+	;
+	; Returns: Status
+	;
+	; History:
+	; 24-Nov-2011	PPP		SR17966: Added checks for S/O, C/O & M/O
+	; 24-May-2011	PPP		SR17767: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	new idType
+	
+	set strStatus = $$$NO
+	
+	do CanEmail(pidOrder)
+	
+	if YQ = $$$YQEnable {
+		//SR17966
+		set idType = $$$INAUFOrderType($get(^INAUF(0,pidOrder,1)))
+		if idType = 2 {		//Only S/O
+			set strStatus = $$Transaction^COMTransaction("EMailPOTxn^INPOrder("""_pidOrder_""")",1)
+		}
+		
+		if $$$ISOK(strStatus) && pblnReloadForm {
+			set YSEITE = 1 // FIXME: This does not even fix all cases where page two is displayed.
+			do ReloadForm^COMUtilForm()
+		}
+	} else {
+		do ReturnError^COMUtils($$$YQMessage)
+	}
+	quit strStatus
+	
+	
+EMailPOTxn(pidOrder)
+	;-------------------------------------------------------------------------------
+	; Print the PO 
+	;	1. using a ZENREPORTS as a HTML File
+	;	2. Attach HTML file to Email and send file to User
+	;
+	; Params:pidOrder - Order ID
+	;
+	; ByRefs: None
+	;
+	; Returns: Status
+	;
+	; History:
+	; 16-Jul-2013	shobby	CORE-385.23: Removed dependency on REP Module
+	; 24-May-2011	PPP		SR17767: Created
+	;-------------------------------------------------------------------------------
+	new arrDisp,idEmail,idFile,idOrdLocn,intLine
+	new lstParams,objOrder,strLocn,strStatus
+	
+	$$$VAR
+	
+	set objOrder    = $get(^INAUF(0,pidOrder,1))
+	set idOrdLocn   = $$$INAUFLocation(objOrder)
+	set idSup       = $$$INAUFSupplierNumber(objOrder)
+	
+	set idEmailList = $$$INLIEFEmail($get(^INLIEF(0,idSup,1)))
+	set lstParams	= $listbuild($listbuild("PurchaseOrderNumber",pidOrder),$listbuild("AlphaUser",$get(YBED)))
+	
+	set strStatus 	= $$RunReport^COMREP("INAUF",lstParams,$get(YBED),.idFile) ;CORE-385.23
+	
+	if $$$ISOK(strStatus) && (idEmailList'="") {
+		set strLocn = "("_idOrdLocn_") "_$$$WWW0121CompanyName($get(^WWW0121(0,0,idOrdLocn,1)))
+		set strSup  = "("_idSup_") "_$$$INLIEFShortName($get(^INLIEF(0,idSup,1)))
+		
+		set intLine = 1
+		set arrDisp(intLine)="#attach"_idFile
+		set arrDisp($i(intLine))=""
+		set arrDisp($i(intLine))="Purchase Order 	: "_$get(pidOrder)
+		set arrDisp($i(intLine))="From Location 	: "_strLocn
+		set arrDisp($i(intLine))="To Supplier 		: "_strSup
+		set arrDisp($i(intLine))="Printed At		: "_$zdt($horolog,3)
+		set arrDisp($i(intLine))="PO File			: "_$get(idFile)
+		
+	//	do SendEmail^COMUtilMail(idEmailList,strLocn,"Purchase Order : "_$get(pidOrder),.arrDisp)
+		do SendEmail^COMUtilMail(idEmailList,"demo@dislinc.com","Purchase Order : "_$get(pidOrder),.arrDisp)
+	}
+	quit strStatus
+	
+]]></Routine>
+</Export>

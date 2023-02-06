@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvUnPost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvUnPost
+	#include COMConst
+	#include COMSYS
+	#include FINConst
+ 
+Cancel(pidInvoice="",pblnReverse=$$$NO) 
+    ;-------------------------------------------------------------------------------
+    ; Cancel this voucher.
+    ; 
+    ; Notes:  Used for testing only!!!  Button on form has been removed.
+    ;	
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 20-Sep-2005	shobby		SR13213: Optional reverse flag to 'UnCancel', currently used from a terminal prompt
+    ; 									 for testing purposes only.
+    ; 19-Sep-2005	shobby		SR13213: Created
+    ;-------------------------------------------------------------------------------
+	;
+	new objFINAPInv,strStatus
+	
+	if pidInvoice'="" {
+		set objFINAPInv=$get(^FINAPInv(YM,pidInvoice,1))
+		if objFINAPInv'="" {
+			if pblnReverse {
+				set $$$FINAPInvStatus(objFINAPInv)=$$$EnumFINSYSSTATUSUnposted
+			} else {
+				set $$$FINAPInvStatus(objFINAPInv)=$$$EnumFINSYSSTATUSCancelled
+			}
+			set strStatus=$$Save^COMUtils("FINAPInv",pidInvoice,objFINAPInv,1)
+		}
+	}
+	do ReloadForm^COMUtilForm() 
+	quit
+ 
+ 
+UnPostable(pidInvoice="",pblnPost=$$$YES,pintStatus="") 
+    ;-------------------------------------------------------------------------------
+    ; Determine if this record can be unposted.
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 22-Sep-2005	shobby		SR13213: Pending cancelled functionality has not yet been fully implemented
+    ; 									 Awaiting specifications.
+    ; 20-Sep-2005	shobby		SR13213: Quit with Status rather than YQ
+    ; 19-Sep-2005	shobby		SR13213: Created
+    ;-------------------------------------------------------------------------------
+	;
+	new strStatus,objInvoice
+	set strStatus=$$$OK
+	if $$$NoKey(pidInvoice) set strStatus=$listbuild("Fin00690")  ;Please Select A Data Record First.
+	if $$$ISOK(strStatus) set objInvoice=$get(^FINAPInv(YM,pidInvoice,1))
+	if $$$ISOK(strStatus) set strStatus=$$UnPostable^FINSYSReview("FINAPInv",$$$FINAPInvStatus(objInvoice))
+	if $$$ISOK(strStatus) set strStatus=$$Editable^FINSYSReview("FINAPInv",$$$FINAPInvStatus(objInvoice),.pblnPost,.pintStatus,$$$YES)
+	if $$$ISOK(strStatus) set strStatus=$$IsInvoiceInPostedPayment(pidInvoice) 
+	
+	if strStatus=$$$OK {
+		set YQ=$$$YQEnable
+		if pintStatus=$$$EnumFINSYSSTATUSPending {
+			set pintStatus=$$$EnumFINSYSSTATUSPendingCancelled
+		} elseif pintStatus=$$$EnumFINSYSSTATUSPosted {
+			set pintStatus=$$$EnumFINSYSSTATUSUnposted
+		}
+	} else {
+		set YQ=$$$YQDisable(strStatus)
+		;set YQ="1 "_strStatus
+	}
+	quit strStatus
+ 
+IsInvoiceInPostedPayment(pidVoucher="") 
+    ;-------------------------------------------------------------------------------
+    ; Is this invoice in a posted Supplier Payment?
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 19-Sep-2005	shobby		SR13213: Created
+    ;-------------------------------------------------------------------------------
+	;
+	new strStatus,idPayment,idPaymentLine,objFINAPPaymentLine,objFINAPInv,objFINAPPayment
+	new idInvoice
+	
+	set strStatus=$$$OK
+	
+	set idPayment=""
+	set objFINAPInv=$get(^FINAPInv(YM,pidVoucher,1))
+	if objFINAPInv'="" {
+		set idInvoice=$$$FINAPInvSuppliersInvoiceNumber(objFINAPInv)
+		for {
+			set idPayment=$order(^FINAPPaymentInvoices(YM,2,idInvoice,idPayment))
+			quit:idPayment=""
+			quit:$$$ISERR(strStatus)
+			set idPaymentLine=""
+			for {
+				set idPaymentLine=$order(^FINAPPaymentInvoices(YM,2,idInvoice,idPayment,idPaymentLine))		
+				quit:idPaymentLine=""
+				quit:$$$ISERR(strStatus)
+				set objFINAPPaymentLine=$get(^FINAPPaymentLine(YM,idPayment,idPaymentLine,1))
+				if $$$FINAPPaymentLineSupplierNumber(objFINAPPaymentLine)=$$$FINAPInvInvoiceSupplier(objFINAPInv) {
+					set objFINAPPayment=$get(^FINAPPayment(YM,idPayment,1))
+					if objFINAPPayment'="" {
+						if $$$FINAPPaymentStatus(objFINAPPayment)'=$$$EnumFINSYSSTATUSUnposted {
+							set strStatus=$listbuild("Fin00892",idInvoice,idPayment,idPaymentLine)  ;Can not unpost. Invoice '%1' is in posted payment '%2', line '%3'.
+						}
+					}
+				}
+			}
+		}
+	}
+	quit strStatus
+ 
+ 
+UnPost(pidInvoice="",blnGroupOrSchedule=$$$NO,pblnBatch=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Unpost this record.
+    ; 
+    ; ***********  Note this only works for vouchers.   ******************8888
+    ;
+    ; History:
+    ; 25-Nov-2006	RPW			SR13087: Added intercompany details
+    ; 06-Nov-2005	SCR			SR13578: Added Drill Down Detail to Allocate
+    ; 19-Oct-2005	PO			SR13613: AddInvoice^FINAPInvPost nolonger uses curAPCAmount
+    ; 21-Sep-2005	shobby		SR13213: If record is in Pending status return it to Unposted.
+    ; 20-Sep-2005	shobby		SR13213: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,objInv,idBatch,idBlock,blnPost,objInvoice,curAPCAmount
+	new blnIsVoucher,idParentInvoice,idAccount,intStatus
+	new curAmount,strNumber,idSupplier,strSupplier,strForm,strDetail
+	new blnInterCompany
+	tstart
+ 
+	set blnPost=$$$YES
+	set strStatus=$$UnPostable(pidInvoice,.blnPost,.intStatus)
+	
+	if $$$ISOK(strStatus) {
+		set objInvoice=$get(^FINAPInv(YM,pidInvoice,1))
+		set blnIsVoucher = $$$FINAPInvIsVoucher(objInvoice)
+		set blnInterCompany = $$$FINAPInvInterCompany(objInvoice) && blnIsVoucher ; SR13087
+		
+		if $$$FINAPInvStatus(objInvoice)=$$$EnumFINSYSSTATUSPosted {
+			if blnPost&&$$$ISOK(strStatus) {
+				new idLocation,dteTransaction,idCreator,idDepartment
+				set idLocation     = $$$FINAPInvCreatorsLocation(objInvoice)
+				set dteTransaction = $$$FINAPInvGLEffectiveDate(objInvoice)
+				set idCreator      = $$$FINAPInvCreatedBy(objInvoice)
+				set idDepartment   = $$$FINAPInvCreatorsDepartment(objInvoice)
+				; SR13578 - Source Details for Drill Down - Start
+				set curAmount	   = $$$FINAPInvActualTotal(objInvoice)				; Get the Invoice Amount, used in the details
+				set curAmount	   = $$$FCGetAmountText(curAmount)
+				set strNumber	   = $$$FINAPInvSuppliersInvoiceNumber(objInvoice)	; Invoice Number
+				set idSupplier	   = $$$FINAPInvInvoiceSupplier(objInvoice)
+				set strSupplier	   = idSupplier
+				if idSupplier'="" = strSupplier=strSupplier_" "_$$$FINAPSupplierSupplierName($get(^FINAPSupplier(YM,idSupplier,1)))
+				set strForm		   = $$CheckForm^FINUtils($get(YFORM),"FINAPInv")	; Get the form using YFORM, with validation
+				set strDetail	   = "Fin00930,"_$translate(strSupplier,","," ")_","_strNumber_","_curAmount  ;Supplier Invoice Reverse %1, Number %2, Amount %3
+ 
+				;set strStatus	   =$$Allocate^FININTBatch(.idBatch,.idBlock,"APINV",idLocation,dteTransaction,,idCreator,idDepartment,strForm,pidInvoice,strDetail) ; SR13087
+				set strStatus	   =$$Allocate^FININTBatch(.idBatch,.idBlock,"APINV",idLocation,dteTransaction,,idCreator,idDepartment,strForm,pidInvoice,strDetail,blnInterCompany)
+				;set strStatus      = $$Allocate^FININTBatch(.idBatch,.idBlock,"APINV",idLocation,dteTransaction,,idCreator,idDepartment)
+				; SR13578 - Source Details for Drill Down - End
+				
+				set curAPCAmount=0
+				if $$$ISOK(strStatus) set strStatus = $$AddCharges^FINAPInvPostCharge(pidInvoice,idBatch,idBlock,$$$YES) ;Reversal of charges
+				if $$$ISOK(strStatus) set strStatus = $$AddInvoice^FINAPInvPost(pidInvoice,idBatch,idBlock,$$$YES) ;Reversal
+				if $$$ISOK(strStatus) set strStatus = $$PostBlock^FININTBatch(idBatch,idBlock)
+				if $$$ISOK(strStatus) set $$$FINAPInvUnpostedDate(objInvoice)=$horolog
+			}
+			if $$$ISOK(strStatus) {
+				set $$$FINAPInvStatus(objInvoice)=$$$EnumFINSYSSTATUSCancelled	
+				set $$$FINAPInvUnpostedBy(objInvoice) = $get(YBED,"UNKNOWN")
+				set $$$FINAPInvUnpostedBatch(objInvoice)=idBatch
+				set $$$FINAPInvUnpostedBlock(objInvoice)=idBlock
+				set strStatus=$$$Save("FINAPInv",pidInvoice,objInvoice,1)
+			}
+		} elseif $$$FINAPInvStatus(objInvoice)=$$$EnumFINSYSSTATUSPending {
+			set $$$FINAPInvStatus(objInvoice)=$$$EnumFINSYSSTATUSUnposted
+			set strStatus=$$$Save("FINAPInv",pidInvoice,objInvoice,1)
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+		
+		if 'pblnBatch {
+			if 'blnIsVoucher && ($$$FINAPInvStatus(objInvoice)=$$$EnumFINSYSSTATUSPosted) {
+				do GoToForm^COMUtilForm("FINAPInvPost",pidInvoice,,pidInvoice)				
+			} elseif $$$FINAPInvRepeat(objInvoice) {
+				do ReturnError^COMUtilError($lb("Fin00589",pidInvoice)) ;Post successful. New invoice ´%1´ has been created and posted.	
+			} else {
+				do ReloadForm^COMUtilForm()
+			}
+		}
+	} else {
+		trollback
+		if '(blnGroupOrSchedule || pblnBatch) {
+			do ReturnError^COMUtilError(strStatus)
+		}
+	}
+	quit strStatus
+ 
+]]></Routine>
+</Export>

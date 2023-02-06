@@ -1,0 +1,396 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReturnToSupplierPost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReturnToSupplierPost 
+	
+#include COMSYS
+#include INConst
+#include FINConst
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INReturnToSupplierPost("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Postable(pidIssue)
+	;-------------------------------------------------------------------------------
+	; Test whether this record is postable
+	; 
+	; Called By: Form INReturnToSupplier : Button 1 - Execute To Check For Disabled
+	; 
+	; Params:	pidIssue - Issue id
+	;
+	; ByRefs:
+	;
+	; Returns:	postable status
+	;
+	; History:
+	; 30-Jun-2010	PPP		SR17297: Created
+	;-------------------------------------------------------------------------------
+	new blnOk,objIssue,strStatus
+	
+	quit:$$$NoKey(pidIssue) '$$$OK
+	
+	set strStatus = $$Editable^INReturnToSupplier(pidIssue)
+	
+	if $$$ISOK(strStatus) {
+		if '$data(^INIssueLine(0,pidIssue)) {
+			set strStatus = $$$MakeStatus("IN00908")  ; "Issue must have lines"
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set objIssue = $get(^INIssue(0,pidIssue,1))
+		if objIssue'="" {
+			if $$IsLockedSiteLocation^INLocking($$$INIssueFromLocn(objIssue)) {
+				set strStatus = $$ReasonLocked^INLocking($$$INIssueFromLocn(objIssue))
+			}
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set YQ = $$$QSave
+	} else {
+		$$$YQHandler(strStatus)
+	}
+	quit strStatus
+	
+	
+Post(pidIssue)
+	;-------------------------------------------------------------------------------
+	; Post Return To Supplier Record
+	;
+    ; Called By: Form INReturnToSupplier : Button 1 - Execute OnClick
+    ; 
+	; Returns:Status
+	;
+	; History:
+	; 30-Jun-2010	PPP		SR17297: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$Transaction^COMTransaction("PostTxn^INReturnToSupplierPost("""_pidIssue_""")",$$$YES)
+		
+	if $$$ISOK(strStatus) {
+		do ReloadForm^COMUtilForm()
+	}
+	quit strStatus
+	
+	
+PostTxn(pidIssue)
+	;-------------------------------------------------------------------------------
+	; Post Txn Return To Supplier Record 
+	; Encompasses
+	;	1. Post of Trans (SOH etc)
+	; 	2. Update of INVMatchCache records
+	;
+    ; 
+	; Returns:Status
+	;
+	; History:
+	; 09-Sep-2010	GRF		SR17537: Don't call via second COMTransaction wrapper
+	; 30-Jun-2010	PPP		SR17297: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	;set strStatus = $$Post^INIssueAuto(pidIssue)  ; SR17537
+	set strStatus = $$PostTxn^INIssueAuto(pidIssue)
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$PostInvMatchCache(pidIssue)
+	}
+	quit strStatus
+	
+	
+PostInvMatchCache(pidIssue)
+	;-------------------------------------------------------------------------------
+	; Post adjustmentInvMatchCache
+	;
+    ; Called By: PostTxn
+    ; 
+	; Returns:Status
+	;
+	; History:
+	; 28-Sep-2010	GRF		SR17537: don't extract data unless processing
+	; 05-Jul-2010	PPP		SR17297-1: Added Update to Average Cost
+	; 01-Jul-2010	PPP		SR17297: Created
+	;-------------------------------------------------------------------------------
+	new dteOrigRec,dteReceipt,fltRevQty,idInvMatch,idItem,idLine,idLocn,idOrder
+	new idOrdLine,idOrigLine,idOrigRecNo,idRec,idRecLn,idStore,idSupplier,idUnit
+	new objInvMatch,objIssue,objIssueLn,objRecLine,strStatus
+	new fltIssRevQty
+	
+	set strStatus = $$$OK
+	set objIssue  = $get(^INIssue(0,pidIssue,1))
+	set idLocn    = $$$INIssueFromLocn(objIssue)
+	
+	set idLine = ""
+	for {
+		quit:$$$ISERR(strStatus)
+		set idLine = $order(^INIssueLine(0,pidIssue,idLine))
+		quit:idLine=""
+		
+		set objIssueLn = $get(^INIssueLine(0,pidIssue,idLine,1))
+		set idInvMatch = $$$INIssueLineReference(objIssueLn)
+		
+		if idInvMatch'="" {
+			set idStore      = $$$INIssueLineFromStorage(objIssueLn)  ; SR17537 4 lines
+			set idItem       = $$$INIssueLineItem(objIssueLn)
+			set fltIssRevQty = $$$INIssueLineQtyIssued(objIssueLn)    ; Inventory Units
+			set idUnit       = $$$INIssueLineUnit(objIssueLn)         ; Required Unit
+			set objInvMatch  = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+			set idRec        = $$$FINAPInvMatchCacheReceiptNumber(objInvMatch)
+			set idRecLn      = +$$$FINAPInvMatchCacheReceiptLine(objInvMatch)
+			
+			if idRec'="" {
+				set objRecLine = $get(^INRECLine(0,idRec,idRecLn,1))
+				
+				set idOrder    = $$$INRECLineOrder1(objRecLine)
+				set idOrdLine  = $$$INRECLineOrderLine(objRecLine)
+				set dteOrigRec = $$$INRECLineReceiptDate(objRecLine)
+				set dteReceipt = $horolog
+								
+				if $$$ISOK(strStatus) {
+					set strStatus = $$UpdateRecInvMatchCache(idInvMatch,idItem,idUnit,fltIssRevQty,
+															idRec,idRecLn,
+				                                           	idOrder,idOrdLine,
+				                                           	dteReceipt,objRecLine)
+				    
+				    if (idOrder'="") && (idOrdLine'="") {  ; FIXME : add strStatus check?
+						set strStatus = $$UpdateOrdInvMatchCache(idInvMatch,idItem,idUnit,fltIssRevQty,
+																idRec,idRecLn,
+				            	                               	idOrder,idOrdLine,
+				                	                           	dteReceipt,objRecLine)
+				    }
+				}
+			}
+			
+			//SR17297-1
+			//Update the Average Cost if the User changes the Cost on the FORM and Reason Code exists.
+			if $$$ISOK(strStatus) {
+				set strStatus = $$UpdateAvgCost(pidIssue,idLine)
+			}
+		}
+	}
+	quit strStatus
+	
+	
+UpdateRecInvMatchCache(pidInvMatch,pidItem,pidUnit,pfltIssRevQty,pidReceipt,pidRecLine,pidOrder,pidOrdLine,pdteRecvd,pobjRecLine) private
+	;-------------------------------------------------------------------------------
+	; Update Receipt FINAPInvMatchCache details for a Return To Supplier
+	; NOTE : FINAPInvMatchCache quantities are all in Order Units
+	;
+	; Called By : PostInvMatchCache^INReturnToSupplierPost
+	; 
+	; Params:	pidOrder,pidOrdLine - order line
+	;			pidUnit				[$$$INIssueLineUnit]		Order (Issue) Unit
+	;			pfltIssRevQty		[$$$INIssueLineQtyIssued]	in Inventory Units
+	;
+	; ByRefs:
+	;
+	; Returns: status
+	;
+	; History:
+	; 03-Mar-2011	PPP		SR17672: Ensured right Qty gets to the FINAPInvMatchCache
+	;							based on the unit used
+	; 01-Jul-2010	PPP		SR17297: Created
+	;-------------------------------------------------------------------------------
+	new blnWithOrder,fltConvFactor,fltRetQty,idOrderUnit,idxOrder,idxOrderLn
+	new objInvMatch,objOrderLinestrStatus
+	
+	$$$LogR("UpdateRecInvMatchCache",pidReceipt_","_pidRecLine_","_pidOrder_","_pidOrdLine)
+	
+	set strStatus     = $$$OK
+	set idxOrder      = $$$Index(pidOrder)
+	set idxOrderLn    = $$$Index(pidOrdLine)
+	set blnWithOrder  = ((pidOrder'="") && (pidOrdLine'=""))
+	
+	//SR17672
+	//set fltConvFactor = $$GetUOMConversion^INUOMConversion(pidItem,pidUnit)
+	//set fltRetQty     = -(pfltRevQty / fltConvFactor)	     ; Conversion Rec Units to Order Units
+	
+	//SR17672
+	if blnWithOrder {   //Convert return qty to Order Units
+		set objOrderLine = $get(^INAUFP(0,pidOrder,pidOrdLine,1))
+		set idOrderUnit  = $$$INAUFPOrderedUnit(objOrderLine)
+	    set fltRetQty    = -$$ConvInvQtyToOtherQty^INRECLineUtil(pidItem,idOrderUnit,pfltIssRevQty)
+	
+	} else {
+	    set fltRetQty    = -pfltIssRevQty
+	}
+	
+	set objInvMatch = $get(^FINAPInvMatchCache(0,pidInvMatch,1))
+	
+	// If not already invoiced
+	if '$$$FINAPInvMatchCacheCompleted(objInvMatch) {
+		if $$$FINAPInvMatchCachePreviouslyInvoicedValue(objInvMatch)="" {
+			set $$$FINAPInvMatchCacheAddedToCache(objInvMatch) 		= $horolog    
+			set $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch)	= $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) + fltRetQty
+			set $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)		= $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)     + fltRetQty
+			
+			if 'blnWithOrder {
+				//1. Update Order Qty too
+				set $$$FINAPInvMatchCacheOrderQuantity(objInvMatch)	= $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)
+			}
+			
+			//No UnMatched Quantity (All Received Qty Returned)
+			if '$$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) {
+				set $$$FINAPInvMatchCacheCompleted(objInvMatch) 	= 1
+				
+				if 'blnWithOrder {    ; FIXME : isn't this just done above?
+					//1. Close the INVMatchCache record
+					set $$$FINAPInvMatchCacheOrderQuantity(objInvMatch)	= $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)
+				}
+			}
+			
+			if $$$ISOK(strStatus) {
+				set strStatus = $$$Save("FINAPInvMatchCache",pidInvMatch,objInvMatch,$$$YES)
+				
+				if $$$ISOK(strStatus) {     //Receipt With an Order
+					if blnWithOrder {
+						//1. Set OrderLn to Open if Rec < Ord
+						//2. Update Received Qty
+						set strStatus = $$UpdateOrderLine(pidOrder,pidOrdLine,fltRetQty)
+					}
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+UpdateOrdInvMatchCache(pidOrigInvMatch,pidItem,pidUnit,pfltIssRevQty,pidReceipt,pidRecLine,pidOrder,pidOrdLine,pdteRecvd,pobjRecLine) private
+	;-------------------------------------------------------------------------------
+	; Update Order FINAPInvMatchCache details for a Return To Supplier
+	; NOTE : FINAPInvMatchCache quantities are all in Order Units
+	; 
+	; Called By : PostInvMatchCache
+	; 
+	; Params:	pidOrder,pidOrdLine - order line
+	;			pidUnit				[$$$INIssueLineUnit]		Order (Issue) Unit
+	;			pfltIssRevQty		[$$$INIssueLineQtyIssued]	in Inventory Units
+	;
+	; ByRefs:
+	;
+	; Returns: status
+	;
+	; History:
+	; 03-Mar-2011	PPP		SR17672: Ensured right Qty gets to the FINAPInvMatchCache
+	;							based on the unit used
+	; 02-Jul-2010	PPP		SR17297: Created
+	;-------------------------------------------------------------------------------
+	new blnWithOrder,fltConvFactor,fltRetQty,idInvMatch,idOrderUnit,idxOrder,idxOrderLn
+	new objInvMatch,objOrderLine,strStatus
+	
+	$$$LogR("UpdateOrdInvMatchCache",pidReceipt_","_pidRecLine_","_pidOrder_","_pidOrdLine)
+	
+	set strStatus     = $$$OK
+	set idxOrder      = $$$Index(pidOrder)
+	set idxOrderLn    = $$$Index(pidOrdLine)
+
+	//SR17672
+	//set fltConvFactor = $$GetUOMConversion^INUOMConversion(pidItem,pidUnit)
+	//set fltRetQty     = (pfltRevQty / fltConvFactor)   ; Conversion Rec Units to Order Units
+
+	//SR17672
+	set objOrderLine  	= $get(^INAUFP(0,pidOrder,pidOrdLine,1))
+	set idOrderUnit   	= $$$INAUFPOrderedUnit(objOrderLine)
+    set fltRetQty 		= $$ConvInvQtyToOtherQty^INRECLineUtil(pidItem,idOrderUnit,pfltIssRevQty)
+	
+	if (idxOrder'=" ") && (idxOrderLn'=" ") {
+		set idInvMatch = ""
+		for {
+			quit:$$$ISERR(strStatus)
+			set idInvMatch = $order(^FINAPInvMatchCaches(0,1,idxOrder,idxOrderLn,idInvMatch),-1)
+			quit:idInvMatch=""
+			
+			continue:pidOrigInvMatch=idInvMatch
+			
+			set objInvMatch = $get(^FINAPInvMatchCache(0,idInvMatch,1))
+			continue:$$$FINAPInvMatchCacheReceipted(objInvMatch)
+			
+			// If not already invoiced
+			if '$$$FINAPInvMatchCacheCompleted(objInvMatch) {
+				if $$$FINAPInvMatchCachePreviouslyInvoicedValue(objInvMatch)="" {
+					set $$$FINAPInvMatchCacheAddedToCache(objInvMatch) 		= $horolog    
+					set $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch)	= $$$FINAPInvMatchCacheUnmatchedQuantity(objInvMatch) + fltRetQty
+					set $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)		= $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)     + fltRetQty
+					
+					if $$$ISOK(strStatus) {
+						set strStatus = $$$Save("FINAPInvMatchCache",idInvMatch,objInvMatch,$$$YES)
+					}
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+UpdateOrderLine(pidOrder,pidOrdLine,pfltRetQty) private
+	;-------------------------------------------------------------------------------
+	; Updates the Order Line with the Returned Quantity
+    ; 
+    ; Called From: UpdateInvMatchCache()
+    ; 
+    ; History:
+	; 01-Jul-2010	PPP		SR17297: Created
+	;-------------------------------------------------------------------------------
+	new objOrderLine,strStatus
+	
+	set objOrderLine = $get(^INAUFP(0,pidOrder,pidOrdLine,1))
+	set $$$INAUFPIncomingGoodsQuantity(objOrderLine) = $$$INAUFPIncomingGoodsQuantity(objOrderLine) + pfltRetQty
+	if ($$$INAUFPIncomingGoodsQuantity(objOrderLine) < $$$INAUFPQuantity(objOrderLine)) {
+		set $$$INAUFPPosCompleted(objOrderLine) = $$$NO
+	}
+	
+	set strStatus = $$$Save("INAUFP",pidOrder_","_pidOrdLine,objOrderLine,$$$YES)
+	
+	quit strStatus
+	
+	
+UpdateAvgCost(pidIssue,pidIssLine) private
+	;-------------------------------------------------------------------------------
+    ;
+    ; 
+    ; Called From: UpdateInvMatchCache()
+    ; 
+    ; History:
+	; 05-Jul-2010	PPP		SR17297: Created
+	;-------------------------------------------------------------------------------
+	new blnUpdStkVal,curCost,idAdj,idCostCentre,idItem,idLocn,idReason
+	new objIssue,objIssueLn,objItem,strStatus
+	
+	$$$LogR("UpdateAvgCost",pidIssue_","_pidIssLine)
+	set strStatus = $$$OK
+	
+	set objIssue     = $get(^INIssue(0,pidIssue,1))
+	set idLocn       = $$$INIssueFromLocn(objIssue)
+	set idCostCentre = $$GetCostCentre^INCostCentre(idLocn)
+	
+	set objIssueLn   = $get(^INIssueLine(0,pidIssue,pidIssLine,1))
+	set idReason     = $$$INIssueLineReasonCode(objIssueLn)
+	set idItem       = $$$INIssueLineItem(objIssueLn)	
+	
+	set objItem      = $get(^INART(0,idItem,1))
+	set blnUpdStkVal = '$$$INARTItemWithoutInventoryMaint(objItem)
+	
+	$$$LogRx("UAC:1:"_idItem_"<"_idCostCentre_"<"_blnUpdStkVal_"<"_idReason_"<")
+	
+	if (idReason'="") {
+		set curCost = $$$INIssueLineAverageCost(objIssueLn)
+		
+		if blnUpdStkVal {
+			set idAdj = $$Create^INStockValCCAdj(idItem,idCostCentre,curCost,idReason,"")
+			
+			if idAdj'="" {
+				set strStatus = $$Adjust^INStockValCCAdj(idItem_$$$COMMA_idCostCentre_$$$COMMA_idAdj,$$$NO,$$$NO)
+			}
+		}
+	}
+	$$$LogRx("UAC:2:"_$$GetCostForCC^INAvgCost(idItem,idCostCentre))
+	quit strStatus
+	
+]]></Routine>
+</Export>

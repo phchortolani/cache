@@ -1,0 +1,460 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRNPickTable" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRNPickTable
+	
+#include COMSYS
+#include INConst
+#include %occInclude
+#include COMGridEdit31
+	
+ShowItems(pidEvent,pidParams)
+	;-------------------------------------------------------------------------------
+	; Show the Bundles for Transfer Pick Lines
+	;
+	; Builds ^CacheTempDynamicTable based on INIssueTable dynamic table headers
+	;         (1)               (2)                      (3)
+	;     "Storage"     Attribute Headings       "Available Quantity"
+	;                   (e.g. "Lot Number")
+	;                   
+	; Params:
+	; 	pidParams is a $piece string with $char(31) as a separator
+	; 		piece 1		=	Calling Form Header
+	; 		piece 2		=	Calling Form Line (GRIDEdit Form)
+	; 		piece 3		= 	
+	;
+	; Returns: Boolean
+	;
+	; History:
+	; 11-Sep-2013	SCR		CORE-266: Pass in Loc
+	; 01-Dec-2009	GRF		SR17007: separate tags for multi-lock operations
+	; 01-Jun-2009	PPP		SR16599: Add Row highlight & click functionality
+	; 31-Oct-2008	HQN		SR16077: Based off the current line, reservation may be
+	; 							released/reserved based on current screen
+	; 22-Sep-2008	HQN		SR15862: Created; Replicated INIssueTable functionality
+	;-------------------------------------------------------------------------------
+	new idKey,idTFR,idTFRPickLine,lstColTypes,lstHeaders,objItem,objItemPolicy,objLocn
+	new objTFRPickLine,objTransfer,strFunction,strGridLineYFORM,strStatus
+ 
+	kill ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle")
+	
+	set strGridLineYFORM = $$$DYNTABLEGridLineFocusGrid(pidParams)
+	set idKey = $$ReferenceKey^COMGridEdit31Interface(strGridLineYFORM,$$$DYNTABLEGridLineFocusRow(pidParams))
+	set idTFR         = $$$KEY1(idKey)
+	set idTFRPickLine = $$$KEY2(idKey)
+	
+	if '$$CanPrintPick^INTRNPick(idTFR) quit $$$NO
+	
+	;---------------------------------------
+	
+	;et strStatus = $$GetLock^WWWMultiLock("INTFR",strGridLineYFORM,idTFR_$$$COMMA_idTFRPickLine,$$$NO)  ; SR17007
+	set strStatus = $$GetLock^WWWMultiLock("INTFR",strGridLineYFORM,idTFR_$$$COMMA_idTFRPickLine)
+	
+ 	set objTransfer    = $$$GRIDYFELDContainer
+ 	set objTFRPickLine = $$$GRIDGetYFELD(idTFRPickLine)
+	
+	set objLocn = ##class(alLOC.dLocation).%OpenId($$$INTFRSendingLocation(objTransfer))
+	set objItem = ##class(alINV.dItem).%OpenId($$$INTFRPickLineItem(objTFRPickLine),0)
+		
+	set objItemPolicy = objItem.ItemPolicy
+	set strFunction = "FillLine"
+	
+	set strStatus = $$BuildDynTableHeader^INIssueTable(objItemPolicy,.lstHeaders,.lstColTypes,objLocn.Code)
+	do BuildDynTableRows^INIssueTable(objItem.%Id(),objLocn.Code,$$$INTFRPickLineSendingStockLocation(objTFRPickLine))
+	
+	; Update with current line reservation release/renew
+	do UpdateDynTableRows^INTRNPickTable(pidParams) ; SR16077
+	
+	if $$$ISERR(strStatus) {
+		write "function "_strFunction_"() {"
+		write "alert('"_$$$JSText($$$Text(strStatus))_"');"
+		write "}"
+	} else {
+		write "function "_strFunction_"() {"
+		write "CallBack(""SelectBundle^INTRNPickTable"", getRowNum(getFocusField()), this.DiscData[0]);"
+		write "}"
+	}
+ 
+	//SR16599
+	//The last parameter (after pidEvent) needs to be set for the RowClick event, will be used by RowClick^WWW120DynTable
+	//	e.g. "WarehouseLine^INReqTable"
+	//	will be called with the following parameters
+	//	1. Row ID
+	//	2. Each entry in ^CacheTempDynamicTable(...,data) separated by "~" will be a new parameter
+	//			in this routines case : do WarehouseLine^INReqTable(pidRow,idLocn) will be executed on Row click
+	do DrawTable^WWW120DynTable(lstHeaders,"dStockBundle",lstColTypes,pidParams,strFunction,pidEvent,"SelectBundle^INTRNPickTable")
+	
+	quit $$$OK
+ 
+	
+SelectBundle(pidRow,pidKey)
+	;-------------------------------------------------------------------------------
+	; Select the Bundles for Transfer Pick Lines
+	;
+	; Params:
+	; 	pidRow		GridRow
+	; 	pidKey		INTFRPickLine YKEY
+	;
+	; Returns:
+	;	Nothing
+	;	
+	; History:
+	; 19-Nov-2013	SCR		SESDF-655: Use Language on Render Bundle
+	; 24-Jun-2009	PPP		SR16682 :Get the Bundle details directly from the Bundle Properties	
+	; 20-Jan-2009	GRF		SR16317: Ensure INTFRPickLine has up-to-date attributes
+	; 							when change selected from dynamic table.
+	; 20-Jan-2009	GRF		SR16317: some fltQty* no longer used - removed from
+	; 							new and not initialised; new missed variables; don't
+	; 							need three versions of fltQtyPicked
+	; 11-Nov-2008	HQN		SR16077: Reworked algorithm again...code cleanup
+	; 11-Nov-2008	HQN		SR16077: Selecting a new bundle may now make other lines
+	; 							valid, refresh them
+	; 05-Nov-2008	HQN		SR16077: determine qtyAvailable then issue that if or
+	; 							actual ammount required for remaining, take all
+	; 							picked quantities for this item, ignore storage now
+	; 03-Nov-2008	HQN		SR16077: Changed algorithm, now takes into account
+	; 							other line reservations that haven't been commited
+	; 							to disk(On screen values)
+	; 							Use SetRecord, this forces a screen update, trigger
+	; 							related screen updates
+	; 31-Oct-2008	HQN		SR16077: We're interested in the selected dBundleStock
+	; 							not the currently displayed line
+	; 							Refresh Issueable table, selection may have
+	; 							invalidated current Issueable line and/or released
+	; 							currently selected reservation
+	; 30-Oct-2008	HQN		SR16077: ##class(alSOH.iSOH).GetQtyAvailable gets 
+	; 							wrong value for this calculation
+	; 30-Oct-2008	GRF		SR16077: Use fltNewQty rather than performing calc
+	; 							twice (which uses function to sum row data)
+	; 29-Oct-2008	HQN		SR16077: Math bad, redo
+	; 28-Oct-2008	HQN		SR16077: Correctly set Issuable Qty
+	; 09-Oct-2008	HQN		SR15874: Find all other Reservations
+	; 08-Oct-2008	HQN		SR15874: GetYFELDEX^COMGridEdit31Interface() based off
+	; 							of REFERENCEKEY not REFERENCEROW
+	; 23-Sep-2008	HQN		SR15862: Created
+	;-------------------------------------------------------------------------------
+	new EnderecoFisico,PhysicalStorage,YFORM,dteUseBy,fltQtyAvailable,fltQtyIssued
+	new fltQtyPicked,fltQtyRequired,idBundle,idItem,idLotNo,idPickLine,idRefKeys
+	new idStorage,idTFR,intRowKey,objBundleStock,objINLP,objPickLine,objTFRLine
+	new objTFRPickLine,objTransfer,sc,strChanges,strParams
+ 	
+	set YFORM = "INTFRPickLine"
+	set idRefKeys = $translate($get($$$WWWDATEN("REFERENCEKEY",pidRow,1)),$$$DBLQUOTE,"")
+	set intRowKey = $$$KEY2(idRefKeys)
+	
+	set idTFR       = $$$GRIDYKEYContainer
+	set objTransfer = $$$GRIDYFELDContainer
+	
+	set objTFRPickLine = $$GetYFELD^COMGridEdit31G(YFORM,pidRow) ; Get Display record
+	set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(pidKey,0,.sc)
+	
+	set idItem = $$$INTFRPickLineItem(objTFRPickLine)
+	set idStorage = objBundleStock.Storage.%Id()
+	set idBundle  = objBundleStock.Bundle.%Id()
+	
+	set objTFRLine = $get(^INTFRLine(YM,idTFR,$$$INTFRPickLineSourceline(objTFRPickLine),1))
+ 
+	set fltQtyPicked = $$GetQtyPickedViaTFRLine^INTFRPickLine(idTFR_","_$$$INTFRPickLineSourceline(objTFRPickLine))
+ 	set fltQtyPicked = fltQtyPicked - $$$INTFRPickLinePickedQuantity(objTFRPickLine)
+ 
+	set fltQtyRequired  = $$$INTFRLineQuantity(objTFRLine) - fltQtyPicked
+	set fltQtyAvailable = $$GetQtyAvailableViaBundleStock(pidKey)
+	
+ 	if fltQtyAvailable > fltQtyRequired {
+	 	set fltQtyIssued = fltQtyRequired
+ 	} else {
+	 	set fltQtyIssued = fltQtyAvailable
+ 	}
+ 	set:fltQtyIssued<0 fltQtyIssued = 0
+	; SR16317  ^^^
+	
+	; Update Grid and make a note of fields that may have been changed ($$$FldINIssueLineQtyIssued)
+	if objBundleStock'=$$$NULLOREF {
+		/* //SR16682 :Get the Bundle details directly from the Bundle Properties		
+		set idLotNo  = $$GetBundleAttribute(objBundleStock.Bundle.%Id(),"Lot Number")
+		set dteUseBy = $$GetBundleAttribute(objBundleStock.Bundle.%Id(),"Use By Date")
+		*/
+		set idLotNo  = objBundleStock.Bundle.LotNumber
+		set dteUseBy = objBundleStock.Bundle.UseByDate
+ 
+		set strChanges = $$$FldINTFRPickLineSendingStockLocation_$$$COMMA_objBundleStock.Storage.Code
+		set strChanges = strChanges_Y_$$$FldINTFRPickLineBundle_$$$COMMA_objBundleStock.Bundle.%Id()
+		set strChanges = strChanges_Y_$$$FldINTFRPickLineLotNumber_$$$COMMA_idLotNo
+		//SRxxxx :Get the Bundle details directly from the Bundle Properties	
+		set strChanges = strChanges_Y_$$$FldINTFRPickLineBatch_$$$COMMA_##class(alSOH.iUSOH).RenderBundle(objBundleStock.Bundle,SPRACHE) ;objBundleStock.Bundle.%Id()
+		set strChanges = strChanges_Y_$$$FldINTFRPickLineUsebyDate_$$$COMMA_dteUseBy
+		if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+		   (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+			set objINLP 	    = $get(^INLP(YM,$$$INTFRSendingLocation(objTransfer),objBundleStock.Storage.Code,1))
+			set PhysicalStorage = $$$INLPPhysical(objINLP)
+
+			if (PhysicalStorage'=""){
+				set EnderecoFisico = $$SQLGetEnderecoParaOrdenar^VARSQL(PhysicalStorage)
+			} elseif (PhysicalStorage=""){
+				set EnderecoFisico = $$SQLGetEnderecoParaOrdenar^VARSQL($$$INLPStorage1(objINLP))
+			}
+			
+			set strChanges = strChanges_Y_$$$FldINTFRPickLineFREE1_$$$COMMA_EnderecoFisico
+		}
+		do SetRecord^COMGridEdit31S1("INTFRPickLine",pidRow,strChanges,$$$FldINIssueLineQtyIssued)
+		; FIXME : $$$FldINIssueLineQtyIssued = D6 - $$$FldINTFRPickLinePriorPickedQuantity or
+		;         some other Field? also used below. <GRF>
+		; SR16317 ^^^
+	}
+	
+	; Sets Maximum amount available to be Issued
+	;---------------------------------------
+	;do UpdateManualField^COMGridEdit31Interface(pidRow,10,fltQtyIssued) ; 03-Nov-2008
+	do SetRecord^COMGridEdit31S1("INTFRPickLine",pidRow,$$$FldINTFRPickLinePickedQuantity_$$$COMMA_fltQtyIssued,$$$FldINIssueLineQtyIssued)
+	
+	; Setting record may remove errors, trigger validation on other PickLines that are of the same dBundleStock
+	; 03-Nov-2008 vvvv
+	for idPickLine=1:1:$$$GRIDGetRowCount(YFORM) {
+		set objPickLine = $$$GRIDGetYFELD($$GetYKEY^COMGridEdit31G(idPickLine))
+		continue:idPickLine=pidRow
+		continue:$$$INTFRPickLineItem(objPickLine)'=idItem
+		continue:$$$INTFRPickLineSendingStockLocation(objPickLine)'=$piece(idStorage,"||",2)
+	;	continue:$$$INTFRPickLineBundle(objPickLine)'=idBundle ; 11-Nov-2008
+		
+		do ScreenUpdateStyle^COMGridEdit31S("Y"_idPickLine_"_"_$order(^WWW122s(0,4,$$$FldINTFRPickLinePickedQuantity,"INTFRPickLine","")),$$$YES)
+	}
+	; 03-Nov-2008 ^^^^
+	
+	set $$$DYNTABLEGridLineFocusForm(strParams)  = "INTFR"
+	set $$$DYNTABLEGridLineFocusGrid(strParams)  = "INTFRPickLine"
+	set $$$DYNTABLEAfterDataFieldsKey(strParams) = intRowKey
+	set $$$DYNTABLEGridLineFocusRow(strParams)   = pidRow
+ 
+	do ShowItems^INTRNPickTable(1,strParams) ; SR16077 31-Oct-2008
+	do objBundleStock.%Close()
+	quit
+	
+	
+GetBundleAttribute(pidBundle,pidAttribute)
+	;-------------------------------------------------------------------------------
+	; TODO : Provide more generally <GRF>    see   $$GetBundleAttribute^INUtilBundle
+	; 							
+	; 20-Jan-2009	GRF		SR16317: Created to ensure INTFRPickLine has up-to-date
+	; 							attributes when change selected from dynamic table.
+	;-------------------------------------------------------------------------------
+	new objAttr,strResult
+
+	
+	quit:($get(pidBundle)="")||($get(pidAttribute)="") ""
+	
+	set objAttr = ##class(alSOH.dBundleAttribute).%OpenId(pidBundle_"||"_pidAttribute)
+	if objAttr=$$$NULLOREF {
+		set strResult = ""
+	} else {
+		set strResult = objAttr.AttributeValue
+	}
+	
+	quit strResult
+	
+	
+UpdateDynTableRows(pstrParams)
+	;-------------------------------------------------------------------------------
+	; based on current Grid line, show released reservation and optionally remove 
+	; current reservation from displaying
+	; 
+	; History:
+	; 20-Jan-2009	GRF		SR16317: Use intLastPiece; prefixes; fltQtyPlannedExcl
+	; 							& SQL block commented since moved elsewhere.
+	; 04-Nov-2008	HQN		SR16119: SumLinesForItem^INTRNValidation doesn't take
+	; 							into account bundle, replaced
+	; 03-Nov-2008	HQN		SR16077: Modified algorithm, for each DynLine, check
+	; 							onscreen values; set Available = OnHand - reserved
+	; 							on disk + (onscreen for all lines)
+	; 31-OCt-2008	HQN		SR16077: Created
+	;-------------------------------------------------------------------------------
+	new fltPickLineQtyPlanned
+	new idBundle,idBundleStock,idDynTableLine,idItem,idPickLine,idStorage,idTFR
+	new intLastPiece,objBundleStock,objDisplay,objPickLine,sc,SQLCODE,YFORM
+	
+	set YFORM = "INTFRPickLine"
+	; DynTable lines aren't indexed...find correct line to update for current grid line
+	set idTFR       = $$$GRIDYKEYContainer
+	set objPickLine = $$$GRIDGetYFELD($$$DYNTABLEGridLineFocusRow(pstrParams))
+	;set idBundleStock = $$$INTFRPickLineItem(objPickLine)_"||"_$$$INTFRSendingLocation($get(^INTFR(YM,idTFR,1)))_"||"_$$$INTFRPickLineSendingStockLocation(objPickLine)_"||"_$$$INTFRPickLineBundle(objPickLine)
+	
+	set idDynTableLine = ""
+	for {
+		set idDynTableLine = $order(^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idDynTableLine))
+		quit:idDynTableLine=""
+	;	quit:$get(^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idDynTableLine,"data"))=idBundleStock
+	;}
+	
+	; displayed QtyOnHand should = dbundleStock:QtyOnHand - Total Reserved Qty for dBundleStock not in this Transfer - all visible pick Qty's
+	; Update displayed dBundleStock:QtyOnHand
+		set idBundleStock  = $get(^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idDynTableLine,"data"))
+		set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idBundleStock,,.sc)
+		if objBundleStock '= $$$NULLOREF {
+		;	set fltQtyPlannedExcl = 0
+			set SQLCODE = 0
+			set idItem    = objBundleStock.Item.%Id()
+			set idStorage = objBundleStock.Storage.%Id()
+			set idBundle  = objBundleStock.Bundle.%Id()
+		/*
+			&sql(
+				SELECT IFNULL(SUM(QtyRequired),0,SUM(QtyRequired)) INTO :fltQtyPlannedExcl
+					FROM alDRP.dPlannedMovement
+					WHERE
+						Item=:idItem           AND
+						FromStorage=:idStorage AND
+						Bundle=:idBundle       AND
+						Reference<>:idTFR      AND
+						State->StateId = 3
+			)
+		*/
+			set fltPickLineQtyPlanned = 0
+			set idPickLine = ""
+			for idPickLine=1:1:$$$GRIDGetRowCount(YFORM) {
+				set fltPickLineQtyPlanned = fltPickLineQtyPlanned + $$GetQtyPlannedViaPickLine(idTFR,idPickLine,idItem,idStorage,idBundle)
+			}
+			set objDisplay = $get(^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idDynTableLine))
+			set intLastPiece = $length(objDisplay,Y)
+		;	set $piece(objDisplay,Y,intLastPiece) = $piece(objDisplay,Y,intLastPiece) + fltPickLineQtyPlanned - $$SumLinesForItem^INTRNValidation(idTFR,idItem,$piece(idStorage,"||",2)) ; SR16119
+			set $piece(objDisplay,Y,intLastPiece) = $$^WWWTR(0,12,($piece(objDisplay,Y,intLastPiece) + fltPickLineQtyPlanned - $$GetQtyPickedViaBundleStock(idItem,idStorage,idBundle))) ; HEVA-857
+			if $piece(objDisplay,Y,intLastPiece) <= 0 {
+				kill ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idDynTableLine)
+			} else {
+				set ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idDynTableLine) = objDisplay
+			}
+		}
+	}
+	quit
+	
+	
+GetQtyPlannedViaPickLine(pidTFR,pidLineNo,pidItem,pidStorage,pidBundle)
+	;-------------------------------------------------------------------------------
+	; Gets the PlannedQty for PickLine Key Set
+	; 
+	; History:
+	; 31-Oct-2008	HQN		SR16119: Created, moved from SelectBundle
+	;-------------------------------------------------------------------------------
+	new fltQtyPlanned,SQLCODE
+	
+	set fltQtyPlanned = 0
+	set SQLCODE = 0
+	&sql(SELECT SUM(IFNULL(QtyRequired,0,QtyRequired)) INTO fltQtyPlanned 
+		FROM alDRP.dPlannedMovement
+		WHERE
+			Item=:pidItem           AND
+			FromStorage=:pidStorage AND 
+			Bundle=:pidBundle       AND
+			LineNumber=:pidLineNo   AND
+			Reference=:pidTFR       AND
+			State->StateId = 3
+	)  ; SR16077
+	quit fltQtyPlanned
+	
+	
+GetQtyPickedViaBundleStock(pidItem,pidStorage,pidBundle)
+	;-------------------------------------------------------------------------------
+	; For the dBundleStock specified, get how much is planned on the grid
+	; 
+	; History:
+	; 04-Nov-2008	HQN		SR16119: Created
+	;-------------------------------------------------------------------------------
+	new fltSumQty,idLine,objLine
+	
+	set fltSumQty = 0
+	set idLine = ""
+	for {
+		set idLine = $order(^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V","REFERENCEROW",idLine))
+ 		quit:(idLine = "")
+ 		continue:($get(^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V","KILLEDRECORD",$get(^WWWDATEN(YM,+$horolog,YUSER,YFORM,"V","REFERENCEROW",idLine,1))))=1)
+ 		
+ 		set objLine = $$GetYFELDEX^COMGridEdit31G(,idLine)
+ 		continue:($$$INTFRPickLineItem(objLine) '= pidItem)
+ 		continue:(pidStorage'="")&&($$$INTFRPickLineSendingStockLocation(objLine) '= $piece(pidStorage,"||",2))
+ 		continue:(pidBundle'="")&&($$$INTFRPickLineBundle(objLine) '= pidBundle)
+ 		
+ 		set fltSumQty = fltSumQty + $piece(objLine,"~",11)
+	}
+	quit fltSumQty
+	
+	
+	;GetQtyAvailableViaBundleStock(pidBundleStock) [YM,YFORM,YUSER,YBED] Public
+GetQtyAvailableViaBundleStock(pidBundleStock)
+	;-------------------------------------------------------------------------------
+	; Return the available qty for this bundle stock, if in the PickGrid, take into account prior picked lines
+	; 
+	; History:
+	; 20-Jan-2009	GRF		SR16317: Refactor as Procedure Block Zero; objPickLine not
+	; 							used
+	; ??-Nov-2008	HQN		SR16077: Created
+	;-------------------------------------------------------------------------------
+	new idBundle,idItem,idLocn,idStorage,idTFR,fltQtyAvailable,fltQtyPlanned,fltQtyPicked,objBundleStock
+	
+	set fltQtyAvailable = 0
+	
+	set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(pidBundleStock)
+	if objBundleStock'=$$$NULLOREF {
+		set idItem    = objBundleStock.Item.%Id()
+		set idLocn    = objBundleStock.Storage.Location.%Id()
+		set idStorage = objBundleStock.Storage.%Id()
+		set idBundle  = objBundleStock.Bundle.%Id()
+		
+		if $get(YFORM) = "INTFRPickLine" {
+		;	set objPickLine = $$$GRIDGetYFELD()
+			set fltQtyPicked  = $$GetQtyPickedViaBundleStock(idItem,idStorage,idBundle)
+			set fltQtyPlanned = $$GetQtyPlannedViaBundleStock(pidBundleStock)
+			
+			if fltQtyPlanned > 0 {
+				if (fltQtyPlanned - fltQtyPicked) = 0 {
+					set fltQtyAvailable = objBundleStock.QtyOnHand - fltQtyPicked
+				} else {
+					set idTFR = $$$GRIDYKEYContainer
+					
+					set fltQtyAvailable = objBundleStock.QtyOnHand
+					set fltQtyAvailable = fltQtyAvailable - ($$GetQtyPlanned^INTFR(idTFR,idItem,idLocn,idStorage,idBundle) - fltQtyPlanned)
+					set fltQtyAvailable = fltQtyAvailable - fltQtyPicked
+				}
+				
+			} else {
+				set fltQtyAvailable = objBundleStock.QtyOnHand - fltQtyPicked
+			}
+			
+		} else {
+			set fltQtyAvailable = objBundleStock.QtyOnHand - $$GetQtyPlannedViaBundleStock(pidBundleStock)
+		}
+	}
+	set:fltQtyAvailable<0 fltQtyAvailable = 0
+	quit fltQtyAvailable
+	
+	
+	;GetQtyPlannedViaBundleStock(pidBundleStock) [idItem,idStorage,idBundle,fltQtyPlanned] Public
+GetQtyPlannedViaBundleStock(pidBundleStock)
+	;-------------------------------------------------------------------------------
+	; Return the Qty Planned for this bundlestock
+	; 
+	; History:
+	; 20-Jan-2009	GRF		SR16317: Refactor as Procedure Block Zero
+	; 11-Nov-2008	HQN		SR16077: Created
+	;-------------------------------------------------------------------------------
+	new fltQtyPlanned,idBundle,idItem,idStorage,objBundleStock,sc,SQLCODE
+	
+	set fltQtyPlanned = 0
+	
+	set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(pidBundleStock,,.sc)
+	if objBundleStock'=$$$NULLOREF {
+		set idItem    = objBundleStock.Item.%Id()
+		set idStorage = objBundleStock.Storage.%Id()
+		set idBundle  = objBundleStock.Bundle.%Id()
+		set SQLCODE   = 0
+		&sql(
+			SELECT IFNULL(SUM(QtyRequired),0,SUM(QtyRequired)) INTO :fltQtyPlanned 
+			FROM alDRP.dPlannedMovement 
+			WHERE 
+				State->StateId=3       AND
+				Item=:idItem           AND
+				FromStorage=:idStorage AND
+				Bundle=:idBundle
+				
+		)
+	}
+	quit fltQtyPlanned
+	
+]]></Routine>
+</Export>

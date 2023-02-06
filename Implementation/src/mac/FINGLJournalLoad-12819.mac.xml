@@ -1,0 +1,638 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLJournalLoad" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLJournalLoad ; routines for importing journal lines.
+    
+#include FINConst
+#include WWWConst
+#include INConst
+#include COMSYS
+	
+OnBeforeSave(pYFELD)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 07-Jan-2005	PO		SR11157 Don't save journal if neither Debit or Credit fields are filled out.
+	;
+	; Currently throwing error up on new page, not able to simply call WWWFORM to draw 
+	;-------------------------------------------------------------------------------
+	if ($$$FINGLJournalLoadDebitColumn(pYFELD)="")  &&
+       ($$$FINGLJournalLoadCreditColumn(pYFELD)="")    {
+		
+		set Q=$$$QDontSave
+		do ReturnError^COMUtils("Fin00525") ; The debit or credit column property must be populated.
+		;do ^WWWFORM
+	}
+	quit
+	
+	
+OnAfterDataFields(pidUser)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 07-Jan-2005	PO		SR11157 Only load journal if required fields are filled out.
+	;-------------------------------------------------------------------------------
+	new objJournalLoad
+ 
+	set objJournalLoad=$get(^FINGLJournalLoad(0,YBED,1))
+ 
+	; At the moment there is no need for the following test to prevent the file from
+	; being loaded if not all the necessary details are specified.
+	if ($$$FINGLJournalLoadImportFilePath(objJournalLoad)'="")     &&
+	   ($$$FINGLJournalLoadAcountNumberColumn(objJournalLoad)'="") &&     ; Note: Acc No never blank as set to 1 in ShowJournalLoad.
+       ($$$FINGLJournalLoadDebitColumn(objJournalLoad)'="")        ||     ; However, carrying out check as defaults may get changed.
+	   ($$$FINGLJournalLoadCreditColumn(objJournalLoad)'="")          {
+		
+		do LoadFile(pidUser,$$$YES,$$$YES)
+	}
+	quit
+	
+	
+ShowJournalLoad(pidJournal)
+    ;-------------------------------------------------------------------------------
+    ; Run from the journal screen to show the journal load screen.
+    ;
+    ; History:
+    ; 12-Aug-2005	JW		Use GoToForm
+    ; 06-Jan-2005	PO		SR11262 Clear the Import File Path field prior to loading page.
+    ; 18-Oct-2004	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new objJournalLoad,strStatus
+	
+	set objJournalLoad=$get(^FINGLJournalLoad(0,YBED,1))
+	set $$$FINGLJournalLoadImportFilePath(objJournalLoad)="" ; SR11262
+	set $$$FINGLJournalLoadJournalNumber(objJournalLoad)=$piece(pidJournal,",",1)
+	;if $$$FINGLJournalLoadImportFilePath(objJournalLoad)="" 	set $$$FINGLJournalLoadImportFilePath(objJournalLoad)=$$$WWW012PhysicalFTPDirectory($get(^WWW012(0,0,1)))
+	if $$$FINGLJournalLoadDelimiter(objJournalLoad)="" 			set $$$FINGLJournalLoadDelimiter(objJournalLoad)=44  ;[Comma]
+	if $$$FINGLJournalLoadFirstreadrow(objJournalLoad)="" 		set $$$FINGLJournalLoadFirstreadrow(objJournalLoad)=1
+	if $$$FINGLJournalLoadAcountNumberColumn(objJournalLoad)="" set $$$FINGLJournalLoadAcountNumberColumn(objJournalLoad)=1
+ 
+	set strStatus = $$$Save("FINGLJournalLoad",YBED,objJournalLoad,$$$YES)
+	;do RedirectForm^COMUtils("FINGLJournalLoad",YBED,YFORM_",",YPARA,YSEITE)
+	do GoToForm^COMUtilForm("FINGLJournalLoad",YBED,YSEITE,YPARA)
+	quit
+	
+	
+LoadFile(pidUser,pblnDummy=$$$NO,pblnWrite=$$$YES,pintErrorLimit=50)
+    ;-------------------------------------------------------------------------------
+    ; Both loads files for display on the screen and load the journal lines.
+    ;
+    ; Params:	pidUser - User ID (i.e. YBED)
+    ; 			pblnDummy - If set to $$$YES, will not process the lines, only preview them for error checking.
+    ; 			pblnWrite - If set to $$$YES, will run routines that write error checking info to screen.
+    ; 			pintErrorLimit - Specifies how many errors to find before stopping (in pblnDummy=$$$YES mode).
+    ; 			
+    ;
+    ; Returns: strQuitStatus - will contain first error in file, or $$$OK if none.
+    ;
+    ; History:
+    ; 22-May-2006	SC		SR14574: Clean up, seperate parsing and printing.
+    ; 18-Apr-2006	JW		SR14557: Moved null amounts check into ValidateJournalLine.
+    ; 10-Aug-2005	JW		Replace SAL with COM help text. Cleaned up.
+    ; 21-Jun-2005	SCR		SR12692: Removed Reason Field
+    ; 09-Dec-2004	Paul K	Check to make sure debit or credit column populated. (SR#11157)
+    ; 09-Dec-2004	Paul K	set Quit Status if no/invalid file. (SR#11091)	
+    ; 18-Nov-2004	Paul K	Added quitstatus (small problem when displaying)
+    ;-------------------------------------------------------------------------------
+	new objJournalLoad,strFile,strStatus,strLine,arrSample,strDelim,intCounter
+	new lstHeader,objJournalLine,strCurrentIO,intStatus,idLine,idJournal
+	new strQuitStatus,strResultMsgColour,strResultMsg,intErrorCount
+	
+	kill ^CacheTempLoadList(YUSER)
+	kill ^CacheTempLoadListErrors(YUSER)
+	
+	set objJournalLoad=$get(^FINGLJournalLoad(0,YBED,1))	
+	do $ZUTIL(68,40,1) 
+	set strFile		  =$$$FINGLJournalLoadImportFilePath(objJournalLoad)
+	set idJournal	  =$$$FINGLJournalLoadJournalNumber(objJournalLoad)
+	set strStatus	  =$$$OK
+	set strDelim	  =$char($$$FINGLJournalLoadDelimiter(objJournalLoad))
+	set strCurrentIO  =$io
+	set strQuitStatus =$$$OK
+	
+	set intCounter	  =0
+	set intErrorCount =0
+		
+	if strFile="" set strStatus=$$$Text("Fin00383")  ;No File Specified.
+	if $$$ISOK(strStatus) open strFile:"RS":0 else  set strStatus=$listBuild("Com00224",strFile)  ; Cannot open file %1
+	
+	//Prepare Journal File for Load Lists.
+	if $$$ISOK(strStatus) {
+		use strFile
+		for {
+			read strLine
+			quit:$zeof=-1
+			set intCounter=intCounter+1
+			continue:intErrorCount>=pintErrorLimit 	;continue as we want to know EOF. Dont care about checking more errors.
+ 
+			if pblnDummy set arrSample(intCounter)=strLine
+			
+			if strLine'="" {
+				set objJournalLine=""
+				set $$$FINGLJournalLineAccount(objJournalLine)	=$piece(strLine,strDelim,$$$FINGLJournalLoadAcountNumberColumn(objJournalLoad))
+				set $$$FINGLJournalLineReference(objJournalLine)=$piece(strLine,strDelim,$$$FINGLJournalLoadReferenceColumn(objJournalLoad))
+				
+				set $$$FINGLJournalLineDebit(objJournalLine)	=$piece(strLine,strDelim,$$$FINGLJournalLoadDebitColumn(objJournalLoad))
+				set $$$FINGLJournalLineCredit(objJournalLine)	=$piece(strLine,strDelim,$$$FINGLJournalLoadCreditColumn(objJournalLoad))
+											
+				//SR14457
+				if intCounter>=$$$FINGLJournalLoadFirstreadrow(objJournalLoad) {
+					set strStatus=$$ValidateJournalLine^FINGLJournalLine(objJournalLine)
+				} 
+				
+				if $$$FINGLJournalLineCredit(objJournalLine)<0 {
+					set $$$FINGLJournalLineDebit(objJournalLine)=-$$$FINGLJournalLineCredit(objJournalLine)
+					set $$$FINGLJournalLineCredit(objJournalLine)=""
+				}
+				if $$$FINGLJournalLineDebit(objJournalLine)<0 {
+					set $$$FINGLJournalLineCredit(objJournalLine)=-$$$FINGLJournalLineDebit(objJournalLine)
+					set $$$FINGLJournalLineDebit(objJournalLine)=""
+				}
+				
+				if $$$ISOK(strStatus) { 
+					;set intStatus=$$$Text("Fin00384")  ;Passed.
+					set ^CacheTempLoadList(YUSER,intCounter)=objJournalLine
+				} else {
+					set strStatus=$listbuild("Fin00385",intCounter,$$$Text(strStatus,0))
+					set intStatus=$$$Text(strStatus,0)  ;Failed. Reason: %1 
+					set ^CacheTempLoadList(YUSER,intCounter)=objJournalLine_"~"_intStatus
+					set intErrorCount = intErrorCount + 1
+					set ^CacheTempLoadListErrors(YUSER,intErrorCount)=objJournalLine_"~"_intStatus
+				}
+				
+				if $$$ISOK(strStatus) {
+					if 'pblnDummy && (intCounter>=$$$FINGLJournalLoadFirstreadrow(objJournalLoad)){
+						set idLine=$order(^FINGLJournalLine(0,idJournal,""),-1)+1
+						set strStatus=$$$Save("FINGLJournalLine",idJournal_","_idLine,objJournalLine,1)
+					}
+				}
+			}
+		}
+		use strCurrentIO
+		close strFile
+ 
+		if $$$ISOK(strQuitStatus) set strQuitStatus=$$GetFirstErrorInFile(objJournalLoad)
+ 
+		//Load Lists
+		if pblnWrite do DisplayFileLoadResults(strQuitStatus,objJournalLoad,intCounter,intErrorCount)
+		
+ 
+ 	} else {
+		set strQuitStatus=strStatus
+	}
+	quit strQuitStatus
+	
+	
+DisplayFileLoadResults(pstrFileLoadStatus,pobjJournalLoad,pintLinesCount,pintErrorCount)
+	;-------------------------------------------------------------------------------
+	; Display File Load Results on screen and if any errors, display errors list too.
+	;
+	; Params:	pstrFileLoadStatus - passed in status from FileLoad, to determine if errors in load.
+	; 			ponjJournalLoad - current JournalLoading record.
+	; 			pintLinesCount - number of lines read in from Journal Loading file
+	; 			pintErrorCount - number of errors identified by FileLoad
+	;
+	; ByRefs:
+	;
+	; Returns:	none
+	;
+	; History:
+	; 13-May-2013	SCR		CORE-98: Correction
+	; 23-May-2006	SC		SR14574: Created
+	;-------------------------------------------------------------------------------
+	new strResultMsgColour,strResultMsg,blnErrorsInFileLoad
+	
+	if $$$ISOK(pstrFileLoadStatus) {
+		set blnErrorsInFileLoad = $$$NO
+	} else { 
+		set blnErrorsInFileLoad = $$$YES
+	}
+	
+	if blnErrorsInFileLoad {
+		set strResultMsgColour=$$$SysEnum("FARBE",+$$$WWW012ColorforWarnings($get(^WWW012(0,0,1))))
+		set strResultMsg="<i>"_$$$Text("Fin01019")_"</i>" ;"File Load Failed. Review errors and reload corrected file."
+	} else {
+		set strResultMsgColour="lightgreen"
+		set strResultMsg="<i>"_$$$Text("Fin01020")_"</i>" ;"All Lines passed successfully. Press generate to load lines to journal."
+	}
+ 
+	do Start^COMTable($lb(""),$listbuild("Fin01021"),1)	;"File Load Results:" ; CORE-98
+	do Start^COMTable(,$listbuild("Fin01021"),1)	;"File Load Results:" 
+	do NewLine^COMTable(strResultMsgColour)
+	do InsertCell^COMTable(strResultMsg)	
+	do EndLine^COMTable()
+	do Stop^COMTable()
+	
+	do FileLoadResultsFooter($$$FINGLJournalLoadFirstreadrow(pobjJournalLoad),pintLinesCount,pintErrorCount)
+	
+	If blnErrorsInFileLoad do DisplayErrorsList(pobjJournalLoad)
+	
+	quit
+ 
+ 
+GetFirstErrorInFile(pobjJournalLoad)
+	;-------------------------------------------------------------------------------
+	; Returns the first error from ^CacheTempLoadListErrors, or $$$OK if none.
+	; Note: ^CacheTempLoadListErrors is constructed by LoadFile routine.
+	;
+	; Params: pobjJournalLoad - Journal Loading record.
+	;
+	; ByRefs:
+	;
+	; Returns: strStatus -	First error message, or $$$OK if no errors.
+	;
+	; History:
+	; 23-May-2006	SC		SR14574: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus=$$$OK
+ 	if $get(^CacheTempLoadListErrors(YUSER,1))'="" set strStatus = $piece($get(^CacheTempLoadListErrors(YUSER,1)),"~",5)
+	
+	quit strStatus
+ 
+DisplayErrorsList(pobjJournalLoad,blnShowAllErrors=$$$NO,pintErrorLimit=50)
+	;-------------------------------------------------------------------------------
+	; Displays Errors List on screen using parsed Journal File built in LoadFile routine.
+	;
+	; Params: pobjJournalLoad - 	Journal Loading record.
+	; 		  pblnShowAllErrors - 	If $$$YES, shows all errors found. 
+	; 		  						If $$$NO, stops when pintErrorLimit reached.
+	; 		  pintErrorLimit -		Number of errors LoadFile will stop at. (defaults to 50).
+	;
+	; ByRefs: none.
+	;
+	; Returns: none.
+	;
+	; History:
+	; 22-May-2006	SC		SR14574: Created
+	;-------------------------------------------------------------------------------
+	new intCounter,intErrorCounter,lstHeader,strFirstReadRow,strLoadStatus
+	
+	set strFirstReadRow = $$$FINGLJournalLoadFirstreadrow(pobjJournalLoad)
+	set lstHeader =           $listbuild($$$StrFINGLJournalLineAccount)
+	set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalLineReference)
+	set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalLineDebit)
+	set lstHeader = lstHeader_$listbuild($$$StrFINGLJournalLineCredit)
+	set lstHeader = lstHeader_$listbuild($$$Text("Fin01022")) //SR14574 ;"Load Status"
+	do Start^COMTable(lstHeader,$$$Text($listbuild("Fin01023",pintErrorLimit)),1)    ;"Error Preview List (First %1 Errors)"
+	
+	set intErrorCounter=0
+	for intCounter=strFirstReadRow:1:$order(^CacheTempLoadList(YUSER,""),-1) {
+		quit:$get(^CacheTempLoadList(YUSER,intCounter))=""
+		if blnShowAllErrors = $$$NO quit:intErrorCounter>=pintErrorLimit	
+		if $piece($get(^CacheTempLoadList(YUSER,intCounter)),"~",5) '="" {
+			set intErrorCounter = intErrorCounter+1
+			do NewLine^COMTable()
+			do InsertCell^COMTable($piece($get(^CacheTempLoadList(YUSER,intCounter)),"~",1))
+			do InsertCell^COMTable($piece($get(^CacheTempLoadList(YUSER,intCounter)),"~",2))
+			do InsertCell^COMTable($piece($get(^CacheTempLoadList(YUSER,intCounter)),"~",3))
+			do InsertCell^COMTable($piece($get(^CacheTempLoadList(YUSER,intCounter)),"~",4))
+			do InsertCell^COMTable("<FONT style='color:red'>"_$piece($get(^CacheTempLoadList(YUSER,intCounter)),"~",5)_"<FONT>")		
+			do EndLine^COMTable()
+		}
+		
+	}
+	do Stop^COMTable()
+ 
+ 	quit
+ 
+FileLoadResultsFooter(pstrFirstReadRow,pintCounter,pintErrorCounter,pintErrorLimit=50)
+	;-------------------------------------------------------------------------------
+	; Prints the File Load Results footer on screen with HTML.  
+	; The footer gives a break-down of the Journal Loading file parsed by LoadFile routine.  
+	; Breakdown includes number of lines tested, errors, lines skipped and lines ignored.
+	;
+	; Params:	pstrFirstReadRow - 	First Read Row of the File, specified on Journal Load Lines form. 
+	; 							   	(ie. to ignore optional file header)
+	; 			pintCounter - 		Number of lines read by LoadFile before stopping. (ie if Error Limit reached)
+	; 			pintErrorCounter -	Number of errors found by LoadFile before stopping. 	
+	; 			pintErrorLimit -	Number of errors LoadFile will stop at. (defaults to 50).
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Sep-2006	SS		SR15081: Mod'd comments for new language texts
+	; 							Removed concatenation of empty strings
+	; 23-May-2006	SC		SR14574: Created
+	;-------------------------------------------------------------------------------
+	new pstrLinesSkipped
+ 	
+ 	write $$$Text($listbuild("Fin01024",pstrFirstReadRow,($order(^CacheTempLoadList(YUSER,""),-1)),pintCounter)) ;Verified file lines %1 to %2 of %3 
+	set pstrLinesSkipped = pintCounter - $order(^CacheTempLoadList(YUSER,""),-1)
+	write "<br>"
+	write $$$Text($listbuild("Fin01026",pintErrorCounter)) ;Verification of file stopped after finding %1 errors
+	write "<br><i>"
+	write $$$Text($listbuild("Fin01027",pstrLinesSkipped)) ;"%1 lines skipped"
+	write "<br>"
+	if pstrFirstReadRow > 1 write ""_$$$Text($listbuild("Fin01028",(pstrFirstReadRow-1),pstrFirstReadRow))_"<br>" ;"%1 lines ignored. (First Read Row: Line %2)"
+	write "</i>"
+	
+	quit
+	
+	
+ /*DisplayFileSample(pobjJournalLoad) 
+	;-------------------------------------------------------------------------------
+	; Displays Errors List on screen using parsed Journal File built in LoadFile routine.
+	;
+	; Params: none.
+	;
+	; ByRefs: none.
+	;
+	; Returns: none.
+	;
+	; History:
+	; 22-May-2006	SC		SR14574: Moved from LoadList routine.
+	;-------------------------------------------------------------------------------
+	new intCounter
+	
+	do Start^COMTable($listbuild($$$Text("Fin00388")),$listbuild($$$Text("Fin00388")))  ;File Sample.
+	set strFirstReadRow = $$$FINGLJournalLoadFirstreadrow(pobjJournalLoad)
+	;set intCounter=""
+	for intCounter=strFirstReadRow:1:strFirstReadRow+9 {
+		quit:$get(^CacheTempLoadList(intCounter))=""
+		do NewLine^COMTable()
+		do InsertCell^COMTable($piece(^CacheTempLoadList(intCounter),"~",1,4))
+		do EndLine^COMTable()
+	}
+	do Stop^COMTable()
+	quit */
+ 
+ /*SR14574LoadFileOld(pidUser,pblnDummy=0,pblnWrite=1)
+    ;-------------------------------------------------------------------------------
+    ; Both loads files for display on the screen and load the journal lines.
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+    ; 18-Apr-2006	JW		SR14557: Moved null amounts check into ValidateJournalLine.
+    ; 10-Aug-2005	JW		Replace SAL with COM help text. Cleaned up.
+    ; 21-Jun-2005	SCR		SR12692: Removed Reason Field
+    ; 09-Dec-2004	Paul K	Check to make sure debit or credit column populated. (SR#11157)
+    ; 09-Dec-2004	Paul K	set Quit Status if no/invalid file. (SR#11091)	
+    ; 18-Nov-2004	Paul K	Added quitstatus (small problem when displaying)
+    ;-------------------------------------------------------------------------------
+	new objJournalLoad,strFile,strStatus,strLine,arrSample,strDelim,intCount
+	new lstHeader,objJournalLine,strCurrentIO,intStatus,idLine,idJournal
+	new strQuitStatus
+	
+	set objJournalLoad=$get(^FINGLJournalLoad(0,YBED,1))
+	
+	do $ZUTIL(68,40,1) 
+	
+	set strFile		  =$$$FINGLJournalLoadImportFilePath(objJournalLoad)
+	set idJournal	  =$$$FINGLJournalLoadJournalNumber(objJournalLoad)
+	set strStatus	  =$$$OK
+	set strDelim	  =$char($$$FINGLJournalLoadDelimiter(objJournalLoad))
+	set intCount	  =0
+	set strCurrentIO  =$io
+	set strQuitStatus =$$$OK
+ 
+	if strFile="" set strStatus=$$$Text("Fin00383")  ;No File Specified.
+	
+	if $$$ISOK(strStatus) open strFile:"RS":0 else  set strStatus=$listBuild("Com00224",strFile)  ; Cannot open file %1
+	
+	//Load List
+	if $$$ISOK(strStatus) {
+		if pblnWrite {
+			set lstHeader=			$lb($$$StrFINGLJournalLineAccount)
+			set lstHeader=lstHeader_$lb($$$StrFINGLJournalLineReference)
+			set lstHeader=lstHeader_$lb($$$StrFINGLJournalLineDebit)
+			set lstHeader=lstHeader_$lb($$$StrFINGLJournalLineCredit)
+			set lstHeader=lstHeader_$lb("Load Status") //SR14574
+			do Start^COMTable(lstHeader,$$$Text("Fin00387"),1)    ;Load Test.
+		}
+		use strFile
+		for {
+			quit:$zeof=-1
+			read strLine
+			set intCount=intCount+1
+			quit:(pblnDummy)&&(intCount>=($$$FINGLJournalLoadFirstreadrow(objJournalLoad)+20))
+			if pblnDummy set arrSample(intCount)=strLine
+			
+			if pblnWrite do NewLine^COMTable()
+			if intCount>=$$$FINGLJournalLoadFirstreadrow(objJournalLoad)&&(strLine'="") {
+				set objJournalLine=""
+				set $$$FINGLJournalLineAccount(objJournalLine)	=$piece(strLine,strDelim,$$$FINGLJournalLoadAcountNumberColumn(objJournalLoad))
+				set $$$FINGLJournalLineReference(objJournalLine)=$piece(strLine,strDelim,$$$FINGLJournalLoadReferenceColumn(objJournalLoad))
+				
+				set $$$FINGLJournalLineDebit(objJournalLine)	=$piece(strLine,strDelim,$$$FINGLJournalLoadDebitColumn(objJournalLoad))
+				set $$$FINGLJournalLineCredit(objJournalLine)	=$piece(strLine,strDelim,$$$FINGLJournalLoadCreditColumn(objJournalLoad))
+				
+				//SR14457
+				set strStatus=$$ValidateJournalLine^FINGLJournalLine(objJournalLine)
+				
+				if $$$FINGLJournalLineCredit(objJournalLine)<0 {
+					set $$$FINGLJournalLineDebit(objJournalLine)=-$$$FINGLJournalLineCredit(objJournalLine)
+					set $$$FINGLJournalLineCredit(objJournalLine)=""
+				}
+				if $$$FINGLJournalLineDebit(objJournalLine)<0 {
+					set $$$FINGLJournalLineCredit(objJournalLine)=-$$$FINGLJournalLineDebit(objJournalLine)
+					set $$$FINGLJournalLineDebit(objJournalLine)=""
+				}
+				
+				if $$$ISOK(strStatus) {
+					if 'pblnDummy {
+						set idLine=$order(^FINGLJournalLine(0,idJournal,""),-1)+1
+						set strStatus=$$$Save("FINGLJournalLine",idJournal_","_idLine,objJournalLine,$$$YES)
+					}
+					set intStatus="<FONT style='color:green'>"_$$$Text("Fin00384")_"<FONT>"  ;Passed.
+				} else {
+					set strStatus=$listbuild("Fin00385",intCount,$$$Text(strStatus,0))
+					set strQuitStatus=strStatus
+					set intStatus="<FONT style='color:red'>"_$$$Text(strStatus,0)_"<FONT>"  ;Failed. Reason: %1
+				}
+				if pblnWrite {
+					do InsertCell^COMTable($$$FINGLJournalLineAccount(objJournalLine))
+					do InsertCell^COMTable($$$FINGLJournalLineReference(objJournalLine))
+					do InsertCell^COMTable($$$FINGLJournalLineDebit(objJournalLine))
+					do InsertCell^COMTable($$$FINGLJournalLineCredit(objJournalLine))
+					do InsertCell^COMTable(intStatus)
+				}
+			} else {
+				if pblnWrite {
+					do InsertCell^COMTable(strLine,,,,,,4)
+					do InsertCell^COMTable($$$Text("Fin00386"))  ;Ignored.
+				}
+			}
+			if pblnWrite do EndLine^COMTable()
+			quit:('pblnDummy)&&$$$ISERR(strStatus)
+		}
+		use strCurrentIO
+		close strFile
+		if pblnWrite do Stop^COMTable()
+	} else {
+		set strQuitStatus=strStatus
+	}
+ 
+	if pblnDummy && pblnWrite {
+		if $$$ISERR(strQuitStatus) write "<span style='color:red'>"_$$$Text(strQuitStatus,0)_"</span>"
+		
+		do Start^COMTable($listbuild($$$Text("Fin00388")))  ;File Sample.
+		set intCount=""
+		for {
+			set intCount=$order(arrSample(intCount))
+			quit:intCount=""
+			
+			do NewLine^COMTable()
+			do InsertCell^COMTable(arrSample(intCount))
+			do EndLine^COMTable()
+		}
+		do Stop^COMTable()
+	}
+	quit strQuitStatus */
+ 
+Generateable(pidUser)
+    ;-------------------------------------------------------------------------------
+	; Check to determine if Generate Journal Load action is allowed.
+	; 
+	; Params: pidUser - User's ID.
+	; 
+	; Returns: None
+	;
+	; History:
+	; 22-May-2006	SC		SR14574: Fixed error check and message.
+	; 07-Jan-2005	PO		SR11157 Currently impossible to see result of these
+	; 							changes, however if save error is later displayed
+	; 							with FINGLJournalLoad form below it alerts will
+	; 							appear when Generate button is clicked.
+    ;-------------------------------------------------------------------------------
+	new objJournalLoad,strStatus
+	
+	set objJournalLoad = $get(^FINGLJournalLoad(0,YBED,1))
+	if $$$FINGLJournalLoadImportFilePath(objJournalLoad)="" {
+		set YQ="1 "_$$$Text("Fin00383") ; No File Specified.
+	
+	} elseif $$$FINGLJournalLoadAcountNumberColumn(objJournalLoad)="" {
+		set YQ=1_$$$Text("Fin00545") ; No Account Number Column specified.
+	
+	} elseif ($$$FINGLJournalLoadDebitColumn(objJournalLoad)="") &&
+	         ($$$FINGLJournalLoadCreditColumn(objJournalLoad)="") {
+		set YQ=1_$$$Text("Fin00525") ; The debit or credit column property must be populated.
+	
+	} else {
+		set strStatus=$$LoadFile(pidUser,$$$YES,$$$NO) //SR14574
+		;if strStatus=1 {
+		if $$$ISOK(strStatus) { //SR14574
+			set YQ=0
+		} else {
+			set YQ="1 "_$$$Text("Fin01029")  //SR14574  "Cannot Generate: File contains errors."
+			;set YQ="1 "_(strStatus)
+		}
+	}
+	quit
+	
+	
+Generate(pidUser)
+    ;-------------------------------------------------------------------------------
+    ; Wrapper for GenerateTxn
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 02-Jun-2005	shobby		Created SR11875
+    ;-------------------------------------------------------------------------------
+	new objJournalLoad,strStatus
+	
+	set strStatus=$$Transaction^COMTransaction("GenerateTxn^FINGLJournalLoad("""_pidUser_""")",1)
+	if $$$ISOK(strStatus) {
+		set objJournalLoad=$get(^FINGLJournalLoad(0,YBED,1))
+		set $$$FINGLJournalLoadLastLoadedJournal(objJournalLoad)=$$$FINGLJournalLoadImportFilePath(objJournalLoad) ; SR11358
+		set ^FINGLJournalLoad(0,YBED,1)=objJournalLoad
+		do RedirectForm^COMUtils("FINGLJournal",$$$FINGLJournalLoadJournalNumber(objJournalLoad),"FINGLJournal,",YPARA,YSEITE) ;SR11357 added
+	}
+	quit
+ 
+GenerateTxn(pidUser)
+    ;-------------------------------------------------------------------------------
+    ; Calls LoadFile with pblnDummy = $$$NO (will save Journal Lines)
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 02-Jun-2005		shobby	SR11875: Transaction protected 'Generate' code.
+    ; 12-Jan-2005		PO		SR11358: Store last loaded journal name
+    ; 06-Jan-2005		SS		SR11357: Changed code to return to Journal form
+    ; 								when loading in journal lines
+    ;-------------------------------------------------------------------------------
+	quit $$LoadFile(pidUser,$$$NO,$$$NO)
+ 
+ 
+CheckColumns(pobjJournalLoad,pstrNewValue,pstrPropertyNumber)
+    ;-------------------------------------------------------------------------------
+    ; Ensure that each column property is unique.
+    ;
+    ; Returns:Status
+    ;
+    ; History:
+    ; 23-Dec-2004		SS		SR11356: Modified language text Fin00424 to spell
+    ; 								'journal' correctly. Updated comment; Boolean
+    ; 								macro
+    ; 10-Dec-2004		PK		Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,strPropertyLoop
+	set strStatus=$$$OK
+	
+	if pstrNewValue'="" {
+		for strPropertyLoop=5:1:8 {
+			if strPropertyLoop'=pstrPropertyNumber {
+				if $piece(pobjJournalLoad,Y,strPropertyLoop) = pstrNewValue {
+					set strStatus=$listbuild("Fin00424") ;Each column property for journal loading must be unique. (modified SR:11356)
+				}
+			}
+		}
+	}
+	
+	if strStatus'=$$$OK {
+		set %TXT(1)="#Y"_YFORM_"D"_pstrPropertyNumber_"~"
+		write "alert('"_$$$Text(strStatus)_"');"  ;The Debit Column property can't be the same as the Credit Column property.
+	}
+	
+	quit strStatus
+ 
+OnBlurImportFilePath(pstrJournalLoadData)
+    ;-------------------------------------------------------------------------------
+	; History:
+	; 14-Feb-2005	PO		SR11328: Improved file check between current and last
+	; 24-Jan-2005	PO		SR11358: Added change focus away from field, shouldn't
+	; 							be necessary however have had report that after
+	; 							alert field regains focus.
+	; 12-Jan-2005	PO		SR11358: Warn if last loaded journal name matches name
+	; 							of file just selected.
+    ;-------------------------------------------------------------------------------
+	new strLast,strNew
+ 
+	; May raise false positives, but will never miss a genuine match.
+	set strLast = $zconvert($$$FINGLJournalLoadLastLoadedJournal($get(^FINGLJournalLoad(0,YBED,1))),"l")
+	set strNew  = $zconvert($$$FINGLJournalLoadImportFilePath(pstrJournalLoadData),"l")
+ 
+	;This is only good when the machine running cache is also holding the journal files.
+	;if $zconvert($extract($System.Version.GetOS(),1,7),"l")="windows" {
+	;	set strLast=$zconvert(strLast,"l")
+	;	set strNew=$zconvert(strNew,"l")
+	;}
+ 
+	if (strLast=strNew) && (strNew'="") {
+		write "document.focus();"
+		write "alert('"_$$$Text("Fin00552")_"');"  ; Journal attempting to be loaded is from the same location used previously.
+ 
+		;new objForm,strHTMLForm - One possible alternative solution, however not complete as confirms can be displayed at inappropriate times.
+		;set objForm=$get(^WWW120(0,"FINGLJournalLoad",1))
+		;set strHTMLForm="WWW"
+		;if $$$WWW120SaveServerdata(objForm) { ; Save Server Data option on the form
+		;	set strHTMLForm=strHTMLForm_"2"
+		;}
+		;write "if (confirm('"_$$$Text("Fin00552")_"')) {"
+		;write "   document.focus();"
+		;write "} else {"
+		;write "   document."_strHTMLForm_".YFINGLJournalLoadD"_$$frmFldNoGivenclsFldNo^COMUtils("FINGLJournalLoad",$$$FldFINGLJournalLoadImportFilePath)_".focus();"
+		;write "}"
+	}
+ 
+	quit
+	
+	
+	
+ 
+]]></Routine>
+</Export>

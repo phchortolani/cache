@@ -1,0 +1,504 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInv2" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInv2
+	
+#include COMSYS
+#include FINConst
+#include COMConst
+#include INConst
+	
+#define NoQuote(%str) $translate(%str,"""")
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^FINAPInv2("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Update(pblnInMemory=$$$NO,pblnPost=$$$NO,pidFINAPInv=" ")
+	;-------------------------------------------------------------------------------
+	; Update the variance data posting if insufficient quantity on hand.
+	; 
+	; Called By: PostTxn^FINAPInvPost
+	;            PostCost^FINAPInvPostCost
+	; 
+	; Returns:
+	;
+	; History:
+	; 10-Apr-2010	GRF		SR17177: arrGrid rather than objGrid; GRID Macros
+	; 30-Sep-2009	GRF		SR16361: Need to have FAIMC D29 "Closed" set before
+	;							calling routine accesses CloseOrders^FINAPInvPost.
+	; 10-Jul-2009	GRF		SR16689: replace variable "i" with "loop"; standard
+	;						variables; Fix merge - wrong global
+	; 31-Aug-2005	shobby	SR12823:Non-stock items post to Inventory.
+	; 31-Aug-2005	shobby	SR12823:Allow this routine to run from either the grid
+	;							or during posting. (new flag pblnPost)
+	; 10-Mar-2005	PO		Use NoKey macro
+	; 01-Feb-2005	Shobby	Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new arrGrid,fltOnHandQty,idInvoice,idLine,idVarianceType,intField,loop,objInvLine
+	
+	$$$LogR("Update",pidFINAPInv_"<"_pblnInMemory_"<"_pblnPost)
+	
+	if pblnPost {
+		set idInvoice = pidFINAPInv
+	;	merge arrGrid(idInvoice) = ^FINAPInv(YM,idInvoice)  SR16689
+		merge arrGrid(idInvoice) = ^FINAPInvLine(0,idInvoice)
+	
+	} else {
+		set idInvoice = $$GetYKEY^COMGridEdit31Interface()
+		$$$GRIDGetContents(.arrGrid)
+	}
+	
+	$$$LogRx("U1:"_idInvoice)
+	
+	if '$$$NoKey(idInvoice) {
+		set idLine = ""
+		for {
+			set idLine = $order(arrGrid(idInvoice,idLine))
+			quit:idLine=""
+			
+			set objInvLine = $get(arrGrid(idInvoice,idLine))
+			for loop="TV","IQ","ID","OD" {
+				set idVarianceType = ""
+				if (loop="TV") &&
+				   (($$$FINAPInvLineVariancePosting(objInvLine)=$$$EnumFINAPVARIANCEPOSTInventory) ||
+				    ($$$FINAPInvLineVariancePosting(objInvLine)=$$$EnumFINAPVARIANCEPOSTSplit))       {
+					set idVarianceType = loop
+					set intField       = $$$FldFINAPInvLineVariancePosting
+				
+				} elseif (loop="IQ") &&
+				         (($$$FINAPInvLineVarianceINVQPost(objInvLine)=$$$EnumFINAPVARIANCEPOSTInventory) ||
+				          ($$$FINAPInvLineVarianceINVQPost(objInvLine)=$$$EnumFINAPVARIANCEPOSTSplit))       {
+				; Don't think this one is needed
+				;	set idVarianceType = loop
+				;	set intField       = $$$FldFINAPInvLineVarianceINVQPost
+				
+				} elseif (loop="ID") &&
+				         (($$$FINAPInvLineVarianceINVDPost(objInvLine)=$$$EnumFINAPVARIANCEPOSTInventory) ||
+				          ($$$FINAPInvLineVarianceINVDPost(objInvLine)=$$$EnumFINAPVARIANCEPOSTSplit))       {
+					set idVarianceType = loop
+					set intField       = $$$FldFINAPInvLineVarianceINVDPost
+				
+				} elseif (loop="OD") &&
+				         (($$$FINAPInvLineVarianceOTHDPost(objInvLine)=$$$EnumFINAPVARIANCEPOSTInventory) ||
+				          ($$$FINAPInvLineVarianceOTHDPost(objInvLine)=$$$EnumFINAPVARIANCEPOSTSplit))       {
+				; Don't think this one is needed
+				;	set idVarianceType = loop
+				;	set intField       = $$$FldFINAPInvLineVarianceOTHDPost
+				}
+				if idVarianceType'="" {
+					if $$IsNonStockItem(objInvLine) {  ; Non stock
+						set $piece(objInvLine,Y,intField) = $$$EnumFINAPVARIANCEPOSTInventory
+						set arrGrid(idInvoice,idLine) = objInvLine
+						if pblnPost do Save^COMUtils("FINAPInvLine",idLine,objInvLine)
+					
+					} else {
+						set fltOnHandQty = $$GetQtyOnHand^FINAPInv(objInvLine)
+						if $$$FINAPInvLineInvoiceQuantity(objInvLine)>fltOnHandQty {
+							; Not enough inventory, create a split.
+							set $piece(objInvLine,Y,intField) = $$$EnumFINAPVARIANCEPOSTSplit
+							do CreateVariance^FINAPInvLineVariance(.objInvLine,idInvoice,idLine,idVarianceType,fltOnHandQty)
+							set arrGrid(idInvoice,idLine) = objInvLine
+							if pblnPost do Save^COMUtils("FINAPInvLine",idLine,objInvLine)
+						}
+					}
+				}
+			}
+		}
+		if 'pblnPost {
+			$$$GRIDSetContents(.arrGrid,pblnInMemory)
+			if 'pblnInMemory do Save^FINAPInv(idInvoice)
+		}
+		do CloseDefault(idInvoice)    ; SR16361
+	}
+	quit
+	
+CloseDefault(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 30-Sep-2009	GRF		SR16361: Need to have FAIMC D29 "Closed" set before
+	;							calling routine accesses CloseOrders^FINAPInvPost.
+	;-------------------------------------------------------------------------------
+	new idLine,objInvLine,strStatus
+	
+	set idLine = ""
+	for {
+		set idLine = $order(^FINAPInvLine(0,pidInvoice,idLine))
+		quit:idLine=""
+		
+		set objInvLine = $get(^FINAPInvLine(0,pidInvoice,idLine,1))
+		do ClosedDefault^FINAPInvMatchCache(.objInvLine)
+		set strStatus = $$$Save("FINAPInvLine",idLine,objInvLine)
+	}
+	quit
+	
+IsNonStockItem(pobjInvLine) 
+	;-------------------------------------------------------------------------------
+	; Determine if the item on this line is a non stock item.
+	; 
+	; Called By : Update^FINAPInv2
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Sep-2005	shobby	SR13280: Also check the AccrualReversal flag.  If set
+	;							treat as NonStock when posting invoice.
+	; 31-Aug-2005	shobby	SR12823: Created
+	;-------------------------------------------------------------------------------
+	new blnFlag,idItem,objFINGeneralSetup
+	
+	set blnFlag = $$$NO
+	set idItem  = $$$FINAPInvLineItem(pobjInvLine)
+	if idItem'="" {
+		set blnFlag	= +$$$INARTItemWithoutInventoryMaint($get(^INART(YM,idItem,1)))
+	}
+	if 'blnFlag {
+		set objFINGeneralSetup = $get(^FINGeneralSetup(YM,YM,1))
+		if objFINGeneralSetup'="" {
+			set blnFlag = $$$FINGeneralSetupAccrualReversal(objFINGeneralSetup)
+		}
+	}
+	quit blnFlag
+ 
+ 
+UpdateSupplier(pidSupplier="",pYFELD="")
+	;-------------------------------------------------------------------------------
+	; Update any supplier details when the Base Supplier Changes
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Jul-2006	JW+SC	SR14714: Replace grid call, so forms can use this at button line.
+	; 01-Feb-2006	SS		SR13497: Discount GL Account (JW - fixed undefined error)
+	; 23-Sep-2005	JW		SR12880: Pass in YKEY
+	; 02-Sep-2005	PO		SR12965: Corrected reference to WWW0121 and checking
+	;							that idTaxLocation not zero length string
+	; 25-Aug-2005	PO		SR12965: Replaced call to UpdateTax with SwitchFields
+	; 24-May-2005	shobby	SR12319: RemittanceAddress is now a calc field (D26->M17)
+	; 23-May-2005	JW		SR12112: Added terms. Removed duplicate line.
+	; 04-May-2005	Paul K	Call to Update Tax and simplified code
+	; 14-Apr-2005	Paul K	Populate the Tax Location property
+	; 30-Mar-2005	JW		Changed TaxInvoice field population
+	; 29-Mar-2005	JW		Added YFELD to CheckSupplier.
+	; 17-Mar-2005	PO		SR11349 Moved ValidSupplier check to OnBlurSupplierNos
+	; 10-Mar-2005	JW		Moved UpdateAddress code into function (removed null check)
+	; 03-Mar-2005	Paul K	Added code to set the LinesIncludeTax Flag
+	; 19-Jan-2005	RobertW	Modified to use YFKEY as YKEY is not defined
+	; 28-Dec-2004	RPW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new strStatus,objSupplier,idTaxLocation, idTerms,invoiceDate,dueDate,idTax,objTax
+	new idDiscAccount,idControl,numDiscount
+	
+	if pidSupplier'="" {
+		set objSupplier   = $get(^FINAPSupplier(YM,pidSupplier,1))
+		set idTaxLocation = $$$FINAPSupplierTaxLocation(objSupplier)
+		if idTaxLocation="" set idTaxLocation = $$$WWW0121TaxLocation($get(^WWW0121(0,YM,YLOCATION,1)))
+ 
+		do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvTaxLocation,idTaxLocation,,.pYFELD)
+		set idTax = $$$FINAPSupplierDefaultTaxCode(objSupplier)
+		if (idTax="") && (idTaxLocation'="") {
+			set objTax = $get(^COMTaxLocation(YM,idTaxLocation,1))
+			if objTax'="" {
+				set idTax = $$$COMTAXLocationDefaultTaxCode(objTax)
+			}
+		}
+		
+		set $piece(pYFELD,Y,$$$FldFINAPInvDefaultTaxCode) = idTax
+		do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvShowTotalVariance,$$$FINAPSupplierTotalInvoiceVariance(objSupplier),,.pYFELD)
+		do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvLinesIncludeTax,$$$FINAPSupplierInvoiceLinesContainTax(objSupplier),,.pYFELD)
+		do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvTaxInvoice,$$$FINAPSupplierIssuesTaxInvoices(objSupplier),,.pYFELD)
+		do PopulateDataField^COMUtils(YFORM,17,$$UpdateAddress^FINAPInv(pidSupplier),"M")
+		if $$$FINAPInvSupplier(pYFELD)="" {
+			do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvSupplier,pidSupplier,,.pYFELD)
+		}
+		do CheckSupplier^FINAPInv(pidSupplier,YFKEY,pYFELD)
+		
+		do SwitchFields^FINAPInvLineTax2(pYFELD,YFKEY)
+		
+	; Terms
+	;---------------------------------------
+		set idTerms = $$GetTerm^FINAPSupplier(pidSupplier)
+		do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvDiscountTerm,idTerms)
+		
+	; Dates
+	;---------------------------------------
+		set invoiceDate = $$$FINAPInvInvoiceDate(pYFELD)
+		if invoiceDate '= "" {
+			set dueDate = $$GetDueDate^FINAPSupplier(pidSupplier,invoiceDate,idTerms)
+			do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvDueDate,$$^WWWDATE(dueDate))
+		}
+		
+	; Discount GL Account
+	;---------------------------------------
+		set idDiscAccount=$$$FINAPSupplierDiscountGLAccount(objSupplier)
+		if (idDiscAccount="") {
+			set idControl=$$$FINAPSupplierControlAccount(objSupplier)
+			if (idControl'="") set idDiscAccount = $$$FINAPAccountDiscountAccount($get(^FINAPAccount(YM,idControl,1)))
+		}
+		do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvDiscountGLAccount,idDiscAccount)
+			
+	; Discount Percent
+	;---------------------------------------
+		set numDiscount = 0
+		if idTerms'="" {
+			set numDiscount = $$$FINSYSTermDiscount1($get(^FINSYSTerm(YM,idTerms,1)))
+		}
+		do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvDiscountPercent,numDiscount)
+	}	
+	
+	quit 
+	
+	
+TotalsMatch(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Checks whether the actual and calculated totals match.
+	; 
+	; Called By:
+	;	PrePost^FINAPInvPrePost
+	;	Postable^FINAPInvPost
+	; 
+	; Returns: status
+	;
+	; History:
+	; 08-Sep-2005	RPW		SR13446: Fix the FCUpdate by using the Invoice Matching
+	;							Exchange rate
+	; 19-Aug-2005	RPW		SR11983: Make sure we add in the discount info as well.
+	; 03-May-2005	Paul K	SR12231: Make sure that there is a line to distribute
+	;							tax over.
+	; 22-Mar-2005	PO		SR11349 FC support
+	; 23-Feb-2005	JW		SR11405: Added Vouchers
+	; 14-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new strStatus,curAmount,idLine,objLine,objInvoice,actualTotal,blnTaxLineExists
+	new fltTotal,fltAdditional
+	
+	$$$LogR("TotalsMatch",pidInvoice)
+	
+	set strStatus = $$$OK
+	
+	if pidInvoice'="" {
+		set objInvoice = $get(^FINAPInv(YM,pidInvoice,1))
+	$$$LogRx("FINAPInv       :"_objInvoice)
+	
+		set curAmount  = 0
+		set idLine     = ""
+		if $$$FINAPInvIsVoucher(objInvoice) {
+			for {
+				set idLine = $order(^FINAPInvCharge(YM,pidInvoice,idLine))
+				quit:idLine=""
+				
+				set objLine = $get(^FINAPInvCharge(YM,pidInvoice,idLine,1))
+	$$$LogRx("FINAPInvCharge :"_idLine_":"_objLine)
+				if '$$$FINAPInvChargeIsOnCharge(objLine) {
+					set curAmount = $$$FCAdd(curAmount,$$$FINAPInvChargeAmountTaxEx(objLine))
+				}
+			}
+			set curAmount = $$$FCAdd(curAmount,$$$FINAPInvTaxTotal(objInvoice))
+			
+		} else {
+			set blnTaxLineExists = $$$NO
+			for {
+				set idLine = $order(^FINAPInvLine(YM,pidInvoice,idLine))
+				quit:idLine=""
+				
+				set objLine       = $get(^FINAPInvLine(YM,pidInvoice,idLine,1))
+	$$$LogRx("FINAPInvLine   :"_idLine_":"_objLine)
+			;	set fltTotal      = $$GetCalcTotal^FINAPInvLineGet(objLine)  ; FIXME Why go to tag when tag just sets a piece directly from objLine? Do it here??
+				set fltTotal      = $$$FINAPInvLineInvoiceTotalIncludingTax(objLine)
+				set curAmount     = $$$FCAdd(curAmount,fltTotal)
+				set fltAdditional = $$GetAdditionalCharges^FINAPInvCharge2(pidInvoice_","_idLine,objLine)
+				set curAmount     = $$$FCAdd(curAmount,fltAdditional)
+				if $$$FINAPInvLineInvoiceTotalIncludingTax(objLine)-$$$FINAPInvLineInvoiceTotal(objLine) > 0 {
+					set blnTaxLineExists = $$$YES
+				}
+	$$$LogRx("               :"_fltTotal_","_fltAdditional_","_curAmount)
+			}
+			if 'blnTaxLineExists && (+$$$FINAPInvTaxTotal(objInvoice)'=0) {
+				set strStatus = $listbuild("Fin00759",$$FormatCurrency^COMTable($$$FINAPInvTaxTotal(objInvoice)))
+			}  ; "Invoice must contain at least 1 line to distribute tax amount of %1 over."
+		}
+		
+		if $$$ISOK(strStatus) {
+			set curAmount = $$$FCRound(curAmount)
+			set curAmount = $$$FCUpdate(curAmount,$$$FINAPInvExchangeRate(objInvoice),1) ; SR13446:
+			
+			set actualTotal = $$$FINAPInvActualTotal(objInvoice)
+	
+			if '$$$FCIsEqual(curAmount,actualTotal) {
+				if $case($$$CurrencyToUse,"Foreign":1,"Either":1,:0) {
+					set actualTotal = $$$FCRound($$$FCAmount(actualTotal))_" "_$$$FCur(actualTotal)
+					set curAmount   = $$$FCRound($$$FCAmount(curAmount))_" "_$$$FCur(curAmount)
+				
+				} else {
+					set actualTotal = $fnumber(actualTotal,"",2)
+					set curAmount   = $fnumber(curAmount,"",2)
+				}
+				set strStatus = $listbuild("Fin00636",actualTotal,curAmount)
+			}  ; "Actual Total (%1) must match Calculated Total (%2) before posting."
+		}
+	}
+	quit strStatus
+	
+	
+CheckDuplicate(pstrSupplier,pstrInvoiceNumber,pstrYFKEY,pblnAlert=$$$YES)
+	;-------------------------------------------------------------------------------
+	; Check if this supplier already has had this invoice number matched here or
+	; has had an adjustment done with this reference number.
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Nov-2005	Steve S	SR13663: Skip cancelled records in the check
+	; 15-Aug-2005	JW		SR13242: Use $$$Index not ^WWWUMLAU. SR12410: Added pblnAlert. Changed Fin00543.
+	; 15-Jul-2005	RPW		SR12981: Moved from FINAPInv
+	; 06-Apr-2005	RobertW	The Index has changed to WWWUMLAU on the Invoice Number piece (piece 4)
+	;						so the code has been modified to handle this now. SR:11407
+	; 19-Jan-2005	RobertW	Modified to pstrYKEY to pstrYFKEY
+	; 17-Jan-2005	RPW		Modifed to handle multiple FINAPInv records.
+	; 14-Jan-2005	RPW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new blnDuplicate,objSetup,strError,strStatus,strUpper,strYKEY
+	
+	set strStatus    = $$$OK
+	set blnDuplicate = $$$NO
+	set strError     = ""
+	
+	if (pstrSupplier'="") && (pstrInvoiceNumber'="") {
+		set objSetup = $get(^FINGeneralSetup(YM,YM,1))
+			
+		if objSetup'="" {
+			if $$$FINGeneralSetupCheckForDuplicate(objSetup)=$$$YES {
+				set strUpper = $$$Index(pstrInvoiceNumber)
+				set strYKEY  = ""
+				for {
+					quit:blnDuplicate
+					set strYKEY = $order(^FINAPInvs(YM,1,pstrSupplier,strUpper,strYKEY))
+					quit:(strYKEY="")
+					continue:(strYKEY=pstrYFKEY)
+					continue:$$$FINAPInvStatus($get(^FINAPInv(YM,strYKEY,1)))=$$$EnumFINSYSSTATUSCancelled
+					
+					set blnDuplicate = ( (pstrYFKEY="") && (strYKEY'="") || ((pstrYFKEY'="")&&(strYKEY'="")&&(pstrYFKEY'=strYKEY)) )
+					if blnDuplicate {
+					; "Supplier Invoice Number %2 has been used with record %3 for Supplier %1. Please choose another number."
+						set strError=$listbuild("Fin00543",pstrSupplier,pstrInvoiceNumber,strYKEY)
+					}
+				}
+				if 'blnDuplicate {
+					set blnDuplicate = $$CheckDuplicateAPAdjustment(pstrSupplier,pstrInvoiceNumber,.strError)
+				}
+			}
+		}
+	}
+	
+	if blnDuplicate {
+		set strStatus = strError
+		if pblnAlert {
+			$$$Alert(strStatus)
+		}
+	}
+	quit strStatus
+	
+	
+CheckDuplicateAPAdjustment(pstrSupplier,pstrInvoiceNumber,pstrError)
+	;-------------------------------------------------------------------------------
+	; Check if this supplier already has had this invoice number on an adjustment
+	;
+	; Returns: Boolean, whether this detail exists on an adjustment
+	;
+	; History:
+	; 15-Jul-2005	RPW		SR12981: Moved from FINAPInv
+	;  1-Feb-2005	JW		Check for "" before 2nd $order.
+	; 01-Feb-2005	RobertW	Modified to use the better index
+	; 14-Jan-2005	RPW		Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new blnDuplicate,idAPADJ,idAPADJLine,strReference
+	
+	set blnDuplicate = $$$NO
+	set strReference = $$^WWWUMLAU(pstrInvoiceNumber,1)
+	
+	set idAPADJ = $order(^FINAPADJLines(YM,52,pstrSupplier,strReference,""))
+	if idAPADJ'="" {
+		set idAPADJLine = $order(^FINAPADJLines(YM,52,pstrSupplier,strReference,idAPADJ,""))
+		if idAPADJLine'="" {
+			set blnDuplicate = $$$YES
+			set pstrError    = $listbuild("Fin00568",idAPADJ,idAPADJLine,pstrInvoiceNumber,pstrSupplier)
+		} ; "Adjustment %1, Line %2, has reference %3 for Supplier %4. Please choose another Supplier Invoice Number."
+	}
+	
+	quit blnDuplicate
+	
+	
+OnBlurDiscountAmount(pYFELD,pYOLDV)
+    /*-------------------------------------------------------------------------------
+	; Code to run on blur of the discount amount field
+	;
+	; Params:	pYFELD		:		The YFELD string
+	;			pYOLDV		:		The YOLDV string (prev value)
+	;			
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Jan-2006	Steve S		SR13497: Created
+	;-------------------------------------------------------------------------------*/
+	new curDiscAmt
+	
+	set curDiscAmt = $$$FINAPInvDiscountAmount(pYFELD)
+	if (curDiscAmt'=pYOLDV) {
+		set %TXT(1) = "#Y"_YFORM_"D"_$$$FldFINAPInvDiscountPercent_Y
+	}
+ 
+	quit
+	
+	
+UpdateDiscount(pcurTotal)
+    /*-------------------------------------------------------------------------------
+	; Code to update discount amounts on the 3WM
+	;
+	; Params:	pcurTotal		:		Current invoice total
+	;			
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Jan-2006	Steve S	SR13497: Created
+	;-------------------------------------------------------------------------------*/
+	new curDiscTotal,curNewTotal,fltDiscPC
+	
+	set fltDiscPC = $$$FINAPInvDiscountPercent($$$GRIDYFELDContainer)
+	if $get(pcurTotal)="" set pcurTotal = $get(^CacheTemp3WMTotal(YUSER))
+	
+	if (fltDiscPC'="") {
+		set curNewTotal  = $$$FCMult2(pcurTotal,(1-(fltDiscPC/100)))
+		set curDiscTotal = $$$FCSub(pcurTotal,curNewTotal)
+		do PopulateDataField^COMUtils("FINAPInv",$$$FldFINAPInvDiscountAmount,curDiscTotal,,,$$$NO)
+	}
+ 
+	quit
+	
+	
+OnBlurDiscountPercent()
+    /*-------------------------------------------------------------------------------
+	; Code to run on blur of the discount percent field
+	;
+	; Params:
+	;			
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Jan-2006	Steve S	SR13497: Created
+	;-------------------------------------------------------------------------------*/
+	do UpdateDiscount()
+	quit
+	
+]]></Routine>
+</Export>

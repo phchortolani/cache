@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Class name="VAR.infra.item.AlertaValidadeAtaRunner">
+<ClassType/>
+<Import>VAR.infra.services</Import>
+<IncludeCode>VARLog,VARService,COMSYS,VARConst</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>ServiceRunner</Super>
+
+<Method name="Register">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit ..RegisterRunner($$$ServiceIdAlertaValidadeAta, $$$ServiceFrequencyHourly, $$$ServicePriorityHighLow, ..%ClassName(1), "Alerta de Validade de ata")]]></Implementation>
+</Method>
+
+<Method name="Unregister">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit ..UnregisterRunner($$$ServiceIdAlertaValidadeAta, "Alerta de Validade de ata")]]></Implementation>
+</Method>
+
+<Method name="Execute">
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	if (('##class(VAR.infra.shadow.ShadowRunner).IsFunctional()) || 
+			((..IsShadowComputer()) && (..IsIntegrationNamespace()))) {
+		quit $$$OK
+	}
+	
+	set status = $$$NO
+	set customFrequency = ##class(CustomFrequency).Load($$$ServiceIdAlertaValidadeAta)
+	if ('$isObject(customFrequency))
+	{
+		set customFrequency = ##class(CustomFrequency).%New()
+		set objVARParametroCliente = ^VARParametroCliente(0,0,1)
+		set customFrequency.ServiceId 		= $$$ServiceIdAlertaValidadeAta
+		set customFrequency.Frequency		= $$$VARParametroClienteFrequenciaValidadeAta(objVARParametroCliente)
+		set customFrequency.DaysOfWeek		= $$$VARParametroClienteDiasdasemanaata(objVARParametroCliente)
+		set customFrequency.DaysOfMonth		= $$$VARParametroClienteDiasdomesata(objVARParametroCliente)
+		set customFrequency.ExecutionHour	= $$$VARParametroClienteHoradeexecucaoata(objVARParametroCliente)
+	}
+	
+	if (customFrequency.CheckFrequency())
+	{
+		$$$VAR
+		
+		set status = ..MonitoraDataDeValidadeAta()
+		if ($$$ISERR(status)) {
+			$$$VARLOGERROR("Erro ao monitorar o Alerta de Validade de ata: "_status)
+		}
+		else {
+			set customFrequency.LastExecute = $horolog
+			set status = customFrequency.%Save(1)
+			$$$VARLOGINFO("Enviado Alerta de Validade de Ata em: "_$zdatetime($horolog,4,1)_" - Maquina: "_##class(VAR.infra.util.Util).GetComputerName()_" - Namespace: "_##class(VAR.infra.util.Util).GetNamespace())
+		}
+	}
+	
+	quit status]]></Implementation>
+</Method>
+
+<Method name="MonitoraDataDeValidadeAta">
+<Private>1</Private>
+<ProcedureBlock>0</ProcedureBlock>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	;Monitora a data de validade dos produtos em estoques
+    $$$VAR
+    
+    new Limit,strStatus,dteStart,dteEnd,object,SQLCODE,mySQL,Mensagem,count,previousLocation,
+    	NumeroAta,Status,dteValidade,idLinhaAta,idProduto,idFornecedor,CustoMedioStr,ValorTotalStr,
+    	fltQuantidade,idUnidade,vlueUnitario,fltSaldoItem,ValorTotalStr,intNoDaysAVencer
+     ; Não pode enviar esse tipo de informação para o usuário final se não forem os
+    ; reais dados da produção!
+    
+    set Limit = $$getDiasAlertaValidadeAta^VARParametroCliente(YM)
+
+    //Monitora a validade para os próximos 30 dias
+    set strStatus = $$$OK
+    set dteStart  = $piece($horolog,",",1)
+    set dteEnd    = dteStart + Limit
+    
+	set object = ##class(%ResultSet).%New()  ;Create Result Set Object
+
+	set mySQL = "SELECT Ata.CodATA,"
+	set mySQL = mySQL_" Ata.NumeroProcesso,"
+	set mySQL = mySQL_" Ata.Status,"
+	set mySQL = mySQL_" Ata.DatadeValidade,"
+	set mySQL = mySQL_" Linha.LinhadaAta,"
+	set mySQL = mySQL_" Linha.Produto,"
+	set mySQL = mySQL_" Linha.Fornecedor,"
+	set mySQL = mySQL_" Linha.Quantidade,"
+	set mySQL = mySQL_" Linha.Unidade,"
+	set mySQL = mySQL_" Linha.ValorUnitario,"
+	set mySQL = mySQL_" $$SQLGetSaldoItemQuant^VARAtaLinha(Ata.CodAta,Linha.LinhadaAta) as Saldo"
+	set mySQL = mySQL_" FROM VARAta Ata"
+	set mySQL = mySQL_" LEFT JOIN VARAtaLinha Linha"
+	set mySQL = mySQL_" ON Linha.CodAta = Ata.CodAta"			
+	set mySQL = mySQL_" WHERE UPPER(Ata.Status) = 1"			
+	
+	set mySQL = mySQL_"  AND $$SQLGetSaldoItemQuant^VARAtaLinha(Ata.CodAta,Linha.LinhadaAta) > 0"
+	set mySQL = mySQL_" AND  Ata.DatadeValidade >= "_dteStart
+	set mySQL = mySQL_" AND  Ata.DatadeValidade < "_dteEnd
+	
+	set mySQL = mySQL_" ORDER BY Ata.DatadeValidade"
+    
+	do object.Prepare(mySQL) ;Prepare Query
+	do object.Execute()  	 ;Execute Query
+    
+    //Iterando
+    new Mensagem, count, idAta, NumeroAta, Status, dteValidade, idLinhaAta, idProduto, idFornecedor,
+   		fltQuantidade, idUnidade
+    
+    set Mensagem = ""
+    set count    = 0
+    
+    set previousLocation = ""
+	//"N°. da Ata","Fornecedor","Produto","Quantidade","Saldo","UN","Preço","Validade","Prazo Restante"
+    set Mensagem = Mensagem_"<table cellspacing='1' style='font-size:12px'>"
+    set Mensagem = Mensagem_"<tr style='background-color:#E0E0E0'>"
+    set Mensagem = Mensagem_"<th>&nbsp;</th>"
+    set Mensagem = Mensagem_"<th style='padding-left:4px;padding-right:4px'>N°. da Ata</th>"
+    set Mensagem = Mensagem_"<th style='padding-left:4px;padding-right:4px'>Fornecedor</th>"    
+    set Mensagem = Mensagem_"<th style='padding-left:4px;padding-right:4px'>Produto</th>"
+    set Mensagem = Mensagem_"<th style='padding-left:4px;padding-right:4px'>Quantidade</th>"    
+    set Mensagem = Mensagem_"<th style='padding-left:4px;padding-right:4px'>Saldo</th>"
+    set Mensagem = Mensagem_"<th style='padding-left:4px;padding-right:4px'>UN</th>"
+    set Mensagem = Mensagem_"<th style='padding-left:4px;padding-right:4px'>Preço</th>"
+    set Mensagem = Mensagem_"<th style='padding-left:4px;padding-right:4px'>Validade</th>"
+    set Mensagem = Mensagem_"<th style='padding-left:4px;padding-right:4px'>Prazo Restante</th>"   
+    set Mensagem = Mensagem_"</tr>"
+    
+    while (object.Next()) {
+        
+        set idAta	      = object.GetData(1)
+		set NumeroAta     = object.GetData(2)
+		set Status        = object.GetData(3)
+		set dteValidade   = object.GetData(4)
+		set idLinhaAta    = object.GetData(5)
+		set idProduto	  = object.GetData(6)
+		set idFornecedor  = object.GetData(7)
+		set fltQuantidade = object.GetData(8)
+		set idUnidade     = object.GetData(9)
+		set vlueUnitario  = object.GetData(10)
+		set fltSaldoItem  = object.GetData(11)				
+		
+		set count = $i(count)
+	
+		set intNoDaysAVencer = 0
+		set intNoDaysAVencer = dteValidade - $piece($horolog,",",1)
+            
+        if (count#2=0) { 
+     		set Mensagem = Mensagem_"<tr style='background-color:white'>"
+        } 
+        else {
+	        set Mensagem = Mensagem_"<tr style='background-color:#F0F0F0'>"
+        }
+        set Mensagem = Mensagem_"<td style='padding-left:4px;padding-right:4px'>"_count_"</td>"
+        set Mensagem = Mensagem_"<td style='padding-left:4px;padding-right:4px'>"_idAta_"</td>"
+        set Mensagem = Mensagem_"<td style='padding-left:4px;padding-right:4px'>"_$$SQLGetDescFornecedor^VARSQL(idFornecedor)_"</td>"
+        set Mensagem = Mensagem_"<td style='padding-left:4px;padding-right:4px'>"_idProduto_" - "_$$SQLGetDescricaoProduto^VARSQL(idProduto)_"</td>"
+        set Mensagem = Mensagem_"<td align='right' nowrap='nowrap' style='padding-left:4px;padding-right:4px'>"_$$^WWWTR(0,12,fltQuantidade)_"</td>"
+        set Mensagem = Mensagem_"<td align='right' nowrap='nowrap' style='padding-left:4px;padding-right:4px'>"_$$^WWWTR(0,12,fltSaldoItem)_"</td>"
+        set Mensagem = Mensagem_"<td align='center' style='padding-left:4px;padding-right:4px'>"_$$SQLGetSiglaUnit^VARSQL(idUnidade)_"</td>"
+        set Mensagem = Mensagem_"<td align='right' nowrap='nowrap' style='padding-left:4px;padding-right:4px'>"_vlueUnitario_"</td>"
+        set Mensagem = Mensagem_"<td style='padding-left:4px;padding-right:4px'>"_$zdate(dteValidade,4)_"</td>"
+        set Mensagem = Mensagem_"<td align='right' nowrap='nowrap' style='padding-left:4px;padding-right:4px'>"_intNoDaysAVencer_" dias</td></tr>"
+    }
+
+    do object.Close()
+    
+    set Mensagem = Mensagem_"</table>"
+    
+    //Caso exista algum alerta... envia o e-mail.
+    if (Mensagem '= "") {
+        set strStatus = ..EnviarEmailAlertaValidadeAta(Limit,Mensagem)
+    }
+    
+    quit strStatus]]></Implementation>
+</Method>
+
+<Method name="EnviarEmailAlertaValidadeAta">
+<FormalSpec>pLimit,pMensagem</FormalSpec>
+<Private>1</Private>
+<ProcedureBlock>0</ProcedureBlock>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	new strStatus,strMensagem,Remetente,Assunto,strDestinatarios,cnt,User,EmailDestino
+    
+    set strStatus = $$$OK
+    
+    set strMensagem = "(Email enviado automaticamente pelo sistema)<br /><br />"
+    set strMensagem = strMensagem_"<strong>Atenção, as seguintes Atas irão vencer nos próximos "_pLimit_" dias:</strong><br /></br />"
+    set strMensagem = strMensagem_pMensagem
+    set strMensagem = strMensagem_"<br />--<br />"
+    set strMensagem = strMensagem_"Módulo de Controle de Compras<br />"
+    set strMensagem = strMensagem_"Disclinc - "_##class(VAR.infra.util.Util).GetNamespace()
+    
+    ;Envia o email
+    set Remetente     = ""
+    set Assunto       = "Alerta de Validade de Atas - "_$zdate($horolog,4)
+ 
+    set strDestinatarios = ""
+    //Petik - 04/08/2010
+    //Destinatários alteradso para pegar do parâmetro UsuariosAlertaValidade
+    set strDestinatarios = $$getUsuariosAlertaValidadeAta^VARParametroCliente(YM)
+
+    //Envia o email para os destinatários           
+    if ($length(strDestinatarios)>0){          
+	    for cnt = 1:1:$length(strDestinatarios,";") {
+	        set User         = $piece(strDestinatarios,";",cnt)
+	        set EmailDestino = $piece($get(^WWW013(YM,User,1)),Y,9)
+            
+	        continue:(EmailDestino = "")
+	        continue:($$IsValidEmailAddress^VAREmail(EmailDestino) = $$$NO)
+        
+	        set strStatus = $$EnviarEmail^VAREmail(Remetente,User,Assunto,strMensagem)
+	    }
+    }
+    
+    quit strStatus]]></Implementation>
+</Method>
+</Class>
+</Export>

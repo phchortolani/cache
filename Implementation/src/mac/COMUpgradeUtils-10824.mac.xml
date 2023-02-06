@@ -1,0 +1,444 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMUpgradeUtils" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMUpgradeUtils
+	
+#include COMSYS
+#include COMConst
+#include WWWConst
+#include %occInclude
+	
+#define NEW	1
+#define OLD 2
+	
+CheckForSQLReservedWords()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 12-May-2006	RPW		SR14609: Do not use $$Upper^COMUtils, use $$$UPPER
+	;-------------------------------------------------------------------------------
+	new idClass,idKey,objKey,strKeyName
+	new idProperty,objProperty,strPropertyName
+	
+	set idClass = ""
+	for {
+		set idClass = $order(^WWW001(0,idClass))
+		quit:idClass=""
+		continue:($extract(idClass,1,2)="IN")||($extract(idClass,1,3)="WWW")||($extract(idClass,1,3)="OBS")||($extract(idClass,1,4)="TERM")
+		
+		set idKey = ""
+		for {
+			set idKey = $order(^WWW002(0,idClass,idKey))
+			quit:idKey=""
+			
+			set objKey     = $get(^WWW002(0,idClass,idKey,1))
+			set strKeyName = $piece(objKey,"~",25)
+			
+			if strKeyName="" {
+				write idClass_":"_idKey_" - Missing",!
+			} else {
+				if ##class(%SYSTEM.SQL).IsReservedWord(strKeyName) {
+					write idClass_":Key="_strKeyName_" - IsReservedWord",!
+				}
+				if $data(^WWWRESs(0,1,$$$UPPER(strKeyName))) {
+					write idClass_":Key="_strKeyName_" - WWWRES",!
+				}
+			}
+		}
+		
+		set idProperty = ""
+		for {
+			set idProperty = $order(^WWW003(0,idClass,idProperty))
+			quit:idProperty=""
+			
+			set objProperty     = $get(^WWW003(0,idClass,idProperty,1))
+			set strPropertyName = $piece(objProperty,"~",25)
+ 
+			if ##class(%SYSTEM.SQL).IsReservedWord(strPropertyName) {
+				write idClass_":Property="_strPropertyName_" - IsReservedWord",!
+			}
+			if $data(^WWWRESs(0,1,$$$UPPER(strPropertyName))) {
+				write idClass_":Property="_strPropertyName_" - WWWRES",!
+			}
+		}
+	}
+	quit 
+	
+	
+PropertyNames(pblnTest=1)
+    ;-------------------------------------------------------------------------------
+    ; Builds up a list of macros that have had the property descriptions changed.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 22-Feb-2005	Paul K	Reduce incedence of calling WWWVAR
+    ; 04-Feb-2005	Shobby	Created
+    ;-------------------------------------------------------------------------------
+	new idClass,idIndex,objWWW003,strPropertyName,objWWW003Compare
+	new intCount,strClass,strPrefix,i,strNew,strOld,objFinal
+	new strClassName,objList,strPrefixName
+	
+	if $get(Y)="" do ^WWWVAR
+	kill ^WWW003Compare
+ 
+	set intCount=0
+	
+	do GetMacroPattern(.strPrefix,.strClass)
+	
+	kill ^CacheTempUpdate
+	
+	for i=2:1:$length(strClass,",")-1 {
+		//write !,$piece(strClass,",",i)
+		
+		kill objFinal
+		set strClassName=$piece(strClass,",",i)
+		do ParseClass(strClassName,.objFinal)
+		do Rewrite(strClassName,.objFinal,.objList)
+		merge ^CacheTempUpdate=objList
+	}
+	
+	for i=2:1:$length(strPrefix,",")-1 {
+		set strPrefixName=$piece(strPrefix,",",i)
+		
+		set strClassName=strPrefixName
+		for {
+			set strClassName=$order(^WWW001(0,strClassName))
+ 
+			quit:strClassName=""
+			quit:$extract(strClassName,1,$length(strPrefixName))'=strPrefixName
+			
+			;write !,strClassName
+			
+			do ParseClass(strClassName,.objFinal)
+			do Rewrite(strClassName,.objFinal,.objList)
+			
+			merge ^CacheTempUpdate=objList
+		}
+	}
+	do Update(pblnTest)
+	kill ^CacheTempUpdate
+	quit
+	
+	
+GetMacroPattern(pstrPrefix="",pstrClass="")
+    ;-------------------------------------------------------------------------------
+    ; Determines which classes (or prefix of classes) are used in the macro generation.
+    ; Obtained from COMConst class.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 04-Feb-2005	Shobby	Created
+    ;-------------------------------------------------------------------------------
+	new idClass,strClass,objCOMConst
+	
+	set strClass = ""
+	set idClass  = ""
+	for {
+		set idClass = $order(^COMConst(0,idClass))
+		quit:idClass=""
+		
+		set objCOMConst = $get(^COMConst(0,idClass,1))
+		if $$$COMConstGenerate(objCOMConst)=1 {
+			if $$$COMConstSubClasses(objCOMConst)=1 {
+				set pstrPrefix = pstrPrefix_idClass_","
+			} else {
+				set pstrClass  = pstrClass_idClass_","
+			}
+		}
+	}
+	if pstrPrefix'="" set pstrPrefix = ","_pstrPrefix
+	if pstrClass'=""  set pstrClass  = ","_pstrClass
+	quit
+	
+	
+ParseClass(pstrClass,pobjFinal)
+	;-------------------------------------------------------------------------------
+    ; Go through a class and find any changed macros. This also checks that a macro
+    ; can be changed or needs to wait for another macro to be altered first.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 15-Mar-2005	PaulK	Added macro usage
+    ; 18-Feb-2005	RPW		Created
+    ;-------------------------------------------------------------------------------
+	new idIndex,objNewWWW003,objOldWWW003,strNew,strOld,objCompareOld,objCompareNew
+	new idIndexOldOuter,idFieldOldOuter,idFieldNewOuter,blnCompleted,intLoops
+	new intChanged,strChanging,idIndexOldInner,strChanged
+ 
+	set idIndex = ""
+	for {
+		set idIndex = $order(^WWW003(0,pstrClass,idIndex))
+		quit:idIndex=""
+		
+		set objNewWWW003 = $get(^WWW003(0,pstrClass,idIndex,1))
+		set objOldWWW003 = $get(^COPYWWW003(0,pstrClass,idIndex,1))
+		
+		set strNew = $$$WWW003PropertyName(objNewWWW003)
+		set strOld = $$$WWW003PropertyName(objOldWWW003)
+		
+		if (strNew'="") && (strOld'="") {
+			set objCompareOld(idIndex,$$$WWW003PropertyName(objOldWWW003)) = ""
+			set objCompareNew(idIndex,$$$WWW003PropertyName(objNewWWW003)) = ""
+		}
+	}
+		
+	set idIndexOldOuter = ""
+	for {
+		set idIndexOldOuter = $order(objCompareOld(idIndexOldOuter))
+		quit:idIndexOldOuter=""
+		
+		set idFieldOldOuter = ""
+		for {
+			set idFieldOldOuter = $order(objCompareOld(idIndexOldOuter,idFieldOldOuter))
+			quit:idFieldOldOuter=""
+			
+			if $data(objCompareNew(idIndexOldOuter,idFieldOldOuter))'=0 {
+				;
+			} else {
+				set idFieldNewOuter = $order(objCompareNew(idIndexOldOuter,""))
+				if idFieldNewOuter'=idFieldOldOuter {
+					set pobjFinal(pstrClass,idFieldNewOuter,idFieldOldOuter) = 1
+				}
+			}				
+		}
+	}	
+	
+	set blnCompleted = $$$NO
+	set intLoops     = 0
+	for {
+		set idIndexOldOuter = ""
+		set intChanged      = 0
+		quit:blnCompleted=$$$YES
+		
+		for {
+			set idIndexOldOuter = $order(objCompareOld(idIndexOldOuter))
+			quit:idIndexOldOuter=""
+			
+			set strOld = ""
+			for {
+				set strOld = $order(objCompareOld(idIndexOldOuter,strOld))
+				quit:strOld=""
+				
+				set strChanging     = $order(objCompareNew(idIndexOldOuter,""))
+				set idIndexOldInner = ""
+				for {
+					set idIndexOldInner = $order(objCompareOld(idIndexOldInner))
+					quit:idIndexOldInner=""
+					continue:idIndexOldInner=idIndexOldOuter
+									
+					if $order(objCompareOld(idIndexOldInner,""))=strChanging {
+						set strChanged = $order(objCompareNew(idIndexOldInner,""))
+						if $get(pobjFinal(pstrClass,strChanging,strOld))<=$get(pobjFinal(pstrClass,strChanged,strChanging)) {
+							set pobjFinal(pstrClass,strChanging,strOld) = pobjFinal(pstrClass,strChanging,strOld)+1
+							set intChanged = intChanged+1
+						}
+					}
+				}
+			}
+		}
+		
+		if intChanged=0 {
+			set blnCompleted = $$$YES
+		} else {
+			set intLoops = intLoops+1
+		}
+		
+		if intLoops>100 {
+			write !,"Recursion Error in class "_pstrClass_" ignoring recursive properties.."
+			set blnCompleted = $$$YES
+		}
+	}
+	quit	
+	
+	
+Rewrite(pstrClass,pobjFinal,pobjRewrite)
+	;-------------------------------------------------------------------------------
+    ; Changes the list structure into a neater one
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 18-Feb-2005	RPW		Created
+    ;-------------------------------------------------------------------------------
+	new strNew,strOld
+ 
+	set strNew = ""
+	for {
+		set strNew = $order(pobjFinal(pstrClass,strNew))
+		quit:strNew=""
+		
+		set strOld = ""
+		for {
+			set strOld = $order(pobjFinal(pstrClass,strNew,strOld))
+			quit:strOld=""
+			
+			set pobjRewrite(pobjFinal(pstrClass,strNew,strOld),pstrClass_strOld)       = pstrClass_strNew
+			set pobjRewrite(pobjFinal(pstrClass,strNew,strOld),"Fld"_pstrClass_strOld) = "Fld"_pstrClass_strNew
+			set pobjRewrite(pobjFinal(pstrClass,strNew,strOld),"Str"_pstrClass_strOld) = "Str"_pstrClass_strNew
+		}
+	}
+	quit
+	
+	
+Update(pblnTest=1)
+	;-------------------------------------------------------------------------------
+    ; Go through the code and see if there are any macros used that we need to change
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 24-Feb-2005	RPW		Modified to break out the renaming
+    ; 18-Feb-2005	RPW		Created
+    ;-------------------------------------------------------------------------------
+	;
+	new idRoutine,objRoutine,intLevel,len,intPos,strLine,strRemainder,i,c,strMacro,objStream,blnModified
+	new strFullLine,strTemp,intLine,arrDone
+	
+	; FIXME : replace single char variables c,i
+	
+	write !
+	set idRoutine = ""
+	for {
+		set idRoutine = $order(^rMAC(idRoutine))
+		write idRoutine_"                               "_$char(13)
+		quit:idRoutine=""
+		
+		set objRoutine  = ##class(%Library.Routine).%New(idRoutine_".MAC")
+		set objStream   = ##class(%Library.GlobalCharacterStream).%New()
+		set blnModified = $$$NO
+ 
+		set intLine=0
+		for { 		
+			set len         = 32000
+			set strLine     = objRoutine.ReadLine(.len)
+			set strFullLine = strLine
+			quit:len<0
+			
+			set intLine  = intLine+1
+			set intLevel = 1
+			for {
+				quit:intLevel=100
+				quit:$data(^CacheTempUpdate(intLevel))=0
+				
+				kill arrDone
+				for {
+					set intPos = $find(strLine,"$$$")
+					quit:intPos=0
+				
+					if intPos>0 {
+						set strLine  = $extract(strLine,intPos,$length(strLine))
+						set strMacro = ""
+						for i=1:1:$length(strLine) {
+							set c = $extract(strLine,i)
+													
+							if ((c?1N)||(c?1A)) {
+								set strMacro = strMacro_c
+							} else {
+								quit
+							}
+						}
+						if strMacro'="" {
+							if '$data(arrDone(strMacro)) {
+								set arrDone(strMacro)=""
+								if $data(^CacheTempUpdate(intLevel,strMacro))'=0 {
+									write:pblnTest !,"Found Macro "_strMacro_" in "_idRoutine_" changing to "_$get(^CacheTempUpdate(intLevel,strMacro))_" on line "_intLine_" level:"_intLevel
+									
+									do Translate(.strFullLine,"$$$"_strMacro,"$$$"_$get(^CacheTempUpdate(intLevel,strMacro)))
+									set blnModified = $$$YES
+									write:pblnTest !,strFullLine
+								}
+							}	
+						}
+					}
+				}
+				set intLevel = intLevel+1
+			}
+			do objStream.Write(strFullLine)
+		}
+		
+		if blnModified {
+			write !,"Updating Routine "_idRoutine,!
+			if 'pblnTest {
+				do objRoutine.Clear()
+				do objRoutine.CopyFrom(objStream)
+				do objRoutine.Compile()
+			}
+		}
+	}
+	
+	for intLevel=1:1:100 kill ^CacheTempUpdate(intLevel)
+ 
+	write !
+	zwrite ^CacheTempUpdate
+	
+	kill ^CacheTempUpdate
+	quit
+	
+	
+Translate(pstrLine,pstrFrom,pstrTo)
+	;-------------------------------------------------------------------------------
+    ; Perform $tr on non single character strings
+    ; 
+    ; See also : Replace^COMUtilStr - functionality differences not checked but
+    ;            one may be more appropriate than the other.
+    ; 
+    ; Returns:
+    ;
+    ; History:
+    ; 24-Feb-2005	RPW		Created
+    ;-------------------------------------------------------------------------------
+	new intLength,strFirst,intCount,strLine,strFinal
+	
+	set strLine   = pstrLine
+	set intLength = $length(pstrLine,pstrFrom)
+	
+	quit:intLength=1
+	
+	for intCount=1:1:intLength {
+		set strFirst = $piece(strLine,pstrFrom,1)
+		set strLine  = $extract(strLine,$length(strFirst)+$length(pstrFrom)+1,$length(pstrLine))		
+		set strFinal = $get(strFinal)_strFirst_$select((intCount<intLength):pstrTo,1:"")
+	}
+	set pstrLine = strFinal
+	quit
+	
+	
+GetUserClasses(pstrRef="AL")
+	;-------------------------------------------------------------------------------
+    ; Get the List of User classes used by 'al' classes using inheritance
+    ; This list will be used for compiling the relevant classes during build load
+    ; 
+    ; 
+    ; Returns:
+    ;
+    ; History:
+    ; 21-Jul-2009	PPP		SR16757:Created
+    ;-------------------------------------------------------------------------------
+	new objClass,result,strClass
+	
+	kill ^CacheTempArrUserClass
+	
+	set result = ##class(%ResultSet).%New("%Dictionary.ClassDefinitionQuery:Summary")
+	do result.Execute()
+	
+	for {
+		quit:'result.Next()
+		
+		set strClass = result.Data("Name")
+		if $zconvert($extract(strClass,1,$length(pstrRef)),"U") = pstrRef {
+ 			set objClass = ##class(%Library.ClassDefinition).%OpenId(strClass)
+			if objClass '=$$$NULLOREF {
+				if ($extract(objClass.Super,1,5) = "User.") {
+					set ^CacheTempArrUserClass(objClass.Super) = strClass
+				}
+				do objClass.%Close()
+			}
+		}
+	}
+	do result.%Close()
+	quit
+	
+]]></Routine>
+</Export>

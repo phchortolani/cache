@@ -1,0 +1,467 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWW0121Select" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWW0121Select
+#include COMSYS
+#include WWWConst
+	;-------------------------------------------------------------------------------
+	;  Common explanation
+	;---------------------------------------
+	;  YLOCNCOMPANY		WWW0121 uses Company & Location as keys
+	;  					In most situations the current company YM is used but in
+	;  					some cases (e.g. form WWW012) we look at locations for a
+	;  					different company to that we are in.
+	;  YVALUE			The selected location from the calling form.  This will be
+	;  					identified with an open rather than a closed folder and bold
+	;  					highlighting.  An empty entry will generate a tree based on
+	;  					the first top-level Entity.
+	;  strLocnPath		The hierarchical path containing the YVALUE location
+	;  YLINKTYPE		"Form"
+	;  					"Window"
+	;  YFILTER			Filter applied to restrict which locations are shown
+	;  					   - not currently implemented
+	;  YDISPLAY			Boolean - ???
+	;---------------------------------------
+	;  Starting at the top-level Entity, perform a tree-traversal of the locations
+	;  identified as descendants of that entity.
+	;  Branches can be opened and closed and links allow other locations to be returned
+	;  as a result of the search.
+	;-------------------------------------------------------------------------------
+	
+	
+ShowTree
+	;-------------------------------------------------------------------------------
+	; Generate a location hierarchy tree diagram that can be used to select location ID
+	;	
+	; Inputs: none - uses %KEY
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 03-Dec-2007	GRF		SR15612: preserve calling form - added as parameter in
+	; 							FullTree through to LinkArguments
+	; 16-Oct-2007	GRF		SR15563: Preserve idCompany & don't use Filters at
+	; 							present; Replace direct call to WWW0121Select in HTML;
+	; 							don't display tree if no entries (idLocnValue="")
+	; 08-Oct-2007	GRF		SR15563: Converted for use
+	; 08-Aug-2007	FIS		SR15563: Created as preliminary
+	;-------------------------------------------------------------------------------
+	new blnDisplay,idCompany,idFilter,idForm,idLocnValue,strType,strSeqNo,strLinkType
+	
+	set idLocnValue = $get(%KEY("YVALUE"))
+	if idLocnValue="" quit
+	
+	;---------------------------------------
+	
+	set idForm     = $get(%KEY("YFORM"))
+	set strType     = $extract($get(%KEY("YLFDAT")))          ; e.g. Form Field M12 => M and 12
+	set strSeqNo    = $extract($get(%KEY("YLFDAT")),2,99)
+	set blnDisplay  = +$get(%KEY("YDISPLAY"))
+	set strLinkType = $get(%KEY("YLINKTYPE"))
+	;set idFilter    = $get(%KEY("YFILTER"))
+	set idFilter    = ""
+	set idCompany   = $get(%KEY("YLOCNCOMPANY"))
+	if idCompany="" set idCompany = YM
+	
+	if blnDisplay=$$$YES {
+		write "<html><head><style>",YCR
+		write " body, td, th, legend {color:black; font-family:arial,SansSerif;}",YCR
+		write " a:hover {color:blue; text-decoration:underline}",YCR
+		write " a {color:black; text-decoration:none;}",YCR
+		write "</style></head>",YCR
+		
+		write "<body>",YCR
+		do FullTree(idForm,idCompany,idLocnValue,strLinkType,idFilter)
+		write "</body></html>",YCR
+		
+	} else {	
+		if idLocnValue="" {
+			if (idForm'="") && (strType'="") && (strSeqNo'="") {
+				set idLocnValue=$piece($get(^WWWDATEN(YM,+$horolog,YUSER,idForm,strType,1)),Y,strSeqNo)
+			}
+		}
+		if idLocnValue'="" {
+			if '$data(^WWW0121(0,idCompany,idLocnValue)) set idLocnValue=""
+		}
+		
+		write "<html>",YCR
+		write "<iframe name=""SelectLocation"""
+		write " src=""javascript:window.location='"
+		write YAKTION_"EP=WWWMANU&amp;YEXEC=*D|ShowTree^WWW0121Select"_$$VAR1^WWWCGI(1)
+		write "&amp;YFORM="_idForm_"&amp;YLFDAT="_strType_strSeqNo_"&amp;YVALUE="_idLocnValue
+		write "&amp;YDISPLAY=1&amp;YLINKTYPE="_strLinkType_"&amp;YLOCNCOMPANY="_idCompany
+	;	write "&amp;YFILTER="_idFilter                  ; TODO : Disregard filters at present
+		write "'"""
+		write " border=0 frameborder=0 framespacing=0 height=400 width=100% scrolling=auto"
+		write ">",YCR
+		write "</iframe>",YCR
+		write "</html>",YCR
+	}
+	quit
+	
+FullTree(pidForm,pidCompany,pstrLocn,pstrLinkType="",pidFilter="")
+	;-------------------------------------------------------------------------------
+	;	Wrapper for Tree - Build the location path for the currently selected
+	;	location and find the top-level entity
+	;	
+	; Inputs:
+	;	pidForm			Form ID
+	;	pidCompany		see YLOCNCOMPANY
+	;	pstrLocn		Currently selected location
+	;	pstrLinkType	see YLINKTYPE
+	;	pidFilter		see YFILTER
+	;	
+	; Returns:
+	;
+	; History:
+	; 08-Oct-2007	GRF		SR15563: Converted for use
+	; 08-Aug-2007	FIS		SR15563: Created as preliminary
+	;-------------------------------------------------------------------------------
+	new strEntityLocn,strLocnPath
+	
+	set strLocnPath   = $$LocationPath^WWW0121Utils(pidCompany,$get(pstrLocn))
+	set strEntityLocn = $$Entity^WWW0121Utils(pidCompany,$get(pstrLocn))
+	if strEntityLocn="" set strEntityLocn = $get(pstrLocn)
+	
+	do Tree(pidForm,pidCompany,strEntityLocn,strLocnPath,pstrLinkType,pidFilter)
+	quit
+	
+Tree(pidForm,pidCompany,pstrTopLevel,pstrLocnPath="",pstrLinkType="",pidFilter="")
+	;-------------------------------------------------------------------------------
+	;	Build list of descendants of the top node in global
+	;	^CacheTempWWW0121ShowTmp#### and traverse it while building
+	;	the tree diagram by recursively calling TreeFork.
+	;	
+	; Inputs:
+	;	pidForm			Form ID
+	;	pidCompany		see YLOCNCOMPANY
+	;	pstrTopLevel	Top node of the location tree
+	;	pstrLocnPath	see strLocnPath
+	;	pstrLinkType	see YLINKTYPE
+	;	pidFilter		see YFILTER
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Oct-2007	GRF		SR15563: Converted for use
+	; 08-Aug-2007	FIS		SR15563: Created as preliminary
+	;-------------------------------------------------------------------------------
+	quit:$get(pstrTopLevel)=""
+	
+	new strTempFile,strFilters
+	
+	set strTempFile="^CacheTempWWW0121ShowTmp"_$job               ; FIXME : use ^CacheTempWWW0121ShowTmp($job)? No indirection required?
+	kill @strTempFile
+	
+	/*-------------------------------------- TODO : Disregard filters at present
+	;if pidFilter'="" {
+	;	write "<font size=2>Change Filter </font>",YCR
+	;	write "<select name='Filter' size=1 style='font:8pt arial; width:250px;'"
+	;	write " onChange=""window.location='"_YAKTION_"EP=WWWMANU&amp;YEXEC=*D|ShowTree^WWW0121Select"_$$VAR1^WWWCGI(1)_"&amp;YVALUE="_pstrTopLevel_"&amp;YDISPLAY=1&amp;YLINKTYPE="_pstrLinkType
+	;	write "&amp;YLOCNCOMPANY='"_pidCompany
+	;	write "&amp;YFILTER=' + this.value"""
+	;	write ">",YCR
+	;	set strFilters=""
+	;	for {
+	;		set strFilters=$order(^WWW0121Filter(YM,strFilters))
+	;		quit:strFilters=""
+	;		
+	;		write "<option value='"_strFilters_"'"
+	;		if strFilters=pidFilter write " selected"
+	;		write ">"_strFilters_" - "_$$$WWW0121FilterName($get(^WWW0121Filter(YM,strFilters,1)))_"</option>",YCR
+	;	}
+	;	write "</select>",YCR
+	;	write "<hr>"
+	;}
+	;---------------------------------------*/
+	
+	write "<table cellspacing=0 cellpadding=2>"
+	do Children^WWW0121Utils(pidCompany,pstrTopLevel,strTempFile,$$$YES)
+	do TreeFork(pidForm,pidCompany,strTempFile,pstrTopLevel,0,pstrLocnPath,pstrLinkType,pidFilter)
+	write "</table>"
+	
+	kill @strTempFile
+	quit
+	
+	; TODO : Should be able to generate a persistant children list similar to the
+	;        ^CacheTempWWW0121("Path") list to speed up processing.  <GRF>
+	
+	;*******************************************************************************
+	;  Children^WWW0121Utils() produces
+	; ^CacheTempWWW0121ShowTmp123(...)
+	; e.g. for top-level location "E2"     TreeFork^WWW0121Select() displays as
+	; 
+	;									|  E2							Bold
+	;	(2,1)		= 3					|       2						Bold
+	;	(2,2)		= 2-10				|            3					Bold
+	;	(3,1)		= 4			<+		|                 4				Bold	<<<< Current
+	;	(3,2)		= 3-05		<+		|                      4-10
+	;	(3,3)		= 3-10		<+		|                 3-05			<
+	;	(3,4)		= 3-20		<+		|                 3-10			<  not $$IsInPath
+	;	(4,1)		= 4-10				|                 3-20			<  so these
+	;	("E2",1)	= 2					|            3-20				<  locations are
+	;	("E2",2)	= E2A				|       E2A						<  not expanded
+	;	("E2",3)	= ROB				|       ROB						<
+	;	
+	;	"<+"  Note : Numeric locations are currently sorted before strings
+	;	             May be desirable to present differently.
+	;	             Try : sort by +locn then by locn - in Children^WWW0121Utils
+	;*******************************************************************************
+	
+	
+TreeFork(pidForm,pidCompany,pstrTemp,pstrThisLocn,pintLevel,pstrLocnPath,pstrLinkType,pidFilter) private
+	;-------------------------------------------------------------------------------
+	;   1.  Print the details for THIS location.
+	;   2.  Get the immediate children
+	;       a.  If grandchildren, repeat TreeFork for the child.
+	;       b.  If no grandchildren, Print the details for the child.
+	;
+	; Inputs:
+	;	pidForm			Form ID
+	;	pidCompany		see YLOCNCOMPANY
+	;	pstrTemp		"^CacheTempWWW0121ShowTmp"_$job
+	;	pstrThisLocn	Current Node
+	;	pintLevel		Number of levels - used to set Indentation
+	;	pstrLocnPath	see strLocnPath
+	;	pstrLinkType	see YLINKTYPE
+	;	pidFilter		see YFILTER
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 16-Oct-2007	GRF		Add quotes to allow for alpha locations as keys
+	; 08-Oct-2007	GRF		SR15563: Converted for use
+	; 08-Aug-2007	FIS		SR15563: Created as preliminary
+	;-------------------------------------------------------------------------------
+	new strTemp1,strTemp2,strTemp3,strChildLocn,intCount
+	
+	set strTemp1 = pstrTemp_"("""_pstrThisLocn_""")"
+	set strTemp2 = pstrTemp_"("""_pstrThisLocn_""",intCount)"
+	
+	;	1.
+	do PrintLocn(pidForm,pidCompany,pstrThisLocn,pstrLocnPath,pintLevel,$$$NO,pstrLinkType,pidFilter)
+	
+	;	2.
+	if $$IsInPath(pstrLocnPath,pstrThisLocn) && $data(@strTemp1) {
+		set pintLevel = pintLevel+1
+		
+		set intCount=""     ; sequence number of children of this location
+		for {
+			set intCount = $order(@strTemp2)
+			quit:intCount=""
+			
+			set strChildLocn=$get(@strTemp2)
+			set strTemp3=pstrTemp_"("""_strChildLocn_""")"
+			
+			if $data(@strTemp3) {
+			;	2a.
+				do TreeFork(pidForm,pidCompany,pstrTemp,strChildLocn,pintLevel,pstrLocnPath,pstrLinkType,pidFilter)
+				
+			} else {
+			;	2b.
+				do PrintLocn(pidForm,pidCompany,strChildLocn,pstrLocnPath,pintLevel,$$$YES,pstrLinkType,pidFilter)
+			}
+		}
+	}
+	quit
+	
+PrintLocn(pidForm,pidCompany,pidLocn,pstrPath,pintLevel,blnIsEnd,pstrLinkType,pidFilter) private
+	;-------------------------------------------------------------------------------
+	; Generate the HTML to display the location details
+	; Inputs:
+	; 	pidForm			FormID
+	;	pidCompany		see YLOCNCOMPANY
+	;	pidLocn			Location ID of node to be displayed
+	;	pstrPath		see strLocnPath
+	;	pintLevel		Number of levels - used to set Indentation
+	;	blnIsEnd		Indicates a node with no descendants
+	;	pstrLinkType	see YLINKTYPE
+	;	pidFilter		see YFILTER
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 03-Dec-2007	GRF		SR15612: preserve calling form
+	; 15-Nov-2007	GRF		SR15563: Application parameter name changed (WWWLOCNTYPE)
+	; 							Extra spaces before html.gif to align better.
+	; 16-Oct-2007	GRF		SR15563: Close Font tag
+	; 08-Oct-2007	GRF		SR15563: Converted for use
+	; 08-Aug-2007	FIS		SR15563: Created as preliminary
+	;-------------------------------------------------------------------------------
+	new idParent,loop,objLocn,strLocnType
+ 
+	;+++++++++++++++++++++++++++++++++++++++
+	;
+	;  Display a row for each location - single field
+	;  1  Indent based on number of levels					FIXME : use WWWMENU approach <GRF>
+	;  
+	;  2a If there are no sub-locations
+	;           show a node				(html.gif)
+	;           
+	;  2b If there ARE sub-locations
+	;     - If this location is the one we are looking at or its parent (i.e. in Path)
+	;           show an open folder		(oopen.gif)
+	;     - else
+	;           show a closed folder	(oclose.gif)
+	;           
+	;  3  Display location Type, ID, Name with link to WWW0121 form
+	;     (Path entries are bold)
+	;
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	if pidLocn'="" {
+		write "<TR><TD NOWRAP>"
+		write "<font size=2>"
+		if pintLevel > 0 {
+			for loop=1:1:pintLevel {
+				write "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+		;		write "<img src='"_YGIF_"bplus.gif' border=0>"
+			}
+		}
+		
+		if blnIsEnd=$$$YES {                  //last level, no more sub locations
+			write "&nbsp;&nbsp;<img src='"_YGIF_"html.gif' border=0>"          ; page
+		;	write "<img src='"_YGIF_"aplatz.gif' border=0>"                    ; computer
+			if $$IsInPath(pstrPath,pidLocn) write "<b>",YCR
+			
+		} elseif $$IsInPath(pstrPath,pidLocn) {  //is parent location 
+			set idParent = $$$WWW0121ParentLocn($get(^WWW0121(0,pidCompany,pidLocn,1)))
+			if idParent="" set idParent = pidLocn                   ; Top level points to itself
+			write YCR,"<a href=""#"""
+			do LinkDirection(pidCompany,idParent,pstrLinkType,pidFilter)       ; Up
+			write ">"
+			write "<img src='"_YGIF_"oopen.gif' border=0>"                     ; open folder
+		;	write "<img src='"_YGIF_"cplus.gif' border=0>"
+			write "</a>"
+			write "<b>",YCR
+			
+		} else {                                  //different location path or lower level
+			write YCR,"<a href=""#"""
+			do LinkDirection(pidCompany,pidLocn,pstrLinkType,pidFilter)        ; Down
+			write ">"
+			write "<img src='"_YGIF_"oclose.gif' border=0>"                    ; closed folder
+		;	write "<img src='"_YGIF_"cminus.gif' border=0>"
+			write "</a>"
+			write YCR
+		}
+		
+		set objLocn=$get(^WWW0121(0,pidCompany,pidLocn,1))
+		
+		write YCR,"<a href=""#"""
+		do LinkArguments(pidForm,pidCompany,pidLocn,pstrLinkType,pidFilter)    ; SR15612
+		write ">"
+		write "("
+		set strLocnType=$$$WWW0121LocationType(objLocn)
+		if strLocnType'="" {
+			write $$$WWW101Text($get(^WWW101(0,"WWWLOCNTYPE",LANGUAGE,strLocnType,1)))
+			write "&nbsp;"
+		}
+		write pidLocn_")&nbsp;"
+		write $$$WWW0121LocationName(objLocn)
+		if $$$WWW0121City(objLocn)'="" write ",&nbsp;"_$$$WWW0121City(objLocn)
+		write "</a>"
+		
+		if $$IsInPath(pstrPath,pidLocn) write "</b>"
+		
+		write "</font></td>"
+		
+	/*	
+		; ----- Temp for testing
+		write "<td><font size=2>"
+		if $$InventoryAllowed^WWW0121Rules(pidCompany,pidLocn) {
+			write "Storage"
+		} else {
+			write "&nbsp;"
+		}
+		write "</font></td>"
+	*/	
+		write "</tr>",YCR
+	}
+	quit
+	
+	
+IsInPath(pstrPath,pidLocn)
+	;-------------------------------------------------------------------------------
+	;	Is a location present in a list of locations?
+	;
+	; Inputs:
+	; 	pstrPath		Comma delimited list of locations
+	; 	pidLocn			Location to search on
+	;
+	; Returns:			0  if not present;  >0  if present
+	;	
+	; History:
+	; 08-Oct-2007	GRF		SR15563: Converted for use
+	; 08-Aug-2007	FIS		SR15563: Created as preliminary
+	;-------------------------------------------------------------------------------
+	quit $find(","_pstrPath_",",","_pidLocn_",")
+	
+	
+LinkDirection(pidCompany,pidLocn,pstrLinkType,pidFilter)   private
+	;-------------------------------------------------------------------------------
+	; Link to either the Location or the parent of the location
+	; 
+	; Inputs:
+	;	pidCompany		see YLOCNCOMPANY
+	;	pidLocn			Locn ID or Parent Locn ID
+	;	pstrLinkType	see YLINKTYPE
+	;	pidFilter		see YFILTER
+	;	
+	; Returns: nothing
+	;
+	; History:
+	; 08-Oct-2007	GRF		SR15563: Converted for use
+	; 08-Aug-2007	FIS		SR15563: Created as preliminary
+	;-------------------------------------------------------------------------------
+	write " onClick=""window.location='"_YAKTION_"EP=WWWMANU&amp;YEXEC=*D|ShowTree^WWW0121Select"_$$VAR1^WWWCGI(1)
+	write "&amp;YVALUE="_pidLocn_"&amp;YDISPLAY=1&amp;YLINKTYPE="_pstrLinkType
+	write "&amp;YLOCNCOMPANY="_pidCompany
+	;write "&amp;YFILTER="_pidFilter             TODO : Disregard Filters for now
+	write "'"""
+	quit	
+	
+	
+LinkArguments(pidForm,pidCompany,pidLocn,pstrLinkType,pidFilter)   private
+	;-------------------------------------------------------------------------------
+	;
+	; Inputs:
+	; 	pidForm			Form ID
+	;	pidCompany		see YLOCNCOMPANY
+	;	pidLocn			Locn ID
+	;	pstrLinkType	see YLINKTYPE
+	;	pidFilter		see YFILTER
+	;
+	; Returns: nothing
+	;
+	; History:
+	; 03-Dec-2007	GRF		SR15612: preserve calling form
+	; 08-Oct-2007	GRF		SR15563: Converted for use
+	; 08-Aug-2007	FIS		SR15563: Created as preliminary
+	;-------------------------------------------------------------------------------
+	
+	; TODO : Disregard Filters for now
+	;---------------------------------------
+	;if $$UseFilter^WWW0121Filter(pidLocn,pidFilter)'=$$$YES {
+	;	write " style='color:gray; font-style:italic; text-decoration:none;'"
+	;		
+	;} elseif pstrLinkType="Form" {
+	;---------------------------------------
+	
+	if pstrLinkType="Form" {
+	;	write " onClick=""parent.window.location='"_$$FormURL^WWWCGI("WWW0121",pidCompany_","_pidLocn)
+		write " onClick=""parent.window.location='"_$$FormURL^WWWCGI(pidForm,pidCompany_","_pidLocn)
+		write "&amp;YLOCNCOMPANY="_pidCompany
+		write "'"""
+			
+	} elseif pstrLinkType="Window" {
+		
+	;	FIXME : <GRF> what about pidCompany?
+		
+		write " onClick=""window.returnValue='"_pidLocn_"'; window.close();"""
+			
+	;} else {
+	;		//do nothing
+	}
+	quit
+]]></Routine>
+</Export>

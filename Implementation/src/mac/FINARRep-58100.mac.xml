@@ -1,0 +1,462 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINARRep" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINARRep
+	
+#include COMSYS
+#include FINConst
+#include WWWConst
+	;-------------------------------------------------------------------------------
+	; Customer Reports
+ 	; 08-Jul-2003	SCR			Bug Fixes from Code Checking
+	;-------------------------------------------------------------------------------
+ 
+	;=============================================================
+	; Input Code
+ 
+Input(Report,Param)
+	;-------------------------------------------------------------------------------
+	; Get Input parameters
+	; 
+	; History
+	; 28-Jul-2003	shobby		Creation
+	;-------------------------------------------------------------------------------
+	do Input^FINRep(.Report,.Param)
+	quit
+	
+	;=============================================================
+	; Extra Cell Prompts
+Cell(key,Data,Options)
+	new Field,Type,Rec,Number
+	
+	set Number=199
+	set Field=$piece(Data,Y,2)
+	set Type=$piece(Data,Y,1)
+	if Type=2 Set Field=""
+	if Field="Balance" {
+		do AddField^REPRepGrid("Balance  Type",6,"BalType")
+	}
+	quit
+	
+AddField(Prompt,Type,VarSubs)
+	new Rec,Var,Vars,Field,YFORM,Key
+	
+	; Build up Var ; Options("x","y","z") from "x,y,z"
+	set Var=""
+	for Vars=1:1:$length(VarSubs,",") {
+		set Var=Var_","""_$piece(VarSubs,",",Vars)_""""
+	}
+	set Var="Options("_$extract(Var,2,999)_")"
+	
+	set Rec=""
+	set $piece(Rec,Y,60)=2  	; Page Number
+	set $piece(Rec,Y,3)=0 		; Row Number
+	set $piece(Rec,Y,4)=1		; Col Number
+	set $piece(Rec,Y,5)=Type	; Data Type
+	set $piece(Rec,Y,15)="@$get("_Var_")" ; Defaule
+	set $piece(Rec,Y,21)=Var	; Input Varible
+	set $piece(Rec,Y,12)=Prompt	; Prompt
+	
+	; Get next field number
+	set Field=$order(^WWW122(0,"REPRepCell",""),-1)
+	if Field<200 set Field=200
+	
+	set YFORM="WWW122"
+	set Key="REPRepCell,"_Field
+	
+	do Save^FINSYS(YFORM,Key,Rec,1)
+	
+	set ^WWW122(0,"REPRepCell",Field,1)=Rec
+	
+	quit
+ 
+DebtorStatementReport(Result,Param)
+	;-------------------------------------------------------------------------------
+	;
+	; 
+	; History
+	; 30-Nov-2005	PO		SR13929: Correction for SR12483
+	; 30-Jun-2005	PO		SR12057: removed hard coding of the word "Statement"
+	; 						and no longer converting date from horolog - instead
+	; 						done by report generator
+	; 01-Apr-2005	Paul K	SR11172: Only mark invoices where balance > 0 with *
+	; 01-Feb-2005	SCR		SR11657: Added Charge, Credit & Running Balance
+	; 17-Dec-2004	Steve S	SR10425: Added code to capture invoice detail 
+	; 28-Jul-2004	shobby	Show 0 Balance Invoices based on selection control.
+	; 09-Jul-2004	shobby	SR7625: Current Location address is displayed on Customer
+	; 						Statement in the 'Remit To' area.
+	; 09-Jul-2004	shobby	Put some gets around Params, fix crashes in designer.
+	; 24-Mar-2004	shobby	Moved United Logistics hack into REPCusUnitedLogistics.mac (TR007288)
+	; 15-Jan-2004	shobby	Exclude invoice total from Unallocated invoices. (TR006600)
+	; 11-Dec-2003   lwaugh     Change to allow access to Customers phone and fax numbers
+	; 03-Nov-2003	shobby	Can't use $$$CRLF, @netManager forms translate to |
+	; 03-Nov-2003	shobby	Address is delimited by $$$CRLF not |.
+	; 16-Oct-2003	lwaugh	Changed Date format to use intraprend formatting
+	; 09-Oct-2003	shobby	Hardcoded a 2% discount (Special request by United Logistics).
+	; 09-Oct-2003	shobby	Reworked for changes as requested by United Logistics
+	; 09-Oct-2003	shobby	Changed date format.
+	; 02-Oct-2003	SCR		Add "*" to Invoice when the Invoice is Past the Due Date
+	; 01-Sep-2003	shobby 	Include 'Date' parameter on this report (Requested by SR)
+	; 29-Aug-2003	shobby	Exclude Invoices that are not yet due (Requested by SR)
+	; 31-Jul-2003	shobby	Fixed Discount calculations (TR005762)
+	; 31-Jul-2003	shobby	Fixed incorrect total calculation. (TR005747)
+	; 12-Jun-2003	shobby	Changed to use Live Data
+	; 03-Jun-2003	shobby	Creation
+	;-------------------------------------------------------------------------------
+	new RepId,i,strDate,fltGrossAmount,fltFreight,fltDiscAllowed,objCompany,idx,objFINARInvoice,lstTotals
+	new fltBalanceDue,fltDiscountOld,fltDiscountNew,fltInvoiceTotal,blnShowZeroBalance
+	new objLocation,fltRunningBalance
+	
+	set RepId="Rep:DebtorStatementReport"
+	kill ^mtemp(RepId,YUSER)
+	kill ^mtemp("RepDrill",YUSER)
+	
+	; Header
+	;--------------------------------------- 
+	set strDate=$get(Param("Date"))
+	set blnShowZeroBalance=$get(Param("Balance"))
+	if strDate="" set strDate=$horolog
+	set ^mtemp(RepId,YUSER,2,"Date")=strDate ; $$^WWWDATE(strDate) ; SR12057
+	set objCompany=$get(^WWW012(0,YM,1))
+	set ^mtemp(RepId,YUSER,2,"ReportTitle")=$piece(objCompany,Y,1)_" "_$$$Text("Fin00827")  ;Statement
+	set ^mtemp(RepId,YUSER,2,"Name")=$piece(objCompany,Y,1)
+	
+	set objLocation=$get(^WWW0121(0,YM,YLOCATION,1))
+	set ^mtemp(RepId,YUSER,2,"LocationName")     = $$$WWW0121LocationName(objLocation)
+	set ^mtemp(RepId,YUSER,2,"LocationAddress1") = $$$WWW0121Street(objLocation)
+	set ^mtemp(RepId,YUSER,2,"LocationAddress2") = $$$WWW0121City(objLocation)_" "_$$$WWW0121State(objLocation)_" "_$$$WWW0121Zipcode(objLocation)
+	
+	; Customer Details
+	;--------------------------------------- 
+	new objFINARCustomer,strCustomerNumber,strAddress,strCustomerName
+	set strCustomerNumber=$get(Param("CustomerNumber"))
+	set ^mtemp(RepId,YUSER,2,"AccountNumber")=strCustomerNumber
+	if strCustomerNumber="" set strCustomerNumber=" "
+	set objFINARCustomer = $get(^FINARCustomer(YM,strCustomerNumber,1))
+	set strCustomerName  = $$$FINARCustomerCustomerName(objFINARCustomer)
+	set strAddress       = $$$FINARCustomerAddress(objFINARCustomer)
+	;set ^mtemp(RepId,YUSER,2,"CustomerName")=Param("CustomerNumber")_" : "_strCustomerName
+	set ^mtemp(RepId,YUSER,2,"CustomerName")     = $zconvert(strCustomerName,"O","HTML")
+	set ^mtemp(RepId,YUSER,2,"CustomerAddress1") = $piece(strAddress,"|",2)
+	set ^mtemp(RepId,YUSER,2,"CustomerAddress2") = $piece(strAddress,"|",3)
+	set ^mtemp(RepId,YUSER,2,"CustomerPhone")    = $$$FINARCustomerPhone(objFINARCustomer)
+	set ^mtemp(RepId,YUSER,2,"CustomerFax")      = $$$FINARCustomerFax(objFINARCustomer)
+	
+	set fltRunningBalance=0 ; Running Balance
+	
+	; Body Actual
+	;--------------------------------------- 
+	set idx=""
+	set i=0
+	for {
+		set idx=$order(^FINARInvoice(YM,strCustomerNumber,idx))
+		quit:idx=""
+		set i=i+1
+		set objFINARInvoice=$get(^FINARInvoice(YM,strCustomerNumber,idx,1))
+		set fltBalanceDue=$$GetBalanceAtDate^FINARInvoice(strCustomerNumber,idx,strDate)
+ 
+		if blnShowZeroBalance||(+fltBalanceDue'=0) {
+		;if (fltBalanceDue+$$$FINARInvoiceInvoiceTotal(objFINARInvoice))'=0 {
+			if $$$FINARInvoiceInvoiceDate(objFINARInvoice)'>$piece(strDate,",",1) {   ;29-Aug-2003
+				set fltRunningBalance=fltRunningBalance+fltBalanceDue
+				set ^mtemp(RepId,YUSER,3,i,"grdRunningBalance")=fltRunningBalance  				; Running Balance
+				set:fltBalanceDue>0 ^mtemp(RepId,YUSER,3,i,"grdChargeAmt")=fltBalanceDue	; Charge Amount
+				set:fltBalanceDue<0 ^mtemp(RepId,YUSER,3,i,"grdCreditAmt")=-fltBalanceDue	; Credit Amount
+				
+				set ^mtemp(RepId,YUSER,3,i,"InvoiceNo")=idx
+				set ^mtemp(RepId,YUSER,3,i,"grdDate")=$$$FINARInvoiceInvoiceDate(objFINARInvoice)
+				if idx["Unallocated" {
+					set fltInvoiceTotal=0
+				} else {
+					set fltInvoiceTotal=$$$FINARInvoiceInvoiceTotal(objFINARInvoice)
+				}
+				set ^mtemp(RepId,YUSER,3,i,"grdGrossAmt")=fltInvoiceTotal
+				set ^mtemp(RepId,YUSER,3,i,"grdFreight")=$$$FINARInvoiceFreight(objFINARInvoice)
+				set ^mtemp(RepId,YUSER,3,i,"grdTerms")=$$$FINARInvoiceDueDate(objFINARInvoice)
+				;------------ if discount not zero ------------------------------------------
+				; if discount not zero
+				set fltDiscountOld=$$$FINARInvoiceSettlementDiscount(objFINARInvoice)
+				if $$$FINARInvoiceDueDate(objFINARInvoice)>strDate {
+					set fltDiscountNew=fltDiscountOld
+				} else {
+					set fltDiscountNew=0
+				}
+ 
+				set ^mtemp(RepId,YUSER,3,i,"grdDiscAllowed")=fltDiscountNew
+				set ^mtemp(RepId,YUSER,3,i,"grdAmount")=$$$FINARInvoiceInvoiceTotal(objFINARInvoice)-fltDiscountNew
+				set ^mtemp(RepId,YUSER,3,i,"grdBalanceDue")=fltBalanceDue-fltDiscountNew
+				set ^mtemp(RepId,YUSER,3,i,"grdDetail")=$$$FINARInvoiceDetail(objFINARInvoice) ;SR10425
+ 
+				if ($$$FINARInvoiceDueDate(objFINARInvoice)'>strDate)&&($$$FINARInvoiceBalance(objFINARInvoice)>0) {
+					set ^mtemp(RepId,YUSER,3,i,"InvoiceNo")="* "_idx
+				}
+				;------------------------------------------------------------------------------
+			}
+		}
+	}
+	set lstTotals=$$CalcPeriodTotal^FINARCustomer(strCustomerNumber,strDate)
+	set ^mtemp(RepId,YUSER,2,"fotCurrent")=$get(^mtemp(RepId,YUSER,2,"fotCurrent"))+$listget(lstTotals,1)
+	set ^mtemp(RepId,YUSER,2,"fotMonth1")=$get(^mtemp(RepId,YUSER,2,"fotMonth1"))+$listget(lstTotals,2)
+	set ^mtemp(RepId,YUSER,2,"fotMonth2")=$get(^mtemp(RepId,YUSER,2,"fotMonth2"))+$listget(lstTotals,3)
+	set ^mtemp(RepId,YUSER,2,"fotMonth3")=$get(^mtemp(RepId,YUSER,2,"fotMonth3"))+$listget(lstTotals,4)+$listget(lstTotals,5) ; SR13929
+	
+	set ^mtemp(RepId,YUSER,2,"fotTotal")=$get(^mtemp(RepId,YUSER,2,"fotCurrent"))+$get(^mtemp(RepId,YUSER,2,"fotMonth1"))+$get(^mtemp(RepId,YUSER,2,"fotMonth2"))+$get(^mtemp(RepId,YUSER,2,"fotMonth3"))
+	
+	set Result="^mtemp("""_RepId_""","""_YUSER_""",2)"
+	set ^mtemp(RepId,YUSER,2,"Result")=Result
+	
+	set YNOFOOT=1
+	
+	quit
+ 
+AddAmount(pstrItem,pintIndex,pfltAmount,pstrDataType,pstrRepId)
+	new strData
+	
+	set ^mtemp(pstrRepId,YUSER,pstrItem)=$get(^mtemp(pstrRepId,YUSER,pstrItem))+pfltAmount
+	if pstrDataType="Currency" {
+		set strData=$$^WWWZAHL(pfltAmount,0,2,YWHR)
+	} elseif pstrDataType="" {
+		set strData=$$^WWWDATE(pfltAmount)
+	}
+	set ^mtemp(pstrRepId,YUSER,pintIndex,pstrItem)=strData
+	
+	quit
+ 
+DebtorStatementReportBody(Result,Param)
+	set Result="^mtemp(""Rep:DebtorStatementReport"","""_YUSER_""",3)"
+	quit
+ 
+DebtorStatementReportHTML(Result,Param)
+	;-------------------------------------------------------------------------------
+	;
+	; 
+	; History
+	; 30-Nov-2005	PO			SR13929: Correction for SR12483
+	; 30-Jun-2005	PO			SR12057: removed hard coding of the word "Statement"
+	; 11-Dec-2003   lwaugh      Change to allow access to Customers phone and fax numbers
+	; 16-Oct-2003	lwaugh		Changed Date format to use intraprend formatting
+	; 23-Jul-2003	shobby		Formatting changes for HTML reports.
+	; 12-Jun-2003	shobby		Changed to use Live Data
+	; 03-Jun-2003	shobby		Creation
+	;-------------------------------------------------------------------------------
+	new RepId,i,strDate,fltGrossAmount,fltFreight,fltDiscAllowed,objCompany,idx,objFINARInvoice,lstTotals
+	new fltDiscountOld,fltDiscountNew
+	
+	set RepId="Statement"
+	kill ^mtemp(RepId,YUSER)
+	kill ^mtemp("RepDrill",YUSER)
+	
+	; Header
+	set strDate=$horolog
+	set ^mtemp(RepId,YUSER,"StatementDate")=$$^WWWDATE(strDate) ; TODO: Should this be a horolog, like in DebtorStatementReport
+	set objCompany=$get(^WWW012(0,YM,1))
+	set ^mtemp(RepId,YUSER,"ReportTitle")=$piece(objCompany,Y,1)_" "_$$$Text("Fin00827")  ;Statement
+	set ^mtemp(RepId,YUSER,"Name")=$piece(objCompany,Y,1)
+	
+	; Customer Details
+	new objFINARCustomer,strCustomerNumber,strAddress,strCustomerName
+	set strCustomerNumber=Param("CustomerNumber")
+	set ^mtemp(RepId,YUSER,"AccountNumber")=strCustomerNumber
+	set objFINARCustomer=$get(^FINARCustomer(YM,strCustomerNumber,1))
+	set strCustomerName=$$$FINARCustomerCustomerName(objFINARCustomer)
+	set strAddress=$$$FINARCustomerAddress(objFINARCustomer)
+	set ^mtemp(RepId,YUSER,"CustomerName")=$zconvert(Param("CustomerNumber")_" : "_strCustomerName,"O","HTML")
+	;set ^mtemp(RepId,YUSER,"CustomerAddress1")=$piece(strAddress,"|",2)
+	;set ^mtemp(RepId,YUSER,"CustomerAddress2")=$piece(strAddress,"|",3)
+	set ^mtemp(RepId,YUSER,"CustomerAddress1")=$piece(strAddress,$$$CRLF,2)
+	set ^mtemp(RepId,YUSER,"CustomerAddress2")=$piece(strAddress,$$$CRLF,3)
+	set ^mtemp(RepId,YUSER,"CustomerPhone")=$$$FINARCustomerPhone(objFINARCustomer)
+	set ^mtemp(RepId,YUSER,"CustomerFax")=$$$FINARCustomerFax(objFINARCustomer)
+	
+	; Body Actual
+	set idx=""
+	set i=0
+	for {
+		set idx=$order(^FINARInvoice(YM,strCustomerNumber,idx))
+		quit:idx=""
+		set i=i+1
+		set ^mtemp(RepId,YUSER,i,"InvoiceNo")=idx
+		set objFINARInvoice=$get(^FINARInvoice(YM,strCustomerNumber,idx,1))
+		set ^mtemp(RepId,YUSER,i,"grdDate")=$$^WWWDATE($$$FINARInvoiceInvoiceDate(objFINARInvoice)) ; TODO: Should this be a horolog, like in DebtorStatementReport
+		;do AddAmount("grdGrossAmount",i,$$$FINARInvoiceBalance(objFINARInvoice),"Currency",RepId)
+		do AddAmount("grdGrossAmount",i,$$$FINARInvoiceInvoiceTotal(objFINARInvoice),"Currency",RepId)
+		do AddAmount("grdFreight",i,$$$FINARInvoiceFreight(objFINARInvoice),"Currency",RepId)
+		set ^mtemp(RepId,YUSER,i,"grdTerms")=$$^WWWDATE($$$FINARInvoiceDueDate(objFINARInvoice)) ; TODO: Should this be a horolog, like in DebtorStatementReport
+		;------------ if discount not zero ------------------------------------------
+		set fltDiscountOld=$$$FINARInvoiceSettlementDiscount(objFINARInvoice)
+		set fltDiscountNew=fltDiscountOld
+		do AddAmount("grdDiscAllowed",i,fltDiscountNew,"Currency",RepId)
+		do AddAmount("grdAmount",i,$$$FINARInvoiceBalance(objFINARInvoice)-fltDiscountNew,"Currency",RepId)
+		do AddAmount("grdBalanceDue",i,$$$FINARInvoiceBalance(objFINARInvoice)+fltDiscountOld-fltDiscountNew,"Currency",RepId)
+		;------------------------------------------------------------------------------
+		set lstTotals=$$CalcPeriodTotal^FINARCustomer(strCustomerNumber,strDate)
+		set ^mtemp(RepId,YUSER,"fotCurrent")=$get(^mtemp(RepId,YUSER,"fotCurrent"))+$listget(lstTotals,1)
+		set ^mtemp(RepId,YUSER,"fotMonth1")=$get(^mtemp(RepId,YUSER,"fotMonth1"))+$listget(lstTotals,2)
+		set ^mtemp(RepId,YUSER,"fotMonth2")=$get(^mtemp(RepId,YUSER,"fotMonth2"))+$listget(lstTotals,3)
+		set ^mtemp(RepId,YUSER,"fotMonth3")=$get(^mtemp(RepId,YUSER,"fotMonth3"))+$listget(lstTotals,4)+$listget(lstTotals,5) ; SR13929
+	}
+	set ^mtemp(RepId,YUSER,"fotTotal")=$get(^mtemp(RepId,YUSER,"fotCurrent"))+$get(^mtemp(RepId,YUSER,"fotMonth1"))+$get(^mtemp(RepId,YUSER,"fotMonth2"))+$get(^mtemp(RepId,YUSER,"fotMonth3"))
+	set ^mtemp(RepId,YUSER,"grdGrossAmount")=$$^WWWZAHL($get(^mtemp(RepId,YUSER,"grdGrossAmount")),0,2,YWHR)
+	set ^mtemp(RepId,YUSER,"grdFreight")=$$^WWWZAHL($get(^mtemp(RepId,YUSER,"grdFreight")),0,2,YWHR)
+	set ^mtemp(RepId,YUSER,"grdDiscAllowed")=$$^WWWZAHL($get(^mtemp(RepId,YUSER,"grdDiscAllowed")),0,2,YWHR)
+	set ^mtemp(RepId,YUSER,"grdAmount")=$$^WWWZAHL($get(^mtemp(RepId,YUSER,"grdAmount")),0,2,YWHR)
+	set ^mtemp(RepId,YUSER,"grdBalanceDue")=$$^WWWZAHL($get(^mtemp(RepId,YUSER,"grdBalanceDue")),0,2,YWHR)
+	
+	set Result="^mtemp("""_RepId_""","""_YUSER_""")"
+	set ^mtemp(RepId,YUSER,"Result")=Result
+	
+	quit
+ 
+SelectionCriteria(pstrParam,pintIndex)
+    ;-------------------------------------------------------------------------------
+    ; Puts Customers that meet this index criteria in to a temporary list to be used
+    ; by the PreRunCode routine.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 04-Aug-2004   Shobby   Created (SR10095)
+    ;-------------------------------------------------------------------------------
+	new idCustomer,blnResult
+	
+	set blnResult=0
+	if pstrParam'="" {
+		set idCustomer=""
+		for {
+			set idCustomer=$order(^FINARCustomers(YM,pintIndex,pstrParam,idCustomer))
+			quit:idCustomer=""
+			set ^CacheTemp(YUSER,"Customers",idCustomer)=$get(^CacheTemp(YUSER,"Customers",idCustomer))+1
+		}
+		set blnResult=1
+	}
+	
+	quit blnResult
+ 
+PreRunCode(Param)
+	;--------------------------------------------------------------------------------
+	; Exclude Customers with no Invoices
+	; 
+	; History
+	; 15-Sep-2005	JW		SR13509: Added $get.
+	; 18-Jul-2005	PO		SR12057: Fixed Show Paid Invoices - added check for Param("Balance")
+	; 04-Aug-2004	shobby	SR10095: Reworked Customer Group to synchronise with IN.
+    ; 03-May-2004   Shobby  Replaced YKOMMA with ","
+	; 25-Mar-2004	shobby	Return "NO CUSTOMERS" if none to report on.  An empty string
+	; 						will mean all customers.
+	; 24-Mar-2004	shobby	Clear the list if no customers with invoices found.
+	; 02-Oct-2003	shobby	Test for invoices outside of the date range.
+	; 08-Aug-2003	shobby	Creation
+	; 
+	;--------------------------------------------------------------------------------
+	new strCustomerNumber,strCustomerListNew,strInvoiceNumber,objFINARInvoice,strDate,i
+	new idCustomer,intConditions
+	
+	set strCustomerListNew=""
+ 
+	if ($get(Param("CustomerGroup"))'="")||($get(Param("DiscountTerm"))'="") {
+		kill ^CacheTemp(YUSER,"Customers")
+		set intConditions=0
+		set intConditions=intConditions+$$SelectionCriteria($get(Param("DiscountTerm")),51)
+		set intConditions=intConditions+$$SelectionCriteria($get(Param("CustomerGroup")),2)
+		set idCustomer=""
+		for {
+			set idCustomer=$order(^CacheTemp(YUSER,"Customers",idCustomer))
+			quit:idCustomer=""
+			if $get(^CacheTemp(YUSER,"Customers",idCustomer))=intConditions {
+				set strCustomerListNew=strCustomerListNew_idCustomer_YKOMMA ; should be ","
+			}
+		}
+		kill ^CacheTemp(YUSER,"Customers")
+	} else {
+		if $get(Param("CustomerNumber"))'="" {
+			set strDate=Param("Date")
+			for i=1:1:$length(Param("CustomerNumber"),",") {
+				set strCustomerNumber=$piece(Param("CustomerNumber"),",",i)
+				if $data(^FINARInvoice(YM,strCustomerNumber)) {
+					set strInvoiceNumber=""
+					for {
+						set strInvoiceNumber=$order(^FINARInvoice(YM,strCustomerNumber,strInvoiceNumber))
+						quit:strInvoiceNumber=""
+						set objFINARInvoice=$get(^FINARInvoice(YM,strCustomerNumber,strInvoiceNumber,1))
+						if ($$$FINARInvoiceBalance(objFINARInvoice)'=0) || $get(Param("Balance")) {	//SR13509
+							if $$$FINARInvoiceInvoiceDate(objFINARInvoice)'>$piece(strDate,",",1) {   ;02-Oct-2003
+								set strCustomerListNew=strCustomerListNew_strCustomerNumber_","
+								quit
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if strCustomerListNew="" {
+		set Param("CustomerNumber")="NO CUSTOMERS"
+	} else {
+		set Param("CustomerNumber")=$extract(strCustomerListNew,1,$length(strCustomerListNew)-1)
+	}
+	quit
+ 
+AfterDataFields()
+    ;-------------------------------------------------------------------------------
+    ; Displays 'Customers Selected' and 'Invoices Selected' fields.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 01-Feb-2005	Steve S	Created (SR11648)
+    ;-------------------------------------------------------------------------------
+	kill ^CacheTempARTB(YUSER)
+	&html<
+	<table style='font-size:14px'><tr>
+	<td>Customers Selected</td>
+	<td><input readonly style='background-color:lightgrey' type=text size=10 value=0 name='CustomersSelected'></td>
+	</tr><tr>
+	<td>Invoices Selected</td>
+	<td><input readonly style='background-color:lightgrey' type=text size=10 value=0 name='InvoicesSelected'></td>
+	</tr><table>
+	>
+	quit
+ 
+Search()
+    ;-------------------------------------------------------------------------------
+    ; Code to execute the search.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 01-Feb-2005	Steve S	Created (SR11648)
+    ;-------------------------------------------------------------------------------
+	do Initialise^COMViewCustom("FINARCustomer","CustomersSelected^FINARRep")
+	do Start^COMViewCustom()
+	quit 1
+ 
+CustomersSelected(pobjResultSet)
+    ;-------------------------------------------------------------------------------
+    ; Code to update customer selected counter.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 01-Feb-2005	Steve S	Created (SR11648)
+    ;-------------------------------------------------------------------------------
+	new idCustomer,intCount
+	
+	while pobjResultSet.Next() {
+		set idCustomer=$$GetID^COMViewCustom(pobjResultSet)
+		set ^CacheTempARTB(YUSER,idCustomer)=""
+	}
+	
+	set intCount=0
+	set idCustomer=""
+	for {
+		set idCustomer=$order(^CacheTempARTB(YUSER,idCustomer))
+		quit:idCustomer=""
+		set intCount=intCount+1
+	}
+	write "document.WWW2.CustomersSelected.value="_intCount_";",!
+	
+	quit
+	
+ 
+]]></Routine>
+</Export>

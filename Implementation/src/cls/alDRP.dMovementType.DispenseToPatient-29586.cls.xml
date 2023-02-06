@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alDRP.dMovementType.DispenseToPatient">
+<ClassType>serial</ClassType>
+<IncludeCode>INConst</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>alDRP.dMovementType</Super>
+
+<Property name="MovementTypeId">
+<Description><![CDATA[
+ 28-Jan-2009 DavidR SR16303: Created
+ copied and based on dMovementType.Sale]]></Description>
+<Type>alSYS.dt.dtInteger</Type>
+<InitialExpression>"21&quot;</InitialExpression>
+<Required>1</Required>
+
+<Parameter name="CAPTION" value="AL00195"/>
+</Property>
+
+
+<Method name="Validate">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; History
+	; 28-Jan-2009   DavidR SR16303: Copied from alDRP.dMovemenType.Sale
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+	if pobjMove.Completed {
+		set strMessage = $$$Text("IN00711")      ; "This movement is already completed."
+		set sc =$$$ERROR($$$GeneralError,strMessage)
+	}
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="Confirm">
+<FormalSpec>pobjMove:alDRP.dMovement</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+#define enumAverageCost		9
+	;-------------------------------------------------------------------------------
+	; Update the BundleStock and StockHistory plus incidentals and then back
+	; populate the V1 data.
+	;
+	; 
+	; History
+	; 12-Jul-2010	SCR		SR17387: Pass Source Details, Form & Rec to Finance
+	; 19-Nov-2009	GRF		SR16471: Change scope of lock by making it a global
+	; 11-Nov-2009	GRF		SR16871: relocate unlock to cover data being updated
+	; 02-Nov-2009	GRF		SR16871: INItemCost with location replaces INARTKOST;
+	; 							Remove ConfirmMovement
+	; 21-Oct-2009	GRF		SR16875: TxnValue should be extended cost; remove spaces
+	; 							in AuditRef string
+	; 14-Sep-2009	DWR		SR16880: call to new alSFI.dStockFin class
+	; 11-May-2009	DWR		SR16406: changed Qty Picked in ConfirmMovement^INStockMovement
+	; 18-Mar-2009	DWR		SR16406: added $listbuild
+	; 28-Jan-2009	DWR 	SR16303: Copied (modified) from alDRP.dMovementType.Sale
+	;--------------------------------------------------------------------------------
+	set objTransType = ##class(alSOH.dTransactionType).%OpenId(3)
+	set sc     = $$$OK
+	set idItem = pobjMove.Item.ItemId
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	lock +^alSOHProcessing(idItem):2
+	if '$test {
+		set strMessage = $$$Text($listbuild("IN00853",idItem))
+		set sc = $$$ERROR($$$GeneralError,strMessage)
+	; "Can not acquire a lock for Item: (%1) please try again"	
+	;+++++++++++++++++++++++++++++++++++++++
+
+	} else {
+	; SR16871 vvv
+	;	lock -^alSOHProcessing(idItem)
+	;;	set fltCost = $$GetCostV2^INARTKOST(idItem) ; SR16871
+	;	set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+	;}
+	
+	;if $$$ISOK(sc) {
+	; Dispense : Stock History & Period Balance
+	;---------------------------------------
+		set fltCost = $$GetCost^INItemCost(idItem,pobjMove.FromLocn.Code,$$$enumAverageCost)
+	; SR16871 ^^^	
+		set objFromStkHist = ##class(alSOH.piSOH).Post(pobjMove, 
+													   pobjMove.FromLocn,
+													   pobjMove.FromStorage,
+													  -pobjMove.QtyPicked,
+													   fltCost,
+													   objTransType,
+													   .sc)
+		
+		set:$$$ISOK(sc) sc = ##class(alSOH.dPeriodBalance).UpdateViaStockHistory(objFromStkHist)
+	;+++++++++++++++++++++++++++++++++++++++ ; SR16871
+		LOCK -^alSOHProcessing(idItem)
+	;+++++++++++++++++++++++++++++++++++++++
+	}
+		
+	; Stock to Finance Interface            ; SR16880
+	;---------------------------------------
+	if $$$ISOK(sc) {  
+		set idDeleteStorage = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+		
+		set objStockFin = ##class(alSFI.dStockFin).%New()
+		set objStockFin.TxnType        = pobjMove.MovementType
+		set objStockFin.TxnTypeRef     = "ADJ"
+		set objStockFin.AuditRef       = "alDRP.dMovementType.DispenseToPatient"
+		set objStockFin.TxnInformation = "Issue"
+		set objStockFin.Item           = pobjMove.Item
+		set objStockFin.Quantity       = pobjMove.QtyPicked
+	;	set objStockFin.TxnValue       = fltCost                  ; SR16875
+		set objStockFin.TxnValue       = fltCost * pobjMove.QtyPicked
+		set objStockFin.FromLocn       = pobjMove.FromLocn
+		set objStockFin.FromStorage    = pobjMove.FromStorage
+		set objStockFin.ToLocn         = pobjMove.FromLocn
+		set objStockFin.ToStorage      = ##class(alLOC.iULOC).GetStorage(pobjMove.FromLocn.Code,idDeleteStorage)
+		set objStockFin.SourceRec	   = pobjMove.Reference										; SR17387
+		set objStockFin.SourceForm	   = "INDispenseToPatient"									; SR17387
+		set objStockFin.SourceDetail   = 34348_","_pobjMove.Reference_","_pobjMove.LineNumber 	; SR17387
+		                                 ; "Dispense %1, Line %2"
+		set sc = objStockFin.StockToFin()
+		
+		set YUSER =%("%KEY","YUSER") 
+		set:YUSER="" YUSER=" "
+		; Set to ensure not processed twice, is checked in FIBU^INARTHIST
+		set:$$$ISOK(sc) ^CacheTemp(YUSER,"FIBURecord") = $$$YES
+	}
+	
+	/* ; SR16871 vvv
+	; Back Populate V1
+	;---------------------------------------
+	if $get(^SysSetup("KeepOldStockHistory")) && $$$ISOK(sc) {
+		set idDeleteStorage = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+		set strStatus = $$ConfirmMovement^INStockMovement(idItem,
+												   pobjMove.Bundle,
+												   pobjMove.QtyPicked,
+												   pobjMove.FromLocn.Code,
+												   pobjMove.FromStorage.Code,
+												   pobjMove.FromLocn.Code,
+												   idDeleteStorage,
+												   pobjMove.MovementType.MovementTypeId,
+												   pobjMove.Reference,
+												   pobjMove.LineNumber,
+												   "")		
+		
+		set:$$$ISERR(strStatus) sc = $$$ERROR($$$GeneralError,"V1 back populate failed")  ; TODO : $$$Text
+	}
+	*/ ; SR16871 ^^^
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="Default">
+<Type>%Library.CacheSerialState</Type>
+</Storage>
+</Class>
+</Export>

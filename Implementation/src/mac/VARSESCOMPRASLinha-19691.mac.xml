@@ -1,0 +1,359 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARSESCOMPRASLinha" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARSESCOMPRASLinha
+#include COMSYS
+ 
+OnBeforeSave(pYFELD)
+	;-------------------------------------------------------------------------------
+    ; Verifica se o usuário preencheu devidamente todos os preços e/ou preencheu a 
+    ; justificativa.
+    ; Atualiza a posição do processo de compra.
+    ; 
+    ; History:
+    ; 26-Aug-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	quit:(YFELD = "")
+	
+	new NoProcessoCompra, EstoquePrincipal, precoANVISA, precoUltimaCompra, precoInformado, Justificativa
+	
+	set precoANVISA 	  = $piece(pYFELD,Y,6)
+	set precoUltimaCompra = $piece(pYFELD,Y,7)
+	set precoInformado    = $piece(pYFELD,Y,8)
+	set Justificativa     = $piece(pYFELD,Y,13)
+	
+	set NoProcessoCompra = $$$KEY1(YKEY)
+	set EstoquePrincipal = $$GetEstoquePrincipal^VARSESCOMPRAS(NoProcessoCompra)
+	
+	if (EstoquePrincipal = "ALMOXARIFADO") {
+		if (precoUltimaCompra = "") && (precoInformado = "") { //Se não inserir nada, aí não importa
+			quit
+		}	
+		if ((precoUltimaCompra = "") || (precoInformado = "") && (Justificativa = "")) { 
+			set Q=$$$QDontSave
+			do ReturnError^COMUtilError("Atenção: quando os dois preços não forem informados, é necessário inserir uma justificativa.")
+		}
+	}
+	
+	else {	
+		if (precoANVISA = "") && (precoUltimaCompra = "") && (precoInformado = "") { //Se não inserir nada, aí não importa
+			quit
+		} 		
+		if ((precoANVISA = "") || (precoUltimaCompra = "") || (precoInformado = "") && (Justificativa = "")) { 
+			set Q=$$$QDontSave
+			do ReturnError^COMUtilError("Atenção: quando os três preços não forem informados, é necessário inserir uma justificativa.")
+		}
+	}
+		
+	quit
+	
+OnAfterDataFields(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Mostra a lista de produtos para seleção e inserção da estimativa de preços.
+    ; 
+    ; History:
+    ; 30-Sep-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	new NoCompra, idLinha, objLinha, chave, Produto, prcAnvisa, prcCompra, prcEstimado, 
+		blnEncerrado, motivo, strMotivo
+	set NoCompra = $$$KEY1(pYKEY)
+ 
+	//Tabela
+   	new lstHeader
+ 	set lstHeader=""
+  	set lstHeader=lstHeader_$listbuild("Item","Produto","ANVISA","Última Compra","Informado","Estimado")
+ 
+  	if $$Start^COMTable(lstHeader,"Preços Estimados para os Produtos na Dispensa de Licitação:") {
+ 
+		$$$Order3(^VARSESCOMPRASLinha,YM,NoCompra,idLinha)
+			set chave = NoCompra_$$$COMMA_idLinha
+			
+			set objLinha    = $get(^VARSESCOMPRASLinha(YM,NoCompra,idLinha,1))
+			set Produto     = $piece(objLinha,Y,2)
+			set prcAnvisa   = $piece(objLinha,Y,6)
+			set prcCompra   = $piece(objLinha,Y,7)
+			set prcInform   = $piece(objLinha,Y,8)
+			set prcEstimado = $$GetPrecoEstimado(chave)					
+ 
+			set blnEncerrado = $piece(objLinha,Y,16)
+				
+			do NewLine^COMTable()
+			do InsertCell^COMTable(idLinha,"VARSESCOMPRASLinha",chave)
+	    	do InsertCell^COMTable(Produto_" - "_$extract($$SQLGetDescProduto^VARSQL(Produto),1,50),"VARSESCOMPRASLinha",chave,,,,,,,1)
+	    	do InsertCurrencyCell^COMTable(prcAnvisa,,"VARSESCOMPRASLinha",chave)
+	    	do InsertCurrencyCell^COMTable(prcCompra,,"VARSESCOMPRASLinha",chave)
+	    	do InsertCurrencyCell^COMTable(prcInform,,"VARSESCOMPRASLinha",chave)
+ 
+			if blnEncerrado '= 1 {
+		    	if prcEstimado '= "" {	    	
+		    		do InsertCurrencyCell^COMTable(prcEstimado,,"VARSESCOMPRASLinha",chave)
+		    	} else {
+			    	do InsertCell^COMTable("Elaborar Estimativa","VARSESCOMPRASLinha",chave)	
+		    	}			
+	    	} else {
+				set motivo = $piece(objLinha,Y,17)
+				set strMotivo = $$GetMotivoDescricao^VARSESCOMPRASEncerrar(motivo)				    	
+				do InsertCell^COMTable("<font color=red>"_strMotivo_"</font>")
+			}
+ 
+			do EndLine^COMTable()
+		$$$End
+		
+		do Stop^COMTable()
+  	}
+ 
+	quit
+	
+OnAfterSaveHook(pYKEY)
+	quit:(pYKEY = "")
+	
+	new NoCompra, Item, strStatus, posicaoAtualProcesso, newPosicaoProcesso, blnPrecosDefinidos, Linha, 
+		chave, PrecoEstimado, objCompra
+			
+	set NoCompra = $$$KEY1(pYKEY)
+	set Item     = $$$KEY2(pYKEY)
+	
+	set strStatus = $$$OK
+	set posicaoAtualProcesso = $$GetPosicao^VARSESCOMPRAS(NoCompra)
+	set newPosicaoProcesso = ""
+	
+	// Verificando se todos os precos estão definidos ou não
+	set blnPrecosDefinidos = $$$NO
+	
+	$$$Order3(^VARSESCOMPRASLinha,YM,NoCompra,Linha)
+				
+		set chave = NoCompra_","_Linha
+		set PrecoEstimado = $$GetPrecoEstimado(chave)
+		
+		if (PrecoEstimado = "") {
+			set blnPrecosDefinidos = $$$NO
+			quit
+		
+		} elseif (PrecoEstimado '= "") {
+			set blnPrecosDefinidos = $$$YES
+		}
+	
+	$$$End
+	
+	// Calcula como deveria ser a nova posição
+	if (blnPrecosDefinidos = $$$YES) && (posicaoAtualProcesso = 2) {
+		;PositionHere -> 3 - Aguardando Fazer Lançamento
+		set newPosicaoProcesso = 3
+	
+	}  elseif (blnPrecosDefinidos = $$$NO) && (posicaoAtualProcesso = 3) {
+		;PositionHere -> 2 - Aguardando Estimativa de Preços
+		set newPosicaoProcesso = 2	
+	}
+	
+	// Se a nova posição for diferente da atual, atualiza
+	if ((newPosicaoProcesso '= posicaoAtualProcesso) && (newPosicaoProcesso '= "")) {
+		set objCompra = $get(^VARSESCOMPRAS(YM,NoCompra,1))				
+		set $piece(objCompra,Y,7) = newPosicaoProcesso
+		set strStatus = $$$Save("VARSESCOMPRAS",NoCompra,objCompra,1)
+		set ^VARSESTempDispensaVoltar(YBED) = 1
+	}
+	
+	quit strStatus
+ 
+OnBlurPreco(pYFELD)
+	new precoANVISA, precoUltimaCompra, precoInformado, noPrecos, precoEstimado
+	
+	set precoANVISA 	  = $piece(pYFELD,Y,6)
+	set precoUltimaCompra = $piece(pYFELD,Y,7)
+	set precoInformado    = $piece(pYFELD,Y,8)
+	
+	set noPrecos = 0
+	if precoANVISA 		 '= "" set noPrecos = noPrecos + 1
+	if precoUltimaCompra '= "" set noPrecos = noPrecos + 1
+	if precoInformado 	 '= "" set noPrecos = noPrecos + 1
+ 
+	if noPrecos = 0 {
+		set %TXT(1) = "#Y"_YFORM_"M15~"
+		quit
+	
+	} else {
+		set precoEstimado = ((precoANVISA + precoUltimaCompra + precoInformado) / noPrecos)
+		set %TXT(1) = "#Y"_YFORM_"M15~"_$$^WWWTR(0,8,precoEstimado)
+	}
+ 
+	quit
+ 
+ 
+GoToInserirProdutos(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Encaminha o usuário para o form de inserir produtos, carregando todos os produtos
+    ; que poderão ser inseridos na Compra.
+    ; 
+    ; History:
+    ; 28-Aug-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	new strStatus, isReadOnly
+	set strStatus = $$$OK
+	
+	set isReadOnly = $$CheckProcessoReadOnly^VARSESCOMPRAS(pYKEY)
+	if isReadOnly = $$$YES {
+		$$$Alert("Não é possível inserir produtos. Processo somente-leitura para este usuário ou posição.")
+		quit
+	}
+	
+	if $get(^VARSESCOMTempItensPAM(YM,pYKEY,1)) = "" {
+		set strStatus = $$CreateEntry^VARSESTempPAMCompras(pYKEY)
+	}
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$UpdateGrid^VARSESTempPAMCompras(pYKEY)
+	}
+	
+	if $$$ISOK(strStatus) {
+		do GoToForm^COMUtilForm("VARSESTempPAMCompras",pYKEY,1,"")				
+	}
+ 
+	quit
+ 
+	
+GetPrecoEstimado(chave)
+	;-------------------------------------------------------------------------------
+    ; Retorna o preço estimado do produto, que é a média aritmética simples dos preços
+    ; informados.
+    ; 
+    ; Params:   1 - No. Compra
+    ; 			2 - Item da Compra
+    ; 
+    ; History:
+    ; 26-Aug-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	quit:(chave = "")
+	
+	new NoCompra, Item, objCompraLinha, precoANVISA, precoUltimaCompra, precoInformado, noPrecos, precoEstimado
+	
+	set NoCompra = $$$KEY1(chave)
+	set Item     = $$$KEY2(chave)
+	
+	if Item = "" quit ""
+	
+	set objCompraLinha = $get(^VARSESCOMPRASLinha(YM,NoCompra,Item,1))
+	
+	set precoANVISA 	  = $piece(objCompraLinha,Y,6)
+	set precoUltimaCompra = $piece(objCompraLinha,Y,7)
+	set precoInformado    = $piece(objCompraLinha,Y,8)
+	
+	set noPrecos = 0
+	if precoANVISA 		 '= "" set noPrecos = noPrecos + 1
+	if precoUltimaCompra '= "" set noPrecos = noPrecos + 1
+	if precoInformado 	 '= "" set noPrecos = noPrecos + 1
+	
+	if noPrecos = 0 quit ""
+	
+	set precoEstimado = ((precoANVISA + precoUltimaCompra + precoInformado) / noPrecos)
+	quit precoEstimado
+	
+	
+GoToEstimativa(pNoCompra,pItem)
+	;-------------------------------------------------------------------------------
+    ; Direciona o usuário para a tela de Estimativa de Preços, setando as chaves.
+    ; 
+    ; History:
+    ; 26-Aug-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	quit:(pNoCompra = "")
+	set chave = pNoCompra_","_pItem
+	do GoToForm^COMUtilForm("VARSESCOMPRASLinha",chave)
+	quit
+	
+VerificaEstoquePrincipal(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Verifica o estoque principal definido para o processo de compra
+    ; 
+    ; History:
+    ; 26-Sep-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	if pYKEY = "" quit $$$NO
+	new NoProcessoCompra, EstoquePrincipal
+	set NoProcessoCompra = $$$KEY1(pYKEY)
+	
+	set EstoquePrincipal = $$GetEstoquePrincipal^VARSESCOMPRAS(NoProcessoCompra)
+	if (EstoquePrincipal = "ALMOXARIFADO") quit $$$YES
+	
+	quit $$$NO
+	
+GetPrecoUltimaCompra(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Pega o preço da última compra com a mesma função do alerta, só que remove o
+    ; R$ (no alerta é uma string que vem com ele)
+    ; 
+    ; History:
+    ; 30-Sep-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	if pYKEY = "" quit ""
+	new NoProcessoCompra, idItem
+	set NoProcessoCompra = $$$KEY1(pYKEY)
+	
+	set idItem = $piece($get(^VARSESCOMPRASLinha(YM,$$$KEY1(pYKEY),$$$KEY2(pYKEY),1)),Y,2)
+	
+	set PrecoUltimaCompra = $extract($$GetPrecoUltimaCompra^VARSESAlertaLinha(idItem),4,10) //remove o R$
+	quit PrecoUltimaCompra
+	
+	
+SolicitarAmostra(pYKEY="",pChecked="")
+	;-------------------------------------------------------------------------------
+    ; Salva a marcação ou desmarcação do usuário no checkbox de Amostra
+    ; 
+    ; History:
+    ; 30-Sep-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	new NoCompra, NoLinha, strStatus, objLinha, blnSolicAmostra
+	set NoCompra = $$$KEY1(pYKEY)
+	set NoLinha  = $$$KEY2(pYKEY)
+	
+	set strStatus = $$$OK
+	set chave = NoCompra_$$$COMMA_NoLinha
+	
+	set objLinha = $get(^VARSESCOMPRASLinha(YM,NoCompra,NoLinha,1))
+	set blnSolicAmostra = $piece(objLinha,Y,15)
+	
+	if ($piece(pChecked,",",1) = "true") && ((blnSolicAmostra = "") || (blnSolicAmostra = $$$NO)) {		
+		set $piece(objLinha,Y,15) = $$$YES		
+		set strStatus = $$$Save("VARSESCOMPRASLinha",chave,objLinha,1)
+	}
+	elseif ($piece(pChecked,",",1) = "false") && (blnSolicAmostra = 1) {
+		set $piece(objLinha,Y,15) = $$$NO		
+		set strStatus = $$$Save("VARSESCOMPRASLinha",chave,objLinha,1)
+	}
+	
+	if $$$ISERR(strStatus) {
+		do ReturnError^COMUtilError(strStatus)
+	}
+	
+	quit $$$YES
+	
+GetSolicAmostra(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Retorna se o produto requer uma amostra ou não
+    ; 
+    ; History:
+    ; 30-Sep-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	if pYKEY = "" quit ""
+	quit $piece($get(^VARSESCOMPRASLinha(YM,$$$KEY1(pYKEY),$$$KEY2(pYKEY),1)),Y,15)
+ 
+ 
+OnBeforeEditAccessHook(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Verifica se o usuário tem permissão ou não para modificar os dados.
+    ; 
+    ; History:
+    ; 30-Oct-2009	Gustavo Fiuza		Created
+    ;-------------------------------------------------------------------------------
+	if pYKEY = "" quit $$$YES
+	
+	new isReadOnly		
+	set isReadOnly = $$CheckProcessoReadOnly^VARSESCOMPRAS($$$KEY1(pYKEY))		
+	if isReadOnly = $$$YES quit $$$NO
+ 
+	quit $$$YES
+]]></Routine>
+</Export>

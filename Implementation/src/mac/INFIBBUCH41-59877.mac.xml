@@ -1,0 +1,533 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INFIBBUCH41" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INFIBBUCH41
+#include COMSYS
+#include INConst
+#define Multiplier(%cur) $select(($piece(BUCHUNG,Y,25)=2):$$$FCMult(%cur,-1),1:%cur)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 23-Mar-2005	GRF		SR10478 : Break routine into more manageable chunks
+	;-------------------------------------------------------------------------------
+	
+ININVOICE(BUCHUNG,YFPARA)
+	;-------------------------------------------------------------------------------
+	; INCOMING INVOICE
+	; 
+	; History:
+	; 05-Feb-2007	GRF		SR15424: Naked References - use objOrder & objSupInv
+	; 03-Apr-2006	Steve S	SR14499: Process Credit Notes
+	; 21-Jun-2005	GRF		SR10478: Keep MAN for EXCHANGE^INFIBBUCH; pass YM (commented)
+	; 21-Jun-2005	GRF		SR12721: replace BTR with FINBTR maintaining
+	; 							consistancy with other routines.
+	; 20-May-2005	GRF		SR10478: Set TranType to "INV" (Supplier Invoice) for
+	; 							clarity - not used by Acct ID Matrix; blnCosts with
+	; 							YES/NO; objINERECH1
+	; 13-Apr-2005	shobby	SR12101: 'if Import {' test should have tested for '=""
+	; 12-Apr-2005	GRF		SR10478: Activate
+	; 23-Mar-2005	GRF		SR10478: Rationalise use of $$^WWWUMLAU calls; EINHEIT
+	; 							not used
+	; 16-Mar-2005	GRF		SR10478: Preserve original location and item group for
+	; 							post cost-matrix profile resolution
+	; 03-Feb-2005	GRF		SR10478: Added characteristic values;
+	; 							Common ITEM, InvoiceNo, SUPPLIER defns;
+	; 							Clear unnecessary DO block
+	; 31.08.2004	FIS		26316 FOREIGN CURRENCY
+	; 15-Nov-2004	JW		SR10775: Added import cost processing
+	;-------------------------------------------------------------------------------
+	new BET,BTR,COST,blnCosts,FCUAMNT,FCURRENCY,FCUXRTE,FINBTR,IGROUP,Import,InvoiceNo
+	new ITEM,LAP,LINE,LineNo,MAN,NKOMMA,objINERECH1,objInvoice,objOrder,objSupInv,ORDER,POS,QTY,RECAMNT
+	new strAccount,SUM,SUPPLIER,TotalTax,TranType,ulInv,ulSup,WAGR,WE1,WED
+	; new EINHEIT
+ 
+	set MAN = YM
+	set BTR = $piece(BUCHUNG,Y,16)
+	if BTR="" set BTR = YLOCATION
+	set FINBTR = BTR
+	
+	if $piece(YFPARA,Y,2)'="" set MAN    = $piece(YFPARA,Y,2)  ;Company  for GL
+	if $piece(YFPARA,Y,3)'="" set FINBTR = $piece(YFPARA,Y,3)  ;Location for GL
+	
+	set ITEM = $piece(BUCHUNG,Y,29)
+	set WAGR = ""
+	if ITEM'="" set WAGR = $piece($get(^INART(0,ITEM,1)),Y,30)
+	if WAGR=""  set WAGR = $piece($get(^INVORG(0,0,1)),Y,13)  ;DFLT.
+	
+	set SUPPLIER  = $piece(BUCHUNG,Y,5)                    ;GET SUPPLIER FROM CREDIT NUMBER
+	set InvoiceNo = $piece(BUCHUNG,Y,7)
+	
+	set ^mtemp($job,"SupInv","InvoiceNumber")        = InvoiceNo                    ; INVOICE NO. -> MUST BE UNIQUE
+	set ^mtemp($job,"SupInv","Location")             = BTR                          ; Location for GL
+	set ^mtemp($job,"SupInv","SourceLocn")           = BTR
+	set ^mtemp($job,"SupInv","SupplierInvoiceNumber")= $piece(BUCHUNG,Y,23)         ; INVOICE NO. FROM SUPPLIER
+	set ^mtemp($job,"SupInv","Date")                 = $piece(BUCHUNG,Y,2)          ; DATE
+	set ^mtemp($job,"SupInv","Supplier")             = SUPPLIER                     ; SUPPLIER/CREDIT ACCOUNT NUMBER
+	set ^mtemp($job,"SupInv","DueDate")              = $piece(BUCHUNG,Y,2)+$piece(BUCHUNG,Y,15)  ; NET DUE DATE
+	set ^mtemp($job,"SupInv","SettlementDiscount")   = +$piece(BUCHUNG,Y,14)_"%"    ; discount %
+	set ^mtemp($job,"SupInv","Terms")                = $piece(BUCHUNG,Y,34)         ; payment terms
+	
+	;set ^mtemp($job,"SupInv","ControlAccount") = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,10),FINBTR)  ; soh account
+	;set ^mtemp($job,"SupInv","Company")        = 0                           ; Company  for GL
+	;set ^mtemp($job,"SupInv","SettlementDays") = $piece(BUCHUNG,Y,13)        ; discount days
+	
+	;set TranType = $piece(BUCHUNG,Y,50)   ; "???"
+	set TranType = "INV"                                ; Supplier Invoice - no matrix
+	set ^mtemp($job,"SupInv","TranType")  = TranType
+	set ^mtemp($job,"SupInv","OrderType") = 2           ; Purchase Order
+	if SUPPLIER'="" {
+		set ulSup = $$^WWWUMLAU(SUPPLIER,1)
+		if $data(^INLIEFs(0,4,ulSup)) set SUPPLIER = $order(^INLIEFs(0,4,ulSup,""))
+	}
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	quit:SUPPLIER=""
+	quit:InvoiceNo=""
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set objInvoice = $get(^INERECH(0,SUPPLIER,InvoiceNo,$piece(BUCHUNG,Y,2),1))
+	set TotalTax   = $piece(objInvoice,Y,8)
+	
+	; JW SR10775: invoice relate to an import?
+	set blnCosts = $$$NO
+	set Import   = $piece(objInvoice,Y,127)
+	if Import'="" {  ; 
+		set ^mtemp($job,"SupInv","Import") = Import  ;import no
+		
+		; Is this invoice for import costs? Note: can't also be for goods.
+		set ulSup = $$^WWWUMLAU(SUPPLIER,1)						;GRF;22-Mar-2005; Ensure correct format
+		if $data(^INSHIPINFOCOSTSs(0,1,ulSup,Import)) {
+			do COSTS(SUPPLIER,BUCHUNG,YFPARA,Import,BTR,WAGR,TotalTax)
+			set blnCosts = $$$YES
+		}
+	}
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	quit:blnCosts=$$$YES         ; if costs, don't do order lines.
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set SUM     = 0
+	set LineNo  = 0
+	set RECAMNT = 0  ;RECEIVE AMOUNT
+	set ulSup   = $$^WWWUMLAU(SUPPLIER,1)
+	set ulInv   = $$^WWWUMLAU(InvoiceNo,1)
+	
+	; TODO : Convert to {} form <GRF>
+	
+	set ORDER = ""
+	for  set ORDER = $order(^INERECH1s(0,1,ulSup,ulInv,ORDER)) quit:ORDER=""  do
+	. set POS = ""
+	. for  set POS = $order(^INERECH1s(0,1,ulSup,ulInv,ORDER,POS)) quit:POS=""  do
+	. . set objINERECH1 = $get(^INERECH1(0,ORDER,POS,SUPPLIER,InvoiceNo,1))
+	. . set COST    = $piece(objINERECH1,Y,22)      ; INVOICE AMOUNT
+	. . set FCUAMNT = $piece(objINERECH1,Y,68)      ; FOREIGN CURRENCY UNIT AMOUNT
+	. . if +FCUAMNT'=0 do
+	. . . set QTY    = $piece(objINERECH1,Y,16)     ; ORDER QTY
+	. . . set NKOMMA = $piece($get(^INAUFPK(0,ORDER,POS,1)),Y,25)    ;NO. OF DECIMALS
+	. . . if (+NKOMMA=0) || (NKOMMA>9) set NKOMMA = 2
+	. . . if +QTY'=0 set FCUAMNT = $justify(FCUAMNT*QTY,0,NKOMMA)
+	. . . set FCURRENCY = $piece($get(^INLIEF(0,SUPPLIER,1)),Y,51)   ;SUPPLIER CURRENCY
+	. . . set objOrder  = $get(^INAUF(0,ORDER,1))
+	. . . if ($piece(objOrder,Y,2)=2) && ($piece(objOrder,Y,51)'="") set FCURRENCY = $piece(objOrder,Y,51)  ;ORDER CURRENCY
+	. . . if $piece(BUCHUNG,Y,2)'="" do
+	. . . . set objSupInv = $get(^INERECH(0,SUPPLIER,InvoiceNo,$piece(BUCHUNG,Y,2),1))
+	. . . . if $piece(objSupInv,Y,131)'="" set FCURRENCY = $piece(objSupInv,Y,131)                          ;INVOICE CURRENCY
+	. . . if (FCURRENCY="") || (FCURRENCY=YWHR) quit           ; Caution when converting : Quits from DO
+	. . . ;
+	. . . set FCUXRTE = $piece(objINERECH1,Y,78)
+	. . . if +FCUXRTE=0 if $piece(BUCHUNG,Y,2)'="" set FCUXRTE = $piece($get(^INERECH(0,SUPPLIER,InvoiceNo,$piece(BUCHUNG,Y,2),1)),Y,130)
+	. . . if +FCUXRTE=0 set FCUXRTE = $piece($get(^WWWWAE(0,FCURRENCY,1)),Y,5)
+	. . . set COST=COST_"@"_FCURRENCY_FCUAMNT_"@"_FCUXRTE
+	. . ;
+	. . set RECAMNT=0  ;RECEIVED AMOUNT
+	. . if $data(^INWEAUF(0,ORDER,POS)) do         ; DEPRECATED - with removal of INWEAUF*     Replace with INRECLine/Summary? SR16361
+	. . . set BET = ""
+	. . . for  set BET = $order(^INWEAUF(0,ORDER,POS,BET)) quit:BET=""  do
+	. . . . set LAP = ""
+	. . . . for  set LAP = $order(^INWEAUF(0,ORDER,POS,BET,LAP)) quit:LAP=""  do
+	. . . . . set WED = ""
+	. . . . . for  set WED = $order(^INWEAUF(0,ORDER,POS,BET,LAP,WED)) quit:WED=""  do
+	. . . . . . set WE1 = $get(^INWEAUF(0,ORDER,POS,BET,LAP,WED,1))
+	. . . . . . set RECAMNT = RECAMNT+$piece(WE1,Y,62)   ; Total Cost On Location
+	. . ;
+	. . if $data(^INWEAUFALT(0,ORDER,POS)) do      ; DEPRECATED - with removal of INWEAUF*     SR16361
+	. . . set BET = ""
+	. . . for  set BET = $order(^INWEAUFALT(0,ORDER,POS,BET)) quit:BET=""  do
+	. . . . set LAP = ""
+	. . . . for  set LAP = $order(^INWEAUFALT(0,ORDER,POS,BET,LAP)) quit:LAP=""  do
+	. . . . . set WED = ""
+	. . . . . for  set WED = $order(^INWEAUFALT(0,ORDER,POS,BET,LAP,WED)) quit:WED=""  do
+	. . . . . . set WE1 = $get(^INWEAUFALT(0,ORDER,POS,BET,LAP,WED,1))
+	. . . . . . set RECAMNT = RECAMNT+$piece(WE1,Y,62)
+	. . ;
+	. . set LineNo       = LineNo+1                        ; Next Line
+	. . set LINE(LineNo) = ORDER_Y_POS_Y_COST_Y_RECAMNT
+	. . set SUM          = SUM+COST                        ; SUM OF AMOUNT
+	
+	;++++++++++++++++++++++++++
+	quit:LineNo=0
+	;++++++++++++++++++++++++++
+	
+	;GRF 22-Mar-2005; simplified but EINHEIT only used in commented code so this block commented as well
+	;IF SUM'=0 {
+	;	SET EINHEIT=$piece(BUCHUNG,Y,3)/SUM
+	;} else {
+	;	SET EINHEIT=$piece(BUCHUNG,Y,3)/LineNo
+	;}
+	;^^^^^^^^^^^^^^^^^^^^^^^
+	
+	;;IF $piece(BUCHUNG,Y,3)'=SUM DO  ;SHARE REST AMOUNT IF TOTAL SUM DOESN'T FIT SUM OF INVOICE ITEMS
+	;. SET SUM=0
+	;. SET POS="" FOR  SET POS=$ORDER(LINE(POS)) QUIT:POS=""  DO
+	;. . SET FCCOST=$piece($piece(LINE(POS),Y,3),"@",2,3)  ;FOREIGN CURRENCY UNIT AMOUNT;FIS;31.08.04;26316
+	;. . SET COST=+$piece(LINE(POS),Y,3)
+	;. . SET COST=$JUSTIFY(COST*EINHEIT,0,2)
+	;. . SET $piece(LINE(POS),Y,3)=COST
+	;. . IF FCCOST'="" SET $piece(LINE(POS),Y,3)=$piece(LINE(POS),Y,3)_"@"_FCCOST  ;FOREIGN CURRENCY UNIT AMOUNT;FIS;31.08.04;26316
+	;. . SET SUM=SUM+COST
+	;. ;	
+	;. IF SUM<$piece(BUCHUNG,Y,3) SET $piece(LINE(LineNo),Y,3)=$piece(LINE(LineNo),Y,3)+($piece(BUCHUNG,Y,3)-SUM)
+	;. IF SUM>$piece(BUCHUNG,Y,3) SET $piece(LINE(LineNo),Y,3)=$piece(LINE(LineNo),Y,3)-(SUM-$piece(BUCHUNG,Y,3))
+	
+	do TAXES(BUCHUNG,TotalTax,.SUM)  ; JW 15-Nov-2004
+	
+	;NEW INVOICE ITEM FOR REST AMOUNT IF TOTAL SUM DOESN'T FIT SUM OF INVOICE ITEMS ;ITEM residue whole 
+	if $piece(BUCHUNG,Y,3)'=SUM {
+		set LineNo       = LineNo+1                               ; Next Line
+		set COST         = $piece(BUCHUNG,Y,3)-SUM
+		set LINE(LineNo) = 0_Y_0_Y_COST
+	}
+	
+	;******************************************************
+	; 'ITEM' IS OBTAINED FROM THE ORDER LINES FROM HERE ON
+	;******************************************************
+	
+	set LineNo=""
+	for {
+		set LineNo=$order(LINE(LineNo))
+		quit:LineNo=""
+		
+		set ORDER=$piece(LINE(LineNo),Y,1)
+		set POS  =$piece(LINE(LineNo),Y,2)
+		set ITEM=""
+		IF ORDER'="" IF POS'="" set ITEM = $piece($GET(^INAUFP(0,ORDER,POS,1)),Y,4)
+		
+		set IGROUP=""
+		if ITEM'=""  set IGROUP = $piece($GET(^INART(0,ITEM,1)),Y,30)
+		if IGROUP="" set IGROUP = WAGR
+		
+		if ($piece(BUCHUNG,Y,4)=99999) || ($piece(BUCHUNG,Y,4)="") {
+			set $piece(BUCHUNG,Y,4) = $piece(YFPARA,Y,35)
+		}
+		
+		set ^mtemp($job,"SupInv","Lines",LineNo,"AccSOH")             = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,31),FINBTR,IGROUP)  ; soh account
+		set ^mtemp($job,"SupInv","Lines",LineNo,"LineReceivedAccount")= $$EXCHANGE^INFIBBUCH($piece(BUCHUNG,Y,4),FINBTR,IGROUP)  ; PURCHASES account
+		set ^mtemp($job,"SupInv","Lines",LineNo,"LineReceivedAmount") = $$$Multiplier($piece(LINE(LineNo),Y,4))  ; VALUE 
+		set ^mtemp($job,"SupInv","Lines",LineNo,"Cost")          	  = $$$Multiplier($piece(LINE(LineNo),Y,3))  ; INVOICED AMOUNT
+		set ^mtemp($job,"SupInv","Lines",LineNo,"RefLine")            = ITEM      ; ITEM NO.
+		set ^mtemp($job,"SupInv","Lines",LineNo,"Order")              = ORDER     ; order no
+		set ^mtemp($job,"SupInv","Lines",LineNo,"OrderLine")          = POS       ; line item
+		set ^mtemp($job,"SupInv","Lines",LineNo,"SourceGroup")        = IGROUP
+		
+		;if ITEM has Acct (INART #31)
+		if ITEM'="" {
+			set strAccount = $piece($get(^INART(0,ITEM,1)),Y,31)		; Revenue Account Inland
+			if strAccount'="" {
+				set ^mtemp($job,"SupInv","Lines",LineNo,"AccSOH") = $$EXCHANGE^INFIBBUCH($zcvt(strAccount,"U"),FINBTR,IGROUP)
+			}
+		}
+		do CopyCharVals^INFIBBUCH4("SupInv",BUCHUNG,LineNo)
+	}
+	QUIT
+	
+	
+COSTS(SUPPLIER,BUCHUNG,YFPARA,import,FINBTR,WAGR,pTotalTax) PRIVATE
+	;-------------------------------------------------------------------------------
+	; Set up lines for extra costs associated with imports.
+	; Some lines copied from ININVOICE - so same variables have been used (in CAPS).
+	;
+	; History:
+	; 20-Oct-2006	JW		SR15138: Should not be '+'ed. "" is not equal to 0.
+	; 03-Apr-2006	Steve S	SR14499: Process Credit Notes
+	; 22-Feb-2006	JW		-: Changed from 6 back to + ??
+	; 21-Feb-2006	JW		SR14325: Should be 6 not 0 enum.
+	; 09-Jan-2006	JW		SR14097: Skip lines if not this invoice (or 0 amount)
+	;  							Also, fill nodes (order and source group)
+	; 04-Jan-2006	JW		SR14066: Updating wrong piece (account not amounts)
+	; 19-Apr-2005	shobby	SR12101	: If no order then this is for import costs that
+	; 							have "$piece(objCost,Y,9) = 0 {  ; Allocate to GL
+	; 							Account" - ignore rollback of estimated import costs
+	; 							as would not have been sent to GL account anyway.
+	; 29-Mar-2005	RobertW	SR11978 : Make sure the line number has changed before
+	; 							attempting to read the data from the array. This
+	; 							makes sure we have data existing.
+	; 16-Mar-2005	GRF		SR10478 : Preserve original location and item group for
+	; 							post cost-matrix profile resolution
+	; 15-Nov-2004	JW		Created
+	;-------------------------------------------------------------------------------
+	new account,COST,costType,fltAmount,idInvoice,idx,IGROUP,InvAndType,ITEM,itemCost,LINE
+	new LineNo,objCost,ORDER,POS,Prev,SUM,thisSum,total,ulInvAndType,ulSup,strType
+ 
+	set LineNo = 0
+	set Prev   = 0
+	set SUM    = 0
+	
+	set ulSup     = $$^WWWUMLAU(SUPPLIER,1)
+	set idInvoice = $piece(BUCHUNG,Y,7)
+	
+	set costType = ""
+	for {
+		set costType = $order(^INSHIPINFOCOSTSs(0,1,ulSup,import,costType))
+		quit:costType=""
+		
+		set objCost = $get(^INSHIPINFOCOSTS(0,import,costType,1))
+		set total   = $$$INSHIPINFOCOSTSActualCosts(objCost)
+		continue:idInvoice'=$$$INSHIPINFOCOSTSInvoiceNumber(objCost)	// wrong invoice number
+		continue:total=""												// no value entered
+		
+		set SUM     = SUM+total
+		
+		if $$$INSHIPINFOCOSTSAllocationMethod(objCost) = 0 {  ; Allocate to GL Account
+			set account = $$$INSHIPINFOCOSTSSuspenseAccount(objCost)
+			
+			set LineNo      = LineNo+1                               ; Next Line
+			set LINE(LineNo)= account_Y_total_Y_total_Y_costType_Y_"IMP "_import_Y_Y_0
+			
+			; Flag as an import cost.
+			set ^mtemp($job,"SupInv","Lines",LineNo,"ImportCost") = 1
+			
+		} else { ; Allocate to Cost of Inventory
+			set InvAndType   = idInvoice_"#"_costType
+			set ulInvAndType = $$^WWWUMLAU(InvAndType,1)
+			
+			set thisSum = 0
+			set ORDER   = ""
+			for {
+				set ORDER = $order(^INERECH1s(0,1,ulSup,ulInvAndType,ORDER))
+				quit:ORDER=""
+				
+				set POS = ""
+				for {
+					set POS = $order(^INERECH1s(0,1,ulSup,ulInvAndType,ORDER,POS))
+					quit:POS=""
+					
+					set COST   = $piece($get(^INERECH1(0,ORDER,POS,SUPPLIER,InvAndType,1)),Y,22)
+			 		set ITEM   = $piece($get(^INAUFP(0,ORDER,POS,1)),Y,4)
+			 		set IGROUP = ""
+			 		if ITEM'=""  set IGROUP = $piece($get(^INART(0,ITEM,1)),Y,30)
+			 		if IGROUP="" set IGROUP = WAGR
+					
+			 		if ($piece(BUCHUNG,Y,4)=99999)||($piece(BUCHUNG,Y,4)="") set $piece(BUCHUNG,Y,4) = $piece(YFPARA,Y,35)
+			 		set account = $$EXCHANGE^INFIBBUCH($piece(BUCHUNG,Y,4),FINBTR,IGROUP)
+					
+					do ProcessItem^INFIBBUCHCODE(ITEM,.BUCHUNG)  ; SR12430
+					
+					set LineNo       = LineNo+1                               ; Next Line
+					set LINE(LineNo) = account_Y_COST_Y_COST_Y_costType_","_ITEM_Y_ORDER_Y_POS_Y_IGROUP
+					set thisSum      = thisSum+COST                           ;SUM OF AMOUNT
+				}
+			}
+			; rounding error - add difference to last line
+			if thisSum '= total {
+				if Prev'= LineNo {
+					set $piece(LINE(LineNo),Y,2) = $piece(LINE(LineNo),Y,2) + (total-thisSum)
+					set $piece(LINE(LineNo),Y,3) = $piece(LINE(LineNo),Y,3) + (total-thisSum)
+				}
+				set Prev=LineNo
+			}
+		}
+	}
+	
+	do TAXES(BUCHUNG,pTotalTax,.SUM)
+	
+	;NEW INVOICE ITEM FOR REST AMOUNT IF TOTAL SUM DOESN'T FIT SUM OF INVOICE ITEMS
+	if $piece(BUCHUNG,Y,3)'=SUM {
+		set LineNo       = LineNo+1                               ; Next Line
+		set COST         = $piece(BUCHUNG,Y,3)-SUM
+		set account      = $$EXCHANGE^INFIBBUCH($piece(BUCHUNG,Y,4),FINBTR,WAGR)
+		set LINE(LineNo) = account_Y_0_Y_COST
+	}
+	
+	for idx=1:1:LineNo {
+		set ^mtemp($job,"SupInv","Lines",idx,"AccSOH")             = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,31),FINBTR,WAGR) ; soh account
+		set ^mtemp($job,"SupInv","Lines",idx,"LineReceivedAccount")= $piece(LINE(idx),Y,1)  ; PURCHASES account
+		set ^mtemp($job,"SupInv","Lines",idx,"LineReceivedAmount") = $$$Multiplier($piece(LINE(idx),Y,2))  ; VALUE
+		set ^mtemp($job,"SupInv","Lines",idx,"Cost")               = $$$Multiplier($piece(LINE(idx),Y,3))  ; INVOICED AMOUNT
+		set ^mtemp($job,"SupInv","Lines",idx,"RefLine")            = $piece(LINE(idx),Y,4)  ; ITEM NO.
+		set ^mtemp($job,"SupInv","Lines",idx,"Order")              = $piece(LINE(idx),Y,5)  ; order no
+		set ^mtemp($job,"SupInv","Lines",idx,"OrderLine")          = $piece(LINE(idx),Y,6)  ; line item
+		set ^mtemp($job,"SupInv","Lines",idx,"SourceGroup")        = $piece(LINE(idx),Y,7)  ; source group
+		
+		set strType   = $piece($piece(LINE(idx),Y,4),",",1)
+		set fltAmount = $$GetServiceCostAmount(strType,BUCHUNG,LINE(idx))  ; ESTIMATED Service Costs on Goods Receipt
+		
+		; If the estimated cost processed to SOH account was correct - don't process either amount
+		if (fltAmount'=$$$Multiplier($piece(LINE(idx),Y,2)))&&(fltAmount'="NO ORDER") {
+			; Reverse out estimated service costs
+			set ^mtemp($job,"SupInv","Lines",idx,"ServiceCost",1,"Account") = $piece(LINE(idx),Y,1)
+			set ^mtemp($job,"SupInv","Lines",idx,"ServiceCost",1,"Amount")  = $$$FCSign(fltAmount)
+			set ^mtemp($job,"SupInv","Lines",idx,"ServiceCost",1,"Type")    = strType
+			
+			; Put in actual service costs.
+			set ^mtemp($job,"SupInv","Lines",idx,"ServiceCost",2,"Account") = $piece(LINE(idx),Y,1)
+			set ^mtemp($job,"SupInv","Lines",idx,"ServiceCost",2,"Amount")  = $$$Multiplier($piece(LINE(idx),Y,2))
+			set ^mtemp($job,"SupInv","Lines",idx,"ServiceCost",2,"Type")    = strType
+		}
+		do CopyCharVals^INFIBBUCH4("SupInv",BUCHUNG,idx)
+	}
+	quit
+	
+	
+GetServiceCostAmount(pstrType,BUCHUNG,LINE)
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Returns: fltAmount
+    ;
+    ; History:
+    ; 08-Jul-2005	shobby	Rounded the Service cost amount  SR12745/SR12548
+    ; 19-Jun-2005	shobby	Included calculations for not yet received. (INWEAUFVOR)
+    ; 20-May-2005	GRF		Remove unnecessary set
+	; 19-Apr-2005	shobby	SR12101	: If no order then this is for import costs that
+	; 							have "$piece(objCost,Y,9) = 0 {  ; Allocate to GL
+	; 							Account" - ignore rollback of estimated import costs
+	; 							as would not have been sent to GL account anyway.
+    ; 19-Apr-2005	shobby	Created SR12101
+    ;-------------------------------------------------------------------------------
+	new fltAmount,idDate,idLine,idLocn,idOrder,idStockLocn,idx
+	new lstReference,objINWEAUF,strReference,objINWEAUFVOR
+	
+	set fltAmount = "NO ORDER"
+	set idOrder   = $piece(LINE,Y,5)
+	set idLine	  = $piece(LINE,Y,6)
+	
+	if (idOrder'="") && (idLine'="") {
+		set fltAmount = 0
+		; Already received.
+		set idLocn = $order(^INWEAUF(0,idOrder,idLine,""))   ; DEPRECATED - with removal of INWEAUF*     Replace with INRECLine? SR16361
+		if idLocn'="" {
+			set idStockLocn = $order(^INWEAUF(0,idOrder,idLine,idLocn,""))
+			if idStockLocn'="" {
+				set idDate = $order(^INWEAUF(0,idOrder,idLine,idLocn,idStockLocn,""))
+				; NOTE : Alphalinc appears to only record a single entry for each date
+				;        It is not clear what happens if two parts of a shipment are
+				;        received on the same date (e.g. overwrite or sum)
+				if idDate'="" {
+					set objINWEAUF = $get(^INWEAUF(0,idOrder,idLine,idLocn,idStockLocn,idDate,1))
+					if $get(objINWEAUF)'="" {
+						set lstReference = $$$INWEAUFFinanceTxRef(objINWEAUF)
+						; Type|Rate;Type|Rate;...
+						; Multiply Rate by Qty for amount
+						for idx=1:1:$length(lstReference,"%3B") {
+							set strReference = $piece(lstReference,"%3B",idx)
+							if strReference'="" {
+								if $piece(strReference,"%7C",1)=pstrType {
+									set fltAmount = $$$FCMult($piece(strReference,"%7C",2),$$$INWEAUFIncomingGoodsQuantity(objINWEAUF))
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		; Not yet received.  Not sure if this is required.  It may be that Estimated costs have not been sent
+		; anyway in which case it is valid to ignore.
+		;set idLocn=$order(^INWEAUFVOR(0,idOrder,idLine,""))
+		;if idLocn'="" {
+		;	set idStockLocn=$order(^INWEAUFVOR(0,idOrder,idLine,idLocn,""))
+		;	if idStockLocn'="" {
+		;		set idDate=$order(^INWEAUFVOR(0,idOrder,idLine,idLocn,idStockLocn,""))
+		;		; NOTE : Alphalinc appears to only record a single entry for each date
+		;		;        It is not clear what happens if two parts of a shipment are
+		;		;        received on the same date (e.g. overwrite or sum)
+		;		if idDate'="" {
+		;			set objINWEAUFVOR=$get(^INWEAUFVOR(0,idOrder,idLine,idLocn,idStockLocn,idDate,1))
+		;			if $get(objINWEAUFVOR)'="" {
+		;				set lstReference=$$$INWEAUFVORFinanceTransactionReferen(objINWEAUFVOR)
+		;				; Type|Rate;Type|Rate;...
+		;				; Multiply Rate by Qty for amount
+		;				for idx=1:1:$length(lstReference,"%3B") {
+		;					set strReference=$piece(lstReference,"%3B",idx)
+		;					if strReference'="" {
+		;						if $piece(strReference,"%7C",1)=pstrType {
+		;							set fltAmount=$$$FCMult($piece(strReference,"%7C",2),$$$INWEAUFVORQuantity(objINWEAUFVOR))
+		;						}
+		;					}
+		;				}
+		;			}
+		;		}
+		;	}
+		;}
+	}
+	set fltAmount = $justify(fltAmount,0,2)
+	quit fltAmount
+	
+TAXES(BUCHUNG,pTotalTax,pSUM) PRIVATE
+	;-------------------------------------------------------------------------------
+	; ByRef : pSUM
+	; 
+	; History:
+	; 03-Apr-2006	Steve S	SR14499: Process Credit Notes
+	; 21-Feb-2006	JW		SR14325: Should be buy tax rates (added $$$YES)
+	; 02-Jun-2005	GRF		COM Routines will exist
+	; 13-Apr-2005	JW		SR10722 : Added IsTaxable
+	; 15-Nov-2004	JW		SR10491 : Created - Lines are now tax exclusive, and tax
+	; 							is on total
+	;-------------------------------------------------------------------------------
+	new idTax,InvTotal,RatesArray,TaxAmount,TaxCode,TaxDetail,TaxLevel
+	new TaxLoc,TaxRate,TaxSum,TotalRate,supplier
+	
+	if pTotalTax {
+		set InvTotal = $piece(BUCHUNG,Y,3)
+		set TaxCode  = $piece(BUCHUNG,Y,6)
+		set supplier = $piece(BUCHUNG,Y,5)
+		set TaxLoc   = ""
+		if supplier'="" {
+			set TaxLoc = $$$INLIEFTaxLocation($get(^INLIEF(0,supplier,1)))
+		}
+		if TaxLoc="" {
+			set TaxLoc = $piece($get(^WWW0121(0,0,YLOCATION,1)),Y,52)
+		}
+		set TaxCode = $$IsTaxable^COMTAX(TaxCode,,,TaxLoc)
+		do TaxRates^COMTAX(TaxCode,TaxLoc,+$horolog,.RatesArray,$$$YES)
+		set TotalRate = 0
+		set idTax = ""
+		for {
+		 	set idTax = $order(RatesArray(idTax))
+		 	quit:idTax=""
+		 	
+		 	set TaxDetail = $get(RatesArray(idTax))
+			quit:TaxDetail=""
+		 	
+		 	set TotalRate = TotalRate+$piece(TaxDetail,Y,2)
+		}
+		
+		set TaxSum = 0
+		set idTax  = ""
+		if TotalRate'=0 {
+			for {
+			 	set idTax = $order(RatesArray(idTax))
+			 	quit:idTax=""
+			 	
+			 	set TaxDetail = $get(RatesArray(idTax))
+				quit:TaxDetail=""
+				
+				set TaxRate   = $piece(TaxDetail,Y,2)
+				set TaxAmount = $justify(pTotalTax*TaxRate/TotalRate,0,2)
+				set ^mtemp($job,"SupInv","Taxes",idTax,"Account") = $piece(TaxDetail,Y,3)
+				set ^mtemp($job,"SupInv","Taxes",idTax,"Amount")  = $$$Multiplier(TaxAmount)
+				set ^mtemp($job,"SupInv","Taxes",idTax,"Code")    = $piece(TaxDetail,Y,1)
+				
+				set TaxSum = TaxSum+TaxAmount
+			}
+		}
+		; rounding error - add difference to last line
+		if $get(idTax)'="" {
+			if TaxSum '= pTotalTax {
+				set ^mtemp($job,"SupInv","Taxes",idTax,"Amount") = $$$Multiplier(($get(TaxAmount) + (pTotalTax-TaxSum)))
+			}
+		}
+		set pSUM = pSUM + pTotalTax
+	}
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,529 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INARTAVG" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+#include COMSYS
+#include INConst
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2)  	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^INARTAVG("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+#define enumAverageCost		9
+	
+INARTAVG(Item,ReceiveQty,ReceiveCost,strRef,pblnAdjust=$$$NO,pblnUpdate=$$$YES,pidLocn="")  ; DEPRECATED
+	;-------------------------------------------------------------------------------
+	;	Standard Calc : New WAC = (Current Qty * Old WAC) + (ReceiveQty * ReceiveCost)
+	;	                          ----------------------------------------------------
+	;	                                      (Current Qty + Receive Qty)
+	;
+	;	pblnAdjust	pblnUpdate				Result
+	;		NO			YES		Returns New WAC & stores in ^INARTAVG     (see UpdateCost^INAvgCost)
+	;		NO			NO		Returns New WAC                           (see CalcNewCost^INAvgCost)
+	;		YES			YES		Set/Return New WAC to ReceiveCost and
+	;		                    store in ^INARTAVG without qty change     (see ResetCost^INAvgCost)
+	;		YES			NO		Return ReceiveCost                        (not in use)
+	;-------------------------------------------------------------------------------
+	
+	;-------------------------------------------------------------------------------
+	;CALCULATE AND UPDATE AVERAGE ITEM COSTS
+	;
+	; Inputs : Item        = Item No.
+	;         ReceiveQty  = Received Qty
+	;         ReceiveCost = unit item cost of receipt
+	;         strRef      = Receipt Reference to re-calculate at time of invoice posting
+	;						Order,OrderLine,Location,Storage,ReceiptDate,ReceiptNo,ReceiptLine
+	;         
+	;         pblnAdjust  = no qty addition, just adjusting cost
+	;         pblnUpdate  = Update globals. If no, just return what cost will be.
+	;         
+	; Outputs:
+	;	new Average Cost per Item
+	;	zero if a non-stock item
+	;
+	;
+	; Updates :		(May not affect all listed; operations may related to different records)
+	;				^INWEAUF			(Modify)      <<< SR16361
+	;				^INART				(Modify)
+	;				^INARTAVG			(Create)
+	;
+	; History:
+	; 30-Oct-2009	GRF		SR16871: DEPRECATED - Use UpdateCost^INAvgCost [$$$NO,
+	; 							$$$YES], ResetCost^INAvgCost [$$$YES,$$$YES] or
+	; 							CalcNewCost^INAvgCost [$$$NO,$$$NO]
+	; 
+	; 
+	; 29-Oct-2009	GRF		SR16871: pblnAdjust logic in doco at top of routine has
+	; 							been fixed (YES/NO were reverse of actual situation)
+	; 07-Oct-2009	GRF		SR16928: correction to receipt reversal processing -
+	;							where ReceiveQty<0; use $$$enumAverageCost
+	; 17-Sep-2009	GRF		SR16361: Remove INWEAUF processing
+	; 14-Sep-2009	PPP		SR16888: Added new Parameter pidLocn, required to get
+	;							the Entity Qty ie qty for Average Cost calculation
+	;							2. Always recalculate the Average Cost
+	; 08-Jul-2009	GRF		SR16689: macro
+	; 22-Sep-2008	shobby	SRBR014969: Decimal places is as defined in INVORG
+	; 18-Dec-2006	GRF		SR15317: Reverse Receipt can introduce negative qty to
+	;						average cost history - must skip calculation.
+	; 18-Dec-2006	GRF		SR15312: Use revised INARTMENGE subroutines; code cleanup
+	; 14-Dec-2006	GRF		Use macros
+	; 30 Nov-2006	GRF		SR15186: allow manual change to zero average cost
+	; 28-Apr-2006	GRF		SR12667: Single calculation of AvailQty + ReceiveQty
+	; 24-Apr-2006	GRF		SR14471: Recalculate with supplier invoice variation
+	; 11-Apr-2006	GRF		SR12667: Return OldCost if ReceiveQty+AvailQty=0; ensures
+	;						we get an INARTAVG record for each receipt.
+	; 10-Apr-2006	GRF		SR14541: Base average cost calculation on ALL stock
+	;						locations; was excluding locked locations
+	; 06-Apr-2006	GRF		SR14529: Don't process Non-stock items
+	; 28-Mar-2006	PO		SR12667: Calculation for AVG Cost when Available Qty is
+	;						below zero
+	; 27-Jan-2006	GRF		SR14203: Use macro; problem 7
+	; 07-Nov-2005	JW		SR13222: Added pblnUpdate param
+	; 06-Nov-2005	JW		SR12920: Cost adjustment. Added pblnAdjust param.
+	; 16-Aug-2005	FIS		SR13253: created	
+	;-------------------------------------------------------------------------------
+	new OldCost,AvailQty,NewCost,objItem,SumQty
+ 
+	$$$LogR("INARTAVG",$get(Item)_","_$get(ReceiveQty)_","_$get(ReceiveCost)_","_$get(strRef)_","_pblnAdjust_","_pblnUpdate)
+	
+	quit:$get(Item)="" 0
+	set objItem = $get(^INART(YM,Item,1))					; SR14529
+	quit:$$$INARTItemWithoutInventoryMaint(objItem) 0
+	;---------------------------------------
+	
+	; Available Stock On Hand before receipt
+	;set AvailQty = $$^INARTMENGE(Item,,,,$$$enumAverageCost)                       ; SR15312
+	
+	//SR16888
+	//set AvailQty = $$QtyForAvgCost^INARTMENGE(Item,"")
+	set AvailQty = $$QtyForAvgCost^INARTMENGE(Item,pidLocn)
+ 
+	//SR16888: Always get the Average Cost
+	//set OldCost  = +$$$INARTAverageCost($get(^INART(YM,Item,1)))       ;average cost before receipt  D140
+	//if OldCost=0 set OldCost = $$^INARTKOST(Item,,$$$enumAverageCost)  ;current AVERAGE cost for item
+	set OldCost = $$GetCost^INARTCOST(Item,$$$enumAverageCost)     ; current AVERAGE cost for item
+	;if +$get(ReceiveCost)=0 set ReceiveCost=OldCost               ;no new cost information = use old cost ;SR15186
+	;---------------------------------------
+	
+	$$$LogRx("Avg1:"_AvailQty_"<"_OldCost)
+	
+	if pblnAdjust {
+		set ReceiveQty = 0
+		set NewCost = ReceiveCost
+	
+	} else {
+		set SumQty = AvailQty + ReceiveQty
+ 
+		if SumQty=0 {
+			set NewCost = OldCost
+		
+		} else {
+			if AvailQty < 0 {
+				if SumQty > 0 {
+					set NewCost = ReceiveCost
+				} else {
+				;	set pblnUpdate = $$$NO ; There is no change to Average Cost, and do not create an INARTAVG entry
+					set NewCost = OldCost  ; There is no change to Average Cost, but create an INARTAVG entry
+				}
+			
+			} elseif ReceiveQty < 0 {      ; SR15317  (Pending)
+			;	set NewCost = OldCost  ; SR16928
+				set NewCost=$justify(((AvailQty*OldCost)+(ReceiveQty*ReceiveCost))/SumQty,0,$$DPforInventoryCost^INVORG())
+			
+			} else {
+				set NewCost=$justify(((AvailQty*OldCost)+(ReceiveQty*ReceiveCost))/SumQty,0,$$DPforInventoryCost^INVORG())  ;calculate new average cost ;BR014969
+			}
+			if NewCost=0 if OldCost'=0 set NewCost=OldCost      ;do not overwrite existing cost with 0
+			
+		}
+	}
+	
+	$$$LogRx("Avg2:"_NewCost)
+	
+	if pblnUpdate {
+		do Save(Item,NewCost)  ;save average cost in item master
+		
+		;SAVE AVERAGE FILE FOR LATER CALCULATION
+		new YFORM,YVOR,YOK,Date,Time,objAvg   ; FIXME : This new location applies to dot level - operation is different under brace format <GRF>
+		
+		set objAvg = AvailQty_Y_ReceiveQty_Y_OldCost_Y_ReceiveCost_Y_NewCost_Y_Y_Y_Y_Y
+		
+		if $get(strRef)'="" {
+			if pblnAdjust {
+				set $$$INARTAVGAdjustmentReference(objAvg) = strRef		; D9
+				
+			} else {   //reference between receipt file and average calculation file
+				set $$$INARTAVGIncomingGoodsReference(objAvg) = $translate($get(strRef),",","-")  ;save with - instead, because of existing routines
+	; SR16361 vvv
+	;			if $$$KEY1(strRef)'=0 set $piece(^INWEAUF(YM,$$$KEY1(strRef),$$$KEY2(strRef),$$$KEY3(strRef),$$$KEY4(strRef),$$$KEY5(strRef),1),Y,41) = AvailQty  ;Save SOH at time of receipt
+	;			if $$$KEY1(strRef)'=0 set $piece(^INWEAUF(YM,$$$KEY1(strRef),$$$KEY2(strRef),$$$KEY3(strRef),$$$KEY4(strRef),$$$KEY5(strRef),1),Y,42) = OldCost   ;save AverageCost at time of receipt
+			}
+		}
+		
+		set Date = +$horolog
+		set Time = $piece($horolog,",",2)
+		if $data(^INARTAVG(YM,Item,Date,Time)) {
+			for  {
+				quit:'$data(^INARTAVG(YM,Item,Date,Time))
+				set Time = Time+1  ;if multiple receipts move to next second (may go past midnight) FIXME
+			}
+		}
+	$$$LogRx(">"_Item_","_Date_","_Time_"<>"_objAvg_"<")
+		set YOK = $$^WWWSPEI("INARTAVG",Item_","_Date_","_Time,objAvg,1)
+	}
+	
+	$$$LogRx(NewCost)
+	
+	quit NewCost
+	
+	
+GetCostAsAtDateSQL(YM,pidItem,pdteDate="")
+	;-------------------------------------------------------------------------------
+	; Class INART : Calculated Field : AverageCostCALC
+	;-------------------------------------------------------------------------------
+	quit $$GetCostAsAtDate(pidItem,pdteDate)
+	
+	
+GetCostAsAtDate(pidItem,pdteDate)                                       ; DEPRECATED
+	;-------------------------------------------------------------------------------
+	; Get the average cost for an item, as at a date.
+	;
+	; Params: pidItem		: The item number
+	;		  pdteDate		: The date to retrieve for
+	;
+	; ByRefs:
+	;
+	; Returns: curCost (the average cost)
+	;
+	; History:
+	; 30-Oct-2009	GRF		SR16871: DEPRECATED - Use GetCostForLocn^INAvgCost
+	; 28-Sep-2006	Steve S	SR14952: Created
+	;-------------------------------------------------------------------------------
+	new curCost,dteLast,objINARTAVG,tmeLast
+ 
+	set:$get(YM)="" YM=0
+	set curCost=0
+	
+	if $get(pidItem)="" quit ""
+	
+	if $get(pdteDate)="" set pdteDate=+$horolog
+	set dteLast = pdteDate+1
+	set dteLast = $order(^INARTAVG(YM,pidItem,dteLast),-1)
+	if dteLast'="" {
+		set tmeLast = $order(^INARTAVG(YM,pidItem,dteLast,""),-1)
+		if tmeLast'="" {
+			set objINARTAVG = $get(^INARTAVG(YM,pidItem,dteLast,tmeLast,1))
+			set curCost = $$$INARTAVGNewAverageCost(objINARTAVG)
+		}
+	}
+ 
+	quit curCost
+	
+	
+GetCostAsAtDateAndTime(pidItem="",pdteDate="",ptmeTime="")              ; DEPRECATED
+	;-------------------------------------------------------------------------------
+	; Extension of routine GetCostAsAtDate to allow specification of time
+	; (Rewrite of some VARSES code)
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Oct-2009	GRF		SR16871: DEPRECATED - Use GetCostAtTimeForLocn^INAvgCost
+	; 28-Sep-2009	PPP		SR16878/SR16904 : If no time specified, get the Last
+	;							INARTAVG for a date
+	; 20-May-2008	shobby	Created
+	;-------------------------------------------------------------------------------
+	new curCost,objINARTAVG,strGlobal
+	
+	quit:pidItem="" ""
+	set:$get(YM)="" YM=0
+ 
+	if pdteDate="" set pdteDate = $horolog
+	
+	//if ptmeTime="" set ptmeTime = $piece($horolog,",",2)
+	//To overcome the problem defined below SR16878/SR16904 (if no time get the last INARTAVG)
+	if ptmeTime="" quit $$GetCostAsAtDate(pidItem,pdteDate)
+	
+	; FIXME : If 3+ lines for same item are processed in same second then the first
+	;         will use the prior INARTAVG entry to build a new entry under "else"
+	;         for pdteDate,ptmeTime.
+	;         The second will find the first's entry under "if" and will use it to
+	;         generate an entry under pdteDate,ptmeTime+1.
+	;         The third (or +) will also find the first's entry under "if" and will use it
+	;         instead of the second's to generate an entry under pdteDate,ptmeTime+2, etc.
+	;         
+	;         Unable to see where problem in SR16904 occurs with just 2 lines being
+	;         received.  INVESTIGATE  <GRF>
+	
+	set curCost = 0
+	if $data(^INARTAVG(YM,pidItem,pdteDate,ptmeTime,1)) {  ; NOTE : getting cost BEFORE the date/time if found.
+		set curCost   = $$$INARTAVGCurrentAverageCost($get(^INARTAVG(YM,pidItem,pdteDate,ptmeTime,1)))
+		
+	} else {
+		set strGlobal = "^INARTAVG(YM,"""_pidItem_""","_pdteDate_","_ptmeTime_")"
+		
+		set objINARTAVG = $query(@strGlobal,-1)
+		if (objINARTAVG="")||($qsubscript(objINARTAVG,2)'=pidItem) {
+			set objINARTAVG = $query(@strGlobal)
+			if (objINARTAVG'="") && ($qsubscript(objINARTAVG,2)=pidItem) {
+				set curCost=$$$INARTAVGCurrentAverageCost(@objINARTAVG)      ; returns cost BEFORE first entry for item even if after date/time
+			
+			} else { ; no INARTAVG for item - get from Item Master Data
+				set curCost = $$$INARTAverageCost($get(^INART(YM,pidItem,1)))
+			}
+			
+		} else {     ; entry for item prior to date/time
+			set curCost = $$$INARTAVGNewAverageCost(@objINARTAVG)
+		}
+	}
+	quit curCost
+	
+		
+Save(pItem,pCost) 
+    /*------------------------------------------------------------------------------
+    ; Save the average cost to INART record
+    ;
+    ; History:
+    ; 14-Jan-2009	shobby	SR17097: Reverted previous change.
+    ; 06-Jan-2009	shobby	SR17097: Don't worry about validation here.
+    ; 27-Jan-2006	GRF		SR14203: Use macro
+    ; 06-Nov-2005	JW		SR12920: Commented
+    ;-----------------------------------------------------------------------------*/
+	new objItem,YFORM,YVOR,YOK
+	
+	quit:$get(pItem)=""
+	
+	set objItem = $get(^INART(YM,pItem,1))
+	set $$$INARTAverageCost(objItem) = $get(pCost)       ; D140
+	
+	// TODO: Use a SPEI wrapper ?
+	
+	set YOK=$$^WWWSPEI("INART",pItem,objItem,1)
+	quit
+	
+	
+Revise(pSource,pRef,pItem,pDate,pTime)                                  ; DEPRECATED
+	/*------------------------------------------------------------------------------
+	; Average Cost Recalculation
+	; 
+	; The Average Cost record has already been updated with the revised details
+	; (usually the Received Unit Cost.)  This subroutine recalculates what the
+	; Weighted Average Cost would have been and then works forward to re-adjust any
+	; later entries.
+	; 
+	; Params:
+	;	pSource			Transaction Type generating AutoUpdate e.g. "INWEFREI"
+	;					 - allows trace if necessary
+	;	pRef			Reference String to identify source transaction
+	;	pItem			Item Number
+	;	pDate			Current Cost Change - Date
+	;	pTime			                    - Time
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 30-Oct-2009	GRF		SR16871: DEPRECATED - Use ReviseHistory^INAvgCost
+	; 
+	; 22-Sep-2008	shobby	SRBR014969: Decimal places is as defined in INVORG
+	; 28-Apr-2006	GRF		SR12667: Single calculation of AvailQty + ReceiveQty;
+	;						apply corrected calculation (prev only used above)
+	; 10-Apr-2006	GRF		SR14529: FIX Item/pItem
+	; 06-Apr-2006	GRF		SR14529: Don't process Non-stock items
+	; 03-Apr-2006	GRF		Added TODO
+	; 28-Mar-2006	PO		SR12667: Calculation for AVG Cost when Available Qty is below zero
+	; 02-Feb-2006	GRF		SR14203: Reuse Save
+	; 01-Feb-2006	GRF		SR14203: Extracted from INERECH1 & INSHIPINFOCOSTS & adapted
+	;-----------------------------------------------------------------------------*/
+	new AvailQty,AvgCost,Date,objAverage,objItem,OldCost
+	new ReceiveCost,ReceiveQty,Time,TotalQty,Value1,Value2,YFORM,YOK,YVOR,intDecimalPoints
+	
+	$$$LogR("Revise",$get(pItem)_","_$get(pDate)_","_$get(pTime)_","_$get(pSource)_","_$get(pRef))
+	
+	set objItem = $get(^INART(YM,pItem,1))
+	quit:$$$INARTItemWithoutInventoryMaint(objItem)
+	/*++++++++++++++++++++++++++++++
+	; Find last ^INARTAVG entry matching current change (pDate/pTime) or with Qty on Hand of zero
+	; SUCHEN START FÜR NEUBERECHNUNG (WENN BESTAND=0 ODER AB AKTUELLER ÄNDERUNG)
+	;+++++++++++++++++++++++++++++++*/
+	set AvgCost = 0
+	set Date   = ""
+	for {
+		set Date=$order(^INARTAVG(YM,pItem,Date),-1)
+		quit:Date=""
+		
+		set Time=""
+		for {
+			set Time=$order(^INARTAVG(YM,pItem,Date,Time),-1)
+			quit:Time=""
+			quit:(Date=pDate)&&(Time=pTime)
+			quit:$piece($get(^INARTAVG(YM,pItem,Date,Time,1)),Y,1)=0 
+		}
+		quit:Time'=""
+	}
+	
+	/*++++++++++++++++++++++++++++++
+	; If an entry was found, go back so we can come forward again.
+	;+++++++++++++++++++++++++++++++*/
+	if (Date'="") && (Time'="") {
+		if $order(^INARTAVG(YM,pItem,Date,Time),-1)'="" {
+			set Time=$order(^INARTAVG(YM,pItem,Date,Time),-1)
+			set Date=Date-1
+		} else {
+			set Date=$order(^INARTAVG(YM,pItem,Date),-1)
+			if Date="" {
+				set Time=""
+			} else {
+				set Time=$order(^INARTAVG(YM,pItem,Date,Time),-1)
+			}
+		}
+	}
+	
+	/*--------------------------------------
+	;
+	;  TODO : Need to consider situation where one of the subsequent entries is
+	;         a manual cost adjustment (D9'=""), should stop carrying
+	;         revision forward at this point.
+	;         
+	;         Also need to consider what happens to SOH/COGS split of difference.
+	;         
+	;         If received 200 items and current QOH is >= 200 then all of
+	;         difference goes to SOH.  If QOH is <200 then QOH/200*Difference
+	;         goes to SOH and balance goes to COGS.  Similar complication if
+	;         item is a component in BOM for another item.
+	;         
+	;  TODO : Should Invoice difference be recorded as new entry (Cost Change?)
+	;         rather than the original and any subsequent entries being
+	;         recalculated?  Original "best average cost information" has been
+	;         used at the time of any transactions and we now lose the audit
+	;         record.  At best should probably keep the original and add a new
+	;         record for the following second - with the timestamp for the actual
+	;         update so intervening transactions can be recognised.
+	;
+	;-------------------------------------*/ ; <GRF>
+	
+	/*++++++++++++++++++++++++++++++
+	; Come forward again.
+	; Save changed Average Cost from previous calculation.
+	; Recalculate subsequent Average Costs.
+	;+++++++++++++++++++++++++++++++*/
+	set intDecimalPoints=$$DPforInventoryCost^INVORG() ;BR014969
+	for {
+		set Date=$order(^INARTAVG(YM,pItem,Date))
+		quit:Date=""
+		
+		for {
+			set Time=$order(^INARTAVG(YM,pItem,Date,Time))
+			quit:Time=""
+			
+			set objAverage=$get(^INARTAVG(YM,pItem,Date,Time,1))
+			
+			if +AvgCost'=0 {
+				set $$$INARTAVGCurrentAverageCost(objAverage)=AvgCost		; D3
+				set $$$INARTAVGCurrentAverageCost(^INARTAVG(YM,pItem,Date,Time,1))=AvgCost
+			}
+				
+			set AvailQty    = $$$INARTAVGQuantityOnHand(objAverage)
+			set ReceiveQty  = $$$INARTAVGIncomingGoodsQuantity(objAverage)
+			set OldCost     = $$$INARTAVGCurrentAverageCost(objAverage)
+			set ReceiveCost = $$$INARTAVGIncomingGoodsCost(objAverage)
+			
+			set TotalQty = AvailQty + ReceiveQty
+			
+			if TotalQty=0 {
+				set AvgCost = OldCost
+			} else {
+				if AvailQty < 0 {
+					
+					if TotalQty > 0 {
+						set AvgCost = ReceiveCost
+					} else {
+						set AvgCost  = OldCost
+					}
+				} else {
+					set Value1   = AvailQty   * OldCost
+					set Value2   = ReceiveQty * ReceiveCost
+					set AvgCost  = $justify((Value1+Value2)/TotalQty,0,intDecimalPoints) ;BR014969
+				}
+				
+			}
+			
+			if AvgCost=0 if OldCost'=0 set AvgCost=OldCost      ;do not overwrite existing cost with 0
+			set $$$INARTAVGNewAverageCost(^INARTAVG(YM,pItem,Date,Time,1)) = AvgCost
+		}
+	}
+	
+	/*++++++++++++++++++++++++++++++
+	; Record new average cost in Item master data.
+	; Update Average Costs in Ledger.
+	;+++++++++++++++++++++++++++++++*/
+	if AvgCost {
+		do Save(pItem,AvgCost)
+		set YOK = $$AutoUpdate^INStockValAdjust(pSource,pRef,pItem,AvgCost)
+	}
+	quit
+
+
+
+	/*------------------------------------------------------------------------------
+    ; GENERAL DOCO
+    ; 
+    ; Average Cost Calculation :
+    ; ------------------------
+    ; Update occurs when;
+    ;   1)  Stock received from supplier
+    ;   2)  Stock manufactured
+    ;   3)  Cost adjustment entered
+    ;   
+    ;				Quantity		Item Value		Total Value
+    ; Current		  160			  $20.00		  $3200.00  (160*20)
+    ; Adding		   40			  $24.00		  $ 960.00  ( 40*24)
+    ;				--------						-----------
+    ; New Totals	  200							  $4160.00
+    ; New Average					  $20.80					(4160/200)
+    ; 
+    ; Exception Situations
+    ; --------------------
+    ; If Current Quantity has gone negative for some reason;
+    ;
+    ;   a)  Adding insufficient to make the new quantity positive.
+    ; 
+    ; Average Cost stays as it is, ie. New Average Cost is set to Current Average Cost.
+    ; 
+    ;   b)  Adding only sufficient to make the new quantity zero.
+    ; 
+    ; Average Cost stays as it is, ie. New Average Cost is set to Current Average Cost.
+    ; 
+    ;   c)  Adding sufficient to make the new quantity positive.
+    ; 
+    ; The Cost of the Items being adding becomes the new Average Cost.
+    ;
+    ;				Quantity		Item Value		Total Value
+    ; Current		  -80			  $15.00
+    ; Adding		  100			  $18.00
+	; New Average					  $18.00
+    ;
+    ; *** FOLLOWING NOT CORRECT ***
+    ; 
+    ; Only the Quantity above zero (ie. Current Qty + Adding Qty) is used at Adding Cost to alter Average Cost.
+    ; 
+    ;				Quantity		Item Value		Total Value
+    ; Current		  -80			  $15.00
+    ; Adding		  100			  $18.00
+    ;				--------
+    ; - Current		   80
+    ; New Quantity	   20
+    ; Where Qty '> 0								  $1200.00	(80*15) ~ (- Current Quantity * Current Item Value)
+    ; Where Qty > 0									  $ 360.00	(20*18) ~ (New Quantity * Adding Item Value)
+    ;				--------						-----------
+    ; Totals		  100							  $1560.00
+    ; New Average					  $15.60					(1560/100)
+    ;-----------------------------------------------------------------------------*/
+
+
+	
+]]></Routine>
+</Export>

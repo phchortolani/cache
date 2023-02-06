@@ -1,0 +1,609 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FININTInvoice" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FININTInvoice ; Supplier Orders & Invoices
+	
+#include COMSYS
+#include FINConst
+	
+	;*******************************************************************************
+	; During Goods Receive (REC Matrix)
+	; ---------------------------------
+	; 	Goods						100
+	; 	EXPECTED Service Charges	 25
+	; 		dr	Inventory (QA?) 						125				(LineSOHAmount)
+	; 		cr		Goods Received Not Invoiced					100		(LineReceivedAmount)
+	; 		cr		Goods Received Not Invoiced					 25		(Sum : ServiceCost/Amount)
+	; 		
+	; During Sup Invoice (REC Matrix for GRNI *ONLY* - others not processed by Account ID Matrix)
+	; -------------------------------------------------------------------------------------------
+	; 	Goods
+	; 		dr	Goods Received Not Invoiced				100
+	; 		dr/cr Variance								 20
+	; 		dr	Tax Expense								 12
+	; 		cr		Supplier (Control Account)					122
+	; Supplier Invoice for Service Charges
+	; ------------------------------------
+	; Processed as separate lines with  and
+	; the sign reversed on the EXPECTED Service Charges so both can be
+	; processed through the same subroutine.
+	; Setting the flag pblnInv = $$$YES causes the Inventory posting (*) to be added 
+	; 
+	; 	EXPECTED Service Charges
+	; 		dr	Goods Received Not Invoiced				 25				ServiceCost/Amount 1
+	; 		cr		Inventory						(*)			 25		ServiceCost/Amount 1
+	; 	ACTUAL Service Charges
+	; 		dr	Inventory							(*)	 30				ServiceCost/Amount 2
+	; 		cr		Goods Received Not Invoiced					 30		ServiceCost/Amount 2
+	; 	ACTUAL Service Charges
+	; 		dr	Goods Received Not Invoiced				 30				"INCOST"
+	; 		dr	Tax Expense								  3				"TAX"
+	; 		cr		Supplier (Control Account)					 33		"APC"
+	;  
+	;  TODO : If stock has already been sold (all or part) should Service Charges
+	;         changes go to COGS?
+	;*******************************************************************************
+	;
+	; History:
+	; 20-May-2005	GRF		SR10478 : Account ID Matrix being used inappropriately;
+	; 						Some truncation of variable names to allow better
+	; 						readability or to clarify use.
+	; 
+	; FIXME : ??? Calls to TranslateFromGlobal^FININTMatrix probably should use
+	; 			  'Invoice' rather than '.Invoice'	<GRF>
+	; TODO  : Convert direct extraction of data to use $$GetValue^FINSYSDCM.
+	;-------------------------------------------------------------------------------
+	
+addSupInvoice(Invoice)
+	;-------------------------------------------------------------------------------
+	; Called From : DCM - INSupInvoicePost
+	; 
+	; Returns:
+	;
+	; History:
+	; 06-Apr-2004	Shobby	If the settlement discount from BackOffice is 0 (or 0%)
+	; 						set it to be a blank string.  A blank string will be
+	; 						interpreted as 'Get the default terms'.
+	; 						Only do this when coming from Back Office, in Finance 0
+	; 						may be a valid entered amount.  (TR007291)
+	;-------------------------------------------------------------------------------
+	new status,strDiscount
+	set $ztrap="addError"
+	
+	do GetValue^FINSYSDCM("SettlementDiscount",.strDiscount,"@Invoice@(")
+	if +strDiscount=0 {
+		set @Invoice@("SettlementDiscount")=""
+	}
+	
+	set status=$$Post(Invoice)
+	quit status
+	
+addError
+	quit "0~Error in Post "_$ze	
+	
+	
+Post(Invoice)
+	;-------------------------------------------------------------------------------
+	; Post Supplier Invoice
+	;
+	; History:
+	; 15-May-2006	JW		SR14615: Added source details
+	; 20-May-2005	GRF		SR10478: Don't call Cost Matrix for Tax Accounts but
+	; 						still need to perform Ledger Profile conversion.
+	; 04-May-2005	shobby	SR10957: Corrected the calculation of tax amounts.
+	; 02-May-2005	RobertW	SR10958: The tax amount should NOT be posted to the
+	; 						Service Cost.
+	; 22-Apr-2005	RobertW	SR12101: Added calls to generate the total supplier
+	; 						invoice amount against the supplier and the GRNYI
+	; 						accounts. We now get accounts and then pass them through
+	; 						CMS.
+	; 11-Apr-2005	GRF		GetValue list
+	; 28-Jan-2005	GRF		Spelling correction - only relevant here; apply TLEVEL
+	; 						test to TCOMMIT instead of TROLLBACK (SR11273)
+	; 11-Nov-2004	Paul K	Add suppliers invoice number to the Details area.
+	; 11-Nov-2004	Paul K	Return the batch and block number if successful.
+	; 11-Jun-2004	shobby	Invoice date required as a Param for APC.
+	; 11-Jun-2004	shobby	Remove Number from the reference for type APC
+	; 17-Jul-2003	SCR		Updated Control Account processing
+	; 15-Jul-2003	SCR		Changed Processing
+	; 07-Jul-2003	SCR		Changed Interface type to "APINV"
+	; 02-Jul-2003	SCR		Bug Fixes
+	;-------------------------------------------------------------------------------
+	
+	;-------------------------------------------------------------------------------
+	; Header Info
+	;   Invoice("Date")
+	;   Invoice("InvoiceNumber")
+	;   Invoice("SupplierInvoiceNumber")
+	;   Invoice("Location")
+	;   Invoice("SourceLocn")
+	;   Invoice("ControlAccount")
+	;   Invoice("Supplier")
+	
+	;   Invoice("SettlementDiscount")
+	;   Invoice("DueDate")
+	
+	;   Invoice("Taxes",TaxCode,"Account")	
+	;   Invoice("Taxes",TaxCode,"Amount")	
+	
+	; Line Account Info 
+	;   Invoice("Lines",1,"AccSOH")
+	;   Invoice("Lines",1,"AccNonSOH")
+	;   Invoice("Lines",1,"Cost")
+	
+	;   Invoice("Lines",1,"Taxes",TaxCode,"Account")
+	;   Invoice("Lines",1,"Taxes",TaxCode,"Amount")
+	
+	; Line Param Info (optional)
+	;   Invoice("Lines",1,"NonStock")
+	;   Invoice("Lines",1,"Parameter")
+	;   Invoice("Lines",1,"LineRef")
+	;   
+	; Line Service Cost - for subsequent Invoicing of Service Costs
+	;   Invoice("Lines",LineNo,"ServiceCost",SCNo,"Account")
+	;   Invoice("Lines",LineNo,"ServiceCost",SCNo,"Amount")
+	;   Invoice("Lines",LineNo,"ServiceCost",SCNo,"Type")
+	;-------------------------------------------------------------------------------
+	new Account,arrCSTKey,Batch,BlockNo,CSTVals,DueDate,Discount
+	new InvDate,InvLineNo,InvNo,LineRef,Location,Order,Param,Prefix,SourceLocn
+	new Status,SupInvNo,Supplier,SupTotal,TaxAccount,TaxAmount,TaxCode,TaxTotal
+	new TranType,strSupplier,strDetail,strKey
+	
+	set $zt="PostError"
+	;***************************************
+	tstart
+	;***************************************
+	
+	set Status	 = $$$OK
+	set SupTotal = 0
+	set Prefix	 = "@Invoice@("
+	
+	set Batch   =""
+	set BlockNo =""
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("SupplierInvoiceNumber",.SupInvNo,  Prefix)
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("InvoiceNumber",        .InvNo,     Prefix,1)
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("Supplier",             .Supplier,  Prefix,1)
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("ControlAccount",       .Account,   Prefix)   ; Not being set
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("Date",                 .InvDate,   Prefix,1)
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("SettlementDiscount",   .Discount,  Prefix)
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("DueDate",              .DueDate,   Prefix)
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("Location",             .Location,  Prefix)
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("SourceLocn",           .SourceLocn,Prefix,1)
+ 
+	if $$$ISOK(Status)&&(Account="") {
+		set Account=$$GetControlAccount^FINAPSupplier(Supplier)
+		if Account="" {
+			set Status=$listbuild("Fin00198",Supplier)  ; Control Required for Supplier ´%1´
+		}
+	}
+	
+	if $$$ISOK(Status) {
+		/*	TODO JW - reverted for build
+		set strKey 		= Supplier_","_InvNo_","_InvDate	//SR14615: Add source details
+		set Status=$$Allocate^FININTBatch(.Batch,.BlockNo,"APINV",Location,InvDate,,,,"INERECH",strKey)
+		*/
+		set Status=$$Allocate^FININTBatch(.Batch,.BlockNo,"APINV",Location,InvDate)
+	}
+	
+	
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	; AddLine generates entries for each invoice line in turn :
+	;    Line Taxes									"TAX"
+	;    Variance between Order And Invoice			"SOH"
+	;    Service Costs (1) - Expected (2) + Actual	"INCOST" (GRNI)
+	;    											"SOH"
+	; then add
+	; Invoice Taxes									"TAX"
+	; Supplier										"APC"
+	; Goods Received Not Invoiced					"INCOST"  (APC-TAX)
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+	if $$$ISOK(Status) {
+		set InvLineNo=""
+		for {
+			set InvLineNo=$order(@Invoice@("Lines",InvLineNo))
+			quit:InvLineNo=""
+			
+			set Status=$$AddLine(Invoice,Batch,BlockNo,InvLineNo,Supplier,InvNo,.SupTotal,Account,SourceLocn)
+			quit:Status'=$$$OK
+		}
+	}
+	
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ Invoice Taxes
+	
+	set TaxTotal=0
+	if $$$ISOK(Status) {
+		kill TaxCode
+		set TaxCode=""
+		for {
+			set TaxCode=$order(@Invoice@("Taxes",TaxCode))
+			quit:TaxCode=""
+			
+			set TaxAccount = @Invoice@("Taxes",TaxCode,"Account")
+			set TaxAmount  = @Invoice@("Taxes",TaxCode,"Amount")
+		;	set TaxTotal   = TaxTotal+TaxAmount 'SR10957
+			set TaxTotal   = $$$FCAdd(TaxTotal,TaxAmount)
+			
+		;	Can't have {Category} for taxes if no pro-rata distribution across items
+		;	may have {Location} - TODO : Revise SALConvert^FINGLProfileConv to handle no SourceGroup
+		;	; Perform Ledger Profile Translations
+		;	set Profile=TaxAccount
+		;	if Profile["{" {
+		;		set Status=$$SALConvert^FINGLProfileConv(.Profile,SourceLocn,SourceGroup)
+		;		if $$$ISOK(Status) set TaxAccount=Profile
+		;	}
+			set Status=$$AddTax(Batch,BlockNo,Supplier,InvNo,TaxCode,TaxAccount,TaxAmount,0,.SupTotal)
+			quit:Status'=$$$OK
+		}
+	}
+	
+	; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+	if $$$ISOK(Status) {
+		set Param=Supplier_","_InvNo_","_DueDate_","_Discount_","_InvDate_","_","_SupInvNo
+		
+		; Post for supplier
+		; -----------------
+		; SR12101
+		if $$$ISOK(Status) set Status=$$AddLine^FININTBatch(Batch,BlockNo,Account,$$$FCSign(SupTotal),"APC",Param,InvNo,Supplier)
+		
+		; Post to GRNI Acct
+		; -----------------
+		if $$$ISOK(Status) set Status=$$TranslateFromGlobal^FININTMatrix(.Invoice,"","REC",.arrCSTKey,.CSTVals,"",.Account)
+		if $$$ISOK(Status) set Status=$$AddLine^FININTBatch(Batch,BlockNo,Account,$$$FCSub(SupTotal,TaxTotal),"INCOST",Param,InvNo,Supplier,,,,$get(arrCSTKey(2)),CSTVals) ;SR10957
+		; SR10958: The tax amount should NOT be posted to the Service Cost, so we need to subtract it.
+		;if $$$ISOK(Status) set Status=$$AddLine^FININTBatch(Batch,BlockNo,Account,$$$FCSub(SupTotal,TaxAmount),"INCOST",Param,InvNo,Supplier,,,,$get(arrCSTKey(2)),CSTVals)
+	}
+	
+	
+	if $$$ISOK(Status) {
+		/*	TODO JW - reverted for build
+		set strSupplier	= Supplier_" "_$$$FINAPSupplierSupplierName($get(^FINAPSupplier(YM,Supplier,1)))		//SR14615
+		set strDetail	= "Fin00929,"_$translate(strSupplier,","," ")_","_InvNo_","_$$$FCGetAmountText(SupTotal)  ;Supplier Invoice %1, Number %2, Amount %3
+		set Status=$$PostBlock^FININTBatch(Batch,BlockNo,strDetail)
+		*/
+		set Status=$$PostBlock^FININTBatch(Batch,BlockNo)
+	}
+	
+	
+	;***************************************
+	if $$$ISOK(Status) {
+		if $tlevel>0 tcommit
+		set Status=$$$OK_Y_Batch_","_BlockNo
+	} else {
+		trollback
+		set Status=$$$NO_Y_$$$Text(Status)
+	}
+	;***************************************
+	
+	quit Status
+	
+PostError  ;Internal Tag
+	new strError
+	set strError = $zerror
+	
+	trollback
+	quit "0~Error in Post "_strError
+	
+AddLine(Invoice,Batch,BlockNo,InvLineNo,Supplier,InvNo,SupTotal,ControlAccount,pSourceLocn)
+	;-------------------------------------------------------------------------------
+	; Adds records for a particular supplier invoice line
+	;
+	; Returns:Status
+	;
+	; History:
+	; 20-May-2005	GRF		SR10478 : Don't call Cost Matrix for Tax Accounts but
+	; 						still need to perform Ledger Profile conversion; add
+	; 						pSourceLocn
+	; 22-Apr-2005	RobertW	SR12101: Modified to get the correct accounts via CMS,
+	;						we also now correctly handle the service costs and
+	;						generated transactions
+	; 15-Nov-2004	JW		SR10775: Added interface batch type INCOST for import costs.
+	; 22-Sep-2004	Paul K	Variance Account overriding main account, use different
+	; 						variable (change from PP)
+	; 13-Sep-2004	shobby	Foreign Currency Upgrade
+	; 24-May-2004	SCR		Foreign Currency Upgrade
+	; 18-Mar-2004	SCR		Tax Changes
+	; 15-Jul-2003	SCR		Changed Posting
+	; 02-Jul-2003	SCR		Bug Fixes
+	;-------------------------------------------------------------------------------
+	new Account,Amount,arrCSTKey,CSTVals,intType,LineRef,Order
+	new Parameter,Prefix,Profile,SourceGroup,Status
+	new TaxAccount,TaxAmount,TaxCode,TaxTotal,VarAccount,Variance
+	
+	; Posting SOH/Non SOH
+	set Status=$$$OK
+	
+	;set Prefix="@Invoice@("
+	set Account   =      @Invoice@("Lines",InvLineNo,"LineReceivedAccount")
+	set LineRef   = $get(@Invoice@("Lines",InvLineNo,"RefLine"))
+	set Parameter = $get(@Invoice@("Lines",InvLineNo,"Parameter"))
+	set Amount    =      @Invoice@("Lines",InvLineNo,"LineReceivedAmount")
+	
+	set Prefix="@Invoice@(""Lines"",InvLineNo,"
+	;if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("SourceGroup",.SourceGroup,Prefix,1)
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("Order",      .Order,      Prefix,1) ;SR12101
+	
+	if $get(@Invoice@("Lines",InvLineNo,"NonStock"))=$$$YES {			;if non-stock post to non-stock instead
+		set Account =    @Invoice@("Lines",InvLineNo,"AccNonSOH")
+	}	
+	
+	if $$$ISOK(Status) {
+		set TaxTotal=0
+		set TaxCode =""
+		for {
+			set TaxCode=$order(@Invoice@("Lines",InvLineNo,"Taxes",TaxCode))
+			quit:TaxCode=""
+			
+			set TaxAccount = @Invoice@("Lines",InvLineNo,"Taxes",TaxCode,"Account")
+			set TaxAmount  = @Invoice@("Lines",InvLineNo,"Taxes",TaxCode,"Amount")
+			
+		;	Can't have {Category} for taxes if no pro-rata distribution across items
+		;	may have {Location} - TODO : Revise SALConvert^FINGLProfileConv to handle no SourceGroup <GRF>
+		;	; Perform Ledger Profile Translations
+		;	set Profile=TaxAccount
+		;	if Profile["{" {
+		;		set Status=$$SALConvert^FINGLProfileConv(.Profile,pSourceLocn,SourceGroup)
+		;		if $$$ISOK(Status) set TaxAccount=Profile
+		;	}
+			if $$$ISOK(Status) set Status=$$AddTax(Batch,BlockNo,Supplier,InvNo,TaxCode,TaxAccount,TaxAmount,1,.SupTotal)
+			set TaxTotal=$$$FCAdd(TaxTotal,TaxAmount)
+			quit:Status'=$$$OK
+		}
+	}
+	
+	if $$$ISOK(Status) {
+		; Post Difference from the Order Amount (TI) and the Invoice Amount (TE+Tax)
+		set Variance=$$$FCSub($get(@Invoice@("Lines",InvLineNo,"Cost")),($$$FCAdd(Amount,TaxTotal)))
+		if Variance {
+			set VarAccount=@Invoice@("Lines",InvLineNo,"AccSOH")
+		; FIXME : First account for "REC" Matrix refers to SOH Acct
+		;          - this code is only suitable if Variance is to go to SOH Acct	<GRF>
+		;          Will all Char Values be set?
+			if $$$ISOK(Status) set Status=$$TranslateFromGlobal^FININTMatrix(.Invoice,InvLineNo,"REC",.arrCSTKey,.CSTVals,.VarAccount,"")
+			set Status=$$AddLine^FININTBatch(Batch,BlockNo,VarAccount,Variance,"SOH",Parameter,InvNo,LineRef,,,,$get(arrCSTKey(1)),CSTVals)
+		}
+		;set SupTotal=SupTotal+Amount+Variance+TaxTotal
+	
+		set SupTotal=$$$FCAdd(SupTotal,Amount)
+		set SupTotal=$$$FCAdd(SupTotal,Variance)
+		set SupTotal=$$$FCAdd(SupTotal,TaxTotal)
+	}
+	if $$$ISOK(Status) {
+		;SR12101: Get the service costs for this line and add them and their reversal to the batch
+		set intType = "INCOST"		; SR10775
+		if $data(@Invoice@("Lines",InvLineNo,"ImportCost")) set intType = "INCOST"
+		if $data(@Invoice@("Lines","ImportCost"))           set intType = "INCOST" ;SR12101 All lines may be for Service Cost.
+		
+		
+		if $$$ISOK(Status) set Status=$$ServiceCostsFromGlobal(.Invoice,InvLineNo,"REC",.arrCSTKey,Batch,BlockNo,LineRef,Order,Supplier_","_Order,$get(arrCSTKey(1)),,$$$YES)
+	;	.Invoice,InvLineNo,"REC",.arrCSTKey,Batch,
+	;	BlockNo,LineRef,Order,Supplier_","_Order,$get(arrCSTKey(1)),
+	;	,$$$YES
+	}
+	
+	quit Status
+	
+AddTax(Batch,BlockNo,Supplier,InvNo,TaxCode,TaxAccount,TaxAmount,Line,SupTotal)
+	;-------------------------------------------------------------------------------
+	; post tax on line or tax on total of invoice
+	; 
+	; ByRef : SupTotal
+	; 
+	; History:
+	; 16-Nov-2004	JW		SR10491: Lines now tax exclusive, so add tax lines to total.
+	; 18-Mar-2004	SCR		Tax Changes
+	; 02-Jul-2003	SCR		Bug Fixes
+	;-------------------------------------------------------------------------------
+	set SupTotal = TaxAmount+SupTotal
+	quit $$AddLine^FININTBatch(Batch,BlockNo,TaxAccount,TaxAmount,"TAX",Line,InvNo,TaxCode)
+	
+SupRec(Receipt) 
+	;-------------------------------------------------------------------------------
+	; Post A Receipt of Goods from a Suppliers Order
+	;
+	; Returns:DCM Status
+	;
+	; History:
+	; 27-Jul-2005	GRF		SR13024 : Split Production Processing away from other REC
+	;-------------------------------------------------------------------------------
+	new OrderType,Status
+	
+	set $zt="SupRecError"
+	
+	set Status = $$$OK
+	set Status=$$GetValue^FINSYSDCM("OrderType",.OrderType,"@Receipt@(",1)
+	
+	if $$$ISOK(Status) {
+		if OrderType=1 {
+			set Status = $$Receive^FININTProd(.Receipt)
+		} else {
+			set Status = $$Receive(.Receipt)
+		}
+	}
+	quit Status
+	
+	
+Receive(Receipt) 
+	;-------------------------------------------------------------------------------
+	; Post A Receipt of Goods from a Suppliers Order
+	;
+	; Returns:DCM Status
+	;
+	; History:
+	; 12-Jul-2010	SCR		SR17387: Changed Line source to equal Record Number
+	; 09-Jul-2010	SCR		SR17387: Set SourceDetail, SourceForm, SourceRec
+	; 27-Jul-2005	GRF		SR13024 : Split Production Processing away from other REC
+	; 14-Jul-2005	GRF		SR12863 : Remove quotes around Interface Type
+	; 01-Jul-2005	GRF		SR12843 : Added new Application Parameters (PRWIP &
+	; 						PREXP) to FININTBatchType to provide better distinction
+	; 						from reused "INPROD".  Applied here.  OrderType needed.
+	; 18-Apr-2005	shobby	Subroutined the whole Service Costs process (SR12101)
+	; 18-Apr-2005	shobby	Subroutined the matrix translation of accounts. (SR12101)
+	; 13-Apr-2005	shobby	Reversed signs of some transactions to balance to 0.  (SR12101)
+	; 11-Apr-2005	GRF		SR10478 : Revision to Location means SourceLocn not reqd;
+	; 						Move CST check to outer if test
+	; 16-Mar-2005	GRF		SR10478 : Preserve original location and item group for
+	; 						profile resolution after cost matrix extraction
+	; 10-Mar-2005	GRF		SR10478 : Module independence
+	; 16-Feb-2005	GRF		SR10478 : Store Matrix Keys and Values with
+	; 						FININTBatchLine as audit link
+	; 10-Feb-2005	GRF		SR10478 : Correction to Prefix level for TT/OT
+	; 08-Feb-2005	GRF		SR10478 : Characteristic Matrix; own error exit
+	; 28-Jan-2005	GRF		SR11273 : Spelling correction - only relevant here;
+	; 						apply TLEVEL test to TCOMMIT instead of TROLLBACK
+	; 11-Nov-2004	Paul K	Return batch and block if successful.
+	; 13-Sep-2004	Shobby	Foreign Currency
+	;-------------------------------------------------------------------------------
+	new arrCSTKey,Batch,BlockNo,CSTVals,Date,element,idx,InterfaceType
+	new Line,LineRef,Location,Order,OrderType,Prefix,Profile,RecAccount,RecAmount
+	new SOHAccount,SOHAmount,Status,StatusLine,Supplier,TranType  ;,strSourceKey,strSource
+	new strSourceDetail,strSourceForm,strSourceRecord
+	
+	set $zt="SupRecError"
+	;***************************************
+	tstart
+	;***************************************
+	set Status  = $$$OK
+	set Batch   = ""
+	set BlockNo = ""
+	set Prefix  = "@Receipt@("
+	
+	if $$$ISOK(Status) set Status = $$GetValue^FINSYSDCM("Date",         .Date,      Prefix,1)
+	if $$$ISOK(Status) set Status = $$GetValue^FINSYSDCM("Location",     .Location,  Prefix)
+	if $$$ISOK(Status)&&(Location="") set Location = "None"     ; Default Location
+	if $$$ISOK(Status) set Status = $$GetValue^FINSYSDCM("Supplier",     .Supplier,  Prefix)
+	if $$$ISOK(Status) set Status = $$GetValue^FINSYSDCM("Order",        .Order,     Prefix)
+	
+	if $$$ISOK(Status) set Status = $$GetValue^FINSYSDCM("SourceDetail", .strSourceDetail, Prefix) ; SR17387
+	if $$$ISOK(Status) set Status = $$GetValue^FINSYSDCM("SourceForm",   .strSourceForm,   Prefix) ; SR17387
+	if $$$ISOK(Status) set Status = $$GetValue^FINSYSDCM("SourceRecord", .strSourceRecord, Prefix) ; SR17387
+	
+	
+	/*	TODO JW - reverted for build
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("Audit", .strSource, Prefix)	//SR14615
+	*/
+	if $$$ISOK(Status) {
+		/*	TODO JW - reverted for build
+		set strSourceKey 	= $piece(strSource,"|",2)	//SR14615	
+		set Status=$$Allocate^FININTBatch(.Batch,.BlockNo,"INREC",Location,Date,,,,$piece(strSource,"|",1),strSourceKey,"Fin01017,"_strSourceKey)	;Goods Receipt %1
+		*/
+	;	set Status = $$Allocate^FININTBatch(.Batch,.BlockNo,"INREC",Location,Date)
+		set Status = $$Allocate^FININTBatch(.Batch,.BlockNo,"INREC",Location,Date,,,,strSourceForm,strSourceRecord,strSourceDetail) ; SR17387
+	}
+	
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("TranType",  .TranType,  Prefix,1)
+	if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("OrderType", .OrderType, Prefix,1)       ;SR12843
+	
+	set CSTVals=""
+	if $$$ISOK(Status) {
+		set Line=""
+		for {
+			set Line=$order(@Receipt@("Lines",Line))
+			quit:(Line="")||(Status'=$$$OK)
+			
+			set Prefix="@Receipt@(""Lines"",Line,"
+			if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("LineReceivedAccount",.RecAccount, Prefix,1)
+			if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("LineReceivedAmount", .RecAmount,  Prefix,1)
+			if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("LineSOHAccount",     .SOHAccount, Prefix,1)
+			if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("LineSOHAmount",      .SOHAmount,  Prefix,1)
+			if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("LineRef",            .LineRef,    Prefix,1)
+			
+			; Override Accounts from Characteristics Matrix if used
+			if $$$ISOK(Status) set Status=$$TranslateFromGlobal^FININTMatrix(.Receipt,Line,TranType,.arrCSTKey,.CSTVals,.SOHAccount,.RecAccount)  ;TODO ????
+			
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			; Stock Received
+			; 
+			;   Debit         Stock On Hand
+			;      Credit        Goods Received Not Invoiced
+			;                 or Work In Progress (Prodn Order)   ; TODO : can remove this line   ; SR13024
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			
+			
+			;if $$$ISOK(Status) set Status=$$AddLine^FININTBatch(Batch,BlockNo,SOHAccount,SOHAmount,"SOH",LineRef,Order,Supplier_","_Order,,,,$get(arrCSTKey(1)),CSTVals)
+			if $$$ISOK(Status) set Status=$$AddLine^FININTBatch(Batch,BlockNo,SOHAccount,SOHAmount,"SOH",LineRef,strSourceRecord,Supplier_","_Order,,,,$get(arrCSTKey(1)),CSTVals) ; SR17387 Change Line Source to Record Number
+			
+			;if OrderType=1 {    ; Production Order    ; SR13024
+			;	set InterfaceType = "PRWIP"
+			;} else {
+				set InterfaceType = "INREC"
+			;}
+			;if $$$ISOK(Status) set Status=$$AddLine^FININTBatch(Batch,BlockNo,RecAccount,$$$FCSign(RecAmount),InterfaceType,LineRef_","_Supplier_","_Order,Order,Supplier_","_Order,,,,$get(arrCSTKey(2)),CSTVals)
+			if $$$ISOK(Status) set Status=$$AddLine^FININTBatch(Batch,BlockNo,RecAccount,$$$FCSign(RecAmount),InterfaceType,LineRef_","_Supplier_","_Order,strSourceRecord,Supplier_","_Order,,,,$get(arrCSTKey(2)),CSTVals) ; SR17387 Change Line Source to Record Number
+			
+			if $$$ISOK(Status) set Status=$$ServiceCostsFromGlobal(.Receipt,Line,TranType,.arrCSTKey,Batch,BlockNo,LineRef,Order,Supplier_","_Order,$get(arrCSTKey(1)))
+		;	.Receipt,Line,TranType,.arrCSTKey,Batch,
+		;	BlockNo,LineRef,Order,Supplier_","_Order,$get(arrCSTKey(1))
+		}
+	}
+	
+	if $$$ISOK(Status) set Status=$$PostBlock^FININTBatch(Batch,BlockNo)
+	;***************************************
+	if $$$ISOK(Status) {
+		if $tlevel>0 tcommit
+		set Status=$$$OK_Y_Batch_","_BlockNo
+	} else {
+		trollback
+		set Status=$$$NO_Y_$$$Text(Status)
+	}
+	;***************************************
+	quit Status
+	
+SupRecError
+	trollback
+	quit "0~Error in Post "_$ze	
+	;***************************************
+	
+	
+ServiceCostsFromGlobal(Object,Line,TranType,arrCSTKey,Batch,BlockNo,Parameter="",Source="",pRef="",pstrCSTMat="",pstrCSTVals="",pblnInv=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Subroutine to handle service costs passed through in the message structure
+	; Add Additional Charge processing Account/Amount => extra AddLine
+	; with CST Matrix as reqd
+	; 
+	; Inputs :
+	;   Object,Line,TranType,arrCSTKey,Batch,
+	;   BlockNo,Parameter="",Source="",pRef="",pstrCSTMat="",
+	;   pstrCSTVals="",pblnInv=$$$NO
+	; 
+	; Returns:
+	;
+	; History:
+	; 18-Apr-2005	shobby		Created SR12101
+	;-------------------------------------------------------------------------------
+	new Status,idx,Prefix,ChargeAccount,ChargeAmount,ChargeType,CSTVals,SOHAccount
+	
+	set Status=$$$OK
+	
+	set Prefix="@Object@(""Lines"",Line,"
+	
+	if $$$ISOK(Status) if pblnInv set Status=$$GetValue^FINSYSDCM("AccSOH",.SOHAccount, Prefix,1)
+	
+	set idx=""
+	for {
+		set idx=$order(@Object@("Lines",Line,"ServiceCost",idx))
+		quit:(idx="")||(Status'=$$$OK)
+		
+		set Prefix="@Object@(""Lines"",Line,""ServiceCost"",idx,"
+		if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("Account",.ChargeAccount, Prefix,1)
+		if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("Amount", .ChargeAmount,  Prefix,1)
+		if $$$ISOK(Status) set Status=$$GetValue^FINSYSDCM("Type",   .ChargeType,    Prefix,1)
+				
+		; Override Accounts from Characteristics Matrix if used
+		if $$$ISOK(Status) set Status=$$TranslateFromGlobal^FININTMatrix(Object,Line,TranType,.arrCSTKey,.CSTVals,.SOHAccount,.ChargeAccount)
+		; TODO : Should we have more generic interface type than INCOST?
+		; IF CSTVals is undefined at this point due to lack of setup then the next line will fail causing a rollback.
+		; On 2003Box it was observed that multiple Interface Batches were created.  This was caused by a failure in
+		; the journal files requiring a cache restart.  SR13108/SR13110
+		if $$$ISOK(Status) set Status=$$AddLine^FININTBatch(Batch,BlockNo,ChargeAccount,$$$FCSign(ChargeAmount),"INCOST",Parameter,Source,pRef,,,,$get(arrCSTKey(2)),CSTVals)
+		if $$$ISOK(Status) {
+			if pblnInv  set Status=$$AddLine^FININTBatch(Batch,BlockNo,SOHAccount,ChargeAmount,"SOH",Parameter,Source,pRef,,,,$get(arrCSTKey(1)),CSTVals)
+		}
+	}
+	
+	quit Status
+	
+
+]]></Routine>
+</Export>

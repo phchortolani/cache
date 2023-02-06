@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARINRECReverse" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARINRECReverse
+	#include COMConst
+	#include INConst
+
+	#define TypeofReceivingEstoque 1
+	
+	quit
+
+CanViewReport(pobjINREC)
+ 	;-------------------------------------------------------------------------------
+    ; Make button Report (Relatório) aviable or not
+    ;
+    ; Params: pobjINREC
+    ;
+    ; History:
+    ; 09-Sep-201	Carlos		Copied from SES and adapted
+    ;-------------------------------------------------------------------------------
+	if $PIECE(pobjINREC,Y,4)=1 {
+		set YQ=0
+		quit
+	} else {
+		set YQ=1_"O Estorno precisa ser processado para visualizar o Relatório."	
+	}
+	quit
+
+ProcessWithIntegration(YFORM,YKEY)
+ ; do ProcessWithIntegration^VARINRECReverse(YFORM,YKEY)
+	//chamado pelo botão processar do Estorno de Recebimento.
+	
+	set strStatus = $$IsLastOrderReceipt(YKEY)
+	
+	if $$$ISOK(strStatus) {
+		do Perform^COMTransaction(YFORM,YKEY,"Reverse^INRECReverse(YKEY)","IN00377")
+		
+		do ##class(VAR.infra.integracao.GerenciaFilaPendencias).RegistraEvento(
+					##class(VAR.infra.integracao.GerenciaFilaPendencias).%GetParameter("ENTIDADERECEBIMENTO"),
+					YKEY,
+					##class(VAR.infra.integracao.GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+					##class(VAR.infra.integracao.GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+					##class(VAR.infra.integracao.GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+					##class(VAR.infra.integracao.GerenciaFilaPendencias).%GetParameter("CHAVEVAZIA"),
+					##class(VAR.infra.integracao.GerenciaFilaPendencias).%GetParameter("ACAOESTORNAR"))
+	}
+	else {
+		$$$StartScript()
+		write "alert('"_strStatus_"');"
+		$$$EndScript()
+		
+		do ReloadForm^COMUtilForm()
+	}
+	
+	quit
+
+OnBlurRecebimento(pYFELD)
+	set status = $$ValidaRecFContabil(pYFELD)
+	
+	if $$$ISERR(status) {
+		quit $$$OK
+	}
+	
+	quit $$$NO
+
+ValidaRecTypeofReceiving(pobjINREC)
+	set Recebimento	= $$$INRECReceiptSourceNo(pobjINREC)
+	set strStatus   = $$$OK
+	set objREC      = $get(^INREC(YM,$$$INRECReceiptSourceNo(pobjINREC),1))
+	
+	if ($$$INRECTypeofReceiving(objREC) '= $$$TypeofReceivingEstoque){
+		set msgErr = "O recebimento "_Recebimento_" não pode ser estornado porque não é um recebimento do tipo '1- Estoque'."
+		set strStatus = $$$MakeStatus("%1",msgErr)
+		quit strStatus
+	}
+	
+	quit strStatus
+
+ValidaRecFContabil(pobjINREC)
+	set Recebimento	= $$$INRECReceiptSourceNo(pobjINREC)
+	set DocOrigem   = ""
+	set FContabil	= ""
+	set MContabil   = ""
+	set AContabil   = ""
+	set strStatus   = $$$OK
+	
+	if (Recebimento = "") quit strStatus
+	
+	&sql(
+		select DocOrigem, VARFechamentoContabilLinha.FechamentoContabil, Mes, Ano 
+		into :DocOrigemContabil, :FechamentoContabil, :MesContabil, :AnoContabil
+		from VARFechamentoContabilLinha
+		inner join VARFechamentoContabil on VARFechamentoContabil.FechamentoContabil = VARFechamentoContabilLinha.FechamentoContabil
+		where DocOrigem = :Recebimento and (TipoMovimentacao = "Recebimento" OR TipoMovimentacao = "Estorno de recebimento")
+		and VARFechamentoContabil.Status <> 3
+		group by DocOrigem
+	)
+	
+	if 'SQLCODE {
+		set DocOrigem = DocOrigemContabil
+		set FContabil = FechamentoContabil
+		set MContabil = MesContabil
+		set AContabil = AnoContabil
+	}
+	
+	if (DocOrigem '= ""){
+		set msgErr = "O recebimento "_Recebimento_" não pode ser estornado pois este já consta no Fechamento Contábil "_FContabil_" de competência "_MContabil_"/"_AContabil_"."
+		set strStatus = $$$MakeStatus("%1",msgErr)
+		quit strStatus
+	} 
+	
+	quit strStatus
+	
+	
+IsLastOrderReceipt(pidINRECRevKey)
+
+	new strStatus, objINRECRev, idINREC, objINREC, idOrdemCompra, blnIsOrderValid, objRec,
+		dtLastProcRec, idLastProcRec
+
+	set strStatus		= $$$OK
+	
+	set objINRECRev 	= $get(^INREC(YM,pidINRECRevKey,1))
+	set idINREC			= $$$INRECReceiptSourceNo(objINRECRev)
+	
+	set objINREC		= $get(^INREC(YM,idINREC,1))
+	set idOrdemCompra	= $$$INRECFREE10(objINREC)
+	
+	if idOrdemCompra '= "" {
+		set blnIsOrderValid = $data(^INAUF(YM,idOrdemCompra,1))
+		if (blnIsOrderValid) {
+			$$$Order4(^INRECs,YM,101,$$$Index(idOrdemCompra),idRec)
+				set objRec = $get(^INREC(YM,idRec,1))
+				//Processed or returned
+				if (($$$INRECStatus(objRec) = 1) || ($$$INRECStatus(objRec) = 4)) {
+					set arrRec($$$INRECProcessedDate(objRec)) = idRec
+				}
+			$$$End
+			
+			if $data(arrRec) {
+				set dtLastProcRec = $order(arrRec(""),-1)
+				set idLastProcRec = $get(arrRec(dtLastProcRec))
+				
+				if (idLastProcRec '= idINREC) {
+					set strStatus = "Este não é o recebimento mais recente para a ordem de compra: "_idOrdemCompra
+				}
+			}
+		}
+	}
+	
+	quit strStatus
+]]></Routine>
+</Export>

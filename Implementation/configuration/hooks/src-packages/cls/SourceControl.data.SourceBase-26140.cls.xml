@@ -1,0 +1,332 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="SourceControl.data.SourceBase">
+<ClassType/>
+<Import>SourceControl.control,SourceControl.xml,VAR.infra.xml,VAR.infra.util</Import>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%RegisteredObject</Super>
+
+<Method name="ExportAsCleanXML">
+<Description><![CDATA[
+Exports a single artifact using its internalName (in the form of
+xxxxxxxxxx.MAC, yyyyyy.INC, zzzzzzzz.GBL or wwwwwwwwww.CLS).
+The XML is cleaned (all timestamps and checksums are removed and the
+the XML elements are written with identation).
+Artifacts that match the exclusion list are ignored]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>internalName:%String,considerExclusionList:%Boolean=1</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set sc = $$$OK
+
+	if ((##class(Config).IsBuildOnlyNonVAR() && ($extract(..GetTargetName(internalName), 1, $length("VAR")) = "VAR")) ||
+		(##class(Config).IsBuildOnlyVAR() && ($extract(..GetTargetName(internalName), 1, $length("VAR")) '= "VAR")) ||
+		(('##class(Config).IsBuildASDE()) &&
+			($extract(internalName, 1, $length("SourceControl.")) = "SourceControl."))) {
+		quit $$$OK
+	}
+
+	if (considerExclusionList && ##class(FileType).IsIgnored(internalName)) {
+		write !, "Ignoring '"_internalName_"' because it is on the ignore list."
+		write !, "To override this, include it in the excludeExceptions list."
+		quit $$$OK
+	}
+
+	if (..IsGeneratedSource(internalName)) {
+		write !, "Ignoring '"_internalName_"' because it is a generated source."
+		quit $$$OK
+	}
+
+	set externalFileName = ##class(FileControl).GetExternalFileName(internalName)
+	if (externalFileName = "") {
+		quit ##class(Errors).MakeErrorStatus("Error: The generated "_
+			"externalFileName is """" for the artifact '"_internalName_"'")
+	}
+
+ 	// Get a temporary filename
+ 	set tmpFileName = ##class(FileControl).GetTemporaryFileName(internalName)
+ 	if (tmpFileName = "")  {
+		quit ##class(Errors).MakeErrorStatus("Error: The generated tmpFileName "_
+			"is """" for the artifact '"_internalName_"'")
+	}
+
+ 	// Create the target directory
+ 	set sc = ##class(DirectoryFile).CreateDirectoryChainFromFile(tmpFileName)
+ 	if (##class(Errors).IsErrorQuiet(sc)) {
+	 	quit sc
+ 	}
+
+ 	// Call the export function to a temporary file (don't show anything -d)
+ 	set sc = $System.OBJ.Export(internalName, tmpFileName, "-d")
+ 	if (##class(Errors).IsErrorQuiet(sc)) {
+	 	quit sc
+ 	}
+
+ 	// Remove timestamp and checksum tags/attributes from the XML file
+ 	set sc = ##class(XMLFileFilter).Filter(tmpFileName, externalFileName)
+ 	if (##class(Errors).IsErrorQuiet(sc)) {
+	 	quit sc
+ 	} 
+
+	write !, "Exported '", internalName, "'"
+	write !, "External name: '", externalFileName, "'"
+
+	do ##class(FileControl).CorrectNIXExecuteFlag(externalFileName)
+
+	// Try to remove the temporary file
+	if (##class(Config).IsDeleteTmpXMLFilesActive()) {
+		if (##class(%File).Exists(tmpFileName)) {
+			do ##class(%File).Delete(tmpFileName)
+		}
+	}
+
+	// Update the timstamp, so that the source control can use it to prevent
+	// the same file from being loaded again. Also, for classes, this
+	// timestamp is checked to see if a compilation has changed the class
+	// and it needs to be re-exported.
+	do ##class(FileControl).UpdateTimeStamp(externalFileName)
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="GetTargetName">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>internalName:%String</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[
+	if (($piece(internalName, ".", 1, $length(internalName, ".") - 2) = "User") ||
+		($piece(internalName, ".", 1, $length(internalName, ".") - 2) = "Report")) {
+		quit $piece(internalName, ".", $length(internalName, ".") - 1)
+	}
+	
+	quit internalName
+]]></Implementation>
+</Method>
+
+<Method name="IsGeneratedSource">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>internalName:%String</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[
+	set $ztrap = "exception"
+
+    // Find the type
+    set type = ##class(FileType).GetType(internalName)
+
+	if (type = ##class(FileType).%GetParameter("MAC")) {
+		set className = $piece(internalName, ".", 1,
+			$length(internalName, ".") - 2)
+
+		if ($length(className) > 0) {
+			set suffix = $piece(internalName, ".", $length(internalName, ".") - 1)
+
+			// Persistent routine extensions
+			if ((($extract(suffix, 1, 1) = "T") ||
+				 ($extract(suffix, 1, 1) = "S")) &&
+				(+$extract(suffix, 2, $length(suffix)) > 0)) {
+				if (('##class(%Dictionary.ClassDefinition).%ExistsId(className)) &&
+					$data(^rMAC(className_"."_suffix, 0, 5))) {
+					set classContext = $get(^rMAC(className_"."_suffix, 0, 5))
+					set className = $piece(classContext, "#classcontext ", 2)
+				}
+
+				if (($length(className) > 0) &&
+					##class(%Dictionary.ClassDefinition).%ExistsId(className) &&
+					##class(%Library.CompiledMethod).%ExistsId(className_".%IsA") &&
+					$zobjClassMethod(className, "%IsA", "%Persistent")) {
+					quit $$$YES
+				}
+			}
+			// Methods with code generator
+			elseif (($extract(suffix, 1, 1) = "G") &&
+					(+$extract(suffix, 2, $length(suffix)) > 0)) {
+				if (##class(%Dictionary.ClassDefinition).%ExistsId(className)) {
+					quit $$$YES
+				}
+			}
+		}
+	}
+	elseif (type = ##class(FileType).%GetParameter("CLS")) {
+		set className = $piece(internalName, ".", 1,
+			$length(internalName, ".") - 2)
+
+		if ($length(className) > 0) {
+			set methodName = $piece(internalName, ".", $length(internalName, ".") - 1)
+
+			// Web Service Servers or Clients
+			if (##class(%Dictionary.ClassDefinition).%ExistsId(className) &&
+				##class(%Library.CompiledMethod).%ExistsId(className_".%IsA") &&
+				($zobjClassMethod(className, "%IsA", "%SOAP.WebService") ||
+				 $zobjClassMethod(className, "%IsA", "%SOAP.WebClient")) &&
+				##class(%Library.CompiledMethod).%ExistsId(className_"."_methodName)) {
+				quit $$$YES
+			}
+		}
+
+		set className = $piece(internalName, ".", 1,
+			$length(internalName, ".") - 1)
+
+		if ($length(className) > 0) {
+			// CSP's
+			if (##class(%Dictionary.ClassDefinition).%ExistsId(className) &&
+				##class(%Library.CompiledParameter).%ExistsId(className_".CSPURL")) {
+				set cdef = ##class(%Dictionary.ClassDefinition).%OpenId(className)
+				set cspParam = ##class(%Library.CompiledParameter).%OpenId(className_".CSPURL")
+
+				if ((cdef.Super = "%CSP.Page") &&
+					##class(Strings).EndsWith(cspParam.Default, ".csp")) {
+					quit $$$YES
+				}
+			}
+		}
+	}
+
+finally
+	quit $$$NO
+
+exception
+ 	set $ztrap = ""
+ 	set $ecode = ""
+ 	
+	goto finally
+]]></Implementation>
+</Method>
+
+<Method name="ExportAsRawXML">
+<Description><![CDATA[
+Exports a single object using its internalName (in the form of
+xxxxxxxxxx.MAC, yyyyyy.INC, zzzzzzzz.GBL or wwwwwwwwww.CLS )
+No check is made for excluding lists]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>internalName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	if ($get(internalName) = "") {
+		quit ##class(Errors).MakeErrorStatus("The internal name "_
+			"can't be empty!")
+	}
+
+	set externalFileName = ##class(FileControl).GetExternalFileName(internalName)
+	if (externalFileName = "") {
+		quit ##class(Errors).MakeErrorStatus("The external filename "_
+			"can't be empty!")
+	}
+
+	set sc = ##class(DirectoryFile).CreateDirectoryChainFromFile(externalFileName)
+	if (##class(Errors).IsErrorQuiet(sc)) {
+		quit sc
+	}
+
+ 	set sc = $System.OBJ.Export(internalName, externalFileName, "")
+ 	if (##class(Errors).IsError(sc)) {
+	 	quit sc
+ 	}
+
+	write !, "Exported '", internalName
+	write !, "External name: '", externalFileName,"'"
+
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="ImportCacheSourceFileHelperMore">
+<Description><![CDATA[
+This is a wrapper for Cache's internal function. Cache's routine fails with runtime
+error on many situations. We need t bypass that to keep loading other files and report the
+error.
+This routines returns 1 if it was OK, 0 - runtime error or -1: status error found and printed
+TODO: figure out how to build a correct Status code from whithin $etrap code. [Private]]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>externalFileName:%String,flags:%String</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[
+	// Turn on error traping: this method will return 0 if a runtime
+	// error happens
+	new $etrap
+	set $etrap = "quit:$quit 0 quit"
+
+	// Call the function to do the load (d: display, f: force, c: compile)
+	set sc = $System.OBJ.Load(externalFileName, flags)
+	if (##class(Errors).IsError(sc)) {
+		write !, "File error: "_externalFileName
+		quit -1
+	}
+
+	set hasClassType = ##class(XMLClassInterpreter).HasClassType(externalFileName)
+	set hasProcedureBlock = ##class(XMLClassInterpreter).HasProcedureBlock(externalFileName)
+	if (('hasClassType) || ('hasProcedureBlock)) {
+        set sc = ##class(FileControl).GetInternalNameFromXmlFile(
+            externalFileName, .internalName)
+        if (('##class(Errors).IsError(sc)) &&
+        	##class(%Dictionary.ClassDefinition).%ExistsId(internalName)) {
+	        if (('hasClassType) && ('hasProcedureBlock)) {
+	        	write !, "Special case: removing 'classtype' and setting 'procedureblock' from '"_internalName_"'"
+	        }
+	        elseif ('hasClassType) {
+	        	write !, "Special case: removing 'classtype' from '"_internalName_"'"
+	        }
+	        elseif ('hasProcedureBlock) {
+	        	write !, "Special case: setting 'procedureblock' from '"_internalName_"'"
+	        }
+
+			set cdef = ##class(%Dictionary.ClassDefinition).%OpenId(internalName)
+			if ('hasClassType) {
+				set cdef.ClassType = "datatype"	// These two lines are
+				set cdef.ClassType = ""			// neccessary
+			}
+			if ('hasProcedureBlock) {
+				set cdef.ProcedureBlock = 1		// Default value
+			}
+			do cdef.%Save()
+        }
+	}
+
+	// Update the timestamp
+	do ##class(FileControl).UpdateTimeStamp(externalFileName)
+
+	quit 1
+]]></Implementation>
+</Method>
+
+<Method name="SaveAuditInfo">
+<Description><![CDATA[
+Log save auditing information]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>type:%String,internalName:%String</FormalSpec>
+<Implementation><![CDATA[
+	if ($SYSTEM.Version.GetNumber() < 2008.1) quit
+
+	if ($length(type) = 0) quit
+	set fileType = ##class(FileType).GetExtensionFromType(type)
+	if (($length(fileType) = 0) || ($length(internalName) = 0)) quit
+
+	set date = +$horolog
+	set time = $piece($horolog, ",", 2)
+	set proc = ##class(%SYS.ProcessQuery).%OpenId($job)
+	set ^SourceControlSourceAudit("SAVE", fileType, internalName, date, time) =
+		proc.OSUserName_"|"_proc.StartupClientIPAddress_"|"_proc.UserName
+]]></Implementation>
+</Method>
+
+<Method name="KillAuditInfo">
+<Description><![CDATA[
+Log kill auditing information]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>type:%String,internalName:%String</FormalSpec>
+<Implementation><![CDATA[
+	if ($SYSTEM.Version.GetNumber() < 2008.1) quit
+
+	if ($length(type) = 0) quit
+	set fileType = ##class(FileType).GetExtensionFromType(type)
+	if (($length(fileType) = 0) || ($length(internalName) = 0)) quit
+
+	set date = +$horolog
+	set time = $piece($horolog, ",", 2)
+	set proc = ##class(%SYS.ProcessQuery).%OpenId($job)
+	set ^SourceControlSourceAudit("KILL", fileType, internalName, date, time) =
+		proc.OSUserName_"|"_proc.StartupClientIPAddress_"|"_proc.UserName
+]]></Implementation>
+</Method>
+</Class>
+</Export>

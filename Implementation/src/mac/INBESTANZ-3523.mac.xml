@@ -1,0 +1,795 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INBESTANZ" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INBESTANZ(YKEY,YEDIT,YAUSWAHL)
+#include COMSYS
+#include INConst
+#define enumAverageCost		9
+ 
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		ANZEIGE BESTAND JE ARTIKEL
+	;
+	;	ACHTUNG ! ÄNDERUNGEN GGF. AUCH IN INBESTANZL VORNEHMEN ! ;estimation too within 
+	;	Stock on hand details from Item Master Data
+	;
+	; Inputs : 
+	;	YKEY		=ARTIKELNUMMER
+	;	YEDIT		=0 ÄNDERUNG NICHT ERLAUBT; YEDIT=1 ÄNDERUNG ERLAUBT
+	;	YAUSWAHL 	= FILTER DER ANZEIGE: VERFÜGBAR, GESPERRT,....
+	;
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 10-Jun-2008	GRF		SR15633: several instances - put commented line before
+	; 							new FOR command to improve performance; Lot No (D19)
+	; 							was required as well, added.  Doco updated
+	; 11-Apr-2008	FIS		SR15633: change activated 
+	; 20-Feb-2008	FIS		SR15633: change display colums/ add expiry date (remove
+	; 							9,14; add 25; move 2,7,8) ALSO CHANGE IN INBESTANZL
+	; 27-Nov-2006	GRF		SR15232: New code enabled; include item name in URL link
+	; 22-Nov-2006	GRF		Naked Reference; quits
+	; 15-Nov-2006	JW		SR15205: Add access to supplier field
+	; 04-Jul-2006	PO		SR14669: List current reservations for item and site locn
+	; 01-Sep-2005	GRF		Doco
+	; 16-Aug-2005	FIS		SR13253 : SHOW AVERAGE COST
+	; 07-Jun-2005	GRF		Clarify; ! => ||; Second clause of OR test not in parentheses
+	; 31-May-2005	RobertW	SR11649: Allow the user to view stock from all locations
+	; 							or this location
+	; 30.01.2000	DT
+	;-------------------------------------------------------------------------------
+	new arrTotal,blnHideCosts,idItem,idLocn,LAP,MINUS
+	
+	; Columns => INWE Fields :
+	;  P2,       P3,        P4,        D4,     D5,    D2,    D19,    D25,    D48,     D7,      D8,    D28
+	;  "02",    "03",      "04"
+	;-------------------------------------------------------------------------------------------------------
+	;Stock (ItemNo) Description                                                                            | (*1*)
+	;-------------------------------------------------------------------------------------------------------
+	;  Site  | Stock  |  Received  |Quantity|Serial|Batch |Lot No.|Useable|Version|Supplier|Unit Lot|Source| (*2*) INWE
+	;Location|Location|     On     |        |Number|Number|       |  To   | (Rev) |        |  Cost  |Order | Descriptions
+	;-------------------------------------------------------------------------------------------------------
+	;-------------------------------------------------------------------------------------------------------
+	;  ...   |...     |            |        |      |      |       |       |       |        |        |      | (*3*)
+	;  ...   |...     |            |        |      |      |       |       |       |        |        |      | 
+	;        |        |Subtotal    |        |      |      |       |       |       |        |        |      | (*4*)
+	;-------------------------------------------------------------------------------------------------------
+	;        |        |Total Amount|        |      |      |       |       |       |        |        |      | (*5*)
+	;-------------------------------------------------------------------------------------------------------
+	;Stock Quantity Including Consignment Stock : qty                                                      | (*6*)
+	;Stock Quantity Excluding Consignment Stock : qty                                                      | 
+	;-------------------------------------------------------------------------------------------------------
+	
+	set YAUSWAHL =  $get(YAUSWAHL)
+	set YEDIT    = +$get(YEDIT)
+	
+	
+	; FIXME : Is it correct to open the font and then quit? <GRF>
+	write "<FONT SIZE=2>",YCR
+	set idItem = $piece($get(YKEY),",",1)  ;ARTIKELNUMMER
+	quit:idItem=""
+	
+	set idLocn = ""
+	if +$$$INVORGViewStockFromAllLocations($get(^INVORG(YM,YM,1)))=$$$NO set idLocn = YLOCATION    ; D218
+	set blnHideCosts = $$CanHidePOCosts^COMSecurity()	// SR15205
+	;set blnHideCosts = ('$$^WWWACCESS("","FIBU") || '$$^WWWACCESS("","EK")) ; Temp SR15205 for 1-26 & 1-28
+	 
+	do ItemDescription(idItem)                        ; (*1*)
+	
+	do ^WWWFRAME(0)
+	;+++++++++++++++++++++++++++++++++++++++
+	; sets
+	;	YVOR1		objCOMPANY	(WWW012)
+	;+++++++++++++++++++++++++++++++++++++++
+ 
+	do TableHeadings(blnHideCosts)                    ; (*2*)
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	new YBACK,YKEY,YFKEY                       ;??? NOTE YKEY is one of the routine arguments
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set YBACK="INART,"                         ; for ^WWWCGI
+	if $get(FERTIGUNGSNR)'="" set YBACK="INWEFERTUM,"  ;RÜCKSPRUNG NACH FERTIGUNGSUMBUCHUNG ;within 
+	if $get(ARTANZEIGE)'=""   set YBACK="INBESTANZ,"   ;RÜCKSPRUNG NACH MANUELLE BESTANDSANZEIGE JE ARTIKEL ;within once item 
+	if $get(LAGERANZEIGE)'="" set YBACK="INBESTANZL,"  ;RÜCKSPRUNG NACH MANUELLE BESTANDSANZEIGE JA LAGERPLATZ ;within yes stock location 
+	
+	do ListByLocn(idItem,idLocn,blnHideCosts,.arrTotal,YAUSWAHL,YEDIT)      ; (*3*) and (*4*)
+	do Totals(blnHideCosts,.arrTotal)                 ; (*5*)
+	do ^WWWFRAME(1)
+	do Summary(idItem,idLocn)                     ; (*6*)
+	quit
+	
+	;------------------------------------------------------------------------------------------------------------------
+	
+ItemDescription(pidItem)
+	;-------------------------------------------------------------------------------
+	;   (*1*) Item Description
+	; Information Prior to Table - Item Number and Description
+	;   
+	; History :
+	; 29-Nov-2006	GRF		SR15232: Wrap link call
+	; 27-Nov-2006	GRF		SR15232: Separate functionality
+	;-------------------------------------------------------------------------------
+	new YBACK
+	
+	write "<A"
+	write " TITLE="_""""_$$^WWWTEXT(374)_""""                  ; "Select Data Record" 
+	write " HREF="
+	;write YAKTION_"EP=WWWFORM&YFORM=INART&YKEY="_pidItem       ;ARTIKEL BEARBEITEN ;item   ; 29-Nov-2006
+	write YAKTION_"EP=WWWFORM&YFORM=INART"                      ;ARTIKEL BEARBEITEN ;item
+	set YBACK=""                       ; for ^WWWCGI
+	;write $$WWWCGI2^WWWCGI()                                   ; 29-Nov-2006
+	do Link(pidItem)
+	write ">"
+	
+	write "<B>",$$^WWWTEXT(32020)," "                          ; "Stock"
+	write "("_pidItem_")&nbsp;"
+	write $$$INARTSearchName($get(^INART(YM,pidItem,1)))       ; D1 ;KURZBEZEICHNUNG ARTIKEL ;item 
+	write "</A>"
+	
+	write "</B>",YCR
+	quit
+	
+	
+TableHeadings(pblnHideCosts)	
+	;-------------------------------------------------------------------------------
+	;   (*2*) Get Table Headings from INWE Descriptions		;KOPF ANZEIGE FÜR UNTERSCHIEDLICHE SPRACHEN
+	;   
+	; History :
+	; 11-Apr-2008	FIS		SR15633: change activated (see main comment header)
+	; 29-Nov-2006	GRF		SR15232: Wrap link call - cleanup newed variables
+	; 27-Nov-2006	GRF		SR15232: Separate functionality
+	;-------------------------------------------------------------------------------
+	new ColumnNo,YDATEI,YTEXT
+ 
+	set YDATEI="INWE"
+	
+	write YCR,"<TR>"
+	;	Only show supplier and cost columns if user has access to EK and FIBU modules
+  ;	for ColumnNo="02","03","04",4,5,7,8,9,14,48,28,2 {   ;AUSWAHL DER DATENFELDER FÜR KOPF
+	for ColumnNo="02","03","04",4,5,2,19,25,48,7,8,28 {                //SR15633
+		continue:pblnHideCosts&&((ColumnNo=7)||(ColumnNo=8))		// SR15205
+		
+		write "<TH ALIGN=CENTER BGCOLOR="_YDARKGRAY_" NOWRAP>"
+		write "<FONT SIZE=2>"
+		
+		if $extract(ColumnNo,1)=0 {
+		;	Text for Key fields     ; TEXT AUS PRIMÄRSCHLUESSEL
+			set YTEXT = $$^WWWFELDNAME(YDATEI,"P",$extract(ColumnNo,2))
+		} else {
+		;	Text for Data fields    ; TEXT AUS DATENFELD 
+			if ColumnNo=4  {
+				set YTEXT = $$^WWWTEXT(31407)                   ; "Quantity"  ;MENGE
+			} else {
+				set YTEXT = $$^WWWFELDNAME(YDATEI,"D",ColumnNo)
+			}
+		}
+		write YTEXT,"</TH>"
+	}
+	write "</TR>",YCR
+	quit
+	
+	
+ListByLocn(idItem,pidLocn,blnHideCosts,&arrTotal,YAUSWAHL,YEDIT)
+	;-------------------------------------------------------------------------------
+	;   (*3*) Get Table Lines from INWE
+	;
+	; History :
+	; 24-Nov-2006	GRF		SR15232: Previous code reorganised to include Reservations
+	; 							without SOH at that stock locn
+	;-------------------------------------------------------------------------------
+	kill ^CacheTempINBESTANZ($job)
+	kill arrTotal
+	
+	set arrTotal("TQty") = 0
+	set arrTotal("TRes") = 0
+	set arrTotal("TVal") = 0
+	
+	if pidLocn'="" {
+		do BuildList(idItem,pidLocn)
+		do ListEntry(idItem,pidLocn,blnHideCosts,YAUSWAHL,YEDIT,.arrTotal)       ; (*3*) and (*4*)
+	
+	} else {
+		do BuildList(idItem,"")
+		for {
+			set pidLocn = $order(^CacheTempINBESTANZ($job,pidLocn))
+			quit:pidLocn=""
+			
+			do ListEntry(idItem,pidLocn,blnHideCosts,YAUSWAHL,YEDIT,.arrTotal)   ; (*3*) and (*4*)
+		}
+	}
+	
+	quit
+		
+	
+BuildList(pidItem,pidSite)
+	;-------------------------------------------------------------------------------
+	; Build list of stock locations to be displayed - with or without SOH
+	; 
+	; History :
+	; 24-Nov-2006	GRF		SR15232 : Include Reservations without SOH at that stock locn
+	;-------------------------------------------------------------------------------
+	new dteRecvd,idLocn,idStore,ReservedQty
+ 
+	set idLocn = ""
+	for {
+		set idLocn = $order(^INWE(YM,pidItem,idLocn))
+		quit:idLocn=""
+		continue:(pidSite'="")&&(idLocn'=pidSite)
+	
+		set idStore = ""
+		for {
+			set idStore = $order(^INWE(YM,pidItem,idLocn,idStore))
+			quit:idStore=""
+			
+			set dteRecvd = ""
+			for {
+				set dteRecvd = $order(^INWE(YM,pidItem,idLocn,idStore,dteRecvd))
+				quit:dteRecvd=""
+				
+			;	Save Reserved Quantity - Clearing past due reservations     ;RES.MENGE AKTUELL HOLEN UND KORRIGIEREN
+				set ^CacheTempINBESTANZ($job,idLocn,idStore,dteRecvd) = $$^INWERMENGE(pidItem,idLocn,idStore,dteRecvd,,$$$YES)
+			}
+		}
+	}
+	
+	set idLocn = ""
+	for {
+		set idLocn = $order(^INWER(YM,pidItem,idLocn))
+		quit:idLocn=""
+		continue:(pidSite'="")&&(idLocn'=pidSite)
+	
+		set idStore = ""
+		for {
+			set idStore = $order(^INWER(YM,pidItem,idLocn,idStore))
+			quit:idStore=""
+			
+			set dteRecvd = ""
+			for {
+				set dteRecvd = $order(^INWER(YM,pidItem,idLocn,idStore,dteRecvd))
+				quit:dteRecvd=""
+			;	Already detected with ^INWE processing
+				continue:$data(^CacheTempINBESTANZ($job,idLocn,idStore,dteRecvd))
+				
+				set ReservedQty = $$^INWERMENGE(pidItem,idLocn,idStore,dteRecvd,,$$$YES)
+				if ReservedQty set ^CacheTempINBESTANZ($job,idLocn,idStore,dteRecvd) = ReservedQty
+			}
+		}
+	}
+	
+	quit
+	
+ListEntry(pidItem,pidLocn,pblnHideCosts,YAUSWAHL,YEDIT,&arrTotal)
+	;-------------------------------------------------------------------------------
+	; Display selected stock locations
+	; 
+	; History :
+	; 24-Nov-2006	GRF		SR15232 : Created
+	;-------------------------------------------------------------------------------
+	new curOnHandVal,ColumnNo,dteRecvd,dteUsableFrom,dteUsableUntil
+	new idStore,objINWE,OnHandQty,ReservedQty,strBGColor
+	
+	set arrTotal("SubQty") = 0
+	set arrTotal("SubRes") = 0
+	set arrTotal("SubVal") = 0
+	
+	set idStore = ""
+	for {
+		set idStore = $order(^CacheTempINBESTANZ($job,pidLocn,idStore))
+		quit:idStore=""
+		
+		set dteRecvd = ""
+		for {
+			set dteRecvd = $order(^CacheTempINBESTANZ($job,pidLocn,idStore,dteRecvd))
+			quit:dteRecvd=""
+			
+			set objINWE     =  $get(^INWE(YM,pidItem,pidLocn,idStore,dteRecvd,1))
+			set ReservedQty = +$get(^CacheTempINBESTANZ($job,pidLocn,idStore,dteRecvd))
+			set arrTotal("SubRes") = arrTotal("SubRes") + ReservedQty
+			set arrTotal("TRes")   = arrTotal("TRes")   + ReservedQty
+			
+			if objINWE'="" {
+				set $$$INWETotalReservedQuantity(objINWE) = ReservedQty                              ; D37
+				
+				set OnHandQty = +$$$INWEQuantity(objINWE)                                            ; D4
+				continue:(OnHandQty=0)&&(ReservedQty'>0)
+				
+				do DisplayOnHand(pidItem,pidLocn,idStore,dteRecvd,pblnHideCosts,ReservedQty,.arrTotal,objINWE,OnHandQty,YAUSWAHL,YEDIT)
+			} else {
+				do DisplayReservation(pidItem,pidLocn,idStore,dteRecvd,pblnHideCosts,ReservedQty,.arrTotal)
+			}
+		}
+	}
+	do Subtotals(pblnHideCosts,.arrTotal)
+	quit
+	
+	
+DisplayOnHand(pidItem,pidLocn,pidStore,pdteRecvd,pblnHideCosts,pReservedQty,&arrTotal,pobjINWE,pOnHandQty,YAUSWAHL,YEDIT)
+	;-------------------------------------------------------------------------------
+	; Display INWE records + reservation total
+	; 
+	; History :
+	; 27-Oct-2009	GRF		SR16871: INItemCost with location replaces INARTCOST
+	; 12-Oct-2009	GRF		SR16878: Replace call to INARTKOST with INARTCOST
+	; 11-Apr-2008	FIS		SR15633: change activated (see main comment header)
+	; 17-Oct-2007	GRF		Remove extra double quotes since already provided for by
+	; 						"END OF TITLE" line; FIXMEs
+	; 21-Feb-2007	GRF		SR15449: dteUsableFrom should be dteUsableUntil in blocked tool tip
+	; 29-Nov-2006	GRF		SR15232: Wrap link call
+	; 24-Nov-2006	GRF		SR15232 : Created; Don't show clock image in Column "02"
+	; 						if no reservation link; straighten out <A> and <FONT>
+	; 						pairing
+	;-------------------------------------------------------------------------------
+	new blnDatePassed,blnLockedLocn,blnMinus,blnTooSoon,curOnHandVal,ColumnNo,dteUsableFrom,dteUsableUntil
+	new LockedReason,objLocation,strBGColor,strMultiUnits,YTEXT
+	
+	set blnMinus = (pOnHandQty<0)                        ; Negative Qty On Hand   ;NEGATIVBESTAND
+	
+	; Create the stock location if it doesn't exist (ignore External Manufacturing locations)
+	; ANLEGEN LAGERPLATZ WENN GELÖSCHT     ;FIS;06.11.03
+	;-----------------------------------
+	; v v v v v v v v v v v v v v v v v v v FIXME : <GRF> SRBR014620 : Validate rather than create
+	;
+	if '$data(^INLP(YM,pidLocn,pidStore,1)) if pidStore'["*" set ^INLP(YM,pidLocn,pidStore,1)=""
+	;
+	; ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^
+	
+	set objLocation = $get(^INLP(YM,pidLocn,pidStore,1))
+	
+	; Expiration Date Passed? / Already Usable
+	; VERFALLSDATUM ÜBERSCHRITTEN? / BEREITS VERWENDBAR
+	;-----------------------------------
+ 
+	set dteUsableUntil  = $$$INWEUseableUntilDate(pobjINWE)             ; D25
+	set dteUsableFrom   = $$$INWEUseableFromDate(pobjINWE)              ; D26
+	set blnDatePassed   = $$$NO
+	set blnTooSoon      = $$$NO
+	if (dteUsableUntil'="") && (dteUsableUntil<$horolog) set blnDatePassed = $$$YES
+	if (dteUsableFrom'="")  && (dteUsableFrom>$horolog)  set blnTooSoon    = $$$YES
+	
+	; Locked
+	;-----------------------------------
+	set blnLockedLocn = +$$$INLPStockLocationIsLocked(objLocation)     ; D8   ; SPERRE  ;LAGERPLATZ GESPERRT?
+	if (pidStore["*") || blnMinus set blnLockedLocn = $$$YES
+	
+	set LockedReason = ""                                                         ; SPERRGRUND
+	if blnLockedLocn    set LockedReason = $$$INLPReasonBlocked(objLocation)      ; D20
+	if LockedReason'="" set LockedReason = $piece($get(^INPARA(YM,"LPSPERRGRUND",SPRACHE,LockedReason,1)),Y,1)
+	
+	;FILTER FÜR GESPERRTE UND VERFÜGBARE, ANSICHT ÜBER LINK AUS INBESTSALES ULM,13.02.03
+	;FILTER FOR CLOSED ONES AND AVAILABLE ONE, OPINION OVER LEFT FROM INBESTSALES
+	quit:(YAUSWAHL'="")&&(pidStore["*")           ;LEIHLAGER MIT * FÜR LEIHLAGERUNG EINES FREMDFERTIGUNGSAUFTRAGES
+	                             ;BORROWING Location WITH * FOR BORROWING STORAGE OF AN ORDER FOR EXTERNAL MANUFACTURE
+	quit:(YAUSWAHL'="")&&(YAUSWAHL'=2)&&(blnLockedLocn&&'blnMinus)
+	quit:(YAUSWAHL'="")&&(YAUSWAHL'=1)&&('blnLockedLocn||blnMinus)
+	
+	;-------------------------------------------------------------------------------------------------------
+	; Columns => INWE Fields :
+	;   P2       P3          P4        D4      D5      D7     D8      D9       D14      D48     D28    D2
+	;  "02"     "03"        "04"
+	;-------------------------------------------------------------------------------------------------------
+	;  Site  | Stock  |  Received  |Quantity|Serial|Supplier|Unit |  Stock  |Delivery|Version|Source|Batch |
+	;Location|Location|     On     |        |Number|        |Price|Locn Note|Note No | (Rev) |Order |Number|
+	;-------------------------------------------------------------------------------------------------------
+	
+	write YCR,"<TR>"
+	set YDDSATZ    = $get(YDDSATZ)+1
+	set strBGColor = $select(YDDSATZ#2=1:" BGCOLOR="_YWHITE,1:"")
+	
+	;AUSWAHL DER DATENFELDER FÜR DATEN (5=SERIENNUMMER)
+  ;	for ColumnNo = "02","03","04",4,5,7,8,9,14,48,28,2 { 
+	for ColumnNo="02","03","04",4,5,2,19,25,48,7,8,28 {                      //SR15633
+		continue:pblnHideCosts&&((ColumnNo=7)||(ColumnNo=8))              ; SR15205
+		
+	; Open
+	;-----------------------------------
+		if (ColumnNo=4)||(ColumnNo=8) {
+			write YCR,"<TD ALIGN=RIGHT NOWRAP VALIGN=TOP",strBGColor,">"
+		} else {
+			write YCR,"<TD ALIGN=LEFT NOWRAP VALIGN=TOP",strBGColor,">"
+		}
+		write "<FONT "
+		if $piece(YVOR,Y,7)'="" write " SIZE="_$$$DBLQUOTE_$piece(YVOR,Y,7)_$$$DBLQUOTE
+		write ">"
+		
+	; Serial Nos (No Linking)     ; SERIENNUMMERN ANZEIGEN
+	;-----------------------------------
+		if ColumnNo=5 {
+			do SerialNos(pidItem,pidLocn,pidStore,pdteRecvd)
+		
+		} else {
+			
+	; Insert Reservations in Quantity
+	;-----------------------------------
+			;RESERVIERTE MENGE; ULM, 11.02.03 ;FIS;04.01.02;24852;FELD 37 NEU RECHNEN (SIEHE OBEN)
+			if (ColumnNo=4) && (pReservedQty'=0) {   
+				do DisplayResQty(pReservedQty,pidItem,pidLocn)
+			}
+			
+	; Build YTEXT, adding to subtotals and totals
+	;-----------------------------------
+			if ColumnNo = "02" set YTEXT = pidLocn
+			if ColumnNo = "03" set YTEXT = pidStore
+			if ColumnNo = "04" set YTEXT = $$^WWWDATE(pdteRecvd)
+			if $extract(ColumnNo)'=0 {
+				set YTEXT = $piece(pobjINWE,Y,ColumnNo)
+			}
+				
+			;	Unit Lot Cost	
+			if ColumnNo=8 {
+			;	if $$$INVORGDefaultCostType($get(^INVORG(YM,YM,1)))=$$$enumAverageCost 
+				if $$$INVORGDefaultCostType($get(^INVORG(YM,YM,1)))=$$$enumAverageCost {
+			;		set YTEXT = $$^INARTKOST(pidItem,,$$$enumAverageCost)  ; SR16878
+		;			set YTEXT = $$GetCost^INARTCOST(pidItem,$$$enumAverageCost)  ; D15 ;Use AVERAGE COST  ; SR16871
+					set YTEXT = $$GetCost^INItemCost(pidItem,pidLocn,$$$enumAverageCost)
+				}
+				set curOnHandVal       = (YTEXT * pOnHandQty / $$^INQTYUNIT(pidItem))
+				set arrTotal("TVal")   = arrTotal("TVal")   + curOnHandVal
+				set arrTotal("SubVal") = arrTotal("SubVal") + curOnHandVal
+				set YTEXT = $$^WWWZAHL(YTEXT,0,2,YWHR)
+				
+				; Price based on multiple units
+				if $$$INARTPriceUnit($get(^INART(YM,pidItem,1)))>1 {          ; D138
+					set strMultiUnits = $$^INARTPE(pidItem)
+					if strMultiUnits'="" set YTEXT = strMultiUnits_" "_YTEXT
+				}
+			}
+			
+			if ColumnNo=4 {
+				set arrTotal("TQty")   = arrTotal("TQty")   + YTEXT
+				set arrTotal("SubQty") = arrTotal("SubQty") + YTEXT        ;26423;FAN;BETRIEB ZWICHENSUMMER;24.09.04
+				set YTEXT = $$^WWWZAHL(YTEXT,0,$length($piece(YTEXT,".",2)))
+			}
+			if ColumnNo=25 {  //SR15633
+				set YTEXT = $$^WWWDATE(YTEXT)
+			}
+			
+	; ToolTip
+	;-----------------------------------
+	; 374		"Select Data Record"
+	; 32657		"Useable From"
+	; 32658		"Useable Until"
+			
+	; 17-Oct-2007		Remove extra double quotes since already provided for by "END OF TITLE" line
+			write YCR,"<A"
+			if blnLockedLocn'=$$$YES {
+				if dteUsableUntil="" {
+					if dteUsableFrom=""  {
+						write " TITLE="_$$$DBLQUOTE_$$^WWWTEXT(374)       ;_$$$DBLQUOTE    
+					} else {
+						write " TITLE="_$$$DBLQUOTE_$$^WWWTEXT(374)_$CHAR(13)_$$^WWWTEXT(32657)_": "_$$^WWWDATE(dteUsableFrom)     ;_$$$DBLQUOTE
+					}
+				} else {
+					if dteUsableFrom="" {
+						write " TITLE="_$$$DBLQUOTE_$$^WWWTEXT(374)_$CHAR(13)_$$^WWWTEXT(32658)_": "_$$^WWWDATE(dteUsableUntil)     ;_$$$DBLQUOTE  ; SR15449
+					
+					} else {
+						write " TITLE="_$$$DBLQUOTE_$$^WWWTEXT(374)_$CHAR(13)_$$^WWWTEXT(32657)_": "_$$^WWWDATE(dteUsableFrom)
+						write $CHAR(13)_$$^WWWTEXT(32658)_": "_$$^WWWDATE(dteUsableUntil)     ;_$$$DBLQUOTE             ; SR15449
+					}
+				}
+			} else {
+				write " TITLE="_$$$DBLQUOTE_$$^WWWTEXT(10004)            ; "Item Closed"
+			}
+			if LockedReason'="" write ": "_LockedReason  ;DATENSATZ AUSWÄHLEN ;data record pick out 
+			
+			write $$$DBLQUOTE       ; END OF TITLE
+			
+	; Link
+	;-----------------------------------
+			if blnMinus  {
+				write " HREF="_$$$DBLQUOTE_"#"_$$$DBLQUOTE_">"
+			} else {
+				if YEDIT=1  {
+					write " HREF="_$$$DBLQUOTE_YAKTION_"EP=WWWFORM&YFORM=INWE"
+				} else {
+					write " HREF="_$$$DBLQUOTE_YAKTION_"EP=WWWFORM&YFORM=INWE1"
+				}
+			;	write $$WWWCGI2^WWWCGI()         ; 29-Nov-2006
+				do Link(pidItem_","_pidLocn_","_pidStore_","_pdteRecvd)
+				write $$$DBLQUOTE_">"
+			}
+			
+	; Color/Strike
+	;-----------------------------------
+	; FIXME : <GRF> Can Color/Strike be set at TR level so doesn't overlap
+	;               with anchor tags - not closing the <a> properly - see below
+			
+			if blnMinus   {             write "<FONT COLOR=ORANGERED>"
+			} elseif blnLockedLocn {    write "<STRIKE>"
+			} elseif blnDatePassed {    write "<STRIKE><FONT COLOR=ORANGERED>"
+			} elseif blnTooSoon {       write "<STRIKE><FONT COLOR=ORANGERED>"
+			}
+			
+	; Output YTEXT information
+	;-----------------------------------
+			write $extract($translate(YTEXT,"|"," "),1,30)
+			write "&nbsp;"
+			
+	;		Display clock link where positive stock on hand or reservation => Reservations
+			if ColumnNo="02" {
+	;			write YCR,"</a>"                 ; FIXME : <GRF> see above in Color/Strike
+ 
+				if (pOnHandQty'<0) || (pReservedQty'<0) {     ;ULM > GEÄNDERT,04.03.03
+					do ReservedLink(pidItem_","_pidLocn_","_pidStore_","_pdteRecvd)
+				}
+				
+				//do PrintLabelLink(pidItem, pidLocn)
+			}
+			
+	; Close
+	;-----------------------------------
+			if blnDatePassed || blnTooSoon write "</FONT></STRIKE>"
+			if blnLockedLocn               write "</STRIKE>"
+			if blnMinus                    write "</FONT>"
+		}
+	;	if ColumnNo'="02"  write YCR,"</a>"      ;  FIXME : <GRF> see above in Color/Strike 
+		write "</FONT>"
+		write "</TD>",YCR
+	}
+	write "</TR>",YCR
+	
+	quit
+	
+DisplayReservation(pidItem,pidLocn,pidStore,pdteRecvd,pblnHideCosts,pReservedQty,&arrTotal)
+	;-------------------------------------------------------------------------------
+	; Display INWER totals where no INWE record
+	; 
+	; History :
+	; 11-Apr-2008	FIS		SR15633: change activated (see main comment header)
+	; 03-Sep-2007	GRF		SRBR014620: Simplify FONT - single construction
+	; 24-Nov-2006	GRF		SR15232 : Created; Don't show clock image in Column "02"
+	; 						if no reservation link
+	;-------------------------------------------------------------------------------
+	new ColumnNo,strBGColor,strFontClose,strFontOpen,YTEXT
+	
+	if $piece(YVOR,Y,7)="" {
+		set strFontOpen = ""
+		set strFontClose = ""
+	} else {
+		set strFontOpen = "<FONT SIZE="""_$piece(YVOR,Y,7)_""">"
+		set strFontClose = "</FONT>"
+	}
+	
+	write YCR,"<TR>"
+	set YDDSATZ    = $get(YDDSATZ)+1
+	set strBGColor = $select(YDDSATZ#2=1:" BGCOLOR="_YWHITE,1:"")
+	
+  ;	for ColumnNo = "02","03","04",4,5,7,8,9,14,48,28,2 { 
+	for ColumnNo="02","03","04",4,5,2,19,25,48,7,8,28 {                      //SR15633
+		continue:pblnHideCosts&&((ColumnNo=7)||(ColumnNo=8))              ; SR15205
+		
+	; Open
+	;-----------------------------------
+		if (ColumnNo=4)||(ColumnNo=8) {
+			write YCR,"<TD ALIGN=RIGHT NOWRAP VALIGN=TOP",strBGColor,">",strFontOpen
+		} else {
+			write YCR,"<TD ALIGN=LEFT NOWRAP VALIGN=TOP",strBGColor,">",strFontOpen
+		}
+		
+	; Build YTEXT, adding to subtotals and totals
+	;-----------------------------------
+		set YTEXT = "&nbsp;"
+		if ColumnNo = "02" {
+			set YTEXT = pidLocn
+			
+		} elseif ColumnNo = "03" {
+			set YTEXT = pidStore
+			
+		} elseif ColumnNo = "04" {
+			set YTEXT = $$^WWWDATE(pdteRecvd)
+			
+		} elseif ColumnNo = 4 {
+			do DisplayResQty(pReservedQty,pidItem,pidLocn)
+		}
+		
+	; Output YTEXT information
+	;-----------------------------------
+		write $extract($translate(YTEXT,"|"," "),1,30)
+		write "&nbsp;"
+	;		Display clock link where positive stock on hand or reservation => Reservations
+		if ColumnNo="02" {
+			if (pReservedQty'<0) {
+				do ReservedLink(pidItem_","_pidLocn_","_pidStore_","_pdteRecvd)
+			}
+		}
+		
+	; Close
+	;-----------------------------------
+		write strFontClose,"</TD>",YCR
+	}		
+	write "</TR>",YCR
+	quit				
+	
+	
+SerialNos(pidItem,pidLocn,pidStore,pdteRecvd) ; display up to 10 serial numbers where applicable
+	new count,SN
+	
+	set SN=""
+	for count=1:1:10 {
+		set SN=$order(^INWES(YM,pidItem,pidLocn,pidStore,pdteRecvd,SN),-1)
+		quit:SN=""
+		
+		write SN,"&nbsp;"                    ;SERIENNUMMER
+		if $order(^INWES(YM,pidItem,pidLocn,pidStore,pdteRecvd,SN),-1)'="" write "<BR>"  ;WEITERE SERIENNUMMERN
+	}
+	if '$data(^INWES(YM,pidItem,pidLocn,pidStore,pdteRecvd)) write "&nbsp;"
+	quit
+	
+	
+DisplayResQty(pReservedQty,pidItem="",pidLocn="")
+	;-------------------------------------------------------------------------------
+	;  Display fainter reservation quantity
+	;  For totals where reservations list isn't required - pass only Reserved Qty
+	;-------------------------------------------------------------------------------
+	if pidItem'="" {
+		write YCR,"<A TITLE="_$$$DBLQUOTE_$$^WWWTEXT(32480)_$$$DBLQUOTE     ; "Reserved"   ;RESERVIERT
+		write " HREF=#"_$$$DBLQUOTE_" >"
+	}
+	
+	write "<FONT COLOR=SLATEGRAY"
+	if $piece(YVOR,Y,7)'="" write " SIZE="_$$$DBLQUOTE_$piece(YVOR,Y,7)_$$$DBLQUOTE
+	if pidItem'="" write " title='"_$$ListReservations^INDRPRUN4(pidItem,pidLocn)_"'"      // SR14669
+	write ">"
+	
+	write "("_$$^WWWZAHL(pReservedQty,0,$length($piece(pReservedQty,".",2)))_")"
+	write "</FONT>"
+	
+	if pidItem'="" write "</A>"
+	write "<BR>"
+	quit
+	
+ReservedLink(YKEY)   ; "Items   Reserve"
+	write YCR,"&nbsp;&nbsp;&nbsp;<A HREF="_$$$DBLQUOTE_YAKTION_"EP=WWWFORM&YFORM=INWER"
+	write $$WWWCGI2^WWWCGI()
+	write $$$DBLQUOTE_">"
+	write YCR,"<img src="_YGIF_"time1.gif width=18 HEIGHT=18 border=0 "
+	write "TITLE="_$$$DBLQUOTE_$$^WWWTEXT(32741)_" "_$$^WWWTEXT(32659)_$$$DBLQUOTE_"></A>","&nbsp;",YCR
+	quit
+	
+Link(YKEY)
+	;-------------------------------------------------------------------------------
+	; Wrapper to Isolate YKEY
+	; 
+	; History :
+	; 29-Nov-2006	GRF		SR15232: Original code didn't confine all in NEW commands
+	;-------------------------------------------------------------------------------
+	write $$WWWCGI2^WWWCGI()
+	quit
+		
+Subtotals(pblnHideCosts,&arrTotal)
+	;-------------------------------------------------------------------------------
+	;   (*4*) Subtotal
+	; 
+	; BETRIEB ZWICHENSUMMER:Zugriff auf Bestände anderer Betriebe;26423;FAN;24.09.04
+	; 
+	; History :
+	; 11-Apr-2008	FIS		SR15633: change activated (see main comment header)
+	; 03-Sep-2007	GRF		SRBR014620: Simplify FONT - single construction
+	;-------------------------------------------------------------------------------
+	new ColumnNo,strBGColor,strFontOpen
+	
+	set strFontOpen = "<FONT"
+	if $piece(YVOR,Y,7)'="" set strFontOpen = strFontOpen_" SIZE="_$$$DBLQUOTE_$piece(YVOR,Y,7)_$$$DBLQUOTE
+	set strFontOpen = strFontOpen_" COLOR=DARKORANGE>"
+	
+	if $$$INVORGViewStockFromAllLocations($get(^INVORG(YM,YM,1))) = $$$YES {                ; D218
+		write YCR,"<TR>"
+		set YDDSATZ    = $get(YDDSATZ)+1
+		set strBGColor = $select(YDDSATZ#2=1:" BGCOLOR="_YWHITE,1:"")
+		
+		;AUSWAHL DER DATENFELDER FÜR DATEN (5=SERIENNUMMER)
+	;	for ColumnNo="02","03","04",4,5,7,8,9,14,48,28,2 {
+		for ColumnNo="02","03","04",4,5,2,19,25,48,7,8,28 {                //SR15633
+			continue:pblnHideCosts&&((ColumnNo=8)||(ColumnNo=7)) 		; SR15205
+			
+			if (ColumnNo=4) || (ColumnNo=8) {
+				write "<TD NOWRAP VALIGN=TOP ALIGN=""RIGHT""",strBGColor,">",strFontOpen
+			} else {
+				write "<TD NOWRAP VALIGN=TOP ALIGN=""LEFT""",strBGColor,">",strFontOpen
+			}
+			
+			if ColumnNo="04" {
+				if arrTotal("SubRes") write "<BR>"
+				write $$^WWWTEXT(32799)                              ; "Subtotal"     ;ZWISCHSUMME
+			
+			} elseif ColumnNo=4 {
+				if arrTotal("SubRes") do DisplayResQty(arrTotal("SubRes"))
+				write $$^WWWZAHL(arrTotal("SubQty"),0,$length($piece(arrTotal("SubQty"),".",2)))
+			
+			} elseif ColumnNo=8 {
+				if arrTotal("SubRes") write "<BR>"
+				write $$^WWWZAHL(arrTotal("SubVal"),12,2,YWHR)
+			
+			}
+			write "&nbsp;</FONT></TD>",YCR
+		}
+		write "</TR>",YCR
+	}
+	quit
+	
+	
+Totals(blnHideCosts,&arrTotal)
+	;-------------------------------------------------------------------------------
+	;   (*5*) Footing Announcement - Totals       FUSSANZEIGE
+	; 
+	; History :
+	; 11-Apr-2008	FIS		SR15633: change activated (see main comment header)
+	; 03-Sep-2007	GRF		SRBR014620: Simplify FONT - single construction
+	; 29-Nov-2006	GRF		SR15232: no links for total - cleanup newed variables
+	;-------------------------------------------------------------------------------
+	new ColumnNo,strBGColor,strFontOpen
+	
+	set strFontOpen = "<FONT"
+	if $piece(YVOR,Y,7)'="" set strFontOpen = strFontOpen_" SIZE="_$$$DBLQUOTE_$piece(YVOR,Y,7)_$$$DBLQUOTE
+	set strFontOpen = strFontOpen_" COLOR=DARKORANGE>"
+	
+	write YCR,"<TR>"
+	set YDDSATZ    = $get(YDDSATZ)+1
+	set strBGColor = $select(YDDSATZ#2=1:" BGCOLOR="_YWHITE,1:"")
+	
+  ;	for ColumnNo="02","03","04",4,5,7,8,9,14,48,28,2 {
+	for ColumnNo="02","03","04",4,5,2,19,25,48,7,8,28 {                //SR15633
+		continue:blnHideCosts&&((ColumnNo=7)||(ColumnNo=8)) 		// SR15205
+		
+		if (ColumnNo=4)||(ColumnNo=8) {
+			write "<TD NOWRAP VALIGN=TOP ALIGN=RIGHT"
+		} else {
+			write "<TD NOWRAP VALIGN=TOP ALIGN=LEFT"
+		}
+		write " style="_$$$DBLQUOTE_"border-top:2px solid darkorange;"_$$$DBLQUOTE,strBGColor,">",strFontOpen
+ 
+		if ColumnNo="04" {
+			if arrTotal("TRes") write "<BR>"
+			write "<B>"_$$^WWWTEXT(32868)_"</B>"                     ; "Total Amount"   ;GESAMTSUMME
+		
+		} elseif ColumnNo=4 {
+			if arrTotal("TRes") do DisplayResQty(arrTotal("TRes"))
+			write "<B>"_$$^WWWZAHL(arrTotal("TQty"),0,$length($piece(arrTotal("TQty"),".",2)))_"</B>"
+		
+		} elseif ColumnNo=8 {
+			if arrTotal("TRes") write "<BR>"
+			write "<B>"_$$^WWWZAHL(arrTotal("TVal"),12,2,YWHR)_"</B>"
+		}
+		
+		write "&nbsp;</FONT></TD>",YCR
+	}
+	write "</TR>",YCR
+	
+	quit
+	
+	
+Summary(pidItem,pidLocn)
+	;-------------------------------------------------------------------------------
+	;   (*6*) Entries following Table
+	;-------------------------------------------------------------------------------
+	new Quantity
+	
+	write "<B>"
+	set Quantity=0   ;WEM;24475;24.02.2004;MENGENANZEIGE AM ENDE DER TABELLE
+	
+	; Available Stock
+	; ---------------
+	if $$$INVORGStockLocnProductionBlock($get(^INVORG(YM,YM,1))) = $$$YES {
+		write $$^WWWTEXT(33772)_": "_$$^INARTMENGE(pidItem,,pidLocn)_"<br>"   ;WEM;24475;24.02.2004;VERFÜGBARE MENGE (INKL. KOMMISSION)-NICHT VERFÜGBAR-LEIHLIEFERUNG
+	}
+	
+	; Stock Quantity Including/Excluding Consignment Stock
+	; ----------------------------------------------------
+	set Quantity=$$^INARTMENGE(pidItem,,pidLocn,,1,1)   ; INKL. KOMMISSION
+	write $$^WWWTEXT(33771)_" "_$$^WWWTEXT(33769)_ ": ",$$^WWWZAHL(Quantity,0,$length($piece(Quantity,".",2)))_"<br>"
+	
+	set Quantity=$$^INARTMENGE(pidItem,,pidLocn,,1,0)   ; EXKL. KOMISSION
+	write $$^WWWTEXT(33771)_" "_$$^WWWTEXT(33770)_ ": ",$$^WWWZAHL(Quantity,0,$length($piece(Quantity,".",2)))
+	write "</B>"
+	
+	quit
+	
+]]></Routine>
+</Export>

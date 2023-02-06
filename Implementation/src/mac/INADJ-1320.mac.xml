@@ -1,0 +1,523 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INADJ" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INADJ	; Stock Adjustment
+	
+#include COMSYS
+#include INConst
+#include WWWConst
+#include COMConst
+#include %occInclude
+	; SRBR014564
+#define WSResponse(%Status,%TextCode) %Status_"~#"_%TextCode_": "_$$^WWWTEXT(%TextCode)
+#define FORMFldINADJLineLotNo	    19
+#define FORMFldINADJLineExpiryDate	20
+#define FORMFldINADJLineBrand		21
+#define FORMFldINADJLineOwner		22
+#define FORMFldINADJLineProgram		23
+	
+OnBeforeButtonLine(pidAdj,pobjAdj,&pobjForm)
+	;-------------------------------------------------------------------------------
+	; Set form to readonly if not editable
+	;
+	; Params:	pidAdj		- Adj id
+	; 			pobjAdj		- Adj object
+	;
+	; Returns:	pobjForm	- Form object (WWW120)
+	;
+	; History:
+	; 15-Aug-2006	JW		SR14826: Created
+	;-------------------------------------------------------------------------------
+	if '$$$NoKey(pidAdj) {
+		if '$$Editable(pidAdj) {
+			set $$$WWW120AuthorizationToModifyData(pobjForm) = $$$EnumReadOnly
+		}
+	}
+	quit
+ 
+Editable(pidAdj) 
+	;-------------------------------------------------------------------------------
+	; Is form editable (unprocessed) ?
+	;
+	; Params:	pidAdj - Adj id
+	;
+	; Returns:	status
+	;
+	; History:
+	; 09-sep-2008 	Luke	SR15897 Reverted SR15800:
+ 	; 17-Jul-2008   Luke    SR15800: Add check if the Conversion has been run
+	; 15-Aug-2006	JW		SR14826: Created
+	;-------------------------------------------------------------------------------
+	new objAdj,strStatus
+	
+	set strStatus = $$$OK
+	
+	if $data(^INADJ(0,pidAdj,1)) {
+		set objAdj = $get(^INADJ(0,pidAdj,1))
+		
+		if $$$INADJStatus(objAdj) '= $$$EnumINSTATUSUnprocessed {    ; FIXME : This is not a strStatus string
+			set strStatus = $listbuild("IN00377")  ; "Record already processed"
+		}
+	}
+	quit strStatus
+	
+	
+Postable(pidAdj) 
+	;-------------------------------------------------------------------------------
+	; Test whether this record is postable
+	;
+	; Params:	pidAdj - INADJ id
+	;
+	; ByRefs:
+	;
+	; Returns:	postable status
+	;
+	; History:
+	; 02-Feb-2009	SCR		SR16331: Improved 'Must have lines' check
+	; 02-Feb-2009	SCR		SR16268: Added Line Error text to Status
+	; 06-Jan-2009	HQN		SR16268: Now check lines for validation errors
+	; 25-Oct-2007,  PJones	BR014730, lock a site location when stocktaking
+	; 15-Aug-2006	JW		SR14826: Created
+	;-------------------------------------------------------------------------------
+	new idAdjLine,objAdj,strStatus,strErrorText
+	
+	quit:$$$NoKey(pidAdj) '$$$OK   ; FIXME : <GRF> 1) strStatus? what error message 2) YQ = QDontSave with error?
+	
+	set strStatus = $$Editable(pidAdj)
+
+	if $$$ISOK(strStatus) {
+		if '$data(^INADJLine(0,pidAdj)) {
+			set strStatus = $listbuild("IN00517")  ; "Adjustment must have lines"
+		}
+	}
+	
+	; lock a site location when stocktaking
+	if $$$ISOK(strStatus) {
+		set objAdj = $get(^INADJ(0,pidAdj,1))
+		if objAdj '= "" {
+			if $$IsLockedSiteLocation^INLocking($$$INADJSiteLocation(objAdj)) {
+				set strStatus = $$ReasonLocked^INLocking($$$INADJSiteLocation(objAdj))
+			}
+		}
+	}
+	
+	; Check Line errors
+	if $$$ISOK(strStatus) {
+		set idAdjLine = ""
+		for {
+			set idAdjLine = $order(^INADJLine(0,pidAdj,idAdjLine))
+			quit:idAdjLine=""
+			
+			set strStatus = $$Postable^INADJLine(pidAdj_$$$COMMA_idAdjLine)
+			if $$$ISERR(strStatus) {
+				set strErrorText = $$$Text(strStatus)
+				set strStatus    = $$$MakeStatus("alADJ0005",idAdjLine,strErrorText) ; SCR, Include Error Text in Status
+				quit
+			}
+		}		
+	}
+	if $$$ISOK(strStatus) {
+		set YQ=$$$QSave
+	} else {
+		set YQ=$$$QDontSave_" "_$$$Text(strStatus)
+	}
+	quit strStatus
+ 
+ 
+OnBeforeSave(pidAdj)
+	;-------------------------------------------------------------------------------
+	; Stock Adjustment
+	; 
+	; Params:	pidAdj - INADJ id
+	; 
+	; Returns: Q (ByRef)
+	;
+	; History:
+	; 13-Nov-2011	shobby	SR17910: Validate grid even if unchanged.
+	; 17-Aug-2006	JW		SR14826: Rewrote
+	; 21-Jul-2006	FAN		SR14826 : Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$Editable(pidAdj)
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$$GRIDSave(pidAdj,,$$$YES) ;SR17910
+	}
+	
+	if ((+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) 
+		&& '(+$$$WWWClientParamCoreChangesTCI($get(^WWWClientParam(YM,YM,1))))){
+		;Verifica no tipo 0-Descarte se os lotes selecionados estão realmente vencidos
+		if $$$ISOK(strStatus) {
+			set strStatus = $$VerificaSeVencido^VARINADJ(pidAdj)
+		}
+	}
+	
+	if $$$ISERR(strStatus) {
+		set Q=$$$QDontSave
+		do ReturnError^COMUtilError(strStatus)
+	}
+	quit
+ 
+HyperPost(YKEY)
+	;-------------------------------------------------------------------------------
+	; Post adjustment via Hyper Event
+	;
+	; Returns:Status
+	;
+	; History:
+	; 30-Jul-2013	SCR		CORE-194: Created
+	;-------------------------------------------------------------------------------
+	new YFORM
+	set YFORM	= "INADJ"
+	do Perform^COMTransaction(YFORM,YKEY,"Post^INADJ("""_YKEY_""")","Fin00365")
+	quit $$$OK
+ 
+Post(pidAdj)
+	;-------------------------------------------------------------------------------
+	; Post adjustment
+	;
+	; Returns:Status
+	;
+	; History:
+	; 16-May-2008	GRF		SR15694: remove ^SysSetup("V1 to V2") switch
+	; 29-Apr-2008	GRF		SR15694: Separate processing once processing V2 Bundles
+	; 							as well as V1
+	; 25-Jul-2006	FAN		SR14828: 
+	;-------------------------------------------------------------------------------
+	new strStatus
+	; FIXME : <GRF> Button in INADJ already includes COMTransaction wrapper - that
+	;               should be removed, leaving this.
+	 set strStatus=$$Transaction^COMTransaction("PostTxn^INADJ("""_pidAdj_""")",$$$YES)
+	if $$$ISOK(strStatus) {
+ 
+		do ReloadForm^COMUtilForm()
+	} 
+	quit strStatus
+	
+		; TODO :  <GRF> Allow a specific bundle to be selected for editing
+		;         e.g. if one bundle is negative but is down the pick sequence
+		;         list for a storage should be able to specifically fix it.
+		;         
+		;         * INListBundles calls INADJ and INMOV directly for specific
+		;         * bundles so this is probably now okay.
+		;         
+		;         WORK AROUND : May be rare to have multiple bundles in the
+		;         one storage so may not be a problem.  In the situation where
+		;         it does apply can relocate all "preferred" bundles to another
+		;         storage, "fix" the required bundle, and then relocate the
+		;         other bundles back into the actual storage.
+		;         
+		;         --- Will show bundles in location by storage so all are available.
+		;         
+		;         TODO is appropriate for Web Services
+		
+		; NOTE :  <GRF> If there are multiple bundles being updated for an
+		;         adjustment line, each UpdateBundle call will generate a new
+		;         dMovement transaction which will in turn generate a separate
+		;         back population call for V1 - and thus separate INARTHISTL
+		;         entries.  This may not be a common occurrance.
+		
+PostTxn(pidAdj)
+	;-------------------------------------------------------------------------------
+	; Post adj
+	;
+	; Returns:Status
+	;
+	; History:
+	; 15-Apr-2014	SCR		HEVA-1473: Record Bundle
+	; 07-Jul-2009	SCR		SR16719: New Ledger Interface processing
+	; 05-Mar-2009	GRF		SR16398: Separate the parameters for GetStockHistory^INADJLine
+	; 05-Mar-2009	GRF		SR16398: Replaced text "INSOH001" with "IN00900"
+	; 25-Feb-2009	HQN		SR16398: Update INADJLine Costs; Added Processed* Field
+	; 							updates
+	; 31-Jul-2008	Luke	SR15814: Change Status return value to sc, then convert
+	; 							if needed
+	; 29-Apr-2008	GRF		SR15694: Source using V2Bundles; move processing to method
+	; 28-Apr-2008	GRF		SR15694: only process UpdateObjects if qty
+	;-------------------------------------------------------------------------------
+	new idLine,idLocn,objAdj,objAdjust,objStockHistory,objUAdjustLine,sc,strStatus
+	new idBatch,idBlock,dteDate
+	
+	set strStatus = $$Editable^INADJ(pidAdj)
+ 	set sc = $$$OK
+
+	if $$$ISOK(strStatus) {
+		set objAdj  = $get(^INADJ(0,pidAdj,1))
+		set idLocn  = $$$INADJSiteLocation(objAdj)
+		set dteDate = $horolog
+	}
+	if $$$ISOK(strStatus) {
+		set idLine = ""
+		for {
+			set idLine = $order(^INADJLine(0,pidAdj,idLine))
+			quit:idLine=""
+
+	 		set objAdjust = ##class(alADJ.dUAdjustmentLine).%OpenId("0||"_pidAdj_"||"_idLine)
+	 		set sc = objAdjust.PostTxn()
+	 		set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	 		quit:$$$ISERR(strStatus)
+	 		
+	 		; if successful, update costs from alSOH.dStockHistory back onto this line
+	 		if $$$ISOK(strStatus) {
+		 		set objStockHistory = $$GetStockHistory^INADJLine(pidAdj,idLine)
+		 		if objStockHistory '= $$$NULLOREF {
+			 		set objUAdjustLine = $get(^INADJLine(0,pidAdj,idLine,1))
+		 			set $$$INADJLineUnitCost(objUAdjustLine)	= objStockHistory.StdPrice
+		 			set $$$INADJLineTotalCost(objUAdjustLine)	= objStockHistory.TxValue
+		 			set $$$INADJLineBundle(objUAdjustLine)		= objStockHistory.Bundle.%Id()
+		 			set strStatus = $$$Save("INADJLine",pidAdj_$$$COMMA_idLine,objUAdjustLine,$$$YES)
+		 		} else {
+			 		set strStatus = $$$MakeStatus("IN00900",pidAdj_$$$COMMA_idLine) ; "Stock History not found for reference %1"
+		 		}
+	 		}
+	 		
+		}
+		
+		if $$$ISOK(strStatus) {
+			set $$$INADJStatus(objAdj) = $$$EnumINSTATUSProcessed
+			set $$$INADJProcessedBy(objAdj)   = YBED
+			set $$$INADJProcessedDate(objAdj) = $horolog
+			set strStatus = $$$Save("INADJ",pidAdj,objAdj,1)
+		}
+	}
+	
+	quit strStatus
+
+	
+LoadGrid(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Code for Grid Edit 
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Sep-2013	SCR		CORE-266: Pass in Location to GetAttributes
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than objGrid; GRID Macros
+	; 09-Jul-2009	PPP		SR16721: Optional policy definitions (can be 1-Yes, 2-No, 3-Optional)
+	; 19-Jun-2009 	PPP 	SR16510: 	1. Updated routine to use INItemPolicy class
+	;									2. Included BRAND, OWNER, PROGRAM in the col checks
+	;									   
+	; 05-Mar-2009	GRF		SR16398: FORMFld macros; clarify boolean usage and
+	; 							simplify Hide/Show
+	; 12-May-2008	HQN		SR15726: Detemine initial hide/show from loaded record
+	; 09-May-2008	HQN		SR15726: Hide Lot No and Expiry Date Columns until used
+	; 25-Jul-2006	FAN		SR14828: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,blnHideExpiry,blnHideLotNo,idForm,objItem,strAdjLine,strLineYKEY,YAUSWAHL
+	new blnLotNo,blnUseByDate,blnLotUnique,intBrand,intOwner,intProgram
+	new blnHideBrand,blnHideOwner,blnHideProgram,idItem
+	new objADJ,idLoc
+	
+	quit:pYKEY=""
+
+	if ((+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) 
+		&& '(+$$$WWWClientParamCoreChangesTCI($get(^WWWClientParam(YM,YM,1))))){
+		;set idForm="INADJLine"
+		if YFORM = "VARINADJDoacao" {
+			set ^CacheTempEvent(YUCI,"VARINADJDoacaoLinha","Container") = 1
+			set ^CacheTempEvent(YUCI,"VARINADJDoacaoLinha","Format") = 1 
+			set idForm = "VARINADJDoacaoLinha"		
+		} elseif YFORM = "VARINADJ" {
+			set ^CacheTempEvent(YUCI,"VARINADJLinha","Container") = 1
+			set ^CacheTempEvent(YUCI,"VARINADJLinha","Format") = 1 
+			set idForm = "VARINADJLinha"		 
+		} else {
+			set idForm = "INADJLine"
+		}
+	
+		set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+		set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 400
+		set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+		set $$$COMGridEditParameterUpdateFields(YAUSWAHL)  = "D2=7"
+		set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+
+		;set $$$COMGridEditParameterContainer(YAUSWAHL)     = "INADJ"
+		if YFORM = "VARINADJDoacao" {
+			set $$$COMGridEditParameterContainer(YAUSWAHL)     = "VARINADJDoacao"	
+
+		} elseif YFORM = "VARINADJ" {
+			set $$$COMGridEditParameterContainer(YAUSWAHL)     = "VARINADJ"	
+
+		} else {
+			set $$$COMGridEditParameterContainer(YAUSWAHL)     = "INADJ"
+		}
+	}
+	else {
+		;set idForm="INADJLine"
+		if (+$$$WWWClientParamCoreChangesTCI($get(^WWWClientParam(YM,YM,1)))) {
+			set idForm="VARTCIINADJLine"
+		} else {
+			set idForm="INADJLine"
+		}
+
+		set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+		set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 400
+		set $$$COMGridEditParameterGridName(YAUSWAHL)      = idForm
+
+		//Note:the following does line totals addition and displays on the gridheader field
+		//ie Add all #7 on the grid lines and update #2 on the Grid Header
+		set $$$COMGridEditParameterUpdateFields(YAUSWAHL)  = "D2=7"
+
+		set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+		;set $$$COMGridEditParameterContainer(YAUSWAHL)     = "INADJ"
+		if (+$$$WWWClientParamCoreChangesTCI($get(^WWWClientParam(YM,YM,1)))) {
+			set $$$COMGridEditParameterContainer(YAUSWAHL)     = "VARTCIINADJ"
+		} else {
+			set $$$COMGridEditParameterContainer(YAUSWAHL)     = "INADJ"
+		}
+	}
+
+	$$$GRIDStart(idForm,pYKEY)
+
+	$$$GRIDGetContents(.arrGrid)    ; FIXME : This appears to be obsolete with comment of next line.
+	//do UpdateContainer^INADJLine(,$g(arrGrid))
+
+
+	; Hide all Policy Columns until needed
+	; Initial Load, check on disk line records
+
+	set blnHideLotNo   = $$$YES
+	set blnHideExpiry  = $$$YES
+	set blnHideBrand   = $$$YES
+	set blnHideOwner   = $$$YES
+	set blnHideProgram = $$$YES
+	
+	set objADJ		= $get(^INADJ(YM,pYKEY,1))
+	set idLoc		= $$$INADJSiteLocation(objADJ)
+	set strLineYKEY = ""
+	for {
+		set strLineYKEY = $order(^WWWDATEN(0,+$horolog,YUSER,idForm,"V","REFERENCEROW",strLineYKEY))
+		quit:(strLineYKEY = "")
+	
+		set strAdjLine = $$$GRIDGetYFELD(strLineYKEY)
+		set idItem = $$$INADJLineItem(strAdjLine)
+		if idItem'="" {
+			do GetAttributes^INItemPolicyUtils(idItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,idLoc)
+			if blnLotNo                       set blnHideLotNo   = $$$NO
+			if blnUseByDate                   set blnHideExpiry  = $$$NO
+			if (intBrand=1)||(intBrand=3)     set blnHideBrand   = $$$NO
+			if (intOwner=1)||(intOwner=3)     set blnHideOwner   = $$$NO
+			if (intProgram=1)||(intProgram=3) set blnHideProgram = $$$NO
+		}
+	}
+
+	if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+		if YFORM = "VARINADJDoacao" {	
+	
+			$$$StartScript()
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineLotNo,blnHideLotNo,"VARINADJDoacaoLinha")    		; F19
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineExpiryDate,blnHideExpiry,"VARINADJDoacaoLinha") 	; F20
+			//SR16510
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineBrand,blnHideBrand,"VARINADJDoacaoLinha")  			; F21
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineOwner,blnHideOwner,"VARINADJDoacaoLinha")  			; F22
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineProgram,blnHideProgram,"VARINADJDoacaoLinha")  		; F23
+			$$$EndScript()
+
+		} elseif YFORM = "VARINADJ" {
+
+			$$$StartScript()
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineLotNo,blnHideLotNo,"VARINADJLinha")    		; F19
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineExpiryDate,blnHideExpiry,"VARINADJLinha") 	; F20
+			//SR16510
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineBrand,blnHideBrand,"VARINADJLinha")  			; F21
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineOwner,blnHideOwner,"VARINADJLinha")  			; F22
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineProgram,blnHideProgram,"VARINADJLinha")  		; F23
+			$$$EndScript()
+
+		} elseif YFORM = "VARTCIINADJ" {
+
+			$$$StartScript()
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineLotNo,blnHideLotNo,"VARTCIINADJLine")    		; F19
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineExpiryDate,blnHideExpiry,"VARTCIINADJLine") 	; F20
+			//SR16510
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineBrand,blnHideBrand,"VARTCIINADJLine")  			; F21
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineOwner,blnHideOwner,"VARTCIINADJLine")  			; F22
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineProgram,blnHideProgram,"VARTCIINADJLine")  		; F23
+			$$$EndScript()
+
+		} else {
+	
+			$$$StartScript()
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineLotNo,blnHideLotNo,"INADJLine")    		; F19
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineExpiryDate,blnHideExpiry,"INADJLine") 	; F20
+			//SR16510
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineBrand,blnHideBrand,"INADJLine")  			; F21
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineOwner,blnHideOwner,"INADJLine")  			; F22
+			$$$GRIDHideShowColumns($$$FORMFldINADJLineProgram,blnHideProgram,"INADJLine")  		; F23
+			$$$EndScript()
+		}
+	}
+	else {
+		$$$StartScript()
+		$$$GRIDHideShowColumns($$$FORMFldINADJLineLotNo,blnHideLotNo,"INADJLine")    		; F19
+		$$$GRIDHideShowColumns($$$FORMFldINADJLineExpiryDate,blnHideExpiry,"INADJLine") 	; F20
+		//SR16510
+		$$$GRIDHideShowColumns($$$FORMFldINADJLineBrand,blnHideBrand,"INADJLine")  			; F21
+		$$$GRIDHideShowColumns($$$FORMFldINADJLineOwner,blnHideOwner,"INADJLine")  			; F22
+		$$$GRIDHideShowColumns($$$FORMFldINADJLineProgram,blnHideProgram,"INADJLine")  		; F23
+		$$$EndScript()
+	}
+	
+	quit 
+	
+	
+OnAfterDataFields(pidAdj)
+	;-------------------------------------------------------------------------------
+	; Code to run when called by the AfterDataField event on the @netManager form.
+	;
+	; History:
+	; 21-Jul-2006	FAN		SR14826: Created
+	;-------------------------------------------------------------------------------
+	do LoadGrid(pidAdj)
+	quit
+	
+	
+ConsumptionAdjust(pidLocn,pidItem,pfltQty,pidStorage,pdteReceived,pstrOrderRef,pstrLot)
+	;-------------------------------------------------------------------------------
+	; Create consumption Adjustment (remote via Web Service Interface)
+	; 
+	; Called By : Not called
+	; 
+	; Inputs:
+	;	pidLocn      	= location
+	;	pidItem      	= item
+	;	pfltQty      	= qty to be taken out of the specified storage
+	;	pidStorage   	= storage location id
+	;	pdteReceived	= receiving date - if blank then will allocate from oldest
+	;					  received else will base on date specified. (may have suffix)
+	;	pstrOrderRef 	= order reference
+	;	pstrLot      	= lot number
+	; 
+	; ByRef:
+	;
+	; Returns: Status code
+	;	
+	; History:
+	; 08-Oct-2008	FIS		BR014564: DEPRECATED -> see INWSConsumptionInterface
+	; 20-Feb-2008	FIS		BR014564: return adjustment number
+	; 05-Feb-2008	FIS		BR014564: set new field NoPartialAdjustment to $$$YES
+	; 05-Feb-2008	FIS		BR014564: De-Activated 25-Jan-2008 change. Better change
+	; 							is now made in Adjust^INWE [development code deleted]
+	; 31-Jan-2008	GRF		BR014564: Activated 25-Jan-2008 change.
+	; 25-Jan-2008	FIS		BR014564: Add Adjustment UNDO if qty goes negative
+	; 18-Jan-2008	GRF		BR014564: Moved #define to top of routine; aligned error
+	; 							text; new list corrected; structure required by
+	; 							coding standards restored; don't need $data AND
+	; 							$order; no need for strDemandStatus - use strStatus
+	; 							(was also shown as strDemStatus).
+	; 15-Jan-2008	FIS		BR014564: language texts with return text code added;
+	; 							return additional failure message if related demand
+	; 							could not be found; catch errors while processing
+	; 							and save it in WWWERROR
+	; 15-Jan-2008	GRF		BR014564: Revision for optional date in web service;
+	; 							additional status checks; '>0 becomes =0 after <0
+	; 							case is turned to zero.
+	; 29-Nov-2007	PJones	Base Storage check on INLP rather than INWE
+	; 02-Nov-2007	FIS		BR014564: Add new Adjustment
+	;-------------------------------------------------------------------------------
+	
+	quit 0  ;######### DEPRECATED ############
+	
+]]></Routine>
+</Export>

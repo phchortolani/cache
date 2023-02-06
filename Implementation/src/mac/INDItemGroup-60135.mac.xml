@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INDItemGroup" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INDItemGroup
+#include COMSYS
+#include INConst
+#include WWWConst
+#include COMConst
+	
+#define HandleError(%1,%2)		if $$$ISERR(%1) set %2($increment(%2)) = %1
+	
+GetDescription(pidGroup)
+	;-------------------------------------------------------------------------------
+	; Return group description.
+	;
+	; Params:	pidGroup	- group id
+	;
+	; ByRefs:
+	;
+	; Returns:	string
+	;
+	; History:
+	; 27-Nov-2006	JW		BR014285: Created
+	;-------------------------------------------------------------------------------
+	new strDesc
+	
+	set strDesc = $$$INItemGroupLangDescription($get(^INItemGroupLang(YM,pidGroup,SPRACHE,1)))
+	if strDesc="" {
+		set strDesc = $$$INItemGroupDescription($get(^INItemGroup(YM,pidGroup,1)))
+	}
+	quit strDesc
+ 
+ 
+IsUsable(pidGroup,pidForm)
+	;-------------------------------------------------------------------------------
+	; Whether item group can be used at this time.
+	;
+	; Params:	pidGroup - group id
+	;
+	; Returns:	status
+	;
+	; History:
+	; 12-Jan-2007	JW		SR15309: Check for active
+	; 27-Nov-2006	JW		BR014285: Created
+	;-------------------------------------------------------------------------------
+	new dteInactive,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$INItemGroupActive1($get(^INItemGroup(YM,pidGroup,1))) {
+		set strStatus = $listbuild("IN00639",pidGroup)  ;Item Group %1 is inactive.
+		
+	} elseif $listfind($listbuild("INART","INANGP","INAUFP"),pidForm) {
+		
+		if $$$INVORGNoMainItemGroupsSelectabl($GET(^INVORG(YM,YM,1))) {
+			if $data(^INItemGroups(YM,1,$$$Index(pidGroup))) {
+				set strStatus = $listbuild("IN00562") ;Parent groups cannot be selected.
+			}
+		}
+	}
+	quit strStatus
+ 
+ 
+DataConversion(pidCompany,&parrError)
+	;-------------------------------------------------------------------------------
+	; INPARA -> INItemGroup
+	;
+	; Params:	pidCompany - company to convert
+	; 			
+	; ByRefs:	parrError - array of errors
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Mar-2007	JW		SR15463: Return errors from VAR Conversion
+	; 12-Jan-2007	JW		SR15309: Added active flag
+	; 23-Nov-2006	JW		BR014285: Created
+	;-------------------------------------------------------------------------------
+	new YM,strDelim,arrParams,idLang,idParam,intLoop,idGroup,idParent,objPara,objGroup,strStatus
+	new arrConversion,objINVORG,blnChanged,arrSALError,idDfltLang,objLang
+	
+	kill parrError
+	set YM = pidCompany
+	
+	// ********* Translate all VAR database relations ***********
+	
+	; Don't think there will be many, but...
+	//do DatabaseConversion("VAR")
+	do DatabaseConversion("VAR",.parrError)		//SR15463
+	
+	
+	// ********* Get old & set new delimiter *********
+	
+	set strDelim = $$GetDelimiter^INWAGRUCHECK()
+	
+	set objINVORG = $get(^INVORG(YM,YM,1))
+	set $$$INVORGItemGroupDelimiter(objINVORG) = strDelim
+	set strStatus = $$$Save("INVORG",YM,objINVORG,1)
+	$$$HandleError(strStatus,parrError)
+	
+	// ********* Translate INPARA -> INItemGroup  ***********
+	
+	; Work out the default language - dodgy, but works for all current data.
+	
+	set idDfltLang = "EN"
+	if $$$WWW012StandardCurrency($get(^WWW012(0,YM,1)))="BRR" {
+		set idDfltLang = "PT"
+	}
+	
+	set blnChanged = $$$NO		// Store whether there is any need for data conversion
+	
+	$$$Order3(^INPARA,YM,"WARENGRUPPE",idLang)
+		$$$Order4(^INPARA,YM,"WARENGRUPPE",idLang,idParam)
+			
+			set arrParams(idParam,idLang) = $get(^INPARA(YM,"WARENGRUPPE",idLang,idParam,1))
+			
+			if idLang = idDfltLang {	
+				// Store data conversion (last piece)
+	 			set arrConversion(idParam) = $piece(idParam,strDelim,$length(idParam,strDelim))
+ 				if idParam[strDelim set blnChanged = $$$YES
+			}
+		$$$End
+	$$$End
+	
+	
+	if blnChanged {	// If need to convert
+	
+		// ********* Translate all occurrences in database ***********
+	
+		do ConvertAllRelations^WWWDataDictionary("INItemGroup",.arrConversion,.parrError)
+		
+		
+		// ********* Match SALGroup to INItemGroup  ***********
+		
+		; Because INPARA -> SALGroup is a 1-1 mirror, need to also convert SALGroup.
+		; So convert the key of SALGroup, then its relations
+		
+		; Don't return the errors, just log for information
+		;  - as there may be some extra SALGroup records that do not have an IN equivalent
+		
+		do ConvertKey^WWWDataDictionary("SALGroup",1,.arrConversion,.arrSALError)
+		do ConvertAllRelations^WWWDataDictionary("SALGroup",.arrConversion,.arrSALError)
+		merge ^zzBR014285 = arrSALError
+	}
+	
+	
+	// ********* Finally, save INItemGroup / INItemGroupLang records ***********
+	
+	; Do this last to avoid issues with DCM and translating self
+	
+	// Transfer data
+	$$$Order1(arrParams,idParam)									// A-B-C
+ 		continue:'$data(arrParams(idParam,idDfltLang))	// dflt only
+ 		
+		// for all ancestors and self
+		// 		if not already created, create
+		
+		set idParent = ""
+		for intLoop = 1:1 {
+			set idGroup = $piece(idParam,strDelim,intLoop)			// A, B, C
+			quit:idGroup=""
+			
+				// Create group if haven't already
+			if '$data(^INItemGroup(YM,idGroup)) {
+				set objPara = arrParams(idParam,idDfltLang)		// default language
+				
+				set $$$INItemGroupParentGroup(objGroup) = idParent
+				set $$$INItemGroupDescription(objGroup) = $$$INPARAText(objPara)
+				set $$$INItemGroupColourCode(objGroup)  = $$$INPARAColorcode(objPara)
+				set $$$INItemGroupAcronym(objGroup)     = idGroup
+				set $$$INItemGroupActive1(objGroup)     = $$$YES		//SR15309
+				
+				set strStatus = $$$Save("INItemGroup",idGroup,objGroup,1)
+				$$$HandleError(strStatus,parrError)
+			}
+			set idParent = idGroup
+		}
+		
+		// Transfer translations (idParent is now the child node)
+		
+		$$$Order2(arrParams,idParam,idLang)
+			continue:idLang=idDfltLang
+			set objPara = arrParams(idParam,idLang)
+			set $$$INItemGroupLangDescription(objLang) = $$$INPARAText(objPara)
+			set strStatus = $$$Save("INItemGroupLang",idParent_","_idLang,objLang,1)
+			$$$HandleError(strStatus,parrError)
+		$$$End
+	$$$End
+	
+	quit 
+	
+ 
+DatabaseConversion(pidModule="",&parrError)
+	;-------------------------------------------------------------------------------
+	; INPARA -> INItemGroup
+	; AEPINPARA -> INItemGroup
+	; 
+	; NOTE: This function was run in DEV on 4-Dec-2006 for all modules
+	; 
+	; Params:	pidModule - (optional) module to filter by
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 02-Mar-2007	JW		SR15463: Remove tstart, return array of errors.
+	; 24-Nov-2006	JW		BR014285: Created
+	;-------------------------------------------------------------------------------
+	new arrRels,blnClass,idClass,idKey1,idKey2,strKeys,strStatus,objData
+	new intFldRelCls,intFldRelKey,intFldRelDF,idGroupClass
+	
+	for idGroupClass = "INPARA","AEPINPARA" {
+		do FindRelations^WWWDataDictionary(idGroupClass,.arrRels,"""WARENGRUPPE"",SPRACHE")
+		
+		$$$Order1(arrRels,idClass)
+			quit:$extract(idClass,1,$length(pidModule))'=pidModule
+			
+			set blnClass = ($extract(idClass,4)=0)		// Whether class or form class
+			set intFldRelCls = $select(blnClass: 8,1:32)
+			set intFldRelKey = $select(blnClass: 9,1:33)
+			set intFldRelDF	 = $select(blnClass:10,1:34)
+			
+			$$$Order2(arrRels,idClass,idKey1)
+				$$$Order3(arrRels,idClass,idKey1,idKey2)
+					set strKeys = idKey1_","_idKey2
+					set objData = $$$DATA(idClass,strKeys)
+					
+					set $piece(objData,Y,intFldRelCls) = "INItemGroup"
+					set $piece(objData,Y,intFldRelKey) = ""
+					set $piece(objData,Y,intFldRelDF)  = 2			// Description rel display
+					
+					set strStatus = $$$Save(idClass,strKeys,objData,1)
+	 				$$$HandleError(strStatus,parrError)
+	 			$$$End
+	 		$$$End
+	 	$$$End
+	}
+	
+	quit
+	
+]]></Routine>
+</Export>

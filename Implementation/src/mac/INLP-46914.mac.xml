@@ -1,0 +1,654 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INLP" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INLP
+	
+#include COMSYS
+#include INConst
+#include %occInclude
+	
+OnAfterPrimaryKey(YKEY)
+	;-------------------------------------------------------------------------------
+	; Some fields will be invisible if no temporary storage setup for this location
+	; (See core rules)
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Jun-2011	shobby	SR17749.1: For a new record, assume the current location 
+	;							when testing whether to show the TSU controls.
+	; 11-May-2011	shobby	SR17749: Renamed from OnBeforeFormConstruction.
+	; 26-Oct-2010	GRF		SR17541: Don't return a value
+	; 07-Oct-2010	shobby	SR17541: Created
+	;-------------------------------------------------------------------------------
+	if YKEY="" set YKEY=$get(YLOCATION)
+	if $$$KEY1(YKEY)'="" {
+		set YOPTION1 = $$TemporaryStorageLocations^WWW0121($$$KEY1(YKEY))
+	}
+	quit
+	
+	
+OnBeforeSave(pidKey,&pobjINLP)
+	;-------------------------------------------------------------------------------
+	; On Before Save of INLP form
+	;
+	; Params:
+	;	pidKEY		YM,Locn,Storage
+	;	pobjINLP	Storage record
+	;	
+	; ByRefs:
+	;	Q			Save/Don't Save flag
+	; 
+	; Returns: none
+	;
+	; History:
+	; 19-Jul-2011	GRF		SR17830: Cannot save a TSU if the Physical Location is
+	;							also a TSU
+	; 04-May-2011	PPP		SR17674: More validation to OnBeforeSave
+	; 28-Oct-2010	shobby	SR17592: Update the field if needed rather than report
+	;							an error.  field can now be hidden.
+	; 21-Jan-2008	GRF		SR15563: Internationalise
+	; 26-Oct-2007	GRF		SR15563: Created
+	;-------------------------------------------------------------------------------
+	new idCompany,idLocn,idStorage,objPhysical,strStatus
+
+	set idCompany = $$$KEY1(pidKey)   ; FIXME : Keys are not used
+	set idLocn    = $$$KEY2(pidKey)
+	set idStorage = $$$KEY3(pidKey)
+	
+	if $$$INLPDepartment(pobjINLP)'="" {
+		set $$$INLPDepartment(pobjINLP) = ""
+	;SR17592 $$$Alert($$^WWWTEXT("IN00569"))   ; "'Department' is obsolete - please remove before saving."
+	;SR17592 set Q = $$$QDontSave
+	}
+	
+	set Q         = $$$QSave
+	set strStatus = $$$OK
+	
+	if $$$INLPTemporaryStorageUnit(pobjINLP) {
+		if $$$INLPPhysical(pobjINLP) = "" {
+			set strStatus = $$$MakeStatus("IN01292")
+		 ; "Physical Storage must be entered for a TSU"
+		} else {
+			set objPhysical = $get(^INLP(0,idLocn,$$$INLPPhysical(pobjINLP),1))
+			if $$$INLPTemporaryStorageUnit(objPhysical) {
+				set strStatus = $$$MakeStatus("IN01292")     ; SR17830           FIXME : wrong text # - temp
+			}
+		}
+	}
+	if $$$ISERR(strStatus) {
+	 	do ReturnError^COMUtilError(strStatus)
+	 	set Q = $$$QDontSave
+ 	}
+	quit
+	
+	
+OnBeforeDelete(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Storages with stock on hand or history cannot be deleted
+	; 
+	; Called By: Execute Before Delete Possibility in form INLP
+	; 
+	; Returns (ByRef) : Q - is delete button to be displayed?
+	; 
+	; History:
+	; 19-Mar-2011	shobby	SR17590.1: Return a status message that we can use from
+	;							INLP2Line
+	; 25-Sep-2008	GRF		SR15932: Created
+	;-------------------------------------------------------------------------------
+	new idLocn,idStore,objStorage,sc,strStatus
+	
+	set Q         = $$$QDelete
+	set strStatus = $$$OK                       ;SR17590.1
+	
+	set idLocn  = $$$KEY1(pYKEY)
+	set idStore = $$$KEY2(pYKEY)
+	
+	set objStorage = ##class(alLOC.iLOC).GetStorage(idLocn,idStore,.sc)
+	
+	if objStorage = $$$NULLOREF {
+		set Q         = $$$QDontDelete
+		set strStatus = $$$MakeStatus("IN01283")      ; "No Storage."    ;SR17590.1 Only if mismatch between @netManager and objects
+	
+	} elseif $$SQLCount(objStorage.%Id()) > 0 {  ; HistoryExists
+		set Q         = $$$QDontDelete
+		set strStatus = $$$MakeStatus("IN01284")      ; "Can't delete Storage with Stock On Hand"  ;SR17590.1
+	}	
+	
+	; NOT REQUIRED since MUST have history if have stock on hand
+	;	; Stock On Hand  ; Equivalent to $data(^INWEs(0,4,idxLocn,idxStore))
+	;	set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dSOH:GetItems")
+	quit strStatus
+	
+	
+SQLCount(pidLocnStore)
+	;-------------------------------------------------------------------------------
+	; Find if Storage has been used in Stock History
+	; 
+	; Called By:
+	;  OnBeforeDelete^INLP
+	;  Core Rule for field Temporary Storage Unit
+	;
+	; Returns (ByRef) : boolean
+	; 
+	; History:
+	; 02-May-2011	PPP		SR17715: Updated to use Top 1
+	; 25-Sep-2008	GRF		SR15932: Created
+	;-------------------------------------------------------------------------------
+	new idHistory    ;,SQLCODE
+	
+	//	SELECT sum(%ID) into :intCount FROM alSOH.dStockHistory WHERE (Storage = :pidLocnStore)  //SR17715
+	//if SQLCODE set intCount=0
+	//quit intCount
+	
+	&sql(
+		SELECT TOP 1 (%ID) into :idHistory FROM alSOH.dStockHistory WHERE (Storage = :pidLocnStore)
+	)
+	quit $select($get(idHistory):$$$YES,1:$$$NO)
+
+	
+OnBeforeDataAccess(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	; Filters the current item. It is shown only if this routine returns $$$YES.
+	; It should be noted that COMVIEW is already listing only those values that are
+	; related to the current site location set in the current INWEINVLINE.
+	; 
+	; Called by: OnBeforeDataAccess Class Hook for class INLP
+	; 
+	; Params:
+	;
+	; Returns:
+	; $$$YES - the item will be shown
+	; $$$NO  - the item won't be shown because it failed the criteria
+	;
+	; History:
+	; 24-Mar-2014	SCR		SESDF-1299: Exclude Delete Storage
+	; 25-May-2012	PPP		SR17955.1: Added Item check
+	; 15-Nov-2011	PPP		SR17955: Removed the check for DeleteLocation (problem
+	;							with INRECTFR- consumption location)
+	; 12-May-2011	PPP		SR17674: Ensure that INLPDisusedStorage are available
+	;							only in the INLP FORM and excluded elsewhere
+	; 12-May-2011	GRF		SR17763: INMOVByPallet validation - split key once
+	; 09-May-2011	PPP		SR17674  If Delete Location do not show (& INLPDisusedStorage)
+	; 02-Oct-2010	shobby	SR17598: WWW0121C call out
+	; 01-Oct-2010	shobby	SR17541: Only show locations that are not 'Temporary
+	;							Storage Locations'
+	; 25-Sep-2008	GRF		SR15932: "Storage"
+	; 21-Jan-2008	GRF		SRBR014847: Variable prefixes
+	; 15-Jan-2008	LUIS	SRBR014847: Created
+	;-------------------------------------------------------------------------------
+	new blnConsumable,blnDelStorage,idClass,idFromStorage,idLocn,idStocktake
+	new idStore,idToStorage,objINLP,objStocktake,strLocnList,strStatus
+	
+	set idLocn    = $$$KEY1(YKEY)
+	set idStore   = $$$KEY2(YKEY)
+	set strStatus = $$$YES
+	
+	//SR17674:If Delete Location do not show
+	//SR17955: vvv
+	//if $$IsDeleteLocation^INLP(idStore) quit $$$NO
+	if $get(YFORM)'="" {
+		set idClass = $$$GetClass(YFORM)
+	
+		;------------------------
+		; Delete Loc  1  0  1  0 
+		; Consumable  1  1  0  0
+		;   Result    1  0  0  1
+		;------------------------
+		if idClass = "INRECLine" {
+			//SR17955.1
+			if $$$INRECLineItem(YFELD)'="" {
+				set blnConsumable = $$IsConsumable^INARTLOCPAR($$$INRECLineItem(YFELD),idLocn)
+			}
+			set blnDelStorage = $$IsDeleteLocation^INLP(idStore)
+			if $get(blnConsumable) {
+				set:'blnDelStorage strStatus = $$$NO
+			} else {
+				set:blnDelStorage strStatus = $$$NO			
+			}
+			
+		}
+	}
+	//SR17955: ^^^
+	
+	if ($get(YFORM)="INWEINVELINE") {
+		if $data(^CacheTempStocktakePara(YUSER,"idStocktake")) {
+			;Get the id that was stored in OnAfterPrimaryKey^INWEINVEHeader
+			set idStocktake = $get(^CacheTempStocktakePara(YUSER,"idStocktake"))
+			
+			;Load the record from INWEINVP 
+			set objStocktake  = $$GetStocktake^INStocktaking(idStocktake)
+			set idFromStorage = $$$INWEINVPFromStockLocation(objStocktake)
+			set idToStorage   = $$$INWEINVPToStockLocation(objStocktake)
+			
+			;All storages must fall within the selected values
+			set strStatus = $$StorageRangeCheck^INStocktaking(idStore,idFromStorage,idToStorage)
+		}
+		
+	} elseif $get(YFORM)="INLP" {      ; SR17541
+		if (idLocn'="") && (idStore'="") {
+			set objINLP   = $get(^INLP(0,idLocn,idStore,1))
+			set strStatus = '$$$INLPTemporaryStorageUnit(objINLP)
+		}
+	
+	} elseif $get(YFORM)="WWW0121C" {  ; SR17598	
+		//SR17955
+		set strStatus = '$$IsDeleteLocation^INLP(idStore)
+		if $$$ISOK(strStatus) {
+			set strStatus = $$OnBeforeDataAccess^WWW0121C(YFORM,YKEY,YFELD,YKEYCONTAINER)
+		}
+			
+	} elseif $get(YFORM)="INWEINVP" {  ; SR17632
+		set strLocnList = ";"_$$$INWEINVPSiteLocation($$GetFormData^COMUtilForm(YFORM))_";"
+		set strStatus   = (strLocnList[(";"_idLocn_";"))
+
+	} elseif $get(YFORM)="INMOVByPallet" {  ; exclude TSU  ; SR17763
+		if (idLocn'="") && (idStore'="") {
+			set objINLP   = $get(^INLP(0,idLocn,idStore,1))
+			set strStatus = '$$$INLPTemporaryStorageUnit(objINLP)
+		}
+	}
+	
+	if $$$ISOK(strStatus) && ($get(YFORM)'="INLP") { ; SR17674
+		if (idLocn'="") && (idStore'="") {
+			set objINLP   = $get(^INLP(0,idLocn,idStore,1))	
+			set strStatus = '$$$INLPDisusedStorage(objINLP)
+			set strStatus = '$$IsDeleteLocation^INLP(idStore)
+		}
+	}
+	
+	
+	if (($get(YFORM)="INIssueLocLine") && (idStore="X")) {  ;HEVA-2044
+		set strStatus = $$$OK
+	}
+	
+	
+	
+	quit strStatus	
+	
+	
+IsDeleteLocation(pidINLP)
+	;-------------------------------------------------------------------------------
+	; Test if this is the delete storage
+	;
+	; Params:
+	;	pidINLP		the id of the storage
+	;	
+	; Returns: $$$YES if it is the delete storage, otherwise, $$$NO
+	;
+	; History:
+	; 14-Jan-2008	PJones	Created, (moved from our INADJ)
+	;-------------------------------------------------------------------------------
+	new blnIsDelete
+	
+	if pidINLP = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1))) {
+		set blnIsDelete = $$$YES
+	} else {
+		set blnIsDelete = $$$NO
+	}
+	quit blnIsDelete
+	
+	
+ValidStorage(pidLocn,pidStore) 
+	;-------------------------------------------------------------------------------
+	; Is pidStorage not null and a valid storage for location?
+	;
+	; Params:
+	;	pidLocn		The location id - assumes already validated
+	;	pidStore 	The storage id
+	;	
+	; Returns: $$$YES if this is an existing storage for the location, otherwise $$$NO
+	;
+	; History:
+	; 25-Sep-2008	GRF		SR15932: Language Text; coding standards
+	; 14-Jan-2008	PJones	Created, (moved from our INADJ)
+	; -------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	if pidStore = "" {
+		set strStatus = $$$MakeStatus("IN00820") ; "Given storage id is blank"
+	
+	} elseif '$data(^INLP(0,pidLocn,pidStore,1)) {
+		set strStatus = $$$MakeStatus("IN00821",pidLocn,pidStore)
+	} ; "Storage %1 does not exist in location %2"
+	quit strStatus
+	
+	
+GetStorage(pidItem, pidLocn)
+	;-------------------------------------------------------------------------------
+	; Calculate Storage for an Item and Location
+	; 			
+	; Params:	pidLocn,pidStore	- location and storage
+	;
+	; Returns: idStore
+	;
+	; History:
+	; 17-Jun-2009	PPP		SR16648:Created
+	;-------------------------------------------------------------------------------
+	new idStore
+	
+	set idStore = ""
+	
+	if $$IsConsumable^INARTLOCPAR(pidItem,pidLocn) {
+		set idStore = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+	} else {
+		if (idStore'="") && '$data(^INLP(0,pidLocn,idStore)) set idStore = ""
+		if idStore="" {
+			set idStore = $$DefaultRecStkLoc(pidLocn,pidItem)
+		}
+	}
+	quit idStore
+	
+ 
+DefaultRecStkLoc(pidLocn, pidItem)
+	;-------------------------------------------------------------------------------
+	; Get default storage
+	;
+	; Params:
+	; 	pidLocn: Location ID
+	; 	pidItem: Item ID
+	;
+	; ByRefs:
+	; 	YM 	Company ID
+	;
+	; Returns:
+	; 	Storage.StockLocation or strStatus
+	;
+	; History:
+	; 17-Jun-2009	PPP		SR16648:Created
+	;-------------------------------------------------------------------------------
+	new idStore,objLocation,objStorage,sc,strStatus
+	
+	set idStore     = ""
+	set objLocation = ##class(alLOC.dULocation).%OpenId("0||"_pidLocn)
+	set objStorage  = objLocation.GetDefaultReceiptStorage($get(pidItem),.sc)
+	if $$$ISOK(sc) {
+		set idStore = objStorage.StockLocation
+	} else {
+		set idStore = $$ISStatusToDLStatus^COMUtilError(sc)
+	}
+	quit idStore
+	
+	
+Description()
+	;-------------------------------------------------------------------------------
+	; Calculated Description field for Storages.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 04-May-2011	shobby	SR17714.4: Created
+	;-------------------------------------------------------------------------------
+	new strDescription
+
+	if '$data(YFELD) quit ""  ; Tempoary fix for SQL
+	if $$$INLPTemporaryStorageUnit(YFELD) {
+		set strDescription = $$$INLPRemarks(YFELD)_" ["_$$$INLPPhysical(YFELD)_"]"
+	} else {
+		set strDescription = $$$INLPRemarks(YFELD)
+	}
+	quit strDescription
+	
+		
+CodeWithTSUAndRemarks(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	; Used by a Manual field on INLP.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 04-May-2011	shobby	SR17714.4: Used common code in Description & removed redundant.
+	; 03-May-2011	shobby	SR17714	 : Changed the format again.
+	; 29-Apr-2011	shobby	SR17714	 : Position of physical and code reversed.
+	; 18-Apr-2011	shobby	SR17714.2: Created
+	;-------------------------------------------------------------------------------
+	quit "("_$$$KEY2(YKEY)_") "_$$Description()
+	
+	
+CodeWithTSUAndRemarks1(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	; .
+	;
+	; Inputs:
+	;
+	; Returns: Formatted Storage
+	;
+	; History:
+	; 04-May-2011	PPP		SR17714	 : Only show the " - " if Description/Remarks exist
+	; 18-Apr-2011	shobby	SR17714.2: Created
+	;-------------------------------------------------------------------------------
+	new strDesc 
+	
+	set strDesc = $$Description()
+	quit $$$KEY2(YKEY)_$select(strDesc'="":" - "_strDesc,1:"")
+	//quit $$$KEY2(YKEY)_" - "_$$Description()
+	
+	
+CodeWithTSU1(pidLocn,pstrCode)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 30-Sep-2010	shobby	SR17714.4: Redirected to INLP
+	;-------------------------------------------------------------------------------
+	new strCode,YKEY,YFELD
+	
+	$$$VAR
+	set YKEY    = pidLocn_","_pstrCode
+	set YFELD   = ""
+	set strCode = ""
+	if (pidLocn'="") && (pstrCode'="") {
+		set YFELD = $get(^INLP(0,pidLocn,pstrCode,1))
+	}
+	quit $$CodeWithTSUAndRemarks1^INLP(YKEY,YFELD)
+
+
+CodeWithTSU2(pidLocn,pstrCode)
+	new strCode,YKEY,YFELD
+	
+	set YKEY    = pidLocn_","_pstrCode
+	set YFELD   = ""
+	set strCode = pstrCode
+	if (pidLocn'="") && (pstrCode'="") {
+		set YFELD = $get(^INLP(0,pidLocn,pstrCode,1))
+		if $$$INLPRemarks(YFELD)'="" 			set strCode = strCode_" ("_$$$INLPRemarks(YFELD)_")"
+		if $$$INLPTemporaryStorageUnit(YFELD) 	set strCode = strCode_" ["_$$$INLPPhysical(YFELD)_"]"
+	}
+	quit strCode
+	
+	
+SetPhysicalStorage(pidLocn,pidPallet,pidPhysical)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 27-Apr-2011	GRF		SR17715: Created
+	;-------------------------------------------------------------------------------
+	new objStore,strStatus
+	
+	set objStore = $get(^INLP(0,pidLocn,pidPallet,1))
+	set $$$INLPPhysical(objStore) = pidPhysical
+	set strStatus = $$$Save("INLP",pidLocn_$$$COMMA_pidPallet,objStore,$$$YES)
+	quit strStatus
+
+
+IsValidTSU(pidLocn,pidStore,pobjStore="") 
+	;-------------------------------------------------------------------------------
+	; Is pidStorage a valid TSU ie Not Closed.  Only tests for TSUs
+	;
+	; Called By: OnBeforeSave^INMOVLine, OnBeforeFormat^INMOVLine2
+	; Params:
+	;	pidLocn		The location id - assumes already validated
+	;	pidStore 	The storage id
+	;	
+	; Returns: $$$YES if Valid TSU, otherwise Error
+	;
+	; History:
+	; 07-Jun-2011	GRF		SR17716: Replace Closed with Status; pass in Storage
+	;							object if already available
+	; 09-May-2011	PPP		SR17756: Created
+	; -------------------------------------------------------------------------------
+	new enumStatus,strStatus
+	
+	set strStatus = $$$OK
+	
+	if pobjStore="" set pobjStore = $get(^INLP(0,pidLocn,pidStore,1))
+	; SR17716 vvv
+	if $$$INLPTemporaryStorageUnit(pobjStore) {
+		set enumStatus = $$$INLPStatus(pobjStore)
+		if enumStatus="" {
+			set enumStatus = $order(^INLPStatuss(0,1,$$$YES,""))   ; Default Status
+		}
+		if enumStatus="" {
+			set strStatus = $$$MakeStatus("IN01300")
+		  ; "Status code not specified and no default code present."
+		
+		} elseif $$$INLPStatusIsTSUClosedForReceipts($get(^INLPStatus(0,enumStatus,1))) {
+			set strStatus = $$$MakeStatus("IN01299")
+		} ; "Cannot move stock to a Closed TSU"
+	}
+	quit strStatus
+	;if ($$$INLPTemporaryStorageUnit(objStore) && $$$INLPClosed(objStore)) {
+	;	set strStatus = $$$MakeStatus("IN01299")
+	;} ; "Cannot move stock to a Closed TSU"
+	;quit strStatus
+	; SR17716 ^^^
+	
+	
+CanBeTSU(pidKey) 
+	;-------------------------------------------------------------------------------
+	; Called by the CORE RULE for INLP D21 "Temporary Storage Unit"
+	;
+	; Can the pidStorage be a valid TSU ie 
+	; 	1. Not already used as a Storage
+	;   2. Not already a Storage for an existing TSU
+	;
+	; Params:
+	;   (pidKey)
+	;	pidLocn		The location id - assumes already validated
+	;	pidStore 	The storage id
+	;	
+	; Returns: $$$YES if Valid TSU, otherwise $$$NO
+	;
+	; History:
+	; 10-May-2011	PPP		SR17757: Created
+	; -------------------------------------------------------------------------------
+	new blnStatus,idLocn,idStore
+	
+	set blnStatus = $$$YES
+	
+	set idLocn	= $$$KEY1(pidKey)
+	set idStore	= $$$KEY2(pidKey)
+	
+	if ($$SQLCount(idLocn_"||"_idStore) > 0) ||     //Not already used as Storage in Stock Transactions/History
+	    $data(^INLPs(0,5,idLocn,idStore))       {   //Not already a Storage for an existing TSU
+			set blnStatus = $$$NO
+	}
+	quit blnStatus
+	
+	
+IsBlocked(pidLocn,pidStore) 
+	;-------------------------------------------------------------------------------
+	; Called by the CORE RULE for INLP D8 "Storage is Blocked"
+	; A Blocked Storage can have stock moved in and out but stock held there is not
+	; available for picking for an order.
+	; 
+	; It would commonly be used for stock received from a supplier or manufacturing
+	; order or stock returned from a customer that has not been through Quality
+	; Control, or stock that has failed a QC check and is awaiting further action.
+	;
+	;
+	; Params:
+	;   (pidKey)
+	;	pidLocn		The location id - assumes already validated
+	;	pidStore 	The storage id
+	;	
+	; Returns: $$$YES if the storage is blocked, otherwise $$$NO
+	;
+	; History:
+	; 12-May-2011	GRF		SR17757: early quit did not include return value
+	; 10-May-2011	PPP		SR17757: Created
+	; -------------------------------------------------------------------------------
+	new objStorage
+	
+	quit:$get(pidStore)="" $$$NO
+	
+	set objStorage = $get(^INLP(0,pidLocn,pidStore,1))
+		
+	quit ''$$$INLPStockLocationIsLocked(objStorage)
+	
+
+IsStorageBlocked(pidLocn,pidStore) 
+	;-------------------------------------------------------------------------------
+	; A Blocked Storage can have stock moved in and out but stock held there is not
+	; available for picking for an order.  Also check if TSU, the physical Storage Location
+	; is blocked.
+	; 
+	;
+	; Params:
+	;   (pidKey)
+	;	pidLocn		The location id - assumes already validated
+	;	pidStore 	The storage id
+	;	
+	; Returns: $$$YES if the storage is blocked, otherwise $$$NO
+	;
+	; History:
+	; 09-Nov-2011	PPP		SR17929: Created
+	; -------------------------------------------------------------------------------
+	new objStorage
+	new blnBlocked
+	new idPhyStore 
+	new objPhyStore,objINVORG,idBlocked
+	 
+	quit:$get(pidStore)="" $$$NO
+	
+	set blnBlocked = $$$NO
+	
+	set objINVORG	= $get(^INVORG(0,YM,1))
+	set idBlocked	= $$$INVORGDeleteStockLocation(objINVORG)
+	set:pidStore=idBlocked blnBlocked	= $$$YES
+	
+	set objStorage = $get(^INLP(0,pidLocn,pidStore,1))
+	if $$$INLPTemporaryStorageUnit(objStorage) {
+		set idPhyStore = $$$INLPPhysical(objStorage)
+
+		if idPhyStore'="" {
+			set objPhyStore = $get(^INLP(0,pidLocn,idPhyStore,1))
+			set blnBlocked = ''$$$INLPStockLocationIsLocked(objPhyStore)
+			set:idPhyStore=idBlocked blnBlocked	= $$$YES
+		}
+		
+	}
+	
+	if blnBlocked=$$$NO {
+		set blnBlocked = ''$$$INLPStockLocationIsLocked(objStorage)
+	}
+
+	quit blnBlocked	
+
+Check()
+
+	;-------------------------------------------------------------------------------
+	; Routine to check if INLP and alLOC.dUStorage are in Sync. Most likely status'
+	; not in sync.
+	;
+	; History:
+	; 13-Jun-2013	shobby		CORE-108: Created
+	; -------------------------------------------------------------------------------
+	new id1,id2,obj
+	
+	$$$VAR
+	set id1="" for { set id1=$order(^INLP(YM,id1)) quit:id1=""
+		set id2="" for { set id2=$order(^INLP(YM,id1,id2)) quit:id2=""
+			set obj=##class(alLOC.dUStorage).%OpenId("0||"_id1_"||"_id2)
+			if 'obj.IsSynced() {
+				write !,id1_"||"_id2_":"
+			}
+		}
+	}
+	quit
+]]></Routine>
+</Export>

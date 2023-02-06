@@ -1,0 +1,292 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTRNFirm" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTRNFirm
+	
+#include INConst
+#include COMSYS
+	
+CanFirm(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Determine whether Transfer Order can be firmed.
+	; Reasons for preventing firming from being allowed
+	;  - No key / record
+	;  - Due date is invalid
+	;  - There are no Transfer Order lines
+	;  - Transfer Order status is not created
+	;  - There is an error with Transfer Order line(s) 
+	;    - There is no item detailed on a Transfer Order line
+	;    - There is no quantity detailed on a Transfer Order line
+	;    - Negative quantity detailed on Transfer Order line
+	;    - Non stock item selected for transfer
+	;
+	; Params:
+	; pidTFR - Key of header record
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing (changes @NM variable YQ)
+	;
+	; History:
+	; 06-Mar-2009	DavidR	SR16384: changed the check to exclude blocked storages,
+	; 							this is the same as the line check.
+	; 05-Feb-2009	DavidR	SR16042: Added a check to ensure that there is no
+	; 							problem between the requested amount and the BOH
+	; 							(uses sum of duplicate line item requests)
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new fltBOHQty,fltSumQuantity,idFromLocn,idItem,idLine,objItem,objLine,objTFR,strStatus
+	
+	set strStatus = $$$OK
+	kill ^CacheTempINTRNFirm(YUSER)
+		
+	if '$$$NoKey(pidTFR) {
+		do TotalQtyByItem(pidTFR)
+		
+		set objTFR    = $get(^INTFR(0,pidTFR,1))
+		set strStatus = $$IsDueDateValid^INTRNValidation(objTFR)
+		
+		if $$$ISOK(strStatus) {
+			if '$data(^INTFRLine(0,pidTFR)) {
+				set strStatus = $listbuild("IN00427")  ; "No stock has been selected to be transferred."
+			}
+		}
+		
+		if $$$ISOK(strStatus) {     ; FIXME : Doesn't appear necessary at this stage - building demand/supply but no actual xfer?
+			set idFromLocn = $$$INTFRSendingLocation(objTFR)
+			if $$IsLockedSiteLocation^INLocking(idFromLocn) {        		// SRBR014730
+				set strStatus = $$ReasonLocked^INLocking(idFromLocn) 		// SR15570
+			}			
+		}
+			
+		if $$$ISOK(strStatus) {
+			if $$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSCreated {
+				set strStatus = $$ProductError^INTRNValidation("IN00432")  ; "Please fix all errors before firming."
+				
+				set idLine = ""
+				for {
+					quit:$$$ISERR(strStatus)
+					set idLine = $order(^INTFRLine(0,pidTFR,idLine))
+					quit:idLine=""
+					
+					set objLine = $get(^INTFRLine(0,pidTFR,idLine,1))
+					set idItem  = $$$INTFRLineItem(objLine)
+					
+					if idItem = "" {
+						set strStatus = $$$MakeStatus("IN00433")         ; "All lines require an item."
+					
+					} elseif +$$$INTFRLineQuantity(objLine) = 0 {
+						set strStatus = $$$MakeStatus("IN00434")         ; "All lines require a quantity."
+					
+					} elseif $$$INTFRLineQuantity(objLine) < 0 {
+						set strStatus = $$$MakeStatus("IN00456",idLine)  ; "Negative quantity on line %1"
+					
+					} elseif $$$INTFRLineUnit(objLine) = "" {
+						set strStatus = $$$MakeStatus("IN00508")         ; "All lines require a unit."
+					
+					} elseif $$$INTFRLineBaseQuantity(objLine) = "" {
+						set strStatus = $$$MakeStatus("IN00509",idLine)  ; "Line ´%1´ is assigned a unit that is not defined in terms of base unit."
+						
+					} else { ; SR16042
+						set fltSumQuantity = $get(^CacheTempINTRNFirm(YUSER,idItem))
+  					;	set fltBOHQty = ##class(alSOH.iSOH).GetQtyOnHand(idItem,idFromLocn,"",$$$NO)
+						set fltBOHQty = ##class(alSOH.iSOH).GetQtyOnHand(idItem,idFromLocn,"",$$$YES) ;dont include blocked items
+						
+						if (fltSumQuantity > fltBOHQty) {  
+							set strStatus = $$$MakeStatus("MED00199")    ; "One or more products do not have enough in storage..." 
+						}
+					} 
+				}
+				
+			} else {
+				set strStatus = $listbuild("IN00241")      ; "Transfer already Firmed."
+			}
+		}
+	
+	} else {
+		set strStatus = $listbuild(32072)                  ; "Please select a data record first."
+	}
+	$$$YQHandler(strStatus)
+	quit
+	
+	
+TotalQtyByItem(pidTFR)
+	;-------------------------------------------------------------------------------
+	; ByRef:
+	; 	YUSER	User SessionId
+	; 
+	; History:
+	; 18-Feb-2009	HQN		AdHoc: Added ByRef Doco
+	; 16-Feb-2009	DavidR	SR16042: Created
+	;-------------------------------------------------------------------------------
+	new idItem,idLine,objLine,idUnit,fltQty
+	
+	set idLine = ""
+	for {
+		set idLine = $order(^INTFRLine(0,pidTFR,idLine))
+ 		quit:idLine=""
+ 		
+ 		set objLine = $get(^INTFRLine(0,pidTFR,idLine,1))
+ 		set idItem = $$$INTFRLineItem(objLine)
+ 		if idItem'="" {
+	 		; HEVA-857 
+	 		set fltQty = $$$INTFRLineQuantity(objLine)
+	 		set idUnit = $$$INTFRLineUnit(objLine)
+	 		if (idUnit '= "") {
+		 		if ('$$IsBaseUnit^INARTPACK(idUnit)) {
+			 		set fltQty = $$CalculateBaseQuantity^INUOMConversion(idItem,idUnit,fltQty)
+		 		}
+	 		}
+	 		set ^CacheTempINTRNFirm(YUSER,idItem) = $get(^CacheTempINTRNFirm(YUSER,idItem)) + fltQty
+	 		; HEVA-857 ^^^^
+ 		}
+	}
+ 	quit
+ 	
+	
+Firm(pidTFR,pblnReloadForm=$$$YES)
+  	;-------------------------------------------------------------------------------
+	; Determine whether firming can be performed, if so perform firm.
+	;
+	; Params:
+	; pidTFR         - Key of header record
+	; pblnReloadForm - $$$YES then reload form else do not
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message or $$$NO
+	;
+	; History:
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$NO
+	
+	do CanFirm(pidTFR)
+ 
+	if YQ = $$$YQEnable {
+		set strStatus = $$Transaction^COMTransaction("FirmTxn^INTRNFirm("""_pidTFR_""")",1)
+		
+		if $$$ISOK(strStatus) && pblnReloadForm {
+			set YSEITE = 1 // FIXME: This does not even fix all cases where page two is displayed.
+			do ReloadForm^COMUtilForm()
+		}
+	} else {
+		do ReturnError^COMUtils($$$YQMessage)
+	}
+	quit strStatus
+	
+	
+FirmTxn(pidTFR)
+	;-------------------------------------------------------------------------------
+	; 1. Create Demands and Supplies
+	; 2. Update Status details on Header.
+	; 
+	; Example:   [EXPECTED] NOTE If Base > Ordered with Reject remainder, this is an error
+	; ----------
+	; Request 175
+	; Cancel   75
+	; Reject    5
+	;    TFRLine : Request = INReq(Ordered - Cancelled - Rejected) - INTFR(Issued)
+	;    1st Transfer : Request 95   Partially ship 20  Don't reject balance
+	;    
+	;    2nd Transfer : Request 75   Partially ship 50  Reject remainder
+	;    
+	;    TfrLine : Base    = 50
+	;    ReqLine : Ordered = 170  Rejected = 5  Issued = 20
+	;    
+	;    Algoritm : Rejected = Ordered - Base - Cancelled - Issued
+	;                  30    =   175   -  50  -    75     -   20
+	;                        
+	;	 After Receiving 2nd Transfer:
+	;	 ReqLine : Ordered = Issued  + Rejected + Cancelled
+	;	 			 175   = (20+50) +    30    +    75
+	; ----------
+	; Params:
+	; 	pidTFR - Key of header record
+	;
+	; Returns: strStatus - $$$OK if all successful, otherwise error message
+	;
+	; History:
+	; 15-Sep-2011	GRF		SR17823: Only set INReqLine "Rejected" fields if
+	;							INTFRLineRejectRemainder is set.
+	; 25-May-2011	GRF		SR17250: call common function for decimal places
+	; 29-Mar-2011	GRF		SR17579: QtyOrdered is in Order Units; QtyRejected, 
+	;							QtyIssued, QtyCancelled and BaseQuantity are all in
+	;							Invent Units
+	; 20-Feb-2009	HQN		SR16296: Update ReqLine only if TFR save OK
+	; 20-Feb-2009	GRF		SR16296: use strReference instead of repeated extractions
+	; 13-Feb-2009	HQN		SR16296: Use $$$Save instead of object save, not allowed
+	; 							to use objects.
+	; 29-Jan-2009	HQN		SR16296: Update Req
+	; 07-Aug-2008	PP		SR15812: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,fltRejected,idInventUnit,idItem,idReq,idReqLine,idTFRLine,intDecPlaces
+	new intFormFld,objReqLine,objTFR,objTFRLine,strReference,strStatus
+	
+	set strStatus = $$$OK
+	set objTFR    = $get(^INTFR(0,pidTFR,1))
+	
+	//Create Demands & Supplies
+	set strStatus = $$CreateDemandAndSupply^INTRNDemand(pidTFR)
+ 
+	if $$$ISOK(strStatus) {
+		set $$$INTFRStatus(objTFR) = $$$EnumINTFRSTATUSFirmed
+		set $$$INTFRFirmed(objTFR) = $horolog
+		
+		set strStatus = $$$Save("INTFR",pidTFR,objTFR,$$$YES)
+		
+		if $$$ISOK(strStatus) {
+			set idTFRLine = ""
+			for {
+				set idTFRLine = $order(^INTFRLine(0,pidTFR,idTFRLine))
+				quit:idTFRLine=""
+				
+				set objTFRLine = $get(^INTFRLine(0,pidTFR,idTFRLine,1))
+				set strReference = $$$INTFRLineReference(objTFRLine)
+				if strReference'="" {
+					set idReq     = $$$KEY1(strReference)
+					set idReqLine = $$$KEY2(strReference)
+					set objReqLine = $get(^INReqLine(0,idReq,idReqLine,1))
+					if objReqLine '= "" {
+						if $$$INTFRLineRejectRemainder(objTFRLine) {                       ; SR17823
+				
+				; SR17579 >>>
+				;			set $$$INReqLineQtyRejected(objReqLine)     = $$$INReqLineQtyOrdered(objReqLine)   -
+				;			                                              $$$INReqLineQtyIssued(objReqLine)    -
+				;			                                              $$$INReqLineQtyCancelled(objReqLine) -
+				;			                                              $$$INTFRLineBaseQuantity(objTFRLine)
+							
+							set idItem      = $$$INReqLineItem(objReqLine)
+							set fltConv     = $$GetUOMConversion^INUOMConversion(idItem,$$$INReqLineUnit(objReqLine),.idInventUnit)
+							set fltRejected = ($$$INReqLineQtyOrdered(objReqLine)*fltConv) -
+							                   $$$INReqLineQtyIssued(objReqLine)    -
+							                   $$$INReqLineQtyCancelled(objReqLine) -
+							                   $$$INTFRLineBaseQuantity(objTFRLine)
+							
+					;		set intDecPlaces = $$GetDecimalsForItemUnit^COMUnit(idItem,idInventUnit)                      ; SR17250 vvv
+							set intFormFld   = $$$GetFormField(YFORM,$$$FldINReqLineQtyRejected)
+							set intDecPlaces = $$GetDecimalPlaces^COMUtilNum(YFORM,intFormFld,idInventUnit,objReqLine,"") ; SR17250 ^^^
+							if intDecPlaces>0 set fltRejected = +$justify(fltRejected,0,intDecPlaces)
+							
+							set $$$INReqLineQtyRejected(objReqLine)     = fltRejected
+							set $$$INReqLineDateRejection(objReqLine)   = +$horolog
+					;		set $$$INReqLineRejected(objReqLine)        = $$$INTFRLineRejectRemainder(objTFRLine)   ; SR17823
+							set $$$INReqLineRejected(objReqLine)        = $$$YES
+							set $$$INReqLineReasonRejection(objReqLine) = $$$INTFRLineReasonRejection(objTFRLine)
+							
+							set strStatus = $$$Save("INReqLine",strReference,objReqLine,$$$YES)
+							if $$$ISOK(strStatus) {
+								set strStatus	= $$UpdateStatus^INReq(idReq)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	quit strStatus
+
+]]></Routine>
+</Export>

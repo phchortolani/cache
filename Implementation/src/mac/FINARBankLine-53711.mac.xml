@@ -1,0 +1,835 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINARBankLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINARBankLine
+	
+#include COMSYS
+#include FINConst
+#include COMConst
+	
+#define YFORM "FINARBankLine"
+	
+IsPosted(pYKEY="") ; TODO: Should this be made part of IsUnposted ??
+    ;-------------------------------------------------------------------------------
+    ; Determine whether record is posted.
+    ;
+    ; Params: Key
+    ;
+    ; Returns: strStatus 0 if posted, 1 + message if not posted
+    ;
+    ; History:
+    ; 06-Jan-2006 	SC		SR13798: Decode wrapper removed. Decode in COMSYS.INC
+    ; 18-Jul-2005	PO		SR12980: Changed language text Fin00832
+    ; 06-Jul-2005	PO		SR12881: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,objFINARBankLine,idFINARBank,idFINARBankLine
+ 
+	set strStatus=$$$OK
+ 
+	if $$GetKey^COMUtilClass(pYKEY,1,,.idFINARBank,.idFINARBankLine) {
+		set strStatus = $$IsPosted^FINARBank(idFINARBank)
+ 
+		if $$$ISOK(strStatus) {
+			set strStatus = $$GetRecord^COMUtilClass($$$YFORM,pYKEY,.objFINARBankLine) ; TODO: How necessary is this? If record does not exist for provided key.
+			if $$$ISOK(strStatus) {
+				if $$$FINARBankLineBeenUnPosted(objFINARBankLine) {
+					set strStatus = $listbuild("Fin00832")  ; "Record is already Unposted."
+				}
+			}
+		}
+	}
+ 
+	if $$$ISOK(strStatus) {
+		set YQ = $$$YQEnable
+	} else {
+		set YQ = $$$YQDisable(strStatus)
+	}
+	quit strStatus
+	
+	
+UnPost(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; Method Usage
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 07-Jul-2005	PO		SR12881: Created
+    ;-------------------------------------------------------------------------------
+    ;
+	new strStatus
+ 
+	set strStatus=$$Transaction^COMTransaction("UnPostTxn^FINARBankLine("""_pYKEY_""")",1)
+ 
+	if $$$ISOK(strStatus) {
+		;do RedirectForm^COMUtils($$$YFORM,pYKEY,$$$YFORM_",",YPARA,1)
+		do ReloadForm^COMUtilForm()
+	}
+ 
+	quit strStatus
+	
+	
+UnPostTxn(pYKEY="")
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Params:
+    ;
+    ; Returns: strStatus
+    ;
+    ; History:
+    ; 27-Jun-2006	SC		SR14734: Save Batch + Block number on Unpost.
+    ; 28-Feb-2006	PO		SR14225: Added Drill Down Detail to Allocate
+    ; 18-Jul-2005	PO		SR12980: Changed language text Fin00832
+    ; 07-Jul-2005	PO		SR12881: Created
+    ;-------------------------------------------------------------------------------
+    new strStatus,idFINARBank,idFINARBankLine,objFINARBank,objFINARBankLine,dteBankingDate,blnUnPost
+    new idBatch,idBlock,BankMessage,strForm,strDetail ; SR14225
+ 
+	set strStatus = $$$OK
+ 
+	if $$GetKey^COMUtilClass(pYKEY,,,.idFINARBank,.idFINARBankLine) {
+		set strStatus = $$GetRecord^COMUtilClass("FINARBank",idFINARBank,.objFINARBank)
+		
+		if $$$ISOK(strStatus) set strStatus = $$UnPostable^FINSYSReview("FINARBank",$$$FINARBankStatus(objFINARBank),.blnUnPost)
+		if $$$ISOK(strStatus) set strStatus = $$GetRecord^COMUtilClass($$$YFORM,pYKEY,.objFINARBankLine)
+ 
+		if $$$ISOK(strStatus) && blnUnPost && $$$FINARBankLineBeenUnPosted(objFINARBankLine) {
+			set strStatus = $listbuild("Fin00832")  ; "Record is already Unposted."
+			set blnUnPost = 0
+		}
+ 
+		if blnUnPost {
+			set dteBankingDate=$$$FINARBankBankingDate(objFINARBank)
+			set $$$FINARBankLineBeenUnPosted(objFINARBankLine) = $$$YES
+			set $$$FINARBankLineUnPostedDate(objFINARBankLine) = $horolog
+			if $$$ISOK(strStatus) { ; SR14225
+				set strForm   = $$CheckForm^FINUtils($get(YFORM),"FINARBankLine")
+				set strDetail = "Fin00990,"_idFINARBank_","_idFINARBankLine  ; "Customer Banking Line Reversal %1, %2"
+				set strStatus = $$Allocate^FININTBatch(.idBatch,.idBlock,"ARBANK",$get(YLOCATION),dteBankingDate,,,,strForm,idFINARBank_","_idFINARBankLine,strDetail)
+			}
+			
+			if $$$ISOK(strStatus) {
+				set BankMessage("Number")=idFINARBank
+				set BankMessage("BankAccount")=$$$FINARBankBankAccount(objFINARBank)
+				set BankMessage("BankingDate")=$$$FINARBankBankingDate(objFINARBank)
+				do BuildMessage^FINARBank(idFINARBank,idFINARBankLine,"BankMessage")
+				
+				do SubBlockNumber^FININTBatch(.idBlock)
+				
+				set strStatus = $$PostPayment^FININTBank("BankMessage",$order(BankMessage("Payments","")),idBatch,idBlock,$$$YES)
+			}
+			if $$$ISOK(strStatus) {
+				set $$$FINARBankLineUnPostBatch(objFINARBankLine) = idBatch
+				set $$$FINARBankLineUnPostBlock(objFINARBankLine) = $piece(idBlock,".",1)  ; Remove sub-block num
+			}
+			if $$$ISOK(strStatus) set strStatus = $$$Save(YFORM,idFINARBank_","_idFINARBankLine,objFINARBankLine,1)
+			if $$$ISOK(strStatus) set strStatus = $$PostBlock^FININTBatch(idBatch,idBlock)
+		}
+	
+	} else {
+		set strStatus = $listbuild("Fin00833")  ; "Invalid key."
+	}
+ 
+	quit strStatus
+	
+	
+ChequeNumberCheck(pidBank)
+    ;-------------------------------------------------------------------------------
+    ; Checks whether all the bank lines that are a payment type of Cheque have Cheque numbers.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 27-Jul-2004	shobby	 Missing 'for' loop (SR10183)
+    ; 07-Jul-2004   Shobby   Created (SR7289)
+    ;-------------------------------------------------------------------------------
+	new idLine,strStatus,objFINARBankLine
+	
+	set strStatus = $$$OK
+	
+	set idLine = ""
+	if $get(pidBank)'="" {
+		for {
+			quit:$$$ISERR(strStatus)
+			set idLine = $order(^FINARBankLine(YM,pidBank,idLine))
+			quit:idLine=""
+			
+			set objFINARBankLine = $get(^FINARBankLine(YM,pidBank,idLine,1))
+			if $$$FINARBankLineMethod(objFINARBankLine)=$$$EnumFINARBANKLINEMETHODCheque {
+				if $$$FINARBankLineChequeNumber(objFINARBankLine)="" {
+					set strStatus = $listbuild("Fin00353",idLine)
+				} ; "Cheque Number for Line %1 is required."
+			}
+		}
+	}
+	quit strStatus
+	
+	
+OnAfterDelete()
+    ;-------------------------------------------------------------------------------
+    ; DELETE the grid once done.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 16-Jun-2005	JW		Created SR12637
+    ;-------------------------------------------------------------------------------
+	do DELETE^COMGridEdit31Interface()
+	quit
+	
+	
+OnAfterDataFields(pidKey)
+	;------------------------------------------------------------------------------
+	;
+	; History:
+	; 22-Jun-2006	SteveS	SR14698: Clear old invoice locks
+	; 16-Jun-2005	SCR		SR12637 Force Clean up of grid data on new record.
+	; 24-Mar-2004	shobby	Renamed from AfterDataFields.
+	; 10-Dec-2004	PO		SR11192 Don't load grid if BankLine key is a plus sign
+	; 24-Nov-2004	PO		SR10544 Use edit grid for invoices
+	; 05-Aug-2003	shobby	Moved from FINARBank
+	; 27-Jul-2003	SCR		Don't do the WWWSAVE at all
+	; 11-Jul-2003	shobby	Don't do the WWWSAVE for a new BankLine
+	;------------------------------------------------------------------------------
+	new idBank,idBankLine,objBankLine
+	
+	set idBank     =$$$KEY1(pidKey)
+	set idBankLine =$$$KEY2(pidKey)
+	
+	if idBankLine="" {
+		do LoadInvoiceGrid("") ; Force clean up on new record.
+	}
+	
+	do ClearOld^WWWMultiLock(YUSER)
+	
+	if (idBank'="") && (idBankLine'="") && (idBankLine'="+") {
+		set objBankLine = $get(^FINARBankLine(0,idBank,idBankLine,1))
+		if $$$FINARBankLineExpensePayment(objBankLine) {
+			do ShowExpenses^FINARBankAccountGroup(pidKey)
+		} else {	
+			do LoadInvoiceGrid(pidKey)
+		}
+	}
+	quit
+	
+	
+LoadInvoiceGrid(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Returns:
+    ;
+    ; History:
+	; 05-Dec-2008	GRF		Clarify Enabled test
+    ; 10-Dec-2004	shobby	Removed null YKEY test (SR11175)
+    ; ??-Dec-2004	?????	Created
+    ;-------------------------------------------------------------------------------
+	new YFORM,YKEY,YAUSWAHL,YFELD
+	
+	set YFORM = "FINARBankInvoice"
+	set YKEY  = $get(pYKEY)
+	set YFELD = ""
+ 
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 500
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = YFORM
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)     = "FINARBankLine"
+	do ^COMGridEdit31
+	quit
+	
+	
+OnBeforeSave(pYKEY="",pYFELD="",pYMFELD="")
+	;-------------------------------------------------------------------------------
+	; Routine to do any checks before saving the record.
+	; Check 1.  Payments must be greater than 0 (TrackReccord 005461)
+	; 
+	; History:
+	;  5-Sep-2005	JW		SR13268: Corrected SR12759 change - added pYMFELD param.
+	; 15-Jul-2005	RPW		SR12759: Ensure there is no undefined error by defining strStatus
+	; 11-Jul-2005	PO		SR12881: Default BeenUnPosted to Zero
+	; 11-Jul-2005	SteveS	SR12759: Ensure Select Amounts <= Total Payments
+	; 24-Mar-2005	PaulK	Passed in pYFELD by reference
+	; 17-Dec-2004	PO		SR10872 Prevent record save if customer doesn't exist
+	; 05-Aug-2003	shobby	Moved from FINARBank
+	; 26-Jun-2003	shobby	Adjusted to handle newly created record.
+	; 25-Jun-2003	shobby	Creation
+	; 01-Oct-2003	SCR		Allow Zero Payment
+	;-------------------------------------------------------------------------------
+	new fltPayment,fltPaymentAmount,fltUnallocated,idBank,idLine,strStatus,strYFELDcopy
+	
+	set strStatus = $$$OK
+ 
+	if $$GetKey^COMUtilClass(pYKEY,3,,.idBank,.idLine) {
+		set strYFELDcopy = $get(^FINARBankLine(YM,idBank,idLine,1))
+	} else {
+		if (idBank'="") && (idLine'="") {
+			if $$$FINARBankLineBeenUnPosted(pYFELD)="" set $$$FINARBankLineBeenUnPosted(pYFELD) = 0 ; Should not need (if ...=""), being extra cautious
+		}
+		set strYFELDcopy=$get(pYFELD)
+	}
+ 
+	if ($get(strYFELDcopy)'="") && '($data(^FINARCustomer(YM,$$$FINARBankLineCustomerNumber(strYFELDcopy),1))#10) {
+		set strStatus = $listbuild("Fin00530",$$$FINARBankLineCustomerNumber(strYFELDcopy))
+	;  "Unable to save since customer number '%1' does not exist."
+	
+	} else {
+		if $$$ISOK(strStatus) && ($get(pYFELD)'="") {
+			set fltPayment=$$$FINARBankLineTotal(strYFELDcopy)
+			if (fltPayment<0)&(fltPayment'="") {
+				set strStatus = $listbuild("Fin00181")
+			} ; "Payment must be greater than 0."
+		}
+	}
+ 
+	if $$$ISOK(strStatus) && (idBank'="") && (idLine'="") {
+		set fltUnallocated = $piece(pYMFELD,Y,14)
+		if (fltUnallocated<0) {
+			set fltPaymentAmount=+$$$FINARBankLineTotal(strYFELDcopy)
+			set strStatus=$lb("Fin00834",$$FormatCurrency^COMTable(fltPaymentAmount-fltUnallocated),$$FormatCurrency^COMTable(fltPaymentAmount))
+		} ; "Selected invoice payment total (%1) cannot exceed the overall payment amount (%2)."
+		
+	}
+	
+	if $$$ISOK(strStatus) {
+		set strStatus = $$$GRIDSave(pYKEY)
+	}
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		do ReturnError^COMUtils(strStatus)
+	}
+	quit 
+ 
+ 
+ShowInvoices(pKey) //NOT IN USE: Replaced by Grid Code
+	;--------------------------------------------------------------------------
+	;
+	; History
+	; 24-Jun-2004	shobby	Foreign Currency.  'Pay' field.
+    ; 03-May-2004   Shobby  Replaced YKOMMA with ","
+	; 05-Aug-2003	shobby	Moved from FINARBank
+	; 31-Jul-2003	shobby	Moved call to 'Pay Invoice' to BeforeButtonLine. (TR005758)
+	; 31-Jul-2003	shobby	Pay off an Invoice with a single click on the grid.
+	; 28-Jul-2003	shobby	Check for valid Customer Number.
+	; 27-Jul-2003	SCR		Check for Banking Line
+	; 02-Jul-2003	shobby	Test whether an invoice is on hold before showing (TR005527)
+	;--------------------------------------------------------------------------
+	new idBank,idBankLine,idBankInvoice,idBankAccount,idCustomerNumber
+	new objFINARInvoice,lstHeader,curOwing,curPayAmount,curBalance,curDiscount,dteDueDate,objBankInvoice,InvoiceKey
+ 	new blnAuto,objFINARBankLine
+ 	;
+	set idBank=$piece(pKey,",",1)
+	set idBankLine=+$piece(pKey,",",2)
+	;do PayInvoice^FINARBankInvoice(YPARA)
+	;
+ 	set objFINARBankLine=$get(^FINARBankLine(YM,idBank,idBankLine,1))
+ 	set blnAuto=+$$$FINARBankLineAutoAllocate(objFINARBankLine)
+ 	;
+	set idCustomerNumber=$$GetCustomerNumber(idBank,idBankLine)
+ 	if idCustomerNumber'="" {
+		set lstHeader=$lb($$$StrFINARBankInvoiceInvoiceDate,$$$StrFINARBankInvoiceInvoiceNumber,$$$StrFINARBankInvoiceDueDate)
+		set lstHeader=lstHeader_$lb($$$StrFINARBankInvoiceAmountOwing,$$$StrFINARBankInvoiceDiscount,$$$StrFINARBankInvoiceDiscountApplied)
+		set lstHeader=lstHeader_$lb($$$StrFINARBankInvoicePayAmount,$$$StrFINARBankInvoiceInvoiceBalance)
+		
+		;FIXME: Internationalise "Pay" ???
+		if ('blnAuto) && ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly) set lstHeader=lstHeader_$listbuild("Pay")
+		do Start^COMTable(lstHeader)
+	 
+		set idBankInvoice =""
+		set curOwing	  =0
+		set curPayAmount  =0
+		set curBalance	  =0
+		set curDiscount   =0
+ 
+		set dteDueDate=""
+		for {
+			set dteDueDate=$order(^FINARBankInvoices(YM,1,idBank,idBankLine,dteDueDate))
+			quit:$tr(dteDueDate," ")=""
+			quit:dteDueDate=" "
+			
+			set idBankInvoice=""
+			for {
+				set idBankInvoice=$order(^FINARBankInvoices(YM,1,idBank,idBankLine,dteDueDate,idBank,idBankLine,idBankInvoice))
+				quit:idBankInvoice=""
+				
+				set objBankInvoice=$get(^FINARBankInvoice(YM,idBank,idBankLine,idBankInvoice,1))
+				set objFINARInvoice=$get(^FINARInvoice(YM,idCustomerNumber,idBankInvoice,1))
+				if '$$$FINARInvoiceOnHold(objFINARInvoice) {
+					set InvoiceKey=idBank_","_idBankLine_","_idBankInvoice
+					do NewLine^COMTable()
+					do InsertCellDate^COMTable($$$FINARBankInvoiceInvoiceDate(objBankInvoice),"FINARBankInvoice",InvoiceKey)
+					do InsertCell^COMTable(idBankInvoice,"FINARBankInvoice",InvoiceKey)
+					do InsertCellDate^COMTable($$$FINARBankInvoiceDueDate(objBankInvoice),"FINARBankInvoice",InvoiceKey)
+					do InsertCurrencyCell^COMTable($$$FINARBankInvoiceAmountOwing(objBankInvoice),$$$NO,"FINARBankInvoice",InvoiceKey)
+					do InsertCurrencyCell^COMTable($$$FINARBankInvoiceDiscount(objBankInvoice),$$$NO,"FINARBankInvoice",InvoiceKey)
+					do InsertCellBoolean^COMTable($$$FINARBankInvoiceDiscountApplied(objBankInvoice),"FINARBankInvoice",InvoiceKey)
+					do InsertCurrencyCell^COMTable($$$FINARBankInvoicePayAmount(objBankInvoice),$$$YES,"FINARBankInvoice",InvoiceKey)
+					do InsertCurrencyCell^COMTable($$$FINARBankInvoiceInvoiceBalance(objBankInvoice),$$$NO,"FINARBankInvoice",InvoiceKey)
+					if 'blnAuto && ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly) {
+						do InsertCell^COMTable("...","FINARBankLine",InvoiceKey,InvoiceKey_","_$select(+$$$FINARBankInvoicePayAmount(objBankInvoice)=0:1,1:0))
+					}
+					do EndLine^COMTable()
+					set curOwing=$$$FCAdd(curOwing,$$$FINARBankInvoiceAmountOwing(objBankInvoice))
+					if $$$FINARBankInvoiceDiscountApplied(objBankInvoice) {
+						set curDiscount=$$$FCAdd(curDiscount,$$$FINARBankInvoiceDiscount(objBankInvoice))
+					}
+					set curPayAmount=$$$FCAdd(curPayAmount,$$$FINARBankInvoicePayAmount(objBankInvoice))
+					set curBalance=$$$FCAdd(curBalance,$$$FINARBankInvoiceInvoiceBalance(objBankInvoice))
+				}	
+			}
+		}
+			
+		do NewLine^COMTable(YDARKGRAY)
+		do InsertCell^COMTable($$^WWWTEXT("Fin00071"))
+		do InsertCell^COMTable("")
+		do InsertCell^COMTable("")
+		do InsertCurrencyCell^COMTable(curOwing,$$$NO)
+		do InsertCurrencyCell^COMTable(curDiscount,$$$NO)
+		do InsertCell^COMTable("")
+		do InsertCurrencyCell^COMTable(curPayAmount,$$$YES)
+		do InsertCurrencyCell^COMTable(curBalance,$$$NO)
+		if 'blnAuto && ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly) do InsertCell^COMTable("")
+		do EndLine^COMTable()
+	 
+		do Stop^COMTable()
+ 	}
+	quit
+ 
+Allocate(pidBank,pidBankLine)
+	;--------------------------------------------------------------------------
+	; if auto allocate on this bank line, distribute the total payment through the links, paying oldest duedate first
+	;
+	; History:
+	; 23-Jun-2006	Steve S		SR14698: Don't assign payments to invoices which aren't free
+	; 10-Jun-2005	Paul K		Wrong macro used to reference invoice balance. SR:12412
+	; 05-Aug-2003	shobby		Moved from FINARBank
+	; 03-Jul-2003	shobby		Calculate credits first (TR005532)
+	; 02-Jul-2003	shobby		Test whether an invoice is on hold before showing (TR005527)
+	;--------------------------------------------------------------------------
+	new idBank,idBankLine,idBankInvoice,curTotalPayments,strCustomerNumber
+	new objFINARInvoice,i,objBankLine,dteDueDate
+ 
+	set objBankLine=$get(^FINARBankLine(YM,pidBank,pidBankLine,1))
+	set curTotalPayments=$$$FINARBankLineTotal(objBankLine)
+	set dteDueDate=""
+	set strCustomerNumber=$$GetCustomerNumber(pidBank,pidBankLine)
+	for i=1:1:2 {
+		for {
+	 		set dteDueDate=$order(^FINARBankInvoices(YM,1,pidBank,pidBankLine,dteDueDate))
+			quit:dteDueDate=""
+			set idBankInvoice=""
+			for {
+				set idBankInvoice=$order(^FINARBankInvoices(YM,1,pidBank,pidBankLine,dteDueDate,pidBank,pidBankLine,idBankInvoice))
+				quit:idBankInvoice=""
+				
+				//SR14698
+				continue:'$$InvoiceIsFree^FINARBankInvoiceCheck(pidBank,pidBankLine,idBankInvoice)
+				
+				set objFINARInvoice=$get(^FINARInvoice(YM,strCustomerNumber,idBankInvoice,1))
+				if (($$$FINARInvoiceBalance(objFINARInvoice)<0)&(i=1))!(($$$FINARInvoiceBalance(objFINARInvoice)'<0)&(i=2)) {
+					if '$$$FINARInvoiceOnHold(objFINARInvoice) {
+						set curTotalPayments=$$Allocate^FINARBankInvoice(pidBank,pidBankLine,idBankInvoice,curTotalPayments,$$$FINARBankLineAutoAllocate(objBankLine))
+					}
+				}
+			}
+		}
+	}
+	quit curTotalPayments
+ 
+OnAfterSave(pidBank,pidBankLine)
+	;-------------------------------------------------------------------------------
+	;
+	; History
+	; 04-May-2006	Steve S		SR14597: Don't allocate -- this is done during posting
+	; 24-May-2005	JW			SR12417: Only create if Bank is editable.
+	; 27-Feb-2004	shobby		Corrected bad test for pidBank preventing code from running when the pidBank begins with a letter.
+	; 05-Aug-2003	shobby		Redirected some code to FINARBankInvoice
+	; 05-Aug-2003	shobby		Moved from FINARBank
+	;-------------------------------------------------------------------------------
+	;
+	new curAmountLeft,objBankLine
+	
+	if '$$$NoKey(pidBank)&&($get(pidBankLine)'="") {
+		if $$Editable^FINSYSReview("FINARBank",$$$FINARBankStatus($get(^FINARBank(YM,pidBank,1)))) {
+			set objBankLine=$get(^FINARBankLine(YM,pidBank,pidBankLine,1))
+			do SetChequeDetails(pidBank,pidBankLine)
+			if $$$FINARBankLineExpensePayment(objBankLine) {
+				do CreateExpenseGroups^FINARBankAccountGroup(pidBank,pidBankLine)
+			} else {
+				do CreateBankInvoices(pidBank,pidBankLine)
+				set curAmountLeft=$$Allocate(pidBank,pidBankLine)
+				//SR14597: Handled on posting end
+				//do AllocatePayment(pidBank,pidBankLine,curAmountLeft)
+				do SetInvoiceBalances^FINARBankInvoice(pidBank,pidBankLine)
+			}
+		}
+	}
+ 
+	quit
+ 
+SetChequeDetails(pidBank,pidBankLine)
+	;-----------------------------------------------------------------------------
+	;
+	; History
+	; 15-Jun-2005	Steve S		SR12644: Store Drawer name, not customer name
+	; 15-Jun-2005	Steve S		SR12636: Allow override of Cheque Name/BSB
+	; 08-Sep-2004	shobby		Simplified Code. (SR10313)
+	; 09-Jan-2004   lwaugh      Removed Lock override on Save call for FINARBankline
+	; 							as this causes a data refresh messsage to appear
+	; 05-Aug-2003	shobby		Moved from FINARBank
+	; 19-Jun-2003	shobby		Check for valid customer id
+	; 
+	; ----------------------------------------------------------------------------
+	; 
+	new objBankLine,objCustomer,idCustomer
+	
+	if '$$$NoKey(pidBank)&&($get(pidBankLine)'="") {
+		set objBankLine=$get(^FINARBankLine(YM,pidBank,pidBankLine,1))
+		if $$$FINARBankLineMethod(objBankLine)=$$$EnumFINARBANKLINEMETHODCheque {
+			set idCustomer=$$$FINARBankLineCustomerNumber(objBankLine)
+			
+			if idCustomer="" {
+				set objCustomer=""
+			} else {
+				set objCustomer=$get(^FINARCustomer(YM,idCustomer,1))
+			}
+			
+			if objCustomer="" {
+				set $$$FINARBankLineChequeName(objBankLine)=""
+				set $$$FINARBankLineChequeBSB(objBankLine)=""
+			} else {
+				;SR12636: Allow override
+				if $$$FINARBankLineChequeName(objBankLine)="" { ;SR12644: use Drawer (account) name
+					set $$$FINARBankLineChequeName(objBankLine)=$$$FINARCustomerBankName(objCustomer)
+					;set $$$FINARBankLineChequeName(objBankLine)=$$$FINARCustomerCustomerName(objCustomer)
+				}
+				
+				if $$$FINARBankLineChequeBSB(objBankLine)="" {
+					set $$$FINARBankLineChequeBSB(objBankLine)=$$$FINARCustomerBankBSB(objCustomer)
+				}
+			}
+			
+			if objBankLine'=$get(^FINARBankLine(YM,pidBank,pidBankLine,1)) {
+				do Save^FINSYS("FINARBankLine",pidBank_$$$COMMA_pidBankLine,objBankLine,1)
+			}		
+			
+			if $$$FINARBankLineUpdateBankDetails(objBankLine) { ;SR12644 -- store over Drawer name
+				set $$$FINARCustomerBankName(objCustomer)=$$$FINARBankLineChequeName(objBankLine)
+				set $$$FINARCustomerBankBSB(objCustomer)=$$$FINARBankLineChequeBSB(objBankLine)
+				do Save^FINSYS("FINARCustomer",idCustomer,objCustomer,1)
+			}
+		}
+	}
+		
+	quit
+	
+	;create banking invoices based on customer
+CreateBankInvoices(pidBank,pidBankLine)
+	;-------------------------------------------------------------------------
+	;
+	; History
+	; 22-Jun-2006	Steve S		SR14698: Skip invoices in use
+	; 24-Jun-2004	shobby		Foreign Currency
+	; 05-Aug-2003	shobby		Moved from FINARBank
+	; 29-Jul-2003	shobby		Freight amount is already included in Charge (TR005728) (Note: This is a direct contradiction of TR005542)
+	; 03-Jul-2003	shobby		Add the freight amount to the amount owing (TR005542)
+	; 
+	;-------------------------------------------------------------------------
+	;
+	new strStatus,idCustomer,idInvoice
+	new objBankLine,objInvoice,objBankInvoice,objInvoiceTax
+	new curTotalTax,intInvoiceTax
+	new Header,BankingDate,DueDate,PayDiscount
+ 
+	set Header=$get(^FINARBank(YM,pidBank,1))
+	set BankingDate=$$$FINARBankBankingDate(Header)	
+ 
+	set strStatus=$$$OK
+	
+	set objBankLine=$get(^FINARBankLine(YM,pidBank,pidBankLine,1))
+	
+	set idCustomer=$$$FINARBankLineCustomerNumber(objBankLine)
+	set strStatus=$$RemoveUnusedInvoices(pidBank,pidBankLine,idCustomer)
+	if (idCustomer'="")&(strStatus=$$$OK) {
+		set idInvoice=""
+		for {
+			set idInvoice=$order(^FINARInvoice(YM,idCustomer,idInvoice))
+			quit:idInvoice=""
+			
+			if '$data(^FINARBankInvoice(YM,pidBank,pidBankLine,idInvoice)) {  ;if the invoice does not exist yet...
+				//SR14698
+				continue:'$$InvoiceIsFree^FINARBankInvoiceCheck(pidBank,pidBankLine,idInvoice)
+				
+				set objInvoice=$get(^FINARInvoice(YM,idCustomer,idInvoice,1))
+				if +$$$FINARInvoiceBalance(objInvoice)'=0 {					;if the outstanding amount of the invoice <> 0
+					set objBankInvoice=""
+					set PayDiscount=0 ; Default to Dont Pay Discount
+					set $$$FINARBankInvoiceDueDate(objBankInvoice)=$$$FINARInvoiceDueDate(objInvoice)
+					set $$$FINARBankInvoiceAmountOwing(objBankInvoice)=$$$FINARInvoiceBalance(objInvoice) ;+$$$FINARInvoiceFreight(objInvoice)) ;(TR005542) - Removed (TR005728)
+					set $$$FINARBankInvoiceDiscount(objBankInvoice)=$$$FINARInvoiceSettlementDiscount(objInvoice)
+					set $$$FINARBankInvoiceInvoiceBalance(objBankInvoice)=$$$FINARInvoiceBalance(objInvoice)
+					set $$$FINARBankInvoiceInvoiceDate(objBankInvoice)=$$$FINARInvoiceInvoiceDate(objInvoice)
+					set curTotalTax=0
+					set intInvoiceTax=""
+					for {
+						set intInvoiceTax=$order(^FINARInvoiceTax(YM,idCustomer,idInvoice,intInvoiceTax))
+						quit:intInvoiceTax=""
+						set objInvoiceTax=$get(^FINARInvoiceTax(YM,idCustomer,idInvoice,intInvoiceTax,1))
+						set curTotalTax=$$$FCAdd(curTotalTax,$$$FINARInvoiceTaxAmount(objInvoiceTax))
+						}
+					set $$$FINARBankInvoiceTax(objBankInvoice)=curTotalTax
+					if objBankInvoice'="" {
+						set strStatus=$$Save^FINSYS("FINARBankInvoice",pidBank_$$$COMMA_pidBankLine_$$$COMMA_idInvoice,objBankInvoice,1)
+					}
+				}
+			}
+			quit:strStatus'=1
+			}
+		}
+	quit strStatus
+	
+RemoveUnusedInvoices(pidBank,pidBankLine,pidCustomer)
+	;-------------------------------------------------------------------------------
+	;
+	; History
+	; 04-May-2006	Steve S		SR14597: All invoices
+	; 05-Aug-2003	shobby		Moved from FINARBank
+	;-------------------------------------------------------------------------------
+	;
+	new strStatus,idBankInvoice
+	
+	set strStatus=$$$OK
+	
+	if (pidBank'="")&(pidBankLine'="") {
+		set idBankInvoice=""
+		for {
+			set idBankInvoice=$order(^FINARBankInvoice(YM,pidBank,pidBankLine,idBankInvoice))
+			quit:idBankInvoice=""
+			if pidCustomer="" set pidCustomer=" "
+			//SR14597
+			if ('$data(^FINARInvoice(YM,pidCustomer,idBankInvoice))) { ;&($$^WWWTEXT("Fin00057")'=idBankInvoice)  {  ; Unallocated
+				new YFORM
+				set YFORM="FINARBankInvoice"
+				do KILL^FINSYS("FINARBankInvoice",pidBank_$$$COMMA_pidBankLine_$$$COMMA_idBankInvoice)
+				}
+			}
+		}
+	quit strStatus
+ 
+GetCustomerNumber(pidBank="",pidBankLine="")
+	quit $$GetCustomerNumber^FINARBankLineGet(pidBank,pidBankLine)
+	
+GetTotalPaying(pidBank="",pidBankLine="")
+	quit $$GetTotalPaying(pidBank,pidBankLine)
+ 
+GetBankAccountTotal(pidBank="",pidBankLine="")
+	quit $$GetBankAccountTotal^FINARBankLineGet(pidBank,pidBankLine)
+ 
+GetAmountOwing(pYKEY="")
+	quit $$GetAmountOwing^FINARBankLineGet(pYKEY)
+	
+GetDiscTotal(pidBank="",pidBankLine="")
+	quit $$GetDiscTotal^FINARBankLineGet(pidBank,pidBankLine)
+ 
+GetBalance(pidBank="",pidBankLine="")
+	quit $$GetBalance^FINARBankLineGet(pidBank,pidBankLine)
+ 
+GetTotalPay(pidBank="",pidBankLine="")
+	quit $$GetTotalPay^FINARBankLineGet(pidBank,pidBankLine)
+ 
+BeforeButtonLine(pKey)
+	;--------------------------------------------------------------------------------
+	;
+	; History
+	; 06-Aug-2003	shobby	Moved from FINARBank
+	; 31-Jul-2003	shobby	Call to PayInvoice
+	;--------------------------------------------------------------------------------
+	new idBank
+ 
+	set idBank=$piece(pKey,$$$COMMA,1)
+	
+	if '$$$NoKey(idBank) {
+		if '$$Editable^FINSYSReview("FINARBank",$$$FINARBankStatus($get(^FINARBank(YM,idBank,1)))) {
+			set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+		}
+	}
+	
+	;do PayInvoice^FINARBankInvoice(pKey)
+	quit
+ 
+OnBeforeFormConstruction(pYKEY,pobjFINARBankLine="")
+    ;-------------------------------------------------------------------------------
+    ; Disables the Customer field when data has been entered.  Replaces the 'Field is Inactive'
+    ; field in the form design.  (SR10313)
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 24-Mar-2005	Paul K	Passed in YFELD
+    ; 08-Sep-2004	Shobby	Created
+    ;-------------------------------------------------------------------------------
+	if $$$FINARBankLineCustomerNumber(pobjFINARBankLine)'="" {
+		set YHID=2
+	}
+	quit
+ 
+OnBlurCustomer(pidCustomer,pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; If this is a new banking line, check to see that there are no other banking lines for that customer
+    ; that are unposted. if there is, as the user to jump to that record, otherwise clear the customer field.
+    ;
+    ; History:
+    ; 22-Jun-2006	Steve S	SR14698: Rolled back -- checking done at invoice level
+    ; 21-Nov-2005	Steve S	SR13155: Show warning only, NOT jump message
+    ;  4-Jul-2005	JW		SR12669/SR12578: Added quit! Added $data check on
+    ;  						header record - in case data error.
+    ; 25-May-2005	Paul K	Created SR:12269
+    ;-------------------------------------------------------------------------------
+	
+	//SR14698
+	if ($get(pidCustomer)'="") && $data(^FINARCustomer(YM,pidCustomer)) {
+		write "SAVENOW();"
+	}
+	
+	/*
+	new idBank,strCustomer,strMessage,strOKCode,strCancelCode,idUser,idBankOrig
+	set idBankOrig=$piece($get(pYKEY),",",1)
+	
+	if (+$piece(YFKEY,$$$COMMA,2)=0)&&(pidCustomer'="")&&($data(^FINARCustomer(YM,pidCustomer,1))) {
+		set strCustomer=$$$Index(pidCustomer)
+		set idBank=""
+		for {
+			set idBank=$order(^FINARBankLines(YM,50,strCustomer,idBank))
+			quit:(idBank="")
+ 			;continue:(idBank=idBankOrig) ;SR13155 commented
+ 			
+			quit:$data(^FINARBank(YM,idBank,1))&&($$$FINARBankPostedDate($get(^FINARBank(YM,idBank,1)))="")  ;SR12669
+		}
+		
+		if (idBank'="") { ;SR13155
+			write "WWW2.YFINARBankLineD"_$$$FldFINARBankLineCustomerNumber_".value='';WWW2.YFINARBankLineD"_$$$FldFINARBankLineCustomerNumber_".focus();"
+			set idUser=$$$FINARBankCreatedBy($get(^FINARBank(YM,idBank,1)))
+			
+			if idBank'=idBankOrig { ;SR13155
+				do Alert^COMConst($$$Text($listbuild("Fin00773",idBank,idUser,pidCustomer))) ;Customer Banking record %1 (created by %2) already contains customer %3 and is unposted.
+			} else {
+				do Alert^COMConst($$$Text($listbuild("Fin00940",pidCustomer)))  ;This customer banking record already has a banking line for customer `%1`.	
+			}
+			
+			set %TXT(1)="#YFINARBankLineD"_$$$FldFINARBankLineCustomerNumber_Y
+		
+		} else {
+			write !,"SAVENOW();"
+		}
+		
+		;SR13155: Commented code below
+		/*
+		if idBank="" {
+			write !,"SAVENOW();"
+		} else {
+			set strMessage=$$$Text($listbuild("Fin00773",idBank,pidCustomer))  ;Customer Banking Record %1 which contains customer %2 is unposted.
+			set strOKCode=$$RedirectForm^COMViewFilter("FINARBank",idBank,"",0)
+			set strCancelCode="WWW2.YFINARBankLineD1.value='';WWW2.YFINARBankLineD1.focus();"
+			write $$$CallBack(strMessage,$$$EnumCOMMSGYesNo+$$$EnumCOMMSGQuestion,,strOKCode,strCancelCode)
+		}
+	}
+	*/
+	
+	quit
+ 
+ 
+CanAutoAllocate(pstrKey)
+    ;-------------------------------------------------------------------------------
+    ; Checks if the Auto Allocate button can be enabled or not.
+	; Must be an Unposted banking record
+	;
+    ; Returns: Status
+    ;
+    ; History:
+    ; 06-Jan-2006 	SC		SR13798: Decode wrapper removed. Decode in COMSYS.INC
+    ; 04-Jan-2005	MS		SR11380 Check for no record selected
+    ; 23-Dec-2004	SS		Created (SR:11345)
+    ;-------------------------------------------------------------------------------
+	new strStatus,idBank
+	
+	set strStatus=$$$OK
+	set idBank=$piece($get(pstrKey),",",1)
+	
+	if ('$$IsUnposted(idBank))&&($piece($get(YVOR),Y,23)=5) { 
+		set strStatus=$lb("Fin00539") ;A banking line must be unposted to auto allocate.
+	}
+	
+	if strStatus=$$$OK {   ; SR11380
+		if $get(YFELD)="" set strStatus=$lb("Fin00089") ;No Record Selected.
+	}
+	
+	if strStatus=$$$OK {
+		set YQ=$$$YQEnable
+	} else {
+		set YQ=$$$YQDisable(strStatus)	;SR13798
+	}
+	
+	quit strStatus
+	
+CanIncomePayment(pstrYFELD)
+    ;-------------------------------------------------------------------------------
+    ; Checks if the Income Payment button can be enabled or not.
+	; Record must be selected
+	;
+    ; Returns: Status
+    ;
+    ; History:
+    ; 06-Jan-2006 	SC		SR13798: Decode wrapper removed. Decode in COMSYS.INC
+    ; 04-Jan-2005	MS		SR11380 Created (copy of CanAutoAllocate)
+    ;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus=$$$OK
+	
+	if $get(pstrYFELD)="" set strStatus=$listbuild("Fin00089") ;No Record Selected.
+	
+	if $$$ISOK(strStatus) {
+		set YQ=$$$YQEnable
+	} else {
+		set YQ=$$$YQDisable(strStatus)	;SR13798
+	}
+	
+	quit strStatus
+ 
+IsUnposted(pidBank)
+    ;-------------------------------------------------------------------------------
+    ; Checks whether a banking record is unposted.
+    ;
+    ; Returns: blnIsUnposted 	1 - Unposted
+    ; 							0 - Posted/Pending
+    ;
+    ; History:
+    ; 23-Dec-2004	SS		Created (SR:11345)
+    ;-------------------------------------------------------------------------------
+	new objBankingRec,postedStatus,blnIsUnposted
+ 
+	set blnIsUnposted=$$$YES
+	
+	if '$$$NoKey(pidBank) {
+		set objBankingRec=$get(^FINARBank(YM,pidBank,1))
+		set postedStatus=$$$FINARBankStatus(objBankingRec)
+		set blnIsUnposted=(postedStatus=$$$EnumFINSYSSTATUSUnposted)
+	}
+	
+	quit blnIsUnposted
+	
+	
+PayLine()  // NOT CURRENTLY IN USE : JW 8-Feb-2005
+	new lineKey
+	
+	set lineKey = $$GetKey^COMGridEdit31G() ; get current row's key
+	do PayInvoice^FINARBankInvoice(lineKey)
+ 
+	do ReloadForm^COMGridEdit31G()
+	
+	quit
+	
+]]></Routine>
+</Export>

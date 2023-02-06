@@ -1,0 +1,587 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="COM.FCKeditor">
+<ClassType/>
+<IncludeCode>COMSYS,WWWConst,COMConst</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%CSP.Page</Super>
+
+<Method name="OnPage">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; When the request comes in from the FCKeditor, this will handle the request.
+	; 
+	; It handles GetFolders, GetFoldersAndFiles, CreateFolder and FileUpload
+	; 
+	; Not that there is also a blank command which is another version of FileUpload
+	; so we it to be FileUpload.
+	; 
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; $$$OK to state that this function worked.
+	;
+	; History:
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	set strCommand      = $get(%request.Data("Command",1))
+	set strResourceType = $get(%request.Data("Type",1))
+	set strCurrent      = $get(%request.Data("CurrentFolder",1))
+	set strNewFolder    = $get(%request.Data("NewFolderName",1))
+		
+	set strPath     = %request.CgiEnvs("PATH_TRANSLATED")
+	set strReferrer = %request.CgiEnvs("HTTP_REFERER")
+	
+	set intLen    = $length(strReferrer,"&")
+	set idCompany = $piece($piece(strReferrer,"&",intLen-2),"=",2)
+	if idCompany'="" {
+		set strSep = $piece($piece(strReferrer,"&",intLen-1),"=",2)
+		set idLang = $piece($piece(strReferrer,"&",intLen),"=",2)
+	} else {
+		set idCompany = $get(%request.Data("YM",1))
+		set strSep    = $get(%request.Data("Y",1))
+		set idLang    = $get(%request.Data("SPRACHE",1))
+	}
+	
+	set objMime=$get(%request.MimeData("NewFile",1))
+	if objMime'=$$$NULLOREF {
+		
+		set blnJS=$$$NO
+		if strCommand="" {
+			set blnJS=$$$YES
+			set strCommand="FileUpload"
+		}		
+	}
+	
+	do $case(strCommand,"GetFolders":			..GetFoldersAndOrFiles(strCommand,strResourceType,strCurrent,idCompany,strSep,$$$NO)
+					   ,"GetFoldersAndFiles":	..GetFoldersAndOrFiles(strCommand,strResourceType,strCurrent,idCompany,strSep,$$$YES)
+					   ,"CreateFolder":			..CreateFolder(idCompany,strSep,strCurrent,strNewFolder)
+					   ,"FileUpload":			..FileUpload(idCompany,strSep,strCurrent,objMime,blnJS,idLang)
+					   ,:						..Nothing())
+	
+	quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="GetFoldersAndOrFiles">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pstrCommand,pstrResourceType,pstrCurrent,pidCompany,pstrSep,pblnGetFiles</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; This returns the XML for 
+	; 
+	; <Connector  command={passed in command} resourceType={passed in resource type}>
+	; 	<CurrentFolder path={current path} url={url to current path} />
+	; 	<Folders>
+	; 		<Folder name={folder name 1} />
+	; 		.
+	; 		.
+	; 		.
+	; 		<Folder name={folder name n} />
+	; 	</Folders>
+	; 	-- If we are getting files then
+	; 	<Files>
+	; 		<File name={file name 1} size={size 1 in Kib} />
+	; 		.
+	; 		.
+	; 		.
+	; 		<File name={file name n} size={size n in Kib} />
+	; 	</Files>
+	; </Connector>
+	;
+	; Params:
+	; pstrCommand     : The command, either "GetFolders" or "GetFoldersAndFiles"
+	; pstrResourceType: The resource type, either "Files", "Images" or "Flash"
+	; pstrCurrent     : The current path to search through
+	; pidCompany      : The @NM company (YM)
+	; pstrSep         : The @NM separator (Y)
+	; pblnGetFiles    : Whether to show files or not
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Mar-2010	GRF		-: Replace order macros
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	do ..GetFolderAndFileInfo(pstrResourceType,pstrCurrent,pidCompany,pblnGetFiles,pstrSep,.arrFiles)
+	Write "<?xml version=""1.0"" encoding=""utf-8"" ?>"
+	write "<Connector command="""_pstrCommand_""" resourceType="""_pstrResourceType_""">"
+	write "<CurrentFolder path="""_pstrCurrent_""" url="""_arrFiles("URL")_""" />"
+	write "<Folders>"
+
+	set strName = ""
+	for {
+		set strName = $order(arrFiles("File","D",strName))
+		quit:strName=""
+		
+		write "<Folder name="""_$piece(strName,"\",$length(strName,"\"))_""" />"
+	}
+	write "</Folders>"
+	if pblnGetFiles {
+		write "<Files>"
+		set strName = ""
+		for {
+			set strName = $order(arrFiles("File","F",strName))
+			quit:strName=""
+
+			write "<File name="""_$piece(strName,"\",$length(strName,"\"))_""" size="""_arrFiles("File","F",strName)_""" />"
+		}
+		write "</Files>"
+	}
+	write "</Connector>"
+]]></Implementation>
+</Method>
+
+<Method name="CreateFolder">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidCompany,pstrSep,pstrCurrent,pstrNewFolder</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Return the XML for creating a new folder.
+	; 
+	; <Connector  command=CreateFolder resourceType=File>
+	; 	<CurrentFolder path={new path} url={url to new path} />
+	; 	<Error number={error number} />
+	; </Connector>
+	;
+	; Params:
+	; pidCompany   : The @NM company (YM)
+	; pstrSep      : The @NM separator (Y)
+	; pstrCurrent  : The current path to search through
+	; pstrNewFolder: The name of the new folder.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	set idError = ..CreateFolderCore(pidCompany,pstrSep, pstrNewFolder, .pstrCurrent,.strWebPath)
+	Write "<?xml version=""1.0"" encoding=""utf-8"" ?>"
+	write "<Connector command=""CreateFolder"" resourceType=""File"">"
+	write "<CurrentFolder path="""_pstrCurrent_""" url="""_strWebPath_""" />"
+	write "<Error number="""_idError_""" />"
+	write "</Connector>"
+]]></Implementation>
+</Method>
+
+<Method name="CreateFolderCore">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidCompany,pstrSep,pstrNewFolder,&amp;pstrCurrent,&amp;pstrWebPath</FormalSpec>
+<ReturnType>%Library.Integer</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; This actually creates the folder and returns any error messages.
+	; 
+	; Params:
+	; pidCompany   : The @NM company (YM)
+	; pstrSep      : The @NM separator (Y)
+	; pstrCurrent  : The current path to search through
+	; pstrNewFolder: The name of the new folder.
+	; pstrWebPath  : The web URL of the folder.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; If the folder already exists, return error 101 - Folder already exist
+	; If it can't be created, return error 110 - Unknown error creating folder.
+	; Otherwise it returns 0, for no error.
+	;
+	; History:
+	; 01-Nov-2006	JW		SR14914: Peer - added internal tag
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	set strPath=pstrCurrent
+	set $ztrap="CFCError"
+	do ..GetPaths(pidCompany,pstrSep,.strPath,.strWebPath,.strImagePath,.strPhysical)
+	
+	set strOldWebPath  = strWebPath
+	set strNewPhysical = ##class(%Library.File).NormalizeDirectory(strPhysical_pstrNewFolder)
+	set strWebPath     = strWebPath_pstrNewFolder
+	set strCurrent     = pstrCurrent_pstrNewFolder_"/"
+			
+	set blnCreated = $$$NO
+	set blnExists  = $$$NO
+	
+	if '##class(%Library.File).DirectoryExists(strNewPhysical) {
+		set blnCreated=##class(%Library.File).CreateNewDir(strPhysical,pstrNewFolder)
+		set pstrWebPath=strWebPath
+		set strPhysical=strNewPhysical
+		set pstrCurrent=strCurrent
+	} else {
+		set blnExists=$$$YES
+		set pstrWebPath=strOldWebPath
+	}
+	
+	set idError=0
+	
+	if blnExists set idError=101
+	if 'blnCreated && (idError=0) {
+		set idError=110
+	}
+	
+	quit idError
+CFCError	; Internal Tag
+	set $ztrap=""
+	set pstrWebPth=$get(strWebPath)
+	quit 110
+]]></Implementation>
+</Method>
+
+<Method name="Nothing">
+<ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Dummy Routine for else clause in the $case statement.
+	; 
+	; Dumps the Data and CGI so we can see the cause.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	if $get(^SysSetup("Editor","Log"))=1 {
+		set idLog=$increment(^LogCOMEditor)
+		set ^LogCOMEditor(idLog,"Data")=%request.Data
+		set ^LogCOMEditor(idLog,"CgiEnvs")=%request.CgiEnvs
+	}
+]]></Implementation>
+</Method>
+
+<Method name="GetPaths">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidCompany,pstrSep,&amp;pstrCurrent,&amp;pstrWebPath,&amp;pstrImagePath,&amp;pstrPhysical</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; This gets the paths, the physical path, the web path, and the virtual path
+	;
+	; Params:
+	; pidCompany   : The @NM company (YM)
+	; pstrSep      : The @NM separator (Y)
+	; pstrCurrent  : The current path to search through
+	; pstrWebPath  : The web path for the current path
+	; pstrImagePath: The image path for the current path
+	; pstrPhysical : The physical path for the current path
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Oct-2006 	JW		SR14914: Peer - use macros
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	set objCompany=$get(^WWW012(0,pidCompany,1))
+	
+	set pstrCurrent=$extract(pstrCurrent,2,$length(pstrCurrent))
+	
+	set pstrWebPath=$translate($$$WWW012PictureDirectoryUser(objCompany),"\","/")
+	if $extract($reverse(pstrWebPath))="/" {
+		set pstrWebPath=$extract(pstrWebPath,1,$length(pstrWebPath)-1)
+	}
+	
+	set objEditor=$get(^COMEditorConfiguration(0,pidCompany,"FCKeditor",1))
+	
+	set pstrImagePath=$translate($$$COMEditorConfigurationImageDirectory(objEditor),"\","/")
+	if $extract($reverse(pstrImagePath))="/" {
+		set pstrImagePath=$extract(pstrImagePath,1,$length(pstrImagePath)-1)
+	}
+	if $extract(pstrImagePath)="/" {
+		set pstrImagePath=$extract(pstrImagePath,2,$length(pstrImagePath))
+	}
+	
+	set strPhysical=$translate($$$WWW012PhysicalWWWDirectory(objCompany),"\","/")
+	if $extract($reverse(strPhysical))="/" {
+		set strPhysical=$extract(strPhysical,1,$length(strPhysical)-1)
+	}
+	
+	if pstrImagePath'="" {
+		set strPhysical=strPhysical_"/"_pstrImagePath
+		if pstrCurrent'="" {
+			set strPhysical=strPhysical_"/"_pstrCurrent
+		}
+	}
+	
+	set pstrPhysical=##class(%Library.File).NormalizeDirectory(strPhysical)
+	set pstrWebPath=pstrWebPath_"/"_pstrImagePath_"/"
+]]></Implementation>
+</Method>
+
+<Method name="GetFolderAndFileInfo">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pstrResourceType,pstrPath,pidCompany,pblnGetFiles,pstrSep,&amp;parrFiles</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Loop through the folder and list all allowed files types
+	;
+	; Params:
+	; pstrResourceType: The file type, "File", "Image", "Flash"
+	; pstrPath        : The path to the image
+	; pidCompany      : The @NM company (YM)
+	; pblnGetFiles    : Whether to show only directories or include files
+	; pstrSep         : The @NM separator (Y)
+	; parrFiles       : The array of files/folders.
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	do ..GetPaths(pidCompany,pstrSep,.pstrPath,.strWebPath,.strImagePath,.strPhysical)
+		
+	set parrFiles("URL")=strWebPath
+	
+	set strAllowed=""
+	set strDenied=""
+	
+	do ..GetFileExtensions(pstrResourceType,.strAllowed,strDenied)
+	
+	set objRS=##class(%Library.ResultSet).%New("%Library.File:FileSet")
+	do objRS.Execute(##class(%Library.File).NormalizeDirectory(strPhysical),"*",,'pblnGetFiles)
+	
+	set intCount=0
+
+	for {
+		quit:'objRS.Next()
+		
+		set strType=objRS.Data("Type")
+		continue:((strType="F") && ('pblnGetFiles))
+		
+		set strName=objRS.Data("Name")
+		set strFilename=##class(%Library.File).GetFilename(strName)
+		set strExtension="|"_$piece(strFilename,".",$length(strFilename,"."))_"|"
+		
+		set blnAllowed=(strType="D")||((strAllowed="")||($find(strAllowed,strExtension)))&&('$find(strDenied,strExtension))
+		
+		if blnAllowed {
+			set intSize=((objRS.Data("Size")+1023)\1024)
+			set intCount=$increment(intCount)
+			set parrFiles("File",strType,strFilename)=intSize
+		}
+	}
+]]></Implementation>
+</Method>
+
+<Method name="GetFileExtensions">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pstrType,&amp;pstrAllowed,&amp;pstrDenied</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; For a given resource type, what extensions are allowed and which are denied
+	;
+	; Params:
+	; pstrType   : The file type, "File", "Image", "Flash"
+	;
+	; ByRefs:
+	; pstrAllowed: The list of allowed extensions
+	; pstrDenied : The list of denied extensions
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	if pstrType="File" {
+		set pstrAllowed=""
+		set pstrDenied ="|php|php2|php3|php4|php5|phtml|pwml|inc|asp|aspx|ascx|jsp|cfm|cfc|pl|bat|exe|com|dll|vbs|js|reg|cgi|htaccess|"
+	} elseif pstrType="Image" {
+		set pstrAllowed="|jpg|gif|jpeg|png|bmp|"
+		set pstrDenied=""
+	} elseif pstrType="Flash" {
+		set pstrAllowed="|swf|fla|"
+		set pstrDenied=""
+	} else {
+		set pstrAllowed="|swf|fla|jpg|gif|jpeg|png|avi|mpg|mpeg|mp(1-4)|wma|wmv|wav|mid|midi|rmi|rm|ram|rmvb|mov|qt|"
+		set pstrDenied=""
+	}
+]]></Implementation>
+</Method>
+
+<Method name="FileUpload">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidCompany,pstrSep,pstrCurrent,pobjMime,pblnJS,pidLang</FormalSpec>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Write out the javascript for the uploading of a file.
+	;
+	; Params:
+	; pidCompany   : The @NM company (YM)
+	; pstrSep      : The @NM separator (Y)
+	; pstrCurrent  : The current path to search through
+	; pobjMime     : The mime object, actually a %CSP.Stream
+	; pblnJS       : Whether to write JS or HTML of the JS
+	; pidLang      : The users language
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	set idError=..FileUploadCore(pidCompany,pstrSep,pstrCurrent,pobjMime,pidLang,.strFileName,.strMessage,.strWebPath)
+	
+	if pblnJS {
+		write "window.parent.OnUploadCompleted("_idError_",'"_strWebPath_"','"_strFileName_"','"_strMessage_"');",!
+	} else {
+		write "<script type='text/javascript'>"
+		write "window.parent.frames['frmUpload'].OnUploadCompleted("_idError_",'"_strFileName_"');",!
+		write "</script>"
+	}
+]]></Implementation>
+</Method>
+
+<Method name="FileUploadCore">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidCompany,pstrSep,pstrCurrent,pobjMime,pidLang,&amp;pstrFileName,&amp;pstrMessage,&amp;pstrWebPath</FormalSpec>
+<ReturnType>%Library.Integer</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Attempt to upload the file and save it to the local file system
+	;
+	; Params:
+	; pidCompany : The @NM company (YM)
+	; pstrSep    : The @NM separator (Y)
+	; pstrCurrent: The current path to search through
+	; pobjMime   : The mime object, actually a %CSP.Stream
+	; pstrMessage: The message to send bacjk for a customer error
+	; pstrWebPath: The full web path for the file.
+	;
+	; Returns:
+	; 0 - Uploaded, no problem
+	; 1 - Customer Error Message
+	; 201 - Uploaded but name has been changed to include version number
+	; 202 - Could not create the file
+	;
+	; History:
+	; 01-Nov-2006	JW		SR14914: Peer - added internal tag
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	set idError=0
+	
+	set $ztrap="FUCError"
+	
+	set pstrMessage=""
+	set strCurrent=pstrCurrent
+	
+	do ..GetPaths(pidCompany,pstrSep,.strCurrent,.pstrWebPath,.strImagePath,.strPhysical)
+	
+	if '##class(%Library.File).DirectoryExists(strPhysical) {
+		do ##class(%Library.File).CreateDirectoryChain(strPhysical)
+	}
+	
+	set strFileName=##class(%Library.File).GetFilename(pobjMime.FileName)
+	set pstrFileName=..GetFileName(strPhysical,strFileName)
+	
+	if pstrFileName'=strFileName {
+		set idError=201
+	}
+	
+	set objFile=##class(%Library.FileBinaryStream).%New()
+	set objFile.Filename=strPhysical_pstrFileName
+	
+	set strStatus=objFile.CopyFromAndSave(pobjMime)
+	
+	if $$$ISOK(strStatus) {
+		do objFile.Flush()
+	} else {
+		set idError=202
+	}
+
+	quit idError
+FUCError	; Internal Tag
+	set pstrFileName=""
+	
+	set SPRACHE=pidLang
+	
+	set pstrMessage=$$$Text($listbuild("Com00262",$zerror))  ;An Error Occurred: %1
+	
+	quit 1
+]]></Implementation>
+</Method>
+
+<Method name="GetFileName">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pstrPhysical,pstrFileName</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Recursively determine the name of a file.
+	; 
+	; If we are uploading file a.gif and it already exists, store it as a(1).gif
+	; If a(1).gif exists, store it as a(2).gif, etc.
+	;
+	; Params:
+	; pstrPhysical: The physical path to the file
+	; pstrFileName: The name of the file as we go
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; the final name of the file.
+	;
+	; History:
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	// What is the max stack level ROBERT ?
+	
+	if '##class(%Library.File).Exists(pstrPhysical_pstrFileName) {
+		quit pstrFileName
+	} else {
+		set intLen       = $length(pstrFileName,".")
+		set strFile      = $piece(pstrFileName,".",1,intLen-1)
+		set strExtension = $piece(pstrFileName,".",intLen)
+		set strJustFile  = $piece(strFile,"(",1)
+		set strNumber    = $piece(strFile,"(",2)+1
+		set pstrFileName = strJustFile_"("_strNumber_")."_strExtension
+		
+		quit ..GetFileName(pstrPhysical,pstrFileName)
+	}
+]]></Implementation>
+</Method>
+
+<Method name="OnPreHTTP">
+<Description><![CDATA[
+Event handler for <B>PreHTTP</B> event: this is invoked before
+the HTTP headers for a CSP page have been sent.  All changes to the
+<class>%CSP.Response</class> class, such as adding cookies, HTTP headers,
+setting the content type etc. must be made from within the OnPreHTTP() method.
+Also changes to the state of the CSP application such as changing
+%session.EndSession or %session.AppTimeout must be made within the OnPreHTTP() method.
+It is prefered that changes to %session.Preserve are also made in the OnPreHTTP() method
+as this is more efficient, although it is supported in any section of the page.
+Return <B>0</B> to prevent <method>OnPage</method> from being called.]]></Description>
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Boolean</ReturnType>
+<ServerOnly>1</ServerOnly>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; If this is an FileUpload or blank (which is a FileUpload as well), we need
+	; to return HTML instead of XML.
+	;
+	; Returns:
+	; %Boolean
+	;
+	; History:
+	; 18-Oct-2006	RPW		SR14914: Created
+	;-------------------------------------------------------------------------------
+	set strCommand=$get(%request.Data("Command",1))
+	if (strCommand="FileUpload")||(strCommand="") {
+		set %response.ContentType="text/html"
+	} else {
+		set %response.ContentType="text/xml"
+	}
+	
+	quit $$$YES
+]]></Implementation>
+</Method>
+</Class>
+</Export>

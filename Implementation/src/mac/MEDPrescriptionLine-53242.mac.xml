@@ -1,0 +1,399 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDPrescriptionLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDPrescriptionLine
+	
+#include COMSYS
+#include MEDConst
+#include INConst
+	
+#define FORMFldMEDPrescriptionLineDoseUOM  3
+
+	
+OnBeforeDisplayCombo(pstrKeys,pobjPres,pintCol,&pSUCH)
+	;-------------------------------------------------------------------------------
+	; Populates the Dose UOM with the UOM as defined in INARTPACK only, excludes
+	; units that the item does not come in.
+	; 
+	; set pSUCH as the items to be used when you override the list (set via blnOverride)
+	;
+	; Inputs:
+	;	pstrKeys	- YKEY
+	;	pobjPres	- YFELD
+	;	pintCol     - Edit Grid Column Id
+	;	pSUCH       - Search Array
+	; 
+	; Returns: $$$YES or $$$NO (override the data) 
+	;
+	; History:
+	; 15-Jul-2011	GRF		SR17669: Call common code
+	; 26-Jun-2009	DWR		SR16303: Created
+	;-------------------------------------------------------------------------------
+	new blnOverride
+	
+	set blnOverride = $$$NO
+	
+	; F11 - Received Unit
+	;---------------------------------------
+	if pintCol = $$$FORMFldMEDPrescriptionLineDoseUOM {    ; SR17669 vvv
+		set blnOverride = $$LoadCombo^INARTPACK($$$MEDPrescriptionLineItem(pobjPres),blnOverride,.pSUCH)
+	}
+	quit blnOverride
+	/*
+	if (pintCol = $$$FORMFldMEDPrescriptionLineDoseUOM)  {
+		kill pSUCH
+		set pSUCH  = "SUCH"
+		set idItem = $$$MEDPrescriptionLineItem(pobjPres)
+		if idItem '= "" {
+			set enumUnit = ""
+			for {
+				set enumUnit = $order(^INARTPACK(0,idItem,enumUnit))
+				quit:enumUnit=""
+				
+				set pSUCH(enumUnit) = enumUnit
+			}
+			set blnOverride = $$$YES
+		}
+	}
+	quit blnOverride
+	*/                                                     ; SR17669 ^^^
+
+
+DoseTotal(objPresLine,pblnApplyRounding=$$$NO,pfltDoseQty="",pdtStart="",pdtEnd="",&parrDoses) ;HEVA-700.3
+	;-------------------------------------------------------------------------------
+	; Calculates the dose total Quantity via core rules.
+	;
+	; Inputs:
+	;
+	; Returns: The Dose Total Qty for a prescription line based on frequency / Dose
+	; 			and Duration in days
+	;
+	; History:
+	; 09-Oct-2014	SCR		HEVA-1580: Add Start & End Times
+	; 15-Jan-2014	shobby	SMSPE-15: Using the MEDPrescription Form, the MEDPrescriptionLineToDate (etc) fields are not available
+	;                                 The Duration field must be used instead.
+	; 13-Sep-2013	FrankF	HEVA-1126: Single Dose Calculation
+	; 16-Jan-2013	SCR		HEVA-763: Exclude Frequency from non continuous solution
+	; 15-Jan-2013	SCR		HEVA-753: Multiply the Dose Quantity * Diuent Qty when non continuous
+	; 10-Jan-2013	SCR		HEVA-753: Continuous Solution Dose Calculation
+	; 10-Jan-2013	shobby	HEVA-713.4: With Start/End time the same the DoseTotal will be the
+	;									Dose Quantity, not 1.
+	; 03-Jan-2013	shobby	HEVA-713.3: Improved accuracy of duration calculation.
+	; 21-Dec-2012	shobby	HEVA-713.2: Improved calculation when start and end times are
+	;									fractions of the frequency.
+	; 13-Dec-2012	shobby	HEVA-700.2: Optionally Get Adjusted DoseTotal
+	; 10-Dec-2012	shobby	HEVA-700: MultidoseInjectable
+	; 08-Aug-2012	SCR		SR17993: If Dose toal is less than 1 , round it to 1
+	; 26-Jun-2009	DWR		SR16642: Created
+	;-------------------------------------------------------------------------------
+	new fltDays,fltDoseQty,fltDoseTotal,fltFactor,idFrequency,idSigleDoseFreq,objFrequency
+	new objSetup
+
+	set fltFactor 	 = 0
+	set fltDoseTotal = 0
+	kill parrDoses
+	
+	if objPresLine'="" {
+		
+		if pfltDoseQty="" {
+			set fltDoseQty  = $$$MEDPrescriptionLineDoseQty(objPresLine) ;HEVA-700.3
+		} else {
+			set fltDoseQty = pfltDoseQty
+		}
+		if (pblnApplyRounding && '$$MultidoseInjectable^INART($$$MEDPrescriptionLineItem(objPresLine))) set fltDoseQty=(fltDoseQty+.999999)\1 		;HEVA-700 ;HEVA-700.2
+		
+		;set fltDays     = $$$MEDPrescriptionLineDuration(objPresLine)
+		if ($$$MEDPrescriptionLineContinuous(objPresLine) &&  $$$MEDPrescriptionLineSolution(objPresLine)) {
+			set fltDoseTotal = fltDoseQty * $$$MEDPrescriptionLineDiluentQty(objPresLine) 
+		} else {
+			;HEVA-713
+			set fltDays = (($$$MEDPrescriptionLineToDate(objPresLine)*86400)+$$$MEDPrescriptionLineToTime(objPresLine))-(($$$MEDPrescriptionLineFromDate(objPresLine)*86400)+($$$MEDPrescriptionLineFromTime(objPresLine))) ;HEVA-713
+			set fltDays = fltDays/86400
+			if fltDays=0 set fltDays=$$$MEDPrescriptionLineDuration(objPresLine) ;SMSPE-15
+			set idFrequency = $$$MEDPrescriptionLineFrequency(objPresLine)
+			if idFrequency '="" {
+				set objFrequency = $get(^MEDFrequency(0,idFrequency,1))
+				set fltFactor    = $$$MEDFrequencyConversion(objFrequency)
+			}
+			if fltFactor'="" {
+				
+				; HEVA-1126 vvvv
+				set objSetup=$get(^MEDPrescriptionSetup(0,YM,1)) 
+				set idSigleDoseFreq	= $$$MEDPrescriptionSetupSingleDoseFrequency(objSetup)
+				if (idSigleDoseFreq '= "" && (idFrequency = idSigleDoseFreq)) {
+					set fltFactor = 1
+					set fltDays = 1
+				}
+				; HEVA-1126 ^^^^
+				
+				; HEVA-763 vvvv
+				if ('$$$MEDPrescriptionLineContinuous(objPresLine) &&  $$$MEDPrescriptionLineSolution(objPresLine)) {
+					set fltFactor = 1
+				} 
+				; HEVA-763 ^^^^
+				set fltDoseTotal 	= fltDoseQty * (fltDays * fltFactor+.9999999999\1) ;HEVA-713.2
+				if (pdtStart'="")&& (pdtEnd'="") {
+					set fltDoseTotal	= $$DosePerShift(fltDoseQty,objPresLine,fltFactor,pdtStart,pdtEnd,.parrDoses)
+				}				; HEVA-753 vvvv
+				if ( $$$MEDPrescriptionLineSolution(objPresLine) && $$$MEDPrescriptionLineDiluentQty(objPresLine)) {
+					set fltDoseTotal = fltDoseTotal * $$$MEDPrescriptionLineDiluentQty(objPresLine)
+				}
+				; HEVA-753 ^^^^
+				; HEVA-800 vvvv
+				set fltDoseTotal=$$RoundDose^MEDPrescriptionCommon(fltDoseTotal) 
+				if 'fltDoseTotal {
+				;if fltDoseTotal<1 {
+					; HEVA-800 ^^^^
+					;HEVA-713.4 set fltDoseTotal=1  ; SR17993
+					set fltDoseTotal=fltDoseQty ;HEVA-713.4
+				}
+			} 
+		}
+	}
+	quit fltDoseTotal	
+
+	
+DosePerShift(pfltDoseQty,pobjPresLine,pfltFactor,pdtStart,pdtEnd,&parrDoses)
+	;-------------------------------------------------------------------------------
+	; Calculates the dose total Quantity via core rules.
+	;
+	; Inputs:
+	;
+	;
+	; History:
+	; 06-Oct-2014	SCR		HEVA-1623: Round Day
+	; 17-Oct-2014	SCR		HEVA-1580: Record Dose Times
+	; 09-Oct-2014	SCR		HEVA-1580: Created
+	;-------------------------------------------------------------------------------
+	new fltDays,fltDoseTotal,fltFactor,idFrequency,idSigleDoseFreq,intDoses,intInc
+	new intRxEnd,intRxStart,intSftEnd,intSftStart,intTime,objSetup
+	
+	kill parrDoses
+	set idFrequency	= $$$MEDPrescriptionLineFrequency(pobjPresLine)
+	set objSetup	= $get(^MEDPrescriptionSetup(0,YM,1)) 
+	set intSftStart	= ($piece(pdtStart,",",1)*86400)+$piece(pdtStart,",",2)
+	set intSftEnd	= ($piece(pdtEnd,",",1)*86400)+$piece(pdtEnd,",",2)
+	set intRxStart	= ($$$MEDPrescriptionLineFromDate(pobjPresLine)*86400)+($$$MEDPrescriptionLineFromTime(pobjPresLine))
+	set intRxEnd	= ($$$MEDPrescriptionLineToDate(pobjPresLine)*86400)+($$$MEDPrescriptionLineToTime(pobjPresLine))
+	set fltDays 	= (intRxEnd-intRxStart) 
+	set fltDays		= fltDays/86400
+	set fltDays		= +$j(fltDays+.0004,0,3) ; Work around for the 23 hour 59 minute day
+	if fltDays=0 set fltDays=$$$MEDPrescriptionLineDuration(pobjPresLine)
+	set idSigleDoseFreq	= $$$MEDPrescriptionSetupSingleDoseFrequency(objSetup)
+	if (idSigleDoseFreq '= "" && (idFrequency = idSigleDoseFreq)) {
+		set fltFactor	= 1
+		set fltDays		= 1
+	}
+	set intRxStart		= ($$$MEDPrescriptionLineFromDate(pobjPresLine)*86400)+($$$MEDPrescriptionLineFromTime(pobjPresLine))
+	set intRxEnd		= ($$$MEDPrescriptionLineToDate(pobjPresLine)*86400)+($$$MEDPrescriptionLineToTime(pobjPresLine))
+	set intDoses		= fltDays * pfltFactor+.9999999999\1
+	if (intRxStart<intRxEnd) && pfltFactor {
+		set intTime	= intRxStart
+		set intInc	= 86400/pfltFactor
+		set intDoses	= 0
+		for {
+			if intTime'<intSftStart {
+				if intTime'>(intSftEnd-1) {
+					set intDoses	= intDoses + 1
+					set parrDoses(intTime)	= ""
+				}
+			}
+			set intTime		= intTime + intInc
+			quit:intTime'<intRxEnd
+		}
+	}
+	set fltDoseTotal 	= pfltDoseQty * (fltDays *intDoses) ;HEVA-713.2
+	quit fltDoseTotal	
+	
+DispensingUOM(pidPres,objPresLine)
+	;-------------------------------------------------------------------------------
+	; convert UOM prescribed into PickUOM
+	;
+	; Inputs:
+	;
+	; Returns: Pick UOM
+	;
+	; History:
+	; 15-Jul-2009	DWR		SR16642: Created
+	;-------------------------------------------------------------------------------
+	new enumIssueType,fltExternalQty,fltOPExternalQty,fltOPInventoryQty,fltOPIssueQty
+	new fltOPPickQty,idExternalUOM,idItem,idOPInventoryUOM,idOPIssueUOM
+	new idOPPickUOM,objHeader,strStatus
+	
+	set strStatus   = $$$OK
+	set idOPPickUOM = ""
+	
+	if '$$$NoKey(pidPres) {
+		set objHeader = $$$GRIDYFELDContainer
+		if objHeader = "" {                        ; called by Web Service
+			set objHeader = $get(^MEDPrescription(0,pidPres,1))
+		}
+		set objHeader = $get(^MEDPrescription(0,pidPres,1))		//SR18002
+		set enumIssueType  = $$$MEDPrescriptionIssueType(objHeader)
+		set idItem         = $$$MEDPrescriptionLineItem(objPresLine)
+		set fltExternalQty = $$$MEDPrescriptionLineDoseTotalQuantity(objPresLine)
+		set idExternalUOM  = $$$MEDPrescriptionLineDoseUOM(objPresLine)
+		
+		if $$$ISOK(strStatus) set idOPPickUOM = $$GetPickUOM^INUOMConversion(idItem,enumIssueType,.strStatus)
+	}
+	quit idOPPickUOM 
+	
+	
+DispensingQty(pidPres,objPresLine)
+	;-------------------------------------------------------------------------------
+	; Convert QTY Prescribed to QTY Picked
+	;
+	; Inputs:
+	;
+	; Returns: Pick Qty
+	;
+	; History:
+	; 15-Jul-2009	DWR		SR16642: Created
+	;-------------------------------------------------------------------------------
+	new enumIssueType,fltExternalQty,fltOPPickQty,idExternalUOM,idItem,idOPIssueUOM
+	new idOPPickUOM,objHeader,strStatus
+	
+	set strStatus    = $$$OK
+	set fltOPPickQty = ""
+	
+	if '$$$NoKey(pidPres) {
+		set objHeader = $$$GRIDYFELDContainer
+		if objHeader = "" {                                ; called by Web Service
+			set objHeader = $get(^MEDPrescription(0,pidPres,1))
+		}
+		set enumIssueType  = $$$MEDPrescriptionIssueType(objHeader)
+		set idItem         = $$$MEDPrescriptionLineItem(objPresLine)
+		set fltExternalQty = $$$MEDPrescriptionLineDoseTotalQuantity(objPresLine)
+		set idExternalUOM  = $$$MEDPrescriptionLineDoseUOM(objPresLine)
+			
+		if $$$ISOK(strStatus) set idOPPickUOM = $$GetPickUOM^INUOMConversion(idItem,enumIssueType,.strStatus)
+		
+		if $$$ISOK(strStatus) {
+			set fltOPPickQty = $$Convert^INUOMConversion(idItem,fltExternalQty,idExternalUOM,idOPPickUOM,$$$YES)
+		}
+	}
+	quit fltOPPickQty
+	
+	
+CustomPres(pidHeader,pobjHeader)
+	;-------------------------------------------------------------------------------
+	; Creates the MEDPrescription lines based on the base item's manufacture bill of
+	; components. should only be called if there are no lines already on the grid, 
+	; and is a custom manufacture prescription ONLY.
+	; 
+	; called by:
+	; OnAfterSave^MEDPrescription
+	;
+	; Inputs:
+	;
+	; Returns: strStatus
+	;
+	; History:
+	; 16-Jul-2009	DWR		SR16303: Created
+	;-------------------------------------------------------------------------------
+	new idBaseItem,idLine,objItemLines,objPresLine,strStatus
+	
+	set strStatus  = $$$OK
+	set idBaseItem = $$$MEDPrescriptionBaseItem(pobjHeader)
+	
+	if idBaseItem'="" { ;just in case. should always be populated, mandatory for customs manufacture
+		set idLine=""
+		for {
+			set idLine = $order(^INARTT(0,idBaseItem,idLine))
+			quit:idLine=""
+			
+			set objItemLines = $get(^INARTT(0,idBaseItem,idLine,1))
+			
+			set objPresLine = ""
+			set $$$MEDPrescriptionLineItem(objPresLine)    = $$$INARTTItemNumber1(objItemLines)
+			set $$$MEDPrescriptionLineDoseQty(objPresLine) = $$$INARTTQuantity(objItemLines)
+			set $$$MEDPrescriptionLineDoseUOM(objPresLine) = $$$INARTTUnit(objItemLines)
+			
+			set strStatus = $$$Save("MEDPrescriptionLine",pidHeader_$$$COMMA_idLine,objPresLine,$$$YES)
+			quit:$$$ISERR(strStatus)
+		}
+	}	
+	quit strStatus
+	
+	
+OnBlurItem(pYKEY, pidGridRow, pidItem, &pobjLine)
+	;-------------------------------------------------------------------------------
+	; On Blur from Item
+	;	Populates Unit dropdown
+	;
+	; Called By : form $MEDPrescriptionLine & MEDPrescriptionHospLine & MEDPrescriptionSolLine
+	;		
+	; Params:	(YKEY,GROW,YINHALT,.YFELD)
+	;
+	; ByRefs:	pobjLine	- current line object
+	;
+	; Returns:
+	;
+	; History :
+	; 20-Jan-2014	shobby	SMSPE-15: Use Core code to show message.
+	; 10-Oct-2012	SCR		SR18139:Use Frequency function
+	; 14-Sep-2010	PPP		SR16642:Created
+	;-------------------------------------------------------------------------------
+	new objItem
+	
+	//Populate Unit Listing
+	set $$$MEDPrescriptionLineDoseUOM(pobjLine) = $$LoadUnitOfMeasureList^INARTUtilities(pidItem)
+	
+	if pidItem'="" {
+		set objItem = $get(^INART(0,pidItem,1))
+		;set $$$MEDPrescriptionLineFrequency(pobjLine)             = $$$INARTMedFrequency(objItem) 
+		set $$$MEDPrescriptionLineFrequency(pobjLine)             = $$Frequency^MEDPrescriptionHosp(objItem)  ; SR18139
+		set $$$MEDPrescriptionLineRouteOfAdministration(pobjLine) = $$$INARTMedRouteOfAdministration(objItem)
+		;SMSPE-15 if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+			do ShowInteractionPrescriptionMessage^MEDDrugInteraction($$$KEY1(pYKEY)) ;SMSPE-15
+		;SMSPE-15 }
+	}
+	do OnBlur(pYKEY,pidGridRow,$$$MEDPrescriptionLineDoseQty(pobjLine),.pobjLine)
+	quit
+	
+	
+OnBlur(pYKEY,pidGridRow,pidField,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; On Blur from Dose Qty/Frequency/DurationDays/Dose UOM
+	;	Populates Unit dropdown
+	;
+	; Called By : form $MEDPrescriptionLine & MEDPrescriptionSolLine
+	;		
+	; Params:	(GROW,YINHALT,.YFELD)
+	;
+	; ByRefs:	pobjLine	- current line object
+	;
+	; Returns:
+	;
+	; History :
+	; 14-Sep-2010	PPP		SR16642:Created
+	;-------------------------------------------------------------------------------
+	new fltQuantity
+	
+	set $$$MEDPrescriptionLineDispenseUOM(pobjLine)       = $$DispensingUOM($$$KEY1(pYKEY),pobjLine)
+	set $$$MEDPrescriptionLineDoseTotalQuantity(pobjLine) = $$DoseTotal(pobjLine)
+	
+	if (pidField '= "") {
+		set fltQuantity = $$DispensingQty($$$KEY1(pYKEY),pobjLine)
+		if fltQuantity {
+			set $$$MEDPrescriptionLineDispenseQuantity(pobjLine) = fltQuantity
+		}
+	} else {
+		set $$$MEDPrescriptionLineDispenseQuantity(pobjLine) = 0
+	}
+	quit
+	
+	
+OnBeforeFormat(pYFIELDNAME,pYTEXT,pobjLine)
+	do OnBeforeFormat^VARMEDPrescriptionLine(pYFIELDNAME,pYTEXT,pobjLine)
+	quit
+
+OnBeforeClick(pstrData)
+	if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+		quit $$OnBeforeClick^VARMEDPrescriptionLine(pstrData)
+	}
+
+	quit 1
+
+]]></Routine>
+</Export>

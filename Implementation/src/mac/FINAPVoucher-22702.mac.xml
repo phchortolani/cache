@@ -1,0 +1,971 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPVoucher" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPVoucher
+	
+#include COMSYS
+#include FINConst
+#include COMConst
+#include WWWConst
+	
+IsPaid(YM,pidVoucher) 
+	;-------------------------------------------------------------------------------
+	; Return an indicator if the voucher has been paid in a supplier payment.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Sep-2005	shobby	SR13213: Pass in YM as a parameter, otherwise won't
+	;							exist when using SQL (ie from COMView)
+	; 22-Sep-2005	shobby	SR13213: Created
+	;-------------------------------------------------------------------------------
+	new strResult
+	
+	set strResult = $$IsInvoiceInPostedPayment^FINAPInvUnPost(pidVoucher)
+	if $$$ISERR(strResult) {
+		set strResult = 1
+	} else {
+		set strResult = 0
+	}
+	quit strResult 
+	
+	
+OnBeforeButtonLine(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Check voucher, editable, create tax codes.
+	;
+	; Returns:
+	;
+	; History:
+	; 13-Oct-2005	RPW		SR13678: Reset currency to that of the supplier when
+	;							redirecting to a Invoice Match
+	; 10-Jul-2005	RPW		If we are in the build, do not do the redirect
+	;  8-Apr-2005	JW		SR12098: Get location from YFELD
+	; 22-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+    new strForm
+    
+	if ($get(pYFELD)'="")&&($get(pYKEY)'="") {
+		// If record isn't a voucher, redirect to invoice matching.
+		if ('$$$FINAPInvIsVoucher(pYFELD))&&('$get(^IsInBuild)) {
+			$$$AlertInScript("Fin00683")   ; "This invoice is for Invoice Matching. Redirecting..."
+			
+			set strForm = "FINAPInv"
+			kill ^CacheTemp(YUSER,strForm,"Toggles")
+			do RedirectForm^COMUtilForm(strForm,pYKEY,"","","")
+			
+		} else {
+			if '$$Editable^FINSYSReview("FINAPInv",$$$FINAPInvStatus(pYFELD)) {
+				set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+				
+			} else {
+				set $$$WWW124AcknowledgementTextBefore(^WWW124(0,"FINAPVoucher",SPRACHE,5,1)) = $$PostWarnings(pYKEY)
+			}
+			// Populate COMTemp for tax codes
+			do CreateTaxCodesList^COMTAXLocation($$$FINAPInvTaxLocation(pYFELD))
+		}
+	}
+	quit
+	
+	
+OnAfterButtonLine()
+	;-------------------------------------------------------------------------------
+	; Check if the user session date has expired
+	;
+	; History:
+	; 01-Jul-2005	RPW		SR12230: Created
+	;------------------------------------------------------------------------------
+	do CheckGLEffectiveDateExpiration^FINAPUtilities()
+	quit
+	
+	
+OnAfterDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Routine to execute after deleting a voucher record
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Oct-2006	JW			SR15134: Look at kill status
+	; 21-Nov-2005	Steve S		SR13853: KILL^COMSchedule
+	; 21-Jun-2005	Steve S		Created SR12250
+	;-------------------------------------------------------------------------------
+    new strStatus
+    
+    if '$$$NoKey(pYKEY) {
+	    set strStatus = $$ClearPrePostData^FINAPVoucherPrePost(pYKEY)		// SR15134
+	    if $$$ISOK(strStatus) {
+	    	set strStatus = $$KILL^COMSchedule("FINAPInv",pYKEY) ;SR13853		// SR15134
+	    }
+	    if $$$ISERR(strStatus) {
+			set Q = $$$QDontDelete		// SR15134
+		}
+    }
+ 
+	quit
+		
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Get the grid to save its contents
+	;
+	; Returns:
+	;
+	; History:
+	; 22-Sep-2005	PO		SR12943: Save creators Location and Department.
+	; 03-May-2005	RPW		SR12227: Removed check for Supplier Invoice Number as 
+	; 							this is now a mandatory field
+	; 22-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idSupplier,objEmployeeData
+	
+	set strStatus = $$$GRIDSave(pYKEY)
+	
+	if $$$ISOK(strStatus) {
+		set Q = $$$QSave
+		if $$$FINAPInvCreatedBy(pYFELD) = "" {
+			set objEmployeeData = $get(^WWW013(0,$get(YBED,"UNKNOWN"),1))
+			set $$$FINAPInvCreatorsLocation(pYFELD)   = $get(YLOCATION) ; If Home Location not set for user then first location is selected ie. 1
+			set $$$FINAPInvCreatorsDepartment(pYFELD) = $$$WWW013HomeDepartment(objEmployeeData) ; What should happen if the department is not set?
+		}
+	} else {
+		set Q = $$$QDontSave
+	}
+	quit
+	
+	
+OnAfterDataFields(pYKEY,pYFELD,pYSEITE)
+	;-------------------------------------------------------------------------------
+	; Execute after data fields
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Sep-2005	PO		SR12880: Show grid on Tax page
+	; 07-Apr-2005	SteveS	SR11669: Check Repeat Group
+	; 22-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new idRepeatGroup,objRepeatGroup
+	
+	// Store page number
+	set ^CacheTemp(YUSER,"FINAPVoucher","Page") = pYSEITE
+	set YOPTION = pYSEITE
+	
+	if (pYSEITE=1) || (pYSEITE=2) || (pYSEITE=6) {
+		do LoadGrid(pYKEY)
+	}
+	if (pYSEITE=4) {
+		// Show schedules if repeat.
+		if $$$FINAPInvRepeat(pYFELD) {
+			set idRepeatGroup=$$$FINAPInvRepeatGroup(pYFELD)
+			if ($$$FINAPInvParentInvoice(pYFELD)="") && (idRepeatGroup'="") {
+				do AfterDataField^COMSchedule(pYKEY,"FINAPInv","PostSchedule^FINAPInvPost(´"_pYKEY_"´)",$$$Text("Fin00731"))
+				set objRepeatGroup = $get(^FINSYSRepeatGroup(YM,idRepeatGroup,1))
+				if $$$FINSYSRepeatGroupPermitSchedules(objRepeatGroup) {
+					do AfterDataField^COMSchedule(idRepeatGroup,"FINSYSRepeatGroup","PostGroupSchedule^FINInvGroupPost(´"_idRepeatGroup_"´)",$$$Text("Fin00732"),$$$YES)	
+				}
+			}
+		} else { // If repeat checkbox not checked, make other repeat fields readonly.
+	 		write "<script>"
+			do ToggleReadOnly^COMUtilForm("36;37;38",$$$YES)
+			write "</script>"
+		}
+	}
+	
+	if (pYSEITE=5) {
+		do DisplayChildren(pYKEY)
+	}
+	quit
+	
+	 
+LoadGrid(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Load the FINAPInvCharge grid.
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Dec-2008	GRF		Clarify Enabled test
+	; 27-Apr-2005	JW		SR12143: removed default fields.
+	; 22-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new YFORM,YKEY,YAUSWAHL,YFELD
+	
+	set YFORM = "FINAPInvCharge"
+	set YFELD = ""
+	set YKEY  = $get(pYKEY)
+	
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 290
+	set $$$COMGridEditParameterGridName(YAUSWAHL)      = YFORM
+	set $$$COMGridEditParameterClearFields(YAUSWAHL)   = "3,4;4,3"
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)       = ($$$WWW120AuthorizationToModifyData(YVOR)'=$$$EnumReadOnly)
+	set $$$COMGridEditParameterContainer(YAUSWAHL)     = "FINAPVoucher"
+	do ^COMGridEdit31
+	
+	quit
+	
+	
+SplitForm(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Go to split form, if there are any lines to apportion.
+	; Set YKEY as first charge to apportion.
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Feb-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new idCharge
+	
+	if $get(pidInvoice)'="" {
+		set idCharge = $order(^FINAPInvChargeDivision(YM,pidInvoice,""))
+		if idCharge="" {
+			do ReturnError^COMUtilError($listbuild("Fin00687")) ; "No charges to apportion."
+		} else {
+			do GoToForm^COMUtilForm("FINAPInvChargeSplit",pidInvoice_","_idCharge)
+		}
+	}
+	quit
+	
+	
+OnBlurTax(pYFELD,pYMFELD)
+	;-------------------------------------------------------------------------------
+	; Update total on blur of tax field
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Jan-2006	SteveS	SR13497: Update discounts
+	; 14-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new total
+	
+	if '$$$FINAPInvLinesIncludeTax(pYFELD) {
+		set total = $$$FINAPInvTaxTotal(pYFELD) + $piece(pYMFELD,Y,11)
+		do PopulateDataField^COMUtils(YFORM,10,total,"M")
+	}
+	do UpdateDiscount^FINAPVoucher2(pYFELD)
+	quit
+	
+	
+OnBlurSupplier(pidSupplier="",strYKEY="",strYFELD="")
+	;-------------------------------------------------------------------------------
+	; Update supplier data and tax on blur of supplier field.
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Mar-2010	shobby	SR15753: Clean up redundant calls.
+	; 22-Mar-2006 	JW		SR13497: Fixed subscript error
+	; 30-Jan-2006	SteveS	SR13497: Discount GL Account stuff
+	; 12-Aug-2005	JW		SR12615: No need to clear supplier if not valid anymore.
+	; 05-Aug-2005	RPW		SR12757: Don't populate invoice date
+	; 24-May-2005	shobby	RemittanceAddress is now a calculated field (D26->M17) SR12319
+	; 29-Apr-2005	JW		SR12255: Changed from OnChange to OnBlur
+	;  8-Apr-2005	JW		SR12098: Store location in YFELD
+	; 08-Mar-2005	JW		Created (copied from FINAPInv)
+	;-------------------------------------------------------------------------------
+	new objSupplier,idTerms,invoiceDate,dueDate,fltDisc,idControl
+	new linesIncludeTax,idSupplier,idDiscAccount,numDiscount
+	
+	if (pidSupplier'="") && $$Editable^FINSYSReview(YFORM,$$$FINAPInvStatus(strYFELD)) {
+		if $$ValidSupplier^FINAPInv(pidSupplier) {
+			set objSupplier=$get(^FINAPSupplier(YM,pidSupplier,1))
+			
+			// Tax fields
+			set $$$FINAPInvTaxLocation(strYFELD)=$$GetTaxLocation^FINAPSupplier(pidSupplier)
+			set $$$FINAPInvTaxInvoice(strYFELD )=$$$FINAPSupplierIssuesTaxInvoices(objSupplier)
+			do PopulateTaxCodeCombo(pidSupplier,.strYFELD)
+			
+			if $$$FINAPInvTaxInvoice(strYFELD) {
+				set linesIncludeTax = $$$FINAPSupplierInvoiceLinesContainTax(objSupplier)
+			} else {
+				set linesIncludeTax = $$$NO
+			}
+			set $$$FINAPInvLinesIncludeTax(strYFELD) = linesIncludeTax
+
+			; Recalculate taxes.
+			do UpdateTaxFields(strYFELD,$$$YES)
+			
+			; Check duplicate supplier / invoice number
+			do CheckSupplier^FINAPInv(pidSupplier,strYKEY,strYFELD)
+			
+			; Address
+			do UpdateHeaderField^COMGridEdit31Interface("M17",$$UpdateAddress^FINAPInv(pidSupplier))
+			
+			; Terms
+			set idTerms = $$GetTerm^FINAPSupplier(pidSupplier)
+			set $$$FINAPInvDiscountTerm(strYFELD)= idTerms
+			
+			; Discount GL Account
+			set idDiscAccount=$$$FINAPSupplierDiscountGLAccount(objSupplier)
+			if (idDiscAccount="") {
+				set idControl=$$$FINAPSupplierControlAccount(objSupplier)
+				if (idControl'="") set idDiscAccount=$$$FINAPAccountDiscountAccount($get(^FINAPAccount(YM,idControl,1)))
+			}
+			set $$$FINAPInvDiscountGLAccount(strYFELD)=idDiscAccount
+			
+			set numDiscount = 0
+			if idTerms'="" {
+				set numDiscount = $$$FINSYSTermDiscount1($get(^FINSYSTerm(YM,idTerms,1)))
+			}
+			set $$$FINAPInvDiscountPercent(strYFELD)=numDiscount
+		}
+	}
+	quit
+	
+	
+OnBlurRepeat(pYFELD,pField)
+	;-------------------------------------------------------------------------------
+	; Don't allow values for repeat fields if not a repeat invoice.
+	; 
+	; Returns: nil
+	; 
+	; History:
+	; 15-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	if '$$$FINAPInvRepeat(pYFELD) {
+		set %TXT(1) = "#Y"_YFORM_"D"_pField_Y
+	}
+	quit
+
+
+OnBlurTaxCode(pYFELD)
+	;-------------------------------------------------------------------------------
+	; Don't allow values for tax code if not a tax invoice.
+	; 
+	; Returns: nil
+	; 
+	; History:
+	; 15-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	if '$$$FINAPInvTaxInvoice(pYFELD) {
+		set %TXT(1) = "#Y"_YFORM_"D"_$$$FldFINAPInvDefaultTaxCode_Y
+	}
+	quit
+	
+	
+OnBlurOnChargeInvoiceDate(pstrDte="")
+	;-------------------------------------------------------------------------------
+	; Set the GL Effective Date to the invoice date
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Sep-2005	JW		SR13156: Created
+	;-------------------------------------------------------------------------------
+	if pstrDte'="" {
+		set %TXT(1)=%TXT(1)_"#Y"_YFORM_"D"_$$$FldFINAPInvOnChargeGLEffectiveDate_Y_pstrDte
+	}
+	quit
+	
+	
+OnClick(pValue,pField)
+	;-------------------------------------------------------------------------------
+	; Executed on click of the form checkboxes.
+	;
+	; Params: 	pValue - checked $$$YES/$$$NO
+	; 			pField - field number
+	;
+	; Returns: nil
+	;
+	; History:
+	; 12-Dec-2005	JW		SR13195: BEARB call now unecessary.
+	; 07-Sep-2005	PO		SR12880: Added handling of Tax details field
+	; 14-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	quit:($get(pValue)="")||($get(pField)="")
+	new YFELD
+	
+		// Tax checkboxes
+	if (pField=$$$FldFINAPInvLinesIncludeTax)||(pField=$$$FldFINAPInvTaxInvoice) {
+		; Update clicked field
+		
+		set YFELD = $$GetFormData^COMUtilForm()
+		set $piece(YFELD,Y,pField) = pValue
+		
+		; Update other field if necessary
+		if (pField=$$$FldFINAPInvLinesIncludeTax)&&pValue {
+			do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvTaxInvoice,$$$YES,,.YFELD)
+		
+		} elseif (pField=$$$FldFINAPInvTaxInvoice)&&'pValue {
+			do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvLinesIncludeTax,$$$NO,,.YFELD)
+			
+			// clear tax code field
+			do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvDefaultTaxCode,"")
+		}
+		do UpdateTaxFields(YFELD,$$$YES)
+		do PopulateDataField^COMUtils(YFORM,43,$$TaxAppliedTo^FINAPInv($$GetFormData^COMUtilForm(,"P"),YFELD),"M")
+		
+	} else { // Repeat field - if not checked, make others readonly.
+		do ToggleReadOnly^COMUtilForm("36;37;38",'pValue)
+		if 'pValue {
+			do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvRepeatStartDate,"",,,$$$NO)
+			do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvRepeatEndDate,"",,,$$$NO)
+			do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvRepeatGroup,"",,,$$$NO)
+		}
+	}
+	quit
+	
+	
+UpdateTaxFields(pYFELD,blnTaxChanged=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Updates tax information.
+	; 
+	; Params:	pYFELD - current version of YFELD
+	; 			blnTaxChanged - do the lines' taxes need to be recalculated?
+	; 
+	; Returns:
+	; 
+	; History:
+	; 10-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new linesIncludeTax,taxInvoice,blnTaxInc
+	
+	set linesIncludeTax = $$$FINAPInvLinesIncludeTax(pYFELD)
+	set taxInvoice = $$$FINAPInvTaxInvoice(pYFELD)
+	
+	// Hide tax columns depending on checkboxes.
+	$$$GRIDHideShowColumns("5;2;1;7",'taxInvoice_";"_+linesIncludeTax_";"_'linesIncludeTax)
+		
+	// Make tax field read only if not tax invoice or tax on lines 
+	if $$Editable^FINSYSReview("FINAPInv",$$$FINAPInvStatus(pYFELD)) {
+		do ToggleReadOnly^COMUtilForm($$$FldFINAPInvTaxTotal,linesIncludeTax||'taxInvoice,"FINAPVoucher")
+		do ToggleReadOnly^COMUtilForm($$$FldFINAPInvDefaultTaxCode,'taxInvoice,"FINAPVoucher")
+	}
+	
+	if blnTaxChanged {
+		do RecalculateTaxes(pYFELD)
+	}
+	quit
+	
+	
+RecalculateTaxes(pobjInvoice="")
+	;-------------------------------------------------------------------------------
+	; Recalculate the taxes on each line.
+	; 
+	; Returns:
+	; 
+	; History:
+	; 10-Apr-2010	GRF		SR17177: arrGrid rather than objGrid; GRID Macros
+	; 08-Mar-2005	JW		Created (copied from FINARInv)
+	;-------------------------------------------------------------------------------
+	new arrGrid,idInvoice,idLine,lineAmount,objInvLine,totalTax,subTotal
+	new defaultTaxCode,itemTaxCode
+	
+	$$$GRIDGetContents(.arrGrid)
+	set totalTax = 0
+	set subTotal = 0
+	
+	set idInvoice = $order(arrGrid(""))
+	if idInvoice'="" {
+		set defaultTaxCode = $$$FINAPInvDefaultTaxCode(pobjInvoice)
+		
+		set idLine = ""
+		for {
+			set idLine = $order(arrGrid(idInvoice,idLine))
+			quit:idLine=""
+			
+			set objInvLine = $get(arrGrid(idInvoice,idLine))
+			
+			set itemTaxCode = $$$FINAPInvChargeTaxCode(objInvLine)
+			if (itemTaxCode'="") && ($data(^COMTempList(YM,YUSER,"TaxCodes",itemTaxCode,1))#2=0) {
+				set $$$FINAPInvChargeTaxCode(objInvLine) = defaultTaxCode
+			}
+			
+			do CalculateTax^FINAPInvCharge(.objInvLine,pobjInvoice)
+			
+			set arrGrid(idInvoice,idLine) = objInvLine
+			if '$$$FINAPInvChargeIsOnCharge(objInvLine) {
+				set totalTax = $$$FCAdd(totalTax,$$$FINAPInvChargeTax(objInvLine))
+				set subTotal = $$$FCAdd(subTotal,$$$FINAPInvChargeAmountTaxEx(objInvLine))
+			}
+		}
+	}
+	$$$GRIDSetContents(.arrGrid)
+	
+	// Update header fields
+	do PopulateDataField^COMUtils(YFORM,11,subTotal,"M")
+	do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvTaxTotal,totalTax)
+	do PopulateDataField^COMUtils(YFORM,10,$$$FCAdd(totalTax,subTotal),"M")
+	
+	quit
+	
+	
+DisplayChildren(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Routine to display all child invoices of a parent in a COM table.
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Sep-2005	shobby	SR13213:New field that displays the number of children for a Repeat Voucher
+	; 						where the posting has been cancelled.  The 'Children Posted' figure now 
+	; 						excludes the 'Cancelled' children. 
+	; 15-Mar-2005	JW		Created (Copied from FINARInvChild)
+	;-------------------------------------------------------------------------------
+	new idxInvoice,lstHeader,idChild,objChild,dtePosted,numChildren,idSupplier,strSupplier
+	new total,tax,charges,onCharges,TOTALCharges,TOTALonCharges,TOTALtax,numCancelled
+	
+	quit:$get(pidInvoice)=""
+	
+	set idxInvoice=$$$Index(pidInvoice)
+	set numChildren = 0
+	set numCancelled= 0
+	
+	if $data(^FINAPInvs(YM,3,idxInvoice)) {
+		
+		set TOTALCharges = 0
+		set TOTALonCharges = 0
+		set TOTALtax = 0
+	
+		set lstHeader=$listbuild($$$Text("Fin00595"),	;Child Invoice
+						$$$StrFINAPInvPostedDate,  		;Posted Date
+						$$$StrFINAPInvSupplier,			;Supplier
+						$$$Text("Fin00609"),			;Sub Total
+						$$$StrFINAPInvTaxTotal,			;Total Tax
+						$$$Text("Fin00071"),			;Total
+						$$$Text("Fin00700"))			;On Charges
+		
+		do Start^COMTable(lstHeader)
+		
+		set idChild=""
+		for {
+			set idChild=$order(^FINAPInvs(YM,3,idxInvoice,idChild))
+			quit:idChild=""
+			
+			set objChild=$get(^FINAPInv(YM,idChild,1))
+			
+			set total = $$SumTotals(idChild,.charges,.onCharges,.tax)
+			
+			do NewLine^COMTable()
+			
+			; CHILD INVOICE CELL
+			do InsertCell^COMTable(idChild,"FINAPVoucher",idChild,"","",1)
+			
+			; POSTED DATE CELL
+			set dtePosted=$$$FINAPInvPostedDate(objChild)
+			if dtePosted="" {
+				do InsertCell^COMTable($$GetEnumDescription^COMUtils("FINSYSSTATUS",$$$FINAPInvStatus(objChild)))
+			} else {
+				do InsertCell^COMTable($$^WWWDATE(dtePosted))
+			}
+			
+			; SUPPLIER NUMBER CELL
+			set idSupplier=$$$FINAPInvInvoiceSupplier(objChild)
+			set strSupplier=$$$FINAPSupplierSupplierName($get(^FINAPSupplier(YM,idSupplier,1)))
+			do InsertCell^COMTable(idSupplier_" ("_strSupplier_")","FINAPSupplier",idSupplier)
+				
+			; TOTAL CELLS
+			do InsertCurrencyCell^COMTable(charges)
+			do InsertCurrencyCell^COMTable(tax)
+			do InsertCurrencyCell^COMTable(total)
+			do InsertCurrencyCell^COMTable(onCharges)
+			
+			do EndLine^COMTable()
+			
+			if ($$$FINAPInvStatus(objChild)=$$$EnumFINSYSSTATUSCancelled)||($$$FINAPInvStatus(objChild)=$$$EnumFINSYSSTATUSCancelled) {
+				set numCancelled=numCancelled+1 ;SR13213
+			} else {
+				set numChildren = numChildren+1
+			}
+			set TOTALCharges = TOTALCharges+charges
+			set TOTALonCharges = TOTALonCharges+onCharges
+			set TOTALtax = TOTALtax+tax
+		}
+		
+		; TOTAL ROW
+		do NewLine^COMTable(YDARKGRAY)
+		do InsertCell^COMTable("<B>"_$$$Text("Fin00427")_":",,,,"CENTER",,3) ;Totals
+		do InsertCurrencyCell^COMTable(TOTALCharges)
+		do InsertCurrencyCell^COMTable(TOTALtax)
+		do InsertCurrencyCell^COMTable(TOTALCharges+TOTALtax)
+		do InsertCurrencyCell^COMTable(TOTALonCharges)
+		do EndLine^COMTable()
+		
+		do Stop^COMTable()
+	}
+	
+	write "<script>"
+	do PopulateDataField^COMUtils(YFORM,28,numChildren,"M")
+	do PopulateDataField^COMUtils(YFORM,52,numCancelled,"M") ;SR13213
+	write "</script>"
+	
+	quit
+	
+	
+SumTotals(pidInvoice,pSubTotal,pOnCharges,pTax)
+	;-------------------------------------------------------------------------------
+	; Sum the voucher amounts from globals
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new idFINAPInvLine,objFINAPInvLine,objFINAPInv
+	
+	set pSubTotal  = 0
+	set pOnCharges = 0
+	set pTax       = 0
+	
+	if $get(pidInvoice)'="" {
+		set idFINAPInvLine=""
+		for {
+			set idFINAPInvLine=$order(^FINAPInvCharge(YM,pidInvoice,idFINAPInvLine))
+			quit:idFINAPInvLine=""
+			
+			set objFINAPInvLine=$get(^FINAPInvCharge(YM,pidInvoice,idFINAPInvLine,1))
+			if $$$FINAPInvChargeIsOnCharge(objFINAPInvLine) {
+				set pOnCharges = $$$FCAdd(pOnCharges,$$$FINAPInvChargeAmountTaxEx(objFINAPInvLine))
+			} else {
+				set pSubTotal = $$$FCAdd(pSubTotal,$$$FINAPInvChargeAmountTaxEx(objFINAPInvLine))
+			}
+		}
+		set objFINAPInv = $get(^FINAPInv(YM,pidInvoice,1))
+		set pTax = $$$FINAPInvTaxTotal(objFINAPInv)
+	}
+	quit $$$FCAdd(pSubTotal,pTax)
+	
+	
+MakeChildInvoice(pidInvoice,pobjInvoice="")
+	;-------------------------------------------------------------------------------
+	; When posting a repeat (parent) invoice, this will create the child invoice record.
+	; 
+	; Params: pidInvoice - invoice id (returns as child id)
+	; 		  pobjInvoice - invoice data (returns updated with parent id)
+	; 
+	; Returns: strStatus
+	;
+	; History:
+	;  3-Nov-2005	JW		Remove batch number from parent and save
+	; 05-Sep-2005	PO		SR13026: When saving a child invoice do not include repeat details
+	; 15-Mar-2005	JW		Created (copied from FINARInvPost)
+	;-------------------------------------------------------------------------------
+	new idChildInvoice,objChildInvoice,strStatus
+	new idLine,objLine,idDivision,objDivision
+	
+	quit:$get(pidInvoice)="" 
+	
+	;***************************************
+	tstart
+	;***************************************
+	
+	set objChildInvoice = pobjInvoice
+	
+	// Remove batch number from parent and Save
+	set $$$FINAPInvBatchNumber(pobjInvoice) = ""
+	set strStatus=$$$Save("FINAPInv",pidInvoice,pobjInvoice,1)
+	
+	if $$$ISOK(strStatus) {
+		set idChildInvoice=$$^WWWNEXT("FINAPInv")
+		set $$$FINAPInvParentInvoice(objChildInvoice)=pidInvoice
+		set $$$FINAPInvSuppliersInvoiceNumber(objChildInvoice)=idChildInvoice
+		
+		// Update Dates
+		set $$$FINAPInvInvoiceDate(objChildInvoice) = +$horolog
+		set $$$FINAPInvDueDate(objChildInvoice) = $$GetDueDate^FINAPSupplier($$$FINAPInvInvoiceSupplier(pobjInvoice),+$horolog,$$$FINAPInvDiscountTerm(pobjInvoice))
+		
+		;Exclude repeat group details
+		set $$$FINAPInvRepeat(objChildInvoice)			= ""
+		set $$$FINAPInvRepeatGroup(objChildInvoice)		= ""
+		set $$$FINAPInvRepeatStartDate(objChildInvoice) = ""
+		set $$$FINAPInvRepeatEndDate(objChildInvoice)   = ""
+		
+		// Save Child
+		set strStatus=$$$Save("FINAPInv",idChildInvoice,objChildInvoice,1)
+		
+		if $$$ISOK(strStatus) {
+			set idLine=""
+			for {
+				set idLine=$order(^FINAPInvCharge(YM,pidInvoice,idLine))
+				quit:idLine=""
+				
+				// Copy Lines
+				set objLine=$get(^FINAPInvCharge(YM,pidInvoice,idLine,1))
+	 
+				set strStatus=$$$Save("FINAPInvCharge",idChildInvoice_","_idLine,objLine,1)
+				quit:$$$ISERR(strStatus)
+				
+				set idDivision=""
+				for {
+					set idDivision=$order(^FINAPInvChargeDivision(YM,pidInvoice,idLine,idDivision))
+					quit:idDivision=""
+					
+					// Copy Divisions
+					set objDivision=$get(^FINAPInvChargeDivision(YM,pidInvoice,idLine,idDivision,1))
+					set strStatus=$$$Save("FINAPInvChargeDivision",idChildInvoice_","_idLine_","_idDivision,objDivision,1)
+					quit:$$$ISERR(strStatus)
+				}
+				quit:$$$ISERR(strStatus)
+			}
+		}
+	}
+	;***************************************
+	if $$$ISOK(strStatus) {
+		set pidInvoice = idChildInvoice // Return child id and record
+		set pobjInvoice = objChildInvoice
+		if $tlevel>0 tcommit
+	} else {
+		trollback
+	}
+	;***************************************
+	quit strStatus
+	
+	
+GetDefaultTaxCode()
+	;-------------------------------------------------------------------------------
+	; Get the default tax code
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new objInv
+	
+	set objInv = $$$GRIDYFELDContainer
+	quit $$$FINAPInvDefaultTaxCode(objInv)
+	
+	
+ConsistentTax(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; If the tax total isn't zero, then one of the lines must be taxable.
+	; 
+	; Returns: bln whether above holds true.
+	;
+	; History:
+	; 21-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new blnConsistent,objInvoice,objCharge,idLine,taxLoc,transDate,taxCode
+	
+	set blnConsistent = $$$NO
+	
+	if $get(pidInvoice)'="" {
+		set objInvoice=$get(^FINAPInv(YM,pidInvoice,1))
+		
+		if $$$FCZero($$$FINAPInvTaxTotal(objInvoice)) || $$$FINAPInvLinesIncludeTax(objInvoice) {
+			set blnConsistent = $$$YES
+		} else {
+			set taxLoc = $$$FINAPInvTaxLocation(objInvoice)
+			set transDate = $$$FINAPInvEnteredDate(objInvoice)
+			
+			set idLine = ""
+			for {
+				set idLine=$order(^FINAPInvCharge(YM,pidInvoice,idLine))
+				quit:idLine=""
+				
+				set objCharge=$get(^FINAPInvCharge(YM,pidInvoice,idLine,1))
+				
+				set taxCode = $$$FINAPInvChargeTaxCode(objCharge)
+				
+				if '$$$FINAPInvChargeIsOnCharge(objCharge) {
+					if ($$CombinedTaxRate^COMTAX(taxCode,taxLoc,transDate) > 0) {
+						set blnConsistent = $$$YES
+					}
+				}
+				quit:blnConsistent
+			}
+		}
+	}
+	quit blnConsistent
+	
+	
+NumChildrenPostedToday(pidInvoice,pDatePosted="")
+	;-------------------------------------------------------------------------------
+	; Given an invoice ID, does this invoice have any children posted today?
+	; 
+	; 
+	; Parameters:	- pidInvoice:  The id of the parent invoice.
+	; 		   		- pDatePosted: Check for children posted on this day (defaults to $H)
+	;
+	; Returns: num children posted today
+	; 
+	; History:
+	; 21-Mar-2005	JW		Created (copied from FINARInv)
+	;-------------------------------------------------------------------------------
+	new numChildren,objInvoice,idParentInvoice,idChildInvoice,objChildInvoice
+	set numChildren=0
+	if pDatePosted="" set pDatePosted=+$H 
+	
+	if $get(pidInvoice)'="" {
+		set objInvoice=$get(^FINAPInv(YM,pidInvoice,1))
+		if $$$FINAPInvRepeat(objInvoice) {
+			set idParentInvoice=$$$Index(pidInvoice)
+			
+			set idChildInvoice=""
+			for {
+				set idChildInvoice=$order(^FINAPInvs(YM,3,idParentInvoice,idChildInvoice))
+				quit:idChildInvoice=""
+				
+				set objChildInvoice=$get(^FINAPInv(YM,idChildInvoice,1))
+				if $$$FINAPInvPostedDate(objChildInvoice)=pDatePosted {
+					set numChildren=numChildren+1
+				}		
+			}
+		}
+	}
+	quit numChildren
+	
+	
+PostWarnings(pidInvoice,pblnChildren,pblnTax)
+	;-------------------------------------------------------------------------------
+	; Return a warning if this invoice already has children posted today, or tax
+	; total is different to sum of line taxes.
+	;
+	; Returns: warning
+	;
+	; History:
+	; 21-Mar-2005	JW		Created (Copied from FINARInv)
+	;-------------------------------------------------------------------------------
+	new intChildrenToday,strWarning,taxTotal,taxSum,objSettings,objInvoice,idLine
+	new objCharge
+	
+	set strWarning = ""
+	set pblnChildren = $$$NO
+	set pblnTax = $$$NO
+	
+	if ($get(pidInvoice)'="") {
+		
+		set objSettings=$get(^FINGeneralSetup(YM,YM,1))
+		if $$$FINGeneralSetupWarnonsamedaypostingAP(objSettings) {
+			
+			set intChildrenToday=$$NumChildrenPostedToday(pidInvoice)
+			if (intChildrenToday>0) {
+				if (intChildrenToday=1) {
+					set strWarning=$$$Text($lb("Fin00600"))  ;This invoice already has a child invoice posted today. Proceed with posting?
+				} else {
+					set strWarning=$$$Text($lb("Fin00601",intChildrenToday))  ;This invoice already has %1 child invoices posted today. Proceed with posting?	
+				}
+				set pblnChildren=$$$YES
+			}
+		}
+		
+		// Check tax
+		set objInvoice = $get(^FINAPInv(YM,pidInvoice,1))
+		if '$$$FINAPInvLinesIncludeTax(objInvoice) {
+			set taxSum=0
+			set idLine = ""
+			for {
+				set idLine=$order(^FINAPInvCharge(YM,pidInvoice,idLine))
+				quit:idLine=""
+				
+				set objCharge=$get(^FINAPInvCharge(YM,pidInvoice,idLine,1))
+				if '$$$FINAPInvChargeIsOnCharge(objCharge) {
+					set taxSum = $$$FCAdd(taxSum,$$$FINAPInvChargeTax(objCharge))
+				}
+			}
+			set taxTotal = $$$FINAPInvTaxTotal(objInvoice)
+			if '$$$FCZero($$$FCSub(taxTotal,taxSum)) {
+				if strWarning'="" set strWarning = strWarning_"\n"_$$$Text("Fin00708")_": " ; "Also"
+				set strWarning = strWarning_$$$Text($listbuild("Fin00707",$$FormatCurrency^COMTable(taxTotal),$$FormatCurrency^COMTable(taxSum)))
+				set pblnTax    = $$$YES
+			} ; "The total tax entered (%1) is not equal to the sum of the line taxes (%2). Proceed with posting?"
+		}
+	}
+	quit strWarning
+	
+	
+PopulateTaxCodeCombo(pidSupplier,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Populate the tax code combo box
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Sep-2005	PO		SR12880: Do not perform dynamic combo population
+	;  8-Mar-2005	JW		SR12098: Pass in location
+	; 30-Mar-2005	JW		Created
+	;-------------------------------------------------------------------------------
+	new objSupplier,defaultTaxCode
+	
+	set defaultTaxCode = ""
+	
+	if $get(pidSupplier)'="" {
+		set objSupplier = $get(^FINAPSupplier(YM,pidSupplier,1))
+		if $$$FINAPSupplierIssuesTaxInvoices(objSupplier) {
+			set defaultTaxCode = $$$FINAPSupplierDefaultTaxCode(objSupplier)
+		}
+	}
+	do PopulateDataField^COMUtils(YFORM,$$$FldFINAPInvDefaultTaxCode,defaultTaxCode,,.pYFELD)
+	quit
+	
+	
+OnAfterSave(pidInvoice,pYFELD="")
+	;-------------------------------------------------------------------------------
+	; Code to run after saving an invoice record.
+	;
+	; Returns:
+	;
+	; History:
+	; 22-Nov-2005	SteveS	SR13853: Use KILL^COMSchedule
+	;  4-Apr-2005	JW		Created (copied from FINARInv)
+	;-------------------------------------------------------------------------------
+	new objSettings
+	
+	if $get(pidInvoice)'="" && '$$$FINAPInvRepeat(pYFELD) {
+		
+		set objSettings=$get(^FINGeneralSetup(YM,YM,1))
+		if $$$FINGeneralSetupDeleteschedulesonRepeatAP(objSettings) {
+			do KILL^COMSchedule("FINAPInv",pidInvoice) ;SR13853
+		}
+	}
+	quit
+	
+	
+ValidRepeatData(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Check repeat data for posting today
+	;
+	; Returns: status
+	;
+	; History:
+	; 12-Apr-2005	JW		Created (copied from FINARInv)
+	;-------------------------------------------------------------------------------
+	new strStatus,objInvoice,today,endDate
+	
+	set strStatus = $$$OK
+	
+	if $get(pidInvoice)'="" {
+		set objInvoice = $get(^FINAPInv(YM,pidInvoice,1))
+		
+		if $$$FINAPInvRepeat(objInvoice) {
+			set today   = +$horolog
+			set endDate = $$$FINAPInvRepeatEndDate(objInvoice)
+			
+			if $$$FINAPInvRepeatGroup(objInvoice)="" {
+				set strStatus="Fin00571"                  ; "Must specify a Repeat Group."
+			
+			} elseif $$$FINAPInvRepeatStartDate(objInvoice) > today {
+				set strStatus=$lb("Fin00578",pidInvoice)  ; "Repeat Start Date for invoice '%1' has not arrived yet."
+			
+			} elseif (endDate'="")&&(endDate<today) {
+				set strStatus=$lb("Fin00734",pidInvoice)  ; "Repeat End Date for invoice '%1' has elapsed."
+			}
+		}
+	}
+	quit strStatus
+	
+	
+GetType()
+	;-------------------------------------------------------------------------------
+	; Get the Type for the Effective Date
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; The type of the effective date
+	;
+	; History:
+	; 26-Jun-2006	RPW		SR13173: Created
+	;-------------------------------------------------------------------------------
+	quit "APINV"
+	
+]]></Routine>
+</Export>

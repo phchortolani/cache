@@ -1,0 +1,540 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INStockValAdjust" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INStockValAdjust
+	;-------------------------------------- 
+	;   SR16871 : Deprecated by INStockValCCAdj
+	;-------------------------------------- 
+#include COMSYS
+#include INConst
+#include FINEnum
+	
+#define enumAverageCost		9
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^INStockValAdjust("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+Adjust(pYKEY,pblnPrePost=$$$NO,pblnRefresh=$$$YES) 
+	;-------------------------------------------------------------------------------
+	; Work out values for adjustment and post (if want)
+	; Posts as "INTRAN" Finance Interface batches
+	; 
+	;-------------------------------------- 
+	;   SR16871 : Deprecated by Adjust^INStockValCCAdj
+	;-------------------------------------- 
+	;
+	; Called By: ReverseTxn^INRECReverse, AfterDataFields^INStockValAdjustPre
+	;            Form INStockValAdjust : Button 1 "Adjust"
+	; 
+	; 
+	; Params: 	pYKEY       - keys of the INStockValAdjust record
+	; 			pblnPrePost - whether we are posting or just preposting
+	; 			pblnRefresh - need to refresh screen?
+	;
+	; Returns: status
+	;
+	; History:
+	; 31-Mar-2009	GRF		SR16461: Explicitly show INARTAVG parameters
+	; 08-May-2006	GRF		SR14622: Lock management
+	; 11-Apr-2006	GRF		SR14529: Patch to change pidItem => idItem
+	; 06-Apr-2006	GRF		SR14529: Don't process Non-stock items
+	; 23-Mar-2006	GRF		SR14203: moved strDesc down with second parameter for "IN00378"
+	; 30-Jan-2006	GRF		SR14203: IgnoreCost & curAdjVal; Saved copy of Adjust reverted
+	; 01-Dec-2005	RPW		SR12920: Do not start a transaction if not pre-post.
+	; 04-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	new blnAddSource,blnREVAL,curAdjVal,curIgnoreCost,curNewCost,curNewVal,curOldVal
+	new fltQty,fltSrcQty,idAdj,idDeleteLocn,idItem,idLocn,idReason,idSource,idSrcLoc
+	new idSrcStore,idStore,objAdjust,objItem,objStockVal,strDesc,strReasonCode,strStatus
+	
+	$$$LogR("Adjust",pYKEY_","_pblnPrePost_","_pblnRefresh)
+	set idItem = $$$KEY1(pYKEY)
+	set idAdj  = $$$KEY2(pYKEY)
+	
+	set strStatus = $$$OK
+	
+	if idItem'="" {
+		set objItem = $get(^INART(YM,idItem,1))                 ;SR14529 + 11-Apr-2006
+	 	if $$$INARTItemWithoutInventoryMaint(objItem)'=$$$YES {
+	 	
+	;+++++++++++++++++++++++++++++++++++++++
+			if 'pblnPrePost tstart
+	;+++++++++++++++++++++++++++++++++++++++
+			
+			set objAdjust = $get(^INStockValAdjust(YM,idItem,idAdj,1))
+			
+			if '$$Editable(objAdjust) {
+				set strStatus = $listbuild("IN00377")  ;Record already processed
+				
+			} else {
+				set curNewCost   = $$$INStockValAdjustNewCost(objAdjust)
+				set blnAddSource = $$$NO
+				
+				if 'pblnPrePost { 	// Update average cost
+					do UpdateValues(.objAdjust,idItem)
+	$$$LogRx(idAdj)
+		;			set curIgnoreCost = $$^INARTAVG(idItem,0,curNewCost,idAdj,$$$YES)         ; SR16461
+					set curIgnoreCost = $$^INARTAVG(idItem,0,curNewCost,idAdj,$$$YES,$$$YES)         ; FIXME : add Location for new processing? <GRF>
+					set blnREVAL      = $$$YES				
+					
+					set idDeleteLocn = $$$INVORGDeleteStockLocation($get(^INVORG(YM,YM,1)))
+					set idReason    = $$$INStockValAdjustReason(objAdjust)
+					
+				} else {	// Get the source details - as they won't have been adjusted yet
+					kill ^CacheTempINStock(YUSER,"Adjust",idItem)
+					set idSource = $$$INStockValAdjustSource(objAdjust)
+					if idSource'="" {
+						do GetDetails^INRECLine(idSource,.fltSrcQty,.idSrcLoc,.idSrcStore)
+						set blnAddSource = $$$YES
+					}
+				}
+				
+				set idLocn=""
+				for {
+					set idLocn = $order(^INStockVal(YM,idItem,idLocn))
+					quit:idLocn=""
+					
+					set idStore = ""
+					for {
+						set idStore = $order(^INStockVal(YM,idItem,idLocn,idStore))
+						quit:idStore=""
+						
+						lock +^INStockVal(YM,idItem,idLocn,idStore):10        ; force through if time out ; SR14622
+						set objStockVal = $get(^INStockVal(YM,idItem,idLocn,idStore,1))
+						
+						set fltQty    = $$$INStockValQuantity(objStockVal)   ; D1
+						set curOldVal = $$$INStockValValue1(objStockVal)     ; D2
+						
+						if blnAddSource && (idSrcLoc=idLocn) && (idSrcStore=idStore) {		// update qty for pre-post
+							set fltQty       = (fltQty - fltSrcQty)
+							set blnAddSource = $$$NO
+							set $$$INStockValLastModified(objStockVal)="***"	// Mark this entry
+						}
+						
+						if +curOldVal || +fltQty {
+							set curNewVal = $justify(fltQty*curNewCost,0,2)		// Calculate updates
+							set curAdjVal = curNewVal - curOldVal
+							
+							if pblnPrePost {	// Just store detail for Pre-Post
+								set ^CacheTempINStock(YUSER,"Adjust",idItem,idLocn,idStore) = objStockVal_Y_curNewVal_Y_curAdjVal
+								
+							} else {			// Post -> INARTHIST
+								set strDesc   = $$$Text($lb("IN00378",idAdj,fltQty))  ; "Stock revalued via cost adjustment %1 (%2)"
+								do ^INARTHIST(idItem,strDesc,idLocn,,,,,-curAdjVal,idDeleteLocn,,idStore,,,idLocn,,"ADJ",,,idReason)
+							;	                 1      2      3             8         9          11        14     16       19
+							}
+						}
+						lock -^INStockVal(YM,idItem,idLocn,idStore)#"I"           ; SR14622
+					}
+				}
+			}   ; end else
+			
+			if 'pblnPrePost {	// Update header record
+				if $$$ISOK(strStatus) {
+					set $$$INStockValAdjustStatus(objAdjust)        = $$$EnumINSTATUSProcessed
+					set $$$INStockValAdjustProcessedBy(objAdjust)   = $get(YBED,"UNKNOWN")
+					set $$$INStockValAdjustProcessedDate(objAdjust) = $horolog
+					set strStatus = $$$Save("INStockValAdjust",idItem_","_idAdj,objAdjust,1)
+				}
+				
+	;+++++++++++++++++++++++++++++++++++++++
+				if $$$ISOK(strStatus) {
+					if $tlevel>0 tcommit
+					if pblnRefresh do ReloadForm^COMUtilForm()
+					
+				} else {
+					trollback
+					if pblnRefresh do ReturnError^COMUtilError(strStatus)	
+				}
+	;+++++++++++++++++++++++++++++++++++++++
+			}
+	 	}
+	}
+	
+	quit strStatus
+	
+	
+AutoUpdate(pSource,pRef,pidItem,pNewCost)
+	;-------------------------------------------------------------------------------
+	;	Apply New Average Cost to BALANCE all existing Stock Histories
+	;	+ post to General Ledger.
+	;	
+	;	Doesn't create an INStockValAdjust record since sourced from input transaction.
+	;	
+	;	This is a "value only" adjustment of the difference between the new total
+	;	value at each stock location (current quantity * new average cost) and the
+	;	previous total value there.
+	;
+	;-------------------------------------- 
+	;   SR16871 : Deprecated by AutoUpdate^INStockValCCAdj
+	;-------------------------------------- 
+	;
+	; Called By: alDRP.dMovementType.Receipt, alDRP.dMovementType.ReceiptReverse,
+	;            Revise^INARTAVG, ^INARTPLUS1, ReceiptWithOrderMovement^INStockMovementRec,
+	;            ReceiptWithOutOrderMovement^INStockMovementRec,
+	;        + DEPRECATED
+	;            Receive^INWEAUF, ReceiveV2^INWEAUF2, WESAVE^INWEFREI
+	;
+	; Params: 
+	; 	pSource			Transaction Type generating AutoUpdate e.g. "INWEFREI" - allows trace if necessary
+	;	pRef			Reference String to identify source transaction
+	; 	pidItem			Item Number
+	;	pNewCost		New Average Cost
+	;	
+	; Returns: status
+	;
+	; Updates :		^INStockVal			(Create, Modify, Kill)
+	; 				^INFIBBUCH			(Create)
+	;
+	; History:
+	; 28-Sep-2009	GRF		SR16880: Activated
+	; 22-Sep-2009	DWR		SR16880: Added call to PostToFIN^INFINInterface will replace
+	; 							FIBU^INARTHIST
+	; 08-May-2006	GRF		SR14622: Lock management
+	; 23-Mar-2006	GRF		SR14203: call modified FIBU rather than INARTHIST since
+	; 							don't want to build INARTHIST/L records form normal
+	; 							location revaluations - will be treated as happening
+	; 							when average cost changes anyway.
+	; 							Still record manual adjustments in Adjust above.
+	; 31-Jan-2006	GRF		SR14203: use text 33352 & audit
+	; 30-Jan-2006	GRF		SR14203: created
+	;-------------------------------------------------------------------------------
+	new blnREVAL,curAdjVal,curNewVal,curOldVal,fltQty,idDeleteLocn,idLocn
+	new idReason,idStore,objINVORG,objStockVal,strAudit,strDesc,strStatus
+	
+	$$$LogR("AutoUpdate",pSource_","_pRef_","_pidItem_","_pNewCost)
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	; TODO : Consider Error Trap for trollback since now strStatus not reset
+	;tstart
+	;+++++++++++++++++++++++++++++++++++++++
+	set objINVORG    = $get(^INVORG(YM,YM,1))
+	set strStatus    = $$$OK
+	set blnREVAL     = $$$YES      ; Required for INARTHIST (passed implicitly - should be through arguments)
+	set idDeleteLocn = $$$INVORGDeleteStockLocation(objINVORG)    ; D87
+	set idReason     = $$$INVORGAutoAvgCostReason(objINVORG)      ; D2
+	set strAudit     = pSource_"|"_pRef
+	set strDesc      = $$^WWWTEXT(33352)              ; "Average Cost Update"
+	
+	set idLocn=""
+	for {
+		set idLocn = $order(^INStockVal(YM,pidItem,idLocn))
+		quit:idLocn=""
+		
+		set idStore = ""
+		for {
+			set idStore = $order(^INStockVal(YM,pidItem,idLocn,idStore))
+			quit:idStore=""
+			
+	$$$LogRx("1:"_pidItem_$$$COMMA_idLocn_$$$COMMA_idStore)
+	;+++++++++++++++++++++++++++++++++++++++
+			lock +^INStockVal(YM,pidItem,idLocn,idStore):10        ; force through if time out ; SR14622
+	;+++++++++++++++++++++++++++++++++++++++
+			set objStockVal = $get(^INStockVal(YM,pidItem,idLocn,idStore,1))
+			
+			set fltQty    = $$$INStockValQuantity(objStockVal)   ; D1
+			set curOldVal = $$$INStockValValue1(objStockVal)     ; D2
+			
+			if curOldVal || fltQty {
+				set curNewVal = $justify(fltQty*pNewCost,0,2)		// Calculate updates
+				set curAdjVal = curNewVal - curOldVal
+	$$$LogRx("2:"_curOldVal_$$$COMMA_curNewVal_$$$COMMA_curAdjVal)
+				
+			; Post -> INARTHIST - will also call Update^INStockVal
+			;	if curAdjVal do ^INARTHIST(pidItem,strDesc,idLocn,,,,,-curAdjVal,idDeleteLocn,,idStore,,,idLocn,,"ADJ",,,idReason,,strAudit)
+			; SR14203 : Don't want to build INARTHIST/L records for normal location
+			;           revaluations - will be treated as happening when average cost
+			;           changes anyway.  Still record manual adjustments.
+			
+				if curAdjVal do PostToFin^INFINInterface($$$EnumMove,"ADJ",strAudit,strDesc,pidItem,"",-curAdjVal,idLocn,idStore,idLocn,idDeleteLocn,,,,,,idReason)
+			;	if curAdjVal do FIBU^INARTHIST(pidItem,,,,strDesc,idLocn,,-curAdjVal,,,idDeleteLocn,idStore,idLocn,"ADJ",,,idReason,strAudit)
+			}
+	;+++++++++++++++++++++++++++++++++++++++
+			lock -^INStockVal(YM,pidItem,idLocn,idStore)#"I"           ; SR14622
+	;+++++++++++++++++++++++++++++++++++++++
+		}
+	}
+	
+	;if $$$ISOK(strStatus) {
+	;	if $tlevel>0 tcommit
+	;} else {
+	;	trollback
+	;}
+	
+	quit strStatus
+	
+	
+BeforeButtonLine(pYKEY,pYFELD) 
+	;-------------------------------------------------------------------------------
+	; Set record to readonly if:
+	; (1) Not editable, or
+	; (2) Created from another source
+	;
+	; Called By: Form INStockValAdjust : Execute Before Buttonline
+	; 
+	; Params:
+	; 	pYKEY		idAdjustment
+	; 	pYFELD		objAdjustment
+	;
+	; ByRef:
+	; 	YVOR
+	;
+	; History:
+	; 03-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	if '$$$NoKey(pYKEY) && ('$$Editable(pYFELD) || ($$$INStockValAdjustSource(pYFELD)'="")) {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+	}
+	
+	quit
+	
+AfterPrimaryKey(pYKEY,pYFELD,pidItem)
+	;-------------------------------------------------------------------------------
+	; Update SOH, current average cost if editable
+	;
+	; Called By: Form INStockValAdjust : Execute After Primary Key
+	; 
+	; Params: Key, objAdjustment, ItemNo
+	;
+	; ByRef:
+	;	pYFELD		objAdjustment
+	;
+	; History:
+	; 06-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	if $$$NoKey(pYKEY) || $$Editable(pYFELD) {
+		do UpdateValues(.pYFELD,pidItem)
+	}
+	quit
+	
+	
+UpdateValues(&pYFELD,pidItem) ;  SR16871 : Deprecated by INStockValCCAdj so doesn't need change to INARTCOST call
+	;-------------------------------------------------------------------------------
+	; Update SOH, current average cost.
+	; 
+	; Called by : Adjust, AfterPrimaryKey, Create
+	; 
+	; Params: objAdjustment, ItemNo
+	;
+	; ByRef:
+	;	pYFELD		objAdjustment
+	;
+	; History:
+	; 15-Sep-2009	PPP		SR16892: Get the Average Cost Qty for a Locn (Entity Qty)
+	; 07-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	$$$LogR("UpdateValues",pidItem_","_pYFELD)
+	
+	if $get(pidItem) '="" {
+	//	set $$$INStockValAdjustOldCost(pYFELD)     = $$^INARTKOST(pidItem,,$$$enumAverageCost)    ; explicit Average Cost - what if other methods used? ; SR16892 vvv
+	//	set $$$INStockValAdjustStockonHand(pYFELD) = $$^INARTMENGE(pidItem,,,,2)
+		set $$$INStockValAdjustOldCost(pYFELD)     = $$GetCost^INARTCOST(pidItem,$$$enumAverageCost)
+		set $$$INStockValAdjustStockonHand(pYFELD) = $$QtyForAvgCost^INARTMENGE(pidItem,$get(YLOCATION))
+	}
+	
+	$$$LogRx(pYFELD)
+	quit
+	
+	
+Editable(pYFELD) 
+	;-------------------------------------------------------------------------------
+	; Should the form be editable?
+	; 
+	; Params: objAdjustment
+	;
+	; Returns: Boolean
+	;
+	; History:
+	; 03-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	quit ($$$INStockValAdjustStatus(pYFELD) = $$$EnumINSTATUSUnprocessed)     ; D4 = 0
+	
+	
+AfterDataFields(pidItem) 
+	;-------------------------------------------------------------------------------
+	; Run after data fields
+	;
+	; Called By: Form INStockValAdjust : Execute After Data Fields
+	; 
+	; Returns: nothing
+	;
+	; History:
+	; 03-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	if pidItem'="" {
+		do ShowAverages(pidItem)
+	}
+	quit
+	
+	;-------------------------------------------------------------------------------
+	; Average Cost History                                                            ShowAverages
+	;-------------------------------------------------------------------------------
+	; Items per page: [   20]  1 2 3 4                                                Query^COMQuery
+	;-------------------------------------------------------------------------------
+	;Date|Time|Quantity|Incoming Goods|  Current   | Incoming |  New       |Source |
+	;    |    |On Hand |   Quantity   |Average Cost|Goods Cost|Average Cost|       |
+	;----+----+--------+--------------+------------+----------+------------+-------+
+	;    |    |        |              |            |          |            |   **  |  ** AverageQueryLoop
+	;----+----+--------+--------------+------------+----------+------------+-------+
+	;    |    |        |              |            |          |            |       |
+	;----+----+--------+--------------+------------+----------+------------+-------+
+	;    |    |        |              |            |          |            |       |
+	;----+----+--------+--------------+------------+----------+------------+-------+
+	;    |    |        |              |            |          |            |       |
+	;-------------------------------------------------------------------------------
+	
+ShowAverages(pidItem)
+	;-------------------------------------------------------------------------------
+	; Show average cost history
+	; 
+	;-------------------------------------- 
+	;   SR16871 : Deprecated by ShowAverages^INStockValCCAdj
+	;-------------------------------------- 
+	;
+	; Called By: MANU^INARTPREISKO, AfterDataFields^INStockValAdjust
+	; 
+	; Params:
+	;
+	; History:
+	; 25-Jan-2006	GRF		SR14203: Add quit
+	; 06-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	new Query,loop
+	
+	set Query("Name")  = "INARTAVG"
+	set Query("Class") = "INARTAVG"
+	set Query("Col",1) = "P~2"                              ; Date
+	set Query("Col",2) = "P~3"                              ; Time
+	
+	;set Query("Title") = $$$Text("IN00373")  ; "Average Cost History"   ; SR16871 - to cover text change
+	set Query("Title") = $$$Text($listbuild("IN00373",""))  ; "Average Cost History for Cost Centre %1"
+	
+	; Qty On Hand  |  Incoming Goods Qty  |  Current Avg Cost  |  Incoming Goods Cost  |  New Avg Cost
+	for loop=3:1:7 {
+		set Query("Col",loop) = "D~"_(loop-2)
+	}
+	set Query("Col",8)      = "D~1~L~R~ ~Type~~"_$$$Text(32042)  ; "Source"
+	set Query("Ref","Type") = "id(4)"
+	
+	set Query("Get")      = "set id=id(1)"
+	set Query("Loop")     = "AverageQueryLoop^INStockValAdjust"   ; SR16871
+	set Query("PageSize") = 20
+	
+	do Query^COMQuery(.Query,.pidItem)
+	quit 
+	
+	
+AverageQueryLoop(&Query,&Storage,&pidItem)
+	;-------------------------------------------------------------------------------
+	; Called from ShowAverages for COMQuery
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	new id,count,strRec,strAdj,strOth,objAvg,strRef
+	
+	set count=0
+	
+	set strRec = $$$Text(32045)		; Receipt
+	set strAdj = $$$Text("IN00374")	; Adjustment
+	set strOth = $$$Text(31614)		; Other
+	
+	set id(2) = ""
+	for {
+		set id(2) = $order(^INARTAVG(YM,pidItem,id(2)),-1)
+		quit:id(2)=""
+		
+		set id(3) = ""
+		for {
+			set id(3) = $order(^INARTAVG(YM,pidItem,id(2),id(3)),-1)
+			quit:id(3)=""
+			
+			set objAvg = $get(^INARTAVG(YM,pidItem,id(2),id(3),1))
+			if $$$INARTAVGIncomingGoodsReference(objAvg)'="" {                      ; D10
+				set strRef = strRec
+				
+			} elseif ($$$INARTAVGAdjustmentReference(objAvg)'="") {
+				set strRef = strAdj_": "_$$$INARTAVGAdjustmentReference(objAvg)     ; D9
+			} else {
+				set strRef = strOth
+			}
+			set id(1) = objAvg
+			set id(4) = strRef
+			
+			merge @Storage@($increment(count)) = id
+		}
+	}
+	quit count
+	
+	
+Create(pidItem,pcurCost,pidReason,pidSource="")
+	;-------------------------------------------------------------------------------
+	; Create a stock adjustment record
+	; 
+	;-------------------------------------- 
+	;   SR16871 : Deprecated by Create^INStockValCCAdj
+	;-------------------------------------- 
+	;
+	; Called By: OnAfterSave^INRECReverseLine
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Nov-2005	JW		SR13222: Created
+	;-------------------------------------------------------------------------------
+	new idAdj,objAdj
+	
+	$$$LogR("Create",pidItem_","_pcurCost_","_pidSource)
+	; TODO : Should we block any non-stock items? <GRF>
+	
+	set idAdj = $$^WWWNEXT("INStockValAdjust")
+	
+	set $$$INStockValAdjustNewCost(objAdj)		= pcurCost
+	set $$$INStockValAdjustStatus(objAdj)		= $$$EnumINSTATUSUnprocessed
+	set $$$INStockValAdjustCreatedBy(objAdj) 	= YBED
+	set $$$INStockValAdjustCreatedDate(objAdj) 	= $horolog
+	set $$$INStockValAdjustReason(objAdj)		= pidReason
+	set $$$INStockValAdjustSource(objAdj)		= pidSource
+	do UpdateValues(.objAdj,pidItem)
+	
+	do Save^COMUtils("INStockValAdjust",pidItem_","_idAdj,objAdj,1)
+	
+	quit idAdj
+	
+	
+UpdateNewCost(pidItem,pidAdj,pcurCost) 
+	;-------------------------------------------------------------------------------
+	;   SR16871 : Deprecated by UpdateNewCost^INStockValCCAdj
+	;-------------------------------------- 
+	;
+	; Called By: OnAfterSave^INRECReverseLine
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Nov-2005	JW		SR13222: Created
+	;-------------------------------------------------------------------------------
+	new objAdjust
+	
+	$$$LogR("UpdateNewCost",pidItem_","_pcurCost_","_pidAdj)
+	set objAdjust = $get(^INStockValAdjust(YM,pidItem,pidAdj,1))
+	
+	if $$$INStockValAdjustNewCost(objAdjust)'=pcurCost {
+		set $$$INStockValAdjustNewCost(objAdjust) = pcurCost
+		do Save^COMUtils("INStockValAdjust",pidItem_","_pidAdj,objAdjust,1)
+	}
+	
+	quit
+	
+]]></Routine>
+</Export>

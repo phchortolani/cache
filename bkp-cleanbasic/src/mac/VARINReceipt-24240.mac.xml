@@ -1,0 +1,1549 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARINReceipt" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARINReceipt
+#include COMSYS
+#include COMConst
+#include INConst
+#include WWWConst
+#include FIN
+#include VARConst
+#include VARLog
+#include COMGridEdit31
+#define RecebimentoProducao 4
+#define RecebimentoRegional 7
+ 		
+OnAfterDataFieldsCustom(pidReceipt,pobjReceipt)
+	
+	//Preserve the ExecuteAfterDataFields form call (WWW120)
+	set YSTOP = $$$NO
+	
+	if (YSEITE = 50) {
+		do AlertarNoRecebimento^VARCompraEntrega(pidReceipt,pobjReceipt)
+	}
+	
+	if (YSEITE = 51){
+		do AlertarNoRecebimento^VARCompraEntrega(pidReceipt,pobjReceipt)
+	}
+	
+	if (YSEITE = 52){
+		do LoadGridOcorrenciasRecebimento(pidReceipt)
+	}
+	
+	quit
+
+OnAfterSave(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Altera o status da Ordem de compra após o recebimento.
+    ; 
+    ;
+    ; Params: YKEY - ReceiptNumber
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 23-Fev-2010	Karine	Created
+    ;-------------------------------------------------------------------------------
+	new idLine, qtIsCompleted, qtLines, objINAUF, hasReceives, objRec, idINAUF, status
+	set objINAUF = ""
+	set objRec = ""
+	set idINAUF = ""
+	
+	set status = $$$OK
+	
+	quit:($$$NoKey(pYKEY)) status
+		
+	set objRec = $get(^INREC(YM,pYKEY,1))
+	
+	//Ignora este hook caso seja recebimento da regional
+	quit:($$$INRECTypeofReceiving(objRec) = 7) status	
+	
+	//Ignora este hook se o status do recebimento for diferente de processado ou estornado
+	quit:(($$$INRECStatus(objRec) '= $$$EnumINSTATUSProcessed) && ($$$INRECStatus(objRec) '= $$$EnumINSTATUSReversed)) status
+			
+	if $$$INRECFirmed(objRec) {    ;já foi confirmado ?
+	
+		set idINAUF = $piece(objRec,Y,30)  
+        
+        if (idINAUF '= "") {
+			
+			set qtIsCompleted = 0
+			set qtLines = 0
+			set hasReceives = 0
+	
+			&SQL(
+			  SELECT count(*) 
+			  INTO qtLines
+			  FROM SQLUser.INAUFP
+			  WHERE 
+				 INAUFP.OrderNo = :idINAUF 
+			)
+			
+			if (SQLCODE '= 0) {
+				set status = "Erro na consulta: "_$SYSTEM.SQL.SQLCODE(SQLCODE)
+			}
+ 
+		    &SQL(
+			  SELECT count(*) 
+			  INTO qtIsCompleted
+			  FROM SQLUser.INAUFP
+			  WHERE INAUFP.OrderNo = :idINAUF 
+			   AND INAUFP.PosCompleted = 1  
+			 )
+			
+			if (SQLCODE '= 0) {
+				set status = "Erro na consulta: "_$SYSTEM.SQL.SQLCODE(SQLCODE)
+			}
+
+			set objINAUF = $get(^INAUF(YM,idINAUF,1))
+	
+			if (qtLines = qtIsCompleted) {
+			   ; Indica que todas as linhas já foram recebidas
+			   set $piece(objINAUF,Y,348) = 3          ;Status = Completed
+	
+			} else {
+			    ; Pesquisa se já existe algum recebimento parcial para a Ordem
+			    ; Atenção: nem sempre o campo "IncomingGoodsQuantity" que indica quantidade já recebida
+			    ;          de um item, é preenchida, mas o status da linha -PosCompleted - é alterado para 1
+			    &SQL(
+			 		SELECT count(*)
+				 		  INTO hasReceives
+		              FROM INAUFP
+		             WHERE INAUFP.company = 0
+		               AND ((NVL(IncomingGoodsQuantity,0) > 0) OR (PosCompleted = 1))
+		               AND INAUFP.OrderNo = :idINAUF
+			     )
+			     
+				if (SQLCODE '= 0) {
+					set status = "Erro na consulta: "_$SYSTEM.SQL.SQLCODE(SQLCODE)
+				}			     
+				 
+				if (hasReceives '= 0) { 
+			       set $piece(objINAUF,Y,348) = 2 ;Status = Partially Received
+			    }
+				if hasReceives = 0 { 
+				       set $piece(objINAUF,Y,348) = 1      ;Status = Processed
+				    }  
+			}
+			
+			if $$$ISOK(status) {
+				set status = $$Save^COMUtils("INAUF", idINAUF, objINAUF, 1)
+			}
+        }
+	}
+	
+	if ($$$ISERR(status)) { 
+		do StartScript^COMUtiljavascript()
+		write "alert('Não foi possível alterar o status da AFM.'); "
+		do EndScript^COMUtiljavascript()
+		$$$VARLOGERROR("("_idINAUF_") "_status)
+	}
+	
+	quit status
+
+OnBeforeSaveHook(pYKEY)
+    ; 17-Feb-2014	shobby	SESDF-1095:	Removed VARTempRemessa (no longer necessary)
+	new strStatus, idCompra, objCompra, idPrograma, idContaContabil, msgErr, receiptLine 
+	new item, nrNotaFiscal, nrSerie, status, fornecedor, keyINREC, objINREC   
+	
+	set strStatus = $$$OK
+		
+	if $$$INRECType(YFELD)'= 2 quit strStatus
+	if $$$INRECStatus(YFELD) = 4 quit strStatus
+	
+	//SESDF-1076
+	if ($get(YFORM) = "VARSESSTATUSNF") {		
+		quit strStatus	
+	}
+	
+	if ($get(YFORM) = "INReceipt"){
+		if (($$$INRECLocation(YFELD) = 5) || ($$$INRECLocation(YFELD) = 1)){
+			if ($$$INRECTypeofReceiving(YFELD) = 7){
+				set msgErr    = "Não é permitido fazer recebimento do tipo ""Recebimento Regional"" no local "
+							  _$$$INRECLocation(YFELD)_" - "_$$SQLGetLocationName^VARSQL($$$INRECLocation(YFELD))_"."
+				set strStatus = $$$MakeStatus("%1",msgErr)
+				quit strStatus			
+			}	
+		}
+
+		/*if ((+$$$INRECTypeofReceiving(YFELD) '= 4) && (+$$$INRECFREE28(YFELD) = 1) && ('$$$NoKey(YKEY))) {
+			if ($$$INRECInvoiceNumber(YFELD) = ""){
+				set msgErr    = "Favor informar na aba ""N. Fiscal"" os dados fiscais obrigatórios."
+				set strStatus = $$$MakeStatus("%1",msgErr)
+				quit strStatus
+			}
+		}*/
+	}
+	
+	if (($$$INRECFREE41(YFELD) '= "") && (+$$$INRECSummaryTotal(YFELD) '= 0)){		
+		if ($$$INRECSummaryTotal(YFELD) < 0){
+			set msgErr    = "Valor do desconto da nota não pode ser maior que o valor do recebimento."
+			set strStatus = $$$MakeStatus("%1",msgErr)
+			quit strStatus			
+		}
+	}
+	if ($$$INRECNotes(YFELD) '= ""){
+		set $$$INRECNotes(YFELD) = $$$DEQUOTE($$$INRECNotes(YFELD))
+	}	
+	
+	set idCompra = $$$INRECFREE10(YFELD)
+		
+	if (idCompra '= "") {
+		
+		//Caso tenha compra, ignora recebimento da regional
+		quit:($$$INRECTypeofReceiving(YFELD) = 7) strStatus
+
+		set objCompra = $get(^INAUF(YM,idCompra,1))
+		
+		if ($$$INAUFFREE14(objCompra) = 3){
+			set msgErr    = "Não é possível realizar o recebimento pois a AFM já foi totalmente recebida." 
+			set strStatus = $$$MakeStatus("%1",msgErr)
+			quit strStatus
+		}
+
+		if ($$$INAUFApproval1(objCompra) = ""){
+			set msgErr    = "Não é possível realizar o recebimento pois a AFM não tem empenho." 
+			set strStatus = $$$MakeStatus("%1",msgErr)
+			quit strStatus
+		}
+		
+		if (+$$$INAUFFREE14(objCompra) '> 0){
+			set msgErr    = "Não é possível realizar o recebimento pois a AFM não está processada." 
+			set strStatus = $$$MakeStatus("%1",msgErr)
+			quit strStatus			
+		}
+		
+		if (+$$$INAUFFREE14(objCompra) = 4) {
+			set msgErr    = "Não é possível realizar o recebimento pois a AFM está totalmente arquivada." 
+			set strStatus = $$$MakeStatus("%1",msgErr)
+			quit strStatus			
+		}
+
+		if (+$$$INAUFFREE27(objCompra)){
+			set msgErr    = "Não é possível realizar o recebimento pois a AFM está bloqueada." 
+			set strStatus = $$$MakeStatus("%1",msgErr)
+			quit strStatus			
+		}
+		
+		if ($$$INAUFLocation(objCompra) '= $$$INRECLocation(YFELD)){
+			set msgErr    = "Não é possível realizar o recebimento pois o local do recebimento não é o mesmo que consta na AFM." 
+			set strStatus = $$$MakeStatus("%1",msgErr)
+			quit strStatus						
+		}
+		
+		if ($$$INAUFSupplierNumber(objCompra) '= $$$INRECSupplier(YFELD)){
+			set msgErr    = $$$Text($listbuild("IN00931",idCompra,$$$INAUFSupplierNumber(objCompra),$$$INRECSupplier(YFELD)))
+			set strStatus = $$$MakeStatus("%1",msgErr)
+			quit strStatus						
+		}
+		
+	}
+	
+	if ($$$INRECType(YFELD) = 2){
+		
+		if ($$$ISOK(strStatus)){
+			set strStatus = $$ValidaICMSPercent(YFELD)
+		}
+	
+		if ($$$ISOK(strStatus)){
+			set strStatus = $$ValidaICMSNF(YFELD)
+		}
+
+		//Salvando Conta Contabil no cabeçalho do recebimento
+		set idContaContabil=""
+		$$$Order3(^INRECSummary,YM,pYKEY,receiptLine)
+			set item=""
+			set item=$piece($get(^INRECSummary(YM,pYKEY,receiptLine,1)),Y,6)
+			if ((item'="") && (idContaContabil="")) {
+				set idContaContabil = $$SQLGetContaContabil^VARSQL(item)
+			}
+		
+		$$$End
+	
+		;set $$$INRECFREE14(YFELD)=idContaContabil
+		//
+	
+		set nrNotaFiscal	= $$$INRECInvoiceNumber(YFELD)
+		set nrSerie			= $$$INRECFREE3(YFELD)
+		set status			= $$$INRECStatus(YFELD)
+		set fornecedor		= $$$INRECSupplier(YFELD)
+
+		if ((fornecedor '= $$$NULLOREF) && (nrNotaFiscal '= $$$NULLOREF)){
+			set keyINREC = ""
+			for {
+				set keyINREC = $order(^INRECs(0,2,$$$Index(fornecedor),$$$Index(nrNotaFiscal),keyINREC))
+				if (keyINREC = "") quit
+				if (keyINREC = pYKEY) continue
+				set objINREC = $get(^INREC(0,keyINREC,1))
+				if (objINREC = "") continue
+				//Trata a inserção de aspas no campo observações = notes
+				set $$$INRECNotes(^INREC(0,keyINREC,1)) = $$$DEQUOTE($$$INRECNotes(objINREC))
+				
+				if ((nrSerie = $$$INRECFREE3(objINREC)) && ($$$INRECStatus(objINREC) = 1)){
+					set msgErr = 	"Não foi possível salvar! "_
+									"O fornecedor """_fornecedor_" - "_$$SQLGetDescFornecedor^VARSQL(fornecedor)_""" já emitiu a nota fiscal """_
+									nrNotaFiscal
+					if (nrSerie '= $$$NULLOREF) set msgErr = msgErr_""" serie """_nrSerie
+					set msgErr = msgErr_""" para o recebimento nº "_keyINREC
+					
+					set strStatus = $$$MakeStatus("%1",msgErr)
+					quit
+				}
+			}
+		}
+	}
+	quit strStatus
+
+OnBeforeSQL()
+	set YSQL = ""
+
+	if (YFORM = "VARFornecedorOcorrencia") {
+		set YSQL =
+			"SELECT INREC.ID "_
+			"FROM   SQLUser.INREC "_
+			"WHERE  INREC.Company = "_YM_
+			"AND    INREC.Status <> '"_$$$EnumINSTATUSUnprocessed_"'"_
+			"AND    INREC.Supplier = '"_
+				$get(^CacheTempFornecedorOcorrenciaSup(YUSER))_"'"
+	
+	} elseif (YFORM = "VARGuiaRemessaNFLinha") {
+		set YSQL =
+			"SELECT INREC.ID "_
+			"FROM   SQLUser.INREC "_
+			"WHERE  INREC.Company = "_YM_
+			"AND    INREC.Status <> '"_$$$EnumINSTATUSUnprocessed_"'"_
+			"AND    INREC.Status <> '"_$$$EnumINSTATUSReversed_"'"_			
+			"AND    INREC.Type = 2"
+	}	
+
+	quit $$$OK
+
+GoToOcorrenciaFornecedor(YKEY)
+	quit:( (YKEY = "") || (YKEY = "+") )
+	
+	new objRecebimento, idFornecedor
+	set objRecebimento = $get(^INREC(YM,YKEY,1))
+	quit:(objRecebimento = "")
+
+	set idFornecedor = $$$INRECSupplier(objRecebimento)
+
+	do GoToForm^COMUtilForm("VARFornecedorOcorrencia", idFornecedor, , , , ,
+		"INREC="_YKEY)
+
+	quit
+	
+	
+EsconderAbaNotaFiscal(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Esconde a aba "Nota Fiscal" caso o Tipo de recebimento seja:
+    ; 4 - Estoque - Transferência
+    ;
+    ; History:
+    ; 20-Jan-2011	Rodrigo Petik	Created
+    ;-------------------------------------------------------------------------------	
+	
+	new Esconder,objINREC
+	
+	set Esconder = $$$NO
+
+	if $$$NoKey(pYKEY) quit Esconder
+	
+	set objINREC = $G(^INREC(YM,pYKEY,1))
+	;Se o Tipo de Recebimento for igual a 4(Estoque - Transferência) esconde a Aba Nota fiscal
+	if $$$INRECTypeofReceiving(objINREC) = 4 {
+		;Só esconde a aba se o perfil do usuário for diferente de 1-Administrador
+		if ($$ChecaPerfilUsuario(1) = $$$NO) { 
+			set Esconder = $$$YES
+		}
+	}
+	
+	quit Esconder
+	
+
+ChecaPerfilUsuario(pstrPerfis)
+	; Gustavo em 06/06/2008 
+ 	;
+ 	; Checa se o perfil do usuário contém algum dos perfis que foram passados
+	; via parâmetro. Caso sim, a rotina retorna 1.
+ 	; 08-Apr-2010	Karine	Alterado 
+ 
+ 	new PerfisUsuario, cnt, blnAcessoPermitido, PerfilPermitido, status
+ 	
+ 	set PerfisUsuario = ";"_$piece($get(^WWW013(YM,YBED,1)),Y,3)_";" 
+ 	set blnAcessoPermitido = $$$NO
+ 
+ 	for cnt = 1:1:$length(pstrPerfis,";") {        
+   
+  		set PerfilPermitido = ";"_$piece(pstrPerfis,";",cnt)_";"
+   
+  		if $find(PerfisUsuario,PerfilPermitido) {
+   			set blnAcessoPermitido = $$$YES
+ 	 	}           
+ 	}
+ 
+    quit blnAcessoPermitido	
+
+CheckRefrigeradoCongelado(pYKEY)
+	new objINRECLine, Temperatura
+	set objINRECLine = ^INRECLine(0,$$$KEY1(pYKEY),$piece($$$KEY2(pYKEY),".",1),1)
+	set Temperatura = $$$INRECLineFREE1(objINRECLine)
+	if ((Temperatura = 3) || (Temperatura = 4)) quit $$$YES
+	quit $$$NO
+	
+
+ValidaTemperaturaConferida(pYFELD)
+	new TemperaturaConferida, TemperaturaArmazenada
+	set TemperaturaConferida = $piece(pYFELD,Y,29)
+	set TemperaturaArmazenada = $piece(pYFELD,Y,26)
+	if (TemperaturaConferida = "") quit $$$NO
+	if (TemperaturaArmazenada = 3){
+		if '((TemperaturaConferida >= 2)&&(TemperaturaConferida <= 8)){
+			quit $$$YES
+		}
+	}
+	if (TemperaturaArmazenada = 4){
+		if '(TemperaturaConferida <= -20){
+			quit $$$YES
+		}
+	}
+	quit $$$NO
+	
+GetDataPagamento(pYFELD)
+	new condicao, dataNF, dataPagamento, dataFormatada
+	set condicao = $piece($get(^INKOND(0,$piece(pYFELD,Y,36),1)),Y,2)
+	set dataNF	 = $piece(pYFELD,Y,16)
+	set dataPagamento = condicao+dataNF
+	quit $$SQLGetDataFormatada^VARSQL(dataPagamento)
+
+CheckOrderNo(pidOrder,pidReceiptNo)
+	new blnFound,idReceipt,idSummaryLine,idxLine,idxOrder,objReceipt,strReceiptID
+	
+ 	if $$$NoKey(pidReceiptNo) set pidReceiptNo = ""   ; "+" or "" become ""
+	set idxOrder = $$$Index(pidOrder)
+	set strReceiptID = ""
+	set idReceipt = ""
+	set idxLine = ""
+	for {
+		set idxLine = $order(^INRECSummarys(0,1,idxOrder,idxLine),-1)
+		quit:idxLine=""
+		
+		for {
+			set idReceipt = $order(^INRECSummarys(0,1,idxOrder,idxLine,idReceipt))
+			quit:idReceipt=""
+			continue:idReceipt=pidReceiptNo
+			
+			set idSummaryLine = $order(^INRECSummary(0,idReceipt,""),-1)      ;14-Aug-2009
+			set objReceipt = $get(^INRECSummary(0,idReceipt,idSummaryLine,1))
+			if objReceipt'=$$$NULLOREF {
+				if $$$INRECSummaryStatus(objReceipt) = $$$EnumINSTATUSUnprocessed {
+					if strReceiptID '[ idReceipt {
+						set strReceiptID = strReceiptID_" "_idReceipt
+					}
+				}
+			}
+		}
+	}
+	if strReceiptID'="" {
+		quit $$$MakeStatus("IN00905",pidOrder,strReceiptID)
+	}	
+	quit $$$OK
+	
+CheckEmpenho(pstrOrderKeys)
+	new strStatus, objCompra
+	set strStatus = $$$OK
+	set objCompra = $get(^INAUF(YM,$$$KEY1(pstrOrderKeys),1))
+	if ($$$INAUFApproval1(objCompra) = ""){
+		set msgErr    = "Não é possível carregar as linhas do recebimento pois a AFM não tem empenho." 
+		set strStatus = $$$MakeStatus("%1",msgErr)
+		quit strStatus
+	}
+	quit strStatus	
+	
+ValidaDescontosETaxas(pidRecebimento)
+	quit:(pidRecebimento = "") "Nenhum recebimento informado"
+	
+	;Não permite repetir o mesmo tipo de desconto/taxa no recebimento em várias linhas
+	new strStatus, idSummaryLine, objSummaryLine, quantNotaFrete, quantNotaAcrescimo,
+		quantNotaDesconto, quantNotaImposto, tipoLinha 
+	
+	set strStatus = $$$OK
+	
+	set quantNotaFrete     = 0
+	set quantNotaAcrescimo = 0
+	set quantNotaDesconto  = 0
+	set quantNotaImposto   = 0	
+	
+	$$$Order3(^INRECSummary,YM,pidRecebimento,idSummaryLine)
+		
+		quit:( $$$ISERR(strStatus) )
+		
+		;Não passa pelas sublinhas, isso é feito por meio da rotina ValidaDescontoTaxaProduto
+		continue:( $piece(idSummaryLine,".",2) )
+		
+		set objSummaryLine = $get(^INRECSummary(YM,pidRecebimento,idSummaryLine,1))
+		
+		set tipoLinha = $$$INRECSummaryLineType(objSummaryLine)
+		
+		;0-Produto
+		if (tipoLinha = 0)  {
+			set strStatus = $$ValidaDescontoTaxaNoProduto(pidRecebimento,idSummaryLine)
+		
+		} else {
+			
+			if (tipoLinha = 1) {
+				set quantNotaDesconto  = $increment(quantNotaDesconto)
+			} elseif (tipoLinha = 3) {
+				set quantNotaImposto   = $increment(quantNotaImposto)
+			} elseif (tipoLinha = 4) {
+				set quantNotaFrete     = $increment(quantNotaFrete)
+			} elseif (tipoLinha = 5) {
+				set quantNotaAcrescimo = $increment(quantNotaAcrescimo)
+			}	
+			
+			if (quantNotaDesconto > 1) set strStatus = "Existe mais de um desconto definido na nota. Favor verificar."
+			if (quantNotaImposto > 1) set strStatus = "Existe mais de um imposto definido na nota. Favor verificar."
+			if (quantNotaFrete > 1) set strStatus = "Existe mais de um frete definido na nota. Favor verificar."
+			if (quantNotaAcrescimo > 1)	set strStatus = "Existem mais de um acréscimo definido na nota. Favor verificar."
+
+		}
+
+	$$$End
+
+	quit strStatus
+	
+
+ValidaDescontoTaxaNoProduto(pidRecebimento,pidSummaryLine)
+	quit:(pidSummaryLine = "") "Nenhuma linha do recebimento informada"
+	
+	new strStatus, idSummaryItemLine, objSummaryItemLine, tipoLinhaNoProduto, quantLineFrete,
+		quantLineAcrescimo, quantLineDesconto, quantLineImposto
+	
+	set strStatus = $$$OK
+	
+	set quantLineFrete     = 0
+	set quantLineAcrescimo = 0
+	set quantLineDesconto  = 0
+	set quantLineImposto   = 0
+	
+	$$$Order3(^INRECSummary,YM,pidRecebimento,idSummaryItemLine)
+		
+		;Só passa pelas linha/sublinhas do produto
+		continue:( $piece(pidSummaryLine,".",1) '= $piece(idSummaryItemLine,".",1) )
+				
+		;Ignora a linha do produto
+		continue:(pidSummaryLine = idSummaryItemLine)
+				
+		set objSummaryItemLine = $get(^INRECSummary(YM,pidRecebimento,idSummaryItemLine,1))
+		set tipoLinhaNoProduto = $$$INRECSummaryLineType(objSummaryItemLine)			
+		
+		if (tipoLinhaNoProduto = 1) {
+			set quantLineDesconto  = $increment(quantLineDesconto)
+		} elseif (tipoLinhaNoProduto = 3) {
+			set quantLineImposto   = $increment(quantLineImposto)
+		} elseif (tipoLinhaNoProduto = 4) {
+			set quantLineFrete     = $increment(quantLineFrete)
+		} elseif (tipoLinhaNoProduto = 5) {
+			set quantLineAcrescimo = $increment(quantLineAcrescimo)
+		}	
+		
+		if (quantLineDesconto > 1) set strStatus = "Existe mais de um desconto definido para o produto da linha "_$piece(idSummaryItemLine,".",1)_". Favor verificar."
+		if (quantLineImposto > 1) set strStatus = "Existe mais de um imposto definido para o produto da linha "_$piece(idSummaryItemLine,".",1)_". Favor verificar."
+		if (quantLineFrete > 1) set strStatus = "Existe mais de um frete definido para o produto da linha "_$piece(idSummaryItemLine,".",1)_". Favor verificar."
+		if (quantLineAcrescimo > 1)	set strStatus = "Existe mais de um acréscimo definido para o produto da linha "_$piece(idSummaryItemLine,".",1)_". Favor verificar."
+		
+	$$$End
+	
+	quit strStatus
+	
+GetQtyEnteredFromGlobals(pstrKeys)
+	;-------------------------------------------------------------------------------
+	; Get the quantity input on the screen for this line and its children
+	;
+	;	INRECLine may have initial item line (integer id) *AND* copies (.01
+	;	increments) representing split allocation to different storages.
+	;	
+	; Called By: 
+	; 	OnBeforeCopy
+	; 	OnBeforeFormat
+	; 	OnBlur^INReceiptLineForm
+	; 	OnAfterSave^INReceiptLineForm
+	; 	IsReceivable^INReceipt
+	; 
+	;
+	; Params:	pstrKeys - keys of INRECLine
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Mai-2012	RGB		Changed to get the total from the globals, not the grid contents.
+	; 30-Jun-2011	shobby	SR17779: Pass in key to GetGridContents
+	; 28-Jun-2011	shobby	SR17779: Got rid of annoying macro.
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than objGrid
+	; 06-Apr-2009	DWR		SR16363: Passed the form name, required because calling
+	; 							from outside the grid
+	; 05-Sep-2006	JW		SR14979: Rewrote below - wasn't finding all
+	; 29-Apr-2006	PO		Fix for Build: Quote nonumeric keys
+	; 20-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,fltQty,idLine,idParent,idReceipt,count
+	
+	
+
+	;$$$GRIDGetContents(.arrGrid) ; SR16363
+ 
+	set fltQty = 0
+	set count=0
+	// loop through all the lines for the same receipt.
+	set idReceipt = $$$KEY1(pstrKeys)
+	set idParent  = $$$KEY2(pstrKeys)\1
+ 
+	//do GetGridContents^COMGridEdit31G(.arrGrid,"INReceiptLine",,idReceipt)  ;SR17779
+
+	set idLine   = $order(^INRECLine(YM,idReceipt,""))		// Go back one
+	while idLine'="" {
+
+		if idLine\1=idParent {
+		set count=count+1
+	
+		set fltQty = fltQty + $$$INRECLineQuantity($get(^INRECLine(YM,idReceipt,idLine,1)))  ; Inventory Qty
+		}
+		set idLine = $order(^INRECLine(YM,idReceipt,idLine))	
+	}
+
+	quit fltQty
+
+CreateINRECLineFromSummary(pidReceipt)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 03-Mai-2012	RGB		Created: Rotina para gerar as linhas de tombamento
+	;-------------------------------------------------------------------------------
+	new objReceipt,strStatus
+	
+	set strStatus  = $$$OK
+
+	set objReceipt = $get(^INREC(0,pidReceipt,1))
+	
+	if ($$$INRECStatus(objReceipt) '= $$$EnumINSTATUSUnprocessed) {  
+		set strStatus = $$$MakeStatus("IN00377")  ; "Record already processed"
+		do ReturnError^COMUtilError(strStatus)    ; 
+		
+	} else {   
+		set strStatus = $$Transaction^COMTransaction("CreateINRECLineFromSummaryTxn^VARINReceipt("""_pidReceipt_""")") 
+	}
+	
+	
+	if $$$ISOK(strStatus) {   
+		do ReloadForm^COMUtilForm()
+	}else {
+		do ReturnError^COMUtilError(strStatus)    
+	}
+	quit
+	
+CreateINRECLineFromSummaryTxn(pidRec)
+	new strStatus,pidLine,key,summaryObj,Quantity,fltConv,objRecLine 
+	new Lot,x,lotLength
+	set strStatus=$$$OK
+	//Kill any lines that have already been replicated
+	$$$Order3(^INRECLine,YM,pidRec,pidLine)
+		set key=pidRec_","_pidLine
+		if (($length(pidLine,".")>1) && (strStatus=$$$OK)) {
+			set strStatus=$$KILL^COMUtils("INRECLine",key)
+		}
+	$$$End
+	if $$$ISOK(strStatus) {
+		$$$Order3(^INRECSummary,YM,pidRec,pidLine)
+			set summaryObj=$get(^INRECSummary(YM,pidRec,pidLine,1))
+			if ((strStatus=$$$OK)) {
+				set Quantity=$piece(summaryObj,Y,33)
+				set Quantity=Quantity-1
+				set objRecLine=$get(^INRECLine(YM,pidRec,pidLine,1))
+				set $piece(objRecLine,Y,64)=1
+				set fltConv = $$GetUOMConversion^INUOMConversion($$$INRECLineItem(objRecLine),$$$INRECLineReceivedUnit(objRecLine)) 
+				set $$$INRECLineQuantity(objRecLine) = $$$INRECLineUnitQuantity(objRecLine) * fltConv
+				set Lot= $piece(objRecLine,Y,21)
+				set key=pidRec_","_pidLine
+				if Lot'="" {
+					SET strStatus=$$KILL^COMUtils("INRECLine",key)
+					set key=pidRec_","_pidLine
+					if (strStatus=$$$OK) set strStatus=$$Save^COMUtils("INRECLine",key,objRecLine,1)
+					if (strStatus=$$$OK) {
+						do AddReference^COMGridEdit31Interface($$$FldINRECLineQuantity,,"INRECLine")  ; Inventory Qty
+						for x=1:1:Quantity {
+							set $piece(pidLine,".",2)=$piece(pidLine,".",2)+1 //Increments ID
+							set key=pidRec_","_pidLine
+							set lotLength=$length(Lot)
+							set Lot=Lot+1
+							while $length(Lot)<lotLength {
+								set Lot="0"_Lot
+							}
+							set $piece(objRecLine,Y,21)=Lot
+							set key=pidRec_","_pidLine
+							if (strStatus=$$$OK) {
+								set strStatus=$$Save^COMUtils("INRECLine",key,objRecLine,1)
+								do AddReference^COMGridEdit31Interface($$$FldINRECLineQuantity,,"INRECLine")  ; Inventory Qty
+							}
+						}
+					}
+				}
+			
+			}
+		$$$End
+	}
+	q strStatus
+
+GetICMSValue()
+	new pICMSValue, pICMSPercent, TotalNF
+	set pICMSValue   = 0
+	set pICMSPercent = $$$INRECFREE22(YFELD)
+	set TotalNF 	 = $$$INRECInvoiceTotal(YFELD)
+	
+	set pICMSValue = TotalNF * (pICMSPercent / 100)
+	set pICMSValue = $fnumber(pICMSValue,".",2)
+	
+	if (pICMSPercent '= "") { 
+		&js< document.getElementById('YINReceiptD43').value = '#(pICMSValue)#'; >
+	}
+	
+	quit pICMSValue
+
+ValidaICMSPercent(pYFELD)
+	set ICMSPercent	= $$$INRECFREE22(pYFELD)
+	set strStatus   = $$$OK
+	
+	if (ICMSPercent = "") quit strStatus
+	
+	if (ICMSPercent > 100){
+		set msgErr = "O valor do campo ICMS % não pode ser maior do que 100."
+		set strStatus = $$$MakeStatus("%1",msgErr)
+		quit strStatus
+	}
+	
+	quit strStatus
+	
+OnBlurICMSPercent(pYFELD)
+	set status = $$ValidaICMSPercent(pYFELD)
+	
+	if $$$ISERR(status) {
+		quit $$$OK
+	}
+	
+	quit $$$NO
+	
+ValidaICMSNF(pYFELD)
+	set ICMS	    = $$$INRECFREE21(pYFELD)
+	set TotalNF	    = $$$INRECInvoiceTotal(pYFELD)
+	set strStatus   = $$$OK
+	
+	if (ICMS = "") quit strStatus
+	
+	if (ICMS > TotalNF){
+		set msgErr = "O valor do campo ICMS R$ não pode ser maior do que o valor do campo Total NF."
+		set strStatus = $$$MakeStatus("%1",msgErr)
+		quit strStatus
+	}
+	
+	quit strStatus
+	
+OnBlurICMSNF(pYFELD)
+	set status = $$ValidaICMSNF(pYFELD)
+	
+	if $$$ISERR(status) {
+		quit $$$OK
+	}
+	
+	quit $$$NO
+	
+OnBlurDescontoNota(pidReceipt)
+	new fltCalcTot, pObjReceipt, objRec, summaryTotal
+	
+	set pObjReceipt = $$$GRIDYFELDContainer
+	set objRec      = $get(^INREC(YM,pidReceipt,1))
+	
+	if (+$$$INRECSummaryTotal(objRec) '= 0){
+		set summaryTotal = $$$INRECSummaryTotal(objRec)
+	} else {
+		set summaryTotal = $$$INRECSummaryTotal(pObjReceipt)
+	}
+	
+	if (($$$INRECFREE41(pObjReceipt) '= "") && (summaryTotal '= "")){
+		set fltCalcTot = summaryTotal - $$$INRECFREE41(pObjReceipt)
+		if (fltCalcTot < 0){
+			quit
+		}
+		do CalculateSummTotal^INRECSummary(pidReceipt)
+		;do UpdateHeaderField^COMGridEdit31G("D75",fltCalcTot)  ; $$$INRECSummaryTotal
+	} 
+	
+	if (($$$INRECFREE41(pObjReceipt) = "")){
+		do CalculateSummTotal^INRECSummary(pidReceipt)
+	}
+	
+	quit
+
+GetLocal(pidRecebimento)
+	quit:(pidRecebimento = "") ""
+	
+	new objRecebimento
+	set objRecebimento = $get(^INREC(YM,pidRecebimento,1))
+	
+	quit:(objRecebimento = "")
+	
+	quit $$$INRECLocation(objRecebimento)
+	
+	
+isProgramaNoCabecalho(pYKEY)
+	new idRecebimento, objRecebimento, idPrograma, objRecLine
+	set idRecebimento = $$$KEY1(pYKEY)
+	
+	quit:(idRecebimento = "") $$$NO
+	
+	set objRecebimento = $get(^INREC(YM,idRecebimento,1))
+	quit:(objRecebimento = "") $$$NO
+	
+	set objRecLine = $get(^INRECLine(YM,idRecebimento,$$$KEY2(pYKEY),1))
+	quit:(objRecLine = "") $$$NO
+	
+	set idItem 	   = $$$INRECLineItem(objRecLine)
+	set idLocn     = $$$INRECLocation(objRecebimento)
+	do GetAttributes^INItemPolicyUtils(idItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,idLocn)
+	
+	set idPrograma = $$$INRECFREE19(objRecebimento)
+	
+	if ((idPrograma '= "") && (intProgram '= 2)){
+		quit $$$YES
+	}
+	
+	quit $$$NO
+	
+	
+GetProgramaCabecalho(pYKEY)
+	new idRecebimento, objRecebimento
+	set idRecebimento = $$$KEY1(pYKEY)
+	
+	quit:(idRecebimento = "") $$$NO
+	
+	set objRecebimento = $get(^INREC(YM,idRecebimento,1))
+	quit:(objRecebimento = "") $$$NO
+	
+	set idPrograma = $$$INRECFREE19(objRecebimento)
+
+	quit idPrograma
+
+CanShipMobile(pidRecebimento)
+	quit:(pidRecebimento = "")
+	
+	new objRecebimento, strStatus
+	
+	set objRecebimento 	= $get(^INREC(YM,pidRecebimento,1))
+	set strStatus 		= $$$OK
+	
+	if (objRecebimento = "") {
+		set strStatus = $$$NO
+		$$$YQHandler(strStatus)
+	}
+	else {
+		if ($$$INRECFirmed(objRecebimento) '= 1){
+			set strStatus = $$$NO_" O recebimento ainda não foi confirmado."
+			$$$YQHandler(strStatus)
+			quit
+		}
+		if ($$$INRECStatus(objRecebimento) '= 0){
+			set strStatus = $$$NO_" Este registro já foi processado."
+			$$$YQHandler(strStatus)
+			quit
+		}
+		if ($$$INRECFREE30(objRecebimento) '= ""){
+			set strStatus = $$$MakeStatus("INREC001") ;O recebimento já foi liberado para mobile.
+			$$$YQHandler(strStatus)
+			quit
+		}
+	}
+		
+	quit
+	
+CanReverseMobile(pidRecebimento)
+	quit:(pidRecebimento = "")
+	
+	new objRecebimento, strStatus
+	
+	set objRecebimento 	= $get(^INREC(YM,pidRecebimento,1))
+	set strStatus 		= $$$OK
+	
+	if (objRecebimento = "") {
+		set strStatus = $$$NO
+		$$$YQHandler(strStatus)
+	}
+	else {
+		if ($$$INRECFirmed(objRecebimento) '= 1){
+			set strStatus = $$$MakeStatus("INREC002") ;O recebimento não está liberado para mobile.
+			$$$YQHandler(strStatus)
+			quit
+		}
+		if ($$$INRECStatus(objRecebimento) '= 0){
+			set strStatus = $$$NO_" Este registro já foi processado."
+			$$$YQHandler(strStatus)
+			quit
+		}
+		if ($$$INRECFREE30(objRecebimento) = ""){
+			set strStatus = $$$MakeStatus("INREC002") ;O recebimento não está liberado para mobile.
+			$$$YQHandler(strStatus)
+			quit
+		}
+	}
+		
+	quit
+	
+IsMobile(pidRecebimento)
+	quit:(pidRecebimento = "") ""
+	new objRecebimento, strStatus
+	
+	$$$VAR
+	
+	set objRecebimento 	= $get(^INREC(YM,$$$KEY1(pidRecebimento),1))
+	set strStatus 		= ""
+	
+	if (objRecebimento = "") {
+		set strStatus = ""
+	}
+	else {
+		if ($$$INRECFREE30(objRecebimento) '= ""){
+			set strStatus = $$$YES
+		}
+	}
+	quit strStatus
+
+UpdateMobileStatus(pidRecebimento,pDoca)
+	quit:(pidRecebimento = "") ""
+	
+	$$$VAR 
+
+	new objRecebimento
+	set objRecebimento 	= $get(^INREC(YM,pidRecebimento,1))
+	
+	set $$$INRECFREE30(objRecebimento) = $$$YES
+	set $$$INRECFREE31(objRecebimento) = $horolog
+	set $$$INRECFREE32(objRecebimento) = YBED
+	set $$$INRECFREE33(objRecebimento) = pDoca
+	
+	set strStatus = $$$Save("INREC",pidRecebimento,objRecebimento,1)
+	
+	if $$$ISERR(strStatus) {
+		set strStatus = $$$NO_strStatus
+	}
+	else {
+		do GoToForm^COMUtilForm("INReceipt",pidRecebimento,2)
+	}
+	
+	quit
+	
+ReverseMobileStatus(pidRecebimento)
+	quit:(pidRecebimento = "") ""
+	
+	$$$VAR 
+
+	new objRecebimento
+	set objRecebimento 	= $get(^INREC(YM,pidRecebimento,1))
+
+	set $$$INRECFREE30(objRecebimento) = ""
+	set $$$INRECFREE31(objRecebimento) = ""
+	set $$$INRECFREE32(objRecebimento) = ""
+	set $$$INRECFREE33(objRecebimento) = ""
+	
+	set strStatus = $$$Save("INREC",pidRecebimento,objRecebimento,1)
+	
+	if $$$ISERR(strStatus) {
+		set strStatus = $$$NO_strStatus
+	}
+	else {
+		do GoToForm^COMUtilForm("INReceipt",pidRecebimento,2)
+	}
+	
+	quit
+	
+PrintJS
+	
+	set strP1Name = "Y"_"INReceipt"_"P1"
+	write !, "<script language=""javascript"">"
+	
+	&js<
+
+	var pidRecebimento = document.#(YHTMFORM)#.#(strP1Name)#.value;
+
+	function OnBlurDescontoNota(){
+		CallBackNow("OnBlurDescontoNota^VARINReceipt", pidRecebimento);
+	}
+
+	function liberarMobile() {
+		CallBackNow("LiberarMobileClickJS^VARINReceipt", pidRecebimento);
+	}
+			
+	function confirmMobile(){
+		var settings = "dialogWidth: 470px; dialogHeight: 150px; center: yes; " +
+			"edge: sunked; scroll: yes; status: no";
+		eval('var url ="#(YAKTION)#EP=WWWFORM&YFORM=VARTempEndReceiptMobile&YKEY='+pidRecebimento+'&YUSER=#(YUSER)#&YBED=#(YBED)#"');
+		if(window.showModalDialog){
+			return window.showModalDialog(url,"name",settings);
+		}
+	}
+	
+	function addEvent(obj, evType, fn) {
+		if (obj.addEventListener) {
+			obj.addEventListener(evType, fn, false);
+			return true;
+		} else if (obj.attachEvent){
+			var r = obj.attachEvent('on'+evType, fn);
+			return r; 
+		} else {
+			return false;
+		}
+	}		
+
+	addEvent(document.forms[1].YINReceiptD87, 'blur', OnBlurDescontoNota);
+
+	>
+	write !, "</script>" 
+	
+	quit
+
+LiberarMobileClickJS(pidRecebimento)
+	&js<
+	    var value = confirmMobile();
+		if ((value) || (value == "") && (value != '0')){
+			//alert(value);
+			CallBackNow("UpdateMobileStatus^VARINReceipt", pidRecebimento, value);
+		}
+	> 
+	quit
+	
+OnAfterButtonLine(pidRecebimento)
+	//utilizado no form modal VARTempEndReceiptMobile
+	
+	new combo, comboHeader, comboDetail, comboFooter, endereco
+	
+	set endereco    = ""
+	set comboHeader = "<select id='pDoca' style='width: 330px;'>"
+	set comboDetail = "<option value=''></option>"
+	set comboFooter = "</select>"
+	
+	&SQL(DECLARE c1 CURSOR FOR 
+	  SELECT StockLocation
+	  INTO :endereco
+  	  FROM SQLUser.INLP
+  	  WHERE Company = 0
+  	  AND AddressType = 1
+  	  AND LocationName = :YLOCATION
+ 	)
+	
+	&sql(OPEN c1)
+	&sql(FETCH c1)
+ 	while (SQLCODE = 0){
+		set comboDetail = comboDetail_"<option value='"_endereco_"'>"_endereco_"</option>"
+		&sql(FETCH c1)
+	} 	
+	&sql(CLOSE c1)
+	
+	set combo = comboHeader_comboDetail_comboFooter
+	
+	&html<
+		<script type='text/javascript'>
+			function yesConfirm(){
+				window.returnValue = document.getElementById("pDoca").value;
+				
+				window.close();
+				return false;
+			}
+			function noConfirm() {
+				window.returnValue = 0;
+				window.close();
+				return false
+			}
+		</script>
+		<body>
+		<blockquote style="font-size:12px;font-weight:bold;margin-top:10px;text-align:left;">Deseja liberar o recebimento #(pidRecebimento)# para o Alphalinc Mobile?</blockquote>
+		
+		&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+		<label style="font-size:12px;font-weight:bold;margin-top:10px;">Doca&nbsp;&nbsp;</label>
+		
+		#(combo)#
+		
+		<br/>	
+			<div style="width:460px;text-align:center;margin-top:15px;">
+				<input type="button" value="    SIM    " onclick="yesConfirm();"  style="font-weight:bold;margin-right:10px;cursor:pointer;"><input type="button" value="     NÃO     " style="font-weight:bold;margin-left:10px;cursor:pointer;" onclick="noConfirm();">
+			</div>
+		</body>
+	>
+	
+	quit
+
+AlertOnProcessMessage(pidRecebimento)
+	write "<script>"
+	&js<
+		var settings = "dialogWidth: 460px; dialogHeight: 440px; center: yes; " +
+		"edge: sunked; scroll: yes; status: no";
+		eval('var url ="#(YAKTION)#EP=WWWFORM&YFORM=VARTempINReceiptAlert&YKEY=#(pidRecebimento)#&YUSER=#(YUSER)#&YBED=#(YBED)#"');
+	    window.showModalDialog(url,"name",settings);
+	>
+	write "</script>"
+	quit
+	
+OnAfterButtonLineP(pidRecebimento)
+	//utilizado no form modal VARTempINReceiptAlert
+	quit:(pidRecebimento = "")
+	
+	new combo, comboHeader, comboDetail, comboFooter, endereco
+	
+	set pidCompra = $$$INRECFREE10($get(^INREC(YM,pidRecebimento,1)))
+ 	
+  	&SQL(DECLARE c2 CURSOR FOR 
+	  SELECT ReceiptNumber, PurchaseOrderLine, QuantityReceived
+	  INTO :idReceipt, :idCompraLinha, :qtyTotalConfirmada
+  	  FROM SQLUser.INRECSummary
+  	  WHERE Company = 0
+  	  AND PurchaseOrder = :pidCompra
+  	  AND ReceiptNumber <> :pidRecebimento
+ 	)
+	
+	&sql(OPEN c2)
+	&sql(FETCH c2)
+	
+	set recAnterior = ""
+	write "<br/><center><font size='3'><b>O recebimento "_pidRecebimento_" não pode ser processado, pois:</b></font></center>"
+
+	if $$Start^COMTable("") {
+		
+	 	while (SQLCODE = 0){
+		 	 			
+	 			set objCompra = $get(^INAUFP(YM,pidCompra,idCompraLinha,1))
+
+	 			set idProduto = $piece(objCompra,Y,4)
+			    set qtyCompra = $piece(objCompra,Y,5)
+
+				set descProduto = $$SQLGetDescricaoProduto^VARSQL(idProduto)
+
+				set qtyTotalRecebida   = $$getQuantidadeRecebida^VARCompra(pidCompra,idCompraLinha)
+				set qtyTotalEstornada  = $$getQuantidadeEstornada^VARCompra(pidCompra,idCompraLinha) 
+				set qtyRestante 	   = qtyCompra - qtyTotalRecebida + qtyTotalEstornada
+
+				if ((recAnterior '= idReceipt || (recAnterior = ""))){
+			]]><![CDATA[		do NewLine^COMTable("lightsteelblue")
+					do InsertCell^COMTable("<b>Os produtos abaixo já foram pré-recebidos no recebimento "_idReceipt_":</b>",,,,,,3)
+					do EndLine^COMTable()
+					do PrintAlertColumnHeader
+					set recAnterior = idReceipt
+				}
+
+    			do NewLine^COMTable()
+     			do InsertCell^COMTable("("_idProduto_") - "_descProduto,,,,,,,,,$$$YES)
+     			do InsertCell^COMTable($$^WWWTR(0,12,qtyTotalConfirmada),,,,"RIGHT",,,,,$$$YES)   				   				
+     			do InsertCell^COMTable($$^WWWTR(0,12,qtyRestante),,,,"RIGHT",,,,,$$$YES)   	
+      			do EndLine^COMTable()
+
+			&sql(FETCH c2)
+		}	 
+		do Stop^COMTable()
+	}	
+	&sql(CLOSE c2)
+	do PrintCloseJs()
+	
+	quit
+	
+PrintAlertColumnHeader
+	do Start^COMTable($listbuild("Produto","Quant. &nbsp;<br/>Confirmada", "Quant. Pendente na &nbsp;<br/>AFM"))
+	quit
+	
+PrintCloseJs()
+	write !,"<INPUT TYPE='button' style='visibility=hidden' id='closeme1' onclick='closeWin()'>"
+	write !,"<script language=""javascript"">"
+	&js<
+		function closeWin() {
+	  		window.close();
+		}
+ 
+		if (window.Event) document.captureEvents(Event.ONKEYDOWN);
+		document.onkeydown = closeWin;
+	
+		if (window.Event) document.captureEvents(Event.ONCLICK);
+		document.onclick = closeWin;
+	>
+	write !,"</script>"
+	
+	quit
+	
+AddOrderLineErrors(pIdOrder,pIdOrderLine)
+	new idItem
+	set idItem = $$$INAUFPItemNumber($get(^INAUFP(YM,pIdOrder,pIdOrderLine,1)))
+
+	if ($$CheckStatusFor^VARItemStatus(idItem,$$$FldINItemStatusReceiveGoods) '= $$$YES){
+		set ^VARTempRecOrderLineError(pIdOrder,pIdOrderLine) = ""
+	}
+	quit
+
+AlertOrderLineErrors(pidOrder)
+	if ($d(^VARTempRecOrderLineError(pidOrder)) = 0) quit
+	&js<
+		var settings = "dialogWidth: 660px; dialogHeight: 340px; center: yes; " +
+		"edge: sunked; scroll: yes; status: no";
+		eval('var url ="#(YAKTION)#EP=WWWFORM&YFORM=VARTempRecOrderLineErrorAlert&YKEY=#(pidOrder)#&YUSER=#(YUSER)#&YBED=#(YBED)#"');
+	    window.showModalDialog(url,"name",settings);
+	>
+	quit
+	
+OnAfterButtonLineOCError(pidOrder)
+	new idOrderLine, lstHeader
+
+	write "<br/><font size='3' align='justify'><b>&nbsp;AFM "_pidOrder_": os produtos listados abaixo estão inativos e não &nbsp;serão carregados na tela de Recebimento.</b></font>"
+	
+	set lstHeader = $listbuild("Seq.","Produto","Unidade","Quantidade","Preço &nbsp;<br/>Unitário")
+	
+	if $$Start^COMTable(lstHeader) {
+		set idOrderLine = ""
+		for {
+			set idOrderLine = $order(^VARTempRecOrderLineError(pidOrder,idOrderLine))
+			quit:(idOrderLine = "")
+			set objRecOrderLineError = $get(^INAUFP(YM,pidOrder,idOrderLine,1))
+			
+	    	do NewLine^COMTable()
+     		do InsertCell^COMTable(idOrderLine,,,,"CENTER",,,,,$$$YES)
+     		do InsertCell^COMTable("("_$$$INAUFPItemNumber(objRecOrderLineError)_") "_$$$INAUFPItemName(objRecOrderLineError),,,,,,,,,$$$YES)
+     		do InsertCell^COMTable($$SQLGetDescCompletaUnit^VARSQL($$$INAUFPQuantityUnit(objRecOrderLineError)),,,,"CENTER",,,,,$$$YES)
+     		do InsertCell^COMTable($$^WWWTR(0,12,$$$INAUFPQuantity(objRecOrderLineError)),,,,"RIGHT",,,,,$$$YES)
+     		do InsertCell^COMTable("R$ "_$$^WWWTR(0,8,$$$INAUFPCost(objRecOrderLineError)),,,,"RIGHT",,,,,$$$YES)
+      		do EndLine^COMTable()			
+		}
+		do Stop^COMTable()
+	}
+	kill ^VARTempRecOrderLineError(pidOrder)
+	
+	quit
+
+ValidaOCLinhas(pidReceipt, pidOrder)
+	quit:((pidReceipt = "") || (pidOrder = "")) $$$OK
+	new idSummary, objSummLine, strMsg, strStatus, objRec
+	
+	set strStatus = $$$OK
+	set strMsg	  = ""
+	set count 	  = 0
+	
+	//Ignora esta validação no recebimento do PDPAS
+	set objRec = $get(^INREC(YM,pidReceipt,1))
+	quit:($$$INRECTypeofReceiving(objRec) = 7) strStatus
+	
+	set idSummary = ""
+	for {
+		set idSummary = $order(^INRECSummary(0,pidReceipt,idSummary))
+		quit:idSummary=""
+		set objSummLine  = $get(^INRECSummary(0,pidReceipt,idSummary,1))
+		if ($$$INRECSummaryPurchaseOrder(objSummLine) '= pidOrder){
+			set count = $increment(count)
+			if (strMsg = ""){
+				set strMsg = strMsg_idSummary
+			} else {
+				set strMsg = strMsg_","_idSummary
+			}
+		}
+	}
+	
+	if (strMsg '= ""){
+		if (count = 1){
+			set strStatus = $$$NO_"Atenção, a linha "_strMsg_" está sem AFM. "
+						   _"Todas as linhas devem pertencer a uma AFM, "
+						   _"por favor exclua o recebimento ou as linhas inseridas manualmente."			
+		} else {
+			set strStatus = $$$NO_"Atenção, as linhas "_strMsg_" estão sem AFM. "
+						   _"Todas as linhas devem pertencer a uma AFM, "
+						   _"por favor exclua o recebimento ou as linhas inseridas manualmente."
+		}
+	}
+	
+	quit strStatus
+	
+LoadGridOcorrenciasRecebimento(pidRecebimento)
+	quit:(pidRecebimento = "")
+	
+	new idFornecedor, idOcorrencia, lstHeader, count, objOcorrencia, dteOcorrencia, idMotivo, outroMotivo,
+		idRecebimento, observacoes, blnNotificado, fornecedorRec
+
+	set fornecedorRec = $$$INRECSupplier($get(^INREC(YM,pidRecebimento,1)))
+
+ 	set lstHeader = ""
+ 	set lstHeader = lstHeader_$listbuild("Seq.","Data","Motivo","Outro","Recebimento","Descrição Detalhada","Fornecedor Notificado?")
+	
+	set count = 0
+	
+  	if $$Start^COMTable(lstHeader,"<div style=margin:3px;>Ocorrências registradas para este recebimento</div>",,,$$$NO) {
+	
+		$$$Order4(^VARFornecedorOcorrencias,YM,2,$$$Index(pidRecebimento),idFornecedor)	
+			$$$Order5(^VARFornecedorOcorrencias,YM,2,$$$Index(pidRecebimento),idFornecedor,idOcorrencia)
+			
+				set objOcorrencia = $get(^VARFornecedorOcorrencia(YM,idFornecedor,idOcorrencia,1))			
+				set dteOcorrencia = $$$VARFornecedorOcorrenciaData(objOcorrencia)
+				set idMotivo 	  = $$$VARFornecedorOcorrenciaMotivo(objOcorrencia)
+				set outroMotivo   = $$$VARFornecedorOcorrenciaOutro(objOcorrencia)
+				set idRecebimento = $$$VARFornecedorOcorrenciaRecebimento(objOcorrencia)
+				set observacoes   = $$$VARFornecedorOcorrenciaDescricaoDetalhada(objOcorrencia)
+				set blnNotificado = $$$VARFornecedorOcorrenciaFornecedorNotificado(objOcorrencia)
+				
+				set count = $increment(count)			
+				set key = idFornecedor_","_idOcorrencia
+
+				if $length(observacoes) > 200 {
+					set observacoes = $extract(observacoes,1,200)_"..."
+				}
+				
+    			do NewLine^COMTable()
+    			do InsertCell^COMTable(count,"VARFornecedorOcorrencia",key)
+				do InsertCell^COMTable($zdate(dteOcorrencia,4),"VARFornecedorOcorrencia",key)
+			    do InsertCell^COMTable($piece($get(^VARPARA(YM,"OCORRENCIAFORNECEDOR",SPRACHE,idMotivo,1)),Y,1),"VARFornecedorOcorrencia",key)
+			    do InsertCell^COMTable(outroMotivo,"VARFornecedorOcorrencia",key)
+				do InsertCell^COMTable(idRecebimento,"VARFornecedorOcorrencia",key)
+			    do InsertCell^COMTable(observacoes,"VARFornecedorOcorrencia",key,,,,,,,$$$YES)
+			    do InsertCell^COMTable($$SQLGetYesOrNo^VARSQL(blnNotificado),"VARFornecedorOcorrencia",key)
+				do EndLine^COMTable()
+			
+			$$$End	
+		$$$End
+
+	    if (count = 0) {
+			do NewLine^COMTable()
+			do InsertCell^COMTable("Nenhuma ocorrência registrada para este recebimento.",,,,,,8)
+			do EndLine^COMTable()   
+	    }
+	    
+		do NewLine^COMTable("lightsteelblue")
+		do InsertCell^COMTable("<strong>Cadastrar nova ocorrência</strong>","VARFornecedorOcorrencia",fornecedorRec,"INREC="_pidRecebimento,"RIGHT",,8)
+		do EndLine^COMTable()	
+  	
+  		do Stop^COMTable()
+  	}
+	quit
+	
+IsFirmable(pidReceipt,pobjReceipt="")
+	do IsFirmable^INReceiptButton(pidReceipt,$get(pobjReceipt))
+	if (YQ = 0){
+		set strStatus = $$ValidaNotaFiscal(pidReceipt)
+		if ($$$ISERR(strStatus)){
+			$$$YQHandler(strStatus)
+		}
+	}
+	if (YQ = 0){
+		set strStatus = $$ValidaEmpenho(pidReceipt)
+		if ($$$ISERR(strStatus)){
+			$$$YQHandler(strStatus)
+		}
+	}
+	quit	
+	
+FirmReceipt(pidReceipt,RedirectForm=1)
+	new strStatus
+	set strStatus = $$FirmReceipt^INReceiptButton(pidReceipt,RedirectForm=1)
+	if ($$$ISOK(strStatus)){
+		do RegistraPreRecebimentoDeZerados^VARSESINRECZerados(pidReceipt,YLOCATION,1)	
+	}
+	quit strStatus
+	
+Post(pidReceipt)
+	do Post^INReceiptButtonP(pidReceipt)
+	if $$$INRECStatus($get(^INREC(YM,pidReceipt,1)))>0 {
+		do RegistraPreRecebimentoDeZerados^VARSESINRECZerados(pidReceipt,YLOCATION,2)
+	}
+	quit
+
+ValidaNotaFiscal(pidRecebimento)
+	new objINREC, msgErr, strStatus,arrGrid,idLine,objSummLine
+	set objINREC = $get(^INREC(YM, pidRecebimento, 1))
+	
+	
+	set strStatus = $$$OK
+	    
+  	if (+$$$INRECTypeofReceiving(objINREC) '= 4) {
+	  	
+	  	if (+$$$INRECFREE28(YFELD) = 1) {
+			if (($length($$$INRECInvoiceNumber(objINREC)) = 0) || ($length($$$INRECInvoiceDate(objINREC)) = 0)){
+				set msgErr = "Favor informar na aba ""N. Fiscal"" os dados fiscais obrigatórios."
+				set strStatus = $$$MakeStatus("%1",msgErr)
+			}
+	  	}
+		
+		if $$$ISOK(strStatus) {
+			set idLine = ""
+			for {
+				set idLine=$order(^INRECSummary(YM,pidRecebimento,idLine))
+				quit:idLine=""
+				quit:'$$$ISOK(strStatus)
+			
+				set objSummLine = $get(^INRECSummary(YM,pidRecebimento,idLine,1))
+			
+				if (objSummLine'=""){
+					if ($length($$$INRECSummaryUnitCost(objSummLine)) = 0){
+						set msgErr = "Favor informar na aba ""N. Fiscal"" os dados fiscais obrigatórios."
+						set strStatus = $$$MakeStatus("%1",msgErr)
+					}				
+				}
+			}
+		}
+  	}
+
+	quit strStatus
+	
+ValidaEmpenho(pidRecebimento)
+	new objINREC, msgErr, strStatus,arrGrid,idLine,objSummLine
+	set objINREC = $get(^INREC(YM, pidRecebimento, 1))
+	
+	
+	set strStatus = $$$OK
+	quit:($$$INRECFREE10(objINREC) = "") strStatus ; Não verifica se não tiver AFM
+	quit:($$$INRECFREE23(objINREC) = "") strStatus ; Não verifica se não tiver modalidade de empenho
+
+  	if ((+$$$INRECTypeofReceiving(objINREC) '= 4) && ($$$INRECFREE23(objINREC) = 3)){ ; Valida modalidade de empenho ordinário
+	  			
+		if $$$ISOK(strStatus) {
+			set idLine = ""
+			for {
+				set idLine=$order(^INRECSummary(YM,pidRecebimento,idLine))
+				quit:idLine=""
+				quit:'$$$ISOK(strStatus)
+			
+				set objSummLine = $get(^INRECSummary(YM,pidRecebimento,idLine,1))
+			
+				if (objSummLine'=""){
+					//Solicitado pelo cliente SES-DF para liberar isto (SESDF-989)
+					if '+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))) {
+						if ($$$INRECSummaryUnitQtyReceived(objSummLine) '= $$$INRECSummaryQuantityOrdered(objSummLine)){
+							set msgErr = "Não é possível realizar um recebimento parcial quando a Modalidade de Empenho = ""Ordinário"" na AFM."
+							set strStatus = $$$MakeStatus("%1",msgErr)
+						}				
+					}
+				}
+			}
+		}
+  	}
+
+	quit strStatus
+	
+BotaoStatusNF(pidRec)
+	if (pidRec) {
+		new StatusRecebimento		
+		set StatusRecebimento = $piece($get(^INREC(YM,pidRec,1)),"~",4)
+	
+		if StatusRecebimento '= 1 {
+			set YQ = 1_"O recebimento ainda não foi processado. É possível alterar os dados da situação fiscal na aba N. Fiscal."
+		}
+	}
+	
+	quit
+	
+IsFirmed(pidRec)
+	quit:($$$NoKey(pidRec))
+	if '($$$INRECFirmed($get(^INREC(YM,pidRec,1)))){
+		set YQ = 1_"O recebimento ainda não foi pré-recebido."
+	}
+	quit
+
+IsRecRegional(pidRec)
+	quit:($$$NoKey(pidRec)) $$$YES
+	set pObjReceipt = $$$GRIDYFELDContainer
+
+	if (($$$INRECTypeofReceiving(pObjReceipt) = 7) || ($$$INRECFREE10(pObjReceipt) '= "")){
+		quit $$$NO
+	}
+	if (($$$INRECTypeofReceiving(pObjReceipt) = 2) && ($$$INRECLocation(pObjReceipt) = 5070)){
+		quit $$$NO
+	}
+	quit $$$YES
+	
+TemNF(pidRec)
+	quit:($$$NoKey(pidRec)) $$$NO
+	set pObjReceipt = $$$GRIDYFELDContainer
+
+	if ($$$INRECFREE28(pObjReceipt) '= 1){
+		quit $$$YES
+	}
+	quit $$$NO
+
+OnFilterHook(YKEY,YFORM)
+	new tipoRecebimento, perfilUsuario, objReceipt, codUnidadeSaude, idAquisicao
+
+	set objReceipt = $get(^INREC(YM,YKEY,1))
+	quit:(objReceipt = "") $$$NO
+	
+	set tipoRecebimento = $$$INRECTypeofReceiving(objReceipt)
+	set idAquisicao		= $$$INRECFREE10(objReceipt)
+	
+	//Não aplicar filtros ao administrador do sistema
+	set perfilUsuario = $piece($get(^WWW013(YM,YBED,1)),Y,3)
+	quit:(perfilUsuario = 1) $$$YES
+	
+	new codUnidadeSaude
+	set codUnidadeSaude = $piece($get(^WWW0121(YM,YM,YLOCATION,1)),Y,64)	
+	
+	;Não aplica filtros caso o usuário seja gestor do PDPAS
+	quit:($$isGestorPDPAS^VARSESCOMPRASPDPAS(perfilUsuario) = $$$YES) $$$YES
+			
+    if ( (YFORM = "VARRecRegional") || (YFORM = "VARRecRegionalAtualiza") ) {
+	    	   
+	    ;Somente recebimentos de Regional
+	    quit:(tipoRecebimento '= $$$RecebimentoRegional) $$$NO	   
+	    
+	    ;Somente recebimentos do PDPAS
+	    quit:(idAquisicao = "") $$$NO
+	    
+	    ;Se for a RecRegionalAtualiza, somente registros processados
+	    quit:( (YFORM = "VARRecRegionalAtualiza") && ($$$INRECStatus(objReceipt) = 0) ) $$$NO
+	    	
+		;Verifica se o registro pertence, ou seja, possui o prefixo da unidade de saúde
+		if (codUnidadeSaude = "") {
+			quit $$$YES			
+		} else {		
+			quit:('$$Contem^VARSESUtil(idAquisicao,codUnidadeSaude)) $$$NO
+		}
+    
+    } elseif (YFORM = "VAREntrada") {
+		quit:(tipoRecebimento '= $$$RecebimentoProducao) $$$NO
+		quit:(idAquisicao '= "") $$$NO ;Incorporação não tem AFM
+    
+    } elseif (YFORM = "INReceipt") {
+	 	quit:(tipoRecebimento = $$$RecebimentoRegional) $$$NO ;Não mostrar recebimento de regional
+	 	quit:( (tipoRecebimento = $$$RecebimentoProducao) && (idAquisicao = "") ) $$$NO ;Não mostrar nenhum recebimento sem AFM
+	 	   
+    }
+
+	quit $$$YES
+
+GetSupplier() ;SESDF-983
+	new strResult,idINAUF,objINAUF
+	set strResult=$$$INRECSupplier(YFELD)
+	
+	set idINAUF=$$GetAFM()
+	if ($$$NoKey(YKEY))&&($$$INRECSupplier(YFELD)="")&&(idINAUF'="") {
+		set objINAUF=$get(^INAUF(YM,idINAUF,1))
+		if objINAUF'="" set strResult=$$$INAUFSupplierNumber(objINAUF)
+	}
+	quit strResult
+
+
+GetAFM() ;SESDF-983
+	new strAFM,fornecedor
+	
+	set strAFM=""
+	if ($get(YUSER)'="")&&($get(YFORM)'="") set strAFM=$piece($get(^WWWDATEN(YM,+$horolog,YUSER,YFORM,"M",1)),Y,7)
+	quit strAFM
+	
+OnBlurSupplier() ;SESDF-1367
+	new strResult,idINAUF,objINAUF
+	set strResult=$$$INRECSupplier(YFELD)
+	
+	set idINAUF=$$GetAFM()
+	if ($$$NoKey(YKEY))&&($$$INRECSupplier(YFELD)="")&&(idINAUF'="") {
+		set objINAUF=$get(^INAUF(YM,idINAUF,1))
+		
+		if (objINAUF'=""){ 
+			set $$$INRECSupplier(YFELD) = $piece(objINAUF,"~",12)
+		}
+	}
+	quit 
+
+	
+]]></Routine>
+</Export>

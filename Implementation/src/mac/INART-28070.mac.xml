@@ -1,0 +1,1043 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INART" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INART
+#include COMSYS
+#include INConst
+	
+#define DEMAND	1
+#define SUPPLY	2
+	
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		PRÜFUNG BEI SPEICHERN ARTIKEL
+	;
+	;	ARTIKEL HISTORY ;item 
+	;	D ^INARTHIST(YKEY,$$^WWWTEXT(32508))  ;Datensatzänderung - ZU VIELE EINTRÄGE
+	; Inputs : 
+	;	YKEY	idItem	
+	;	YFELD	objINART
+	;	BETR	Site Location (YLOCATION)
+	; 
+	; Called By:
+	; 	OnAfterSaveEvent for INART Form
+	; 	
+	; ByRef :
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 05-Nov-2010	GRF		SR17243: OnAfterSave health check of INARTPACK units
+	; 11-Feb-2009	HQN		SR16347: Added INARTPACK saving defaults
+	; 20-Nov-2008	shobby	SR16169: Allow non-numeric UOMs
+	; 25-Aug-2006	GRF		SR12027: quits; doco; macros & code clarification
+	;                       Use Supplier Product No instead of Product Description
+	; 12-Jul-2005	GRF		SR12027: Identify INARTK Product Description Use
+	; 24-Jun-2005	GRF		Comments; clarify; ! => ||
+	; 30.01.2000  	DT
+	;-------------------------------------------------------------------------------
+	NEW YKALK,BETR,WG,ME,LIEF,strStatus
+	
+	QUIT:$GET(YKEY)=""
+	QUIT:$GET(YFELD)=""
+	
+	;UEBERSICHT DRP
+	SET ^INDRPUSER(0,YUSER,1) = Y_YKEY
+	
+	;KALKULATIONSVORGABEN AUS BETRIEBSDATEI SUCHEN ;out of seek 
+	IF $GET(BETR)="" SET BETR = $GET(YLOCATION)
+	IF BETR="" SET BETR = $ORDER(^INKALK(0,""))      ; FIXME : The first location may not be a usable location. <GRF>
+	IF BETR="" SET BETR = 1                          ; FIXME : We may not even HAVE a location "1".             <GRF>
+	
+	; Item Group      ;WARENGRUPPE SUCHEN
+	; Use defaults if not set up and store in item record  ;SETZEN STANDARDWARENGRUPPE IN ARTIKEL
+	;---------------------------------------
+	SET WG=$PIECE(YFELD,Y,30)
+	IF WG="" {
+		SET WG = $$$INVORGDefaultItemGroup($GET(^INVORG(0,0,1)))
+		IF (WG="") && (BETR'="") SET WG = $ORDER(^INKALK(0,BETR,""))
+		SET $PIECE(YFELD,Y,30) = WG
+	}
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;   Calculation Rules
+	;	YKALK		objINKALKART    Item Level - first choice, or
+	;	YKALK		objINKALK       Group Level - based on default group if 
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	IF WG'="" IF '$DATA(^INKALK(0,BETR,WG)) SET WG = $$$INVORGDefaultItemGroup($GET(^INVORG(0,0,1)))   ;DFLT WARENGRUPPE = 1.
+	
+	SET YKALK=""
+	IF BETR'="" {
+		IF WG'="" SET YKALK = $GET(^INKALK(0,BETR,WG,1))
+		IF (YKEY'="") && $DATA(^INKALKART(0,BETR,YKEY)) {
+			SET YKALK = $GET(^INKALKART(0,BETR,YKEY,1))  ;ARTIKELKALKULATIONSVORGABEN
+		}
+	}
+	
+	; Ensure the Quantity Unit exists   ; PRUEFEN DER MENGENEINHEIT AUF BESTAND
+	;---------------------------------------
+	IF $$$INARTOldQuantityUnit(YFELD)'="" { 
+		IF $DATA(^INWE(0,YKEY)) {
+			IF $$$INARTOldQuantityUnit(YFELD)'=$$$INARTUnitofMeasure(YFELD) {
+				SET $$$INARTUnitofMeasure(YFELD)=$$$INARTOldQuantityUnit(YFELD)      ;NICHT ZULÄSSIGE PRUEFUNG ;Not 
+			}
+		}
+	}
+	
+	IF +$$$INARTItemType(YFELD)=0      SET $$$INARTItemType(YFELD)     =0  ;ARTIKELART=0 "Make or Buy"
+	IF $$$INARTUnitofMeasure(YFELD)="" SET $$$INARTUnitofMeasure(YFELD)=1  ;when no units, set to "EACH"   ;16169
+	
+	IF $$$INARTItemType(YFELD)=2 {                          ; D26 = "Service"
+		if "~2~10~11~15~16~17~" '[ ("~"_$$$INARTUnitofMeasure(YFELD)_"~") set $$$INARTUnitofMeasure(YFELD)=10  ;DFLT. MINUTEN
+	}
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;      * = Service Units above
+	;---------------------------------------
+	;	 1       Each
+	;	 2   *   Hours
+	;	 3       Litre
+	;	 4       Kg
+	;	 5       m
+	;	 6       m²
+	;	 7       *Litre
+	;	 9       Package
+	;	10   *   Minutes
+	;	11   *   Industry-Minutes
+	;	12       m³
+	;	13       Pair
+	;	14       Grams
+	;	15   *   Days
+	;	16   *   Weeks
+	;	17   *   Months
+	;	18       mm
+	;	19       km
+	;	20       mm²
+	;	21       mg
+	;	22       /100
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	;-------------------------------------------------------------------------------
+	; Based on Unit of Measure, reset certain parameters...
+	;	
+	;	D15			$$$INARTLength1()
+	;	D16			$$$INARTWidth()
+	;	D17			$$$INARTHeight()
+	;	D18			$$$INARTSurface()
+	;	D37			$$$INARTMaterial()
+	;	D43			$$$INARTWeight()
+	;	D44			$$$INARTVolume()
+	;	D45			$$$INARTExecutionTime()
+	;-------------------------------------------------------------------------------
+	
+	SET ME = $$$INARTUnitofMeasure(YFELD)   ;MENGENEINHEIT
+	SET $$$INARTOldQuantityUnit(YFELD) = ME  ;GGF NEUE MENGENEINHEIT ZUR PRUEFUNG  ; D40 => D196
+	
+	IF (ME'=2) && (ME'=10) && (ME'=11) SET $$$INARTExecutionTime(YFELD) = 0
+	
+	; derive from BOM?
+	SET $$$INARTExecutionTime(YFELD) = $$^INARTDAUER(YKEY)   ;FIXME : This is over-written in next block
+	SET $$$INARTWeight(YFELD)        = $$^INGEWICHT(YKEY)
+	
+	;*******************************************************************************
+	
+	; ItemType=1 ("Buy" Items) indicates external processing?    ;(AUSSER FREMDLEISTUNGEN)
+	
+	; Hours
+	IF ME=2 {
+		IF $$$INARTItemType(YFELD)'=1 SET $$$INARTItemType(YFELD)=2
+		SET $$$INARTExecutionTime(YFELD) = 3600
+		SET $$$INARTWeight(YFELD)        = ""
+		SET $$$INARTVolume(YFELD)        = ""
+		SET $$$INARTMaterial(YFELD)      = ""
+	}
+	
+	; Minutes                ;MINUTEN
+	IF ME=10 {
+		IF $$$INARTItemType(YFELD)'=1 SET $$$INARTItemType(YFELD)=2
+		SET $$$INARTExecutionTime(YFELD) = 60
+		SET $$$INARTWeight(YFELD)        = ""
+		SET $$$INARTVolume(YFELD)        = ""
+		SET $$$INARTMaterial(YFELD)      = ""
+	}
+	
+	; Industry Minutes       ;INDUSTRIIMINUTEN
+	IF ME=11 {
+		IF $$$INARTItemType(YFELD)'=1 SET $$$INARTItemType(YFELD)=2
+		SET $$$INARTExecutionTime(YFELD) = 60                 ; FIXME: Shouldn't this be 100? <GRF>
+		SET $$$INARTWeight(YFELD)        = ""
+		SET $$$INARTVolume(YFELD)        = ""
+		SET $$$INARTMaterial(YFELD)      = ""
+	}
+	
+	;*******************************************************************************
+	
+	; Kilograms    ;KG NUR WENN KEIN AUTOMATISCHES GEWICHT
+	IF ME=4  SET $$$INARTWeight(YFELD) = 1
+	
+	; Grams        ;G NUR WENN KEIN AUTOMATISCHES GEWICHT
+	IF ME=14 SET $$$INARTWeight(YFELD) = 0.001
+	
+	;*******************************************************************************
+	; No Height - 2D - Calculate Surface Area if no entry
+	; Height    - 3D - Calculate Volume if no entry
+			
+	; millimetres
+	if ME=18 {
+		if $$$INARTLength1(YFELD) && $$$INARTWidth(YFELD) {
+			if '$$$INARTSurface(YFELD) && '$$$INARTHeight(YFELD) {
+				set $$$INARTSurface(YFELD) = $JUSTIFY(($$$INARTLength1(YFELD)/1000)*($$$INARTWidth(YFELD)/1000),0,4)
+			}
+			if '$$$INARTVolume(YFELD) && $$$INARTHeight(YFELD) {
+				SET $$$INARTVolume(YFELD) = $JUSTIFY(($$$INARTLength1(YFELD)/1000)*($$$INARTWidth(YFELD)/1000)*($$$INARTHeight(YFELD)/1000),0,4)
+			}
+		}
+	}
+	
+	; metres, metres², metres³
+	if (ME=5) || (ME=6) || (ME=12) {
+		if $$$INARTLength1(YFELD) && $$$INARTWidth(YFELD) {
+			if '$$$INARTSurface(YFELD) && '$$$INARTHeight(YFELD) {
+				set $$$INARTSurface(YFELD) = $JUSTIFY($$$INARTLength1(YFELD)*$$$INARTWidth(YFELD),0,4)
+			}
+			if '$$$INARTVolume(YFELD) && $$$INARTHeight(YFELD) {
+				SET $$$INARTVolume(YFELD) = $JUSTIFY($$$INARTLength1(YFELD)*$$$INARTWidth(YFELD)*$$$INARTHeight(YFELD),0,4)
+			}
+		}
+	}
+	
+	;*******************************************************************************
+	
+	SET $PIECE(YFELD,Y,47) = $$^INARTKOST(YKEY,1)  ;SELBSTKOSTEN NEU RECHNEN ;total production costs recent have faith in 
+	
+	IF $$$INARTItemType(YFELD)'=2 IF $$$INARTItemType(YFELD)'=3 DO
+	. IF $PIECE(YFELD,Y,140)="" SET $PIECE(YFELD,Y,140) = $PIECE(YFELD,Y,47)  ;DURCHSCHNITTLICHER EK ;Planned Cost 
+	
+	SET $PIECE(YFELD,Y,50) = $$^INDAUERTAGE($PIECE(YFELD,Y,45)) ;DAUER IN TAGEN ;permanence within 
+	
+	
+	;NEU SETZTEN HERSTELLSTUNDENSÄTZTE ;recent 
+	SET $PIECE(YFELD,Y,251) = ""  ;MASCHINEN-STUNDENSATZ
+	SET $PIECE(YFELD,Y,252) = ""  ;BEDIENER-STUNDENSATZ
+	IF $$$INARTItemType(YFELD)=2 DO  ;NUR LEISTUNGEN ;only LEISTUNGEN 
+	. NEW KALK
+	. QUIT:$GET(YKEY)=""
+	. SET KALK = $$^INMASCHKOST(1,YKEY)
+	. SET $PIECE(YFELD,Y,251) = $PIECE(KALK,Y,1)
+	. SET $PIECE(YFELD,Y,252) = $PIECE(KALK,Y,2)
+	
+	IF $PIECE(YFELD,Y,57)'="" DO       ;MASCHINE ;machine 
+	. QUIT:$$$INARTItemType(YFELD)'=2  ;NUR LEISTUNGEN ;only service 
+	. ;FERTIGUNGSPLATZ
+	. QUIT:$PIECE(YFELD,Y,61)'=""      ;SCHON BELEGT ;production site 
+	. IF $PIECE($GET(^INMASCH(0,$PIECE(YFELD,Y,57),1)),Y,9)'="" DO  ;FERTIGUNGSNEST
+	. . SET $PIECE(YFELD,Y,61) = $PIECE($GET(^INMASCH(0,$PIECE(YFELD,Y,57),1)),Y,9)  ;VORGABE   ;default 
+	
+	
+	IF YKALK'="" DO  ;VORGABEN ÜBERTRAGEN ;transport 
+	. IF $PIECE(YKALK,Y,25)=1 DO  ;IMMER NEU BERECHNEN! 1.PREIS ;constantly recent 
+	. . IF $PIECE(YKALK,Y,30)'="" IF $$$INARTItemType(YFELD)'="" QUIT:$FIND($PIECE(YKALK,Y,30),$$$INARTItemType(YFELD))   ;AUSSNAHMEN DER UEBERGABE = NICHT ANZEIGEN ;the Not display 
+	. . IF +$PIECE(YFELD,Y,47)'=0 SET $PIECE(YFELD,Y,88) = ""   ;PREIS LÖSCHEN DANN NEU ;price Delete recent 
+	. . IF $PIECE(YKALK,Y,11)'="" SET $PIECE(YFELD,Y,86) = $PIECE(YKALK,Y,11)  ;AUFSCHL1
+	. . IF $PIECE(YKALK,Y,16)'="" SET $PIECE(YFELD,Y,90) = $PIECE(YKALK,Y,16)  ;PREISKZ1
+	. ;
+	. IF $PIECE(YKALK,Y,26)=1 DO  ;IMMER NEU BERECHNEN! 2.PREIS ;constantly recent 
+	. . IF $PIECE(YKALK,Y,31)'="" IF $$$INARTItemType(YFELD)'="" QUIT:$FIND($PIECE(YKALK,Y,31),$$$INARTItemType(YFELD))   ;AUSSNAHMEN DER UEBERGABE = NICHT ANZEIGEN ;the Not display 
+	. . IF +$PIECE(YFELD,Y,47)'=0 SET $PIECE(YFELD,Y,98)  = ""   ;PREIS LÖSCHEN DANN NEU ;price Delete recent 
+	. . IF $PIECE(YKALK,Y,12)'="" SET $PIECE(YFELD,Y,96)  = $PIECE(YKALK,Y,12)  ;AUFSCHL2
+	. . IF $PIECE(YKALK,Y,17)'="" SET $PIECE(YFELD,Y,100) = $PIECE(YKALK,Y,17)  ;PREISKZ2
+	. ;
+	. IF $PIECE(YKALK,Y,27)=1 DO  ;IMMER NEU BERECHNEN! 3.PREIS ;constantly recent 
+	. . IF $PIECE(YKALK,Y,32)'="" IF $$$INARTItemType(YFELD)'="" QUIT:$FIND($PIECE(YKALK,Y,32),$$$INARTItemType(YFELD))   ;AUSSNAHMEN DER UEBERGABE = NICHT ANZEIGEN ;the Not display 
+	. . IF +$PIECE(YFELD,Y,47)'=0 SET $PIECE(YFELD,Y,108) = ""   ;PREIS LÖSCHEN DANN NEU ;price Delete recent 
+	. . IF $PIECE(YKALK,Y,13)'="" SET $PIECE(YFELD,Y,106) = $PIECE(YKALK,Y,13)  ;AUFSCHL3
+	. . IF $PIECE(YKALK,Y,18)'="" SET $PIECE(YFELD,Y,110) = $PIECE(YKALK,Y,18)  ;PREISKZ3
+	. ;
+	. IF $PIECE(YKALK,Y,28)=1 DO  ;IMMER NEU BERECHNEN! 4.PREIS ;constantly recent 
+	. . IF $PIECE(YKALK,Y,33)'="" IF $$$INARTItemType(YFELD)'="" QUIT:$FIND($PIECE(YKALK,Y,33),$$$INARTItemType(YFELD))   ;AUSSNAHMEN DER UEBERGABE = NICHT ANZEIGEN ;the Not display 
+	. . IF +$PIECE(YFELD,Y,47)'=0 SET $PIECE(YFELD,Y,118) = ""   ;PREIS LÖSCHEN DANN NEU ;price Delete recent 
+	. . IF $PIECE(YKALK,Y,14)'="" SET $PIECE(YFELD,Y,116) = $PIECE(YKALK,Y,14)  ;AUFSCHL4
+	. . IF $PIECE(YKALK,Y,19)'="" SET $PIECE(YFELD,Y,120) = $PIECE(YKALK,Y,19)  ;PREISKZ4
+	
+	IF YKALK'="" DO   ;EINMALIGE VORGABE ;default 
+	. IF $PIECE(YFELD,Y,86)'="" QUIT   ; SCHON EINMAL KAA ÜBERTRAGEN ;yet sometimes transport 
+	. DO
+	. . IF $PIECE(YKALK,Y,30)'="" IF $$$INARTItemType(YFELD)'="" QUIT:$FIND($PIECE(YKALK,Y,30),$$$INARTItemType(YFELD))   ;AUSSNAHMEN DER UEBERGABE = NICHT ANZEIGEN
+	. . IF $PIECE(YFELD,Y,86)="" SET $PIECE(YFELD,Y,86)=$PIECE(YKALK,Y,11)  ;AUFSCHL1
+	. . IF $PIECE(YFELD,Y,90)="" SET $PIECE(YFELD,Y,90)=$PIECE(YKALK,Y,16)  ;PREISKZ1
+	. ;
+	. DO
+	. . IF $PIECE(YKALK,Y,31)'="" IF $$$INARTItemType(YFELD)'="" QUIT:$FIND($PIECE(YKALK,Y,31),$$$INARTItemType(YFELD))   ;AUSSNAHMEN DER UEBERGABE = NICHT ANZEIGEN
+	. . IF $PIECE(YFELD,Y,96)=""  SET $PIECE(YFELD,Y,96) =$PIECE(YKALK,Y,12)  ;AUFSCHL2
+	. . IF $PIECE(YFELD,Y,100)="" SET $PIECE(YFELD,Y,100)=$PIECE(YKALK,Y,17)  ;PREISKZ2
+	. ;
+	. DO
+	. . IF $PIECE(YKALK,Y,32)'="" IF $$$INARTItemType(YFELD)'="" QUIT:$FIND($PIECE(YKALK,Y,32),$$$INARTItemType(YFELD))   ;AUSSNAHMEN DER UEBERGABE = NICHT ANZEIGEN
+	. . IF $PIECE(YFELD,Y,106)="" SET $PIECE(YFELD,Y,106)=$PIECE(YKALK,Y,13)  ;AUFSCHL3
+	. . IF $PIECE(YFELD,Y,110)="" SET $PIECE(YFELD,Y,110)=$PIECE(YKALK,Y,18)  ;PREISKZ3
+	. ;
+	. DO
+	. . IF $PIECE(YKALK,Y,33)'="" IF $$$INARTItemType(YFELD)'="" QUIT:$FIND($PIECE(YKALK,Y,33),$$$INARTItemType(YFELD))   ;AUSSNAHMEN DER UEBERGABE = NICHT ANZEIGEN
+	. . IF $PIECE(YFELD,Y,116)="" SET $PIECE(YFELD,Y,116)=$PIECE(YKALK,Y,14)  ;AUFSCHL4
+	. . IF $PIECE(YFELD,Y,120)="" SET $PIECE(YFELD,Y,120)=$PIECE(YKALK,Y,19)  ;PREISKZ4
+	
+	;PREISE UND AUFSCHLAG ;price and overcharge 
+	FOR YI=88,98,108,118 DO
+	. ;
+	. IF +$PIECE(YFELD,Y,YI-2)=0   IF $PIECE(YFELD,Y,YI-2)'=0    IF $PIECE(YFELD,Y,YI+2)="" SET $PIECE(YFELD,Y,YI)="",$PIECE(YFELD,Y,YI-2)=""  ;EK=VK UND KEIN PREISKENNZEICHEN UND KEINE EK=VK ;TYBD;2,1,2005;And no 
+	. IF (+$PIECE(YFELD,Y,YI-2)=0)||(+$PIECE(YFELD,Y,YI-2)=-100) IF $PIECE(YFELD,Y,YI+2)="" SET $PIECE(YFELD,Y,YI)="",$PIECE(YFELD,Y,YI-2)=""  ;EK=VK UND KEIN PREISKENNZEICHEN UND KEINE EK=VK ;TYBD;2,1,2005;And no 
+	. ;
+	. IF $PIECE(YFELD,Y,YI)="" IF +$PIECE(YFELD,Y,YI-2)=0 IF $PIECE(YFELD,Y,YI+2)="" IF $PIECE($GET(^INVORG(0,0,1)),Y,202)'=1 QUIT   ;TYBD;18,09,03;KEIN AUFSCHLAG UND KEIN VK
+	. IF $PIECE(YFELD,Y,YI)="" IF +$PIECE(YFELD,Y,YI-2)'=0 DO   ;AUFSCHLAG UND KEIN VK ;overcharge And no Sale 
+	. . SET YINHALT=$$^WWWZAHL($PIECE(YFELD,Y,YI-2),0,9)        ;AUFSCHLAG ;overcharge 
+	. . SET YVAR=YKEY
+	. . DO ^INEKVK
+	. . IF %TXT(1)'="" IF $$^WWWTR(1,12,%TXT(1))'="" SET $PIECE(YFELD,Y,YI)=$$^WWWTR(1,12,%TXT(1)) ;VK EINTRAGEN ;Sale 
+	. ;
+	. IF +$PIECE(YFELD,Y,YI)'=0 DO                       ;AUFSCHLAG NACHRECHNEN ;overcharge 
+	. . SET YINHALT=$$^WWWZAHL($PIECE(YFELD,Y,YI),0,2)   ;VK ;Sale 
+	. . SET YVAR=YKEY
+	. . DO ^INVKEK
+	. . IF %TXT(1)'="" IF $$^WWWTR(1,12,%TXT(1))'="" SET $PIECE(YFELD,Y,YI-2)=$$^WWWTR(1,12,%TXT(1))
+	. ;
+	. IF $PIECE(YFELD,Y,YI+2)'="" IF $PIECE($GET(^INVORG(0,0,1)),Y,202)=1 DO   ;EK=VK;TYBD;2,1,2005
+	. . SET YINHALT=$$^WWWZAHL($PIECE(YFELD,Y,YI-2),0,9)                         ;AUFSCHLAG ;overcharge 
+	. . SET YVAR=YKEY
+	. . DO ^INEKVK
+	. . IF %TXT(1)'="" IF $$^WWWTR(1,12,%TXT(1))'="" SET $PIECE(YFELD,Y,YI)=$$^WWWTR(1,12,%TXT(1)) ;VK EINTRAGEN ;Sale 
+	
+	;******************************************************************************* SUPPLIER
+	
+	SET LIEF=$$^INARTLIEF($PIECE(YKEY,",",1))
+	IF LIEF'="" SET $PIECE(YFELD,Y,195)=$PIECE($GET(^INLIEF(0,LIEF,1)),Y,8)  ;LIEFERANTENNAME IN ARTIKELSTAMM ;within 
+	
+	IF LIEF'="" DO  ;NEW INFO TO INART
+	. NEW ARTK1
+	. set ARTK1=$GET(^INARTK(0,YKEY,LIEF,1))
+	. ;
+	.;set $PIECE(YFELD,Y,151) = $$$INARTKProductDescription(ARTK1)                      ; D1   BESTELLBEZEICHNUNG
+	. set $$$INARTProductDescription(YFELD) = $$$INARTKSupplierItemNo(ARTK1)            ; D8   SR12027
+	. set $$$INARTManufacturerDesc(YFELD)   = $$$INARTKManufacturersDescription(ARTK1)  ;HERSTELLERBEZEICHNUNG
+	. set $$$INARTManufacturer(YFELD)       = $$$INARTKManufacturer(ARTK1)              ;HERSTELLER
+	. set $$$INARTSupplierCatalog(YFELD)    = $$$INARTKSupplierCatalog(ARTK1)           ;KATALOG
+	. set $$$INARTSuppliersItemGroup(YFELD) = $$$INARTKSuppliersCatalogGroup(ARTK1)     ;UNTERKATALOG/WARENGRUPPE
+	
+	;*******************************************************************************
+	
+	IF $$$INVORGUseItemSuperIndex($GET(^INVORG(0,0,1)))=$$$YES SET YFELD=$$^INARTINDEX(YFELD)   ;TYBD;21,2,2005;SUPERINDEX MIT TEIL STING SUCHE / PARTSTING SEARCH
+	
+	
+	;*******************************************************************************  Save Record (INART)
+	
+	SET YOK=$$^WWWSPEI(YDATEI,YKEY,YFELD,1)
+	
+	;*******************************************************************************
+	
+	DO   ;KG UND METER IN LIEFERANTENKONDITIONEN PRUEFEN
+	. NEW ART,ART1,YART1,YARTK1,ME,LIEF 
+	. SET YART1 = YFELD                        ; objINART
+	. SET ART   = YKEY 
+	. DO   ;LÖSCHEN DES FAKTORS, WENN GLEICHE EINHEIT
+	. . SET ME=$$$INARTUnitofMeasure(YART1)
+	. . SET LIEF=""
+	. . FOR  SET LIEF=$ORDER(^INARTK(0,ART,LIEF)) QUIT:LIEF=""  DO
+	. . . QUIT:$$$INARTKDeliveryQuantityUnit($get(^INARTK(0,ART,LIEF,1)))'=ME
+	. . . ;
+	. . . SET $$$INARTKConversionFactor(^INARTK(0,ART,LIEF,1))=""
+	. ;
+	. DO  ;KOPIE, WENN KG UND METER
+	. . SET ME=$$$INARTUnitofMeasure(YART1)
+	. . IF (ME'=5) && (ME'=6) && (ME'=12) && (ME'=18) QUIT
+	. . QUIT:+$PIECE(YART1,Y,172)=0                                ; D172	$$$INARTWeightUM()
+	. . SET LIEF=""
+	. . FOR  SET LIEF=$ORDER(^INARTK(0,ART,LIEF)) QUIT:LIEF=""  DO
+	. . . QUIT:$$$INARTKDeliveryQuantityUnit($get(^INARTK(0,ART,LIEF,1)))'=4
+	. . . ;
+	. . . SET YARTK1=$GET(^INARTK(0,ART,LIEF,1))
+	. . . QUIT:+$$$INARTKConversionFactor(YARTK1)'=0
+	. . . SET $$$INARTKConversionFactor(^INARTK(0,ART,LIEF,1))=$PIECE(YART1,Y,172)
+	
+	; Hours, Minutes, Industry Minutes
+	if (ME=2) || (ME=10) || (ME=11) {
+		set $$$INARTSetupCosts(^INART(0,YKEY,1))=$$^INARTRWERT(YKEY)  ; D71   RECHNEN RÜSTKOSTEN FÜR LEISTUNGEN
+	} else {
+		DO ^INARTNEU(YKEY)  ;ARTIKELTEILE NEU BERECHNEN ;recent calculate 
+	}
+	
+	DO ^INKUNDEARTSPERR(,YKEY)  ;SPEICHERN KUNDEN-ARTIKELSPERRE;FIS;15.02.05;27351
+	
+	set strStatus = $$HealthCheck^INARTPACK(YKEY)   ; SR17243 vvv
+	if $$$ISERR(strStatus) {
+		$$$Alert(strStatus)       ; Can't display message AFTER loading form
+		do GoToForm^COMUtilForm("INARTPACK",YKEY)
+	}
+	quit
+	
+	
+KILL ;KILL WENN LÖSCHEN ;when Delete 
+	QUIT:YKEY=""
+	DO ^INARTKILL(YKEY)
+	QUIT
+	
+	
+KILL1 ;KEIN LÖSCHEN MÖGLICH ;no Delete potential 
+	;-------------------------------------------------------------------------------
+	; Check to disable/enable record Delete button.
+	; 
+	; Delete button disabled if Q set to $$$QDontSave,
+	; Delete button allowed if Q set to $$$QSave.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns: 
+	;
+	; History:
+	; 05-Nov-2010	GRF		-: use delete macros rather than save - same values
+	; 20-Jul-2010	PPP/CB	SR17468 : Use alSOH.StockHistory instead of INARTHISTL
+	; 07-Mar-2006	SC		SR14378: Disable delete in item on a Bill of Materials,
+	; 							or has Transaction History.
+	;-------------------------------------------------------------------------------
+	SET Q = $$$QDelete
+	QUIT:$GET(YKEY)=""
+	
+	IF +$TRANSLATE($$^INARTAUF(YKEY),"/")'=0 {
+		SET Q = $$$QDontDelete                       ;MENGE VORHANDEN ;quantity on hand 
+		
+	} elseif +$$^INARTMENGE(YKEY)'=0 {
+		SET Q = $$$QDontDelete                       ;AUFRTÄGE VORHANDEN ;quantity on hand
+		
+	} elseif $DATA(^INARTTs(0,1,$$^WWWUMLAU(YKEY,1))) {
+		SET Q = $$$QDontDelete                       ;If item is on a Bill of Materials. ;SR14378
+	
+	
+	//} elseif $DATA(^INARTHISTL(0,YKEY)) {       ; SR17468
+	} elseif ##class(alSOH.iStockHistory).ItemHasTransactions(YKEY) {
+		SET Q = $$$QDontDelete                       ;If item has transaction history.   ;SR14378
+	}
+	
+	;IF Q=$$$QDontDelete DO ^WWWINFO($$^WWWTEXT(32528),1)   ;NICHT GELÖSCHT, DA AUFTRÄGE
+	quit
+	
+	
+OnAfterPrimaryKey(YKEY="",YFELD="") 
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Feb-2009	GRF		SR16347: Call ItemUnits to improve INART presentation
+	; 27-Jul-2005	shobby	SR12786 Created
+	;-------------------------------------------------------------------------------
+	do BuildCustomsMessage(YKEY,YFELD)
+	do ^INARTINFO
+	do ItemUnits^INARTPACK(YKEY)     ; SR16347
+	quit
+	
+	
+BuildCustomsMessage(YKEY="",YFELD="") 
+	;-------------------------------------------------------------------------------
+	; Determines and displays an appropriate message as to how Customs are applied to this item.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Oct-2006	Steve S	SRBR014280: (Peer review) Added carriage returns
+	; 13-Oct-2006 	HeberB	SRBR014280: Only display message when defined on INVORG
+	; 21-Aug-2006	shobby	SRBR014203: Don't display a message when no record is loaded.
+	; 15-Jul-2005	shobby	SR12786: Created
+	;-------------------------------------------------------------------------------
+	new objINVORG,strForm,strLevel,strMessage
+	
+	set strForm   = YFORM
+	set objINVORG = $get(^INVORG(0,0,1))
+	
+	if $$$NoKey(YKEY) || ($$$INVORGHideCustomsInformation(objINVORG)) {	
+		set strMessage = "&nbsp;"
+	
+	} elseif $$$INARTExemptFromDuty(YFELD) { 	
+		set strMessage = "IN00353"              ; "This item is not subject to Customs."
+	
+	} elseif $$HasCustoms(YKEY,.strLevel) {	   	
+		set strMessage = "IN00354"              ; "This item has Customs rate set up at Supplier or Country level."
+	
+	} else {                     	   			
+		set strMessage = "IN00355"              ; "This item is subject to Customs but has no rates set up."
+	}
+	
+	do DisplayMessage^COMUtils(strForm,YKEY,strMessage,,0,6)
+	quit
+	
+	
+OnAfterDataFields(YKEY="",YFELD="") 
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Oct-2006	JW		SR15104: Add page 3 check, add param to INARTPRICESHOW1
+	; 27-Jul-2005	shobby	SR12786 Created
+	;-------------------------------------------------------------------------------
+	if YSEITE=3 {
+		do Show^INARTPRICESHOW1(YKEY)
+	} elseif YSEITE=6 {
+		do ShowCustoms(YKEY,YFELD)
+	}
+	quit
+	
+	
+ShowCustoms(YKEY="",YFELD="") 
+	;-------------------------------------------------------------------------------
+	; Display a tree of all customs rates for this item.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Jul-2005	shobby	SR12786: Created
+	;-------------------------------------------------------------------------------
+	new fltRate,idCountry,idSupplier,objINARTK,objINLIEF
+	new strDescription,strKey,strKey2,strKey3
+	
+	if '$$$NoKey(YKEY) {
+		do StartTree^COMTree2($get(YPARA))
+		set fltRate        = $$GetRate(YKEY,"INARTCustom",.strKey)
+		set strDescription = YKEY_":"_$$$INARTSearchName(YFELD)
+		do AddNode^COMTree2("",strKey,"",strDescription,"","INARTCustom","","",fltRate,"","")
+		set idSupplier = ""
+		for {
+			set idSupplier = $order(^INARTK(0,YKEY,idSupplier))
+			quit:idSupplier=""
+			
+			set objINLIEF      = $get(^INLIEF(0,idSupplier,1))
+			set objINARTK      = $get(^INARTK(0,YKEY,idSupplier,1))
+			set fltRate        = $$GetRate(YKEY_","_idSupplier,"INARTKCustom",.strKey2)
+			set strDescription = idSupplier_":"_$$$INLIEFShortName(objINLIEF)
+			do AddNode^COMTree2(strKey,strKey2,"",strDescription,"","INARTKCustom","","",fltRate,"","")
+			
+			set idCountry = ""
+			for {
+				set idCountry = $order(^INARTKCountry(0,YKEY,idSupplier,idCountry))
+				quit:idCountry=""
+				
+				set fltRate        = $$GetRate(YKEY_","_idSupplier_","_idCountry,"INARTKCountryCustom",.strKey3)
+				set strDescription = idCountry_":"_$$GetEnumDescription^COMUtils("LAND",idCountry,1)
+				do AddNode^COMTree2(strKey2,strKey3,"",strDescription,"","INARTKCountryCustom","","",fltRate,"","")
+			}
+		}
+		do StopTree^COMTree2(1)
+	}
+	quit
+	
+	
+HasCustoms(YKEY="",pstrLevel="")
+	;-------------------------------------------------------------------------------
+	; Determine if this item has customs at any level.
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Jul-2005	shobby	SR12786?: Created
+	;-------------------------------------------------------------------------------
+	new blnHasCustoms
+	
+	set blnHasCustoms = $$$NO
+	if YKEY'="" {
+		set blnHasCustoms = $$$YES
+		if '$data(^INARTCustom(0,YKEY)) {
+			if '$data(^INARTKCustom(0,YKEY)) {
+				if '$data(^INARTKCountryCustom(0,YKEY)) {
+					set blnHasCustoms = $$$NO
+				}
+			}
+		}
+	}
+	quit blnHasCustoms
+	
+	
+GetRate(YKEY,YDATEI,pidLinkKey) 
+	;-------------------------------------------------------------------------------
+	; Find the rate that applies for this level
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Jul-2005	shobby	SR12786 Created
+	;-------------------------------------------------------------------------------
+	new fltRate,idDate,obj
+	
+	set fltRate = "......."
+	if $get(YKEY)'="" {
+		set pidLinkKey = $$^WWWKEYBUILD(YKEY)
+		set idDate     = ""
+		xecute "set idDate=$order(^"_YDATEI_"("_$$^WWWYM(YDATEI)_","_pidLinkKey_",""""),-1)"
+		if idDate'="" {
+			set obj = ""
+			xecute "set obj=$get(^"_YDATEI_"("_$$^WWWYM(YDATEI)_","_pidLinkKey_",idDate,1))"
+			set fltRate = $$$INARTCustomRate(obj)
+		}
+		set pidLinkKey = $translate(pidLinkKey_","_idDate,"""")
+	}
+	quit fltRate
+	
+	
+OnBeforeSave(pobjItem="")
+	;-------------------------------------------------------------------------------
+	; Routine to execute before saving an item record
+	;
+	; Returns:
+	;
+	; History:
+	; 24-Jun-2005	GRF		Ensure Q is cleanly set
+	; 17-Jun-2005	Steve S	Use Macros
+	; 04-Apr-2005	Steve S	Created SR11996
+	;-------------------------------------------------------------------------------
+	new idForeignAcc,idInlandAcc,strStatus
+	
+	;TODO: Do we need this routine, now that @net manager supports relation validation?
+	
+	set Q = $$$QSave
+	set idInlandAcc  = $$$INARTRevenueAccountInland(pobjItem)
+	set idForeignAcc = $$$INARTRevenueAccountForeign(pobjItem)
+	set strStatus    = $$$OK
+	
+	if (idInlandAcc'="") && '$data(^INFIBSA(0,idInlandAcc,1)) {
+		set strStatus = $$^WWWFELDNAME("INART","D",31)_" '"_idInlandAcc_"' : "_$$^WWWTEXT(86)   ; "Not Available!"
+	}
+	
+	if (strStatus=$$$OK) && (idForeignAcc'="") && ('$data(^INFIBSA(0,idForeignAcc,1))) {
+		set strStatus = $$^WWWFELDNAME("INART","D",32)_" '"_idForeignAcc_"' : "_$$^WWWTEXT(86)
+	}
+	
+	if strStatus'=$$$OK {
+		set Q = $$$QDontSave
+		do ^WWWINFO(strStatus)		
+	}
+
+	if ((+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) 
+		&& '(+$$$WWWClientParamCoreChangesTCI($get(^WWWClientParam(YM,YM,1))))
+		&& '(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))) ){
+		;Rotina VAR para gerar o código do Produto
+		if (strStatus=$$$OK){
+			do GerarChaveINART^VARINART(YKEY, pobjItem)
+		}
+	}
+	quit
+	
+	
+OnBeforeDataAccess(YKEY,YFELD)
+	;-------------------------------------------------------------------------------
+	; Filters what COMView displays for chosing. It is mandatory to test if the calling form
+	; is the intended one.
+	;
+	; Called by : OnBeforeDataAccess Class Hook for INART
+	; Params:
+	;
+	; Returns:
+	; $$$YES - if the item can be displayed for the user
+	; $$$NO  - if the item cannot be displayed (it will be hidden)
+	;
+	; History:
+	; 19-Nov-2009	shobby	SR17034: Call to OnBeforeDataAccess
+	; 21-Jan-2008	GRF		SRBR014847: variable prefix; doco
+	; 15-Jan-2008	LUIS	SRBR014847: Created
+	;-------------------------------------------------------------------------------
+	new idItem,objStocktake,strItemGroups,strStatus
+	
+	;It defaults to show everything in order to keep other things from breaking
+	set strStatus = $$$YES
+	
+	;Choose which check to run based on the calling form
+	if ($get(YFORM)="INWEINVELINE") {
+		if $data(^CacheTempStocktakePara(YUSER,"idStocktake")) {
+			
+			;The idStocktake was stored at OnAfterPrimaryKey^INWEINVEHeader
+			set objStocktake = $$GetStocktake^INStocktaking($get(^CacheTempStocktakePara(YUSER,"idStocktake")))
+			
+			set strItemGroups = $$$INWEINVPItemGroup(objStocktake)
+			set idItem = YKEY
+			
+			;If the item is not on the allowed lists, don't allow it be shown
+			if '$$ItemGroupCheckById^INStocktaking(idItem,strItemGroups) {
+				set strStatus = $$$NO
+			}
+		}
+	
+	} elseif (YFORM'="") {
+		if ((+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1))) &&
+													  ((YFORM = "INReqLine") ||
+													 (YFORM = "INReqKitLine")||
+													 (YFORM = "INTFRLine")))) { 
+			quit strStatus
+		}
+		else {
+			if $data(^rOBJ(YFORM_"OBDA")) xecute "set strStatus=$$OnBeforeDataAccess^"_YFORM_"OBDA(YKEY,YFELD)"		;SR17034
+		}
+	}
+	quit strStatus
+	
+	
+OnBeforeSQL(&YSQL)
+	;-------------------------------------------------------------------------------
+	; The OnBeforeSQL code will behave differently according to what the calling form is.
+	; This routine redirects to a procedure based on the form name.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Nov-2009	shobby	SR17034: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	if $data(^rOBJ(YFORM_"OBSQL")) xecute "set strStatus=$$OnBeforeSQL^"_YFORM_"OBSQL(.YSQL)"		;SR17034
+	
+	quit strStatus
+	
+	
+GetPAB(pidItem,pidLocation,ptmsUntil)
+	;-------------------------------------------------------------------------------
+	; Returns the Projected Available Balance at the $horolog format
+	; date passed in via ptmsUntil
+	; 
+	; Called by:
+	; 	Form INART (Customised) F294 - 'Execute Before Data Field'
+	; 	
+	; Inputs:
+	;	pidItem			Item No
+	;	pidLocation		Site Location
+	;	ptmsUntil		Date,Time
+	;						If omitted - use now to get PAB
+	;						If null    - return current qty on hand
+	;						If past    - use now to get PAB
+	;						If future  - find PAB at specified time
+	;
+	; Returns:
+	;	The Projected Available Balance (unformatted)
+	;
+	; History:
+	; 03-May-2007	GRF		SRBR014346: Direct call to INDRPRUNSort rather than
+	; 							through INDRPRUN; older dates become now
+	; 30-Mar-2007	RPW		SRBR014346: Created
+	;-------------------------------------------------------------------------------
+	new dteDate,fltPAB,objWWWSOR,strID,strQuery,strType,tmeTime,tmeUntil,tmsNow
+	
+	set tmsNow    = $horolog
+	set ptmsUntil = $get(ptmsUntil,tmsNow)
+	if (ptmsUntil'="") && (ptmsUntil<tmsNow) {
+		set ptmsUntil = tmsNow
+	}
+	set tmeUntil  = +$piece(ptmsUntil,",",2)
+	
+	if '$data(^INART(0,pidItem,1)) || '$data(^WWW0121(0,0,pidLocation,1)) {
+		ztrap "PAB1" // Crash here if the item is not a real item or the location is not a real location
+	}
+	
+	set fltPAB = $$^INARTMENGE(pidItem,,pidLocation,,2)
+	
+	kill ^WWWSOR(YUSER,"0")
+	kill ^WWWSOR(YUSER,"RMA")
+	if pidItem'="" {
+		do Sort^INDRPRUNSort(pidItem,pidLocation)
+	}
+	
+	set strQuery="^WWWSOR("_YUSER_",0)"
+	set %3 = $qlength(strQuery)
+	set %4 = $name(@strQuery,%3)
+	for {
+		set strQuery = $query(@strQuery)
+		quit:((strQuery="") || ($name(@strQuery,%3)'=%4))
+
+		set dteDate = $qsubscript(strQuery,3)
+		quit:(dteDate>ptmsUntil)||(dteDate="")
+		
+		set tmeTime = $qsubscript(strQuery,4)
+		continue:tmeTime=""
+		quit:((dteDate=+ptmsUntil) && (tmeTime>tmeUntil))
+		
+		set strID = $qsubscript(strQuery,5)
+		continue:(strID="")
+		
+		set strType   = $piece(strID,"#",2)
+		set objWWWSOR = $get(^WWWSOR(YUSER,"0",dteDate,tmeTime,strID))
+		
+		if strType=$$$SUPPLY {
+			set fltPAB = fltPAB+$piece(objWWWSOR,Y,5)
+			
+		} elseif strType=$$$DEMAND {
+			set fltPAB = fltPAB-$piece(objWWWSOR,Y,5)
+			
+		} else {
+			ztrap "PAB2" // Crash if we get here, there is another type.
+		}
+	}
+	
+	kill ^WWWSOR(YUSER,"0")
+	kill ^WWWSOR(YUSER,"RMA")
+	quit fltPAB
+	
+	
+ValidItem(pidItem)
+	;-------------------------------------------------------------------------------
+	; Common tag for repeated test
+	; 
+	; Returns $$$OK if pidItem contains an item ID that exists in Item Master
+	; 
+	; History :
+	; 30-Sep-2008	GRF		SR15810: Remove unnecessary duplicated test; doco
+	; 29-Aug-2008	shobby	SRBR014971: Updated from the SES version. 
+	; 21-Dec-2007	PhilJ	Created
+	;-------------------------------------------------------------------------------
+	new strStatus 
+	
+	set strStatus = $$$OK
+	
+	if ($get(pidItem)="") || '$data(^INART(0,pidItem,1)) {
+		set strStatus = $$$MakeStatus("STK0002",pidItem)
+	} ; "Item Number ´%1´ does not exist."
+	quit strStatus
+	
+	
+GetItem(pidItem) 
+	;-------------------------------------------------------------------------------
+	; Get an Item otherwise a blank string
+	; 	
+	; Inputs:
+	;	pidItem			Item No
+	;
+	; Returns:
+	;	an item object
+	;
+	; History:
+	; 11-Jan-2008	PJones	Created (currently used in INStocktaking)
+	;-------------------------------------------------------------------------------
+ 	quit $get(^INART(0,pidItem,1))
+	
+	
+IsAsset(pobjItem) 
+	;-------------------------------------------------------------------------------
+	; Is an item an asset?
+	; History:
+	; 30-Sep-2008	GRF		SR15810: Correct variable name
+	; 24-Feb-2008	PJones
+	;-------------------------------------------------------------------------------
+	new blnResult
+	
+	set blnResult = $$$YES
+	if '$$$INARTItemWithoutInventoryMaint(pobjItem) set blnResult = $$$NO
+	quit blnResult
+	
+	
+IsAssetItemId(pidItem) 
+	;-------------------------------------------------------------------------------
+	; Is an item an asset? Query by pidItem
+	; History:
+	; 24-Feb-2008	PJones
+	;-------------------------------------------------------------------------------
+	new obj
+	
+	set obj = $$GetItem(pidItem)
+	quit $$IsAsset(obj) 	
+	
+	
+GetGroup(pidItem)
+	;-------------------------------------------------------------------------------
+	; get the group number
+	; History:
+	; 03-Oct-2008	GRF		SR15810: Get default if group is blank
+	; 22-Feb-2008	PJones
+	;-------------------------------------------------------------------------------
+	new idGroup,objItem
+	
+	set objItem = $get(^INART(0,pidItem,1))
+	set idGroup = $$$INARTItemGroup(objItem)
+	set:idGroup="" idGroup = $$$INVORGDefaultItemGroup($get(^INVORG(0,0,1)))
+	quit idGroup
+	
+	
+GetUnitOfMeasure(pidItem)
+	quit $$$INARTUnitofMeasure($$GetItem(pidItem))
+	
+	
+SQLGetDescUnitOfMeasure(pidItem)
+	do ^WWWVAR
+	if ($get(pidItem) '= "") {
+		quit $$$WWW101Text($$Get^WWW101("EINHEIT","PT",$$GetUnitOfMeasure(pidItem)))   ; FIXME : "PT"???
+	}
+	quit ""
+	
+	
+	;SR18093 IsInUse(pidItem)
+	;SR18093 ;-------------------------------------------------------------------------------
+	;SR18093 ; Returns a boolean indicating whether or not this item is currently in use
+	;SR18093 ; within the syste]]><![CDATA[m
+	;SR18093 ; 	
+	;SR18093 ; Inputs:
+	;SR18093 ;	pidItem			Item No
+	;SR18093 ;	
+	;SR18093 ; History
+	;SR18093 ; 18-Apr-2008	HQN		SR15675: Created
+	;SR18093 ;-------------------------------------------------------------------------------
+	;SR18093 new blnIsInUse,objResultSet
+	
+	;SR18093 set blnIsInUse = $$$NO
+	
+	;SR18093 set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dStockBalance:GetViaItem")
+	;SR18093 if objResultSet.Execute(pidItem) {
+	;SR18093 	if objResultSet.Next() {
+	;SR18093 		set blnIsInUse = $$$YES
+	;SR18093 	}
+	;SR18093 }
+	;SR18093 quit blnIsInUse
+
+
+IsInUse(pidItem)
+	;-------------------------------------------------------------------------------
+	; Returns a boolean indicating whether or not this item is currently in use
+	; within the system
+	;  
+	; Inputs:
+	; pidItem   Item No
+	; 
+	; History
+	; 26-Fev-2012 RGB  SR18093: Correction, routine is not checking for stock quantity
+	; 18-Apr-2008 HQN  SR15675: Created
+	;-------------------------------------------------------------------------------
+	new blnIsInUse,objResultSet,mySQL
+
+	set blnIsInUse = $$$NO
+	if pidItem="" quit blnIsInUse
+
+	set objResultSet = ##class(%ResultSet).%New()  ;Create Result Set Object
+
+	set mySQL = "SELECT %ID FROM alSOH.dStockBalance "_
+	  "WHERE Item = '"_pidItem_"' "_
+	  "AND QtyOnHand>0 "
+
+	do objResultSet.Prepare(mySQL)  ;Prepare Query
+	do objResultSet.Execute()  ;Execute Query
+	if objResultSet.Next() {
+		set blnIsInUse = $$$YES
+	}
+
+	do objResultSet.Close() 
+
+	quit blnIsInUse
+	
+
+OnAfterSaveHook(pidItem,pobjItem)
+	;-------------------------------------------------------------------------------
+	; If INART record is changed *assume* Policy has been altered - simply means
+	; ^CacheTempPolicy entry will be recreated when next used.
+	; 
+    ; See also : CheckPolicy^INRECPDA2
+	; 
+	; History:
+	; 11-Jan-2010	GRF		SR17104: Created
+	;-------------------------------------------------------------------------------
+	lock +^CacheTempPolicy(YUCI,pidItem):2
+	kill ^CacheTempPolicy(YUCI,pidItem)
+	lock -^CacheTempPolicy(YUCI,pidItem)
+	quit $$$YES
+	
+	
+OnBeforeSaveHook(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Ensures there is a valid entry for the UnitOfMeasure entry within INARTPACK
+	; Updates corresponding record for Base/Inventory INARTPACK
+	; 
+	; History:
+	; 15-Feb-2010	shobby	SRAdhoc: Check that loop contains a value.
+	; 13-Jan-2010	shobby	SR17119: Restructured updates to INARTPACK to take into
+	; 							account that base unit and Inventory Unit are no
+	; 							longer stored.
+	; 06-Jan-2010	shobby	SR17097: Renamed from OnAfterSaveHook
+	; 13-Feb-2009	GRF		SR16347: Language Text
+	; 12-Feb-2009	HQN		SR16347: Created
+	;-------------------------------------------------------------------------------
+	new loop,objINARTPACK,strStatus
+	
+	; Base UoM can only be selected from existing INARTPACK records (initially
+	; automatically matched to Inventory UoM)
+	; If Inventory UoM is changed to something not in INARTPACK, a new
+	; INARTPACK record is created with the unit = 1 of itself.
+	; This will then need to be correctly expressed in terms of the Base UoM
+	
+	set strStatus = $$$OK
+	for loop = $$$INARTBaseUnit(pYFELD),$$$INARTUnitofMeasure(pYFELD) {
+		quit:$$$ISERR(strStatus)
+		
+		if loop'="" {
+			if '$data(^INARTPACK(0,pYKEY,loop)) {
+				quit:$$$ISERR(strStatus)
+		
+				set objINARTPACK = ""
+				set $$$INARTPACKQuantity(objINARTPACK) = 1
+				set $$$INARTPACKUnit(objINARTPACK)     = loop
+				set strStatus = $$$Save("INARTPACK",pYKEY_$$$COMMA_loop,objINARTPACK,$$$YES)
+			}
+		}
+	}
+	quit strStatus
+
+
+GetPackUOM(pidItem="")
+	;-------------------------------------------------------------------------------
+	; Get the Pack UOM for this item.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Aug-2009	PPP		SR16842: If no Pack Unit defined, Inv Unit is PackUnit
+	; 25-Aug-2009	shobby	SR16511: Created
+	;-------------------------------------------------------------------------------
+	new idUOM,objItem
+	
+	set idUOM = ""
+	if '$$$NoKey(pidItem) {
+		set idUOM = $order(^INARTPACKs(0,6,1,pidItem,""))
+		if idUOM="" {
+			set objItem = $get(^INART(0,pidItem,1))
+			set idUOM   = $$$INARTUnitofMeasure(objItem)
+		}
+	}
+	quit idUOM
+
+MultidoseInjectable(pidItem="")
+	;-------------------------------------------------------------------------------
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Dec-2012	shobby	HEVA-700: Created
+	;-------------------------------------------------------------------------------
+	new blnResult
+	
+	set blnResult=$$$NO
+	if '$$$NoKey(pidItem) {
+		set blnResult=$$$INARTMultidoseInjectable($get(^INART(0,pidItem,1)))
+	}
+	quit +blnResult
+]]></Routine>
+</Export>

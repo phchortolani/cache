@@ -1,0 +1,330 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="MEDDispenseLineTable" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+MEDDispenseLineTable
+	
+#include COMSYS
+#include COMConst
+#include INConst
+#include COMGridEdit31
+#include MEDConst
+	
+#define MEDDisLineDynTable1	1	
+#define MEDDisLineDynTable2	2	
+	
+ShowIssues(pidEvent,pidParameters)
+	;-------------------------------------------------------------------------------
+	; Called By :
+	;		
+	; Inputs : pidEvent
+	;          pidParameters - $c(31) delimited string [idForm*idGrid*idKey*intRow]
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Nov-2012	SCR		SR18204: Make header conditional & Show Suspened lines
+	; 08-Nov-2012	SCR		SR18193: Corrected Heading
+	; 07-Nov-2012	SCR		SR18177: Added 'Created On'
+	; 24-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------
+	new idGrid
+	new lstHeaders
+	new lstColTypes
+	new idKey
+	new idDispense
+	new idKeyLine
+	new objDispense
+	new objLine
+	new strFunction
+	new idItem,idxItem
+	new strItem
+	new idPrescription
+	 
+	set idGrid  =  $$$DYNTABLEGridLineFocusGrid(pidParameters)
+
+	set lstHeaders  = "" 
+	set lstColTypes = ""
+	
+	kill ^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable1)
+	
+	set idKey        	= $$ReferenceKey^COMGridEdit31Interface(idGrid,$$$DYNTABLEGridLineFocusRow(pidParameters))
+	set idDispense 		= $$$KEY1(idKey)
+	set idKeyLine     	= $$$KEY2(idKey)
+
+	;if '$$Editable^MEDDispense(idDispense) quit                     ; *** EARLY EXIT ***
+	
+	set objDispense 	= $$$GRIDYFELDContainer
+	set idPrescription	= $$$MEDDispensePrescription(objDispense)
+	set objLine        	= $$$GRIDGetYFELD(idKeyLine)
+	set idItem   		= $$$MEDDispenseLineItemName(objLine)
+	
+	do ShowSuspends(idDispense,idKeyLine,objLine,pidEvent,pidParameters) ;SR18204
+	
+	set strFunction = "FillLine"
+	
+	set lstHeaders  = $listbuild($$^WWWFELDNAME("MEDDispenseLine","P",1),
+								 $$^WWWFELDNAME("MEDDispenseLine","D",$$$FldMEDDispenseLineRoute),
+								 $$^WWWFELDNAME("MEDDispenseLine","D",$$$FldMEDDispenseLineIssueQuantity),
+								 $$^WWWFELDNAME("MEDDispenseLine","D",$$$FldMEDDispenseLineIssueUOM),
+								 $$^WWWFELDNAME("MEDDispenseLine","D",$$$FldMEDDispenseLineValidatedBy),
+								 $$^WWWFELDNAME("MEDDispenseLine","D",$$$FldMEDDispenseLineValidatedOn),
+								 $$^WWWFELDNAME("MEDDispense","D",$$$FldMEDDispenseDateProcessed)
+								 )
+	
+	set lstColTypes = $listbuild($listbuild("left","display"),
+								 $listbuild("left","display"),
+								 $listbuild("right","display"),
+								 $listbuild("left","display"),
+								 $listbuild("left","display"),
+								 $listbuild("left","display"),
+								 $listbuild("left","display")
+								 )
+	//Get the data
+	do GetIssuesForItem(idItem,idDispense,idPrescription)
+	set strItem = "("_idItem_") "_$$^INARTNAME(idItem)
+	;---------------------------------------
+	; The last parameter (after pidEvent) needs to be set for the RowClick event, will be used by RowClick^WWW120DynTable
+	; 	e.g. "WarehouseLine^INReqTable"
+	; 	will be called with the following parameters
+	; 	1. Row ID
+	; 	2. Each entry in ^CacheTempDynamicTable(...,data) separated by "~" will be a new parameter
+	; 			in this routines case : do WarehouseLine^INReqTable(pidRow,idLocn) will be executed on Row click
+	;---------------------------------------
+	
+	//Item %1 in other Dispenses for Prescription %2
+	if $data(^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable1)) { ; SR18204
+		do DrawTable^WWW120DynTable(lstHeaders,$$$MEDDisLineDynTable1,lstColTypes,pidParameters,strFunction,pidEvent,"",($listbuild("MED00414",strItem,idPrescription))) ;SR18204
+		;do DrawTable^WWW120DynTable(lstHeaders,$$$MEDDisLineDynTable1,lstColTypes,pidParameters,strFunction,pidEvent,"",$$$Text($listbuild("MED00414",strItem,idPrescription)))
+	}
+	kill ^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable1)
+
+	quit
+	
+
+GetIssuesForItem(pidItem,pidDispense,pidPrescription)
+	;-------------------------------------------------------------------------------
+	; Get the details of a Previous Issues of MEDDispenseLine Item
+	; 
+	; Params:	pidDispense			- Current Dispense
+	;			pidPrescription		- Prescription
+	;
+	; Returns:	strStatus
+	;
+	; History :
+	; 06-Dec-2012	SCR		HEVA-693: Use Pick Qty and UOM
+	; 20-Nov-2012	SCR		SR18204: Index bug
+	; 07-Nov-2012	SCR		SR18177: Added 'Created On'
+	; 24-May-2012	PPP		SR18002: Created
+	;-------------------------------------------------------------------------------	
+	new objDisp,idDispense,idxPres,blnRejected,idxDispense,idxItem,idLine,objLine
+	new strUser,idDynLine,dteProcessed,strRoute,idUOM,fltTotPicked,objPick
+	new dtValidated
+	 
+	set idDispense=""
+	set idxPres = $$$Index(pidPrescription)
+	set idxItem = $$$Index(pidItem)
+	set blnRejected = $$$NO
+	
+	//^MEDDispenseLines(0,1,40002,"PP0000004",1)=""
+	
+	set idDispense=""
+	for {
+		quit:blnRejected
+		set idDispense = $order(^MEDDispenses(0,1,idxPres,idDispense))
+
+		quit:idDispense=""
+		
+		//write !,idDispense," "
+		
+		continue:idDispense=pidDispense		//Current one
+		set idxDispense = $$$Index(idDispense)
+		
+		set dteProcessed = $$$MEDDispenseDateProcessed($get(^MEDDispense(0,idDispense,1)))
+		if dteProcessed'="" {
+			set dteProcessed = $$^WWWDATE(dteProcessed)
+		}
+		
+		set idLine = ""
+		for {
+			quit:blnRejected
+			set idLine = $order(^MEDDispenseLines(0,1,idxItem,idDispense,idLine)) ; SR18204
+			;set idLine = $order(^MEDDispenseLines(0,1,idxItem,idxDispense,idLine))
+			quit:idLine=""
+		
+			set objLine = $get(^MEDDispenseLine(0,idDispense,idLine,1))
+			if $$$MEDDispenseLineValidatedStatus(objLine)="accept.gif" {
+			//set ^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable1,$increment(idLine),"data") = idLocn_Y_fltATP
+			
+			set strUser = $$$MEDDispenseLineValidatedBy(objLine)
+			if $get(strUser)'="" {
+				set strUser = $$$WWW013Name($get(^WWW013(0,strUser,1)))
+			}
+			; SR18177 vvvv
+			set dtValidated = $$$MEDDispenseLineValidatedOn(objLine)
+			if dtValidated'="" {
+				set dtValidated = $$^WWWTR(0,14,dtValidated)
+			}
+			; SR18177 ^^^^
+			set strRoute = $$$MEDDispenseLineRoute(objLine)
+			if $get(strRoute)'="" {
+				set strRoute = $$GetParamDesc^INPARA("MEDROUTEADMIN",strRoute)
+			}
+
+			set idUOM = $$$MEDDispenseLineIssueUOM(objLine) ; SR18218
+			;set objPick = $get(^MEDDispensePickLine(0,idDispense,idLine,1))
+			;set idUOM = $$$MEDDispensePickLineIssueUOM(objPick)
+			if $get(idUOM)'="" {
+				set idUOM = $$$AppEnum("EINHEIT",idUOM)
+			}
+			
+			set fltTotPicked = $$GetTotalIssued^MEDDispenseProcess(idDispense,idLine,$$$YES)
+
+			//set ^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable1,$increment(idDynLine),"data") = idDispense
+			set idDynLine = $increment(idDynLine)
+			set ^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable1,idDynLine) = 
+																idDispense_"/"_idLine_Y_
+															  	strRoute_Y_
+															  	fltTotPicked_Y_
+															  	idUOM_Y_
+															  	strUser_Y_
+															  	dtValidated_Y_
+															  	dteProcessed
+
+			}
+		
+		}
+		
+	
+	} 
+
+	quit 
+	
+ShowSuspends(pidDispense,pidKeyLine,pobjDispLine,pidEvent,pidParameters)
+	;-------------------------------------------------------------------------------
+	; Show suppended drugs
+	;		
+	; Inputs idDispense,idKeyLine,objDispense,pidParameters
+	;
+	; Params:
+	;
+	; Returns:
+	; 
+	; History:
+	; 20-Nov-2012	SCR		SR18204: Created
+	;-------------------------------------------------------------------------------
+	new lstHeaders,lstColTypes,idItem ,strFunction,strItem,lstLines,intCount,intDisp,idDisp,objDisp,idRx,idLine
+	new objLine,strRoute,idUOM,fltTotPicked,strRemark,idDynLine,idRxLine,objRxLine,objRx
+
+	set lstHeaders  = "" 
+	set lstColTypes = ""
+	
+	
+	kill ^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable2)
+	
+	
+	set idItem   		= $$$MEDDispenseLineItemName(pobjDispLine)
+	
+	set strFunction = "FillLine" 
+	
+	set lstHeaders  = $listbuild($$^WWWFELDNAME("MEDDispenseLine","P",1),
+								 $$^WWWFELDNAME("MEDDispenseLine","D",$$$FldMEDDispenseLineRoute),
+								 $$^WWWFELDNAME("MEDDispenseLine","D",$$$FldMEDDispenseLineIssueQuantity),
+								 $$^WWWFELDNAME("MEDDispenseLine","D",$$$FldMEDDispenseLineIssueUOM),
+								 $$^WWWFELDNAME("MEDPrescriptionLine","D",$$$FldMEDPrescriptionLineRemarks),
+								 )
+	
+	set lstColTypes = $listbuild($listbuild("left","display"),
+								 $listbuild("left","display"),
+								 $listbuild("right","display"),
+								 $listbuild("left","display"),
+								 $listbuild("left","display"),
+								 )
+	//Get the data
+	set lstLines 	= $$GetLastDispWithSuspPresToday^MEDDispenseLine(pidDispense_","_pidKeyLine,pobjDispLine)
+	set intCount 	= $length(lstLines,";")
+	set idDynLine	= 0
+	
+	
+	for intDisp=1:1:intCount {
+		set idDisp	= $piece(lstLines,";",intDisp)
+		if idDisp'="" {
+			set objDisp	= $get(^MEDDispense(YM,idDisp,1))
+			set idRx	= $$$MEDDispensePrescription(objDisp)
+			continue:idRx=""
+			set objRx	= $get(^MEDPrescription(YM,idRx,1))
+			set idLine	= ""
+			for {
+				set idLine	= $order(^MEDDispenseLine(YM,idDisp,idLine))
+				quit:idLine=""
+				set objLine	= $get(^MEDDispenseLine(YM,idDisp,idLine,1))
+				continue:$$$MEDDispenseLineItemName(objLine)'=idItem
+				set idRxLine=idLine\1
+				set objRxLine = $get(^MEDPrescriptionLine(YM,idRx,idRxLine,1))
+					if $$$MEDPrescriptionLineStatus(objRxLine)=6 {
+					set strRoute = $$$MEDDispenseLineRoute(objLine)
+					if $get(strRoute)'="" {
+						set strRoute = $$GetParamDesc^INPARA("MEDROUTEADMIN",strRoute)
+					}
+
+					set idUOM =  $$$MEDDispenseLineIssueUOM(objLine)
+					if $get(idUOM)'="" {
+						set idUOM = $$$AppEnum("EINHEIT",idUOM)
+					}
+					
+					set fltTotPicked = $$GetTotalIssued^MEDDispenseProcess(idDisp,idLine)
+
+					set strRemark = $$$MEDPrescriptionLineRemarks(objRxLine) 
+					set:strRemark="" strRemark = $$$MEDPrescriptionNotes(objRx) 
+
+					set idDynLine = $increment(idDynLine)
+					set ^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable2,idDynLine) = 
+																		idDisp_"/"_idLine_Y_
+																	  	strRoute_Y_
+																	  	fltTotPicked_Y_
+																	  	idUOM_Y_
+																	  	strRemark
+					set ^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable2,idDynLine,"data") = idDisp
+				}
+				
+			}
+		}
+	}
+	
+	set strItem = "("_idItem_") "_$$^INARTNAME(idItem)
+	;---------------------------------------
+	; The last parameter (after pidEvent) needs to be set for the RowClick event, will be used by RowClick^WWW120DynTable
+	; 	e.g. "WarehouseLine^INReqTable"
+	; 	will be called with the following parameters
+	; 	1. Row ID
+	; 	2. Each entry in ^CacheTempDynamicTable(...,data) separated by "~" will be a new parameter
+	; 			in this routines case : do WarehouseLine^INReqTable(pidRow,idLocn) will be executed on Row click
+	;---------------------------------------
+	; $listbuild("MED01401",)  ;Suspended Dispenses for Item %
+	if $data(^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable2)) { ; SR18204
+		do DrawTable^WWW120DynTable(lstHeaders,$$$MEDDisLineDynTable2,lstColTypes,pidParameters,strFunction,pidEvent,"LoadDispense^MEDDispenseLineTable",($listbuild("MED01401",strItem)))
+	}
+	;kill ^CacheTempDynamicTable(YUCI,YUSER,$$$MEDDisLineDynTable2)
+
+	quit
+	
+LoadDispense(pidRow,pidKey)
+	;-------------------------------------------------------------------------------
+	; Load Dispense in a new window
+	;		
+	; Inputs Row, Key
+	;
+	; Params:
+	;
+	; Returns:
+	; 
+	; History:
+	; 21-Nov-2012	SCR		SR18204: Created
+	;-------------------------------------------------------------------------------
+	if pidKey'="" {
+		do GoToForm^COMUtilForm("MEDDispense",pidKey,,,$$$YES)
+	}
+	quit
+]]></Routine>
+</Export>

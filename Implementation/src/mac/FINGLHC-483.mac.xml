@@ -1,0 +1,399 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLHC" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLHC  ; GL Health Check
+	
+#include FINHC
+	
+#define Check "^CacheTemp(YUSER,""FINGLHC"")"
+	
+TransactionToTop(Start="",End="",Location="",Level="",Result)
+	;-------------------------------------------------------------------------------
+	; Check that all Transaction Accounts rollup to the Top Account
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Mar-2004	SCR		Return Status 2 if Ok
+	; 05-Mar-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+	new Acc,Depth,Rec,Amt,Hash,LastAcc,Status,AccOk,HashValue,ErrorCount
+	
+	set Status=$$$OK
+	set ErrorCount=0
+	kill Result  				; Clear Result
+	set Depth=$length(Level) 	; Set the detail depth
+	set Acc=Level				; Set the Acc to Start at the Level ( Optimisation )
+	if (Acc'="") && ($data(^FINGLAccount(YM,Acc))) {	; If the Start Account exsits, go back one
+		set Acc=$order(^FINGLAccount(YM,Acc),-1) 	
+	}
+	for {											; Start of the Loop
+		set Acc=$order(^FINGLAccount(YM,Acc))
+		quit:Acc=""
+		
+		if $extract(Acc,1,Depth)'=Level {  			; If the Account is outside the Level
+			if (+Level'=Level) || (+Acc'=Acc) { 	; If it is a String Quit
+				quit
+				
+			} else { 			; Do number checking
+				set LastAcc=Acc
+				; Pad out the Number with zeros
+				; Example if the Level is 13 Check 130, 1300, 13000 etc.
+				set Acc=Level_$translate($justify("",$Length(Acc)-Depth)," ","0")
+				if LastAcc>Acc set Acc=Acc_"0" ; If the Account is Greater than the Level add an zero.
+				; If the Account exsits, go back one
+				if (Acc'="") && ($data(^FINGLAccount(YM,Acc))) set Acc=$order(^FINGLAccount(YM,Acc),-1)
+			}  
+		} else {				; Record the Info
+			set AccOk=$$AccountParent(Acc)
+			set Result("Total")=$$$FCAdd($get(Result("Total")),AccOk)
+			if AccOk'=$$$OK {
+				set Status = $$$NO  				; Stand Alone Error
+				set ErrorCount=ErrorCount+1
+				if ErrorCount<20 {
+					set Hash=Acc
+					if Hash="" set Hash="?"
+					set HashValue=$zcrc(Acc_"="_AccOk,7)
+					set Result("Hash",Hash)=$zcrc($get(Result("Hash",Hash))_HashValue,7)
+				}
+				set Result("Hash","ErrorCount")=ErrorCount
+			}
+		}
+	}
+	if Status=$$$OK {
+		set Status=2  ; Because this is a Standalone Check return 2 if Ok
+	}
+	quit Status
+
+
+AccountParent(Acc="") 
+    ;-------------------------------------------------------------------------------
+    ; Check Accounts Parents
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 03-Jun-2005	shobby	SR10782: Don't test statistical accounts.
+    ; 05-Mar-2004	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new blnDone,blnOk,Depth,Rec,Parent,ParentRec
+	
+	set blnOk   = $$$NO
+	set blnDone = $$$NO
+	
+	for Depth=1:1:50 {
+		quit:blnDone
+		
+		if Acc="" set Acc=" "
+		set Rec=$get(^FINGLAccount(YM,Acc,1))
+		if $$$FINGLAccountAccountType(Rec)=$$$EnumFINGLACCOUNTTYPEStatistical {
+			set blnDone = $$$YES
+			set blnOk   = $$$YES
+		}
+		if 'blnDone && ($$$FINGLAccountAccountType(Rec)=$$$EnumFINGLACCOUNTTYPETopAccount) {
+			set blnDone = $$$YES
+			set blnOk   = $$$YES  ; Made it to the Top Account
+		}
+		set Parent=$$$FINGLAccountParent(Rec)
+		if 'blnDone {
+			if Parent="" {
+				set blnDone = $$$YES ; No Parent Error
+			}
+		}
+		if 'blnDone {
+			set ParentRec=$get(^FINGLAccount(YM,Parent,1))
+			if $$$FINGLAccountAccountUsage(ParentRec)=$$$EnumFINGLACCOUNTUSAGETransaction {
+				set blnDone = $$$YES ; parent account can not be a transaction account
+			}
+		}
+		set Acc = Parent ; Check the next account in the tree
+	}
+	
+	quit blnOk
+	
+	
+TopAccount(Start="",End="",Location="",Level="",Result)
+	;-------------------------------------------------------------------------------
+	; Check For
+	; 1 There is 1 Top Account
+	; 2 There Balance is zero
+	; 3 All Periods Amount are zero
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Apr-2005	RPW		SR12159: Make sure that FINGLTranType is no longer shared.
+	; 25-Jun-2004	shobby	Code Check
+	; 09-Mar-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+	new Status,ErrorCount,ParentCount,Acc,Rec,Bal
+	new Period,Type,TypeRec,PeriodAmount
+	
+	set Status      = $$$OK
+	set ErrorCount  = 0
+	set ParentCount = 0
+	set Acc         = ""
+	kill Result  				; Clear Result
+
+	for {
+		set Acc=$order(^FINGLAccount(YM,Acc))
+		quit:Acc=""
+		
+		set Rec=$get(^FINGLAccount(YM,Acc,1))
+		if $$$FINGLAccountAccountType(Rec)=$$$EnumFINGLACCOUNTTYPETopAccount {
+			set ParentCount=ParentCount+1
+			; Balance = zero check
+			set Bal=$get(^FINGLAccountTotal(YM,Acc,"BAL",1))
+			if Bal {
+				set Status = $$$NO
+				set Result("Hash",Acc_" Bal")=1
+			}
+			set Period=""
+			for {
+				set Period=$order(^FINGLPeriodTotal(YM,Acc,Period))
+				quit:Period=""
+				
+				set Type=""
+				for {
+					set Type=$order(^FINGLPeriodTotal(YM,Acc,Period,Type))
+					quit:Type=""
+					
+					set PeriodAmount=$get(^FINGLPeriodTotal(YM,Acc,Period,Type,1))
+					set TypeRec=$get(^FINGLTranType(YM,Type,1))
+					if ('$$$FINGLTranTypeBudget(TypeRec))&&(PeriodAmount) {
+						set Result("Hash",Acc_" Per "_Period_" "_Type)=PeriodAmount
+						set Status = $$$NO
+					}
+				}
+			}
+		}
+	}
+	if Status=$$$OK {
+		set Status=2  ; Because this is a Standalone Check return 2 if Ok
+	}
+	quit Status
+	
+	
+ParentAccountBalance(Start="",End="",Location="",Level="",Result)
+    ;-------------------------------------------------------------------------------
+    ; Checks that the Parent Account Balance is equal to the Sum of
+    ; the Child Account Balances.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 28-Apr-2004	shobby	Superseded by 2 part check AccountBalanceParentZCRC /
+    ; 							AccountBalanceChildZCRC
+    ; 25-Mar-2004   shobby 	Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,idFINGLAccount,objFINGLAccountTotal,idFINGLAccountTotal,idType,objAmounts
+	
+	if $get(Y)="" do ^WWWVAR
+	set strStatus = $$$OK
+	kill @$$$Check
+	kill Result  				; Clear Result
+
+	set idFINGLAccountTotal=""
+	for {
+		set idFINGLAccountTotal=$order(^FINGLAccountTotal(YM,idFINGLAccountTotal))
+		quit:idFINGLAccountTotal=""
+		
+		set idType=""
+		for {
+			set idType=$order(^FINGLAccountTotal(YM,idFINGLAccountTotal,idType))
+			quit:idType=""
+			
+			set objFINGLAccountTotal=$get(^FINGLAccountTotal(YM,idFINGLAccountTotal,idType,1))
+			do Add(idFINGLAccountTotal,idType,$$$FINGLAccountTotalAmount(objFINGLAccountTotal),0)
+		}
+	}
+	
+	; Check for variances.
+	set idFINGLAccountTotal=""
+	for {
+		set idFINGLAccountTotal=$order(@$$$Check@(idFINGLAccountTotal))
+		quit:idFINGLAccountTotal=""
+		
+		set idType=""
+		for {
+			set idType=$order(@$$$Check@(idFINGLAccountTotal,idType))
+			quit:idType=""
+			
+			set objAmounts=$get(@$$$Check@(idFINGLAccountTotal,idType))
+			if +$piece(objAmounts,Y,1)'=+$piece(objAmounts,Y,2) {
+				set Result("Hash",$$$ErrorNo(Result("Errors")))="Account:"_idFINGLAccountTotal_" ("_idType_") does not balance. ("_+$piece(objAmounts,Y,1)_","_+$piece(objAmounts,Y,2)_")"
+				set strStatus = $$$NO
+			}
+		}		
+	}
+	kill @$$$Check
+	
+	if strStatus=$$$OK {
+		set strStatus=2  ; Because this is a Standalone Check return 2 if Ok
+	}
+
+	quit strStatus
+	
+	
+Add(pidFINGLAccount,pidType,pfltAmountActual,pfltAmountFromChildren)
+    ;-------------------------------------------------------------------------------
+    ; Add a value
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 25-Mar-2004  	shobby   Created
+    ;-------------------------------------------------------------------------------
+	new objFINGLAccount,idFINGLAccountParent,fltAmountActual,fltAmountFromChildren,objAmounts
+	
+	set objAmounts=$get(@$$$Check@(pidFINGLAccount,pidType))
+	set $piece(objAmounts,Y,1)=$$$FCAdd($piece(objAmounts,Y,1),pfltAmountActual)
+	set $piece(objAmounts,Y,2)=$$$FCAdd($piece(objAmounts,Y,2),pfltAmountFromChildren)
+	
+	set objFINGLAccount=$get(^FINGLAccount(YM,pidFINGLAccount,1))
+	if $$$FINGLAccountAccountUsage(objFINGLAccount)=$$$EnumFINGLACCOUNTUSAGEParent {
+		; Don't worry about Transaction Accounts
+		set @$$$Check@(pidFINGLAccount,pidType)=objAmounts
+	}
+
+	; Add to parent
+	set objFINGLAccount=$get(^FINGLAccount(YM,pidFINGLAccount,1))
+	set idFINGLAccountParent=$$$FINGLAccountParent(objFINGLAccount)
+	if idFINGLAccountParent'="" {
+		do Add(idFINGLAccountParent,pidType,0,pfltAmountActual)
+	}
+	quit
+
+
+AccountBalanceChildZCRC(StartDate="",EndDate="",Location="",Level="",Result)
+	;-------------------------------------------------------------------------------
+	; Check Account Balance
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Aug-2004	shobby	Rewritten
+	; 28-Apr-2004	shobby	Created
+	;-------------------------------------------------------------------------------
+	new idFINGLAccount,Depth,Amt,Hash,idFINGLAccountLast,HashValue,idType
+	new idFINGLAccountParent,objFINGLAccountTotal
+	
+	if $get(Y)="" do ^WWWVAR
+	kill Result  							; Clear Result
+	kill @$$$Check
+	set Depth=$length(Level) 				; Set the detail depth
+	set idFINGLAccountParent=Level			; Set the idFINGLAccount to Start at the Level ( Optimisation )
+	
+	if (idFINGLAccountParent'="")&&($data(^FINGLAccounts(YM,50,idFINGLAccountParent))) {	; If the Start Account exists, go back one
+		set idFINGLAccountParent=$order(^FINGLAccounts(YM,50,idFINGLAccountParent),-1) 	
+	}
+
+	for {
+		set idFINGLAccountParent=$order(^FINGLAccounts(YM,50,idFINGLAccountParent))
+		quit:idFINGLAccountParent=""
+		
+		if $extract(idFINGLAccountParent,1,Depth)=Level {	; If the Account is inside the Level
+			if idFINGLAccountParent'=" " { ;Exclude the top Account
+				set idFINGLAccount=""
+				for {
+					set idFINGLAccount=$order(^FINGLAccounts(YM,50,idFINGLAccountParent,idFINGLAccount))
+					quit:idFINGLAccount=""
+					
+					set idType=""
+					for {
+						set idType=$order(^FINGLAccountAmountType(YM,idType))
+						quit:idType=""
+						
+						set objFINGLAccountTotal=$get(^FINGLAccountTotal(YM,idFINGLAccount,idType,1))
+						set @$$$Check@(idFINGLAccountParent,idType)=$get(@$$$Check@(idFINGLAccountParent,idType))+$$$FINGLAccountTotalAmount(objFINGLAccountTotal)
+					}
+				}
+			}
+		}
+	}
+
+	set idFINGLAccountParent=""
+	for {
+		set idFINGLAccountParent=$order(@$$$Check@(idFINGLAccountParent))
+		quit:idFINGLAccountParent=""
+		
+		set idType=""
+		for {
+			set idType=$order(@$$$Check@(idFINGLAccountParent,idType))
+			quit:idType=""
+			
+			set Amt=$get(@$$$Check@(idFINGLAccountParent,idType)) ; Get the Amount
+			set Result("Total")=$get(Result("Total"))+Amt
+			set Hash=$extract(idFINGLAccountParent,1,Depth+1)
+			if Hash="" set Hash="?"
+			set HashValue=$zcrc(idFINGLAccountParent_"("_idType_")="_Amt,7)
+			set Result("Hash",Hash)=$zcrc($get(Result("Hash",Hash))_HashValue,7)
+		}
+	}
+	kill @$$$Check
+	
+	quit 1
+	
+	
+AccountBalanceParentZCRC(StartDate="",EndDate="",Location="",Level="",Result)
+	;-------------------------------------------------------------------------------
+	; Check Account Balance
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Aug-2004	shobby	Rewritten
+	; 28-Apr-2004	shobby	Creation
+	;-------------------------------------------------------------------------------
+	new idFINGLAccount,Depth,Amt,Hash,idFINGLAccountLast,HashValue,idType
+	new idFINGLAccountParent,objFINGLAccountTotal
+	
+	if $get(Y)="" do ^WWWVAR
+	kill Result  							; Clear Result
+	kill @$$$Check
+	set Depth=$length(Level) 				; Set the detail depth
+	set idFINGLAccountParent=Level			; Set the idFINGLAccount to Start at the Level ( Optimisation )
+	
+	if (idFINGLAccountParent'="")&&($data(^FINGLAccounts(YM,50,idFINGLAccountParent))) {	; If the Start Account exists, go back one
+		set idFINGLAccountParent=$order(^FINGLAccounts(YM,50,idFINGLAccountParent),-1) 	
+	}
+
+	for {
+		set idFINGLAccountParent=$order(^FINGLAccounts(YM,50,idFINGLAccountParent))
+		quit:idFINGLAccountParent=""
+		if $extract(idFINGLAccountParent,1,Depth)=Level {	; If the Account is inside the Level
+			if idFINGLAccountParent'=" " { ;Exclude the top Account
+				set idType=""
+				for {
+					set idType=$order(^FINGLAccountAmountType(YM,idType))
+					quit:idType=""
+					set objFINGLAccountTotal=$get(^FINGLAccountTotal(YM,idFINGLAccountParent,idType,1))
+					set @$$$Check@(idFINGLAccountParent,idType)=+$$$FINGLAccountTotalAmount(objFINGLAccountTotal)
+				}
+			}
+		}
+	}
+
+	set idFINGLAccountParent=""
+	for {
+		set idFINGLAccountParent=$order(@$$$Check@(idFINGLAccountParent))
+		quit:idFINGLAccountParent=""
+		
+		set idType=""
+		for {
+			set idType=$order(@$$$Check@(idFINGLAccountParent,idType))
+			quit:idType=""
+			set Amt=$get(@$$$Check@(idFINGLAccountParent,idType)) ; Get the Amount
+			set Result("Total")=$get(Result("Total"))+Amt
+			set Hash=$extract(idFINGLAccountParent,1,Depth+1)
+			if Hash="" set Hash="?"
+			set HashValue=$zcrc(idFINGLAccountParent_"("_idType_")="_Amt,7)
+			set Result("Hash",Hash)=$zcrc($get(Result("Hash",Hash))_HashValue,7)
+		}
+	}
+	kill @$$$Check
+	
+	quit 1
+	
+]]></Routine>
+</Export>

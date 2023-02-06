@@ -1,0 +1,1730 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARCompra" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARCompra
+#include COMSYS
+#include COMConst
+#include INConst
+#include VARConst
+#include VARLog
+
+OnAfterDataFields(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Campo OnAfterDataFields do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ; 	05-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+ 		
+	new statusCompra
+	set statusCompra = $piece(YFELD,Y,348)	
+	
+	if ($get(YSEITE) = 2) {
+		do ListarEntregas^VARCompraEntrega(pYKEY)
+	} elseif ($get(YSEITE) = 1) {
+		do LoadGrid^VARCompraLinha(pYKEY)
+	}
+ 
+	do PrintTableRecebimentos(pYKEY)	
+	do PrintTableSaldoRestante(pYKEY)
+ 	 	 	 	 	 
+ 	quit
+ 	
+OnBeforeEditAccessHook(YKEY)
+	;-------------------------------------------------------------------------------
+    ; Descrição: 
+    ;	Deixa o formulário somente leitura caso a ordem de compra não esteja em aberto.
+    ;
+    ; Chamado por:
+    ;	VARHook OnBeforeEditAccess da classe INAUF.
+    ; 
+    ; Histórico:
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------		
+	if YKEY = "" quit $$$YES
+	
+	if YFORM = "VARCompra" {
+		
+		new statusCompra
+		set statusCompra = $piece(YFELD,Y,348)
+
+		if statusCompra '= 0 {
+			quit $$$NO
+		}
+	}
+	
+	quit $$$YES
+ 	
+OnBeforeSave(pidCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	1. Verifica se pode utilizar o pedido de compra (caso fazer compra com pedido
+    ;	   seja obrigatório
+    ;	2. Verifica se a data de entrega do empenho é válida
+    ;	3. Salva o grid
+    ;
+    ; Chamado por:
+    ;	Campo OnBeforeSave do form VARPedidoCompra.
+    ; 
+    ; Histórico:
+    ;	21-Set-2011		Karine:Verifica a formato do Empenho
+    ;   15-Set-2011		Karine:Inserido verificação de registro único de Empenho por OF
+    ;   01-Set-2011		Atualiazado para verificar se informar o pedido é obrigatório
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new strStatus, objCompra, idPedidoCompra, statusCompra, dteEntregaEmpenho, noEmpenho, getSpace	
+	set strStatus = $$$OK
+	set getSpace = 0
+	/* Verifica (quando o pedido de compra é obrigatório) se pode utilizar o pedido
+	   de compra - quando não foi criado ainda o registro na VARCompra ou quando não
+	   existem linhas no pedido ou quando ainda não tem um processo associado a ele	*/
+	   
+	set idPedidoCompra = $$$INAUFFREE20(YFELD)
+	
+	if (idPedidoCompra '= "") {
+	
+		if ((pidCompra = "") || (pidCompra = "+")) {
+			set strStatus = $$CanUsePedidoCompra(pidCompra)
+	
+		} elseif ('$data(^INAUFP(YM,pidCompra))) {
+			set strStatus = $$CanUsePedidoCompra(pidCompra)
+		}
+	}
+	//Verifica se a data de entrega do empenho é válida
+	if $$$ISOK(strStatus) {
+		set dteEntregaEmpenho = $piece(YFELD,Y,349)
+		if (dteEntregaEmpenho > $horolog) {
+			set strStatus = "A data de entrega do empenho ao fornecedor não pode ser maior que a data de hoje."
+		}		
+	}
+	set noEmpenho = $piece(YFELD,Y,336)
+	
+	if $$$ISOK(strStatus) {
+		if noEmpenho '= "" {
+			set countNoEmpenho = $length(noEmpenho)
+			set getSpace = $find(noEmpenho," ") 
+			if countNoEmpenho < 12 {  ; total de dígitos do Empenho
+				set strStatus = "Número do Empenho incompleto."_$c(10)_"Favor verificar."		
+			} elseif getSpace '= 0 {
+				set strStatus = "Número do Empenho incorreto."_$c(10)_"Favor verificar."		
+			}			
+		}	
+	}
+	if $$$ISOK(strStatus) {	
+		set strStatus = $$blnEmpenhoUnico(noEmpenho,pidCompra)
+	}
+	
+	if (pidCompra '= ""){
+		set objCompra = $get(^INAUF(YM,pidCompra,1))
+		
+		if ( ($piece(objCompra,Y,348) = 1) && (objCompra '= "") ){
+			$$$Alert("Este registro já foi processado.")
+			set Q=$$$QDontSave
+			quit
+		}
+	}
+	
+	//Salva o grid
+	if $$$ISOK(strStatus) {
+		set strStatus = $$$GRIDSave(pidCompra)
+	}
+
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		do ReturnError^COMUtilError(strStatus)
+	}
+	
+	quit
+	
+OnAfterSave(pYKEY)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	1. Adiciona os produtos do pedido de compra (quando o grid está vazio).
+    ;	2. Calcula/atualiza o campo valor total (FREE2) com base nas linhas.   
+    ;	3. Cria as entregas padrão para a ordem de compra.
+	;
+   	; Chamado por:
+   	;	Campo OnAfterSave do form VARCompra.
+    ;
+    ; History:
+	;	27-Jun-2012		Inserida rotina que faz atualização na Ordem de Compra e Linhas 
+	;	01-Set-2011		Atualizado para verificar se o pedido de compra existe ou não
+	;	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+	quit:(pYKEY = "")
+	
+	new idCompraLinha, objCompraLinha, fltQuantity, unitPrice, totalLinha, totalCompra, objCompra, strStatus,
+		dteEntregaEmpenho, idPedidoCompra
+	
+	set strStatus = $$$OK
+	
+	set idPedidoCompra = $$$INAUFFREE20(YFELD)
+
+	//Adiciona os produtos do pedido de compra (somente quando o grid está vazio e quando o pedido de compra existe)
+	if ( '$data(^INAUFP(YM,pYKEY)) && (idPedidoCompra '= "") ) {
+			set strStatus = $$InserirItens(pYKEY)
+	}
+	
+	if $$$ISOK(strStatus) {
+		// Cria as entregas padrão
+		new entregaPadrao
+		set entregaPadrao = $piece(YFELD,Y,356)
+		
+		; Se a entrega é 0-Conforme Solicitação, não deve ter definição de entregas	
+		if (entregaPadrao '= 0){
+		
+			if ($get(entregaPadrao) '= "") {			
+				set strStatus = $$CriaEntregasPadrao^VARCompraEntrega(YKEY,YFELD)
+				
+				//Atualiza as entregas caso já tenha sido preenchida a data de entrega do empenho
+				if $$$ISOK(strStatus) {
+					set dteEntregaEmpenho = $piece(YFELD,Y,349)
+					if (dteEntregaEmpenho '= "") {
+						set strStatus = $$Transaction^COMTransaction("AtualizaEntregas^VARCompraEntrega("""_YKEY_""","_dteEntregaEmpenho_")",$$$YES)
+					}
+				}
+		
+				if $$$ISERR(strStatus) {
+					do AlertInScript^COMConst("Erro ao criar entrega padrão. "_YCR_"Informações sobre o erro: "_strStatus)		
+				}	
+			}
+		}	
+	}
+
+	
+	if $$$ISOK(strStatus) {
+		/* Aplica o rateio dos campos frete, acréscimos e desconto do cabeçalho nas linhas
+		   Atualiza o total na linha e o total no cabeçalho
+		   Atualiza o total do IPI no cabeçalho    */
+		set strStatus = $$AtualizaOrdemCompraELinhas(pYKEY)
+	}	
+
+	if $$$ISERR(strStatus) { 
+		do ReturnError^COMUtilError(strStatus)
+	}
+ 
+	quit
+	
+OnBeforeDelete(pidCompra) 
+	;-------------------------------------------------------------------------------
+	; Descrição:
+	;	Antes de deletar o registro pai, deleta as linhas e as tabelas filhas para que
+	;	não hajam registros órfãos nestas.
+	;
+	; Chamado por:
+	;	Campo OnBeforeDelete do form VARPedidoCompra.
+	; 
+	; Histórico:
+	; 	13-Jul-2010		Criado
+	;-------------------------------------------------------------------------------		
+	new strStatus	
+ 	set strStatus = $$$NO
+ 	
+ 	do CanDelete^INAUFKILL(pidCompra)
+ 	
+ 	if ($get(Q) '= $$$QDontDelete) {
+		set strStatus = $$Transaction^COMTransaction("DeleteTxn^VARCompra("""_pidCompra_""")",0)
+ 		
+		if $$$ISERR(strStatus) {
+ 	 		do ReturnError^COMUtilError($listbuild("Exclusão da compra %1 falhou. Mensagem de erro: %2",pidCompra,$$$Text(strStatus)))
+		 	set Q = $$$QDontDelete // this routine also has to return the variable Q, to tell @NM whether to kill Order or not.
+		}
+	
+	} else {
+	 	set strStatus = $listbuild("Exclusão da compra não permitida.")
+  	 	do ReturnError^COMUtilError($listbuild("Exclusão da compra %1 não permitida.",pidCompra))
+	}
+	
+	quit strStatus
+	
+DeleteTxn(pidCompra)
+    ;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;   Função OnBeforeDelete^VARCompra.mac
+    ; 
+    ; Histórico:
+    ;   13-Jul-2010     Criado
+    ;-------------------------------------------------------------------------------    
+    new strStatus, keyCompraLinha, idCompraLinha, keyCompraPrecoLinha, idCompraPrecoLinha,
+    	keyEntrega, idEntrega, keyEntregaLinha, idEntreg, idEntregaLinha, keyAlteracao, idAlteracao,
+    	keyEntregaAgend, idEntregaAgend, idAgendamento
+    	
+    set strStatus = $$$OK
+    
+    ; Atenção: essa rotina core não retorna o status da transação
+    ; Ela retorna a variável "Q" com 0 para deletar ou 1 para não deletar
+    do ^INAUFKILL($GET(pidCompra))
+    
+    if ($get(Q) = $$$QDontDelete) {
+        set strStatus = $listbuild("Exclusão não permitida por rotina ^INAUFKILL.")
+    }
+    
+    //Apagando as linhas e demais entidades que a INAUFKILL não está limpando.
+        
+    if $$$ISOK(strStatus) {
+		//Apagando as linhas da Compra (INAUFP)
+		$$$Order3(^INAUFP,YM,pidCompra,idCompraLinha)
+			set keyCompraLinha = pidCompra_$$$COMMA_idCompraLinha
+			set strStatus=$$KILL^COMUtils("INAUFP",keyCompraLinha)
+			quit:$$$ISERR(strStatus)
+		$$$End
+    }
+    
+    if $$$ISOK(strStatus) {
+		//Apagando o preço ref. da linha da Compra (INAUFPK)
+		$$$Order3(^INAUFPK,YM,pidCompra,idCompraPrecoLinha)
+			set keyCompraPrecoLinha = pidCompra_$$$COMMA_idCompraPrecoLinha
+			set strStatus=$$KILL^COMUtils("INAUFPK",keyCompraPrecoLinha)
+			quit:$$$ISERR(strStatus)
+		$$$End
+    }
+ 
+    if $$$ISOK(strStatus) {
+		//Apagando as entregas da compra (VARCompraEntrega)
+		$$$Order3(^VARCompraEntrega,YM,pidCompra,idEntrega)
+			set keyEntrega = pidCompra_$$$COMMA_idEntrega
+			set strStatus=$$KILL^COMUtils("VARCompraEntrega",keyEntrega)
+			quit:$$$ISERR(strStatus)
+		$$$End
+    }
+    
+    if $$$ISOK(strStatus) {
+		//Apagando as linhas das entregas da compra (VARCompraEntregaLinha)
+		$$$Order3(^VARCompraEntregaLinha,YM,pidCompra,idEntreg)
+			$$$Order4(^VARCompraEntregaLinha,YM,pidCompra,idEntreg,idEntregaLinha)
+				set keyEntregaLinha = pidCompra_$$$COMMA_idEntreg_$$$COMMA_idEntregaLinha
+				set strStatus=$$KILL^COMUtils("VARCompraEntregaLinha",keyEntregaLinha)
+				quit:$$$ISERR(strStatus)
+			$$$End
+		$$$End		
+    } 
+    
+    if $$$ISOK(strStatus) {
+		//Apagando o histórico de alterações da ordem de compra (VARCompraHistorico)
+		$$$Order3(^VARCompraHistorico,YM,pidCompra,idAlteracao)
+			set keyAlteracao = pidCompra_$$$COMMA_idAlteracao
+			set strStatus=$$KILL^COMUtils("VARCompraHistorico",keyAlteracao)
+			quit:$$$ISERR(strStatus)
+		$$$End		
+    }
+ 
+    if $$$ISOK(strStatus) {
+		//Apagando os agendamentos das entregas da compra (VARCompraEntregaAgendamento)
+		$$$Order3(^VARCompraEntregaAgendamento,YM,pidCompra,idEntregaAgend)
+			$$$Order4(^VARCompraEntregaAgendamento,YM,pidCompra,idEntregaAgend,idAgendamento)
+				set keyEntregaAgend = pidCompra_$$$COMMA_idEntregaAgend_$$$COMMA_idAgendamento
+				set strStatus=$$KILL^COMUtils("VARCompraEntregaAgendamento",keyEntregaAgend)
+				quit:$$$ISERR(strStatus)
+			$$$End
+		$$$End		
+    }
+ 
+    quit strStatus
+	
+CanProcess()
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Botão (1)-Processar do form VARCompra.
+    ; 
+    ; Histórico:
+    ;	05-Mar-2012		Alterado: não permite processar uma compra por ata se o preço 
+    ;					for diferente da ata E se a compra NÃO for de ação judicial.
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:(YKEY = "")
+	
+	new blnStatusCompra, idCompraLinha, unitPrice, modalidadeEmpenho, countEntrega, statusCompraPorAta
+	set blnStatusCompra = $piece(YFELD,Y,348)
+	
+	set YQ = $$$YQEnable
+ 	
+	if (blnStatusCompra '= 0) {
+		set YQ = 1_"A ordem de compra "_YKEY_" já foi processada."
+		quit
+ 	}
+ 	
+	if ($order(^INAUFP(YM,YKEY,"")) = "") {
+		set YQ = 1_"A ordem de compra não possui produtos. Favor verificar."
+		quit
+	} 	 
+ 	
+ 	$$$Order3(^INAUFP,YM,YKEY,idCompraLinha)		
+		set unitPrice = $piece($get(^INAUFP(YM,YKEY,idCompraLinha,1)),Y,282)		
+		if (unitPrice = "") || (unitPrice <= 0 ) {
+			set YQ = 1_"Preço unitário é obrigatório para todos os produtos. Não é possível processar."
+			quit
+		} 	
+ 	$$$End
+ 	
+ 	// Quando o empenho é ordinário não pode ter mais de uma entrega.
+ 	set modalidadeEmpenho = $piece(YFELD,Y,345)
+ 	
+ 	if (modalidadeEmpenho = 3) { //3-ordinário
+ 		
+ 		set countEntrega = 0
+ 		
+ 		$$$Order3(^VARCompraEntrega,YM,YKEY,idEntrega)	 		
+	 		set countEntrega = $i(countEntrega)	 		
+	 		if (countEntrega > 1) {
+				set YQ = 1_"Quando o empenho é ordinário a compra não pode ter mais do que uma entrega."
+	 		} 				 		
+ 		$$$End		
+ 	}
+ 	
+	set statusCompraPorAta = $$$OK
+	set statusCompraPorAta = $$VerificaCompraPorAta(YKEY,YFELD)
+	if $$$ISERR(statusCompraPorAta) {
+		set YQ = 1_statusCompraPorAta
+	}
+	 	
+	
+	quit	
+	
+Process(pidCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	1. Alerta caso o valor total da compra seja diferente do valor do empenho
+    ;	2. Valida as entregas
+    ;	3. Seta e atualiza o campo Status e data de emissão da ordem de compra.
+    ;	4. Replica dados na INARTK (necessidade Core)
+    ;	5. Crosscheck fornecedor cabeçalho e linha
+    ;
+    ; Chamado por:
+    ;	Botão (1)-Processar do form VARCompra.
+    ; 
+    ; Histórico:
+    ;	23-Set-2011		Atualizado - valida valor da compra e valor do empenho
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new objCompra, strStatus, listaStatusEntregas, linhaCompra, errMsg, errMsgLinhas,
+		vlueCompra, vlueEmpenho, strAlert
+	
+	set strStatus = $$$OK
+	set objCompra = $get(^INAUF(YM,pidCompra,1))
+	
+	// Verifica se o valor do empenho é igual ao valor total da compra
+	set vlueCompra = $piece(objCompra,Y,321)   ; salva 7 casas decimais
+	set vlueEmpenho = $piece(objCompra,Y,322)  ; salva 2 casas decimais
+	set numEmpenho = $piece(objCompra,Y,336) 
+	set strModalidadeLic = $piece(objCompra,Y,346)
+	set strModalidadeEmp = $piece(objCompra,Y,345)  
+	
+	set vlueCompra =  $NORMALIZE(vlueCompra,2) ; Karine:iguala as casas decimais
+	//Valida campos obrigatorios caso seja modalidade de adesao a ata
+	if (strModalidadeLic = 7) {
+		set strAlert=""
+		if vlueEmpenho="" set strAlert="O valor do empenho é obrigatório para a modalidade de Adesão a Ata. Favor verificar."
+		if numEmpenho="" set strAlert="O número do empenho é obrigatório para a modalidade de Adesão a Ata. Favor verificar."
+		if strModalidadeEmp="" set strAlert="A modalidade de empenho é obrigatória para a modalidade de Adesão a Ata. Favor verificar."
+			if strAlert'="" {
+			do StartScript^COMUtiljavascript()
+			w "alert('"_strAlert_"'); "
+			do EndScript^COMUtiljavascript()
+			do GoToForm^COMUtilForm("VARCompra", pidCompra)
+			quit
+		}
+	}
+
+	if ( (vlueCompra '= vlueEmpenho) && (vlueEmpenho '= "") ) {
+		do StartScript^COMUtiljavascript()
+		w "alert('O valor do empenho é diferente do valor total da compra. Favor verificar.'); "
+		do EndScript^COMUtiljavascript()
+		do GoToForm^COMUtilForm("VARCompra", pidCompra)
+		quit
+	}
+	
+	// Verifica se entregas são válidas:
+	set strStatus = $$EntregasValidas^VARCompraEntrega(pidCompra,.listaStatusEntregas)
+	if (strStatus '= $$$OK) {
+ 		set linhaCompra = ""
+ 		set errMsg = $piece(strStatus,Y,2)
+		set:($get(errMsg) = "") errMsg = "Erro na validação das entregas."
+		set errMsgLinhas = ""
+		for {
+			set linhaCompra = $order(listaStatusEntregas(linhaCompra))
+			quit:(linhaCompra = "")
+			if ( listaStatusEntregas(linhaCompra) '= 1 ) {
+				set:($get(errMsgLinhas) = "") errMsgLinhas = "Situação das entregas para cada linha da Ordem de Compra:"
+				set errMsgLinhas = errMsgLinhas_$char(10)_linhaCompra_": "_$piece(listaStatusEntregas(linhaCompra),Y,2)
+			}
+		}
+		set:($get(errMsgLinhas) '= "") errMsg = errMsg_$char(10)_errMsgLinhas
+		do AlertInScript^COMConst(errMsg)
+		do GoToForm^COMUtilForm("VARCompra", pidCompra)	
+		quit
+	}
+	
+	//Seta o status e data de emissão da ordem de compra
+	set $piece(objCompra,Y,4)   = $horolog
+	set $piece(objCompra,Y,348) = 1
+
+	set strStatus = $$$Save("INAUF",pidCompra,objCompra,1)
+	
+	if $$$ISERR(strStatus) { 
+		do StartScript^COMUtiljavascript()
+		w "alert('Não foi possível processar a ordem de compra. Erro ao processar.'); "
+		do EndScript^COMUtiljavascript()
+	}
+	
+	//Grava dados na INARTK
+	if $$$ISOK(strStatus) {
+		set strStatus = $$BackPopulateINARTK(pidCompra)
+	}
+ 
+	do GoToForm^COMUtilForm("VARCompra", pidCompra)
+ 
+	quit
+	
+	
+CanViewReport()
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Desabilita o botão de relatório caso a ordem de compra não tenha sido processada.
+    ;
+    ; Chamado por:
+    ;	Botão (2)-Relatório do form VARCompra.
+    ; 
+    ; Histórico:
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+ 	new blnStatusCompra
+ 	set YQ = $$$YQEnable
+
+ 	set blnStatusCompra = $piece(YFELD,Y,348) 	
+ 	if blnStatusCompra = 0 {
+		set YQ = 1_"O relatório só fica disponível depois que a ordem de compra ter sido processada."
+		quit
+	}
+
+	quit
+	
+CanRevisar(YKEY) 
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Verifica se pode habilitar botão desprocessar.
+    ;
+    ; Chamado por:
+    ;	Botão (3)-Revisar do form VARCompra.
+    ; 
+    ; Histórico:
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new strStatus
+	
+	if ($$CheckCompraEncerrada(YKEY) '= 0){
+		set YQ = 1_"A ordem de compra já foi encerrada."
+		quit
+	}
+		
+	set strStatus = $$CanDesprocessar(YKEY)
+	if (strStatus = $$$YES) {
+		set YQ = $$$YQEnable
+	}
+	else {
+		set YQ = 1_$piece(strStatus,Y,2)
+	}
+	quit
+	
+CanEditarEntregas(pidCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Desabilita o botão de Entregas.
+    ;
+    ; Chamado por:
+    ;	Botão (4)-Relatório do form VARCompra.
+    ; 
+    ; Histórico:
+    ; 	29-Ago-2012		Criado
+    ;-------------------------------------------------------------------------------	
+ 	quit:(pidCompra = "")
+ 	
+ 	new idModeloEntrega, objINAUF
+ 	set YQ = $$$YQEnable
+	
+	set objINAUF = $get(^INAUF(YM,pidCompra,1))
+	
+ 	set idModeloEntrega = $piece(objINAUF,Y,356)
+ 	if (idModeloEntrega '= 0) {
+		set YQ = 1_"Só é possível cadastrar manualmente entregas quando o Modelo de Entrega está definido como 'Conforme solicitação'. "
+		quit
+	}
+
+	quit
+	
+CanDesprocessar(pidCompra)
+ 	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Verifica se a ordem de compra pode ser revisada.
+    ;
+    ; Chamado por:
+    ;	Função CanRevisar^VARCompra.mac
+    ; 
+    ; Histórico:
+    ; 	19-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new blnStatusCompra, objCompra, SetorSolicitante, idEstorno, idRec
+ 	
+ 	set idEstorno = ""
+ 	
+ 	if ($get(pidCompra) = "") {
+	 	quit "0~Informe o número da ordem de compra."
+ 	}
+ 	
+ 	set objCompra = $get(^INAUF(YM,pidCompra,1))
+ 	
+ 	if (objCompra = "") {
+	 	quit "0~Ordem de compra "_pidCompra_" não encontrada."
+ 	}
+ 	
+ 	set blnStatusCompra = +$piece(objCompra,Y,348) 	
+ 	if ( (blnStatusCompra = 0) || (blnStatusCompra = "") ) {
+		quit "0~Só é possível revisar uma ordem de compra processada. Esta ordem de compra não está processada."
+	}
+	
+	if ( $data(^INRECSummarys(YM,1,$$$Index(pidCompra))) ) {
+		
+		new objCompra, qtyComprada, qtyTotalRecebida, qtyTotalEstornada, blnCanRevisar
+		
+		set blnCanRevisar = $$$YES
+		
+ 		$$$Order3(^INAUFP,YM,pidCompra,idCompraLinha)
+ 			
+ 			set objCompra = $get(^INAUFP(YM,pidCompra,idCompraLinha,1))
+ 			
+		    set qtyComprada       = $$$INAUFPQuantity(objCompra)
+			set qtyTotalRecebida  = $$getQuantidadeRecebida(pidCompra,idCompraLinha)
+			set qtyTotalEstornada = $$getQuantidadeEstornada(pidCompra,idCompraLinha) 
+			
+			set qtyRestante = qtyComprada - qtyTotalRecebida + qtyTotalEstornada
+			
+			if (qtyRestante '= qtyComprada) {
+				set blnCanRevisar = $$$NO
+				quit
+		    }
+
+    	$$$End
+   	
+    	if $$$ISERR(blnCanRevisar) {
+	    	quit "0~Existe um ou mais recebimentos processados para esta ordem de compra. Não é possível revisá-la."
+    	}
+	}
+	
+	quit $$$YES
+
+CanEncerrar(YKEY)
+
+	new strStatus
+	
+	if ($$CheckCompraLinhas(YKEY) = 0){
+		set YQ = 1_"Não é possível encerrar uma Ordem de Compra sem itens."
+		quit
+	}
+	
+	if ( ($znspace = "HEVA") || ($znspace = "AME") || ($znspace = "SEDI") ) {
+		set YQ = $$$YQEnable // Natália solicitou que no heva deve ser possível encerrar uma ordem de compra a qualquer momento.
+		quit
+	}
+	
+	if ($$SQLGetRecebimentoFromINAUF^VARSQL(YKEY) = ""){
+		set YQ = 1_"Não existe recebimento confirmado para essa ordem de compra."
+		quit
+	}
+	
+	set strStatus = $$CanDesprocessar(YKEY)
+	if (strStatus '= $$$YES) {
+		set YQ = $$$YQEnable
+	}
+	else {
+		set YQ = 1_"Não é possível encerrar a ordem de compra."
+	}
+		
+	quit
+
+Revisar(pidCompra)
+	new objCompra, strStatus
+ 
+ 	set strStatus = $$$OK
+ 	
+ 	if ($get(pidCompra) = "") {
+	 	quit "0~Informe o número da ordem de compra."
+ 	}
+ 	
+	if ($$CanDesprocessar(pidCompra)) {
+	 	set objCompra = $get(^INAUF(YM,pidCompra,1))
+	 	
+	 	if (objCompra = "") {
+		 	quit "0~Ordem de compra "_pidCompra_" não encontrada."
+	 	}
+	 	
+	 	set $piece(objCompra,Y,348) = 0 // Campo Status
+	 	set strStatus = $$$Save("INAUF",pidCompra,objCompra,1)
+
+		if $$$ISERR(strStatus) { 
+			do StartScript^COMUtiljavascript()
+			w "alert('Não foi possível revisar a ordem de compra.'); "
+			do EndScript^COMUtiljavascript()
+		}
+	}
+ 
+	do GoToForm^COMUtilForm("VARCompra", pidCompra)
+	
+	quit
+	
+CanUsePedidoCompra(pidCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Verifica se o pedido de compra pode ser utilizado.
+    ;
+    ; Chamado por:
+    ;	Função OnBeforeSave^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new statusCompra, idPedidoCompraLinha, noProcesso
+	set idPedidoCompra = $$$INAUFFREE20(YFELD)
+	
+	set statusCompra = $$getStatusPedidoCompra^VARPedidoCompra(idPedidoCompra)
+	
+	if (statusCompra = 0) {
+		set strStatus = "O pedido de compra "_idPedidoCompra_" não está processado. Favor verificar."
+	
+	} elseif (statusCompra = 1) {
+		set strStatus = $$$OK
+	
+	} elseif (statusCompra = 3) {
+		set strStatus = "O pedido de compra "_idPedidoCompra_" foi arquivado e não pode ser utilizado. Favor verificar."		
+	
+	} else {
+		set strStatus = "Não é possível utilizar o pedido "_idPedidoCompra_". Favor verificar."
+		
+	}
+	
+	//Verificando se o pedido de compra tem processo associado a ele
+	if $$$ISOK(strStatus) {	
+		set noProcesso = $$getNoProcesso^VARPedidoCompra(idPedidoCompra)
+	
+		if (noProcesso = "") {
+			set strStatus = 1 ;"Não é possível utilizar o pedido "_idPedidoCompra_" pois ele não tem um número de processo associado a ele."
+		}		
+	}	
+	
+	//Verificando as linhas do pedido de compra
+	if $$$ISOK(strStatus) {		
+		$$$Order3(^VARPedidoCompraLinha,YM,idPedidoCompra,idPedidoCompraLinha)
+			set qtyPendente = $$GetQuantidadeAAtender^VARPedidoCompraLinha(idPedidoCompra, idPedidoCompraLinha)
+			if (qtyPendente > 0) {
+				set strStatus = $$$OK
+				quit
+			}
+			
+			set strStatus = "O pedido de compra "_idPedidoCompra_" não possui nenhum produto com saldo pendente. Favor verificar."	
+		$$$End
+	}
+	
+	quit strStatus
+
+InserirItens(pidCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Insere os itens pendentes do pedido de compra na ordem de compra.
+    ;
+    ; Chamado por:
+    ;	Função OnBeforeSave^VARPedidoCompra.mac
+    ; 
+    ; Histórico:
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------
+	new strStatus, objPedidoCompra, idPedidoCompraLinha, objPedidoCompraLinha, idProduto, unidade,
+		fltQuantAAtender, idCompraLinha, objCompraLinha, keyCompraLinha, objCompra
+	
+	set strStatus = $$$OK
+	set objCompra = $get(^INAUF(YM,pidCompra,1))
+	
+	set idPedidoCompra = $$$INAUFFREE20(YFELD)
+	set idCompraLinha  = 0
+	
+	$$$Order3(^VARPedidoCompraLinha,YM,idPedidoCompra,idPedidoCompraLinha)
+	
+		set objPedidoCompraLinha = $get(^VARPedidoCompraLinha(YM,idPedidoCompra,idPedidoCompraLinha,1))		
+		
+		//Dados do pedido
+		set idProduto = $$$VARPedidoCompraLinhaProduto(objPedidoCompraLinha)
+		set unidade   = $$$VARPedidoCompraLinhaUnidade(objPedidoCompraLinha)
+		set fltQuantAAtender = $$GetQuantidadeAAtender^VARPedidoCompraLinha(idPedidoCompra, idPedidoCompraLinha)
+		
+		;Só adiciona o item se resta saldo a atender
+		continue:(fltQuantAAtender <= 0)
+		
+		//Preparando a linha da compra
+		set idCompraLinha = $i(idCompraLinha)
+				
+		set objCompraLinha = ""
+		set $$$INAUFPItemName(objCompraLinha)     = $$SQLGetDescricaoProduto^VARSQL(idProduto)
+		set $$$INAUFPItemNumber(objCompraLinha)   = idProduto
+		set $$$INAUFPQuantity(objCompraLinha)     = fltQuantAAtender
+		; FIDI-20: Adicionado para preencher o campo OrderedQuantity, que faz parte da validação do preenchimento automatico do pedido de compra na ordem de comra, utilizado posteriormente para o preenchimento da FINAPInvMatchCache, que é utilizada posteriormente para realizar a validação do recebimento e estorno.
+		set $$$INAUFPOrderedQuantity(objCompraLinha)     = fltQuantAAtender
+		set $$$INAUFPSource(objCompraLinha)		  = 1 					;Ordem
+		set $$$INAUFPSupplier(objCompraLinha)	  = $$$INAUFSupplierNumber(objCompra)	
+		set $$$INAUFPQuantityUnit(objCompraLinha) = unidade
+		set $$$INAUFPFREE14(objCompraLinha)		  = idPedidoCompra
+		set $$$INAUFPFREE15(objCompraLinha)		  = idPedidoCompraLinha
+		
+
+		set keyCompraLinha = pidCompra_$$$COMMA_idCompraLinha
+		set strStatus = $$$Save("INAUFP",keyCompraLinha,objCompraLinha,1)
+		
+		quit:$$$ISERR(strStatus) strStatus
+		
+	$$$End
+	
+	quit strStatus
+	
+OnBlurPedidoCompra(pidPedidoCompra,pYFELD)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Preenche o campo Local, conforme o local informando no pedido de compra.
+    ;
+    ; Chamado por:
+    ;	Campo ExecuteOnBlur do campo (354)-FREE20 no form VARCompra
+    ; 
+    ; Histórico:
+    ;	23-Mar-2012		RGB		- Alterando a parte em que o campo Location e o Campo Free de processo são apagados no OnBlur,
+    ;							  caso não exista pedido de compra ele irá voltar para o Local corrente
+    ; 	28-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	new objPedidoCompra, localPedidoCompra, noProcesso
+	
+	if (pidPedidoCompra '= "") {
+		
+		set objPedidoCompra = $get(^VARPedidoCompra(YM,pidPedidoCompra,1))		
+		quit:(objPedidoCompra = "")
+				
+		set localPedidoCompra = $$$VARPedidoCompraLocaldeEntrega(objPedidoCompra)		
+		set noProcesso = $$$VARPedidoCompraNoProcesso(objPedidoCompra)
+		
+		set %TXT(1) = %TXT(1)_"#Y"_YFORM_"D"_$$$FldINAUFLocation_"~"_localPedidoCompra
+		set %TXT(1) = %TXT(1)_"#Y"_YFORM_"M"_$$$FldINAUFFREE25_"~"_noProcesso
+	
+	} else {
+		set %TXT(1) = %TXT(1)_"#Y"_YFORM_"D"_$$$FldINAUFLocation_"~"_YLOCATION //RGB alterado
+		set %TXT(1) = %TXT(1)_"#Y"_YFORM_"M"_$$$FldINAUFFREE25_"~"
+	}
+
+	quit	
+
+getDescEntrega(pobjCompra)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Regra core 01 do campo (357)-Descrição da Entrega do form VARCompra.
+    ; 
+    ; Histórico:
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:(pobjCompra)
+	new descEntrega, descEntPadrao, idEntregaModelo, primEntDiasUteis, primEntPodeSerAnt
+	
+	set descEntrega = ""
+	quit:( $get(pobjCompra) = "" ) ""
+	
+	set idEntregaModelo = $piece(pobjCompra,Y,356)
+	
+	set descEntPadrao = $$getDescricao^VARCompraEntregaModelo(idEntregaModelo)
+	
+	quit descEntPadrao
+	
+	if ($get(descEntPadrao) '= "") {
+		set descEntrega = descEntPadrao
+	}
+	else {
+		set descEntrega = "Veja entregas personalizadas item a item."
+	}
+	
+	quit descEntrega
+	
+getDescEntregaPedido(pidCompra, pobjCompra)	
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Regra core 01 do campo (357)-Descrição da Entrega do form VARCompra.
+    ; 
+    ; Histórico:
+    ; 	13-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:((pidCompra = "") || (pidCompra = "+")) ""
+	
+	new idPedidoCompra, objPedidoCompra	
+	set idPedidoCompra  = $piece(pobjCompra,Y,354)
+	quit:(idPedidoCompra = "") ""
+	
+	set objPedidoCompra = $get(^VARPedidoCompra(YM,idPedidoCompra,1))
+	quit:(objPedidoCompra = "") ""
+	
+	quit $$getDescEntrega^VARPedidoCompra(objPedidoCompra)
+	
+getDataEntregaEmpenho(pidCompra)	
+	quit:(pidCompra = "") ""
+	new objCompra
+	set objCompra = $get(^INAUF(YM,pidCompra,1))
+	quit $$$INAUFFREE15(objCompra)
+	
+getFornecedorCompra(pidCompra)	
+	quit:(pidCompra = "") ""
+	new objCompra
+	set objCompra = $get(^INAUF(YM,pidCompra,1))
+	quit $$$INAUFSupplierNumber(objCompra)
+	
+getComprasPendentesPorProduto(pidItem, &parrOpenCompras)
+	;-------------------------------------------------------------------------------
+    ; Chamado por:
+    ;	Retorna os documentos de compras pendentes para um produto
+    ; 
+    ; Histórico:
+    ; 	22-Sep-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:(pidItem = "") ""
+	
+ 	new idLocation, idCompra
+ 
+	// Para o status = " " - Aberta;
+	$$$Order4(^INAUFPs,YM,102,$$$Index(pidItem),idLocation)
+		$$$Order6(^INAUFPs,YM,102,$$$Index(pidItem),idLocation," ",idCompra)
+			set parrOpenCompras(idCompra) = "" 			
+		$$$End
+	$$$End	
+ 	
+	// Para o status = 0 - Aberta;
+	$$$Order4(^INAUFPs,YM,102,$$$Index(pidItem),idLocation)
+ 		$$$Order6(^INAUFPs,YM,102,$$$Index(pidItem),idLocation,0,idCompra)
+			set parrOpenCompras(idCompra) = "" 			
+		$$$End
+	$$$End	
+ 	
+	// Para o status = 1 - Processada - Aguardando Recebimento.
+	$$$Order4(^INAUFPs,YM,102,$$$Index(pidItem),idLocation)
+ 		$$$Order6(^INAUFPs,YM,102,$$$Index(pidItem),idLocation,1,idCompra)
+			set parrOpenCompras(idCompra) = ""
+		$$$End	
+	$$$End
+ 
+	// Para o status = 2 - Parcialmente recebida.
+	$$$Order4(^INAUFPs,YM,102,$$$Index(pidItem),idLocation)
+ 		$$$Order6(^INAUFPs,YM,102,$$$Index(pidItem),idLocation,2,idCompra)
+			set parrOpenCompras(idCompra) = ""
+		$$$End
+	$$$End	
+  	
+  	// Montar a String de retorno
+ 	set strCompras = ""
+ 	$$$Order1(parrOpenCompras,idCompra)
+ 	
+ 		if strCompras = "" {
+	 		set strCompras = idCompra
+ 		} else {
+	 		set strCompras = strCompras_";"_idCompra
+ 		}
+ 	
+ 	$$$End
+ 
+	quit strCompras
+
+getQuantidadeRecebida(pidCompra,pidCompraLinha)
+	quit:( (pidCompra = "") || (pidCompraLinha = "") ) ""
+	
+	new qtyRecebida, statusRec, idRecebimento, objRecebimentoLinha, idRecebimentoLinha, qtyRecebidaNoDoc
+	
+	set qtyRecebida = 0
+
+ 	$$$Order5(^INRECSummarys,YM,1,$$$Index(pidCompra),pidCompraLinha,idRecebimento)
+
+		set statusRec = $piece($get(^INREC(YM,idRecebimento,1)),Y,4)
+
+		if (statusRec > 0) {
+
+			$$$Order6(^INRECSummarys,YM,1,$$$Index(pidCompra),pidCompraLinha,idRecebimento,idRecebimentoLinha)
+
+				set objRecebimentoLinha = $get(^INRECSummary(YM,idRecebimento,idRecebimentoLinha,1))
+
+				set qtyRecebidaNoDoc = $piece(objRecebimentoLinha,Y,33)
+				set qtyRecebida = qtyRecebida + qtyRecebidaNoDoc
+
+			$$$End
+		}
+
+	$$$End
+
+	quit qtyRecebida
+	
+getQuantidadeEstornada(pidCompra,pidCompraLinha)
+	quit:( (pidCompra = "") || (pidCompraLinha = "") ) ""
+	
+	new qtyEstorno, idRecebimento, idRecebimentoLinha, objRecebimentoLinha, qtyEstornoTotal
+	
+	set qtyEstornoTotal = 0
+	
+ 	//Estornos 		
+ 	$$$Order5(^INRECLines,YM,4,$$$Index(pidCompra),pidCompraLinha,idRecebimento)
+
+		set objRecebimento = $get(^INREC(0,idRecebimento,1))
+				
+		//5=Estorno
+		continue:($$$INRECType(objRecebimento) '= 5)
+		continue:($$$INRECStatus(objRecebimento)= 0)
+ 			
+ 		$$$Order6(^INRECLines,YM,4,$$$Index(pidCompra),pidCompraLinha,idRecebimento,idRecebimentoLinha)
+ 				
+ 			set objRecebimentoLinha = $get(^INRECLine(0,idRecebimento,idRecebimentoLinha,1))
+ 				
+ 			set qtyEstorno = $$$INRECLineQuantity(objRecebimentoLinha) 				
+ 			set qtyEstornoTotal = qtyEstornoTotal + qtyEstorno
+ 		
+ 		$$$End
+ 			
+ 	$$$End
+ 	
+ 	quit qtyEstornoTotal
+	
+BackPopulateINARTK(pidCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Popula os dados da compra na INARTK (obrigatório para fazer a nova tela de
+    ;	recebimento funcionar.
+    ;
+    ; Chamado por:
+    ;	Função Process^VARCompra.mac
+    ; 
+    ; Histórico:
+    ;	22-Oct-2012		SLV		Adicionada atualizaÃ§Ã£o de fornecedores nas linhas.
+    ; 	19-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:(pidCompra = "")
+	
+	new objCompra, idFornecedor, idCompraLinha, objCompraLinha, idProduto, objProduto,
+		keyINARTK, objINARTK, strStatus
+	
+	set strStatus = $$$OK
+	
+	set objCompra = $get(^INAUF(YM,pidCompra,1))	
+	set idFornecedor = $$$INAUFSupplierNumber(objCompra)	
+	quit:(idFornecedor = "") strStatus
+	
+	$$$Order3(^INAUFP,YM,pidCompra,idCompraLinha)
+		
+		set objCompraLinha = $get(^INAUF]]><![CDATA[P(YM,pidCompra,idCompraLinha,1))
+		set idProduto = $$$INAUFPItemNumber(objCompraLinha)
+		
+		set idFornecedorLinha = $$$INAUFPSupplier(objCompraLinha)
+		
+		//Garantir que o fornecedor seja igual nas linhas. SESPE-389
+		if (idFornecedor '= idFornecedorLinha) {
+			set $$$INAUFPSupplier(objCompraLinha) = idFornecedor
+			set strStatus = $$$Save("INAUFP",pidCompra_","_idCompraLinha,objCompraLinha,$$$YES)
+		}
+		
+		if ('$data(^INARTK(YM,idProduto,idFornecedor))) {
+			
+			set objProduto = $get(^INART(YM,idProduto,1))
+			
+			set keyINARTK = idProduto_$$$COMMA_idFornecedor
+			
+			set objINARTK = ""
+			set $$$INARTKDeliveryQuantityUnit(objINARTK) = $$$INARTUnitofMeasure(objProduto)
+			set $$$INARTKAverageOutflowMonth(objINARTK)	 = "0.00"
+			set $$$INARTKFREE10(objINARTK) = ""
+			
+			set strStatus = $$$Save("INARTK",keyINARTK,objINARTK,$$$YES)
+		}
+			
+	$$$End
+
+	quit strStatus
+	
+PrintTableRecebimentos(pidCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Imprime a tabela com os recebimentos processados para a ordem de compra.
+    ;
+    ; Chamado por:
+    ;	Função OnAfterDataFields^VARCompra.mac
+    ; 
+    ; Histórico:
+    ; 	19-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:(pidCompra = "")
+	
+	new idRecebimento, objRecebimento, statusRec, dteRecebida, numNotaFiscal, qtyRecebida, idCompraLinha,
+		lstHeader, idRecebimentoLinha, objRecebimentoLinha, idProduto, descProduto, countRec, qtyEstorno, 
+		qtyEstornoProduto
+
+	//Monta cabeçalho da tabela
+ 	set lstHeader = ""
+  	set lstHeader = lstHeader_$listbuild("Data","Nº Recebimento","Nº Nota Fiscal","Produto","Quantidade","Status")
+
+	set countRec = 0
+    			    							 	
+  	if $$Start^COMTable(lstHeader,"Recebimentos já processados para esta compra:",,,$$$NO) {
+
+ 		//Recebimentos
+ 		$$$Order4(^INRECSummarys,YM,1,$$$Index(pidCompra),idCompraLinha)
+
+ 			$$$Order5(^INRECSummarys,YM,1,$$$Index(pidCompra),idCompraLinha,idRecebimento)
+
+ 			set objRecebimento = $get(^INREC(YM,idRecebimento,1))
+
+ 			set statusRec     = $piece(objRecebimento,Y,4)
+ 			set dteRecebida   = $zdate($piece(objRecebimento,Y,8),4)
+   			set numNotaFiscal = $piece(objRecebimento,Y,14)
+ 			
+ 			if (statusRec > 0) {
+	 			
+	 			$$$Order6(^INRECSummarys,YM,1,$$$Index(pidCompra),idCompraLinha,idRecebimento,idRecebimentoLinha)
+		    		
+		    		set objRecebimentoLinha = $get(^INRECSummary(YM,idRecebimento,idRecebimentoLinha,1))
+
+					// verifica se a linha é diferente do tipo produto
+					if ($$$INRECSummaryLineType(objRecebimentoLinha) '= 0) {
+						continue
+					}
+		    		
+		    		set idProduto   = $piece(objRecebimentoLinha,Y,6)
+		    		set qtyRecebida = $piece(objRecebimentoLinha,Y,33)
+		    		set descProduto = $$SQLGetDescricaoProduto^VARSQL(idProduto)
+		  			
+		  			set countRec = $i(countRec)
+		  			   				            				              	      	     	   		       			  		
+   					do NewLine^COMTable()
+   					do InsertCell^COMTable(dteRecebida,"INReceipt",idRecebimento,"")
+   					do InsertCell^COMTable(idRecebimento,"INReceipt",idRecebimento,"")
+   					do InsertCell^COMTable(numNotaFiscal,"INReceipt",idRecebimento,"")
+   					do InsertCell^COMTable(idProduto_" - "_descProduto,"INReceipt",idRecebimento,"",,,,,,$$$YES)
+					do InsertCell^COMTable($$^WWWTR(0,12,qtyRecebida),"INReceipt",idRecebimento,"")					
+					do InsertCell^COMTable("<font color=blue>Recebimento Processado</font>","INReceipt",idRecebimento,"")					
+  		    		do EndLine^COMTable()
+	 			
+	 			$$$End
+ 			}
+ 			$$$End
+ 		$$$End
+ 		
+ 		//Estornos
+ 		$$$Order4(^INRECLines,YM,4,$$$Index(pidCompra),idCompraLinha) 		
+ 			$$$Order5(^INRECLines,YM,4,$$$Index(pidCompra),idCompraLinha,idRecebimento)
+
+				set objRecebimento = $get(^INREC(0,idRecebimento,1))
+				
+				//5=Estorno
+				continue:($$$INRECType(objRecebimento) '= 5)
+				continue:($$$INRECStatus(objRecebimento)= 0)
+				
+				set dteEstorno = $$$INRECProcessedDate(objRecebimento)
+ 				
+ 				//Cada linha da compra corresponde a 01 produto, e para cada recebimento podemos ter n
+ 				//linhas na INRECLine, o que corresponde a múltiplos lote do mesmo produto. Assim sendo:
+ 				set qtyEstornoProduto = 0
+ 				
+ 				$$$Order6(^INRECLines,YM,4,$$$Index(pidCompra),idCompraLinha,idRecebimento,idRecebimentoLinha)
+ 					
+ 					set objRecebimentoLinha = $get(^INRECLine(0,idRecebimento,idRecebimentoLinha,1))
+ 					
+ 					set idProduto  = $$$INRECLineItem(objRecebimentoLinha)
+ 					set qtyEstorno = -$$$INRECLineQuantity(objRecebimentoLinha) 
+		    		set descProduto = $$SQLGetDescricaoProduto^VARSQL(idProduto)
+		    		
+		    		set qtyEstornoProduto = qtyEstornoProduto + qtyEstorno
+ 				
+ 				$$$End
+ 				
+ 				do NewLine^COMTable()
+ 				do InsertCell^COMTable($zdate(dteEstorno,4),"INRECReverse",idRecebimento)
+ 				do InsertCell^COMTable(idRecebimento,"INRECReverse",idRecebimento)
+ 				do InsertCell^COMTable("-")
+   				do InsertCell^COMTable(idProduto_" - "_descProduto,"INRECReverse",idRecebimento,"",,,,,,$$$YES)
+   				do InsertCell^COMTable($$^WWWTR(0,12,qtyEstornoProduto),"INRECReverse",idRecebimento,"")
+   				do InsertCell^COMTable("<font color=red>Recebimento Estornado</font>","INRECReverse",idRecebimento,"")   					
+ 				do EndLine^COMTable()
+ 				
+ 			$$$End 		
+ 		$$$End
+ 		
+ 		if (countRec = 0) {
+	 		do NewLine^COMTable()
+	 		do InsertCell^COMTable("Nenhum recebimento processado para esta ordem de compra.",,,,,,6)
+	 		do EndLine^COMTable()
+ 		}
+ 		
+ 		do Stop^COMTable()
+  	}
+
+	quit
+	
+PrintTableSaldoRestante(pidCompra)
+	;-------------------------------------------------------------------------------
+    ; Descrição:
+    ;	Imprime a tabela com o saldo restante da ordem de compra.
+    ;
+    ; Chamado por:
+    ;	Função OnAfterDataFields^VARCompra.mac
+    ; 
+    ; Histórico:
+    ; 	19-Jul-2010		Criado
+    ;-------------------------------------------------------------------------------	
+	quit:(pidCompra = "")
+	
+	kill ^VARTempCompraSaldosReport(YM,YBED)
+		
+	new listHeader, idCompraLinha, objCompra, descProduto, idProduto, qtyCompra, qtyTotalRecebida,
+		qtyTotalEstornada, qtyRestante, blnSaldoRestante, strStatus, objReport, stKey
+		
+   	//Monta cabeçalho da tabela
+ 	set lstHeader = ""
+  	set lstHeader = lstHeader_$listbuild("Seq.","Produto","Quant. Pendente")
+	
+	set blnSaldoRestante = $$$NO
+						 			    			    							 	
+  	if $$Start^COMTable(lstHeader,"Saldo a receber da compra:",,,$$$NO) {
+ 	
+ 		if ($$CheckCompraEncerrada(pidCompra) '= 0){
+ 			do NewLine^COMTable()
+     		do InsertCell^COMTable("Os saldos pendentes foram encerrados manualmente.",,,,,,3)
+      		do EndLine^COMTable()	
+ 			quit
+ 		}
+ 	
+ 		$$$Order3(^INAUFP,YM,pidCompra,idCompraLinha)
+ 			
+ 			set objCompra = $get(^INAUFP(YM,pidCompra,idCompraLinha,1))
+ 			
+ 			set idProduto = $piece(objCompra,Y,4)
+		    set qtyCompra = $piece(objCompra,Y,5)
+		    
+			set descProduto = $$SQLGetDescricaoProduto^VARSQL(idProduto)
+			
+			set qtyTotalRecebida  = $$getQuantidadeRecebida(pidCompra,idCompraLinha)
+			set qtyTotalEstornada = $$getQuantidadeEstornada(pidCompra,idCompraLinha) 
+			
+			set qtyRestante = qtyCompra - qtyTotalRecebida + qtyTotalEstornada
+			
+			if (qtyRestante > 0) {
+    			
+    			do NewLine^COMTable()
+     			do InsertCell^COMTable(idCompraLinha,"",,"")
+     			do InsertCell^COMTable(idProduto_" - "_descProduto,"",,"")
+     			do InsertCell^COMTable($$^WWWTR(0,12,qtyRestante),"",,"")   				   				
+      			do EndLine^COMTable()
+      			set blnSaldoRestante = $$$YES	    	
+      			
+				set objReport = ""
+				set $piece(objReport,Y,1) = idProduto
+		    	set $piece(objReport,Y,2) = $$^WWWTR(0,12,qtyRestante)
+		    	set $piece(objReport,Y,3) = pidCompra
+		    	set stKey = YBED_","_idCompraLinha 
+		    	set strStatus = $$$Save("VARTempCompraSaldosReport",stKey,objReport,1)
+		    	if $$$ISERR(strStatus) {
+		    		$$$VARLOGERROR("Erro ao salvar dados de relatório da compra "_pidCompra)
+		    	}
+		    }
+
+    	$$$End
+    	
+    	if (blnSaldoRestante = $$$NO) {
+	        do NewLine^COMTable()
+     		do InsertCell^COMTable("Nenhum saldo restante para recebimento.",,,,,,3)
+      		do EndLine^COMTable()	    	
+    	}
+    	
+    	do Stop^COMTable()
+  	}
+		
+	quit
+	
+	
+  ;-------------------------------------------------------------------------------
+  ; Funções que apresentam os dados da última compra:
+  ;
+  ; History:
+  ; 13-Jul-2011	Marcelo Ottoni	Created
+  ;-------------------------------------------------------------------------------	
+
+getPrecoUltimaCompra(idItem)
+	new objUltimaCompra, fltPrecoUnitario
+	if idItem="" quit ""
+	
+	set objUltimaCompra  = $$getUltimaCompra(idItem)
+	set fltPrecoUnitario = $piece(objUltimaCompra, Y, 2)
+	
+	quit fltPrecoUnitario
+	
+getDataUltimaCompra(idItem)
+	new objUltimaCompra, fltDataUnitario
+	if idItem="" quit ""
+	
+	set objUltimaCompra  = $$getUltimaCompra(idItem)
+	set fltDataUnitario = $piece(objUltimaCompra, Y, 5)
+	
+	quit fltDataUnitario
+	
+getQuantUltimaCompra(idItem)
+	new objUltimaCompra, fltQuantUnitario
+	if idItem="" quit ""
+	
+	set objUltimaCompra  = $$getUltimaCompra(idItem)
+	set fltQuantUnitario = $piece(objUltimaCompra, Y, 1)
+	
+	quit fltQuantUnitario
+	
+	
+getUltimaCompra(CodProduto)
+	// Retorna uma string delimitada com os dados da última compra:
+	// piece 1: quantidade
+	// piece 2: Preço
+	// piece 3: valor total
+	// piece 4: fornecedor
+	// piece 5: data
+	// piece 6: número da ordem de compra (OF)
+	// piece 7: número do item do pedido
+	
+	&sql(
+		DECLARE C1 CURSOR FOR
+		SELECT 
+			INAUFP.Quantity AS Quantidade,
+			INAUFPK.UnitPrice AS PrecoUnitario,
+			INAUFP.Cost AS ValorTotal,
+			INAUF.SupplierNumber||' - '||INLIEF.ShortName AS Fornecedor,
+			INAUF.OrderDate AS Data,
+			INAUF.OrderNumber AS NumOF,
+			INAUFP.LineItem AS NumItemOF
+		INTO
+			:Quantidade, :PrecoUnitario, :ValorTotal, :Fornecedor, :Data, :NumOF, :NumItemOF 
+		FROM INAUFP, INAUF, INAUFPK, INLIEF 
+		WHERE  INAUF.OrderNumber = INAUFP.OrderNo
+		  AND  INAUFP.OrderNo = INAUFPK.OrderNumber
+		  AND  INAUFP.LineItem = INAUFPK.LineItem
+		  AND  INAUF.SupplierNumber = INLIEF.SupplierNumber
+		  AND ItemNumber = :CodProduto
+		ORDER BY Data DESC
+	)
+	&sql(OPEN C1)
+	&sql(FETCH C1)
+	set returnValue = ""
+	if (SQLCODE = 0) {
+		set returnValue = Quantidade_Y_PrecoUnitario_Y_ValorTotal_Y_Fornecedor_Y_$$SQLGetFormatDate^VARSQL(Data)_Y_NumOF_Y_NumItemOF
+	}
+	/*
+	While (SQLCODE = 0) {
+		Write id, ":  ", name,!        
+		&sql(FETCH C1)
+	}
+	*/
+ 	&sql(CLOSE C1)
+	quit returnValue
+	
+	
+blnPossuiPedidoCompra(pidCompra)	
+	quit:($$$KEY1(pidCompra = "")) ""
+	new objCompra, idPedidoCompra, blnPossuiPedidoCompra
+	
+	set objCompra = $get(^INAUF(YM,$$$KEY1(pidCompra),1))	
+	set idPedidoCompra = $$$INAUFFREE20(objCompra)
+	
+	if (idPedidoCompra '= "") {
+		set blnPossuiPedidoCompra = $$$YES	
+	} else {
+		set blnPossuiPedidoCompra = $$$NO
+	}
+	
+	quit blnPossuiPedidoCompra
+	
+blnEmpenhoUnico(noEmpenho="",pidCompra)
+	;-------------------------------------------------------------------------------
+	; Called By : OnBeforeSave^VARCompra
+	;            Verifica se já existe o número de Empenho já cadastrado para outra OF
+	; 
+	; History :
+	; 15-Set-2011	Karine	Created
+	;-------------------------------------------------------------------------------
+	new getNoEmpenho, noOrdem, status, getEmpenhoU
+	
+	set status = $$$OK
+	set getOrdens=""
+	
+	if noEmpenho '= "" {
+		$$$Order3(^INAUFs,YM,300,getEmpenho)
+			set getEmpenhoU = $ZCONVERT(getEmpenho,"U")
+				if noEmpenho = getEmpenhoU {
+					
+					$$$Order4(^INAUFs,YM,300,getEmpenho,noOrdem)
+						if noOrdem '= pidCompra {
+							set status="Não é possível salvar."_$c(10)_"Já existe uma OF para esse Empenho."_$char(10)_"Número: "_noOrdem_"."	
+						}
+					$$$End
+				    ;set status="Não é possível salvar."_$c(10)_"Já existe uma OF para esse Empenho."_$char(10)_"Números: "_getOrdens_"."	
+				}
+		$$$End
+	}
+	quit status
+
+
+VerificaCompraPorAta(pidCompra,YFELD)
+	quit:(pidCompra = "")
+	
+	new strStatus, isAcaoJudicial, idCompraLinha, objCompraLinha, idAta, idAtaLinha, precoItemAta,
+		precoItemCompra
+	
+	set strStatus = $$$OK		
+	set isAcaoJudicial = $$$INAUFFREE16(YFELD)
+
+	$$$Order3(^INAUFP,YM,pidCompra,idCompraLinha)
+		
+		set objCompraLinha = $get(^INAUFP(YM,pidCompra,idCompraLinha,1))
+		set idAta = $$$INAUFPFREE20(objCompraLinha)
+		set idAtaLinha = $$$INAUFPFREE21(objCompraLinha)						
+			
+		//Somente em se tratando de ata de registro de preços			
+		continue:(idAta = "")
+		
+		set precoItemAta 	= $$GetPrecoUnitario^VARAtaLinha(idAta,idAtaLinha)					
+		set precoItemCompra = $$$INAUFPFREE7(objCompraLinha)
+		
+		//Somente se não for ação judicial
+		if (isAcaoJudicial '= $$$YES)  {
+					
+			if (precoItemAta '= precoItemCompra) {
+				set strStatus = "Linha "_idCompraLinha_": o preço do item na compra deve ser idêntico ao preço do item na ata."
+				quit
+			}
+		}
+		
+
+	$$$End	
+
+	
+	quit strStatus
+	
+	
+AtualizaOrdemCompraELinhas(pidCompra)
+	;Aplica o rateio dos campos frete, acréscimos e desconto do cabeçalho nas linhas
+	quit:(pidCompra = "") $$$NO
+	
+	new strStatus, objCompra, valorTotalSimples, valorAcrescimoCabecalho, valorDescontoCabecalho,
+		valorFrete, tipoFrete, totalGeralCompra, totalGeralIPI, idLinha, objLinha, quantidade,
+		precoUnitario, valorAcrescimoRateado, valorDescontoRateado, valorFreteRateado,
+		valorAcrescimoProduto, valorDescontoProduto, totalLinhaSemImposto, percentIPI, valorIPI,
+		totalLinhaComImposto, chave
+	
+	set strStatus = $$$OK
+	
+	set objCompra = $get(^INAUF(YM,pidCompra,1))
+
+	set valorTotalSimples = $$getValorTotalSimples(pidCompra) ;Valor total simples = Somatória de (Quantidade x Preço Unitário)
+
+	;Caso as linhas ainda não tenham informação de quantidade e preço, vai embora, mas sem gerar mensagem de erro
+	quit:(valorTotalSimples = "") $$$OK
+	quit:(valorTotalSimples <= 0) $$$OK
+	
+	;Passo 1 – Faz o rateio de desconto e acréscimos, com base em preço unitário x quantidade
+	set valorAcrescimoCabecalho = $$$INAUFSurchargeAmount(objCompra)	
+	set valorDescontoCabecalho  = $$$INAUFFREE24(objCompra)
+	
+	if ( (valorAcrescimoCabecalho > 0) || (valorDescontoCabecalho > 0) ) {	
+		do CalculaRateioDescontoAcrescimos(pidCompra,valorTotalSimples)
+	}
+	
+	;Passo 2 - Faz o rateio de frete, somente se for FOB e o valor do frete estiver preenchido
+	set valorFrete = $$$INAUFFreightAmount(objCompra)
+	set tipoFrete  = $$$INAUFFreightCondition(objCompra)
+	
+	if ( (valorFrete '= "") && (tipoFrete = "FOB") ) {	
+		do CalculaRateioFrete(pidCompra)
+	}
+	
+	/* 
+	;Passo 3 - Calcula o IPI, Total da Linha da Compra e Total da Compra, salva os novos dados na INAUF e INAUFP
+		IPI = x% (preço unitário x quantidade) + Frete (Rateio) + Acréscimo (Rateio) + Acréscimo no Produto - Desconto (Rateio) – Desconto no Produto
+		Total da linha da compra = (preço unitário x quantidade) + Frete (Rateio) + Acréscimo (Rateio) + Acréscimo no Produto - Desconto (Rateio) – Desconto no Produto + IPI
+		Total da compra = Somatória do total das linhas 
+	*/
+
+	set totalGeralCompra = ""
+	set totalGeralIPI 	 = ""
+	
+	$$$Order3(^INAUFP,YM,pidCompra,idLinha)
+		quit:( $$$ISERR(strStatus) )
+		
+		set objLinha = $get(^INAUFP(YM,pidCompra,idLinha,1))
+		
+		set quantidade 	  = $piece(objLinha,Y,5)
+		set precoUnitario = $piece(objLinha,Y,282)
+		
+		set valorAcrescimoRateado = $get(^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLinha,"Acrescimo"))
+		set valorDescontoRateado  = $get(^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLinha,"Desconto"))
+		
+		if tipoFrete = "FOB" {		
+			set valorFreteRateado = $get(^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLinha,"Frete"))		
+		} else {
+			set valorFreteRateado = "" ;Isso tem como objetivo limpar o campo caso o usuário tenha trocado a condição de frete
+		}
+		
+		set valorAcrescimoProduto = $piece(objLinha,Y,299)   ;FREE24
+		set valorDescontoProduto  = $piece(objLinha,Y,298)	 ;FREE23		
+		
+		set totalLinhaSemImposto = (quantidade * precoUnitario) + valorAcrescimoRateado + valorAcrescimoProduto - valorDescontoRateado - valorDescontoProduto + valorFreteRateado
+
+		set percentIPI = $piece(objLinha,Y,336)  ;FREE25
+		
+		if (percentIPI '= "") {
+			set valorIPI = (percentIPI / 100) * totalLinhaSemImposto
+		} else {
+			set valorIPI = $piece(objLinha,Y,300)
+		}
+		
+		set totalLinhaComImposto  = totalLinhaSemImposto + valorIPI
+	
+		//Atualizando os dados rateados, o novo imposto calculado e o novo total na linha
+		set $piece(objLinha,Y,337) = valorAcrescimoRateado
+		set $piece(objLinha,Y,338) = valorDescontoRateado		
+		set $piece(objLinha,Y,297]]><![CDATA[) = valorFreteRateado
+		set $piece(objLinha,Y,300) = valorIPI		
+		set $piece(objLinha,Y,283) = totalLinhaComImposto		
+		
+		set totalGeralCompra = totalGeralCompra + totalLinhaComImposto
+		set totalGeralIPI    = totalGeralIPI + valorIPI
+		
+		set chave = pidCompra_$$$COMMA_idLinha
+		
+		set strStatus = $$$Save("INAUFP",chave,objLinha,$$$YES)	
+	
+	$$$End
+	
+	//Atualizando os dados na compra (cabeçalho)
+	set $piece(objCompra,Y,321) = totalGeralCompra  ;FREE2 (INAUF)
+	set $piece(objCompra,Y,361) = totalGeralIPI		;FREE361 (INAUF)
+		
+	set strStatus = $$$Save("INAUF",pYKEY,objCompra,1)
+	
+	quit strStatus
+
+
+CalculaRateioDescontoAcrescimos(pidCompra,pvalorTotalLinhas)
+	new objCompra, valorAcrescimosCabecalho, valorDescontoCabecalho, quantidade, precoUnitario,
+		valorLinha, pesoDaLinha, valorAcrescimosRateado, valorDescontoRateado
+	
+	set objCompra = $get(^INAUF(YM,pidCompra,1))
+
+	set valorAcrescimosCabecalho = $piece(objCompra,Y,251) ;SurchargeAmount	
+	set valorDescontoCabecalho 	 = $piece(objCompra,Y,358) ;FREE24
+
+	$$$Order3(^INAUFP,YM,pidCompra,idLinha)
+
+		set objLinha = $get(^INAUFP(YM,pidCompra,idLinha,1))
+		
+		set quantidade 	  = $piece(objLinha,Y,5)
+		set precoUnitario = $piece(objLinha,Y,282)
+		
+		set valorLinha = quantidade * precoUnitario		
+		set pesoDaLinha = valorLinha / pvalorTotalLinhas
+
+		set valorAcrescimosRateado = valorAcrescimosCabecalho * pesoDaLinha
+		set valorDescontoRateado   = valorDescontoCabecalho * pesoDaLinha
+		
+		set ^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLinha,"Desconto")  = valorDescontoRateado
+		set ^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLinha,"Acrescimo") = valorAcrescimosRateado
+	
+	$$$End
+
+	quit
+
+CalculaRateioFrete(pidCompra)
+	new objCompra, valorFreteCabecalho, valorTotalAcrescimoDesconto, idLine, objLine, quantidade, 
+		precoUnitario, valorDescontoProduto, valorAcrescimoProduto, valorAcrescimoRateado, 
+		valorDescontoRateado, valorLinha, pesoDaLinha, valorFreteRateado
+	
+	set objCompra = $get(^INAUF(YM,pidCompra,1))
+	set valorFreteCabecalho = $piece(objCompra,Y,183) ;FreightAmount
+
+	set valorTotalAcrescimoDesconto = $$getValorTotalComAcrescimoDesconto(pidCompra)
+
+	$$$Order3(^INAUFP,YM,pidCompra,idLine)
+
+		set objLine = $get(^INAUFP(YM,pidCompra,idLine,1))
+		
+		set quantidade 	  = $piece(objLine,Y,5)
+		set precoUnitario = $piece(objLine,Y,282)
+		set valorDescontoProduto   = $piece(objLine,Y,298)  ;FREE23
+		set valorAcrescimoProduto = $piece(objLine,Y,299)  ;FREE24
+		
+		set valorAcrescimoRateado = $get(^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLine,"Acrescimo"))
+		set valorDescontoRateado  = $get(^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLine,"Desconto"))
+		
+		set valorLinha = (quantidade * precoUnitario) + valorAcrescimoRateado + valorAcrescimoProduto - valorDescontoRateado - valorDescontoProduto
+		set pesoDaLinha = valorLinha / valorTotalAcrescimoDesconto
+		
+		set valorFreteRateado   = valorFreteCabecalho * pesoDaLinha
+		
+		set ^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLine,"Frete")  = valorFreteRateado
+	
+	$$$End
+	
+	quit
+	
+getValorTotalSimples(pidCompra)
+	;Retorna o total de preço x quantidade nas linhas da compra
+	;A ponderação é feita utilizando somente os valores de preço unitário x quantidade
+	quit:(pidCompra = "")
+	
+	new valorTotalSimples, objLinha	, quantidade, precoUnitario, totalLinha, idLinha
+		
+	set valorTotalSimples = ""
+
+	$$$Order3(^INAUFP,YM,pidCompra,idLinha)
+		
+		set objLinha = $get(^INAUFP(YM,pidCompra,idLinha,1))
+		
+		set quantidade 	    = $piece(objLinha,Y,5)
+		set precoUnitario   = $piece(objLinha,Y,282)
+		
+		set totalLinha = quantidade * precoUnitario
+		set valorTotalSimples = valorTotalSimples + totalLinha
+	
+	$$$End
+	
+	quit valorTotalSimples
+	
+getValorTotalComAcrescimoDesconto(pidCompra)
+	;Retorna o total de (preço x quantidade) + acréscimos - descontos nas linhas da compra
+	quit:(pidCompra = "")
+	
+	new valorTotalComAcrescimoDesconto, idLinha, objLinha, quantidade, precoUnitario, valorDescontoProduto,
+	valorAcrescimoProduto, valorAcrescimoRateado, valorDescontoRateado, totalLinha
+		
+	set valorTotalComAcrescimoDesconto = ""
+
+	$$$Order3(^INAUFP,YM,pidCompra,idLinha)
+		
+		set objLinha = $get(^INAUFP(YM,pidCompra,idLinha,1))
+		
+		set quantidade 	    = $piece(objLinha,Y,5)
+		set precoUnitario   = $piece(objLinha,Y,282)
+		set valorDescontoProduto  = $piece(objLinha,Y,298)  ;FREE23
+		set valorAcrescimoProduto = $piece(objLinha,Y,299)  ;FREE24		
+		set valorAcrescimoRateado = $get(^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLinha,"Acrescimo"))
+		set valorDescontoRateado  = $get(^CacheTempRecRateio(YUCI,YUSER,pidCompra,idLinha,"Desconto"))
+		
+		set totalLinha = (quantidade * precoUnitario) + valorAcrescimoRateado + valorAcrescimoProduto - valorDescontoRateado - valorDescontoProduto
+		set valorTotalComAcrescimoDesconto = valorTotalComAcrescimoDesconto + totalLinha
+	
+	$$$End
+	
+	quit valorTotalComAcrescimoDesconto		
+	
+OnAfterPrimaryKey(pYKEY,pYFELD="")
+	quit:(pYKEY = "")
+	if ($$CheckCompraEncerrada(pYKEY) '= 0){
+		do ShowMensagemEncerrado(pYKEY)
+	}
+	quit
+	
+ShowMensagemEncerrado(pYKEY)
+	quit:(pYKEY = "")
+	
+	new Motivo
+	
+	set Motivo = $$GetMotivo^VARINAUFPCLOSE(pYKEY)
+	w "<div style=border-color:999999;border-width:1px;border-style=solid;background-color:#E0E0E0;margin-top:5px;margin-bottom:5px;padding-top:4px;padding-right:12px;padding-bottom:4px;padding-left:12px>"
+	w "	<font color=red size=2>"
+	w "		Atenção: a ordem de compra foi encerrada manualmente por <strong>"_$piece(Motivo,Y,2)_"</strong> em <strong>"_$zdate($piece(Motivo,Y,3),4)_"</strong>. Clique no botão 'Encerrar' para ver os detalhes."
+	w "	</font>"
+	w "</div>"	
+	quit
+	
+CheckCompraEncerrada(pYKEY)
+	new Encerrada
+	
+	set Encerrada = 0
+	
+	&SQL(
+	 SELECT count(*)
+	 INTO qtManualyClosed
+	 FROM SQLUser.INAUFP
+	 WHERE
+	 	INAUFP.OrderNo = :pYKEY
+	 	AND INAUFP.LineItemManualyClosed = 1
+	)
+	if 'SQLCODE {
+		set Encerrada = qtManualyClosed
+	}
+	quit Encerrada
+	
+CheckCompraLinhas(pYKEY)
+	new Qty
+	
+	set Qty = 0
+	
+	&SQL(
+	 SELECT count(*)
+	 INTO qtManualyClosed
+	 FROM SQLUser.INAUFP
+	 WHERE
+	 	INAUFP.OrderNo = :pYKEY
+	)
+	if 'SQLCODE {
+		set Qty = qtManualyClosed
+	}
+	quit Qty
+	
+isAlgumItemEncerrado(pYKEY)
+	new qtEncerrados
+	set qtEncerrados = 0
+	
+	&SQL(
+	 SELECT count(*)
+	 INTO qtManualyClosed
+	 FROM SQLUser.INAUFP
+	 WHERE
+	 	INAUFP.OrderNo = :pYKEY
+	 	AND INAUFP.LineItemManualyClosed = 1
+	)
+	if 'SQLCODE {
+		set qtEncerrados = qtManualyClosed
+	}
+	quit qtEncerrados
+
+getQuantidadeRestante(pidCompra,idCompraLinha)
+	quit:( (pidCompra = "") || (idCompraLinha = "") ) ""
+	$$$VAR
+	
+	new objCompraLinha, qtyComprada, qtyTotalRecebida, qtyTotalEstornada, qtyRestante
+	
+	set objCompraLinha = $get(^INAUFP(YM,pidCompra,idCompraLinha,1))
+	
+	;Se o item estiver encerrado, a quantidade restante = 0
+	set blnEncerrado = $$$INAUFPLineItemManualyClosed(objCompraLinha)
+	quit:(blnEncerrado = $$$YES) 0
+	
+    set qtyComprada       = $$$INAUFPQuantity(objCompraLinha)
+	set qtyTotalRecebida  = $$getQuantidadeRecebida(pidCompra,idCompraLinha)
+	set qtyTotalEstornada = $$getQuantidadeEstornada(pidCompra,idCompraLinha) 
+	
+	set qtyRestante = qtyComprada - qtyTotalRecebida + qtyTotalEstornada
+	quit qtyRestante
+
+isItemEncerrado(pOrder,pItem)
+	new status
+	set status = $$$NO
+	
+	&SQL(
+	 SELECT LineItemManualyClosed
+	 INTO LineItemManualyClosed
+	 FROM SQLUser.INAUFP
+	 WHERE
+	 	INAUFP.OrderNo = :pOrder
+	 	AND INAUFP.ItemNumber = :pItem
+	 	AND INAUFP.LineItemManualyClosed = 1
+	)
+	if 'SQLCODE {
+		set status = $$$YES
+	}
+	quit status
+]]></Routine>
+</Export>

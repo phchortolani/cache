@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTFRButtons" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTFRButtons
+	
+#include COMSYS
+#include COMConst
+#include INConst
+	
+CanCreateReversal(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Determines whether the Transfer Order can be reversed.
+	; Reasons for preventing reversal of quantity on lines from being allowed
+	;  - Current Location must be the sending location
+	;  - Status must be sent or received
+	;  - If Status is received there must be at least one transfer
+	;     order line where
+	;         the received quantity is zero, and
+	;         (base quantity less reversal quantity) is non-zero
+	;
+	; Params:
+	;	pidTFR	Key of header record
+	;
+	; ByRefs:
+	;	YQ		Button management
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 30-Jun-2011	GRF		SR17770: Allow reversal of any balance after receipt
+	; 27-Jan-2009	HQN		SR16296: Reversable should match against shipped qty
+	; 							for sent state
+	; 22-Oct-2008	GRF		SR16003: strStatus should be $$$MakeStatus for correct
+	; 							processing by $$$YQHandler
+	; 07-Oct-2008	HQN		SR16003: Can't reverse fully reversed lines
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new arrDummy,blnOpenLineFound,idSendingLocn,objTFR,strStatus,strTfrStatus
+	new idTfrLine,idTfrPickLine,fltQtyReversed,blnReversable,fltQtyShipped,objTfrLine,objTfrPickLine
+	
+	set strStatus = $$$OK
+	
+	if $$$NoKey(pidTFR) {
+		set strStatus = $$$MakeStatus(32072)    ; "Please Select A Data Record First."
+	
+	} else {
+		set objTFR = $get(^INTFR(0,pidTFR,1))
+		set idSendingLocn = $$$INTFRSendingLocation(objTFR)
+		
+		if idSendingLocn '= YLOCATION {
+			set strStatus = $$$MakeStatus("IN00431",idSendingLocn,YLOCATION)
+		;	 "Action must be performed from Sending Location %1. Current location is %2."
+		
+		} else {
+			set strTfrStatus = $$$INTFRStatus(objTFR)
+			if (strTfrStatus = 0) || (strTfrStatus = 1) {    ; Created, Firmed
+				set strStatus = $$$MakeStatus("IN00735")        ; "Transfer needs to be Sent before Reversal can occur"
+				
+			} elseif strTfrStatus = 2 {                      ; Sent
+				set idTfrPickLine  = ""
+				set fltQtyReversed = 0
+				set blnReversable  = $$$NO
+				for {
+					set idTfrPickLine = $order(^INTFRPickLine(0,pidTFR,idTfrPickLine))
+					quit:idTfrPickLine=""
+					
+					set objTfrPickLine = $get(^INTFRPickLine(0,pidTFR,idTfrPickLine,1))
+					set fltQtyReversed($$$INTFRPickLineSourceline(objTfrPickLine)) = $get(fltQtyReversed($$$INTFRPickLineSourceline(objTfrPickLine))) + $$$INTFRPickLineReversalQuantity(objTfrPickLine)
+				}
+				set idTfrLine = ""
+				for {
+					set idTfrLine = $order(fltQtyReversed(idTfrLine))
+					quit:idTfrLine=""
+					
+					set objTfrLine = $get(^INTFRLine(0,pidTFR,idTfrLine,1))
+					set fltQtyShipped = 0
+					set idTfrPickLine = ""
+					for { ; FIXME: Use index 1
+						set idTfrPickLine = $order(^INTFRPickLine(0,pidTFR,idTfrPickLine))
+						quit:idTfrPickLine=""
+						
+						set objTfrPickLine = $get(^INTFRPickLine(0,pidTFR,idTfrPickLine,1))
+						if $$$INTFRPickLineSourceline(objTfrPickLine) = idTfrLine {
+							set fltQtyShipped = fltQtyShipped + $$$INTFRPickLinePickedQuantity(objTfrPickLine)
+						}
+					}
+					if fltQtyReversed(idTfrLine) + $$$INTFRLineReceivedQuantity(objTfrLine) '= fltQtyShipped { ;$$$INTFRLineQuantity(objTfrLine) {
+						set blnReversable = $$$YES
+					}
+				}
+				
+				if 'blnReversable {
+					set strStatus = $$$MakeStatus("IN00736")
+				} ; "No lines on transfer are available to reverse"
+				
+			} elseif strTfrStatus = 3 {                      ; Received
+		;		set blnOpenLineFound = $$GetOpenLines^INTFRRevLine(pidTFR,.arrDummy)   ; SR17770
+				set blnOpenLineFound = $$GetOpenPickLines^INTFRRevLine(pidTFR,.arrDummy)
+				if 'blnOpenLineFound {
+					set strStatus = $$$MakeStatus("IN00736")
+				} ; "No lines on transfer are available to reverse"
+			}
+		}
+				
+		;	lock +^INTFR(YM,pidTFR,1):1
+		;	if $test {
+		;		lock -^INTFR(YM,pidTFR,1)#"I"
+		;	} else {
+		;		set strStatus = $$$MakeStatus("IN00530",pidTFR)  ; Unable to lock Transfer Order '%1'.
+		;	}
+	}
+	$$$YQHandler(strStatus)
+	quit	
+	
+	
+CreateReversal(pidTFR)
+	;-------------------------------------------------------------------------------
+	; Create Transfer Reversal
+	; 
+	; NOTE: Reason for not calling CreateReceipt^INTFRInterface directly from form def
+	;		is so that a common interface is used.
+	;
+	; Params:
+	;	pidTFR - Transfer Id
+	;
+	; ByRefs: None
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 28-Feb-2008	GRF		SRBR014859: Created
+	;-------------------------------------------------------------------------------
+	new idRevSeq
+	
+	if $$OpenReversal^INTFRRev(pidTFR,.idRevSeq) {
+		do GoToForm^COMUtilForm("INTFRRev",pidTFR_","_idRevSeq)
+		
+	} elseif $$$ISOK($$Transaction^COMTransaction("CreateReversalTxn^INTFRRevLine("""_pidTFR_""")",$$$YES)) {
+		do GoToForm^COMUtilForm("INTFRRev",$get(^CacheTempINTFRRev(YUCI,YUSER)))
+	}
+	kill ^CacheTempINTFRRev(YUCI,YUSER)
+	quit
+	
+]]></Routine>
+</Export>

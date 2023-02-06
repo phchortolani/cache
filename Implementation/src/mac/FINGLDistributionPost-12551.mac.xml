@@ -1,0 +1,464 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLDistributionPost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLDistributionPost
+	#Include FINConst
+	#Include FIN
+	;-------------------------------------------------------------------------------
+	; History:
+	; 07-Mar-2007	GRF		Highlight transaction processing; align }
+	;-------------------------------------------------------------------------------
+	
+PostDistributions() // ??? Is this in use, is this for DEV purposes if so should be DEV code
+	; run by the scheduler to post incomplete distributions.
+	new dtePosted,lngTransactions,idDistribution,strStatus,lngProcessed,lngSuccessful,strMessage
+	
+	set dtePosted=" "
+	do ^WWWVAR
+	set lngTransactions = 0
+	set lngSuccessful   = 0
+	set lngProcessed    = 0
+	for {
+		set dtePosted=$order(^FINGLDistributions(YM,2,dtePosted))
+		quit:dtePosted=""
+		
+		set idDistribution=""
+		for {
+			set idDistribution=$order(^FINGLDistributions(YM,2,dtePosted," ",idDistribution))
+			quit:idDistribution=""
+			
+			set lngProcessed=lngProcessed+1
+			set strStatus=$$Post(idDistribution,.lngTransactions)
+			if strStatus=1 {
+				do RemoveError^COMUtilError("FINGLDistribution",idDistribution)
+				set lngSuccessful=lngSuccessful+1
+			}
+			if strStatus'=1 {
+				do RaiseError^COMUtilError(strStatus,"FINGLDistribution",idDistribution)
+			}	
+		}
+	}
+	set strMessage=$$$Text($listbuild("Fin00139",lngProcessed,lngSuccessful,lngTransactions))  ; Distribution/Accrual: %1 Distribution(s) processed, %2 successful, %3 Transactions
+	quit strMessage
+	
+Post(pidDistribution,plngTransactions)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Oct-2006	JW		SR15134: Cleaned up
+	; 01-Mar-2004	SCR		Handle Location Prefix on Transactions
+	;-------------------------------------------------------------------------------
+	new lstHeader,objDistribution,curTotal,lngNumPeriods,idPeriod,objPeriodType
+	new strStatus,idPeriodType,dteStartDate,lngPeriodLoop,dteDistributionDate,objPeriod
+	
+	set $ztrap="PostDistributionError"
+	
+	;***************************************
+	tstart
+	;***************************************
+	
+	set strStatus=$$$OK
+	if pidDistribution'="" {
+		if $data(^FINGLDistribution(YM,pidDistribution,1)) {
+			set objDistribution = $get(^FINGLDistribution(YM,pidDistribution,1))
+			if $$$FINGLDistributionPosted(objDistribution)'="" {
+				set lngNumPeriods = $$$FINGLDistributionNumberofPeriods(objDistribution)
+				set idPeriod      = $$$FINGLDistributionPeriodStart(objDistribution)
+				set idPeriodType  = $$$FINGLDistributionPeriodType(objDistribution)
+				set objPeriodType = $get(^FINGLPeriodType(YM,idPeriodType,1))
+				for lngPeriodLoop=1:1:lngNumPeriods {
+					set objPeriod=$get(^FINGLPeriod(YM,idPeriod,1))
+					set dteStartDate=$$$FINGLPeriodStartDate(objPeriod)
+					if dteStartDate'>$horolog {
+						if $$FindTransaction(pidDistribution,dteStartDate,$$$EnumFINGLDISTRIBUTIONHISTORYAccruedTransaction)="" {
+							set strStatus=$$PostAccrued(pidDistribution,dteStartDate,.plngTransactions)
+						}
+					}
+					quit:$$$ISERR(strStatus)
+					set idPeriod=$$GetNextPeriod^FINGLPeriod(idPeriodType,idPeriod)
+					if (idPeriod="") && (lngNumPeriods'=lngPeriodLoop) {
+						set strStatus=$listbuild("Fin00118",$$$FINGLPeriodTypeDescription(objPeriodType))  ; Unable to continue, ran out of periods for period type %1.
+					}
+					quit:idPeriod=""
+					quit:$$$ISERR(strStatus)
+				}
+				set dteDistributionDate=$$$FINGLDistributionDistributionDate(objDistribution)
+				if $$$ISOK(strStatus) {
+					if dteDistributionDate'>$horolog {
+						if $$FindTransaction(pidDistribution,dteDistributionDate,$$$EnumFINGLDISTRIBUTIONHISTORYTransactionReversal)="" {
+							set strStatus=$$PostReverse(pidDistribution,.plngTransactions)
+						}
+					}
+				}
+			}
+		}
+	}
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+	} else {
+		trollback
+	}
+	quit strStatus
+	
+PostDistributionError
+	trollback
+	quit $lb($zerror)
+ 
+FindTransaction(pidDistribution,pdteTransDate,pEnumTransType)  ;look for an accrued transaction that matches this date
+	new idTran,objDistributionHistory
+	
+	set idTran=""
+	for {
+		set idTran=$order(^FINGLDistributionHistory(YM,pidDistribution,idTran))
+		quit:idTran=""
+		
+		set objDistributionHistory=$get(^FINGLDistributionHistory(YM,pidDistribution,idTran,1))
+		if $$$FINGLDistributionHistoryDistributionTransactionTy(objDistributionHistory)=pEnumTransType {
+			quit:$$$FINGLTranTransactionDate($get(^FINGLTran(YM,idTran,1)))=pdteTransDate
+		}
+	}
+	quit idTran
+	
+PostAccrued(pidDistribution,pdteTransDate,&plngTransactions)
+	;-------------------------------------------------------------------------------
+	; Post the Accrual Distribution.
+	;
+	; Params:
+	; pidDistribution : The id of the FINGLDistribution
+	; pdteTransDate   : The transaction date to post to
+	; plngTransactions: The number of transactions
+	;
+	; ByRefs:
+	; plngTransactions
+	;
+	; Returns:
+	; strStatus: $$$OK no errors, anything else are errors
+	;
+	; History:
+	; 14-Jun-2006	RPW		SR14642: Updated to use Batches instead of direct GL Accounts
+	; 31-Oct-2005	PO		SR12776: Only allow transactions accounts for manual account selection.
+	; 25-Jun-2004	shobby	Foreign Currency.
+	;-------------------------------------------------------------------------------
+	new strStatus,idAccount,fltWeight,curTotal,objDistribution,objDistributionAccount,curAmount,objDistributionHistory
+	new curDebit,lngAccounts,curCredit,idBatch,idBlock,strDistribution,idTran
+	
+	set strStatus=$$$OK
+	
+	set $ztrap="PostAccruedError"
+ 
+	;***************************************
+	tstart
+	;***************************************
+	
+	set idTran      = ""
+	set strStatus   = $$CreateBatch(pidDistribution,pdteTransDate,.idBatch,.idBlock) // SR14642
+	set idAccount   = ""
+	set fltWeight   = $$GetTotalWeighting^FINGLDistributionAccount(pidDistribution)
+	set curTotal    = $$GetRoundedTotal^FINGLDistribution(pidDistribution)
+	set objDistribution=$get(^FINGLDistribution(YM,pidDistribution,1))
+	set curDebit    = $select(curTotal<0:-curTotal,1:0)
+	set curCredit   = $select(curTotal>0:curTotal,1:0)
+	set lngAccounts = $$GetNumberOfAccounts^FINGLDistributionAccount(pidDistribution)
+	if $$$ISOK(strStatus) set strStatus=$$CreateLine(idBatch,idBlock,pidDistribution,$$$FINGLDistributionContraAccount(objDistribution),curDebit,curCredit,$$^WWWTEXT("Fin00120"))  ; Accrual Account // SR14642
+	
+	set strDistribution=$$^WWWTEXT("Fin00121")
+	
+	if $$$ISOK(strStatus) {
+		for {
+			set idAccount=$order(^FINGLDistributionAccount(YM,pidDistribution,idAccount))
+			quit:idAccount=""
+			
+			set objDistributionAccount=$get(^FINGLDistributionAccount(YM,pidDistribution,idAccount,1))
+			set curAmount   = $$Round^COMUtils($select(fltWeight:$$$FINGLDistributionAccountWeighting(objDistributionAccount)/fltWeight*curTotal,1:curTotal/lngAccounts))
+			set curTotal    = curTotal-curAmount
+			set lngAccounts = lngAccounts-1
+			set fltWeight   = fltWeight-$$$FINGLDistributionAccountWeighting(objDistributionAccount)
+			set curDebit    = $select(curAmount>0:curAmount,1:0)
+			set curCredit   = $$$FCSign($select(curAmount<0:curAmount,1:0))
+			set strStatus   = $$CreateLine(idBatch,idBlock,pidDistribution,idAccount,curDebit,curCredit,strDistribution)  ; Distribution Account // SR14642
+			quit:strStatus'=1
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		 // SR14642
+		set strStatus = $$PostBlock^FININTBatch(idBatch,idBlock)
+		if $$$ISOK(strStatus) {
+			set strStatus = $$PostBatch^FININTBatch(idBatch,"DIS",.idTran)
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set objDistributionHistory=""
+		set $$$FINGLDistributionHistoryDistributionTransactionTy(objDistributionHistory)=$$$EnumFINGLDISTRIBUTIONHISTORYAccruedTransaction
+		set strStatus=$$$Save("FINGLDistributionHistory",pidDistribution_","_idTran,objDistributionHistory,1)
+	}
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+		set plngTransactions=plngTransactions+1
+	}
+	if strStatus'=1 trollback
+	quit strStatus
+	
+PostAccruedError ; Internal Tag
+	trollback
+	
+	quit $lb($zerror)
+	
+CreateBatch(pidDistribution,pdteTransDate,&pidBatch,&pidBlock)
+	;-------------------------------------------------------------------------------
+	; Add this distribution to an interface batch instead of going directly to the
+	; GL Journal
+	;
+	; Params:
+	; pidDistribution: The id of the FINGLDistribution
+	; pdteTransDate  : The date of the posting
+	; pidBatch       : The id of the FININTBatch
+	; pidBlock       : The id of the FININTBatchBlock
+	;
+	; ByRefs:
+	; pidBatch
+	; pidBlock
+	;
+	; Returns:
+	; strStatus: $$$OK no errors, anything else are errors
+	;
+	; History:
+	; 13-Jun-2006	RPW		SR14642: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,objDistribution,idCreator,idBankAccount,strDetail,strForm,idBatch,idBlock
+	
+	set objDistribution=$get(^FINGLDistribution(YM,pidDistribution,1))
+	
+	set idCreator     = $$$FINGLDistributionCreatedBy(objDistribution)
+	set strDetail     = "Fin01042"_$$$COMMA_pidDistribution                     ; Distribution & Accrual %1
+	set strForm		  = $$CheckForm^FINUtils($get(YFORM),"FINGLDistribution")	; Get the form using YFORM, with validation
+	set strStatus     = $$Allocate^FININTBatch(.pidBatch,.pidBlock,"GLDIS",,pdteTransDate,,idCreator,,strForm,pidDistribution,strDetail) ; SR13087
+	
+	quit strStatus
+	
+CreateLine(pidBatch,pidBlock,pidDistribution,pidAccount,pcurDebit,pcurCredit,pstrAccountType)
+	;-------------------------------------------------------------------------------
+	; Add this line to the BatchLine
+	;
+	; Params:
+	; pidBatch       : The id of the FININTBatch
+	; pidBlock       : The id of the FININTBatchBlock
+	; pidDistribution: The id of the FINGLDistribution
+	; pidAccount     : The id of the FINGLAccount
+	; pcurDebit      : The amount for debitting
+	; pcurCredit     : The amount for crediting
+	; pstrAccountType: The reference
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; strStatus: $$$OK no errors, anything else are errors
+	;
+	; History:
+	; 14-Jun-2006	RPW		SR14642: Created
+	;-------------------------------------------------------------------------------
+	new curAmount,objParameters,strStatus
+	
+	set curAmount=$select($$$FCZero(pcurCredit):$$$FCSign(pcurDebit),1:pcurCredit)
+		
+	set $piece(objParameters,",",1)=pidDistribution
+	set $piece(objParameters,",",2)=pidAccount
+	set $piece(objParameters,",",8)=pstrAccountType
+ 
+	set strStatus=$$AddLine^FININTBatch(pidBatch,pidBlock,pidAccount,curAmount,"DIS",objParameters,pidDistribution_$$$COMMA_pidAccount,pstrAccountType)
+		
+	quit strStatus
+		
+GetRoundedTotal(pidDistribution)
+	new objDistribution,curTotal,numPeriods,idAccuredAccount,idTran,idTranLine,objTranLine,objTran
+	
+	set curTotal=0
+	set numPeriods=1
+	if pidDistribution'="" {
+		if $data(^FINGLDistribution(YM,pidDistribution,1)) {
+			set objDistribution=$get(^FINGLDistribution(YM,pidDistribution,1))
+			set curTotal=$$$FINGLDistributionAmount(objDistribution)
+			set numPeriods=$$$FINGLDistributionNumberofPeriods(objDistribution)
+			set idAccuredAccount=$$$FINGLDistributionContraAccount(objDistribution)
+			set idTran=""
+			for {
+				set idTran=$order(^FINGLDistrbutionHistory(YM,pidDistribution,idTran))
+				quit:idTran=""
+				
+				if $$$FINGLDistributionHistoryDistributionTransactionTy($get(^FINGLDistrbutionHistory(YM,pidDistribution,idTran,1)))=$$$EnumFINGLDISTRIBUTIONHISTORYAccruedTransaction {
+					set objTran=$get(^FINGLTran(YM,idTran,1))
+					set idTranLine=""
+					for {
+						set idTranLine=$order(^FINGLTranLine(YM,idTran,idTranLine))
+						quit:idTran=""
+						
+						set objTranLine=$get(^FINGLTranLine(YM,idTran,idTranLine,1))
+						quit:$$$FINGLTranLineAccount(objTranLine)=idAccuredAccount
+					}
+					set curTotal=curTotal-$$$FINGLTranLineDebit(objTranLine)-$$$FINGLTranLineCredit(objTranLine)
+					set numPeriods=numPeriods-1
+				}
+			}
+		}
+	}
+	
+	quit $select(numPeriods=0:0,1:$$Round^COMUtils(curTotal/numPeriods))
+	
+PostReverse(pidDistribution,plngTransactions)
+	;-------------------------------------------------------------------------------
+	; Post the Reversal Distribution.
+	;
+	; Params:
+	; pidDistribution : The id of the FINGLDistribution
+	; plngTransactions: The number of transactions
+	;
+	; ByRefs:
+	; plngTransactions
+	;
+	; Returns:
+	; strStatus: $$$OK no errors, anything else are errors
+	;
+	; History:
+	; 14-Jun-2006	RPW		SR14642: Updated to use Batches instead of direct GL Accounts
+	;-------------------------------------------------------------------------------
+	new strStatus,idTran,idAccount,fltWeight,curTotal,objDistribution,objDistributionAccount,curAmount,objDistributionHistory
+	new idBatch,idBlock
+ 
+ 	set $ztrap="PostReverseError"
+	
+	;***************************************
+	tstart
+	;***************************************
+	
+	set strStatus=$$$OK
+	set idTran=""
+	set objDistribution=$get(^FINGLDistribution(YM,pidDistribution,1))
+	
+	set strStatus=$$CreateBatch(pidDistribution,$$$FINGLDistributionDistributionDate(objDistribution),.idBatch,.idBlock) // SR14642
+	set curTotal=$$$FINGLDistributionAmount(objDistribution)
+	if $$$ISOK(strStatus) set strStatus=$$CreateLine(idBatch,idBlock,pidDistribution,$$$FINGLDistributionContraAccount(objDistribution),$select(curTotal>0:curTotal,1:0),-$select(curTotal<0:curTotal,1:0),$$^WWWTEXT("Fin00120"))  ; Distribution Account // SR14642
+	if $$$ISOK(strStatus) set strStatus=$$CreateLine(idBatch,idBlock,pidDistribution,$$$FINGLDistributionSourceAccount(objDistribution),-$select(curTotal<0:curTotal,1:0),$select(curTotal>0:curTotal,1:0),$$^WWWTEXT("Fin00122"))  ; Distribution Account // SR14642
+	if $$$ISOK(strStatus) {
+		 // SR14642
+		set strStatus = $$PostBlock^FININTBatch(idBatch,idBlock)
+		if $$$ISOK(strStatus) {
+			set strStatus = $$PostBatch^FININTBatch(idBatch,"DIS",.idTran)
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		set objDistributionHistory=""
+		set $$$FINGLDistributionHistoryDistributionTransactionTy(objDistributionHistory)=$$$EnumFINGLDISTRIBUTIONHISTORYTransactionReversal
+		set strStatus=$$$Save("FINGLDistributionHistory",pidDistribution_","_idTran,objDistributionHistory,1)
+	}
+	
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+		set plngTransactions=plngTransactions+1
+	} else {
+		trollback
+	}
+	quit strStatus
+	
+PostReverseError ; Internal Tag
+	trollback
+	quit $listbuild($zerror)
+ 
+SetPostedFlag(pidDistribution="")
+	;-------------------------------------------------------------------------------
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Oct-2006	JW		SR15134: Cleaned up
+	;-------------------------------------------------------------------------------
+	new objDistribution,strStatusm,lngTrans,strStatus,blnPost,intStatus
+ 
+	set blnPost=1
+	set intStatus=""
+	
+	;***************************************
+	tstart
+	;***************************************
+	
+	if pidDistribution="" {
+		set strStatus=$$$Text("Fin00089")  ;No Record Selected.
+	} else {
+		set objDistribution=$get(^FINGLDistribution(YM,pidDistribution,1))
+		set strStatus=$$Editable^FINSYSReview("FINGLDistribution",$$$FINGLDistributionStatus(objDistribution),.blnPost,.intStatus)
+		
+		if $$$ISOK(strStatus)&&(blnPost) {
+			set $$$FINGLDistributionPosted(objDistribution)=$horolog
+			set strStatus=$$$Save("FINGLDistribution",pidDistribution,objDistribution)
+			if $$$ISOK(strStatus) set strStatus=$$Post(pidDistribution,0)
+		}
+		if $$$ISOK(strStatus) {
+			set $$$FINGLDistributionStatus(objDistribution)=intStatus
+			set strStatus=$$$Save("FINGLDistribution",pidDistribution,objDistribution)
+		}
+	}
+ 
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit	
+		do ^WWWFORM
+	} else {
+		trollback
+		do ReturnError^COMUtils(strStatus)
+	}
+	quit
+ 
+ 
+UnPost(pidDistribution)
+	;not used by front end.
+	new objDistribution
+	
+	if pidDistribution '="" {
+		set objDistribution=$get(^FINGLDistribution(YM,pidDistribution,1))
+		set $$$FINGLDistributionPosted(objDistribution)=""
+		do Save^FINSYS("FINGLDistribution",pidDistribution,objDistribution)
+	}
+ 	quit 
+ 	
+Postable(pidDistribution)
+	new objDistribution,strStatus
+	
+	set strStatus=1
+	if pidDistribution'="" {
+		if $data(^FINGLDistribution(YM,pidDistribution,1)) {
+			set objDistribution=$get(^FINGLDistribution(YM,pidDistribution,1))
+			if $$$FINGLDistributionSourceAccount(objDistribution)="" {
+				set strStatus=$listbuild("Fin00126")  ; Must Have a Source Account
+			} else {
+				if $$$FINGLDistributionDistributionDate(objDistribution)=""          set strStatus=$listbuild("Fin00130")  ; Must have a distribution date
+				if +$$$FINGLDistributionAmount(objDistribution)=0                    set strStatus=$listbuild("Fin00129")  ; Must have an amount to distribute
+				if ($$$FINGLDistributionPeriodStart(objDistribution)="") || ($$$FINGLDistributionNumberofPeriods(objDistribution)<1) set strStatus=$listbuild("Fin00128") ; Must have an Accruing Period
+				if $$GetNumberOfAccounts^FINGLDistributionAccount(pidDistribution)=0 set strStatus=$listbuild("Fin00127")  ; Must have at least one Destination Account
+			}
+		} else {
+			set strStatus=$listbuild("Fin00133")  ; Save required.
+		}
+	} else {
+		set strStatus=$listbuild("Fin00133")  ; Save required.
+	}
+	
+	if strStatus=1 set strStatus=$$Editable^FINSYSReview("FINGLDistribution",$$$FINGLDistributionStatus(objDistribution))
+	
+	if strStatus=1 {
+		set YQ=0
+	} else {
+		set YQ="1 "_$$$Text(strStatus)
+	}
+	quit strStatus
+	
+]]></Routine>
+</Export>

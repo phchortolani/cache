@@ -1,0 +1,709 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INSHIPINFOCOSTS" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INSHIPINFOCOSTS
+#include COMSYS
+#include INConst
+#include FINConst
+	
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		CALCULATE ESTIMATED COSTS FOR IMPORT
+	; 
+	; Called by : 
+	; 	Routines : INAUFPA			(from Edit Order Confirmation)
+	; 	           INSHIPINFOALL
+	; 
+	; Inputs : 
+	;	YKEY		Import "," Type
+	;	YFELD		objINSHIPINFOCOSTS
+	;	
+	; ByRef :
+	;
+	;
+	; Returns :
+	; 
+	; FIXME : 	Do we really want the Type code to be hard-coded to "CUSTOMS"?  Although
+	; SR15140	the text can be internationalised, INPARA is user definable and "CUSTOMS"
+	;         	could be deleted and re-entered under a different code.  Should there be
+	;         	some other way of listing them?                             <GRF>
+	;         
+	; TODO  : save $p(objINAUFP,Y,4) into some "ItemNo" variable after checking called
+	;         routines don't use the "ItemNo" variable without newing it. <GRF>
+	;
+	; History :
+	; 13-Oct-2006	GRF		SR15107: quit inside IF reversed in logic and made new IF test 
+	; 11-Oct-2006	GRF		SR15107: Split INSHIPINFOCOSTSCustoms as separate routine
+	; 11-Oct-2006	GRF		SR15107: Split INSHIPINFOCOSTSAllocn as separate routine
+	; 10-Oct-2006	GRF		SR15107: Split AllocateOrderLine et al from main routine;
+	; 						Correct GetCurrentCost to generate line by line costs;
+	; 						arrCustoms(AUF_","_POS) => arrCustoms(AUF,POS)
+	; 09-Oct-2006	GRF		SR15107: Justify Average Cost amendment to 2dp
+	; 13-Sep-2006	GRF		SR15035: Replace arrCustoms(POS) with arrCustoms(AUF_","_POS)
+	; 14-Jul-2006	GRF		SR14707: Set KOST from new subr GetCurrentCost
+	; 13-Jul-2006	GRF		SR14707: Index parameters not present in Data test;
+	; 						Superfluous "DO" removed; Replace Naked Reference
+	; 04-Jul-2006	GRF		SR14707: idAllocMethod text not required
+	; 14-Jun-2006	GRF		SR14707: Revised code; Extracted update; eliminate
+	; 						naked references
+	; 13-Jun-2006	GRF		SR14707: Add call to INShipVal; use macros
+	; 06-Feb-2006	JW		SR14263: Divide by zero error
+	; 01-Feb-2006	GRF		SR14203: Revise^INARTAVG extracted from INERECH1 & INSHIPINFOCOSTS
+	; 27-Jan-2006	GRF		SR14203: Doco
+	; 09-Jan-2006	JW		SR14097: Apportion costs correctly
+	; 04-Jan-2006	JW		SR14066: YFELD is a INSHIPINFOCOSTS record, not INSHIPINFO.
+	; 26-Aug-2005	GRF		Close up gap in dot levels
+	; 30-May-2005	RobertW	SR12056: Attempt at Performance Increase
+	; 14-Apr-2005	shobby	Included Recalculate Average costs code as per email from Mr Fischer.		
+	; 30.03.2005			INTRAPREND;SERVICE 10641 : FIXED BUG CHANGING FIELD 10 
+	; 01.09.2004	FIS		25736: Created
+	;-------------------------------------------------------------------------------
+	; 
+	; CUSTOMS CALCULATION
+	; 
+	;   Edit Import Costs (Form : INSHIPINFOCOSTS)
+	;     Estimate and Actual Costs are the total duty for ALL dutiable lines assigned
+	;     to the Import Shipment.
+	;   Edit Incoming Goods (Form : INWEAUFVOR / INWEAUF)
+	;     "Edit Details" from Supplier Receipt grid.
+	;     Unit Price and CDV may alter from when order was placed & defaults.
+	;   
+	;   Actual Cost should be the sum of the CDV's but if there is a discrepancy the
+	;   Actual Cost is used and distributed proportionally across the order lines based
+	;   on the calculated value (Qty * CDV * Rate of Duty) for each line
+	; 
+	;-------------------------------------------------------------------------------
+	new arrCustoms,AUF,blnCustoms,CONID,CONTYPE,COST,CountryOfOrigin
+	new idAllocMethod,idxIMPORT,IMPORT,objINAUFP,POS,POSANZ,TOTAL,TYPE
+	
+	set IMPORT = $PIECE($GET(YKEY),",",1)			quit:IMPORT=""		;IMPORT NO. ;importation 
+	set TYPE   = $PIECE($GET(YKEY),",",2)			quit:TYPE=""		;COST TYPE  ;letter 
+	set YFELD  = $GET(YFELD)						quit:YFELD=""
+	
+	set idxIMPORT = $$^WWWUMLAU(IMPORT,1)
+	;+++++++++++++++++++++++++++++++++++++++
+	;  YFELD	objINSHIPINFOCOSTS
+	;  SATZ		objINERECH1
+	;  WE1		objINWEAUF
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	;-------------------------------------------------------------------------------
+	;  Step 1 : Update Estimated Cost in INSHIPINFOCOSTS using either a percentage
+	;           of the order line value or on container costs
+	;-------------------------------------------------------------------------------
+	do ReviewEstimatedCost(IMPORT,TYPE,YKEY,YFELD,idxIMPORT)
+	
+	;-------------------------------------------------------------------------------
+	;  Step 2 :  ALLOCATE COSTS TO LINE ITEMS     -     AUFTEILEN KOSTEN ZU AUFTRAGSPOSITIONEN
+	;-------------------------------------------------------------------------------
+	
+	; If COSTS AVAILABLE, INVOICE NOT POSTED
+	;---------------------------------------
+	if (+$$$INSHIPINFOCOSTSActualCosts(YFELD)'=0)      &&
+	    ($$$INSHIPINFOCOSTSServiceSupplier(YFELD)'="") &&
+	    ($$$INSHIPINFOCOSTSInvoiceNumber(YFELD)'="")   &&
+	    ($$$INSHIPINFOCOSTSInvoicePosted(YFELD)="")       {
+		set idAllocMethod = +$$$INSHIPINFOCOSTSAllocationMethod(YFELD)      ; D9
+		set blnCustoms    = (TYPE="CUSTOMS")
+		
+		if (idAllocMethod'=0) || blnCustoms {       ;NO COST ALLOCATING    ; 13-Oct-2006
+			
+		;-----------------------------------------------------------------------------
+		; a)  Calculate Total Based on Method
+		;     Customs derives calculated duty based on CDV for TOTAL rather than on entered "Actual"
+		;-----------------------------------------------------------------------------
+			set TOTAL = 0
+			if idAllocMethod'=6 set TOTAL = $$GetTotal^INSHIPINFOCOSTSAllocn(IMPORT,TYPE,idxIMPORT,idAllocMethod,blnCustoms,.arrCustoms)
+			
+		;-----------------------------------------------------------------------------
+		; b)  Allocate the proportion of the total cost except when COSTTYPE=CUSTOMS
+		;     in which case use the CUSTOMS calculation.
+		;-----------------------------------------------------------------------------
+			if (idAllocMethod=6) || blnCustoms || TOTAL {        ;FIS;19.11.2004;26593  ;SR12679 no total check for customs
+				set AUF=""
+				for {
+					set AUF = $order(^INAUFPAs(YM,2,idxIMPORT,AUF))
+					quit:AUF=""
+					
+					set POS=""
+					for {
+						set POS = $order(^INAUFPAs(YM,2,idxIMPORT,AUF,POS))
+						quit:POS=""
+						
+						set objINAUFP = $get(^INAUFP(YM,AUF,POS,1))
+						do AllocateOrderLine^INSHIPINFOCOSTSAllocn(IMPORT,TYPE,AUF,POS,objINAUFP,YFELD,idAllocMethod,TOTAL,blnCustoms,.arrCustoms)
+					}
+				}
+			}
+		}
+	}
+	quit
+	
+	;
+	; Step 1   *********************************************************************
+	;
+	
+ReviewEstimatedCost(IMPORT,TYPE,YKEY,YFELD,idxIMPORT)
+	;-------------------------------------------------------------------------------
+	;  Step 1 : Update Estimated Cost in INSHIPINFOCOSTS using either a percentage
+	;           of the order line value or on container costs.
+	;           
+	;  FIXME :  Should this be skipped if entering the actual values when the
+	;           shipping costs are invoiced?  Will recalculate estimates whenever saved. <GRF>
+	;           
+	;  NOTES : - Values in ^INWEAUF D115 are not refreshed.
+	;          - It might not be appropriate to recalculate Estimated values. <GRF>
+	; 
+	; History :
+	; 10-Oct-2006	GRF		SR15107: Split from main routine
+	;-------------------------------------------------------------------------------
+	new AUF,CONID,CONTYPE,COST,EstPercent,EstType,FrForwarder,InitialCost
+	new objINSHIPINFO,POS,ServiceSup,SUPPLIER
+	
+	set COST        = $$$INSHIPINFOCOSTSEstimatedCosts(YFELD)         ; D1
+	set InitialCost = COST
+	set EstType     = $$$INSHIPINFOCOSTSEstimatedCostBy(YFELD)        ; D10
+	
+	;---------------------------------------
+	; Base on Value of Goods
+	;---------------------------------------
+	if EstType = 0 {
+		set COST = 0
+		set EstPercent = +$$$INSHIPINFOCOSTSPercentage(YFELD)         ; D11
+		if EstPercent {
+			
+			set AUF = ""
+			for {
+				set AUF = $order(^INAUFPAs(YM,2,idxIMPORT,AUF))
+				quit:AUF=""
+				
+				set POS=""
+				for {
+					set POS = $order(^INAUFPAs(YM,2,idxIMPORT,AUF,POS))
+					quit:POS=""
+					
+					set COST = COST + $$$INAUFPCost($GET(^INAUFP(YM,AUF,POS,1)))
+				;	NOTE : The INAUFP figure may have been updated <GRF>
+				}
+			}
+			set COST = COST*EstPercent/100
+		}
+	
+	;---------------------------------------
+	; Base on Container Costs
+	;---------------------------------------
+	} elseif EstType = 1 {
+		set COST = 0
+		set $$$INSHIPINFOCOSTSPercentage(YFELD) = ""                       ; Clear Percentage   D11
+		set objINSHIPINFO = $get(^INSHIPINFO(YM,IMPORT,1))
+		set SUPPLIER    = $$$INSHIPINFOSupplier(objINSHIPINFO)             ; D2
+		set FrForwarder = $$$INSHIPINFOFreightForwarder(objINSHIPINFO)     ; D3
+		set:FrForwarder'="" SUPPLIER=FrForwarder
+		set ServiceSup  = $$$INSHIPINFOCOSTSServiceSupplier(YFELD)         ; D6
+		set:ServiceSup'="" SUPPLIER=ServiceSup
+		
+		set CONID = ""
+		for {
+			set CONID = $order(^INSHIPINFOCON(YM,IMPORT,CONID))
+			quit:CONID=""
+			
+			set CONTYPE = $piece($get(^INCONTAINER(YM,CONID,1)),Y,1)
+			if CONTYPE'="" {
+				if (SUPPLIER'="") && $data(^INCONTAINERVERWKL(YM,CONTYPE,TYPE,SUPPLIER)) {
+					set COST = COST + $piece($get(^INCONTAINERVERWKL(YM,CONTYPE,TYPE,SUPPLIER,1)),Y,1)
+					
+				} elseif $data(^INCONTAINERVERWK(YM,CONTYPE,TYPE)) {
+					set COST = COST + $piece($get(^INCONTAINERVERWK(YM,CONTYPE,TYPE,1)),Y,1)
+				}
+			}
+		}
+	}
+	IF COST'=InitialCost do SaveEstimatedCost(YKEY,YFELD,COST)
+	
+	quit
+	
+SaveEstimatedCost(pYKEY,pYFELD,pCOST)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 04-Jul-2006	GRF		SR14707: macro
+	; 14-Jun-2006	GRF		SR14707: Extracted update
+	;-------------------------------------------------------------------------------
+	new YOK,YFORM,YVOR
+	
+	set YKEY  = pYKEY
+	set YFELD = pYFELD
+	set $$$INSHIPINFOCOSTSEstimatedCosts(YFELD) = pCOST   ; D1
+	set YOK=$$^WWWSPEI("INSHIPINFOCOSTS",YKEY,YFELD,1)
+	quit
+	
+	;
+	;*******************************************************************************
+	;
+	
+AUFTRAG
+	;-------------------------------------------------------------------------------
+	; ANZEIGEN ZUGEORNDETE AUFTRÄGE ;display
+	;
+	; Called by : 
+	; 	Routines : INERECHIMPORT
+	; 	           INSHIPINFOCOSTS
+	; 	           
+	; ByRef :
+	;	YKEY
+	;	YFELD		objINSHIPINFOCOSTS
+	;	
+	; History:	
+	; 15-Jan-2009	GRF		SR15853: Pass audit string to NewUserSession (not used)
+	; 11-Jan-2007	JW		BR014262: Create child user
+	;-------------------------------------------------------------------------------
+	NEW IMPORT,TYPE,AUF,POS,LIEF,RECH,RECH1,idChildUser
+	
+	SET YKEY   = $GET(YKEY)
+	SET YFELD  = $GET(YFELD)
+	SET IMPORT = $PIECE(YKEY,",",1)			QUIT:IMPORT=""		;IMPORT NO. ;importation
+	SET TYPE   = $PIECE(YKEY,",",2) 		QUIT:TYPE=""		;COST TYPE ;letter
+	SET LIEF   = $PIECE(YFELD,Y,6)			QUIT:LIEF=""		;SERVICE LIEFERANT ;supplier 
+	
+	DO  ;YUSER NEU, DAMIT MEHRERE TABELLEN AUFGEBAUT WERDEN KÖNNEN;FIS;09.09.04
+	. set idChildUser = $$CreateChildUser^WWWUSER(YUSER,$$$NO)	// BR014262
+	. NEW YUSER
+	. set YUSER = idChildUser
+	. ;set YUSER = $$NewUserSession^WWWUSER("INSHIPINFOCOSTS")  ;SR15853
+	. ;FOR  SET YUSER=$RANDOM(10000000) QUIT:'$DATA(^WWWUSER(0,YUSER))  
+	. ;SET YUSER=(100000000+YUSER)     
+	. ;SET ^WWWUSER(0,YUSER,1)=$$^WWWUPER($GET(YPWD))_Y_YBED_Y_+$HOROLOG_Y_$PIECE($HOROLOG,",",2)   ;BEC;26524;12.11.04;wegen no ACCEESS
+	. ;SET ^WWWUSER(0,YUSER,1)=$zconvert($GET(YPWD),"U")_Y_YBED_Y_+$HOROLOG_Y_$PIECE($HOROLOG,",",2)   ;BEC;26524;12.11.04;wegen no ACCEESS
+	. KILL ^WWWSOR(YUSER)
+	. SET IMPORT(1)=$$^WWWUMLAU(IMPORT,1)
+	. SET AUF=""
+	. FOR  SET AUF=$ORDER(^INAUFPAs(YM,2,IMPORT(1),AUF)) QUIT:AUF=""  DO
+	. . SET POS=""
+	. . FOR  SET POS=$ORDER(^INAUFPAs(YM,2,IMPORT(1),AUF,POS)) QUIT:POS=""  DO
+	. . . QUIT:'$DATA(^INERECH1(YM,AUF,POS))
+	. . . SET RECH=""
+	. . . FOR  SET RECH=$ORDER(^INERECH1(YM,AUF,POS,LIEF,RECH)) QUIT:RECH=""  DO
+	. . . . SET RECH1=$GET(^INERECH1(YM,AUF,POS,LIEF,RECH,1))
+	. . . . IF $PIECE(RECH1,Y,80)'=TYPE QUIT  ;FALSCHE KOSTENART
+	. . . . ;
+	. . . . NEW ART
+	. . . . SET ART=$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,4)
+	. . . . IF ART'="" SET ART=ART_" "_$EXTRACT($PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,1),1,35)
+	. . . . IF ART'="" IF $PIECE(ART," ",2)="" SET ART=ART_$EXTRACT($$^INARTNAME(ART),1,35)
+	. . . . SET ^WWWSOR(YUSER,"DATA",AUF_POS)=AUF_"-"_POS_Y_ART_Y_$PIECE(RECH,"#",1)_Y_$$^WWWDATE($PIECE(RECH1,Y,1))_Y_$$^WWWZAHL($PIECE(RECH1,Y,22),0,2,YWHR)
+	. ;
+	. IF $DATA(^WWWSOR(YUSER,"DATA")) DO
+	. . WRITE "</TABLE>"
+	. . NEW TITLE
+	. . SET TITLE=$$^WWWTEXT(33970)  ;ZUGEORDNETE POSITIONEN
+	. . SET TITLE=TITLE_" ("_$PIECE($GET(^INPARA(YM,"KOSTENARTEN",SPRACHE,+TYPE,1)),Y,1)
+	. . IF $PIECE(YFELD,Y,9)'="" SET TITLE=TITLE_" / "_$PIECE($GET(^WWW101(0,"KOSTENZUORDNUNG",SPRACHE,$PIECE(YFELD,Y,9),1)),Y,1)
+	. . SET TITLE=TITLE_")"  ;ZUGEORDNETE POSITIONEN
+	. . SET ^WWWSOR(YUSER,"TITLE")=TITLE
+	. . SET ^WWWSOR(YUSER,"HEAD")=$$^WWWFELDNAME("INERECH1","P",1)_Y_$$^WWWTEXT(32024)_Y_$$^WWWFELDNAME("INERECH1","P",4)_Y_$$^WWWFELDNAME("INERECH1","D",1)_Y_$$^WWWFELDNAME("INERECH1","D",22)
+	. . SET ^WWWSOR(YUSER,"HEADSIZE")="150~150~150~150~150"      ;BEC;26785;15.11.04
+	. . SET ^WWWSOR(YUSER,"LEFT")="1,2,3,4"
+	. . SET ^WWWSOR(YUSER,"RIGHT")="5"
+	. . DO ^WWWTABLE(25)
+	. ;
+	. KILL ^WWWSOR(YUSER)
+	
+	QUIT
+	
+GetImportLineTotal(pidImport)
+	;-------------------------------------------------------------------------------
+	; Get total value of all import shipment order lines
+	;
+	; Returns: fltTotal
+	;
+	; History:
+	; 31-Mar-2005	Steve S		Created (SR:11994)
+	;-------------------------------------------------------------------------------
+	new fltTotal,idImportIdx,idOrder,idLine,objSupplierLine,fltOrderQty
+	new objOrderLine,fltSupplierAmt
+	
+	set fltTotal=0
+	
+	if $get(pidImport)'="" {
+		set idImportIdx=$$Index^COMUtils(pidImport)
+		
+		set idOrder=""
+		for {
+			set idOrder=$order(^INAUFPAs(YM,2,idImportIdx,idOrder))
+			quit:idOrder=""
+			
+			set idLine=""
+			for {
+				set idLine=$order(^INAUFPAs(YM,2,idImportIdx,idOrder,idLine))
+				quit:idLine=""
+				
+				set objSupplierLine = $get(^INAUFPK(YM,idOrder,idLine,1))
+				set objOrderLine    = $get(^INAUFP(YM,idOrder,idLine,1))
+				
+				set fltSupplierAmt = $piece(objSupplierLine,Y,47)
+				set fltOrderQty    = $piece(objOrderLine,Y,5)
+				set fltTotal       = fltTotal+(fltSupplierAmt*fltOrderQty)
+			}
+		}	
+	}
+	
+	quit fltTotal
+	
+	;
+	; FORM METHODS   ***************************************************************
+	;
+	
+OnBlurSupplier(pSupplier,pYFELD)
+	;-------------------------------------------------------------------------------
+	; To be run on blur of the supplier field
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Apr-2005	JW		Created SR10722
+	;-------------------------------------------------------------------------------
+	new idInvoice,invoiceDate
+	
+	// Clear invoice number and invoice date fields - if no invoice data
+	
+	set idInvoice   = $piece(pYFELD,Y,7)
+	set invoiceDate = $piece(pYFELD,Y,8)
+	
+	if (idInvoice'="") && (invoiceDate'="") {
+		if (pSupplier="") || '$data(^INERECH(YM,pSupplier,idInvoice,invoiceDate,1)) {
+			set %TXT(1) = %TXT(1)_"#Y"_YFORM_"D7"_Y
+			set %TXT(1) = %TXT(1)_"#Y"_YFORM_"D8"_Y
+		}
+	}
+	
+	quit
+	
+OnBeforeFormConstruction(pstrField,YKEY="",YFELD="")
+    ;-------------------------------------------------------------------------------
+    ; Disable fields when not required.
+    ; 
+    ; Inputs:
+    ;	pstrField	
+    ;	YKEY		
+    ;	YFELD		
+    ; 
+    ; Returns:
+    ;	YHID	(byRef)
+    ;
+    ; History:
+    ; 07-Jun-2005	shobby	Created SR12408
+    ;-------------------------------------------------------------------------------
+	if pstrField="Estimated Costs" {
+		;if $piece($get(YFELD),Y,10)'="" set YHID=2 
+		if $$$INSHIPINFOCOSTSEstimatedCostBy(YFELD)'="" set YHID=2
+	} elseif pstrField="Percentage" {
+		if $piece($get(YFELD),Y,10)=0 set YHID=0
+	}
+	if $piece(YKEY,",",2)="CUSTOMS" set YHID=2
+	quit
+	
+OnAfterFormConstruction(pstrField,YKEY="",YFELD="")
+	new fltAmount
+	
+	set fltAmount=""
+	if pstrField="Actual" {
+	
+	} elseif pstrField="Estimated Costs" {
+		if $piece(YKEY,",",2)="CUSTOMS" {
+			do BuildDetailsButton()
+		}
+	}
+	quit
+	
+BuildDetailsButton()
+	WRITE YCR
+	WRITE "<A HREF="_""""
+	;SET URL=YAKTION_"EP=WWWFORM&YFORM=WWWDOCUMENT&YUSER="_YUSER_"&YBED="_YBED_"&YUCI="_$GET(YUCI)_"&YM="_YM_"&YDATA="_YDATEI_"|"_YKEY_"|"_YLFN_"&YHTMFORM1="_YHTMFORM
+	SET URL=YAKTION_"EP=WWWFORM&YEXEC=D|ShowCalculations^INSHIPINFOCOSTS(YKEY)&YFORM=WWWINFO&YKEY="_YKEY_"&YUSER="_YUSER_"&YBED="_YBED_"&YUCI="_$GET(YUCI)_"&YM="_YM_"&YDATA="_YDATEI_"|"_YKEY_"|"_YLFN_"&YHTMFORM1="_YHTMFORM
+	SET OPT="HEIGHT=520,WIDTH=990,SCROLLBARS=YES,TOOLBAR=NO,RESIZABLE=YES"          ;tybd;26317;07.09.2004;wieder zurückgeändert
+	WRITE "javascript:var textanzeige=window.open('"_URL_"','text','"_OPT_"');"
+	WRITE """"
+	WRITE ">"
+	WRITE YCR,"<IMG SRC="_""""_YGIF_"text.gif"_""""_" ALIGN=ABSBOTTOM TITLE="_""""_"Text"_""""_" border=0>"
+	WRITE "</A>"
+	quit
+	
+ShowCalculations(YKEY="")
+    /*------------------------------------------------------------------------------
+    ; Show how the estimated costs were arrived at.
+    ; 
+    ; Action used in BuildDetailsButton script
+    ; 
+    ; Returns:
+    ;
+    ; History:
+    ; 16-Jun-2005	shobby	Code Check.
+    ; 16-Jun-2005	shobby	$$$Index idImport.  SR12408
+    ; 10-Jun-2005	shobby	Created SR12408
+    ;-----------------------------------------------------------------------------*/
+	new idOrder,idLine,idImport,lstHeader,objINAUFP,objINSHIPINFO,objINAUFPK
+	new idItem,strCountry,idImportIdx
+	new idSupplier,idCountry,idDate,fltRate,fltAmount
+	
+	set idImport=$piece(YKEY,",",1)
+	if idImport'="" {
+		set lstHeader=$lb("Order","Line","Item","Description","Price","Rate","Amount","Supplier","Country","Date")	
+		do Start^COMTable(lstHeader,"Import Costs",1,1)
+		set idImportIdx=$$$Index(idImport)
+		set idOrder=""
+		for {
+			set idOrder=$order(^INAUFPAs(YM,2,idImportIdx,idOrder))
+			quit:idOrder=""
+			set idLine=""
+			for {
+				set idLine=$order(^INAUFPAs(YM,2,idImportIdx,idOrder,idLine))
+				quit:idLine=""
+				
+				set objINAUFP      = $get(^INAUFP(YM,idOrder,idLine,1))   ;prices here are what we sell it for ???
+				set objINAUFPK     = $get(^INAUFPK(YM,idOrder,idLine,1))  ;prices here are what we sell it for ???
+				set objINSHIPINFO  = $get(^INSHIPINFO(YM,idImport,1))
+				set idItem		   = $$$INAUFPItemNumber(objINAUFP)
+				set idSupplier	   = $$$INAUFPSupplier(objINAUFP)
+				set idCountry	   = $$$INSHIPINFOCountryOfOrigin(objINSHIPINFO)
+				set idDate		   = $$$INSHIPINFOCustomsClearance(objINSHIPINFO)
+				set fltRate		   = $$GetRate^INARTKCountryCustom(idItem_","_idSupplier_","_idCountry,idDate)/100
+				if idDate="" set idDate = +$horolog
+				set fltAmount	   = $$$FCMult($$$INAUFPKNetOriginalPrice(objINAUFPK),fltRate)
+				
+				do NewLine^COMTable("")
+				do InsertCell^COMTable(idOrder)
+				do InsertCell^COMTable(idLine)
+				do InsertCell^COMTable(idItem)
+				do InsertCell^COMTable($$$INAUFPItemName(objINAUFP))
+				do InsertCurrencyCell^COMTable($$$INAUFPKNetOriginalPrice(objINAUFPK))
+				do InsertCellPercentage^COMTable(fltRate)
+				do InsertCurrencyCell^COMTable(fltAmount)
+				do InsertCell^COMTable(idSupplier)
+				set strCountry=$$$SysEnum("LAND",idCountry)
+				do InsertCell^COMTable(strCountry)
+				do InsertCellDate^COMTable(idDate)
+				do EndLine^COMTable()
+			}
+		}
+		do Stop^COMTable()
+	}
+	quit
+	
+OnBeforeTableDisplay()
+    /*------------------------------------------------------------------------------
+    ; This code will disable the 'Data Record Search' if coming to the INSHIPINFOCOSTS form
+    ; from INERECH (Supplier Invoice).
+    ; This is done because if switching between INSHIPINFOCOSTS record from the hyperlink
+    ; on the table the 'Invoice Number' field can not be populated as it is when coming
+    ; from the INERECH form.  The user is thus forced to select each INSHIPINFOCOSTS record
+    ; from the table at the bottom of the INERECH form instead, this ensures correct data
+    ; but it is still a bit annoying.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 16-Jun-2005	shobby	Created SR12163
+    ;-----------------------------------------------------------------------------*/
+	if $piece(YBACK,",",$length(YBACK,",")-1)="INERECH" set Q=1
+	quit
+	
+OnAfterDataFields()
+    /*------------------------------------------------------------------------------
+    ;
+    ; ByRef:	YKEY
+    ;
+    ; History:
+    ; 16-Jun-2005	shobby	Put these calls inside a routine rather than entered directly on form.
+    ;-----------------------------------------------------------------------------*/
+	new idINSHIPINFO,objINSHIPINFO,strStatus
+	
+	do AUFTRAG
+	do ^INERECHIMPORT
+	
+	set idINSHIPINFO=$piece($get(YKEY),",",1)
+	if idINSHIPINFO'="" {
+		set objINSHIPINFO=$get(^INSHIPINFO(YM,idINSHIPINFO,1))
+		set strStatus=$$Save^COMUtils("INSHIPINFO",idINSHIPINFO,objINSHIPINFO,1)
+	}
+	quit
+	
+OnAfterPrimaryKey(YKEY="",YFELD="")
+    /*------------------------------------------------------------------------------
+    ; FIXME : It appears something is resetting YKEY before this subr is called
+    ;         so that "CUSTOMS" may be recalculated multiple times <GRF>
+    ; 
+    ; Inputs:	YKEY
+    ; ByRef: 	YFELD
+    ;
+    ; History:
+    ; 08-Jun-2005	shobby	Disable the Allocation Method for CUSTOMS SR12408
+    ;-----------------------------------------------------------------------------*/
+	if $piece(YKEY,",",2)="CUSTOMS" {
+		set $$$INSHIPINFOCOSTSEstimatedCosts(YFELD)=$$GetCustoms^INSHIPINFOCOSTSCustoms(YKEY)     ; 11-Oct-2006
+		;set $$$INSHIPINFOCOSTSActualCosts(YFELD)=$$GetCustomsActual^INSHIPINFOCOSTSCustoms(YKEY) ; 11-Oct-2006
+		set $$$INSHIPINFOCOSTSDutiableItemsOnly(YFELD)=1
+		set $$$INSHIPINFOCOSTSAllocationMethod(YFELD)=""
+		set $$$INSHIPINFOCOSTSEstimatedCostBy(YFELD)=""
+		set $$$INSHIPINFOCOSTSPercentage(YFELD)=""
+		do Save^COMUtils("INSHIPINFOCOSTS",YKEY,YFELD,1)
+	}
+	quit
+	
+OnAfterSave(YKEY,YFELD)
+    /*------------------------------------------------------------------------------
+    ;
+    ; Inputs:	YKEY		ImportNo,CostType
+    ; 			YFELD		objINSHIPINFOCOSTS
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 08-Jul-2005	shobby	SR12744 Created
+    ;-----------------------------------------------------------------------------*/
+	new idINSHIPINFO,objINSHIPINFO
+	
+	do ^INSHIPINFOCOSTS ;Taken off of form
+	
+	set idINSHIPINFO=$piece($get(YKEY),",",1)
+	if idINSHIPINFO'="" {
+		set objINSHIPINFO=$get(^INSHIPINFO(YM,idINSHIPINFO,1))
+		set $$$INSHIPINFOEstimatedCosts(objINSHIPINFO)=$$GetEstimatedCosts^INSHIPINFO(idINSHIPINFO,objINSHIPINFO)
+		do Save^COMUtils("INSHIPINFO",idINSHIPINFO,objINSHIPINFO,1)
+	}	
+	quit
+	
+	/*
+GetCustoms(YKEY="",pobjINSHIPINFO="")
+		quit $$GetCustoms^INSHIPINFOCOSTSCustoms(YKEY,pobjINSHIPINFO)
+	*/
+	
+ActualCustoms(YKEY="")
+	; TODO : at some stage remove redirection once new buttons distributed
+	; set in PATCH00101400800076.MAC - retained as link for the present though button callback has now been updated <GRF>
+	do ActualCustoms^INSHIPINFOCOSTSCustoms(YKEY)
+	quit
+	
+	/*
+GetCustomsActual(YKEY="",pidOrder="",pidLine="")
+	quit $$GetCustomsActual^INSHIPINFOCOSTSCustoms(YKEY,pidOrder,pidLine)
+	*/
+	
+OnBeforeSave(YKEY,YFELD)
+    /*------------------------------------------------------------------------------
+    ; Don't allow Foreign Currency suppliers to be used for CUSTOMS
+    ;
+    ; Params:
+    ;	YKEY		ImportNo, CostType
+    ;	YFELD		objINSHIPINFOCOSTS
+    ; 
+    ; Returns:
+    ;   Q			(ByRef) Save flag
+    ;   
+    ; History:
+    ; 18-Sep-2006	GRF		SR15053: convert key to index form
+    ; 19-Jul-2006	GRF		SR14471: Don't process Actual Costs in certain circumstances.
+    ; 16-Mar-2006	Steve S	SR14431: Call ServiceSupplierCheck
+    ; 21-Feb-2006	JW		SR14325: Make sure allocation method is selected if not customs
+    ;  6-Feb-2006	JW		SR14263: Make sure rates are set up.
+    ; 08-Jul-2005	shobby	SR12932: Only check for CUSTOMS - Adjusted warning message.
+    ; 30-Jun-2005	shobby	SR12746:
+    ;-----------------------------------------------------------------------------*/
+	new blnOrderLines,blnReceived,idImport,idOrder,idOrderLine,idSupplier,idxImport,objINLIEF,strStatus
+	
+	set strStatus=$$$OK
+	set strStatus=$$ServiceSupplierCheck(YFELD) ;SR14431
+	
+	if $piece($get(YKEY),",",2)="CUSTOMS" {
+		
+		if '$$$INSHIPINFOCOSTSEstimatedCosts(YFELD) && $$$INSHIPINFOCOSTSActualCosts(YFELD) {	;SR14263
+			set strStatus = $listbuild("IN00393")  ;No shipped items have applicable customs rates set up. Please create on Item Master Data before continuing.
+			
+		} else {
+			set idSupplier=$$$INSHIPINFOCOSTSServiceSupplier(YFELD)
+			if idSupplier'="" {
+				set objINLIEF=$get(^INLIEF(YM,idSupplier,1))
+				if $$$INLIEFCurrency(objINLIEF)'="" {
+					if $$$INLIEFCurrency(objINLIEF)'=$get(YWHR) {
+						set strStatus = $listbuild("IN00349")  ;Foreign Currency Service Suppliers can not be used for CUSTOMS.
+					}
+				}
+			}
+		}
+	} elseif $$$INSHIPINFOCOSTSAllocationMethod(YFELD)="" {		//SR14325
+		set strStatus = $listbuild("IN00395")	;Must enter an allocation method
+	}
+	
+	; Check all order lines have been received before accepting "Actual" 19-Jul-2006
+	
+	if $$$ISOK(strStatus) && ($$$INSHIPINFOCOSTSActualCosts(YFELD)'="") {
+		set idImport  = $piece($get(YKEY),$$$COMMA,1)
+		set idxImport = $$$Index(idImport)                    ; SR15053
+		
+		if idImport="" {
+			set strStatus = $listbuild(34432)       ; Import No. Missing
+		} else {
+			set blnOrderLines = $$$NO
+			set blnReceived   = $$$YES
+			
+			set idOrder = ""
+			for {
+	;			set idOrder = $order(^INAUFPAs(YM,2,idImport,idOrder))         ; SR15053
+				set idOrder = $order(^INAUFPAs(YM,2,idxImport,idOrder))
+				quit:idOrder=""
+				
+				set idOrderLine = ""
+				for {
+	;				set idOrderLine = $order(^INAUFPAs(YM,2,idImport,idOrder,idOrderLine))   ; SR15053
+					set idOrderLine = $order(^INAUFPAs(YM,2,idxImport,idOrder,idOrderLine))
+					quit:idOrderLine=""
+					
+					set blnOrderLines = $$$YES
+					if '$data(^INWEAUF(YM,idOrder,idOrderLine)) set blnReceived = $$$NO
+				}
+			}
+			
+			if blnOrderLines=$$$NO {
+				set strStatus = $listbuild(34433)   ; No Order Lines assigned to Shipment
+			} elseif blnReceived=$$$NO {
+				set strStatus = $listbuild(34434)   ; One or more Order Lines are still to be received.
+			}
+		}
+	}
+	
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		$$$Error(strStatus)
+	}
+	quit
+	
+ServiceSupplierCheck(pobjINSHIPINFO)
+	;-------------------------------------------------------------------------------
+	; Check the service supplier
+	;
+	; Params: pobjINSHIPINFO		: The Service Cost record
+	;
+	; ByRefs:
+	;
+	; Returns: strStatus
+	;
+	; History:
+	; 16-Mar-2006	Steve S	SR14431: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idSupplier,objINLIEF,strCurrency
+ 
+	set strStatus=$$$OK
+	
+	set idSupplier=$$$INSHIPINFOCOSTSServiceSupplier(pobjINSHIPINFO)
+	
+	if (idSupplier'="") {
+		set objINLIEF=$get(^INLIEF(YM,idSupplier,1))
+		set strCurrency=$$$INLIEFCurrency(objINLIEF)
+		if (strCurrency'="")&&(strCurrency'=$get(YWHR)) {
+			set strStatus=$listbuild("IN00399")  ;Service supplier can not use foreign currency	
+		}
+	}
+ 
+	quit strStatus
+	
+]]></Routine>
+</Export>

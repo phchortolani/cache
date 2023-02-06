@@ -1,0 +1,427 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache" ts="2001-01-01 00:00:00">
+<Class name="VAR.infra.shadow.ShadowRunner">
+<ClassType/>
+<Import>VAR.infra.cache,VAR.infra.util</Import>
+<IncludeCode>VARConst,VARLog,VARErros,VARService</IncludeCode>
+<ProcedureBlock>0</ProcedureBlock>
+<Super>VAR.infra.services.ServiceRunner</Super>
+<LegacyInstanceContext>1</LegacyInstanceContext>
+
+<Parameter name="VIRTUALIPSTATUSFILE">
+<Type>%String</Type>
+<Default>VirtualIP-Status.txt</Default>
+</Parameter>
+
+<Parameter name="VIRTUALIPCACHESIGNALFILE">
+<Type>%String</Type>
+<Default>VirtualIP-CacheSignal.txt</Default>
+</Parameter>
+
+<Parameter name="SHADOWCONTROLGLOBALNODE">
+<Type>%String</Type>
+<Default>^VAR.infra.shadow.ShadowRunner("CONTROL")</Default>
+</Parameter>
+
+<Parameter name="SHADOWFUNCGLOBALNODE">
+<Type>%String</Type>
+<Default>^VAR.infra.shadow.ShadowRunner("FUNCTIONAL")</Default>
+</Parameter>
+
+<Parameter name="MAXDIFFMINUTES">
+<Type>%Integer</Type>
+<Default>15</Default>
+</Parameter>
+
+<Parameter name="RESUMESHADOW">
+<Type>%Integer</Type>
+<Default>1</Default>
+</Parameter>
+
+<Parameter name="STOPSHADOW">
+<Type>%Integer</Type>
+<Default>2</Default>
+</Parameter>
+
+<Parameter name="SHADOWSTATUSPROCESSING">
+<Type>%Integer</Type>
+<Default>1</Default>
+</Parameter>
+
+<Property name="Count">
+<Type>%Numeric</Type>
+<InitialExpression>0</InitialExpression>
+
+<Parameter name="MAXVAL" value="20"/>
+</Property>
+
+<Method name="Register">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit ..RegisterRunner($$$ServiceIdShadowing, $$$ServiceFrequencyMinutely, $$$ServicePriorityHigh, ..%ClassName(1), "Shadow Service")]]></Implementation>
+</Method>
+
+<Method name="Unregister">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	quit ..UnregisterRunner($$$ServiceIdLogger, "Shadow Service")]]></Implementation>
+</Method>
+
+<Method name="Execute">
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	set ..Count = ..Count + 1
+	
+	if (..Count = 1) {
+		set ..Count = 0
+
+		set sc				 = $$$OK	
+		set strVirtualIPPath = ..GetVirtualIPPath()
+		set blnIsShadowComp  = ..IsShadowComputer()
+		if (blnIsShadowComp) {	
+			if ('..IsFunctional()) {
+				if (strVirtualIPPath '= "") {
+					set sc = ..IsActive(strVirtualIPPath)
+
+					if ($$$ISOK(sc)) {
+						if (..IsShadowUpdated()) {
+							do ..StopShadowing(strVirtualIPPath)
+
+							set sc = ..SaveRecord($$$YES)
+						}
+						else {
+							$$$VARLOGERROR("Shadow machine is not updated")
+						}
+					}
+					else {
+						do ..ResumeShadowing(strVirtualIPPath)
+					}
+				}
+			}
+			else {
+				do ..StopShadowing(strVirtualIPPath)
+			}	
+		}	
+		else {
+			set sc = ..SaveRecord()
+		}
+	}
+
+	quit $$$OK]]></Implementation>
+</Method>
+
+<Method name="ResumeShadowing">
+<FormalSpec>pstrVirtualIPPath:%String</FormalSpec>
+<Implementation><![CDATA[	job StartThreadWithParams^VARRemote(..%ClassName(1), ..#RESUMESHADOW, pstrVirtualIPPath)::10]]></Implementation>
+</Method>
+
+<Method name="StopShadowing">
+<FormalSpec>pstrVirtualIPPath:%String</FormalSpec>
+<Implementation><![CDATA[	job StartThreadWithParams^VARRemote(..%ClassName(1), ..#STOPSHADOW, pstrVirtualIPPath)::10]]></Implementation>
+</Method>
+
+<Method name="StartThread">
+<FormalSpec>params</FormalSpec>
+<ProcedureBlock>0</ProcedureBlock>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	set intAction				 = params(1)
+	set strVirtualIPPath		 = params(2)
+	set sc						 = $$$OK
+	set blnValid	 		  	 = $$$NO
+	set blnRunning   			 = $$$NO
+	set blnRestarted 		  	 = $$$NO
+	set strNamespace			 = ##class(Util).GetNamespace()
+	set strCurrentShadowFile	 = ""
+
+	try {
+		znspace "%SYS"
+	} 
+	catch objErr {
+		set sc = ..exceptionLog(objErr)
+	}
+
+	if ($$$ISERR(sc)) quit
+
+	new (%this, intAction, strVirtualIPPath, sc, blnValid,
+		blnRunning, blnRestarted, strNamespace, strCurrentShadowFile)
+
+	set objShadow 	 = ##class(SYS.Shadowing.Shadow).%OpenId(strNamespace)
+	set sc 	   	  	 = $isObject(objShadow)
+
+	// Verifying sc just to be sure. The object is always loaded, independently
+	// if the name passed is valid or not.
+	if ($$$ISOK(sc)) {
+		set sc = objShadow.IsValid(strNamespace) // Validate the shadow
+
+		if ($$$ISOK(sc)) {
+			set blnValid = $$$YES
+
+			do ##class(SYS.Shadowing.Shadow).CheckPointInfo(objShadow.Name, .cpinfo)
+			set strCurrentShadowFile = $get(cpinfo(0, "JournalLocation", "File"))
+
+			if (intAction = ..#RESUMESHADOW) { // Resume
+				if (##class(%ShadowState).CanStart(objShadow.Status) ||
+					##class(%ShadowState).CanResume(objShadow.Status)) {
+					if (##class(%ShadowState).CanStart(objShadow.Status)) {
+						set sc = objShadow.Restart()
+					}
+					else {
+						set sc = objShadow.Resume()
+					}
+
+					for i = 1:1:30 {
+						hang 1
+
+						if (objShadow.Status = ..#SHADOWSTATUSPROCESSING) quit
+					}
+
+					if ($$$ISOK(sc)) {
+						set blnRestarted = $$$YES
+					}
+				}
+
+				if (objShadow.Status = ..#SHADOWSTATUSPROCESSING) {
+					set blnRunning = $$$YES
+				}
+				else {
+					set sc = $$$CUSTOMERROR("Shadow machine is not updated")
+				}
+			}
+			elseif (intAction = ..#STOPSHADOW) { // Stop
+				if (##class(%ShadowState).CanStop(objShadow.Status)) {
+					set sc = objShadow.Stop($$$NO, $$$YES)  // Not forced; with RollBack
+				}
+			}
+		}
+	}
+
+	kill (%this, strVirtualIPPath, sc, blnValid, blnRunning,
+		blnRestarted, strNamespace, strCurrentShadowFile)
+
+	try {
+		znspace strNamespace
+	}
+	catch objErr {
+		halt
+	}
+
+	$$$VARLOGINFO("Shadow journal file: "_strCurrentShadowFile)
+
+	// No valid shadow configuration
+	if ('blnValid) {
+		// Ignore this
+		quit
+	}
+
+	// Signaling
+	if (blnRunning) {
+		do ..SignalRunning(strVirtualIPPath)
+	}
+
+	// Logging
+	if (blnRestarted) {
+		$$$VARLOGWARNING("Shadowing was stopped or suspended. Restarting...")
+	}
+
+	// General error log
+	if ($$$ISERR(sc)) {
+		$$$VARLOGERROR(sc)
+	}]]></Implementation>
+</Method>
+
+<Method name="exceptionLog">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pobjErr:%Exception.AbstractException</FormalSpec>
+<Implementation><![CDATA[	set logMsg = "Erro: "_
+				pobjErr.Name_", "_
+				pobjErr.Code_", "_
+				pobjErr.Data_", "_
+				pobjErr.Location_", "_
+				pobjErr.InnerException
+	$$$VARLOGERROR(logMsg)
+
+	quit logMsg]]></Implementation>
+</Method>
+
+<Method name="SaveRecord">
+<FormalSpec>blnTookControl:%Boolean=0</FormalSpec>
+<ProcedureBlock>0</ProcedureBlock>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[	set globalNode 		= ..#SHADOWCONTROLGLOBALNODE
+	set globalFuncNode	= ..#SHADOWFUNCGLOBALNODE
+	set newKey 	   		= $increment(@globalNode)
+
+	set @(globalNode)@(newKey) = $horolog
+	set @(globalFuncNode) 	   = $$$NO
+
+	if (blnTookControl) {
+		set $piece(@(globalNode)@(newKey),"~",2) = $$$YES
+		set @(globalFuncNode) = $$$YES
+	}
+
+	quit $$$OK]]></Implementation>
+</Method>
+
+<Method name="IsActive">
+<Description><![CDATA[Verify if VirtualIP status file has changed to Status = 1 (Slave server is on control)]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>dir:%String="",blnPrint:%Boolean=0</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[	if (dir = "") {
+		set dir = ..GetVirtualIPPath()
+		if (dir = "") quit $$$NO
+	}
+
+	set fileName = ##class(DirectoryFile).ConcatPath(dir, ..#VIRTUALIPSTATUSFILE)
+
+	set line 		= ""
+	set blnActive	= $$$NO
+
+	set strFile = ##class(%Library.File).%New(fileName)
+
+	try {
+		set status = strFile.Open("R")
+
+		if ($$$ISOK(status)) {
+			while ('strFile.AtEnd) {
+				set line = strFile.ReadLine()
+
+				if ($piece(line, "=", 2) = "ATIVO") {
+					set blnActive = $$$YES
+					quit
+				}
+			}
+
+			do strFile.Close()
+		}
+	}
+	catch objErr {
+		set status = ..exceptionLog(objErr)
+	}
+
+	if ($$$ISERR(status)) $$$VARLOGERROR(status)
+
+	if (blnPrint) {
+		write "Is Active? "_$case(blnActive, 1: "Yes", 0: "No"),!
+	}
+
+	quit blnActive]]></Implementation>
+</Method>
+
+<Method name="SignalRunning">
+<Description><![CDATA[Signal that shadow is running in the file system]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>dir:%String=""</FormalSpec>
+<Implementation><![CDATA[	if (dir = "") {
+		set dir = ..GetVirtualIPPath()
+		if (dir = "") quit $$$NO
+	}
+
+	set fileName = ##class(DirectoryFile).ConcatPath(dir, ..#VIRTUALIPCACHESIGNALFILE)
+
+	set line 		= ""
+	set blnActive	= $$$NO
+
+	set strFile = ##class(%Library.File).%New(fileName)
+
+	try {
+		set status = strFile.Open("NW")
+
+		if ($$$ISOK(status)) {
+			set status = strFile.WriteLine("OK")
+
+			do strFile.Close()
+		}
+	}
+	catch objErr {
+		set status = ..exceptionLog(objErr)
+	}
+
+	if ($$$ISERR(status)) $$$VARLOGERROR(status)]]></Implementation>
+</Method>
+
+<Method name="GetVirtualIPPath">
+<Description><![CDATA[Alphalinc Path to VirtualIP]]></Description>
+<ClassMethod>1</ClassMethod>
+<ProcedureBlock>0</ProcedureBlock>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[	set objClient = $get(^VARParametroCliente(0, 0, 1))
+	if (objClient = "") quit ""
+
+	quit ##class(DirectoryFile).GetOSDir($$$VARParametroClienteCaminhoVirtualIP(objClient))]]></Implementation>
+</Method>
+
+<Method name="GetFunctionalRegShadow">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[	set strGlobal 		 	 = ..#SHADOWFUNCGLOBALNODE	
+
+	quit $get(@strGlobal)]]></Implementation>
+</Method>
+
+<Method name="IsFunctional">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>blnPrint:%Boolean=0</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[	set blnFunctional 	 = $$$YES
+
+	set blnIsShadowComp  = ..IsShadowComputer()
+	if (blnIsShadowComp) {
+		set blnFunctional = +..GetFunctionalRegShadow()
+	}
+
+	if (blnPrint) {
+		write "Is functional? "_$case(blnFunctional, 1: "Yes", 0: "No"),!
+	}
+
+	quit blnFunctional]]></Implementation>
+</Method>
+
+<Method name="GetLastDateShadowControl">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[	set strGlobal 		 = ..#SHADOWCONTROLGLOBALNODE
+	set lastKey   		 = $order(@(strGlobal)@(""), -1)
+	set objLastShadowReg = ""
+
+	if (lastKey '= "") {
+		set objLastShadowReg    = $get(@(strGlobal)@(lastKey))
+	}
+
+	quit objLastShadowReg]]></Implementation>
+</Method>
+
+<Method name="IsShadowUpdated">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>blnPrint:%Boolean=0</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[	set curDate					= $horolog
+	set lastShadowRecordDate	= ..GetLastDateShadowControl()
+	set blnUptoDate				= $$$YES
+
+	set diffMinutes = ##class(%SYSTEM.SQL).DATEDIFF("minute", lastShadowRecordDate, curDate)
+
+	if (blnPrint) {
+		write "Main server timestamp: "_$zdatetime(lastShadowRecordDate, 4),!
+		write "Shadow server timestamp: "_$zdatetime(curDate, 4),!
+		write "Difference: "_diffMinutes_" minute(s)"
+		quit
+	}
+
+	if (diffMinutes > ..#MAXDIFFMINUTES) {
+		set blnUptoDate	= $$$NO
+	}
+
+	quit blnUptoDate]]></Implementation>
+</Method>
+
+<Method name="PrintStatus">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[	do ..IsShadowComputer(1)
+	do ..IsIntegrationNamespace(1)
+	do ..IsActive("", 1)
+	do ..IsFunctional(1)
+	do ..IsShadowUpdated(1)]]></Implementation>
+</Method>
+</Class>
+</Export>

@@ -1,0 +1,491 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMLock" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMLock
+	/**************************************************
+	 * PLEASE BE CAREFUL IF CHANGING ANY CODE IN HERE *
+	 **************************************************/
+	
+#include COMSYS
+#include COMConst
+	
+#define GetLockId(%1,%2)		$order(^COMLocks(0,1,$$$Index(%1),$$$Index(%2),""))
+#define LockOK					(enmStatus=$$$EnumCOMLOCKLockSuccessful)
+#define LockAvailable			(+$get(^CacheTempLock(pstrLocking,pstrLocked))=1)
+#define IncrementLock			set ^CacheTempLock(pstrLocking,pstrLocked)=$increment(^CacheTempLock(pstrLocking,pstrLocked)),blnLocked=$$$YES
+#define DecrementLock			set ^CacheTempLock(pstrLocking,pstrLocked)=$increment(^CacheTempLock(pstrLocking,pstrLocked),-1),blnLocked=$$$NO
+#define Lock					lock ^CacheTempLock(pstrLocking,pstrLocked):2
+#define UnLock					lock -^CacheTempLock(pstrLocking,pstrLocked)#"I"
+#define DoIHaveLock(%1,%2,%3)	''$data(^COMLocks(0,2,$$$Index(%1),$$$Index(%2),%3))
+	
+#define NOCODE					"NOCODE" 
+	
+AddLock(pstrLocking,pidLocking,pstrLocked,pidLocked)
+	;-------------------------------------------------------------------------------
+	; Adds a lock for an object if it can be done.
+	;
+	; Params:
+	; pstrLocking: The class requesting the lock
+	; pidLocking : It's id
+	; pstrLocked : The class requested to be locked
+	; pindLocked : It's id.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; 0 - Lock Owned By Someone else
+	; 1 - Lock Owned By Me
+	; 2 - Lock Successful
+	; 3 - Lock Sync Failure - Record Exists no owner
+	; 4 - Lock Sync Failure - Unable to Create Lock, save failed
+	; 5 - Lock Sync Failure - Process Swapping 
+	; 6 - Lock Failed - Cache error
+	;
+	; History:
+	; 08-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	new enmStatus,idLock,blnLocked,strStatus
+	
+	set blnLocked=$$$NO
+	
+	set $ztrap="AddLockError"
+	
+	set enmStatus = $$$EnumCOMLOCKLockSuccessful
+	
+	set idLock = $$$GetLockId(pstrLocked,pidLocked) // If this returns blank, the record is not locked
+	
+	if idLock'="" {
+		// There is a lock, either I have it or someone else does. Obvious huh?
+		if $$$DoIHaveLock(pstrLocking,pidLocking,idLock) {
+			set enmStatus = $$$EnumCOMLOCKLockOwnedByMe
+		} else {
+			set enmStatus = $$$EnumCOMLOCKLockOwnedBySomeoneelse
+		}
+	}
+	
+	if $$$LockOK {
+		$$$Lock // Take out a Cache lock
+		if $test {
+			$$$IncrementLock // Increase the semaphore
+			if $$$LockAvailable {
+				// Yep, now create our lock
+				set strStatus = $$CreateLock(pstrLocking,pidLocking,pstrLocked,pidLocked)
+				$$$DecrementLock // Remove the semaphore
+				
+				$$$UnLock // Unlock the Cache lock
+				
+				// If the status is good, we got the lock, otherwise the save failed.
+				// So we couldn't get it.
+				
+				if $$$ISOK(strStatus) {
+					set enmStatus = $$$EnumCOMLOCKLockSuccessful
+				} else {
+					set enmStatus = $$$EnumCOMLOCKLockSyncFailureUnabletoCreateLocksavefailed
+				}	
+				
+			} else {
+				$$$DecrementLock // Remove the semaphore
+				// There is a BAD lock. We could remove it and try again, but will leave that for the COMLock manager.
+				set enmStatus = $$$EnumCOMLOCKLockSyncFailureRecordExistsnoowner
+			}
+			
+		} else {
+			// Just in case two or more processes swap out somewhere in the middle, we still need to fail nicely.
+			set enmStatus = $$$EnumCOMLOCKLockSyncFailureProcessSwapping
+		}
+	}
+	quit enmStatus
+	
+AddLockError ; Internal Tag
+	set $ztrap=""
+	
+	if +$get(blnLocked) {
+		$$$DecrementLock // Remove the semaphore
+		$$$UnLock        // Unlock the Cache lock
+	}
+	quit $$$EnumCOMLOCKLockFailedCacheError
+	
+	
+CreateLock(pstrLocking,pidLocking,pstrLocked,pidLocked) private
+	;-------------------------------------------------------------------------------
+	; Actually create the lock object
+	;
+	; Params:
+	; pstrLocking: The class doing requesting the lock
+	; pidLocking : It's id
+	; pstrLocked : The class requested to be locked
+	; pindLocked : It's id.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; The status of the save, extremely important
+	;
+	; History:
+	; 08-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	set $ztrap="CreateLockError"
+	
+	new objData
+	
+	set objData = ""
+	set $$$COMLockLockingClassName(objData) = pstrLocking
+	set $$$COMLockLockingClassId(objData)   = pidLocking
+	set $$$COMLockLockedClassName(objData)  = pstrLocked
+	set $$$COMLockLockedClassId(objData)    = pidLocked
+	
+	quit $$$Save("COMLock",$$^WWWNEXT("COMLock"),objData,$$$YES)
+	
+CreateLockError ; Internal Tag
+	set $ztrap=""
+	quit '$$$OK
+	
+	
+RemoveLock(pstrLocking,pidLocking,pstrLocked,pidLocked)
+	;-------------------------------------------------------------------------------
+	; This allows the system to remove a lock. First it checks that I have the lock
+	; and if so, kill the lock object.
+	;
+	; Params:
+	; pstrLocking: The class doing requesting the lock
+	; pidLocking : It's id
+	; pstrLocked : The class requested to be locked
+	; pindLocked : It's id.
+	;
+	; ByRefs:	pstrStatus - status of kill removal
+	;
+	; Returns:
+	; Boolean, $$$NO = It couldn't be removed, $$$YES = Removed
+	;
+	; History:
+	; 19-Oct-2006	JW		SR15134: Look at kill status. Return status, not boolean
+	; 08-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	new idLock,blnRemove,strStatus
+	
+	set strStatus = $$$OK
+	set idLock=$$$GetLockId(pstrLocked,pidLocked)
+	
+	if (idLock'="") && $$$DoIHaveLock(pstrLocking,pidLocking,idLock) {
+		set strStatus = $$$Kill("COMLock",idLock)
+	}
+	quit strStatus
+	
+	
+GetMyLocks(pstrLocking,pidLocking,&parrLocks)
+	;-------------------------------------------------------------------------------
+	; Get the list of locks that I own. Could have used a listbuild, but an array
+	; is more expansive.
+	;
+	; Params:
+	; pstrLocking: The class requesting the lock
+	; pidLocking : It's id
+	;
+	; Returns:
+	;
+	; History:
+	; 10-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	new idLock,idxLocking,intCount,objLock,strLocking
+	
+	set strLocking = $$$Index(pstrLocking)
+	set idxLocking = $$$Index(pidLocking)
+	set idLock = ""
+	for {
+		set idLock = $order(^COMLocks(0,2,strLocking,idxLocking,idLock))
+		quit:idLock=""
+		
+		set objLock = $get(^COMLock(0,idLock,1))
+		set parrLocks($increment(intCount)) = $$$COMLockLockedClassName(objLock)_Y_$$$COMLockLockedClassId(objLock)
+	}
+	quit
+	
+	
+RemoveLocksIfRequired(pstrLocking,pidLocking,pstrCode="",pblnForce=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Remove all locks for the locker if they should be removed.
+	;
+	; Params:
+	; pstrLocking	: The class requesting the lock
+	; pidLocking 	: It's id
+	; pstrCode   	: The code to run to remove unnecessary locks.
+	; pblnForce		: Whether to ignore failures/status.
+	;					$$$YES - ignore, $$$NO - stop at first failure
+	; 					Set to $$$YES when you want to remove as many as possible
+	; 					(changing forms) and set to $$$NO when inside of a transaction
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 01-Jul-2011	GRF		-: Replace Order macros
+	; 19-Oct-2006	JW		SR15134: Look at kill status. Return status. Added pblnForce
+	; 10-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	new arrLocks,blnKill,blnRunCode,intCount,strClassId,strClassName,strStatus
+	
+	set $ztrap="RLIRError"
+	
+	set strStatus = $$$OK
+	
+	do GetMyLocks(pstrLocking,pidLocking,.arrLocks)
+		
+	set blnKill = $$$NO
+	
+	if pstrCode="" {
+		set blnKill    = $$$YES
+		set blnRunCode = $$$NO
+	} else {
+		set pstrCode   = "set blnKill="_$$GetCode(pstrCode)
+		set blnRunCode = $$$YES
+	}
+	
+	set intCount = ""
+	for {
+		set intCount = $order(arrLocks(intCount))
+		quit:intCount=""
+		
+		set strClassName = $piece(arrLocks(intCount),Y,1)
+		set strClassId   = $piece(arrLocks(intCount),Y,2)
+		
+		if blnRunCode xecute pstrCode
+		
+		if blnKill {
+			set strStatus = $$RemoveLock(pstrLocking,pidLocking,strClassName,strClassId)
+		}
+		quit:'pblnForce&&$$$ISERR(strStatus)
+	}
+ 	quit strStatus
+	
+RLIRError ; Internal Tag
+	set $ztrap=""
+	quit
+	
+	
+GetCode(pstrCode)
+	;-------------------------------------------------------------------------------
+	; If the code is not a routine call, remove the = in front.
+	;
+	; Params:
+	; pstrCode   : The code to run to remove unessecary locks.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; The code to be executed.
+	;
+	; History:
+	; 08-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	if $extract(pstrCode,$$$LOCKCODELEN)=$$$LOCKCODE {
+		set pstrCode = $extract(pstrCode,$$$LOCKCODELEN+1,$length(pstrCode))
+	}
+	quit pstrCode
+	
+	
+RemoveOrphanedLocks(pblnReload=$$$YES)
+	;-------------------------------------------------------------------------------
+	; Find all locks in the system that the locking entry no longer exists. If this
+	; happens, they need to be removed.
+	;
+	; Params:
+	; pblnReload: Should we reload the form? (Defaults to Yes).
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Jul-2011	GRF		-: Replace Order macros
+	; 19-Oct-2006	JW		SR15134: Force to delete all locks (ignore status)
+	; 08-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	new arrClasses,idLock,idLocking,objLock,strCode,strLocking
+	
+	if $$^WWWRELOAD()'=1 {
+		set idLock = ""
+		for {
+			set idLock = $order(^COMLock(0,idLock))
+			quit:idLock=""
+			
+			set objLock    = $get(^COMLock(0,idLock,1))
+			set strLocking = $$$COMLockLockingClassName(objLock)
+			set idLocking  = $$$COMLockLockingClassId(objLock)
+			
+			if '$data(arrClasses(strLocking,idLocking)) {
+				
+				set arrClasses(strLocking,idLocking) = ""
+				set strCode = $$GetRemovalCode(strLocking,idLocking)
+				if strCode'=$$$NOCODE {
+					do RemoveLocksIfRequired(strLocking,idLocking,strCode,$$$YES)
+				}
+			}
+		}
+	}
+	do:pblnReload ReloadForm^COMUtilForm()
+	quit
+	
+	
+GetRemovalCode(pstrLocking,pidLocking)
+	;-------------------------------------------------------------------------------
+	; Check that the routine for getting the removal code exists and execute it.
+	;
+	; Params:
+	; pstrLocking: The class doing requesting the lock
+	; pidLocking : It's id
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; The Code
+	;
+	; History:
+	; 05-Feb-2007	RPW		SR14900: Use ExecuteCode to handle invalid code instead of $text
+	; 01-Feb-2007	RPW		SR15418: Fixed logging and remove early quits.
+	; 16-Oct-2006	RPW		SR15123: added logging for invalid keys.
+	; 11-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	new strCall,strClass,strCode,strRoutine
+	
+	set $ztrap="GRCError"
+	
+	; FIXME : Should make formal ^COMGRCError or ^LOGGRCError global rather than using
+	;         zzGRCError
+	
+	quit:(pstrLocking="")||(pidLocking="") ""
+	
+	if $piece(pidLocking,$$$COMMA,$length(pidLocking,$$$COMMA))="" {
+		set ^zzGRCError($i(^zzGRCError)) = $zdatetime($horolog,3)_">>"_pstrLocking_">>"_pidLocking_"."
+		do:$get(^SysSetup("Logging","SR15123"),0) StackDump^COMDebug("GetRemovalCode")   ; => ^LogStackDump
+		set strCode = "" 
+	
+	} elseif $data($$$DATA(pstrLocking,pidLocking)) {
+		if '$$ExecuteCode^COMUtils("set strCode=$$GetRemovalCode^"_pstrLocking_"("""_pstrLocking_""","""_pidLocking_""")") {
+			set strCode = $$$NOCODE
+		}
+	
+	} else {
+		set strCode = ""
+	}
+	quit strCode
+	
+GRCError ; Internal Tag
+	set $ztrap=""
+	set ^zzGRCError($i(^zzGRCError))=$zdatetime($horolog,3)_">>"_pstrLocking_">>"_pidLocking_". "_$zerror
+	do:$get(^SysSetup("Logging","SR15123"),0) StackDump^COMDebug("GetRemovalCode")
+	quit ""
+	
+	
+IsExternallyLocked(pstrLocked,pidLocked)
+	;-------------------------------------------------------------------------------
+	; Determines where the a locked object is locked by someone else or not locked.
+	;
+	; Params:
+	; pstrLocking: The class doing requesting the lock
+	; pidLocking : It's id
+	; pstrLocked : The class requested to be locked
+	; pindLocked : It's id.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; Boolean
+	;
+	; History:
+	; 18-May-2006	Steve S	Newed strData
+	; 11-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	new blnExternal,idLockClass,idLocked,strData,strLockClass
+	
+	set strData = $get(^CacheTempLockInterest(YUSER))
+	
+	set strLockClass = $piece(strData,Y,1)
+	set idLockClass  = $piece(strData,Y,2)
+	
+	set idLocked = $$$GetLockId(pstrLocked,pidLocked)
+	if idLocked'="" {
+		set blnExternal = '$$$DoIHaveLock(strLockClass,idLockClass,idLocked)
+	} else {
+		set blnExternal = $$$NO
+	}
+	quit blnExternal
+	
+	
+SetLockingInterest(pstrLocking,pidLocking)
+	;-------------------------------------------------------------------------------
+	; Prepare to set this owner as the lock owner.
+	;
+	; Params:
+	; pstrLocking: The class doing requesting the lock
+	; pidLocking : It's id
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Aug-2006	RPW/SCH	SRBR014167:Modified to send out the javascript to call
+	;							SetLockingInterest1
+	; 11-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	$$$StartScript()
+	write "function LoadEvent() {"
+	if '$$$NoKey(pidLocking) {
+		write "if (typeof(CallBackNow) != 'undefined') { CallBackNow('SetLockingInterest1^COMLock','"_pstrLocking_"','"_pidLocking_"'); }"
+	}
+	write "}"
+	$$$EndScript() 
+	quit
+	
+	
+SetLockingInterest1(pstrLocking,pidLocking)
+	;-------------------------------------------------------------------------------
+	; Set this form to be a Lock Owner.
+	; Used primarily for COMView at this stage.
+	;
+	; Params:
+	; pstrLocking: The class doing requesting the lock
+	; pidLocking : It's id
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Aug-2006	RPW/SCH	SRBR014167: Created
+	;-------------------------------------------------------------------------------
+	if (pstrLocking'="") && (pidLocking'="") {
+ 		set ^CacheTempLockInterest(YUSER) = pstrLocking_Y_pidLocking
+	}
+	quit
+	
+	
+RemoveLockingInterest(pstrLocking,pidLocking)
+	;-------------------------------------------------------------------------------
+	; Set this form as no longer a Lock Owner and remove all it's locks.
+	;
+	; Params:
+	; pstrLocking: The class doing requesting the lock
+	; pidLocking : It's id
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Oct-2006	JW		SR15134: Force to delete all locks (ignore status)
+	; 11-May-2006	RPW		SR14420: Created
+	;-------------------------------------------------------------------------------
+	new strCode
+	
+	kill ^CacheTempLockInterest(YUSER)
+	
+	set strCode = $$GetRemovalCode(pstrLocking,pidLocking)
+	if strCode'=$$$NOCODE {
+		do RemoveLocksIfRequired(pstrLocking,pidLocking,strCode,$$$YES)
+	}
+	quit
+	
+]]></Routine>
+</Export>

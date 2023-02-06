@@ -1,0 +1,350 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPPaymentAuto" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+    ;-------------------------------------------------------------------------------
+    ; FINAPPaymentAuto - Routines related to Auto Payment
+    ;-------------------------------------------------------------------------------
+	#include FINConst
+	#include WWWConst
+	#include COMSYS
+ 
+ /* SR14869 - This routine is no longer in use, left available to be used so testing can compare results.
+  */
+ 
+AutoPayJob(pidPayment)
+    ;-------------------------------------------------------------------------------
+    ; Create Auto Payment Lines via a back ground job.
+    ; 
+    ; History:
+    ; 28-Mar-2006	SC		SR13942: Use JobWrapper^COMUtilJob.
+    ; 22-Feb-2006	JW		SR13942: Rolled back change
+    ; 20-Dec-2005	RPW		SR13942: Pass the current environment through to the job.
+    ; 30-Nov-2005	RPW		SR13933: If the status is not posted, just reload the form, otherwise do the
+    ; 						auto payment creation
+    ; 20-Oct-2005	PO		SR12943 Included YBED in arg list.
+    ; 23-May-2005	PK		Created SR12178
+    ;-------------------------------------------------------------------------------
+    new Log
+	
+	if '$$$NoKey(pidPayment) {
+		if $$$FINAPPaymentStatus($get(^FINAPPayment(YM,pidPayment,1)))'=$$$EnumFINSYSSTATUSUnposted { ; SR13933
+			do ReloadForm^COMUtilForm()
+		} else {
+			do StartLog^COMLog($$$Text($listbuild("Fin00766",pidPayment)),.Log)  ;Creation of Auto Payment Lines for Payment %1.
+ 
+			;job AutoPay(pidPayment,"",Log,YUSER,YBED) //:(:1::) ; SR13942
+			do JobWrapper^COMUtilJob("AutoPay^FINAPPaymentAuto("""_pidPayment_""","""","""_Log_""")",YUSER) ;SR13942
+			
+			do RedirectForm^COMUtils("COMMsg",Log,"FINAPPayment,","","")
+		}
+	}
+	
+	quit
+ 
+AutoPay(pidPayment,pblnTest=$$$NO,pidLog="")
+	;AutoPay(pidPayment,pblnTest=$$$NO,pidLog="",pstrYUSER="",pstrYBED="")
+    ;-------------------------------------------------------------------------------
+    ; Either creates an auto paymemt, or tests to see if an auto payment can be created.
+    ;
+    ; History:
+    ; 17-May-2006	Steve S		SR14648: Performance increase
+    ; 28-Mar-2006	SC			SR13942: No longer need YUSER and YBED parameter for background
+    ; 							processes. Use JobWrapper^COMUtilsJob instead.
+    ; 02-Dec-2005	PO			SR13948: Call OnAfterSave with flag detailing pay line created via auto process
+    ; 30-Nov-2005	RPW			SR13933: Store the status of the record and change it to 5 - Processing.
+    ; 							When finished, reset the status to the stored status. On error, also restore the status 
+    ; 							and set the stored status to an error.
+    ; 							Use CacheTempInvoices for all the invoices instead of passing the huge structure around.
+    ; 							Also fixed the logging to correctly show the number of suppliers added and ignored.
+    ; 							Ignored now includes the Foreign Currency suppliers. So the count is now accurate.
+    ; 25-Nov-2005	PO			SR13902: Removed coding done in SR13555
+    ; 24-Nov-2005	Steve S		SR13902: Pass $$$NO to AutoPay
+    ; 24-Oct-2005	PO			SR12943: Since auto paying then check whether need to split by supplier
+    ; 19-Oct-2005	JW&SS		SR13216: Set status
+    ; 28-Sep-2005	PO			SR13555: When amount owing less than zero all invoice flagged not to be paid, pay and prepay are set to 0.
+    ; 13-Sep-2005	PO			SR12943: Allow payments to be broken up by department.
+    ; 30-Jun-2005	PO			SR12783: Only base currency suppliers can be auto paid at FINAPPayment level
+    ; 23-May-2005	PK			SR12178: Added logging
+    ; 19-Apr-2005	RobertW/JW	SR12016: Removed Testing from here. The system could and would timeout the loading of 
+    ; 									 the page if there are too many suppliers/invoices that don't qualify 
+    ; 									 before finding one that does.
+    ; 									 Fixed the error messages to be displayed at this point.
+    ; 15-Apr-2005	JW			PR SR11880: Fixed up status usage
+    ; 07-Apr-2005 	Paul K		Don't allow auto payments from $$$EnumFINARBANKLINEMETHODZeroPayment 11880
+    ; 31-Mar-2005	Paul K		Created (adapted from old routine AutoPay^FINAPPayment) (SR#11880)
+    ;-------------------------------------------------------------------------------
+	new strStatus,arrStatus,objPayment,strControlAccountList,idAccount,idSupplier,objPaymentLine,ControlLoop,idPayLine
+	new fltAmountDue,blnFoundSupplier,strMessage,intAdded,intIgnored,idAdded,idIgnored,arrInvoices,idDepartment,idInvoice
+	new strAccounts
+	;new objInvoice,objInvoices ; SR13902
+ 
+	set $ztrap="AutoPayError"
+	
+	/*if $get(Y)="" {
+		do ^WWWVAR
+		set YUSER = pstrYUSER
+		set YBED  = pstrYBED
+	}*/ ;SR13942
+ 
+	kill ^CacheTempInvoice(YUSER) ; SR13933
+		
+	set strStatus=$$$OK
+	if '$$$NoKey(pidPayment) {
+		set objPayment=$get(^FINAPPayment(YM,pidPayment,1))
+		set $$$FINAPPaymentStoredStatus(objPayment)=$$$FINAPPaymentStatus(objPayment) ; SR13933
+		set $$$FINAPPaymentStatus(objPayment)=$$$EnumFINSYSSTATUSProcessing ; SR13933
+		
+		do Save^COMUtils("FINAPPayment",pidPayment,objPayment,1) ; SR13933
+		
+		if 'pblnTest {
+			do KillLines^FINAPPayment(pidPayment,$$$YES)
+		} else {
+			set strStatus = $$Editable^FINAPPayment(pidPayment)
+			if $$$ISOK(strStatus) {
+				if $$$FINAPPaymentPaymentMethod(objPayment)=$$$EnumFINARBANKLINEMETHODZeroPayment {
+					set strStatus=$$$Text("Fin00730")  ;Zero payments must be made manually.
+					
+				} elseif $$$FINAPPaymentPaymentMethod(objPayment)=$$$EnumFINARBANKLINEMETHODCash {
+					 set strStatus=$listbuild("Fin00406")  ;Cash payments must be made manually
+				}
+			}
+		}
+		if $$$ISOK(strStatus) {
+			if $$$FINAPPaymentControlAccounts(objPayment)="" {
+				set $$$FINAPPaymentControlAccounts(objPayment)=$$GetSupplierControl^FINAPSupplier()
+			}
+			
+			set blnFoundSupplier = $$$NO
+			
+			set strAccounts=$$$FINAPPaymentControlAccounts(objPayment) //SR14648 (get accounts once)
+			for ControlLoop=1:1:$length(strAccounts,";") {
+				set idAccount=$piece(strAccounts,";",ControlLoop)
+				quit:(idAccount="") ; SR11570
+				set idAccount=$$$Index(idAccount)
+				
+				if pidLog'="" {
+					do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00767",idAccount)))  ;Processing Suppliers for Control Account %1.
+					set intAdded   = 0
+					set intIgnored = 0
+					set idAdded    = ""
+					set idIgnored  = ""
+				}
+				set idSupplier=""
+				for  { 																	;loop through each supplier in the control account
+					set idSupplier=$order(^FINAPSuppliers(YM,2,idAccount,idSupplier))
+					quit:(idSupplier="")
+					
+					if $$GetFCCode^FINAPSupplier(idSupplier)'="" { ; SR13933
+						if pidLog'="" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00769",$increment(intIgnored))),.idIgnored)  ;%1 Ignored. ; SR13933
+						continue ; Only base currency suppliers can be auto paid at FINAPPayment level ; SR13933
+					}
+ 
+					set strStatus=$$AddSupplier(idSupplier,$$$FINAPPaymentPaymentMethod(objPayment),$$$FINAPPaymentDueDate(objPayment),.fltAmountDue)
+				//	quit:$$$ISOK(strStatus)&&(pblnTest)
+					
+					if $$$ISOK(strStatus)&&('pblnTest)&&('$data(^FINAPPaymentLines(YM,1,pidPayment,idSupplier))) {
+				;		if pidLog'="" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00768",$increment(intAdded))),.idAdded)  ;%1 Added. ; SR13933
+ 
+						do GetInvoices^FINAPPaymentInvoice(idSupplier,$$$YES) ; SR13933
+						
+						set idDepartment = ""
+						for {
+				;			set idDepartment = $order(arrInvoices(idDepartment)) ; SR13933
+							set idDepartment = $order(^CacheTempInvoice(YUSER,idDepartment)) ; SR13933
+							quit:(idDepartment="")
+ 
+							set objPaymentLine=""
+							set $$$FINAPPaymentLineSupplierNumber(objPaymentLine) = idSupplier
+							set $$$FINAPPaymentLineAutoAllocate(objPaymentLine)   = $$$YES
+				;			set $$$FINAPPaymentLineTotal(objPaymentLine)          = $$AmountDue^FINAPSupplier(idSupplier,$$$FINAPPaymentDueDate(objPayment))
+							set $$$FINAPPaymentLineTotal(objPaymentLine)          = fltAmountDue
+				;			if idDepartment'=$char(255) set $$$FINAPPaymentLineDepartment(objPaymentLine)=idDepartment ; SR13933
+							set idPayLine=$order(^FINAPPaymentLine(YM,pidPayment,""),-1)+1
+							if idDepartment '= $char(255) {
+								set $$$FINAPPaymentLineDepartment(objPaymentLine) = idDepartment
+							}
+							
+							set $$$FINAPPaymentLineStatus(objPaymentLine) = $$$EnumFINSYSSTATUSUnposted		//SR13216
+							
+							do Save^FINSYS("FINAPPaymentLine",pidPayment_","_idPayLine,objPaymentLine,1)
+							do OnAfterSave^FINAPPaymentLine(pidPayment_","_idPayLine,objPaymentLine,$$$YES) ; SR13933 & SR13948
+							
+							if '$data(^FINAPPaymentInvoice(YM,pidPayment,idPayLine)) {
+								do KILL^FINSYS("FINAPPaymentLine",pidPayment_","_idPayLine)
+								set idPayLine = idPayLine - 1
+								if pidLog'="" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00769",$increment(intIgnored))),.idIgnored)  ;%1 Ignored. ; SR13933
+							} else {
+								if pidLog'="" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00768",$increment(intAdded))),.idAdded)  ;%1 Added. ; SR13933
+								do AutoPay^FINAPPaymentInvoice(pidPayment_","_idPayLine,1,$$$NO) ;SR13902
+ 
+								; SR12849
+								; 
+								; AddMessage will need to be run after the auto pay for this following code to be used.
+								; 
+								; If the payment method is not a zero payment and and the payment line total is zero
+								; then remove the payment line.
+								;set blnAdded = $$$YES
+								;if $$$FINAPPaymentPaymentMethod(objPayment) '= $$$EnumFINARBANKLINEMETHODZeroPayment {
+								;	set objPaymentLine = $get(^FINAPPaymentLine(YM,pidPayment,idPayLine,1))
+								;	if $$$FINAPPaymentLineTotal(objPaymentLine) = 0 {
+								;		do $$$Kill("FINAPPaymentLine",pidPayment_$$$COMMA_idPayLine)
+								;		set idPayLine = idPayLine - 1
+								;		if pidLog'="" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00769",$increment(intIgnored))),.idIgnored)  ;%1 Ignored. ; SR13933
+								;		set blnAdded = $$$NO
+								;	}
+								;}
+								;if blnAdded {
+								;	if pidLog'="" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00768",$increment(intAdded))),.idAdded)  ;%1 Added. ; SR13933
+								;}
+ 
+ /* SR13902
+								kill objInvoices
+								set idInvoice = ""
+								for {
+									set idInvoice = $order(^FINAPPaymentInvoice(YM,pidPayment,idPayLine,idInvoice))
+									quit:idInvoice=""
+									set objInvoices(pidPayment,idPayLine,idInvoice) = $get(^FINAPPaymentInvoice(YM,pidPayment,idPayLine,idInvoice,1))
+								}
+								if $$GetInvoiceAmounts^FINAPPaymentLine(.objInvoice) < 0 {
+									set idInvoice=""
+									for {
+										set idInvoice = $order(^FINAPPaymentInvoice(YM,pidPayment,idPayLine,idInvoice))
+										quit:idInvoice=""
+										set objInvoice = $get(^FINAPPaymentInvoice(YM,pidPayment,idPayLine,idInvoice,1))
+ 
+										set $$$FINAPPaymentInvoicePay(objInvoice) = $$$NO
+										set $$$FINAPPaymentInvoicePayAmount(objInvoice) = ""
+										set $$$FINAPPaymentInvoiceInvoiceBalance(objInvoice) = $$$FINAPPaymentInvoiceAmountOwing(objInvoice)
+ 
+										do Save^FINSYS("FINAPPaymentInvoice",pidPayment_","_idPayLine_","_idInvoice,objInvoice,1)
+									}
+									set $$$FINAPPaymentLineTotal(objPaymentLine) = 0
+									set $$$FINAPPaymentLinePrepayment(objPaymentLine) = 0
+									do Save^FINSYS("FINAPPaymentLine",pidPayment_","_idPayLine,objPaymentLine,1)
+								}
+ */
+							}
+						}
+ 
+						;OLD CODE FOR AUTO PAYMENTS
+						;	set objPaymentLine=""
+						;	set $$$FINAPPaymentLineSupplierNumber(objPaymentLine)=idSupplier
+						;	set $$$FINAPPaymentLineAutoAllocate(objPaymentLine)=$$$YES
+						;	;set $$$FINAPPaymentLineTotal(objPaymentLine)=$$AmountDue^FINAPSupplier(idSupplier,$$$FINAPPaymentDueDate(objPayment))
+						;	set $$$FINAPPaymentLineTotal(objPaymentLine)=fltAmountDue
+						;	set idPayLine=$order(^FINAPPaymentLine(YM,pidPayment,""),-1)+1
+						;	do Save^FINSYS("FINAPPaymentLine",pidPayment_","_idPayLine,objPaymentLine,1)
+						;	do OnAfterSave^FINAPPaymentLine(pidPayment_","_idPayLine)
+						;	do AutoPay^FINAPPaymentInvoice(pidPayment_","_idPayLine,1)
+ 
+						set blnFoundSupplier = $$$YES
+						
+	//				} elseif (pblnTest) {
+					} else {
+						if pidLog'="" do AddMessage^COMLog(pidLog,$$$Text($listbuild("Fin00769",$increment(intIgnored))),.idIgnored)  ;%1 Ignored.
+						set arrStatus(strStatus)=$get(arrStatus(strStatus))+1
+					}
+				}
+	//			quit:$$$ISOK(strStatus)&&(pblnTest)
+			}
+		}
+	//	if pblnTest {
+	//		if $$$ISERR(strStatus) {
+		
+		if 'blnFoundSupplier {
+			if $data(arrStatus) {
+				set strMessage=$$$Text("Fin00722")_$$$CRLF  ;Cannot create auto run. Reason(s):
+					
+				set strStatus=""
+				for {
+					set strStatus=$order(arrStatus(strStatus))
+					quit:strStatus=""
+						
+					set strMessage=strMessage_$$$Text(strStatus)_" ("_arrStatus(strStatus)_")"_$$$CRLF
+				}
+			} else {
+				set strMessage=$$$Text($listbuild("Fin00716",$tr($$$FINAPPaymentControlAccounts(objPayment),";"," ")))  ;No Suppliers found for Control Accounts: %1.
+			}
+			
+			$$$AlertInScript(strMessage)
+		}
+		
+		 
+		set $$$FINAPPaymentStatus(objPayment)=$$$FINAPPaymentStoredStatus(objPayment) ; SR13933
+		set $$$FINAPPaymentStoredStatus(objPayment)="" ; SR13933
+		
+		do Save^COMUtils("FINAPPayment",pidPayment,objPayment,1) ; SR13933
+	}
+	
+	kill ^CacheTempInvoice(YUSER) ; SR13933
+	
+	if pidLog="" {
+		do ReloadForm^COMUtilForm()	
+	} else {
+		do AddMessage^COMLog(pidLog,$$$Text("Fin00770"))  ;Auto Create Finished.
+	}
+	quit
+	
+AutoPayError ; Internal Tag SR13933
+ 
+	set $ztrap=""
+ 
+	if $get(pidPayment)'="" {
+		set objPayment=$get(^FINAPPayment(YM,pidPayment,1))
+		set $$$FINAPPaymentStatus(objPayment)=$$$FINAPPaymentStoredStatus(objPayment)
+		set $$$FINAPPaymentStoredStatus(objPayment)=$zerror
+		
+		do Save^FINSYS("FINAPPayment",pidPayment,objPayment,1)
+	}
+	
+	kill ^CacheTempInvoice(YUSER)
+	
+	quit
+ 
+AddSupplier(pidSupplier,pintMethod="",pdteDueDate="",pfltAmountDue)
+    ;-------------------------------------------------------------------------------
+    ; For a given supplier, can they be included in this payment run?
+    ;
+    ; Returns:Status
+    ; 
+    ; ByRef:
+    ; pfltAmountDue	The Amount due for the supplier.
+    ;
+    ; History:
+    ; 16-May-2006	Steve S		SR14648: Fix redundant checking, clean up
+    ; 19-Apr-2005	RobertW		SR12016: Modified to return the amount due, as this
+    ; routine calculated it and then the caller also calculated it..
+    ; 15-Apr-2005	JW			PR SR11880: Fixed up status usage
+    ; 01-Apr-2005	Paul K		Created  (SR#11880)
+    ;-------------------------------------------------------------------------------
+	new strStatus,objSupplier,strBankAcc
+	
+	set strStatus=$$$OK
+	set pfltAmountDue=0
+	
+	// SR14648: Not needed -- handled by calling code
+	//	if (pidSupplier="") || ($get(^FINAPSupplier(YM,pidSupplier,1))="") {
+	//	set strStatus=$listbuild("Fin00717")  ;No Supplier Record
+		
+	set objSupplier=$get(^FINAPSupplier(YM,pidSupplier,1))
+	set strBankAcc=$$$FINAPSupplierBankAccountNumber(objSupplier) // SR14648
+	
+	if $$$FINAPSupplierOnHold(objSupplier) {
+		set strStatus=$listbuild("Fin00718")  ;Supplier On Hold
+	} else {
+		if (pintMethod=$$$EnumFINARBANKLINEMETHODCheque) && (strBankAcc'="") {
+			set strStatus=$listbuild("Fin00719")  ;Supplier Uses EFT
+		} elseif (pintMethod=$$$EnumFINARBANKLINEMETHODEFT) && (strBankAcc="") {
+			set strStatus=$listbuild("Fin00720")  ;Supplier Uses Cheque
+		} else {
+			set pfltAmountDue=$$AmountDue^FINAPSupplier(pidSupplier,pdteDueDate)
+			if (pfltAmountDue<=0) {
+				set strStatus=$listbuild("Fin00721")  ;No Payment Required By Due Date.
+			}
+		}
+	}
+	
+	quit strStatus
+	
+]]></Routine>
+</Export>

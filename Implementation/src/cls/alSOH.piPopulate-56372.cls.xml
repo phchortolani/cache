@@ -1,0 +1,727 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Class name="alSOH.piPopulate">
+<ClassType>persistent</ClassType>
+<IncludeCode>%occStatus,INConst,COMSYS</IncludeCode>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%Persistent</Super>
+
+<Method name="ConvertSOHV2">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:%String="&quot;</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; For a given Item, create all the necessary V2 data
+	; If the item is not passed, then do it for all Items (converts INWE data) 
+	; 
+	; History: 
+	; 24-Jan-2011 	PPP		SR17652 - SOH Transactions no longer converted from INWE (deprecated)
+	; 27-Aug-2008	GRF		SR15813: apply coding standards to variable names
+	; 21-Aug-2008	HQN		SR15801: Populate V1 data for PeriodBalance
+	; 21-May-2008	HQN		SR15764: Passing Errors back instead of writing to
+	; 							^ConvertErr.  kill byref .errlist before using,
+	; 							oneshot use as the routine appends!  Not outputting
+	; 							errors to screen, already passed back to caller.
+	; 16-May-2008 	Luke	SR15754 Rewritten to speed up processing 
+	;-------------------------------------------------------------------------------
+	set hardsc  = $$$OK // hard errors that stop the processing //SR15704
+	set softsc  = $$$OK // Errors that must be reported, but dont stop processing //SR15704
+	set initialTime = $piece($horolog,",",2)
+	set hardsc  = ##class(alSOH.piPopulate).DeleteSOH(pidItem)
+	
+	if $$$ISERR(hardsc) {									// EARLY EXIT
+		write !,"Error Deleting Previous SOH Records" 
+		write !,"Cannot continue SOH record conversion...." 
+		quit
+	}
+	
+	// VVV SR15813
+	if $$$ISOK(hardsc) {
+		set hardsc = ##class(alSOH.dTransactionType).Populate()
+	}
+	if $$$ISERR(hardsc) {									// EARLY EXIT
+		write !,"Error Creating Transactio Types" 
+		write !,"Cannot continue SOH record conversion...." 
+		quit
+	}
+
+
+	// ^^^ SR15813
+	//set:$$$ISOK(hardsc) hardsc = 
+	set:$$$ISOK(hardsc) hardsc = ##class(alSOH.piPopulate).ConvertPeriodBalance() ; 21-Aug-2008 HQN SR15801
+
+	if $$$ISERR(hardsc) {									// EARLY EXIT
+		write !,"Error Converting Period Balance" 
+		write !,"Cannot continue SOH record conversion...." 
+		quit
+	}
+		
+	if $$$ISERR(hardsc) {
+		quit hardsc
+	} else {
+		quit softsc
+	}
+]]></Implementation>
+</Method>
+
+<Method name="ReIndex">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Reindex and Tunes SOH tables  
+	; 
+	; History: 
+	; 16-May-2008 	Luke	SR15754 
+	;-------------------------------------------------------------------------------
+	set hardsc = $$$OK
+	write !,"ReIndex"
+	if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dSOHPeriod")
+	if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dSOHPeriod).%BuildIndices()
+	
+	if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dStockBalance")
+	if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dStockBalance).%BuildIndices()
+	
+	if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dBundle")
+	if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dBundle).%BuildIndices()
+	
+	if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dBundleAttribute")
+	if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dBundleAttribute).%BuildIndices()
+	
+	if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dBundleStock")
+	if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dBundleStock).%BuildIndices()
+	
+	if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dSOH")
+	if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dSOH).%BuildIndices()
+	
+	if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dStockHistory")
+	if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dStockHistory).%BuildIndices()
+	quit hardsc
+]]></Implementation>
+</Method>
+
+<Method name="UpdateFromINWE">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pobjItem:alINV.dItem,pobjLocn:alLOC.dLocation,pobjStore:alLOC.dStorage,pdteRecvd:%String,pstrLotNo:%String,pdteUseBy:%String,pfltQty:%Float</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; History:
+	; 10-Oct-2008  	Luke	SR16025  Removed refernce to Default Policy
+	; 27-Aug-2008	GRF		SR15813: apply coding standards to variable names;
+	; 							Quantity is a %Float not %String
+	;-------------------------------------------------------------------------------
+	set hardsc  = $$$OK
+	set hashmap = ##class(%ArrayOfDataTypes).%New()
+	set dteTemp = $piece(pdteRecvd,".",1)
+	
+	if pobjItem.ItemPolicy.Description = "Lot Num Policy" {
+						
+		if pstrLotNo = "" {
+			set strHashVal = $piece(pdteRecvd,".",2)
+			if strHashVal = "" set strHashVal = 0
+			do hashmap.SetAt(strHashVal,"Lot Number")
+		} else {
+			do hashmap.SetAt(pstrLotNo, "Lot Number") //SR15692
+		}					
+		 
+ // Use By Date
+	} elseif pobjItem.ItemPolicy.Description = "Use By Date Policy" {
+		/*
+		set strHashVal = $piece(pdteRecvd,".",2)
+		if strHashVal = "" set strHashVal = 0
+		do hashmap.SetAt(strHashVal,"Lot Number")
+		*/
+		if pstrLotNo = "" {
+			set strHashVal = $piece(pdteRecvd,".",2)
+			if strHashVal = "" set strHashVal = 0
+			do hashmap.SetAt(strHashVal,"Lot Number")
+		} else {
+			do hashmap.SetAt(pstrLotNo, "Lot Number") //SR15692
+		}
+
+		set strHashVal = pdteUseBy
+		//objINWE.UseableUntilDate
+		if strHashVal = "" set strHashVal = +$horolog
+		do hashmap.SetAt(strHashVal,"Use By Date")
+					
+ // Blank
+		} elseif pobjItem.ItemPolicy.Description = "Blank Policy" {
+			// Do Nothing
+			
+ // Default by Default
+		} else {
+				
+			do hashmap.SetAt(objINWE.StockLocation,"Storage")
+			set dteTemp = $piece(pdteRecvd,".",1)
+			do hashmap.SetAt(dteTemp,"ReceiveDate")
+			
+			set strHashVal = $piece(pdteRecvd,".",2)
+			if strHashVal = "" set strHashVal = 0
+			do hashmap.SetAt(strHashVal,"ReceiptNo")
+		}
+		
+		set objBundle = ##class(alSOH.iSOH).GetBundle(pobjItem.%Id(),.hashmap)
+		if $zdateh(objBundle.CreationDate,3) = +$horolog {
+			set objBundle.CreationDate = $zdatetime(dteTemp,3)
+		}
+		
+		do hashmap.%Close()
+					
+		set objMove = ##class(alDRP.dMovement.dInitialLoad).%New()
+		set objMove.Item         = pobjItem
+		set objMove.FromLocn     = pobjLocn
+		set objMove.ToLocn       = pobjLocn
+		set objMove.FromStorage  = pobjStore
+		set objMove.ToStorage    = pobjStore		
+	 	set objMove.Bundle       = objBundle
+		set objMove.Reference    = "on Build"
+		set objMove.LineNumber   = ""
+		set objMove.QtyPicked    = pfltQty 
+		set objMove.QtyReceived  = 0
+		set objMove.QtyRequired  = pfltQty 
+		set objMove.Supply       = ""
+		set objMove.Demand       = ""
+		set objMove.Completed    = $$$NO
+				
+		if $$$ISOK(hardsc) {
+			set hardsc = objMove.ChangeState(4)
+		}
+		if $$$ISOK(hardsc) {
+			set hardsc = objMove.%Close()
+			kill objMove
+		}
+
+	quit hardsc
+]]></Implementation>
+</Method>
+
+<Method name="ConvertSOH">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:%String="&quot;</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; For a given Item, create all the necessary V2 data
+	; If the item is not passed, then do it for all Items (converts INWE data) 
+	; 
+	; WHERE Company = 0
+	; 
+	; History:
+	; 10-Oct-2008  	Luke	SR16025  Removed refernce to Default Policy
+	; 27-Aug-2008	GRF		SR15813: apply coding standards to variable names
+	; 15-Aug-2008	Luke 	SR15813 Added population of transaction types 
+	; 15-May-2008 	PPP 	SR15732 added 'WHERE Company = 0' to the SQL
+	; 12-May-2008 	Luke 	SR15735 added addition for qty and totalreservedQTY on INWE
+	; 12-May-2008 	Luke    SR15732: removed quit on error and collected errors to
+	; 							display to user
+	; 07-May-2008			SR15704: Corrected Error handling for hard and soft
+	; 							errors.  Created a way of informing user of errors 
+	; 							Now does not break on error, but continues and
+	; 							collects them 
+	; 05-May-2008	HQN		Removed ReceiveDate as an Attribute from all lot number
+	; 							policy, no longer applicable
+	; 							Relabelled objV1 to onjINWE, more meaningful
+	; 						SR15705: Use interface getters instead of loading V2
+	; 						directly if the input key is from V1
+	; 						SR15705: Return a meaningful error on processing...V1
+	; 							integrity failures
+	; 01-May-2008	PPP		Created
+	;-------------------------------------------------------------------------------
+	set hardsc  = $$$OK // hard errors that stop the processing                   //SR15704
+	set softsc  = $$$OK // Errors that must be reported, but dont stop processing //SR15704
+	set initialTime = $piece($horolog,",",2)
+	set hardsc  = ##class(alSOH.piPopulate).DeleteSOH(pidItem)
+	// VVV SR15813
+	if $$$ISOK(hardsc) {
+		set hardsc = ##class(alSOH.dTransactionType).Populate()
+	}
+	// ^^^ SR15813
+	set rsCount = ##class(%ResultSet).%New()
+	set strSQL="SELECT COUNT(*) as COUNT FROM SQLUser.INWE WHERE Company = 0"
+	
+	set strAddSQL=""
+	if pidItem '= "" set strAddSQL=" AND Item = '"_pidItem_"'"
+	
+	do rsCount.Prepare(strSQL_strAddSQL)
+	do rsCount.Execute()
+	
+	set inweCount = 0 
+	while (rsCount.Next(.hardsc)) {
+		if ($SYSTEM.Status.IsOK(hardsc)) {
+			set inweCount = rsCount.Data("COUNT")
+		}
+	} 
+	
+	write !!,"Processing INWE"_$select(pidItem'="":" for Item "_pidItem,1:"")_" ("_ inweCount _" Records)",!
+	
+	set rs = ##class(%ResultSet).%New()
+	set strSQL="select ID from SQLUser.INWE WHERE Company = 0"
+	do rs.Prepare(strSQL_strAddSQL)
+
+	do rs.Execute()
+	set counter = 0
+	
+	while (rs.Next(.hardsc)) {
+		if ($SYSTEM.Status.IsOK(hardsc)) {  // check if this succeeded without errors
+			//set objINWE = ##class(alSOH.dUINWE).%OpenId(rs.Data("ID"),1)
+			set objINWE = ##class(User.INWE).%OpenId(rs.Data("ID"),1)
+			
+			set counter = counter+1
+
+			write:'(counter#70) !,counter
+			write "."
+			
+			if objINWE '="" {
+				set tempStatus	= $$$OK 
+				set blnSkip		= $$$NO
+				set objItem    = ##class(alINV.iUINV).GetItem(objINWE.Item,.tempStatus)
+				set objLocn    = ##class(alLOC.iLOC).GetLocation(objINWE.Location,.tempStatus)
+				if $$$ISOK(tempStatus)   { //SR15704
+					set objStore = ##class(alLOC.iLOC).GetStorage(objINWE.Location,objINWE.StockLocation,.tempStatus)
+				} 
+				if (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(0,YM,1)))) {
+					set blnSkip='$$OnlyTrackPrograms^INBundleUtils(idRecLoc) ; Only do non lot controlled locations
+					continue
+				}
+				
+				do GetAttributes^INItemPolicyUtils(idItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,idLoc)
+				if $$$ISERR(tempStatus) { //SR15704
+					set strErrMessage = ""
+					do DecomposeStatus^%apiOBJ(tempStatus,.errlist,"-d")
+					for loopK=1:1:errlist {
+						set strErrMessage = errlist(loopK)
+					}
+					set ^ConvertErr($i(^ConvertErr)) = " INWE ID :"_objINWE.%Id()_"   :  "_strErrMessage
+					set newErr = $$$ERROR($$$GeneralError,"Can not Convert INWE :"_objINWE.%Id()_":"_strErrMessage) 
+					set softsc = $$$ADDSC(newErr,softsc)
+					continue //SR15704
+					//quit
+				}
+				
+				if (objItem '= "") && (objLocn'= "") && (objStore '= "") {
+					set hashmap = ##class(%ArrayOfDataTypes).%New()
+					set dteTemp = $piece(objINWE.GoodsReceipt,".",1)
+					
+				// Lot Number
+				if blnLotNo {					
+					if objINWE.LotNo = "" {
+						set strHashVal = $piece(objINWE.GoodsReceipt,".",2)
+						if strHashVal = "" set strHashVal = 0
+						do hashmap.SetAt(strHashVal,"Lot Number")
+					} else {
+						do hashmap.SetAt(objINWE.LotNo, "Lot Number") //SR15692
+					}
+				}	
+				// Use By Date
+				if blnUseByDate {
+					set strHashVal = objINWE.UseableUntilDate
+					if strHashVal = "" set strHashVal = +$horolog         ; FIXME - is this correct? Show as expiring if not present?
+					do hashmap.SetAt(strHashVal,"Use By Date")
+				}	
+					
+				set objBundle = ##class(alSOH.iSOH).GetBundle(objItem.%Id(),.hashmap)
+				if $zdateh(objBundle.CreationDate,3) = +$horolog {
+					set objBundle.CreationDate = $zdateTime(dteTemp,3)
+				}
+				
+				do hashmap.%Close()
+				
+				;	FIXME : Where is hardsc being updated after rs.Next?  use sc?
+				;	        Should we be checking objBundle is not NULLOREF instead? <GRF>
+					
+				if $$$ISOK(hardsc) {		
+					set fltQty = objINWE.Quantity + objINWE.TotalReservedQuantity //SR15735
+				
+					set objMove = ##class(alDRP.dMovement.dInitialLoad).%New()
+					set objMove.Item         = objItem
+					set objMove.FromLocn     = objStore.Location
+					set objMove.ToLocn       = objStore.Location
+					set objMove.FromStorage  = objStore
+					set objMove.ToStorage    = objStore		
+	    		 	set objMove.Bundle       = objBundle
+					set objMove.Reference    = "on Build"
+					set objMove.LineNumber   = ""
+					set objMove.QtyPicked    = fltQty //SR15735
+					set objMove.QtyReceived  = 0
+					set objMove.QtyRequired  = fltQty //SR15735
+					set objMove.Supply       = ""
+					set objMove.Demand       = ""
+					set objMove.Completed    = $$$NO
+				
+					if $$$ISOK(hardsc) {
+						set hardsc = objMove.ChangeState(4)
+					}
+					if $$$ISOK(hardsc) {
+						set hardsc = objMove.%Close()
+						kill objMove
+					}
+					if $$$ISERR(hardsc) {
+						write !,"Item :"_objItem.%Id()_ "  Loc :"_objLocn.%Id()_"   Store :"_objStore.%Id()
+						write !,"ItemPolicy :"_objItem.ItemPolicy.Description
+						write !,"Bundle :"_objBundle.%Id()
+						write !,"Attributes :"_objBundle.Attributes.Count()
+						write !,"INWE :"_objINWE.%Id()
+						
+						for loopi=1:1:objBundle.Attributes.Count() {
+							set tempx = objBundle.Attributes.GetAt(loopi)
+							write !,tempx.%Id()
+						}
+						set strMessage = ""
+						do DecomposeStatus^%apiOBJ(hardsc,.errlist,"-d")
+					for loopK=1:1:errlist {
+							set strMessage = strMessage_errlist(loopK)
+						}
+						write !!,strMessage
+						quit
+					}
+				}
+					
+				if $$$ISOK(hardsc) set hardsc = objItem.%Close()
+				if $$$ISOK(hardsc) set hardsc = objLocn.%Close()
+				if $$$ISOK(hardsc) set hardsc = objStore.%Close()
+				if $$$ISOK(hardsc) set hardsc = objBundle.%Close()
+				
+			} else { ; V1 data integrity failure!
+				/// VVVVV  SR15732:
+				set ^ConvertErr($i(^ConvertErr)) = "V1 data integrity failure INWE ID :"_rs.Data("ID")_"   :  Does Not Exist"
+				set newErr     = $$$ERROR($$$GeneralError," INWE ID :"_rs.Data("ID")_"   :  Does Not Exist") 
+				set softsc = $$$ADDSC(newErr,softsc)
+				continue //SR15704			
+				//set hardsc = $$$ADDSC($$$ERROR(5001,"V1 data integrity failure"),hardsc)
+				continue ; While break//SR15704
+				/// ^^^^^^  SR15732:
+			}
+			if $$$ISOK(hardsc) set hardsc = objINWE.%Close()
+		}				
+	}
+}
+	
+	do rs.%Close()
+
+	if pidItem = "" {
+		if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dSOHPeriod")
+		if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dSOHPeriod).%BuildIndices()
+		
+		if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dStockBalance")
+		if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dStockBalance).%BuildIndices()
+		
+		if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dBundle")
+		if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dBundle).%BuildIndices()
+		
+		if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dBundleAttribute")
+		if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dBundleAttribute).%BuildIndices()
+		
+		if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dBundleStock")
+		if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dBundleStock).%BuildIndices()
+		
+		if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dSOH")
+		if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dSOH).%BuildIndices()
+		
+		if $$$ISOK(hardsc) set hardsc = $system.SQL.TuneTable("alSOH.dStockHistory")
+		if $$$ISOK(hardsc) set hardsc = ##class(alSOH.dStockHistory).%BuildIndices()
+		
+		set finshtime =  $piece($horolog,",",2)
+		set overall = finshtime - initialTime
+		write !,"Total Count        : " _ +$get(inweCount)
+		write !,"Records Processed  : " _ +$get(counter)
+		write !,"Time Taken to process Transactions : " _ $ztime(overall,1)
+	}
+	
+	if $$$ISERR(softsc) {
+		write !!,"Some Errors occured in the Converstion process"
+		write !,"These are also saved in the ^ConvertErr global"  //SR15732:
+		set strMessage = ""
+		do DecomposeStatus^%apiOBJ(softsc,.errlist,"-d")
+		for loopK=1:1:errlist {
+			write !,errlist(loopK)
+		}
+		//write !!,strMessage
+	}
+	
+	quit hardsc
+]]></Implementation>
+</Method>
+
+<Method name="DeleteAllData">
+<ClassMethod>1</ClassMethod>
+<Private>1</Private>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Initial take on of V1 data to V2
+	; Delete all relevant D2 data
+	; 
+	; History
+	; 02-May-2008   Luke 	SR15705 Copied from alINV.piPopulate::DeleteAllData
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+   	
+   	
+   	if $$$ISOK(sc) {	
+		do ##class(alSOH.dTransactionType).%KillExtent()
+		//set sc = ##class(alSOH.dBundle).%DeleteExtent()
+		//do ##class(alSOH.dBundle).%PurgeIndices()
+   	}
+   	
+	if $$$ISOK(sc) {	
+		do ##class(alSOH.dBundle).%KillExtent()
+		//set sc = ##class(alSOH.dBundle).%DeleteExtent()
+		//do ##class(alSOH.dBundle).%PurgeIndices()
+   	}
+	if $$$ISOK(sc) {			
+		do ##class(alSOH.dBundleStock).%KillExtent()
+		//set sc = ##class(alSOH.dBundleStock).%DeleteExtent()
+		//do ##class(alSOH.dBundleStock).%PurgeIndices()
+   	}
+	if $$$ISOK(sc) {			
+		do ##class(alSOH.dBundleAttribute).%KillExtent()
+		//set sc = ##class(alSOH.dBundleAttribute).%DeleteExtent()
+		//do ##class(alSOH.dStockBalance).%PurgeIndices()
+   	}
+	if $$$ISOK(sc) {			
+		do ##class(alSOH.dSOH).%KillExtent()
+		//set sc = ##class(alSOH.dSOH).%DeleteExtent()
+		//do ##class(alSOH.dSOH).%PurgeIndices()
+   	}
+	if $$$ISOK(sc) {			
+		do ##class(alSOH.dStockBalance).%KillExtent()
+		//set sc = ##class(alSOH.dStockBalance).%DeleteExtent()
+		//do ##class(alSOH.dStockBalance).%PurgeIndices()
+   	}
+	if $$$ISOK(sc) {			
+		do ##class(alSOH.dStockHistory).%KillExtent()
+		//set sc = ##class(alSOH.dStockHistory).%DeleteExtent()
+		//do ##class(alSOH.dStockHistory).%PurgeIndices()
+	}
+	quit sc
+]]></Implementation>
+</Method>
+
+<Method name="DeleteSOH">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pidItem:%String="&quot;</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; For Initial take on of V1 data to V2 delete the relevant data for an Item
+	;
+	;-- Bundle Item Storage
+	;select * from alSOH.dBundleStock WHERE Item = '10101'
+	;
+	;-- Item Storage
+	;select * from alSOH.dSOH WHERE Item = '10101'
+	;
+	;-- Item Location
+	;select * from alSOH.dStockBalance WHERE Item = '10101'
+	;
+	;-- Period Balances
+	;select * from alSOH.dPeriodBalance WHERE Item = '10101'
+	;
+	;-- Stock History
+	;select * from alSOH.dStockHistory WHERE Item = '10101'
+	;
+	;-- Stock Movement
+	;select * from alDRP.dMovement WHERE Item = '10101'
+	; 
+	; History:
+	; 05-May-2008	HQN		SR15711: Added Bundle Deletion
+	; 02-May-2008	Luke	Added call for deletion of tables 
+	; 01-May-2008	PPP 	Created
+	;-------------------------------------------------------------------------------
+	set strStatus   = $$$OK
+	
+	// For a Specific Item	
+	if pidItem '= "" {
+		set objItem = ##class(alINV.iUINV).GetItem(pidItem)
+		//Bundle Item Storage
+		set rs = ##class(%ResultSet).%New()
+		//do rs.Prepare("select ID from alSOH.dBundleStock WHERE Item = '"_pidItem_"'")
+		do rs.Prepare("select ID from alSOH.dBundleStock WHERE Item = '"_objItem.%Id()_"'")
+		do rs.Execute()
+		set counter = 0
+		
+		while (rs.Next(.strStatus)) {
+			if ($SYSTEM.Status.IsOK(strStatus)) {
+				set strStatus = ##class(alSOH.dBundleStock).%DeleteId(rs.Data("ID"),1)
+			}
+		}
+		do rs.%Close()
+		
+		//Item Storage
+		set rs = ##class(%ResultSet).%New()
+		do rs.Prepare("select ID from alSOH.dSOH WHERE Item = '"_pidItem_"'")
+		do rs.Execute()
+		set counter = 0
+		
+		while (rs.Next(.strStatus)) {
+			if ($SYSTEM.Status.IsOK(strStatus)) {
+				set strStatus=##class(alSOH.dSOH).%DeleteId(rs.Data("ID"),1)
+			}
+		}
+		do rs.%Close()
+		
+		//Item Location
+		set rs = ##class(%ResultSet).%New()
+		do rs.Prepare("select ID from alSOH.dStockBalance WHERE Item = '"_pidItem_"'")
+		do rs.Execute()
+		set counter = 0
+		
+		while (rs.Next(.strStatus)) {
+			if ($SYSTEM.Status.IsOK(strStatus)) {
+				set strStatus=##class(alSOH.dStockBalance).%DeleteId(rs.Data("ID"),1)
+			}
+		}
+		do rs.%Close()
+		
+		//Period Balances
+		set rs = ##class(%ResultSet).%New()
+		do rs.Prepare("select ID from alSOH.dPeriodBalance WHERE Item = '"_pidItem_"'")
+		do rs.Execute()
+		set counter = 0
+		
+		while (rs.Next(.strStatus)) {
+			if ($SYSTEM.Status.IsOK(strStatus)) {
+				set strStatus=##class(alSOH.dPeriodBalance).%DeleteId(rs.Data("ID"),1)
+			}
+		}
+		do rs.%Close()
+	
+		//Stock History
+		set rs = ##class(%ResultSet).%New()
+		do rs.Prepare("select ID from alSOH.dStockHistory WHERE Item = '"_pidItem_"'")
+		do rs.Execute()
+		set counter = 0
+		
+		while (rs.Next(.strStatus)) {
+			if ($SYSTEM.Status.IsOK(strStatus)) {
+				set strStatus=##class(alSOH.dStockHistory).%DeleteId(rs.Data("ID"),1)
+			}
+		}
+		do rs.%Close()
+	
+		//Stock Movement
+		set rs = ##class(%ResultSet).%New()
+		do rs.Prepare("select ID from alDRP.dMovement WHERE Item = '"_pidItem_"'")
+		do rs.Execute()
+		set counter = 0
+		
+		while (rs.Next(.strStatus)) {
+			if ($SYSTEM.Status.IsOK(strStatus)) {
+				set strStatus=##class(alDRP.dMovement).%DeleteId(rs.Data("ID"),1)
+			}
+		}
+		do rs.%Close()
+		
+		set rs = ##class(%Library.ResultSet).%New()
+		do rs.Prepare("select * from alSOH.dBundle WHERE item = ?")
+		do rs.Execute(objItem.%Id())
+		while rs.Next(.strStatus) {
+			if $SYSTEM.Status.IsOK(strStatus) {
+				set strStatus = ##class(alSOH.dBundle).%DeleteId(rs.Data("ID"),1)
+			}
+		}
+		do rs.%Close()
+	}
+	
+	// Delete All	
+	if pidItem = "" {
+		set strStatus = ..DeleteAllData()
+	}
+		
+	quit strStatus
+]]></Implementation>
+</Method>
+
+<Method name="ConvertPeriodBalance">
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	;-------------------------------------------------------------------------------
+	; Converts all records required for PeriodBalance to be able to be used in ANM
+	; Utilising tools via 1.5
+	; 
+	; History:
+	; 27-Aug-2008	GRF		SR15813: parentheses missing around TLEVEL clause
+	; 21-Aug-2008	HQN		SR15801: Created
+	;-------------------------------------------------------------------------------
+	set sc = $$$OK
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	tstart
+	;+++++++++++++++++++++++++++++++++++++++
+
+	; Period Cycle
+	set sc = ##class(alSOH.dUPeriodCycle).%DeleteExtent()
+	set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dPeriodCycle:Extent")
+	if objResultSet.Execute() {
+		while objResultSet.Next(.sc) {
+			set sc = ##class(alSOH.dUPeriodCycle).ConvertV2(objResultSet.Data("ID"))
+		}
+	}
+	
+	; Period Type
+	set sc = ##class(alSOH.dUPeriodType).%DeleteExtent()
+	if $$$ISOK(sc) {
+		; Ensure that the V1 Keys will auto increment at the same rate as V2
+		set objUNumerator = ##class(User.WWW128).%OpenId("0||SOHPeriodType")
+		if objUNumerator = $$$NULLOREF {
+			set objUNumerator = ##class(User.WWW128).%New()
+			set objUNumerator.Company  = 0
+			set objUNumerator.FormName = "SOHPeriodType"
+		}
+		
+		set objUNumerator.IncrementBy    = 1
+		//set objUNumerator.SequenceNumber = @##class(%Dictionary.ClassDefinition).%OpenId("alSOH.dPeriodType").Storages.GetAt(1).IdLocation
+		set objUNumerator.SequenceNumber = ##class(%Dictionary.ClassDefinition).%OpenId("alSOH.dPeriodType").Storages.GetAt(1).IdLocation
+		set sc = objUNumerator.%Save()
+		; Ensure that COMConversion is hooked so V2 gets updated from V1
+		set objCOMConversion = ##class(User.COMConversion).%OpenId("SOHPeriodType",,.sc)
+		if objCOMConversion = $$$NULLOREF {
+			set objCOMConversion = ##class(User.COMConversion).%New()
+			set objCOMConversion.OldClass = "SOHPeriodType"
+		}
+		set objCOMConversion.Package = "alSOH.dUPeriodType"
+		set sc = objCOMConversion.%Save()
+		
+		set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dPeriodType:Extent")
+		if objResultSet.Execute() {
+			while objResultSet.Next(.sc) {
+				set sc = ##class(alSOH.dUPeriodType).ConvertV2(objResultSet.Data("ID"))
+			}
+		}
+	}
+	; SOHPeriod
+	set sc = ##class(alSOH.dUSOHPeriod).%DeleteExtent()
+	if $$$ISOK(sc) {
+		set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dSOHPeriod:Extent")
+		if objResultSet.Execute() {
+			while objResultSet.Next(.sc) {
+				set sc = ##class(alSOH.dUSOHPeriod).ConvertV2(objResultSet.Data("ID"))
+			}
+		}
+	}
+
+	;+++++++++++++++++++++++++++++++++++++++
+	tcommit:$$$ISOK(sc)&&($tlevel>0)
+	trollback:$$$ISERR(sc)
+	;+++++++++++++++++++++++++++++++++++++++
+	quit sc
+]]></Implementation>
+</Method>
+<Storage name="Default">
+<Type>%Library.CacheStorage</Type>
+<DataLocation>^alSOH.piPopulateD</DataLocation>
+<DefaultData>piPopulateDefaultData</DefaultData>
+<IdLocation>^alSOH.piPopulateD</IdLocation>
+<IndexLocation>^alSOH.piPopulateI</IndexLocation>
+<StreamLocation>^alSOH.piPopulateS</StreamLocation>
+<Data name="piPopulateDefaultData">
+<Value name="1">
+<Value>%%CLASSNAME</Value>
+</Value>
+</Data>
+</Storage>
+</Class>
+</Export>

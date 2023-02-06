@@ -1,0 +1,798 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INFIBBUCH43" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INFIBBUCH43
+#include COMSYS
+#include INConst
+#include COMDebug
+	;-------------------------------------------------------------------------------
+	; History:
+	; 01-Jun-2005	GRF		SR10478 : Add SourceLocn back until ledger profile defn
+	; 						is rationalised.
+	; 11-Apr-2005	GRF		SR10478 : Revision to Location means SourceLocn not reqd
+	; 07-Apr-2005	GRF		SR10478 : Break routine into more manageable chunks
+	;-------------------------------------------------------------------------------
+	
+	; TODO : Will we ever call ADJ?
+	;        How are Warehouse orders handled - ensure from/to locations dealt with
+	
+INVENTORY(BUCHUNG,YFPARA)
+	;-------------------------------------------------------------------------------
+	; Stock Movements and Adjustments
+	; 
+	;        FINBTR should *** ONLY *** be used for the IN Ledger profile
+	;        substitution with $$EXCHANGE^INFIBBUCH.
+	; 
+	; Params : YFPARA = ^INFIBPAR(0,0,Location,1)
+	; 
+	; History:
+	; 16-Jun-2005	GRF		SR10478 : Disable GINILocn from order
+	; 02-Jun-2005	GRF		COM Routines will exist
+	; 11-Apr-2005	GRF		SR10478 : Default value for DeleteLocn; correct From/To
+	;                       location and stock location; Split processes; validate
+	;                       WebService available BEFORE further processing; braces
+	;                       format.
+	; 08-Apr-2005	GRF		SR10478 : INAdjStock rather than INAdjust; activate
+	; 						changes; "INQuantitySave" not defined so commented out.
+	; 16-Mar-2005	GRF		SR10478 : Preserve original location and item group for
+	; 						post cost-matrix profile resolution
+	; 03-Feb-2005	GRF		SR10478 : Added characteristic values;
+	; 						Common ITEM, POS, DeleteLocn defns
+	;-------------------------------------------------------------------------------
+	new BTR,FINBTR,ITEM,MAN,POS,WAGR
+	
+	set MAN = YM
+	set BTR = $piece(BUCHUNG,Y,16)
+	if BTR="" set BTR = YLOCATION
+	set FINBTR = BTR
+	
+	if $piece(YFPARA,Y,2)'="" set MAN    = $piece(YFPARA,Y,2)  ;Company in GL
+	if $piece(YFPARA,Y,3)'="" set FINBTR = $piece(YFPARA,Y,3)  ;Location in GL 
+	
+	set ITEM = $piece(BUCHUNG,Y,29)
+	set WAGR = ""
+	if ITEM'="" set WAGR = $piece($get(^INART(0,ITEM,1)),Y,30)
+	if WAGR=""  set WAGR = $piece($get(^INVORG(0,0,1)),Y,13)  ;DFLT.
+	
+	set POS = $piece(BUCHUNG,Y,28)
+	if +POS=0 set POS = 1
+	
+	if $piece(BUCHUNG,Y,9)=0 {
+		do REC(.BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR)  ; FIXME : don't actually need . for BUCHUNG? <GRF>
+	
+	} elseif $piece(BUCHUNG,Y,9)=1 {
+		do ISS(.BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR)  ; FIXME : don't actually need . for BUCHUNG? <GRF>
+	
+	} elseif $piece(BUCHUNG,Y,9)=2 {
+		do TFR(.BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR)  ; FIXME : don't actually need . for BUCHUNG? <GRF>
+	
+	} elseif $piece(BUCHUNG,Y,9)=3 {
+		do ADJ(.BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR)  ; FIXME : don't actually need . for BUCHUNG? <GRF>
+	}
+	quit
+	
+	
+REC(BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR)
+	;-------------------------------------------------------------------------------
+	; ByRef : BUCHUNG		; FIXME : Why does it need to be passed byRef? <GRF>
+	; 
+	; History:
+	; 30-May-2007	HeberB	BR014304 : Web Services Update
+	; 30-Mar-2006	GRF		Restored missing quit - technical issue only
+	; 27-Jul-2005	GRF		SR13024 : Split Production Processing away from other REC
+	;-------------------------------------------------------------------------------
+	new idOrder,objOrder,OrderType
+	
+	set idOrder = $piece(BUCHUNG,Y,27)
+	if idOrder'="" {
+		set objOrder  = $get(^INAUF(0,idOrder,1))
+		set OrderType = $piece(objOrder,Y,2)
+	} else {
+		set idOrder = $piece(BUCHUNG,Y,36)        ; BR014304 : Web Services Update  ;FIXME Should this be piece 27 Order Number
+	}
+ 
+	if $get(OrderType)="" set OrderType = 9    ; No Order
+	
+	/*	TODO JW - reverted for build
+	set ^mtemp($job,"INSupRec","Audit") = $piece(BUCHUNG,Y,11)	//SR14615
+	*/
+	if OrderType=1 {
+		do RECProd(.BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR,idOrder,OrderType)   ; FIXME : don't actually need . for BUCHUNG? <GRF>
+	} else {
+		do RECOther(.BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR,idOrder,OrderType)  ; FIXME : don't actually need . for BUCHUNG? <GRF>
+	}
+	quit
+	
+	
+RECProd(BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR,idOrder,OrderType)
+	;-------------------------------------------------------------------------------
+	; Receiving Goods / Wareneingang
+	; 
+	; ByRef : BUCHUNG
+	; 
+	; History:
+	; 09-Jul-2010	SCR		SR17387: Send SourceDetail, SourceForm, SourceRec
+	; 17-Aug-2005	GRF		SR13215: Include Quantity Reference for ease of checking
+	; 27-Jul-2005	GRF		SR13024: Split Production Processing away from other REC
+	;-------------------------------------------------------------------------------
+	
+	; TODO : Use Production specific message rather than INSupRec
+	; ditto for Customer Returns
+	;------------------------------------------------------
+	;          DTD Element Structure : INSupRec
+	; Date(Receive Date)
+	; Lines(Receive Lines)
+	;	CharVal(CST Characteristic Values)
+	;	
+	;	LineReceivedAccount(Line Account (AR-SUP))		D35		$$$INFIBPARPurchases (actually GRNYI)
+	;	LineSOHAccount(Stock on Hand Account)			D31		$$$INFIBPARInventoryAccount
+	;	
+	;	LineSOHAmount(Line Received Amount)
+	;	LineMATAmount(Line Received Amount)
+	;	LineLBRAmount(Line Received Amount)
+	;	LineMBDAmount(Line Received Amount)
+	;	LineBDNAmount(Line Received Amount)
+	;	LineRef(Line Reference (Stock Number))
+	;	
+	;	OrderLine(Order Line)
+	;	SourceGroup(Source Item Group)
+	; Location(Location)
+	; Order(Order Number)
+	; OrderType(CST Order Type)
+	; SourceDetail(Message ID and arguments)
+	; SourceForm(Form ID)
+	; SourceRecord(Source Transaction Keys)
+	; Supplier(Supplier Number)
+	; TranType(CST Transaction Type)
+	;------------------------------------------------------
+	new arrServiceCosts,fltAmount,fltServiceCost,idx,OK
+	
+	set ^mtemp($job,"INSupRec","Date")         = $piece(BUCHUNG,Y,2)    ;DATE / DATUM
+	set ^mtemp($job,"INSupRec","Supplier")     = $piece(BUCHUNG,Y,22)   ;VENDOR / LIEFERANT ;supplier 
+	set ^mtemp($job,"INSupRec","Location")     = BTR                    ;BETRIEB IN FIBU / Location in GL 
+	set ^mtemp($job,"INSupRec","SourceLocn")   = BTR                    ;Location
+	set ^mtemp($job,"INSupRec","Order")        = idOrder                ;ORDER
+	set ^mtemp($job,"INSupRec","TranType")     = "REC"
+	set ^mtemp($job,"INSupRec","OrderType")    = OrderType
+	set ^mtemp($job,"INSupRec","SourceDetail") = $piece(BUCHUNG,Y,105) ; SR17387
+	set ^mtemp($job,"INSupRec","SourceForm")   = $piece(BUCHUNG,Y,106) ; SR17387
+	set ^mtemp($job,"INSupRec","SourceRecord") = $piece(BUCHUNG,Y,107) ; SR17387
+	
+	
+	
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineSOHAmount")      = $piece(BUCHUNG,Y,3)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineMATAmount")      = $piece(BUCHUNG,Y,56)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineLBRAmount")      = $piece(BUCHUNG,Y,57)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineMBDAmount")      = $piece(BUCHUNG,Y,58)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineBDNAmount")      = $piece(BUCHUNG,Y,59)
+	set ^mtemp($job,"INSupRec","Lines",POS,"QRef")               = $piece(BUCHUNG,Y,32)   ;quantity reference ;SR13215
+	
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineReceivedAccount")= $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,35),FINBTR,WAGR)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineSOHAccount")     = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,31),FINBTR,WAGR)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineRef")            = ITEM                   ;item no. / ARTIKEL-NUMMER
+	set ^mtemp($job,"INSupRec","Lines",POS,"OrderLine")          = POS                    ;LINE ITEM
+	set ^mtemp($job,"INSupRec","Lines",POS,"SourceGroup")        = WAGR
+	
+	do CopyCharVals^INFIBBUCH4("INSupRec",BUCHUNG,POS)
+	set OK = $$setRelevantEvents^COMDCMControlModule("DiscLinc","INSupRec","other","","")
+	quit
+	
+	
+RECOther(BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR,idOrder,OrderType)
+	
+	; TODO : REC for Customer Order => -ve Issue? + similar
+	
+	;-------------------------------------------------------------------------------
+	; Receiving Goods / Wareneingang
+	; 
+	; ByRef : BUCHUNG
+	; 
+	; History:
+	; 09-Jul-2010	SCR		SR17387: Send SourceDetail, SourceForm, SourceRec
+	; 17-Aug-2005	GRF		SR13215 : Include Quantity Reference for ease of checking
+	; 27-Jul-2005	GRF		SR13024 : Split Production Processing away from other REC
+    ; 08-Jul-2005	shobby	SR12745 : BUCHUNG now has the amount without service
+    ; 							costs to handle rounding issues
+	; 18-Apr-2005	GRF		SR10478 : Get order type from the order
+	; 12-Apr-2005	shobby	SR12101 : Include service costs in the message.
+	; 11-Apr-2005	GRF		SR10478 : Why on earth would we want to substitute a
+	; 							"Net Profit" account for "SOH"?  Why would we define
+	; 							it at an item level?
+	;-------------------------------------------------------------------------------
+	;------------------------------------------------------
+	;          DTD Element Structure : INSUPREC
+	; Date(Receive Date)
+	; Lines(Receive Lines)
+	;	CharVal(CST Characteristic Values)
+	;	LineReceivedAccount(Line Account (AR-SUP))		D35		$$$INFIBPARPurchases (actually GRNYI)
+	;	LineReceivedAmount(Line Received Amount)
+	;	LineRef(Line Reference (Stock Number))
+	;	LineSOHAccount(Stock on Hand Account)			D31		$$$INFIBPARInventoryAccount
+	;	OrderLine(Order Line)
+	;	SourceGroup(Source Item Group)
+	; Location(Location)
+	; Order(Order Number)
+	; OrderType(CST Order Type)
+	; SourceDetail(Message ID and arguments)
+	; SourceForm(Form ID)
+	; SourceRecord(Source Transaction Keys)
+	; Supplier(Supplier Number)
+	; TranType(CST Transaction Type)
+	;------------------------------------------------------
+	new arrServiceCosts,fltAmount,fltServiceCost,idx,OK
+	
+	set ^mtemp($job,"INSupRec","Date")         = $piece(BUCHUNG,Y,2)    ; DATE
+	set ^mtemp($job,"INSupRec","Supplier")     = $piece(BUCHUNG,Y,22)   ; Supplier 
+	set ^mtemp($job,"INSupRec","Location")     = BTR                    ; BETRIEB IN FIBU / Location in GL 
+	set ^mtemp($job,"INSupRec","SourceLocn")   = BTR                    ; Location
+	set ^mtemp($job,"INSupRec","Order")        = idOrder                ; ORDER
+	set ^mtemp($job,"INSupRec","TranType")     = "REC"
+	set ^mtemp($job,"INSupRec","OrderType")    = OrderType
+	set ^mtemp($job,"INSupRec","SourceDetail") = $piece(BUCHUNG,Y,105) ; SR17387
+	set ^mtemp($job,"INSupRec","SourceForm")   = $piece(BUCHUNG,Y,106) ; SR17387
+	set ^mtemp($job,"INSupRec","SourceRecord") = $piece(BUCHUNG,Y,107) ; SR17387
+	
+	set fltServiceCost = $$GetImportAmount(BUCHUNG,.arrServiceCosts)     // SR12745
+	;set fltAmount     = $$$FCSub($piece(BUCHUNG,Y,3),fltServiceCost)    // SR12745
+	set fltAmount      = $$$FCAdd($piece(BUCHUNG,Y,3),fltServiceCost)    // SR12745
+	
+	;Reverse these - BUCHUNG now has the amount without service costs to handle rounding issues.
+	;set ^mtemp($job,"INSupRec","Lines",POS,"LineReceivedAmount") = fltAmount
+	;set ^mtemp($job,"INSupRec","Lines",POS,"LineSOHAmount")      = $piece(BUCHUNG,Y,3)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineReceivedAmount") = $piece(BUCHUNG,Y,3)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineSOHAmount")      = fltAmount
+	set ^mtemp($job,"INSupRec","Lines",POS,"QRef")               = $piece(BUCHUNG,Y,32)   ;quantity reference ;SR13215
+	
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineReceivedAccount")= $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,35),FINBTR,WAGR)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineSOHAccount")     = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,31),FINBTR,WAGR)
+	set ^mtemp($job,"INSupRec","Lines",POS,"LineRef")            = ITEM                   ;item no. / ARTIKEL-NUMMER
+	set ^mtemp($job,"INSupRec","Lines",POS,"OrderLine")          = POS                    ;LINE ITEM
+	set ^mtemp($job,"INSupRec","Lines",POS,"SourceGroup")        = WAGR
+	
+	set idx = ""
+	for {
+		set idx = $order(arrServiceCosts(idx))
+		quit:idx=""
+		
+		if $data(arrServiceCosts(idx)) {
+			set ^mtemp($job,"INSupRec","Lines",POS,"ServiceCost",idx,"Account") = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,35),FINBTR,WAGR)
+		;	set ^mtemp($job,"INSupRec","Lines",POS,"ServiceCost",idx,"Account") = $piece($get(^INFIBPAR(0,0,BTR,1)),Y,53) ;SR12101
+			set ^mtemp($job,"INSupRec","Lines",POS,"ServiceCost",idx,"Amount")  = $get(arrServiceCosts(idx,"Amount"))
+			set ^mtemp($job,"INSupRec","Lines",POS,"ServiceCost",idx,"Type")    = $get(arrServiceCosts(idx,"Type"))
+		}
+	}
+	do CopyCharVals^INFIBBUCH4("INSupRec",BUCHUNG,POS)
+	set OK = $$setRelevantEvents^COMDCMControlModule("DiscLinc","INSupRec","other","","")
+	quit
+	
+	
+GetImportAmount(BUCHUNG,&arrResults)
+    ;-------------------------------------------------------------------------------
+    ; Creates an array of the additional charges from delimited string.
+    ;
+    ; NOTE *********** The delimiters are probably going to change!!!!
+    ;                  comment below is new delims - initially  IFR@20|DUTY@55
+    ; 
+    ; Additional charges are a series of pairs "Type|Amount" separated by semicolons.
+    ;    e.g. IFR|20;DUTY|55
+    ; 
+    ; ByRef  : arrResults
+    ; 
+    ; Returns: total of additional charges
+    ;
+    ; History:
+    ; 08-Jul-2005	shobby	SR12745 : BUCHUNG now has the amount without service
+    ; 						costs to handle rounding issues
+    ; 04-May-2005	shobby	Use FC multiplication.
+    ; 15-Apr-2005	shobby	Delimiters now %3B and %7C.
+    ; 13-Apr-2005	shobby	SR12101 : Reversed previous reversal. Amounts don't have
+    ; 						 to balance here, it is sorted out at the other end.
+    ; 13-Apr-2005	shobby	SR12101 : Reversed the sign of fltLineAmount.
+    ; 12-Apr-2005	shobby	SR12101 : Use intCounter to index the array, ie ignore
+    ; 							blank entries. This handles some invalid data coming
+    ; 							from the German construction.
+    ; 12-Apr-2005	shobby	SR12101 : Created
+    ;-------------------------------------------------------------------------------
+	new fltAmount,fltLineAmount,idx,intCounter,lstServiceCosts,strServiceCost
+	
+	; %3B	: Semicolon          (;)
+	; %7C   : Vertical Separator (|)
+	; BUCHUNG #32 = Quantity
+	
+	set fltAmount  = 0
+	set intCounter = 0
+	set lstServiceCosts = $piece(BUCHUNG,Y,104)  ; Finance Transaction Reference / Discount Term Id
+	
+	for idx=1:1:$length(lstServiceCosts,"%3B") {
+		set strServiceCost = $piece(lstServiceCosts,"%3B",idx)
+		if strServiceCost'="" {
+			set intCounter=intCounter+1
+			set arrResults(intCounter,"Type")   = $piece(strServiceCost,"%7C",1)
+		;	set fltLineAmount            		= $$$FCMult($piece(strServiceCost,"%7C",2),$piece(BUCHUNG,Y,32))  ;SR12745
+			set fltLineAmount            		= $justify($$$FCMult($piece(strServiceCost,"%7C",2),$piece(BUCHUNG,Y,32)),0,2)
+			set arrResults(intCounter,"Amount") = fltLineAmount
+			
+			set fltAmount = $$$FCAdd(fltAmount,fltLineAmount)
+		}
+	}
+	quit fltAmount
+	
+		
+ISS(BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR)
+	;-------------------------------------------------------------------------------
+	; Shipping Goods / Warenausgang
+	;
+	; ByRef : BUCHUNG
+	; 
+	; History:
+	; 14-Dec-2006	HeberB	BR014297: Call from COM.AlphaWeb without idOrder
+	; 05-Dec-2006	GRF		SR15271 : Add Intra-Company Order/Internal Customer
+	; 17-Aug-2005	GRF		SR13215 : Include Quantity Reference for ease of checking
+	; 27-Jul-2005	GRF		SR13024 : Send Parent Item for Manufacturing Order
+	; 21-Jun-2005	GRF		SR10478 : Keep MAN for EXCHANGE^INFIBBUCH; pass YM
+	; 21-Jun-2005	GRF		SR12721 : GINILocn reinstated : This account will be
+	; 							based on the order location.
+	; 18-May-2005	GRF		SR10478 : Use BTR not FINBTR for GINILocn default
+	; 12-May-2005	GRF		SR10478 : Activate GINILocn
+	; 03-May-2005	GRF		SR10478 : Preserve GINI Location for Customer Orders
+	;-------------------------------------------------------------------------------
+	;------------------------------------------------------
+	;          DTD Element Structure : INCusShip
+	; Customer            (Customer Number)
+	; Date                (Ship Date)
+	; GINILocn            (Goods Issued Not Invoiced Location)
+	; Lines
+	; 	CharVal           (CST Characteristic Values)
+	; 	LineRef           (Line Reference (Stock Number))
+	; 	LineSOHAccount    (Stock on Hand Account)			D31		$$$INFIBPARInventoryAccount
+	; 	LineShipAccount   (Line Ship Account (Clearance))	D36		$$$INFIBPARGoodsShipped
+	; 	LineShipAmount    (Line Ship Value (Cost))
+	; 	OrderLine
+	; 	ParentItem        (Manufacturing Order - Finished Goods)
+	; 	ParentGroup
+	; 	SourceGroup
+	; Location
+	; Order               (Customer or Manufacturing Order number)
+	; OrderType           (CST Order Type)
+	; TranType            (CST Transaction Type)
+	; 
+	;------------------------------------------------------
+	new blnInternalCust,GINILocn,idCustomer,idOrder,objOrder,OK,OrderType,ParentGroup,ParentItem
+	
+	set OrderType  = ""
+	set idCustomer = $piece(BUCHUNG,Y,22)
+	set idOrder    = $piece(BUCHUNG,Y,27)
+	
+	if idOrder'="" {
+		set objOrder = $get(^INAUF(0,idOrder,1))
+		set OrderType = $piece(objOrder,Y,2)
+		; TODO : Originally proposed code - subject to variation since this
+		; is the source location & may add new field to order for override
+		; for Selling Location
+		if OrderType = 0 {                       ; Customer Order
+			set GINILocn  = $piece(objOrder,Y,6)
+		}
+	}
+	if (OrderType=0) && (idCustomer'="") {
+		set blnInternalCust = $$$INKUNDEInternalCustomer($get(^INKUNDE(0,idCustomer,1)))
+		if blnInternalCust set OrderType = 7     ; Intra-Company Order
+	}
+	if $get(OrderType)=""  set OrderType = 9     ; No Order
+	if $get(GINILocn)=""   set GINILocn  = BTR
+	
+	/*	TODO JW - reverted for build
+	set ^mtemp($job,"INCusShip","Audit") 	 = $piece(BUCHUNG,Y,11)	//SR14615
+	*/
+	
+	set ^mtemp($job,"INCusShip","Date")      = $piece(BUCHUNG,Y,2)    ; DATE
+	set ^mtemp($job,"INCusShip","Customer")  = idCustomer             ; CUSTOMER
+	set ^mtemp($job,"INCusShip","Location")  = BTR                    ; Location 
+	set ^mtemp($job,"INCusShip","SourceLocn")= BTR                    ; Location
+	set ^mtemp($job,"INCusShip","Company")   = 0                      ; COMPANY
+	set ^mtemp($job,"INCusShip","Order")     = idOrder                ; ORDER
+	set ^mtemp($job,"INCusShip","TranType")  = "ISS"
+	set ^mtemp($job,"INCusShip","OrderType") = OrderType
+	set ^mtemp($job,"INCusShip","GINILocn")  = GINILocn
+ 
+	set ^mtemp($job,"INCusShip","Lines",POS,"LineShipAmount") = $piece(BUCHUNG,Y,3)    ;total amount / GESAMTBETRAG ;whole 
+	set ^mtemp($job,"INCusShip","Lines",POS,"LineShipAccount")= $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,36),FINBTR,WAGR)    ;AR-SUP / WARENAUSGANGSKONTO
+	set ^mtemp($job,"INCusShip","Lines",POS,"LineSOHAccount") = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,31),FINBTR,WAGR)    ;Stock on Hand Account / WARENBESTANDSKONTO ;storey manual Account 
+	set ^mtemp($job,"INCusShip","Lines",POS,"QRef")           = $piece(BUCHUNG,Y,32)   ;quantity reference
+	
+	set ^mtemp($job,"INCusShip","Lines",POS,"LineRef")        = ITEM                   ;item no
+	set ^mtemp($job,"INCusShip","Lines",POS,"OrderLine")      = POS                    ;LINE ITEM
+	set ^mtemp($job,"INCusShip","Lines",POS,"SourceGroup")    = WAGR
+	if OrderType=1 {
+		set ParentItem  = $piece(BUCHUNG,Y,42)
+		set ParentGroup = ""
+		if ParentItem'="" {
+			set ParentGroup = $piece($get(^INART(0,ParentItem,1)),Y,30)
+		}
+		if ParentGroup="" set ParentGroup = $piece($get(^INVORG(0,0,1)),Y,13)    ;Default
+		set ^mtemp($job,"INCusShip","Lines",POS,"ParentItem")  = ParentItem      ;Finished Goods for Manufacturing Order
+		set ^mtemp($job,"INCusShip","Lines",POS,"ParentGroup") = ParentGroup
+	}
+	
+	do CopyCharVals^INFIBBUCH4("INCusShip",BUCHUNG,POS)
+	set OK = $$setRelevantEvents^COMDCMControlModule("DiscLinc","INCusShip","other","","")
+	quit
+	
+	
+TFR(BUCHUNG,YFPARA,BTR,pidItem,pidGroup,POS,MAN,pstrFromSub)
+	;-------------------------------------------------------------------------------
+	; Stock Changes / Warenumlagerung
+	; 
+	; ByRef : BUCHUNG
+	; 
+	; Called By : Form INWE1 (AlphaLinc >> Stock and Stocktaking >> 
+	;                                                     Stock >> Goods Relocation)
+	; History:
+	; 08-Aug-2011	GRF		SR17849: Issue To Consumption based on expense acct and
+	;							(ISS/NoOrder) Matrix
+	; 23-Mar-2011	GRF		SR17668: Distinguish when Audit string has "ValueAdjust"
+	; 12-Jul-2010	SCR		SR17387: Pass Source Details
+	; 23-Mar-2010	GRF		SR17229: re-write to properly identify different tx type
+	; 22-Mar-2010	GRF		SR17229.2: OrderType 5 or 9 depending on Audit string
+	; 17-Mar-2010	GRF		SR17229.1: use idToAcc (wasn't being set properly) [v1.60 patch only]
+	; 15-Mar-2010	GRF		SR17229: Transfer between stock and consumption locns
+	;							needs to be an "ADJ"
+	; 18-Feb-2010	GRF		SR17173: DispenseToPatient processed as "5-Requisition"
+	; 							"ADJ" matrix rather than "9-No Order"
+	; 19-Nov-2009	PPP		SR16974: Get the Acc Params from the Sending/Rec Locn     <<<<<
+	; 18-Nov-2009	GRF		SR17046/SR16871: base INFIBPAR on location hierarchy
+	; 05-Feb-2007	GRF		SR15424: Naked Reference
+	; 31-Jan-2006	GRF		SR14203: include Audit String
+	; 05-Sep-2005	GRF		SR13412: Correction to line number in "QRef" setting
+	; 17-Aug-2005	GRF		SR13215: Include Quantity Reference for ease of checking
+	; 16-Jun-2005	GRF		SR10478: Standardise spelling "Dispatch"; Order Type 4
+	;                       	for Inter-warehouse Transfers
+	; 05-May-2005	GRF		SR10478: Adjust Order Type - always 9 for ADJ/MVI
+	; 17-Apr-2005	GRF		SR12146: Missing line for stock group
+	; 11-Apr-2005	GRF		SR10478: FROM/TO locations were wrong way around - e.g.
+	; 						INFIBBUCH has 33 as the TO WAREHOUSE; If DeleteLocn is
+	; 						null the Goods Relocation code compares it to "X"
+	;-------------------------------------------------------------------------------
+	;------------------------------------------------------
+	;          DTD Element Structure : INTranStck/INAdjStock
+	; Date()								*		*			D2   $$$INFIBBUCHDate1()
+	; FromLocation()						*		*			D16  $$$INFIBBUCHBranch()
+	; FromStockLocation()					*		*			D30  $$$INFIBBUCHFromStockLocation()
+	; Lines()								*		*		seq	
+	;	LineRef()							*		*			D39  $$$INFIBBUCHItem()
+	;	AccountSOHFrom()					*		*			    D31  $$$INFIBPARInventoryAccount(D16)
+	;	AccountSOHTo()						*					    D31  $$$INFIBPARInventoryAccount(D33)
+	;	AccountAdjust()								*			    D37  $$$INFIBPARAdjustments(D33)
+	;	Cost()								*		*			D3   $$$INFIBBUCHAmount()
+	;	SourceGroup(Source Item Group)		*		*			D39  $$$INFIBBUCHItem() => INART D30
+	; 	CharVal(CST Characteristic Values)	*		*		[D70-103]
+	; 	Audit                               *       *			D11  $$$INFIBBUCHAuditText()
+	; 	QRef                                *       *			D32  $$$INFIBBUCHQuantity()
+	; TranType(CST Transaction Type)		*		*			D50  $$$INFIBBUCHTransactionCharacteristic()  (ISS,REC,MVI,ADJ)
+	; Dispatch(Warehouse Order number)		*		*			D27  $$$INFIBBUCHOrder1()
+	; OrderType(CST Order Type)				*		*		(calc)
+	; ToLocation()							*					D33  $$$INFIBBUCHToLocation()
+	; ToStockLocation()						*					D31  $$$INFIBBUCHToStockLocation()
+	; SourceDetail()											D105 $$$INFIBBUCHTSourceDetail
+	; SourceForm												D106 $$$INFIBBUCHTSourceForm
+	; SourceRecord												D107 $$$INFIBBUCHTSourceRecord
+	;------------------------------------------------------
+	; Transfer				ISS/REC
+	; Issue				*	MVI 9	Inter-Dept STOCK => STOCK
+	; Issue				*	MVI 9	Inter-Dept STOCK => CONS  (idToStore = idDeleteStorage)
+	; DispenseToPatient	*	ADJ 5
+	; Adjustment			ADJ 9
+	; Stocktake				ADJ 9		[* + Reversal]
+	;------------------------------------------------------
+	new enumTranType,enumOrderType,idDeleteStorage,idFromLocn,idFromStore,idFromAcct
+	new idToAcct,idToLocn,idToStore,objToParams,objFromParams,strAudit,strToSub
+	new OK
+	
+	set idDeleteStorage = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+	if idDeleteStorage="" set idDeleteStorage = "X"
+	
+	;-----
+	
+	set enumTranType = $$$INFIBBUCHTransactionCharacteristic(BUCHUNG)
+	set strAudit     = $$$INFIBBUCHAuditText(BUCHUNG)
+	
+	set idFromLocn  = $$$INFIBBUCHBranch(BUCHUNG)             ; D16  BTR guarantees YLOCATION; pstrFromSub guarantees BTR
+	set idFromStore = $$$INFIBBUCHFromStockLocation(BUCHUNG)  ; D30
+	set idToLocn    = $$$INFIBBUCHToLocation(BUCHUNG)         ; D33
+	set idToStore   = $$$INFIBBUCHToStockLocation(BUCHUNG)    ; D31
+	
+	;-----
+	
+	set objFromParams = $$GetGLParams^WWW0121Utils(idFromLocn)             ; INFIBPAR
+	set idFromAcct    = $$$INFIBPARInventoryAccount(objFromParams)
+	set idFromAcct    = $$EXCHANGE^INFIBBUCH(idFromAcct,pstrFromSub,pidGroup)
+	
+	set strToSub    = idToLocn
+	set idToAcct	= $$$INFIBPARInventoryAccount(YFPARA)
+	;if idToLocn'="" {  ; SR17849 vvv
+	;	set objToParams = $$GetGLParams^WWW0121Utils(idToLocn)
+	;	set idToAcct    = $$$INFIBPARInventoryAccount(objToParams)
+	;	set strToSub    = $$$INFIBPARLocationInGL(objToParams)
+	;}
+	if idToLocn'="" {
+		set objToParams = $$GetGLParams^WWW0121Utils(idToLocn)
+		set strToSub    = $$$INFIBPARLocationInGL(objToParams)
+		if idToStore'=idDeleteStorage {
+			set idToAcct = $$$INFIBPARInventoryAccount(objToParams)      ; Movement
+		} else {
+			set idToAcct = $$$INFIBPARAdjustments(objToParams)           ; Issue to Consumption
+		}
+	} ; SR17849 ^^^
+	set idToAcct = $$EXCHANGE^INFIBBUCH(idToAcct,strToSub,pidGroup)
+	
+	;-----
+	
+	if (enumTranType="ISS") || (enumTranType="REC") {
+		set enumOrderType  = 4         ; Warehouse Dispatch
+	
+	} elseif (enumTranType="MVI") || (enumTranType="MVO") {
+		set enumOrderType  = 9         ; Inter-Department Requisition
+		
+	} else {   ; "ADJ"
+		if (strAudit["DispenseToPatient") {
+			set enumOrderType  = 5     ; Requisition
+			
+		} else {
+			set enumOrderType  = 9     ; No Order
+		}
+	}
+	
+	if idToStore'=idDeleteStorage {              ; TRANSFER
+		set ^mtemp($job,"INTranStck","ToLocation")             = idToLocn
+		set ^mtemp($job,"INTranStck","ToStockLocation")        = idToStore
+		set ^mtemp($job,"INTranStck","Lines",1,"AccountSOHTo") = idToAcct
+	
+	} elseif strAudit["ValueAdjust" {            ; INStockValCCAdj recalculation  ; SR17668
+		set enumTranType = "ADJ"
+		set ^mtemp($job,"INTranStck","Lines",1,"AccountAdjust") = $$EXCHANGE^INFIBBUCH($$$INFIBPARAdjustments(YFPARA),pstrFromSub,pidGroup)
+	
+	} elseif strAudit["Issue" {                  ; ISSUE TO CONSUMPTION
+	; SR17849 : "ISS" / No Order with "AccountAdjust" from expense
+	;	set ^mtemp($job,"INTranStck","ToLocation")             = idToLocn
+	;	set ^mtemp($job,"INTranStck","Lines",1,"AccountSOHTo") = idToAcct
+		set enumTranType = "ISS"
+		set ^mtemp($job,"INTranStck","ToLocation")              = idToLocn
+		set ^mtemp($job,"INTranStck","Lines",1,"AccountAdjust") = idToAcct
+		
+	} else {                                     ; ADJUSTMENT / DISPENSE TO PATIENT
+		set enumTranType = "ADJ"
+		set ^mtemp($job,"INTranStck","Lines",1,"AccountAdjust") = $$EXCHANGE^INFIBBUCH($$$INFIBPARAdjustments(YFPARA),pstrFromSub,pidGroup)
+	}
+	
+	set ^mtemp($job,"INTranStck","Date")                     = $$$INFIBBUCHDate1(BUCHUNG)
+	set ^mtemp($job,"INTranStck","Dispatch")                 = $$$INFIBBUCHOrder1(BUCHUNG)
+	set ^mtemp($job,"INTranStck","FromLocation")             = BTR                  ; FROM Location
+	set ^mtemp($job,"INTranStck","FromStockLocation")        = idFromStore
+	set ^mtemp($job,"INTranStck","OrderType")                = enumOrderType
+	set ^mtemp($job,"INTranStck","TranType")                 = enumTranType         ; MVI, MVO, ADJ, ISS, REC
+	set ^mtemp($job,"INTranStck","SourceDetail") 			 = $$$INFIBBUCHSourceDetail(BUCHUNG) ; SR17387
+	set ^mtemp($job,"INTranStck","SourceForm")  			 = $$$INFIBBUCHSourceForm(BUCHUNG)   ; SR17387
+	set ^mtemp($job,"INTranStck","SourceRecord")			 = $$$INFIBBUCHSourceRecord(BUCHUNG) ; SR17387
+	
+	set ^mtemp($job,"INTranStck","Lines",1,"AccountSOHFrom") = idFromAcct
+	set ^mtemp($job,"INTranStck","Lines",1,"Audit")          = strAudit
+	set ^mtemp($job,"INTranStck","Lines",1,"Cost")           = $$$INFIBBUCHAmount(BUCHUNG)
+	set ^mtemp($job,"INTranStck","Lines",1,"LineRef")        = pidItem
+	set ^mtemp($job,"INTranStck","Lines",1,"QRef")           = $$$INFIBBUCHQuantity(BUCHUNG) ;quantity reference
+	set ^mtemp($job,"INTranStck","Lines",1,"SourceGroup")    = pidGroup
+	
+	do CopyCharVals^INFIBBUCH4("INTranStck",BUCHUNG)
+	set OK = $$setRelevantEvents^COMDCMControlModule("DiscLinc","INTranStck","other","","")
+	
+	quit
+	
+	
+OLDTFR(BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR)
+	;-------------------------------------------------------------------------------
+	; Stock Changes / Warenumlagerung
+	; 
+	; ByRef : BUCHUNG
+	; 
+	; Called By : Form INWE1 (AlphaLinc >> Stock and Stocktaking >> 
+	;                                                     Stock >> Goods Relocation)
+	; History:
+	; 22-Mar-2010	GRF		SR17229.2: OrderType 5 or 9 depending on Audit string
+	; 17-Mar-2010	GRF		SR17229.1: use idToAcc (wasn't being set properly) [v1.60 patch only]
+	; 15-Mar-2010	GRF		SR17229: Transfer between stock and consumption locns
+	;							needs to be an "ADJ"
+	; 18-Feb-2010	GRF		SR17173: DispenseToPatient processed as "5-Requisition"
+	; 							"ADJ" matrix rather than "9-No Order"
+	; 19-Nov-2009	PPP		SR16974: Get the Acc Params from the Sending/Rec Locn
+	; 18-Nov-2009	GRF		SR17046/SR16871: base INFIBPAR on location hierarchy
+	; 05-Feb-2007	GRF		SR15424: Naked Reference
+	; 31-Jan-2006	GRF		SR14203: include Audit String
+	; 05-Sep-2005	GRF		SR13412: Correction to line number in "QRef" setting
+	; 17-Aug-2005	GRF		SR13215: Include Quantity Reference for ease of checking
+	; 16-Jun-2005	GRF		SR10478: Standardise spelling "Dispatch"; Order Type 4
+	;                       	for Inter-warehouse Transfers
+	; 05-May-2005	GRF		SR10478: Adjust Order Type - always 9 for ADJ/MVI
+	; 17-Apr-2005	GRF		SR12146: Missing line for stock group
+	; 11-Apr-2005	GRF		SR10478: FROM/TO locations were wrong way around - e.g.
+	; 						INFIBBUCH has 33 as the TO WAREHOUSE; If DeleteLocn is
+	; 						null the Goods Relocation code compares it to "X"
+	;-------------------------------------------------------------------------------
+	;------------------------------------------------------
+	;          DTD Element Structure : INTranStck/INAdjStock
+	; Date()								*		*			D2   $$$INFIBBUCHDate1()
+	; FromLocation()						*		*			D16  $$$INFIBBUCHBranch()
+	; FromStockLocation()					*		*			D30  $$$INFIBBUCHFromStockLocation()
+	; Lines()								*		*		seq	
+	;	LineRef()							*		*			D39  $$$INFIBBUCHItem()
+	;	AccountSOHFrom()					*		*			    D31  $$$INFIBPARInventoryAccount(D16)
+	;	AccountSOHTo()						*					    D31  $$$INFIBPARInventoryAccount(D33)
+	;	AccountAdjust()								*			    D37  $$$INFIBPARAdjustments(D33)
+	;	Cost()								*		*			D3   $$$INFIBBUCHAmount()
+	;	SourceGroup(Source Item Group)		*		*			D39  $$$INFIBBUCHItem() => INART D30
+	; 	CharVal(CST Characteristic Values)	*		*		[D70-103]
+	; 	Audit                               *       *			D11  $$$INFIBBUCHAuditText()
+	; 	QRef                                *       *			D32  $$$INFIBBUCHQuantity()
+	; TranType(CST Transaction Type)		*		*			D50  $$$INFIBBUCHTransactionCharacteristic()  (ISS,REC,MVI,ADJ)
+	; Dispatch(Warehouse Order number)		*		*			D27  $$$INFIBBUCHOrder1()
+	; OrderType(CST Order Type)				*		*		(calc)
+	; ToLocation()							*					D33  $$$INFIBBUCHToLocation()
+	; ToStockLocation()						*					D31  $$$INFIBBUCHToStockLocation()
+	;------------------------------------------------------
+	new DeleteLocn,DispatchNo,FINTOBTR,idFromBTR,idToAcc
+	new objFINParam,objFromParams,OK,OrderType,TOBTR,TranType
+	
+	; SR17229.2 moved up
+	set DeleteLocn = $piece($get(^INVORG(0,0,1)),Y,87)
+	if DeleteLocn="" set DeleteLocn = "X"
+	
+	set DispatchNo = $piece(BUCHUNG,Y,27)
+	set TranType   = $piece(BUCHUNG,Y,50)
+	if (TranType="ISS") || (TranType="REC") {
+		set OrderType  = 4    ; Warehouse Dispatch
+		
+	} else {
+	;	set OrderType  = 9    ; No Order  ; SR17173 vvv
+		if ($$$INFIBBUCHAuditText(BUCHUNG) [ "DispenseToPatient") {
+			set OrderType  = 5    ; Requisition
+			
+		} elseif ($$$INFIBBUCHAuditText(BUCHUNG) [ "Adjustment") {   ; SR17229.2 vvv
+			set OrderType  = 9    ; No Order
+			
+		} elseif ($$$INFIBBUCHAuditText(BUCHUNG) [ "Stocktake") {
+			set OrderType  = 9    ; No Order
+			
+		} elseif ($$$INFIBBUCHAuditText(BUCHUNG) [ "Issue") &&
+		         ($piece(BUCHUNG,Y,31)=DeleteLocn) {
+			set OrderType  = 5    ; Requisition                      ; SR17229.2 ^^^
+			
+		} else {
+			set OrderType  = 9    ; No Order
+		}  ; SR17173 ^^^
+	}
+	
+	; SR17229.2 moved up
+	;set DeleteLocn = $piece($get(^INVORG(0,0,1)),Y,87)
+	;if DeleteLocn="" set DeleteLocn="X"
+	
+	set TOBTR    = $piece(BUCHUNG,Y,33)
+	set FINTOBTR = TOBTR
+	
+	;   SR17046/16871 vvv
+	;if TOBTR'="" if $piece($get(^INFIBPAR(0,0,TOBTR,1)),Y,3)'="" set FINTOBTR=$piece($get(^INFIBPAR(0,0,TOBTR,1)),Y,3)     ; SR15424
+	
+	set idToAcc = $piece(YFPARA,Y,31) ; $$$INFIBPARInventoryAccount()
+	
+	if TOBTR {
+		set objFINParam = $$GetGLParams^WWW0121Utils(TOBTR)
+		set idToAcc		= $piece(objFINParam,Y,31)	//SR16974 Get the Ledger Parameters from the Receiving Location
+		set FINTOBTR    = $$$INFIBPARLocationInGL(objFI]]><![CDATA[NParam)
+	} ; SR17046/16871 ^^^
+	
+	
+	; SR17229 vvv Moved up to re-set TranType if necessary for transfer to a consumption location
+	if $piece(BUCHUNG,Y,31)'=DeleteLocn {        ; TRANSFER
+		set ^mtemp($job,"INTranStck","ToLocation")            = TOBTR                 ;TO Location
+		set ^mtemp($job,"INTranStck","ToStockLocation")       = $piece(BUCHUNG,Y,31)  ;TO Storage 
+		set ^mtemp($job,"INTranStck","Lines",1,"AccountSOHTo")= $$EXCHANGE^INFIBBUCH(idToAcc,FINTOBTR,WAGR)   ;WARENBESTANDSKONTO
+	
+	} else {                                     ; ADJUSTMENT
+		set TranType = "ADJ"
+		set ^mtemp($job,"INTranStck","Lines",1,"AccountAdjust")=$$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,37),FINBTR,WAGR)   ;WARENBerichtigung
+	}
+	; SR17229 ^^^
+	
+	set ^mtemp($job,"INTranStck","Date")                    = $piece(BUCHUNG,Y,2)  ; DATE
+	set ^mtemp($job,"INTranStck","FromLocation")            = BTR                  ; FROM Location
+	set ^mtemp($job,"INTranStck","FromStockLocation")       = $piece(BUCHUNG,Y,30) ; FROM Storage
+	set ^mtemp($job,"INTranStck","Dispatch")                = DispatchNo
+	set ^mtemp($job,"INTranStck","TranType")                = TranType             ; MVI, MVO, ADJ, ISS, REC
+	set ^mtemp($job,"INTranStck","OrderType")               = OrderType
+	
+	set ^mtemp($job,"INTranStck","Lines",1,"Cost")          = $piece(BUCHUNG,Y,3)  ; Stock on Hand Account / WARENBESTANDSKONTO
+	set ^mtemp($job,"INTranStck","Lines",1,"LineRef")       = ITEM                 ; Item no
+	
+	//set ^mtemp($job,"INTranStck","Lines",1,"AccountSOHFrom")= $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,31),FINBTR,WAGR)   ;WARENBESTANDSKONTO
+	//SR16974 Get the Ledger Parameters from the Sending Location
+	set idFromBTR     = $piece(BUCHUNG,Y,16)
+	set objFromParams = $$GetGLParams^WWW0121Utils(idFromBTR)
+	set ^mtemp($job,"INTranStck","Lines",1,"AccountSOHFrom")= $$EXCHANGE^INFIBBUCH($piece(objFromParams,Y,31),FINBTR,WAGR)   ;WARENBESTANDSKONTO
+	
+	set ^mtemp($job,"INTranStck","Lines",1,"SourceGroup")   = WAGR
+	set ^mtemp($job,"INTranStck","Lines",1,"QRef")          = $piece(BUCHUNG,Y,32)   ;quantity reference ;SR13215 ; SR13412
+	
+	if TranType = "ADJ" {
+		set ^mtemp($job,"INTranStck","Lines",1,"Audit")     = $piece(BUCHUNG,Y,11)   ; Audit String  ; SR14203
+	}
+	
+	/* SR17229 vvv
+	if $piece(BUCHUNG,Y,31)'=DeleteLocn {        ; TRANSFER
+		set ^mtemp($job,"INTranStck","ToLocation")            = TOBTR                 ;TO Location
+		set ^mtemp($job,"INTranStck","ToStockLocation")       = $piece(BUCHUNG,Y,31)  ;TO Storage 
+		//set ^mtemp($job,"INTranStck","Lines",1,"AccountSOHTo")= $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,31),FINTOBTR,WAGR)   ;WARENBESTANDSKONTO
+		
+		//SR16974 (use idToAcc, set earlier)
+		set ^mtemp($job,"INTranStck","Lines",1,"AccountSOHTo")= $$EXCHANGE^INFIBBUCH(idToAcc,FINTOBTR,WAGR)   ;WARENBESTANDSKONTO
+		
+	} else {                                     ; ADJUSTMENT
+		
+	;	FIXME : This needs to reset the TranType to "ADJ" so
+	;	        Transfer^FININTStock doesn't crash with missing
+	;	        "AccountSOHTo".  May need other corrections.             <GRF> SR15026
+	;	        
+	;	        Stock @ Locn A but Consumable @ Locn B so the
+	;	        TO location becomes B/X.  This should be a THIRD
+	;	        type of transaction rather than an adjustment
+	;	        since totally different accounts are involved.
+	;	        
+	;	        Can be managed by Account Identification Matrix
+		
+		set ^mtemp($job,"INTranStck","Lines",1,"AccountAdjust")=$$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,37),FINBTR,WAGR)   ;WARENBerichtigung
+	}
+	*/
+	
+	do CopyCharVals^INFIBBUCH4("INTranStck",BUCHUNG)
+	set OK = $$setRelevantEvents^COMDCMControlModule("DiscLinc","INTranStck","other","","")
+	
+	quit
+	
+	
+ADJ(BUCHUNG,YFPARA,BTR,ITEM,WAGR,POS,MAN,FINBTR)
+	;-------------------------------------------------------------------------------
+	; Adjustments - Generated from routine INWEADJUST
+	; 
+	;   Adj set as transfer type.
+	; 
+    ; This is for a 'value only' adjustment - 
+    ; Alphalinc >> System >> General Ledger Specifications >> Stock Adjustments
+    ; (Direct update of SOH/StockAdjust Accts - *** DO NOT USE ***)
+	; 
+	; ByRef : BUCHUNG
+	; 
+	; History:
+	; 27-Mar-2006	GRF		SR14468 : Processed with FININTStock so needs to use same
+	;							field names as ADJ processed through "INTranStck"
+	;							above - Location & StockLocation have "From" prefix.
+	; 31-Jan-2006	GRF		SR14203 : include Audit String
+	; 17-Aug-2005	GRF		SR13215 : Include Quantity Reference for ease of checking
+	;-------------------------------------------------------------------------------
+	new OK
+	 
+	set ^mtemp($job,"INAdjStock","Date")                    = $piece(BUCHUNG,Y,2)       ;DATE / DATUM
+	set ^mtemp($job,"INAdjStock","FromLocation")            = BTR                       ;BETRIEB IN FIBU / Location IN GL
+	set ^mtemp($job,"INAdjStock","FromStockLocation")       = $piece(BUCHUNG,Y,31)      ;von lagerplatz / COMPANY NUMBER IN GL
+	set ^mtemp($job,"INAdjStock","TranType")                = "ADJ"
+	set ^mtemp($job,"INAdjStock","OrderType")               = 9       ; No Order
+	
+	set ^mtemp($job,"INAdjStock","Lines",1,"LineRef")       = ITEM                      ;item no. / ARTIKEL-NUMMER
+	set ^mtemp($job,"INAdjStock","Lines",1,"Cost")          = $piece(BUCHUNG,Y,3)       ;von lagerplatz / COMPANY NUMBER IN GL
+	set ^mtemp($job,"INAdjStock","Lines",1,"AccountSOHFrom")= $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,31),FINBTR,WAGR)   ;WARENBESTANDSKONTO
+	set ^mtemp($job,"INAdjStock","Lines",1,"AccountAdjust") = $$EXCHANGE^INFIBBUCH($piece(YFPARA,Y,37),FINBTR,WAGR)   ;WARENBerichtigung
+	set ^mtemp($job,"INAdjStock","Lines",1,"SourceGroup")   = WAGR
+	set ^mtemp($job,"INAdjStock","Lines",1,"QRef")          = $piece(BUCHUNG,Y,32)      ;quantity reference ;SR13215
+	set ^mtemp($job,"INAdjStock","Lines",1,"Audit")         = $piece(BUCHUNG,Y,11)      ; Audit String  ; SR14203
+
+	do CopyCharVals^INFIBBUCH4("INAdjStock",BUCHUNG)
+	set OK = $$setRelevantEvents^COMDCMControlModule("DiscLinc","INAdjStock","other","","")
+	
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,503 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvLineVariance" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvLineVariance
+	
+#include FINConst
+#include COMSYS
+	
+	// These definitions are here because the form is all manual fields.
+	
+#define VarianceTemp "^CacheTemp(YUSER,""FINAPInvLineVariance"")"
+	
+CreateVariance(pobjFINAPInvLine,pidFINAPInv,pidLine,pidVarianceType,pfltOnHandQty)
+    ;-------------------------------------------------------------------------------
+    ; Creates a variance line
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 15-Jul-2005	RW		SR12891: Moved the Swizzle call to FINAPVarianceUtilities
+	; 07-Apr-2005	RPW		SR11836: Modified OpenQuantity to UnmatchedQuantity;
+	; 							removed duplicate line
+    ; 14-Mar-2005	PO		SR11349
+    ; 08-Feb-2005	RPW		Use the Swizzle^FINAPVarianceUtilities method to load an
+    ; 							existing variance or return a new one.
+    ; 02-Feb-2005	shobby	Don't assign to inventory if -ve quantity.
+    ; 01-Feb-2005	Shobby	SR10061: Created
+    ;-------------------------------------------------------------------------------
+	new idFINAPInvLineVariance,objFINAPInvLineVariance,strStatus
+	new idFINAPInvLine,fltRatio,fltINVPrice,idKey
+	
+	set idKey = pidFINAPInv_","_pidLine_","_pidVarianceType
+	do Swizzle^FINAPVarianceUtilities(idKey,.objFINAPInvLineVariance)
+ 
+	set $$$FINAPInvLineVarianceInventoryQty(objFINAPInvLineVariance) = ($$$FINAPInvLineInvoiceQuantity(pobjFINAPInvLine)-$$$FINAPInvLineUnmatchedQuantity(pobjFINAPInvLine))
+	
+	if pfltOnHandQty>0 {
+		set fltRatio = pfltOnHandQty/$$$FINAPInvLineInvoiceQuantity(pobjFINAPInvLine)
+	} else {
+		set fltRatio = 0
+	}
+	
+	set fltINVPrice = $$GetINVPrice^FINAPInvLine(pobjFINAPInvLine)
+	set $$$FINAPInvLineVarianceInventory(objFINAPInvLineVariance)        = $$$FCMult(fltINVPrice,fltRatio)
+	set $$$FINAPInvLineVarianceExpense(objFINAPInvLineVariance)          = $$$FCSub(fltINVPrice,$$$FCMult(fltINVPrice,fltRatio))
+	set $$$FINAPInvLineVarianceInventoryPercent(objFINAPInvLineVariance) = ""
+	set $$$FINAPInvLineVarianceExpensePercent(objFINAPInvLineVariance)   = ""
+	set $$$FINAPInvLineVarianceCompleted(objFINAPInvLineVariance)        = $$$YES
+ 
+	do SaveData^FINAPInvLineVarMod(objFINAPInvLineVariance,idKey)
+ 
+	quit
+	
+	
+Set()
+    ;-------------------------------------------------------------------------------
+    ; Code to run to create the forms data.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 15-Jul-2005	RW		SR12891: Moved the Swizzle call to FINAPVarianceUtilities
+    ; 02-Feb-2005	RPW		Added a call to Swizzle^FINAPVarianceUtilities the variance into memory
+    ; 01-Feb-2005	RPW		We don't need to copy via a loop, we just try and get the
+    ; 						data and the reset the passed in parameters.
+    ; 19-Jan-2005	RPW		Modified to use passed in options.
+    ; 17-Jan-2005	JW		Don't save data to global.
+    ; 05-Jan-2005	RPW		Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+	new idAPInv,idAPInvLine,idAPInvLineVariance,NEWYMFELD,i
+	
+	; YMFELD is used for Manual Fields.	
+	set YMFELD = $GET(%(YQUERY,"GDIFFS"))
+	
+	do Swizzle^FINAPVarianceUtilities(YKEY,.YMFELD)
+ 
+	; YOPTION allows us to turn off fields.
+	set YOPTION=$get(%(YQUERY,"YOPT"))
+	
+	quit
+ 
+OnAfterDataFields()
+    ;-------------------------------------------------------------------------------
+    ; Code to run after data fields
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 15-Jul-2005	RW		SR12891: Moved the Buttons and OnBlurAfterData calls to
+    ; 							FINAPVarianceUtilities
+    ; 17-Mar-2005	shobby	Renamed from AfterDataFields.
+    ; 05-Jan-2005	RPW		Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+	
+	; Do not show the user hyperlinks at the bottom of the form
+	Set YNOFOOT=1
+	
+	; Put the save/delete buttons on the form
+	do Buttons^FINAPVarianceUtilities
+	
+	; Call the onblur event
+	do OnBlurAfterData^FINAPVarianceUtilities
+	
+	quit
+	
+	
+OnBlur(pintField,pstrValue)
+    ;-------------------------------------------------------------------------------
+    ; This code is called after the blur of every cell. As the form is entirely
+    ; manual fields, we must store the data in YMFELD and the perform the 
+    ; calculations. The calculations cater for the distribution of the quantities,
+    ; then the remainder of the total amount - the amount based on the quantities is
+    ; used to determine percentage and finally the dollar amount.
+    ; 
+    ; Currently the Quantity is the hardline factor.
+    ; 
+    ; Returns:
+    ;
+    ; History:
+    ; 15-Jul-2005	RW		SR12891: Moved the UpdateScreen call to FINAPVarianceUtilities
+    ; 14-Mar-2005	PO		SR11349
+    ; 01-Feb-2005	RPW		Use the class field macros now.
+    ; 27-Jan-2005	RPW		Modified to use a local copy of YMFELD and store this in the temp.
+    ; 24-Jan-2005	RPW		Get the values for the percentages and get them drawn on the screen
+    ; 21-Jan-2005	RPW		Handle YFKEY not being set, so use YKEY
+    ; 19-Jan-2005	RPW		Handle being on a different form
+    ; 17-Jan-2005	JW		Don't save data to global.
+    ; 05-Jan-2005	RPW		Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+	new fltInvdol,fltInvdis,intInvqty
+	new fltExpdol,fltExpdis,intExpqty
+	new fltSupdol,fltSupdis,intSupqty
+	new intSumqty,fltSumdol,fltTotaldol
+	new fltTotal,fltAmtqty,fltSumdis
+	new fltOrigInvdol,intOrigInvqty,fltOrigOthdol
+	new fltInvP,fltExpP,fltSupP
+	new strYMFELD,strType
+	
+	quit:($get(pintField)="")
+	
+	set strYMFELD = $get(@$$$VarianceTemp@("YMFELD"))
+	
+	set strType=$piece(YFKEY,",",3)
+	
+	// The initial blur does not set YFKEY, it uses YKEY
+	if strType="" {
+		set strType=$piece(YKEY,",",3)
+	}
+ 
+	; Store the value into the YMFELD data structure	
+	set $piece(strYMFELD,Y,pintField)=pstrValue
+	
+	; Get the three original values	
+	set fltOrigInvdol=$piece(strYMFELD,Y,$$$FldFINAPInvLineVarianceInventoryQuantityVariance)
+	set intOrigInvqty=$piece(strYMFELD,Y,$$$FldFINAPInvLineVarianceInventoryQuantity)
+	set fltOrigOthdol=$piece(strYMFELD,Y,$$$FldFINAPInvLineVarianceOtherAmountVariance)
+	
+	; Calculate the total quantity, dollar amount for that quantity and finally the remaining dollar amount
+	set intSumqty=$$CalculateQuantity(strYMFELD)
+	set fltAmtqty=$$CalcluateQuantityAmount(intSumqty,intOrigInvqty,fltOrigInvdol)
+	set fltSumdol=$$CalculateDollar(strYMFELD)
+	
+	; From the remaining dollar amount, calculate the percentage.
+	
+	if $piece(YFKEY,",",3)'="TV" {
+		set fltTotaldol=$$$FCSub($$$FCAdd(fltOrigInvdol,fltOrigOthdol),fltAmtqty)
+	} else {
+		set fltTotaldol=fltOrigOthdol
+	}
+	set fltSumdis=$$CalculatePercentage(strYMFELD,fltTotaldol,.fltInvP,.fltExpP,.fltSupP)
+	
+	; Lastly caluclate the variance of the amounts. This should end up being 0.
+	set fltTotal=$$CalculateTotal(fltTotaldol,fltSumdol,fltSumdis)
+	set $$$FINAPInvLineVarianceAmountVariance(strYMFELD)=fltTotal
+	//set $piece(strYMFELD,Y,$$$FldFINAPInvLineVarianceAmountVariance)=fltTotal
+ 
+	; Show this data on the screen
+	do UpdateScreen^FINAPVarianceUtilities(fltTotal,(intSumqty-intOrigInvqty),strType,fltInvP,fltExpP,fltSupP)
+	
+	; Set the completed flag if the form data is complete.
+	; Note there is a cheat here, flt's and int's, the sum should be zero, this is not
+	; currency v quantity problem, just a quick way to check for 0 variance.
+	set $$$FINAPInvLineVarianceCompleted(strYMFELD)=$$IsCompleted($$$FCBase(fltTotal)-(intSumqty-intOrigInvqty))
+ 
+	; Store this locally, we have to do this as the Save routine doesn't have this information
+	set @$$$VarianceTemp@("YMFELD") = strYMFELD
+	
+	quit
+	
+CalculatePercentage(pYMFELD,pfltTotaldol,pfltInvP,pfltExpP,pfltSupP)
+    ;------------------------------------------------------------------------------
+    ; Calculate the values of the amounts given the percentages. It does this for
+    ; the Supplier, Expense and Inventory Percentages.
+    ;
+    ; Returns:
+    ; The sum of the discounts returned as amounts.
+    ;
+    ; History:
+    ; 14-Mar-2005	PO		SR11349
+    ; 02-Feb-2005	RPW		Modified to use the system generated macros
+    ; 24-Jan-2005	RPW		Modified to return the percentages
+    ; 05-Jan-2005	RPW		Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+	set pfltInvP=0
+	set pfltExpP=0
+	set pfltSupP=0
+	
+	quit:$get(pYMFELD)="" 0
+	quit:$get(pfltTotaldol)="" 0
+	
+	set pfltInvP=$$$FCMult(pfltTotaldol,($$$FINAPInvLineVarianceInventoryPercent(pYMFELD)/100))
+	set pfltExpP=$$$FCMult(pfltTotaldol,($$$FINAPInvLineVarianceExpensePercent(pYMFELD)/100))
+	set pfltSupP=$$$FCMult(pfltTotaldol,($$$FINAPInvLineVarianceSupplierPercent(pYMFELD)/100))
+	
+	quit $$$FCAdd($$$FCAdd(pfltInvP,pfltExpP),pfltSupP)
+	
+CalculateDollar(pYMFELD)
+    ;-------------------------------------------------------------------------------
+    ; Sums the three amount fields
+    ;
+    ; Returns:
+    ; The sum of the amounts.
+    ;
+    ; History:
+    ; 14-Mar-2005	PO		SR11349
+    ; 02-Feb-2005	RPW		Modified to use the system generated macros
+    ; 05-Jan-2005	RPW		Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+ 
+	quit:$get(pYMFELD)="" 0
+	quit $$$FCAdd($$$FCAdd($$$FINAPInvLineVarianceInventory(pYMFELD),$$$FINAPInvLineVarianceExpense(pYMFELD)),$$$FINAPInvLineVarianceSupplier(pYMFELD))
+	
+CalculateQuantity(pYMFELD)
+    ;-------------------------------------------------------------------------------
+    ; Sums the three quantity fields
+    ;
+    ; Returns:
+    ; The sum of the quantity.
+    ;
+    ; History:
+    ; 02-Feb-2005		RPW				Modified to use the system generated macros
+    ; 05-Jan-2005		RPW				Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+	quit:$get(pYMFELD)="" 0
+	quit $piece(pYMFELD,Y,$$$FldFINAPInvLineVarianceInventoryQty)+$piece(pYMFELD,Y,$$$FldFINAPInvLineVarianceExpenseQty)+$piece(pYMFELD,Y,$$$FldFINAPInvLineVarianceSupplierQty)
+	
+CalcluateQuantityAmount(pintSumqty,pintOrigInvqty,pfltOrigInvdol)
+    ;-------------------------------------------------------------------------------
+    ; Returns the value of the quantities allocation of the dollar fields.
+    ; ie if there is 6 quantity and we have a receipt quantity of 4, then
+    ; we will have a discrepancy 2 @ $50. If we have allocated 1, then this 
+    ; will return a value of $25.
+    ;
+    ; Returns:
+    ; The value of the quantites apportioned value.
+    ;
+    ; History:
+    ; 14-Mar-2005	PO		SR11349
+    ; 05-Jan-2005	RPW		Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+	quit:(($get(pintSumqty)="")||($get(pintOrigInvqty)="")||($get(pfltOrigInvdol)="")) 0
+ 
+	new fltResult
+	
+	set fltResult=0
+	
+	if +pintOrigInvqty'=0 {
+		set fltResult=$$$FCMult(pfltOrigInvdol,(pintSumqty/pintOrigInvqty))
+	}
+	
+	quit fltResult
+ 
+IsCompleted(pfltTotal)
+    ;-------------------------------------------------------------------------------
+    ; Checks if the data is complete. It just checks if the passed in value is 0.
+    ;
+    ; Returns:
+    ; 1 for Complete, 0 for Incomplete.
+    ;
+    ; History:
+    ; 14-Mar-2005	PO		SR11349
+    ; 05-Jan-2005	RPW		Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+	quit $$$FCZero($get(pfltTotal))
+ 
+CalculateTotal(pfltTotaldol=0,pfltSumdol=0,pfltSumdis=0)
+    ;-------------------------------------------------------------------------------
+    ; Calculates the remaining unallocated amount
+    ;
+    ; Returns:
+    ; The unallocated amount
+    ;
+    ; History:
+    ; 14-Mar-2005		PO				SR11349
+    ; 05-Jan-2005		RPW				Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+	
+	quit $$$FCSub($$$FCSub(pfltTotaldol,pfltSumdol),pfltSumdis)
+	
+ 
+	
+DeleteData(pstrYKEY,b)
+    ;-------------------------------------------------------------------------------
+    ; Deletes the record currently being used.
+    ;
+    ; Returns:
+    ; An empty string.
+    ;
+    ; History:
+    ;  1-Feb-2005	JW		Don't delete global.
+    ; 17-Jan-2005	JW		Don't save data to global.
+    ; 05-Jan-2005	RPW		Created for 3 Way Match (SR10061)
+    ;-------------------------------------------------------------------------------
+	
+	; Get the key from the local storage, as YKEY does not exist here.
+	set pstrYKEY=@$$$VarianceTemp@("KEY")
+	
+	; Kill the data
+	if pstrYKEY'="" {
+		set @$$$VarianceTemp@("DATA",$p(pstrYKEY,",",1),$p(pstrYKEY,",",2),$p(pstrYKEY,",",3)) = ""
+	}
+	
+	quit ""
+	
+ 
+	
+DeleteAllVariances(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; Remove the associated lines
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 24-Jun-2005	PO		SR12705: Now using GetKey^COMUtilClass
+    ; 01-Feb-2005	JW		Don't delete globals
+    ; 05-Jan-2005	RPW		Created (SR10061)
+    ;-------------------------------------------------------------------------------
+	new idAPInv,idLineItem
+	if $get(pYKEY)'="" {
+		do GetKey^COMUtilClass(pYKEY,,,.idAPInv,.idLineItem)
+		kill @$$$VarianceTemp@("DATA",idAPInv,idLineItem)
+	}
+	
+	quit
+	
+DeleteVariance(pYKEY,pstrType)
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 24-Jun-2005	PO		SR12705: Now using GetKey^COMUtilClass
+    ;-------------------------------------------------------------------------------
+	new strVarianceType,YFELD,idAPInv,idLineItem
+	
+	if $get(pYKEY)'="" {
+		do GetKey^COMUtilClass(pYKEY,,,.idAPInv,.idLineItem)
+		if (idAPInv'="")&&(idLineItem'="") {
+			kill @$$$VarianceTemp@("DATA",idAPInv,idLineItem,pstrType)
+		}
+	}
+	
+	quit
+	
+	
+OnBeforeFormConstruction(pintField)
+    ;-------------------------------------------------------------------------------
+    ; Disable various fields based on the type of split form displayed. (Amount,Qty,Other).
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 14-Jan-2005	Shobby	Created (SR10061)
+    ;-------------------------------------------------------------------------------
+	new strType
+	
+	if '$get(%(YQUERY,"GALLOWINVMOD"),1) {
+		if ",7,8,9,"[(","_pintField_",") {
+			set YHID=2
+		}
+	}
+	
+	quit
+	
+	
+SaveAllVariances(pIdAPINV)
+    ;-------------------------------------------------------------------------------
+    ; Now save all variances to global
+    ;
+    ; Returns: status
+    ;
+    ; History:
+	; 05-May-2005	shobby	SR11875.  Managed transactions to handle rollback after cache errors.
+    ; 17-Jan-2005	JW		Created
+    ;-------------------------------------------------------------------------------
+	new strStatus
+	set strStatus=$$Transaction^COMTransaction("SaveAllVariancesTxn^FINAPInvLineVariance("""_pIdAPINV_""")",0)
+	quit strStatus
+	
+	
+SaveAllVariancesTxn(pIdAPINV)
+    ;-------------------------------------------------------------------------------
+    ; Transaction protected 'SaveAllVariances' code.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 05-May-2005	shobby	Created SR11875
+    ;-------------------------------------------------------------------------------
+	new idAPInvLine,idVarianceType,strData,key,strStatus
+	
+	set strStatus = $$$OK
+	
+	set idAPInvLine = ""
+	for {
+		set idAPInvLine = $order(@$$$VarianceTemp@("DATA",pIdAPINV,idAPInvLine))
+		quit:idAPInvLine=""
+		
+		set idVarianceType=""
+		for {
+			set idVarianceType=$order(@$$$VarianceTemp@("DATA",pIdAPINV,idAPInvLine,idVarianceType))
+			quit:idVarianceType=""
+			
+			set strData=@$$$VarianceTemp@("DATA",pIdAPINV,idAPInvLine,idVarianceType)
+			
+			set key = pIdAPINV_","_idAPInvLine_","_idVarianceType
+			
+			set strStatus=$$$Save("FINAPInvLineVariance",key,strData,1)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	
+	quit strStatus
+	
+	
+VarianceCompleted(pidInvoice,pidInvoiceLine,pstrType)
+    ;-------------------------------------------------------------------------------
+    ; Determines whether the given variance is completed.
+    ; 
+    ; If the input data is invalid, just say it's not completed
+    ; 
+    ; If we have a variance object, check if it's completed
+    ; 
+    ; Otherwise just say it's completed.
+    ;
+    ; Returns: Boolean
+    ;
+    ; History:
+    ; 15-Jul-2005	RPW		SR12891: Moved the GetVarianceData call to FINAPVarianceUtilities
+    ; 01-Feb-2005	RPW		Use the class field macros now.
+    ; 31-Jan-2005	RPW		Modifed to show incomplete if no split data.
+    ; 24-Jan-2005	RPW		Created
+    ;-------------------------------------------------------------------------------
+	new objVariance,blnCompleted
+	
+	set blnCompleted=$$$NO
+	
+	quit:pidInvoice="" 'blnCompleted
+	quit:pidInvoiceLine="" 'blnCompleted
+	quit:pstrType="" 'blnCompleted
+	
+	set objVariance = $$GetVarianceData^FINAPVarianceUtilities(pidInvoice,pidInvoiceLine,pstrType)
+	
+	if objVariance'="" {
+		if +$$$FINAPInvLineVarianceCompleted(objVariance) {
+			set blnCompleted = $$$YES
+		}
+	}
+	
+	quit blnCompleted
+	
+	
+ChangeStatus(pstrKey,pstrType,pfltVariance)
+    ;-------------------------------------------------------------------------------
+    ; Change the status of the variance. If the existing variance matches the passed
+    ; in value, set the Completed Status to 1, otherwise to ""
+    ;
+    ; Returns: 
+    ;
+    ; History:
+    ; 15-Jul-2005	RPW		SR12891: Moved GetVarianceData call to FINAPVarianceUtilities
+    ; 24-Jun-2005	PO		SR12705: Now using GetKey^COMUtilClass
+    ; 01-Feb-2005	RPW		Use the class field macros now.
+    ; 27-Jan-2005	RPW		Created
+    ;-------------------------------------------------------------------------------
+    new idAPInv,idAPInvLine,strData
+    
+	do GetKey^COMUtilClass(pstrKey,,,.idAPInv,.idAPInvLine)
+ 
+	set strData=$$GetVarianceData^FINAPVarianceUtilities(idAPInv,idAPInvLine,pstrType)
+	if strData'="" {
+		if pfltVariance=$$$FINAPInvLineVarianceInventoryTotal(strData) {
+			set $$$FINAPInvLineVarianceCompleted(strData)=1
+		} else {
+			set $$$FINAPInvLineVarianceCompleted(strData)=""
+		}
+		set @$$$VarianceTemp@("DATA",idAPInv,idAPInvLine,pstrType)=strData
+	}
+	
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INWE3" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INWE3
+ 
+#include COMSYS
+#include INConst
+ 
+Update(YKEY="",YFELD)
+	/*------------------------------------------------------------------------------
+	;
+	; History:
+	; 29-Jan-2008	shobby	SRBR014754: Include auditing information for INARTHISTL
+	; 07-Apr-2006	GRF		SR14203: Add from location to text for INARTHIST record
+	; 28-Feb-2006	PP		SR14508: Created
+	;-----------------------------------------------------------------------------*/
+	new fltCost,ART,objINART,LOESCHPLATZ,BET,LP,fltQty,TEXT,ReasonCode
+	
+	quit:$piece(YKEY,",",1)=""   ;ARTIKEL ;item 
+	quit:$piece(YKEY,",",2)=""   ;BETRIEB
+	quit:$piece(YKEY,",",3)=""   ;LAGERPLATZ ;stock location 
+	quit:$piece(YKEY,",",4)=""   ;DATUM ;Date
+	
+	quit:$get(YFELD)=""
+ 	
+	set ART=$piece(YKEY,",",1)
+	set objINART = $GET(^INART(YM,ART,1))
+	if $$$INARTItemWithoutInventoryMaint(objINART)=$$$YES QUIT    ;KEINE BESTANDSFÜHRUNG  TYBD 16.05.2002 ;no inventory maintenance
+	IF $$$INARTItemType(objINART)=2 QUIT                          ;ACHTUNG LEISTUNG        ;estimation performance (SERVICE)
+	IF $$$INARTItemType(objINART)=5 QUIT                          ;ACHTUNG PHANTOM-ARTIKEL ;estimation (PHANTOM ITEM)
+	IF $$$INARTItemType(objINART)=6 QUIT                          ;ACHTUNG Pauschale       ;estimation (OVERALL PERFORMANCES)
+	IF $$$INARTItemType(objINART)=7 QUIT                          ;ACHTUNG KONFIGURATION   ;estimation configuration (ITEM TO CONFIGURE)
+		
+	set LOESCHPLATZ = $$$INVORGDeleteStockLocation($GET(^INVORG(YM,YM,1)))               ;LÖSCH-LAGERPLATZ;FIS;24.02.05;nur 1 x holen
+	if LOESCHPLATZ="" set LOESCHPLATZ = "X"
+ 
+	set BET = $piece(YKEY,",",2)
+	set LP  = $piece(YKEY,",",3)
+ 
+	set fltQty = $$$INWEQuantity(YFELD)
+	
+	if fltQty<0 {
+		set fltQty=fltQty*-1
+		set YDATEI="INWE"
+		set $piece(YFELD,Y,4)=$piece(YFELD,Y,4)+fltQty	; make it zero
+		SET YOK=$$^WWWSPEI(YDATEI,YKEY,YFELD,1)
+	}
+	
+	set ReasonCode=$$$INWEReasonOfQTYChange(YFELD)
+	set TEXT = fltQty_" Adjusted From "_BET_"/"_LP_" Reason Code "_$get(ReasonCode)     ; GRF 07-Apr-2006
+ 	
+	set fltCost=$piece(YFELD,Y,8)
+	if $piece($get(^INVORG(YM,YM,1)),Y,15)=9 set fltCost=$$^INARTKOST(ART,,9)  ;USE ALWAYS AVERAGE COST
+	
+	set fltQty = -fltQty
+	do ^INARTHIST(ART,TEXT,BET,,,fltQty,,fltCost*fltQty,LOESCHPLATZ,,LP,,,BET,,"ADJ",,,ReasonCode,,,$get(YFORM),$get(YKEY))  ;<MENGE> AUS INVENTURRÜCKBUCHUNG ; PPP ;BR014754
+	
+	quit
+ 
+ 
+	;+++++++++++++++++++++++++++++++++++++++  If status starts off as (1) other conditions may over-write
+	;    OLD        -ve   -ve   -ve      0     0     0      +ve   +ve   +ve      ""    ""    ""
+	;    NEW		-ve    0    +ve		-ve    0    +ve		-ve    0    +ve		-ve    0    +ve
+	;               same  <blocked>     ???
+	;                (a)  (a)   (a)     (b)   (c)   (d)     (2)   (2)   (2)     (1)   (c)   (d)
+	;                                   (1?)
+	;
+	; (1)  "Negative quantity not allowed" - doesn't save
+	; (2)  "Data already exists.  Please use Goods Relocation Screen." - doesn't save
+	; (a)  Form doesn't let negative values get changed - only permits a -ve qty to be changed to zero
+	;      Because this generates an INARTHIST record showing a disposal of the qty to "X" we INCREASE  <<< FIXED
+	;      the QOH and decrease the value in the SOH account!                                           <<< 
+	; (b)  Why should this be different from (1)?  0 => -ve will be reset to zero with an INARTHIST
+	;      record showing a disposal of the qty to "X"
+	; (c)  Why bother?
+	; (d)  Increases stock on hand.  Blocked -ve to +ve can thus be done in two stages.  This at least
+	;      generates two valid INARTHIST records; a combined record will not give the right value with
+	;      the current code.
+	;+++++++++++++++++++++++++++++++++++++++
+  
+OnBeforeSave(pYKEY, pYFELD)
+    ;-------------------------------------------------------------------------------
+    ; Check for -ve quantites
+    ;
+    ; Params: line object
+    ;
+    ; Returns: nil
+    ;
+    ; History:
+    ; 28-Feb-2006	PPP		SR14508: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,fltQty,strOldData
+	
+	set Q = $$$QSave
+	set strStatus    = $$$OK
+ 	
+	if $data(^INWE(YM,$piece(pYKEY,",",1),$piece(pYKEY,",",2),$piece(pYKEY,",",3),$piece(pYKEY,",",4))) {
+ 
+ 		set strOldData=$get(^INWE(YM,$piece(pYKEY,",",1),$piece(pYKEY,",",2),$piece(pYKEY,",",3),$piece(pYKEY,",",4),1))
+ 		
+ 		if $$$INWEQuantity(strOldData) > 0 {
+			set strStatus="Data already exists.  Please use Goods Relocation Screen."
+ 		}
+ 		
+ 	} elseif $$$INWEQuantity(pYFELD)<0 {
+		set strStatus="Negative quantity not allowed"
+	}
+	
+	if $$$ISERR(strStatus) {
+		set Q = $$$QDontSave
+		do ^WWWINFO(strStatus)		
+	}
+ 
+	quit
+ 
+ 
+]]></Routine>
+</Export>

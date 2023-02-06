@@ -1,0 +1,1514 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INSOHToolBox" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INSOHToolBox
+	#include COMSYS
+	#include INConst
+	#include INSYS
+	
+ScanMissingBundles(pblnVerbose=$$$NO,pblnRepair=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Seach for missing Bundles
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Nov-2013	SCR		SESDF-686: Created
+	;-------------------------------------------------------------------------------
+	new idBundle,objResultSet,sc,strResp,strSQL
+
+	; 1 Get All Bundles from History
+	set strSQL			= "select bundle from alSOH.dStockHistory group by bundle"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute()
+	if sc {
+		while objResultSet.Next() {
+			set idBundle	= objResultSet.Data("Bundle")
+			;write:pblnVerbose !,"Checking ",idBundle
+			set sc	=$$CheckBundle(idBundle)
+			if $$$ISOK(sc) {
+				;write:pblnVerbose " OK"
+				continue
+			}
+			write:pblnVerbose !,"Bunlde  "_idBundle_"Has an Error "_sc
+			continue:'pblnRepair
+			Write !,"Repair Bundle ",idBundle," Enter 'y' to Repair 'd' to Delete "
+			Read strResp
+			if strResp="d" {
+				write:pblnVerbose !,"Deleting Bunlde  "_idBundle
+				do Delete(idBundle)
+			}
+			continue:strResp'="y"
+			do RepairBundle(idBundle,pblnVerbose)
+		}
+	}
+	
+	quit sc
+	
+DeleteCompletedPlannedMov(pblnVerbose=$$$NO,pblnRepair=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Remove Commpleted Planned Movements
+	;
+	; Returns:
+	;
+	; History:
+	; 11-Jul-2014	SCR		SMERECIFE-53: Clean up data
+	;-------------------------------------------------------------------------------
+	new idMov,intCount,intOk,objResultSet,sc,strSQL
+
+
+	set intCount		= 0
+	set intOk			= 0
+	set strSQL			= "select id from alDRP.dPlannedMovement where dPlannedMovement.State->StateId = 4"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute()
+	if sc {
+		while objResultSet.Next() {
+			set idMov	= objResultSet.Data("ID")
+			set intCount= intCount+1
+			if pblnVerbose {
+				write !,"About to Delete Planned Movement ",idMov
+			}
+			if pblnRepair=$$$YES {
+				set sc = ##class(alDRP.dPlannedMovement).%DeleteId(idMov)
+				if pblnVerbose {
+					write " Deleted, sc=",sc
+				}
+				if sc=$$$OK {
+					set intOk	= intOk+1
+				}
+
+			}
+		}
+	}
+	write !!,"Found ",intCount," to delete, Deleted ",intOk
+	quit
+	
+ScanMissingBundlesAtts(pblnVerbose=$$$NO,pblnRepair=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Seach for missing Bundles blank optional attributes
+	;
+	; Returns:
+	;
+	; History:
+	; 21-Mar-2014	SCR		SESDF-1189: Created
+	;-------------------------------------------------------------------------------
+	new arrBundleAtts,arrReqAttributes,blnOptional,idAtt,idBundle,idLoc,objAtt
+	new objBundle,objItem,objPolicy,objResultSet,sc,strSQL
+
+	; 1 Get All Bundles from History
+	set strSQL			= "select bundle,location from alSOH.dStockHistory group by bundle"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute()
+	if sc {
+		while objResultSet.Next() {
+			set idBundle	= objResultSet.Data("Bundle")
+			set idLoc		= objResultSet.Data("Location")
+			;continue:idBundle'="9||37"
+			;write:pblnVerbose !,"Checking ",idBundle
+			set objBundle	= ##class(alSOH.dBundle).%OpenId(idBundle)
+			if objBundle=$$$NULLOREF {
+				write !,"Can not open ",idBundle
+				continue
+			}
+			set objItem		= objBundle.Item
+			set objPolicy	= objItem.ItemPolicy
+			set sc			= objBundle.GetAttributes(.arrBundleAtts)
+			;zwrite arrBundleAtts
+			set sc = ##class(alSOH.iBundle).GetAttributesForPolicy(objItem.ItemPolicy.%Id(), .arrReqAttributes, idLoc)
+			;zwrite arrReqAttributes
+			set idAtt=""
+			for {
+				set idAtt	= $order(arrReqAttributes(idAtt))
+				quit:idAtt=""
+				set blnOptional	= $get(arrReqAttributes(idAtt))
+				if blnOptional {
+					if '$data(arrBundleAtts(idAtt)) {
+						write !,"Missing Att Bundle ",idBundle," Item ",objItem.%Id()," Location ",idLoc," Optional Attribute ",idAtt
+					}
+					continue:'pblnRepair
+					set objAtt = ##class(alSOH.dBundleAttribute).%New()
+					set objAtt.Bundle         = objBundle
+ 					set objAtt.AttributeName  = idAtt
+ 					set objAtt.AttributeValue = ""
+ 					set sc	= objBundle.%Save()
+				} else {
+					if $get(arrBundleAtts(idAtt))="" {
+						write !,"Missing Att Bundle ",idBundle," Item ",objItem.%Id()," Location ",idLoc," Attribute ",idAtt
+					}
+				}
+			}
+		}
+	}
+	
+	quit sc
+	
+ScanDuplicateBundles(pblnVerbose=$$$NO,pblnRepair=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Seach for missing Bundles blank optional attributes
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Apr-2014	SCR		SESDF-1189: Created
+	;-------------------------------------------------------------------------------
+	new dtCreated,idBunQty,idBundle,idItem,objBunQty,objBundle,objResultQty,objResultSet
+	new sc,strGlo,strKey,strSQL
+	
+	set strGlo			= "^CacheTempSOHTBDupBun("""_$znspace_""")"
+	kill @strGlo
+	set strSQL			= "select id from alsoh.dbundle"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute()
+	if sc {
+		while objResultSet.Next() {
+			set idBundle	= objResultSet.Data("ID")
+			set objBundle	= ##class(alSOH.dBundle).%OpenId(idBundle)
+			set idItem		= objBundle.Item.%Id()
+			if objBundle=$$$NULLOREF {
+				write !,"Can not open ",idBundle
+				continue
+			}
+			set strKey	= idItem_","_objBundle.Description
+			;write !,idBundle," ",strKey
+			if $data(@strGlo@("bl",strKey)) {
+				set @strGlo@("bld",strKey,idBundle)	= ""
+				write !,idBundle," ",strKey
+				write "  Duplicate ",idBundle
+			}
+			set @strGlo@("bl",strKey,idBundle)	= ""
+		}
+	}
+	set strKey	= ""
+	for {
+		set strKey	= $order(@strGlo@("bld",strKey))
+		quit:strKey=""
+		set idBundle	= ""
+		write !,"Checking ",strKey
+		for {
+			set idBundle	= $order(@strGlo@("bl",strKey,idBundle))
+			quit:idBundle=""
+			set strSQL			= "select ID from alsoh.dbundlestock where bundle = ?"
+			set objResultQty	= ##class(%Library.ResultSet).%New()
+			set sc				= objResultQty.Prepare(strSQL)	
+			set:sc sc			= objResultQty.Execute(idBundle)
+			while objResultQty.Next() {
+				set idBunQty	= objResultQty.Data("ID")
+				set objBunQty	= ##class(alSOH.dBundleStock).%OpenId(idBunQty)
+				set idItem		= objBunQty.Item.%Id()
+				if objBundle=$$$NULLOREF {
+					write !,"Can not open ",idBundle
+				}
+				set dtCreated	= (objBunQty.Bundle.CreationDate)
+				write !," Storage ",objBunQty.Storage.%Id()," ",objBunQty.QtyOnHand," "
+				write objBunQty.Bundle.%Id()," ",dtCreated
+			}
+		}
+	}	
+	quit sc
+
+Delete(pidBundle)
+	;-------------------------------------------------------------------------------
+	; Delete Bundle
+	;
+	; 09-Nov-2013	SCR		SESDF-686: Created
+	;-------------------------------------------------------------------------------
+	new idBundle,objBundle,objResultSet,sc,strSQL
+	set strSQL			= "select id from alSOH.dBundleStock where bundle = ?"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidBundle)
+	write !,"sc=",sc
+	if sc {
+		while objResultSet.Next() {
+			set idBundle	= objResultSet.Data("ID")
+			set objBundle	= ##class(alSOH.dBundleStock).%OpenId(idBundle)
+			do objBundle.%DeleteExtent()
+		}
+	}
+	set strSQL			= "select id from alSOH.dStockHistory where bundle = ?"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidBundle)
+	if sc {
+		while objResultSet.Next() {
+			set idBundle	= objResultSet.Data("ID")
+			set objBundle	= ##class(alSOH.dStockHistory).%OpenId(idBundle)
+			do objBundle.%DeleteExtent()
+		}
+	}
+	quit
+
+CheckBundle(pidBundle)
+	;-------------------------------------------------------------------------------
+	; Check Bundle
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Nov-2013	SCR		SESDF-686: Created
+	;-------------------------------------------------------------------------------
+	new objBundle,sc
+	
+	set objBundle	= ##class(alSOH.dBundle).%OpenId(pidBundle)
+	set sc			= $$$OK
+	if objBundle=$$$NULLOREF {
+		set sc="Bundle "_pidBundle_" Missing "
+		;write !,sc
+		quit sc
+	}
+	quit sc
+	;s i="" f  s i=$o(^alSOH.dBundleStockD(i)),s="" q:i=""  f  s s=$o(^alSOH.dBundleStockD(i,s)),b="" q:s=""  f  s b=$o(^alSOH.dBundleStockD(i,s,b)) q:b=""  w !,i," ",s," ",b s p=$p(b,"|",1),e=$p(b,"|",3) i '$d(^alINV.dItemPolicyD(p,"Bundles",e)) w " Missing"
+
+RepairBundle(pidBundle,pblnVerbose=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Repair Bundle
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Nov-2013	SCR		SESDF-686: Created
+	;-------------------------------------------------------------------------------
+	new dtExp,idAdj,idBrand,idHist,idHist1,idItem,idItem1,idLine,idLoc,idMoveType
+	new idOwner,idProgram,idRec,idTxType,intItemCount,objAdjLine,objHist,objRecLine
+	new objResultSet,sc,strLot,strSQL
+
+	$$$VAR
+	; 1 Find Item from History
+	set strSQL			= "select Item,Id from alSOH.dStockHistory where Bundle = ? group by Item"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidBundle)
+	set intItemCount	= 0
+	if sc {
+		while objResultSet.Next() {
+			set idItem	= objResultSet.Data("Item")
+			set idHist	= objResultSet.Data("ID")
+			set intItemCount	= intItemCount+1
+			if intItemCount=1 {
+				set idItem1		= idItem
+				set idHist1		= idHist
+			}
+			if intItemCount>1 {
+				if idItem1'=idItem {
+					set sc="Multiple Items with this Bunlde ("_pidBundle_")  "_idItem1_" & "_idItem_" can not fix"
+					quit
+				}
+			}
+		}
+	}
+	; 2 Try to get bundle details 
+	if $$$ISOK(sc) {
+		set idHist	= idHist1
+		if $get(idHist)=$$$NULLOREF {
+			set sc = "Can not find History for bundle "_pidBundle
+		}
+	}
+	if $$$ISOK(sc) {
+		set objHist	= ##class(alSOH.dStockHistory).%OpenId(idHist)
+		if objHist = $$$NULLOREF {
+			set sc	= "Can not open History for id "_idHist
+		}
+	}
+	if $$$ISOK(sc) {
+		set idMoveType	= objHist.MovementType.MovementTypeId
+		set idTxType	= objHist.TxType.%Id()
+		set idLoc		= objHist.Location.%Id()
+		if ( idMoveType= 1) && (idTxType = 2) {
+			set idRec	= objHist.Reference
+			set idLine	= objHist.LineNumber
+			set objRecLine	= ##class(User.INRECLine).%OpenId(YM_"||"_idRec_"||"_idLine)
+			if objRecLine = $$$NULLOREF {
+				set sc	= "Can not open Receipt "_idRec_" Line "_idLine
+			} else {
+				set strLot		= objRecLine.LotNumber
+				set dtExp		= objRecLine.ExpirationDate
+				set idProgram	= objRecLine.Program1
+				set idOwner		= objRecLine.Owner
+				set idBrand		= objRecLine.Brand
+				set sc			= $$ReCreateBundle(pidBundle,idItem,strLot,dtExp,idProgram,idOwner,idBrand,pblnVerbose,idLoc)
+			}
+		} elseif ( idMoveType= 40) && (idTxType = 9) {
+			set idAdj	= objHist.Reference
+			set idLine	= objHist.LineNumber
+			set idLine	= $piece(idLine,"||",2)
+			set objAdjLine	= ##class(User.INADJLine).%OpenId(YM_"||"_idAdj_"||"_idLine)
+			if objAdjLine = $$$NULLOREF {
+				set sc	= "Can not open Adjust "_idAdj_" Line "_idLine
+			} else {
+				set strLot		= objAdjLine.LotNumber
+				set dtExp		= objAdjLine.ExpirationDate
+				set idProgram	= objAdjLine.Program1
+				set idOwner		= objAdjLine.Owner
+				set idBrand		= objAdjLine.Brand
+				set sc			= $$ReCreateBundle(pidBundle,idItem,strLot,dtExp,idProgram,idOwner,idBrand,pblnVerbose,idLoc)
+			}
+		} else {
+			set sc	= "Can not process 1st history ("_idHist_") for Move Type "_idMoveType_" Tx Type "_idTxType
+		}
+	}
+	if pblnVerbose {
+		write !,"sc = "_sc
+	}
+	quit sc
+	
+ReCreateBundle(pidBundle,pidItem,pstrLot,pdtExp,pidProgram,pidOwner,pidBrand,pblnVerbose=$$$NO,pidLoc)
+	;-------------------------------------------------------------------------------
+	; ReCreate Bundle
+	;
+	; Returns:
+	;
+	; History:
+	; 21-Mar-2014	SCR		SESDF-1189: Record blank optional attibutes
+	; 09-Nov-2013	SCR		SESDF-686: Created
+	;-------------------------------------------------------------------------------
+	new arrAtts,arrReqAttributes,blnOpt,idChild,idPolicy,objAtt,objBundle,objItem
+	new objPolicy,oldCounter,sc,strName,strVal
+	
+	write:pblnVerbose !,"Repairing Bundle "_pidBundle_" Item = "_pidItem_" Lot = "_pstrLot_" Date = "_pdtExp_" Program = "_pidProgram_" Owner = "_pidOwner_" Brand = "_pidBrand
+	set sc	= $$$OK
+	
+	set arrAtts("Brand")		= pidBrand
+	set arrAtts("Lot Number")	= pstrLot
+	set arrAtts("Use By Date")	= pdtExp
+	set arrAtts("Owner")		= pidOwner
+	set arrAtts("Program")		= pidProgram
+
+	set idPolicy	= $piece(pidBundle,"||",1)
+	set idChild		= $piece(pidBundle,"||",2)
+	set objItem		= ##class(alINV.dItem).%OpenId(pidItem,0)
+	set objPolicy	= objItem.ItemPolicy
+	set objBundle = ##class(alSOH.dBundle).%New()
+	set objBundle.ItemPolicy = objItem.ItemPolicy
+	set objBundle.Item       = objItem
+	set sc = ##class(alSOH.iBundle).GetAttributesForPolicy(objItem.ItemPolicy.%Id(), .arrReqAttributes, pidLoc)
+	zwrite arrReqAttributes
+	set strName	= ""
+	for {
+		set strName			= $order(arrReqAttributes(strName))
+		quit:strName=""
+		set blnOpt			= $get(arrReqAttributes(strName))
+		set strVal			= $get(arrAtts(strName))
+		write !,strName," ["_strVal_"] ",blnOpt
+		if (strVal="") && ('blnOpt) {
+			set sc	= "Missing Value for Attribute "_strName
+			quit
+		}
+		;if blnOpt && (strVal="") continue
+		set objAtt = ##class(alSOH.dBundleAttribute).%New()
+		set objAtt.Bundle         = objBundle
+ 		set objAtt.AttributeName  = strName
+ 		set objAtt.AttributeValue = strVal
+		
+	}	
+	if $$$ISOK(sc) {
+		tstart
+		lock +^alSOHProcessing  ; Stop All Processing
+		lock +^alINV.dItemPolicyD
+		lock +^alINV.dItemPolicyC
+		;w " $job "_$job for i=1:1:100 h 1
+		; Black Magic
+		set oldCounter	= $get(^alINV.dItemPolicyC("Bundles")) 
+		set ^alINV.dItemPolicyC("Bundles")	= $piece(pidBundle,"||",2)-1
+		set sc 	= objBundle.%Save()
+		if $$$ISOK(sc) {
+			write !,"Bundle Saved id = ",objBundle.%Id()
+			
+		}
+		set ^alINV.dItemPolicyC("Bundles")	= oldCounter
+		lock -^alINV.dItemPolicyC
+		lock -^alINV.dItemPolicyD
+		lock -^alSOHProcessing
+	}
+	
+	
+	quit sc
+	
+RemoveHist(pstrRef,pidType,pbnlKill=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Remove History for Ref & Type
+	;
+	; Returns:
+	;
+	; History:
+	; 14-May-2014	SCR		HEVA-1387: Make Delete History Common
+	; 29-Jan-2013	SCR		HEVA-1343: Created
+	;-------------------------------------------------------------------------------
+	new blnFail,idHist,idRef,idType,intCount,intKilled,objHist,sc
+	
+	tstart:pbnlKill
+	
+	$$$VAR
+	if pstrRef="" write !,"Must Enter a Reference" quit
+	if pidType="" write !,"Must Enter a Type" quit
+	set intCount	= 0
+	set intKilled	= 0
+	set blnFail		= 0
+	set idHist		= ""
+	set sc			= 1
+	for {
+		set idHist	= $order(^alSOH.dStockHistoryD(idHist))
+		quit:idHist=""
+		quit:'sc
+		set objHist	= ##class(alSOH.dStockHistory).%OpenId(idHist)
+		set idRef	= objHist.Reference
+		set idType	= objHist.MovementType.MovementTypeId
+		if (idType=pidType)&&(idRef=pstrRef) {
+			set sc = $$RemoveHistAct(objHist,pbnlKill)
+			set intCount	= intCount + 1
+			if pbnlKill {
+				if $$$ISOK(sc) {
+					set intKilled	= intKilled + 1
+				} else {
+					set blnFail	= 1
+				}
+			}
+		}
+	}
+	write !,"History Count ",intCount," Removed ",intKilled
+	if blnFail {
+		write !,"At least 1 Save Failed Rolling Back"
+		trollback
+	}
+	quit
+RemoveHistAct(pobjHist,&pbnlKill=$$$NO,&pintKilled)
+	;-------------------------------------------------------------------------------
+	; Remove History for Ref & Type
+	;
+	; Returns:
+	;
+	; History:
+	; 14-May-2014	SCR		HEVA-1387: Created
+	;-------------------------------------------------------------------------------
+	new dtDate,idBundle,idHist,idItem,idLine,idLoc,idRef,idStore,idTxn,intQty,sc
+
+	set sc		= $$$OK
+	set idHist	= pobjHist.%Id()
+	set intQty	= pobjHist.QtyMoved
+	set idItem	= pobjHist.Item.%Id()
+	set idStore	= pobjHist.Storage.%Id()
+	set idBundle= pobjHist.Bundle.%Id()
+	set idTxn	= pobjHist.TxType.%Id()
+	set idRef	= pobjHist.Reference
+	set idLine	= pobjHist.LineNumber
+	set dtDate	= pobjHist.DateConfirmed
+	set idLoc	= pobjHist.Location.%Id()
+	write !,"About to Remove id:"_idHist_" Item:"_idItem_" Store:"_idStore
+	write " Bundle:"_idBundle_" Qty:"_intQty_" Txn:"_idTxn_" Line:"_idLine
+	write " Date:"_$zdate(dtDate)
+	if pbnlKill {
+		set sc	= ##class(alSOH.dStockHistory).%DeleteId(idHist)
+		write " Removed sc:"_sc
+		if $$$ISOK(sc) {
+			set sc=$$RebuildHistQOH(idItem,idLoc,pbnlKill)
+		}
+	}
+	quit sc
+	
+ResetDoc(pstrType,pstrPK)
+	;-------------------------------------------------------------------------------
+	; Reset Doc
+	; Type 	Rec	= INREC
+	;		TFR	= INTFR
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Apr-2014	SCR		HEVA-1466: Reset Adjustment
+	; 02-Apr-2014	SCR		SESDF-1189: Reset Transfer Receipt
+	; 29-Jan-2013	SCR		HEVA-1343: Created
+	;-------------------------------------------------------------------------------
+	new objRec,objTFR,sc,objADJ
+	
+	tstart
+	$$$VAR
+	if pstrPK="" {
+		write !,"Primary Key Required"
+		quit
+	}
+	if pstrType="Rec" {
+		set objRec	= $get(^INREC(YM,pstrPK,1))
+		if objRec="" {
+			write !,"No Record for "_pstrPK
+			quit
+		}
+		set $$$INRECStatus(objRec)			= 0
+		set $$$INRECProcessedDate(objRec)	= ""
+		set sc=$$$Save("INREC",pstrPK,objRec,$$$YES)
+		write !,"Receipt INREC "_pstrPK_" Reset sc:"_sc
+		if $$$INRECType(objRec)=3 {
+			do ResetTransferReceipt(pstrPK)
+		}
+	} elseif pstrType="TFR" {
+		set objTFR	= $get(^INTFR(YM,pstrPK,1))
+		if objTFR="" {
+			write !,"No Record for "_pstrPK
+			quit
+		}
+		set $$$INTFRStatus(objTFR)	= 1
+		set $$$INTFRShipped(objTFR)	= ""
+		set sc=$$$Save("INTFR",pstrPK,objTFR,$$$YES)
+		write !,"Transfer INTFR "_pstrPK_" Reset"_" Reset sc:"_sc
+	} elseif pstrType="ADJ" {
+		set objADJ	= $get(^INADJ(YM,pstrPK,1))
+		if objADJ="" {
+			write !,"No Record for "_pstrPK
+			quit
+		}
+		set $$$INADJStatus(objADJ)	= 0
+		set $$$INADJProcessedDate(objADJ)	= ""
+		set $$$INADJProcessedBy(objADJ)	= ""
+		set sc=$$$Save("INADJ",pstrPK,objADJ,$$$YES)
+		write !,"Adjustment INADJ "_pstrPK_" Reset"_" Reset sc:"_sc
+	} else {
+		write !,"Invalid Type:"_pstrType
+	}
+
+	quit
+
+ResetTransferReceipt(pidRec)
+	;-------------------------------------------------------------------------------
+	; Reset Transfer Receipt
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Apr-2014	SCR		SESDF-1189: Created
+	;-------------------------------------------------------------------------------
+	new arrQty,arrThis,fltQty,idLine,idTFR,idTFRLine,objLine,strStatus
+	set strStatus	= $$$OK
+	if $$$ISOK(strStatus) {     // Transfer receipts
+		set idLine = ""
+		for {
+			set idLine = $order(^INRECLine(YM,pidRec,idLine))
+			quit:idLine=""
+			
+			set objLine = $get(^INRECLine(YM,pidRec,idLine,1))
+			
+			set fltQty = +$$$INRECLineQuantity(objLine)
+			if fltQty {
+				set idTFR     = $$$KEY1($$$INRECLineCacheLink(objLine))
+				set idTFRLine = $$$KEY2($$$INRECLineCacheLink(objLine))
+				
+				set arrQty(idTFR,idTFRLine) = $get(arrQty(idTFR,idTFRLine))+fltQty
+			}
+			quit:$$$ISERR(strStatus)
+		}
+		
+		if $$$ISOK(strStatus) {   //Update transfers and receive
+			set idTFR = ""
+			for {
+				set idTFR = $order(arrQty(idTFR))
+				quit:idTFR=""
+				
+				kill arrThis
+				merge arrThis = arrQty(idTFR)
+				set strStatus = $$ReceiveTransferReverse(idTFR,.arrThis)
+				quit:$$$ISERR(strStatus)
+			}
+		}
+		
+	}
+	quit strStatus
+	
+	
+ReceiveTransferReverse(pidTFR,&parrQty)
+	;-------------------------------------------------------------------------------
+	; Reverse transfer line receipt quantites and transfer header with status
+	; 
+	; Params:
+	;	pidTFR		transfer id
+	;	parrQty		ByRef : array of line quantites
+	;						parrQty(idLine) = fltQty
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 02-Apr-2014	SCR		SESDF-1189: Created
+	;-------------------------------------------------------------------------------
+	new arrReqID,fltQty,idLine,idReq,objReq,objTFR,objTFRLine,objUReqLine,sc,strStatus
+	
+	set strStatus = $$$OK
+	
+	// Update transfer lines
+	set idLine = ""
+	for {
+		set idLine = $order(parrQty(idLine))
+		quit:idLine=""
+		
+		set fltQty     = parrQty(idLine)
+		set objTFRLine = $get(^INTFRLine(YM,pidTFR,idLine,1))
+		set $$$INTFRLineReceivedQuantity(objTFRLine) = $$$INTFRLineReceivedQuantity(objTFRLine) - fltQty
+		if $$$INTFRLineReceivedQuantity(objTFRLine)<0 {
+			set $$$INTFRLineReceivedQuantity(objTFRLine)=0
+		}
+		set strStatus = $$$Save("INTFRLine",pidTFR_","_idLine,objTFRLine,$$$YES)
+		
+		if $$$ISOK(strStatus) && ($$$INTFRLineReference(objTFRLine) '= "") {
+			set idReq = $$$KEY1($$$INTFRLineReference(objTFRLine))
+			if idReq'="" set arrReqID(idReq)=""        //SR16819
+			
+			set objUReqLine = ##class(alREQ.dUReqLine).%OpenId("0||"_$$$KEY1($$$INTFRLineReference(objTFRLine))_"||"_$$$KEY2($$$INTFRLineReference(objTFRLine)),,.sc)
+			
+			if objUReqLine '= $$$NULLOREF {
+				set objUReqLine.QtyReceived = objUReqLine.QtyReceived - fltQty
+				if objUReqLine.QtyReceived<0 {
+					set objUReqLine.QtyReceived	= 0
+				}
+				set objUReqLine.Status	= 2
+				if $$$ISERR(sc) {
+					set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+				} else {
+					set sc	= objUReqLine.%Save()
+					if $$$ISERR(sc) {
+						set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+					}
+				}			
+			}
+		}
+		quit:$$$ISERR(strStatus)
+	}
+
+	; Try to close the Relevant Req's
+	set idReq = ""
+	for {
+		set idReq = $order(arrReqID(idReq))
+		quit:idReq=""
+		if objUReqLine '= $$$NULLOREF {
+			set objReq = ##class(alREQ.dUReq).%OpenId("0||"_idReq)
+			do objReq.AutoClose()
+		}
+	}
+	
+	// Update header
+	if $$$ISOK(strStatus) {
+		set objTFR = $get(^INTFR(YM,pidTFR,1))
+		if $$$INTFRReceived(objTFR)="" {	// Only update for first receipt
+			set $$$INTFRStatus(objTFR)   = $$$EnumINTFRSTATUSReceived
+			set $$$INTFRReceived(objTFR) = $horolog
+			set strStatus = $$$Save("INTFR",pidTFR,objTFR,$$$YES)
+		}
+	}
+	quit strStatus
+	
+RebuildHistQOH(pidItem,pidLoc,pblnFix=0,pblnVerbose=0)
+	;-------------------------------------------------------------------------------
+	; Rebuild StockHistory QOHLocn & QOHStorage for a Item at a Location
+	; 
+	; Params:
+	;	pidItem		
+	;	pidLoc		
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 02-Apr-2014	SCR		SESDF-1189: Created
+	;-------------------------------------------------------------------------------
+	new arrStrQOH,blnFix,dtLT,idStockHistory,idStore,intCorrected,intCount,intError
+	new intMove,intQOH,intStrQOH,objResultSet,objStockHistory,sc,strSQL
+
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set strSQL			= "select id from alSOH.dStockHistory where Item = ? "
+	set strSQL			= strSQL _"and location = ? "
+	set strSQL			= strSQL _" order by DateConfirmed , TimeConfirmed "
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidItem,pidLoc)
+	write !,sc
+	quit:'sc sc
+	set intCount		= 0
+	set intCorrected	= 0
+	set intError		= 0
+	set dtLT			= $horolog
+	kill arrStrQOH
+	set intQOH			= 0
+	set blnFix			= 0
+	write:pblnVerbose !,"Checking History QOH for Item ",pidItem," Location ",pidLoc
+	while objResultSet.Next() {
+		set idStockHistory	= objResultSet.Data("ID")
+		set objStockHistory	= ##class(alSOH.dStockHistory).%OpenId(idStockHistory)
+		set blnFix			= 0
+		set intCount		= intCount + 1
+		set intMove			= objStockHistory.QtyMoved
+		set idStore			= objStockHistory.Storage.%Id()
+		if intQOH'=objStockHistory.QOHLocn {
+			write !,"Correcting ID ",idStockHistory," QOHLocn From ",objStockHistory.QOHLocn," to ",intQOH
+			set objStockHistory.QOHLocn=intQOH
+			set blnFix		= 1
+		}
+		set intStrQOH		= +$get(arrStrQOH(idStore))
+		if intStrQOH'=objStockHistory.QOHStorage {
+			write !,"Correcting ID ",idStockHistory," QOHStorage From ",objStockHistory.QOHStorage," to ",intStrQOH
+			set objStockHistory.QOHStorage=intStrQOH
+			set blnFix		= 1
+		}
+		set:blnFix intError	= intError + 1
+		if blnFix && pblnFix {
+			set sc	= objStockHistory.%Save()
+			write !," Saving ",sc
+			set intCorrected	= intCorrected+1
+		}
+		set intQOH				= intQOH + intMove
+		set arrStrQOH(idStore)	= $get(arrStrQOH(idStore))+intMove
+		quit:'sc
+	}
+	write:blnFix!pblnVerbose !," History QOH check count:",intCount," to Be Corrected:",intError," Corrected:",intCorrected
+	quit sc
+
+RebuildItemQty(pidItem)
+	;-------------------------------------------------------------------------------
+	; Rebuild SOH,StockBalance,BundleStock&PeriodBalance for an Item
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Jan-2013	SCR		HEVA-1343: Created
+	;-------------------------------------------------------------------------------
+	new Bundle,Err,Item,QtyMoved,Storage,arrCount,blnMSASave,blnNonStock,dtLT,idBundleStock
+	new idPeriodBalance,idSOH,idStockBalance,idStockHistory,intCount,objINVORG
+	new objResultSet,objStockHistory,sc,strSQL
+
+	if pidItem="" {
+		write !,"No Item"
+		quit
+	}
+	$$$VAR
+	lock +^alSOHProcessing(pidItem)
+	
+	set strSQL			= "select id from alSOH.dSOH where Item = ?"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidItem)
+	write !,"sc=",sc
+	if sc {
+		while objResultSet.Next() {
+			set idSOH	= objResultSet.Data("ID")
+			;set objSOH	= ##class(alSOH.dSOH).%OpenId(idSOH)
+			write !," ID ",idSOH," Deleted "
+			set sc=##class(alSOH.dSOH).%DeleteId(idSOH)
+			write sc
+			if 'sc kill Err Do $system.Status.DecomposeStatus(sc,.Err) zwrite Err
+
+			set arrCount("SOH")	= $get(arrCount("SOH"))+1		
+		}
+	}
+	set strSQL			= "select id from alSOH.dStockBalance where Item = ?"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidItem)
+	write !,"sc=",sc
+	if sc {
+		while objResultSet.Next() {
+			set idStockBalance	= objResultSet.Data("ID")
+			;set objStockBalance	= ##class(alSOH.dStockBalance).%OpenId(idStockBalance)
+			write !," ID ",idStockBalance," Deleted "
+			set sc=##class(alSOH.dStockBalance).%DeleteId(idStockBalance)
+			write sc
+			if 'sc kill Err Do $system.Status.DecomposeStatus(sc,.Err) zwrite Err
+			set arrCount("StockBalance")	= $get(arrCount("StockBalance"))+1		
+		}
+	}
+	set strSQL			= "select id from alSOH.dBundleStock where Item = ?"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidItem)
+	write !,"sc=",sc
+	if sc {
+		while objResultSet.Next() {
+			set idBundleStock	= objResultSet.Data("ID")
+			;set objBundleStock	= ##class(alSOH.dBundleStock).%OpenId(idBundleStock)
+			write !," ID ",idBundleStock," Deleted "
+			set sc=##class(alSOH.dBundleStock).%DeleteId(idBundleStock)
+			if 'sc kill Err Do $system.Status.DecomposeStatus(sc,.Err) zwrite Err
+			write sc
+			set arrCount("BundleStock")	= $get(arrCount("BundleStock"))+1		
+		}
+	}
+
+	set strSQL			= "select id from alSOH.dPeriodBalance where Item = ?"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidItem)
+	write !,"sc=",sc
+	if sc {
+		while objResultSet.Next() {
+			set idPeriodBalance		= objResultSet.Data("ID")
+			;set objPeriodBalance	= ##class(alSOH.dPeriodBalance).%OpenId(idPeriodBalance)
+			write !," ID ",idPeriodBalance," Deleted "
+			set sc=##class(alSOH.dPeriodBalance).%DeleteId(idPeriodBalance)
+			write sc
+			if 'sc kill Err Do $system.Status.DecomposeStatus(sc,.Err) zwrite Err
+			set arrCount("PeriodBalance")	= $get(arrCount("PeriodBalance"))+1		
+		}
+	}
+	if sc {
+		set objINVORG	= $get(^INVORG(0,0,1))
+		set blnMSASave	= $$$INVORGMinusStockAllowed(objINVORG)
+		set $$$INVORGMinusStockAllowed(objINVORG)	= 1
+		set ^INVORG(0,0,1)	= objINVORG
+	}
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set strSQL			= "select id from alSOH.dStockHistory where Item = ? "
+	;set strSQL			= strSQL _" and item->itempolicy = bundle->itempolicy "
+	;set strSQL			= strSQL _" order by DateConfirmed , TimeConfirmed "
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidItem)
+	set intCount		= 0
+	set dtLT			= $horolog
+	if sc {
+		while objResultSet.Next() {
+			set idStockHistory	= objResultSet.Data("ID")
+			set objStockHistory	= ##class(alSOH.dStockHistory).%OpenId(idStockHistory)
+			set intCount		= intCount + 1
+			if dtLT'=$horolog {
+				write !,$zdatetime($horolog)," ",intCount," ",idStockHistory
+				set dtLT=$horolog
+			}
+			set blnNonStock   = objStockHistory.NonStock
+	
+			if 'blnNonStock {
+				if $$$ISOK(sc) {
+					set Item     = objStockHistory.Item
+					set Storage  = objStockHistory.Storage
+					set Bundle   = objStockHistory.Bundle
+					set QtyMoved = objStockHistory.QtyMoved
+
+					set sc = ##class(alSOH.dBundleStock).ChangeQuantity(Item,Storage,Bundle,QtyMoved)
+				}
+			}
+			set arrCount("StockHistory")	= $get(arrCount("StockHistory"))+1		
+		}
+	}
+	if sc {
+		set objINVORG	= $get(^INVORG(0,0,1))
+		set $$$INVORGMinusStockAllowed(objINVORG)	= blnMSASave
+		set ^INVORG(0,0,1)	= objINVORG
+	}
+	write !,"Complete sc="_sc,!
+	
+	zwrite arrCount
+	lock -^alSOHProcessing(pidItem)
+	quit
+
+CheckHist(pidItem)
+	;-------------------------------------------------------------------------------
+	; Check Item History
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Jan-2013	SCR		HEVA-1343: Created
+	;-------------------------------------------------------------------------------
+	new arrCount,blnNonStock,idStockHistory,objBundle,objItem,objResultSet,objStockHistory
+	new sc,strSQL
+	if pidItem="" {
+		write !,"No Item"
+		quit
+	}
+	$$$VAR
+	
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set strSQL			= "select id from alSOH.dStockHistory where Item = ?"
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidItem)
+	if sc {
+		while objResultSet.Next() {
+			set idStockHistory	= objResultSet.Data("ID")
+			set objStockHistory	= ##class(alSOH.dStockHistory).%OpenId(idStockHistory)
+			set blnNonStock   = objStockHistory.NonStock
+	
+			if 'blnNonStock {
+				if $$$ISOK(sc) {
+					set objItem     = objStockHistory.Item
+					set objBundle   = objStockHistory.Bundle
+					if objItem.ItemPolicy '= objBundle.ItemPolicy {
+						write !,"Item:",objItem.%Id()," Policy:",objItem.ItemPolicy.%Id()," Missmatch ",idStockHistory," Policy:",objBundle.ItemPolicy.%Id()
+					}
+				}
+			}
+			set arrCount("StockHistory")	= $get(arrCount("StockHistory"))+1		
+		}
+	}
+	write !,"Complete sc="_sc,!
+	
+	zwrite arrCount
+	quit
+
+MoveHist()
+	;-------------------------------------------------------------------------------
+	; Move History Lines
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Feb-2013	SCR		HEVA-1343: Created
+	;-------------------------------------------------------------------------------
+	new arrMove,arrSave,dtLT,idHist,idNew,intCount,intDist,intMove,intMoveTo,intNewTop
+	new intOldTop,intStart,lstIDs,objHist,strOK,strStatus
+	
+	Read !,"Move to ID ",intMoveTo
+	Read !,"Comma List of ID to Move ",lstIDs
+	set strStatus	= 1
+	set intStart	= intMoveTo
+	set idNew		= intStart
+	set intCount	= $length(lstIDs,",")
+	for intMove=1:1:$length(lstIDs,",") {
+		set idHist	= $piece(lstIDs,",",intMove)
+		if '$data(^alSOH.dStockHistoryD(idHist)) {
+			write !,"ID ",idHist," Not Defined ",!
+			set strStatus=0
+		}
+		set idNew	= idNew+1
+		set arrMove(idNew)=idHist
+		set arrSave(idHist)=$get(^alSOH.dStockHistoryD(idHist))
+		set:idHist<intStart intStart=idHist
+		quit:'strStatus
+		write !,"About to Move History ",idHist," to ",idNew
+	}
+	set intDist	= idNew-$order(arrSave(""))
+	quit:'strStatus
+	read !,"Enter 'y' to Proceed ",strOK
+	set dtLT="" 
+	if strOK="y" {
+		write !,"moving Counter from "_$get(^alSOH.dStockHistoryD)
+		set intOldTop	= $get(^alSOH.dStockHistoryD)
+		set intNewTop	= intOldTop+(intCount+10)
+		set ^alSOH.dStockHistoryD	= $get(^alSOH.dStockHistoryD)+(intCount+20)
+		write " to "_^alSOH.dStockHistoryD
+		write !,"moving IDs from ",intOldTop," down to "_(intStart+1)_" up by "_(intCount+10)
+		set idHist=""
+		for {
+			set idHist=$order(arrSave(idHist))
+			quit:idHist=""
+			kill ^alSOH.dStockHistoryD(idHist)
+		}
+		set idHist	= intNewTop
+		for {
+			set idHist	= $order(^alSOH.dStockHistoryD(idHist),-1)
+			quit:idHist=""  ; this should never happen
+			quit:idHist=intStart
+			quit:idHist<intStart
+			continue:$data(arrSave(idHist)) 
+			set idNew	= idHist+(intDist+10)
+			if '$data(arrSave(idHist))  { ; dont move the ones to be inserted
+				set ^alSOH.dStockHistoryD(idNew)=$get(^alSOH.dStockHistoryD(idHist))
+				write !," ",idHist,"->",idNew
+			}
+			kill ^alSOH.dStockHistoryD(idHist)
+			if dtLT'=$horolog {
+				set dtLT	= $horolog
+				write !,$zdatetime($horolog)," ",idHist
+			}
+		}
+		set idNew=""
+		for {
+			set idNew	= $order(arrMove(idNew))
+			quit:idNew=""
+			set idHist	= arrMove(idNew)
+			set objHist	= $get(arrSave(idHist))
+			write !,"Moving History from ",idHist," to ",idNew
+			set ^alSOH.dStockHistoryD(idNew)	= objHist
+			;kill ^alSOH.dStockHistoryD(idHist)	
+		}
+	}
+	zwrite arrSave
+	zwrite arrMove
+	quit
+
+CheckHistoryDateTime(pidItem="")
+	;------------------------------------------------------------------]]><![CDATA[-------------
+	; Check Histroy for Date Time
+	;
+	; Returns:
+	;
+	; History:
+	; 21-Feb-2013	SCR		HEVA-1375 
+	;-------------------------------------------------------------------------------
+	new blnOK,dtDate,dtNextD,dtNextT,dtTime,idHist,idItem,idLast,idNextType,idType
+	new objHist,objResultSet,sc,strNextRef,strRef,strSQL
+	
+	$$$VAR
+	set idItem	=""
+	for {
+		set idItem	= $order(^INART(YM,idItem))
+		quit:idItem=""
+		if pidItem'="" {
+			continue:idItem'=pidItem
+		}
+	
+		set strSQL			= "select id from alSOH.dStockHistory where item=? order by id"
+		set objResultSet	= ##class(%Library.ResultSet).%New()
+		set sc				= objResultSet.Prepare(strSQL)
+		set:sc sc			= objResultSet.Execute(idItem)
+		set dtDate			= ""
+		set dtTime			= ""
+		set idLast			= ""
+		set idType			= ""
+		set strRef			= ""
+		if sc {
+			while objResultSet.Next() {
+				set idHist	= objResultSet.Data("ID")
+				set objHist	= ##class(alSOH.dStockHistory).%OpenId(idHist)
+				set blnOK	= $$$YES
+				set dtNextD	= objHist.DateConfirmed
+				set dtNextT	= objHist.TimeConfirmed
+				set idNextType	= objHist.MovementType.MovementTypeId
+				set strNextRef	= objHist.Reference
+				if dtNextD<dtDate {
+					set blnOK	= $$$NO
+				} elseif dtNextD=dtDate {
+					if dtNextT<dtTime {
+						set blnOK	= $$$NO
+					}
+				}
+				if blnOK=$$$NO {
+					write !,"Date out of Order for Item ",idItem," Last ID ",idLast," ",$zdatetime(dtDate_","_dtTime,3)," ",idType," ",strRef
+					write " ID ",idHist," ",$zdatetime(dtNextD_","_dtNextT,3)," ",idNextType," ",strNextRef
+				}
+				set dtDate	= dtNextD
+				set dtTime	= dtNextT
+				set idLast	= idHist
+				set idType	= idNextType
+				set strRef	= strNextRef
+			}
+		}
+	}
+	quit sc
+	
+
+
+
+
+ScanDuplicateHistory()
+	;-------------------------------------------------------------------------------
+	; Seach for duplicate history
+	;
+	; Returns:
+	;
+	; History:
+	; 01-May-2014	SCR		SESDF-1387: Created
+	;-------------------------------------------------------------------------------
+	new dtLT,idHist,idLine,idMove,idTx,intCount,intEC,objHist,objResultSet,sc,strGlo
+	new strKey,strRef,strSQL
+	
+	set dtLT			= ""
+	set intCount		= 0
+	set strGlo			= "^CacheTempSOHTBDubHist("""_$znspace_""")"
+	kill @strGlo
+	set strSQL			= "select id from alsoh.dstockhistory"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute()
+	if sc {
+		while objResultSet.Next() {
+			set idHist	= objResultSet.Data("ID")
+			set objHist	= ##class(alSOH.dStockHistory).%OpenId(idHist)
+			set strRef	= objHist.Reference
+			set idLine	= objHist.LineNumber
+			set idTx	= objHist.TxType.%Id()
+			set idMove	= objHist.MovementType.MovementTypeId
+			set strKey	= idMove_" "_idTx_" "_strRef_" "_idLine
+			set @strGlo@(strKey)	= $get(@strGlo@(strKey))+1
+			set intCount= intCount+1
+			if dtLT'=$h {
+				set dtLT	= $h
+				write !,$zdt($h)," ",intCount," ",idHist
+			}	
+		}
+	}
+	set intEC	= 0
+	if sc {
+		set strKey	= ""
+		for intCount=0:1 {
+			set strKey	= $o(@strGlo@(strKey))
+			quit:strKey=""
+			if @strGlo@(strKey)=1 {
+				kill @strGlo@(strKey)
+			} else {
+				set intEC	= intEC+1
+			}
+			if dtLT'=$h {
+				set dtLT	= $h
+				write !,$zdt($h)," ",intCount," ",intEC
+			}	
+		}
+	}
+	zw @strGlo
+	
+PostingTimes()
+	;-------------------------------------------------------------------------------
+	; Display Posting Times
+	;
+	; Returns:
+	;
+	; History:
+	; 05-May-2014	SCR		SESDF-1387: Created
+	;-------------------------------------------------------------------------------
+	new dtDate,dtLT,dtTime,idHist,idLine,idMove,idTx,intCnt,intCount,intDayAve
+	new intDayCnt,intDayTime,intEC,intLast,intSec,intStart,intTime,objHist,objResultSet
+	new sc,strDay,strGlo,strKey,strRec,strRef,strSQL
+	
+	set dtLT			= ""
+	set intCount		= 0
+	set strGlo			= "^CacheTempSOHTBHistTime("""_$znspace_""")"
+	kill @strGlo
+	set strSQL			= "select id from alsoh.dstockhistory"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute()
+	if sc {
+		while objResultSet.Next() {
+			set idHist	= objResultSet.Data("ID")
+			set objHist	= ##class(alSOH.dStockHistory).%OpenId(idHist)
+			set strRef	= objHist.Reference
+			set idLine	= objHist.LineNumber
+			set dtDate	= objHist.DateConfirmed
+			set dtTime	= objHist.TimeConfirmed
+			set intSec	= (dtDate*86400)+dtTime
+			set idTx	= objHist.TxType.%Id()
+			set idMove	= objHist.MovementType.MovementTypeId
+			set strKey	= idMove_" "_idTx
+			set strRec	= $get(@strGlo@("t",strKey,strRef))
+			set intCnt	= $piece(strRec,",",1)+1
+			set intStart= $piece(strRec,",",2)
+			set intLast	= $piece(strRec,",",3)
+			if (intStart>intSec)||(intStart="") {
+				set intStart	= intSec
+			}
+			if intSec>intLast {
+				set intLast		= intSec
+			}
+			set @strGlo@("t",strKey,strRef)	= intCnt_","_intStart_","_intLast_","_dtDate
+			set intCount= intCount+1
+			if dtLT'=$h {
+				set dtLT	= $h
+				write !,$zdt($h)," ",intCount," ",idHist
+			}	
+		}
+	}
+	set intCount	= 0
+	set intEC	= 0
+	if sc {
+		set strKey	= ""
+		for {
+			set strKey	= $o(@strGlo@("t",strKey))
+			quit:strKey=""
+			set strRef	= ""
+			for {
+				set strRef	= $order(@strGlo@("t",strKey,strRef))
+				quit:strRef=""
+				set strRec	= $get(@strGlo@("t",strKey,strRef))
+				set intCnt	= $piece(strRec,",",1)
+				set intStart= $piece(strRec,",",2)
+				set intLast	= $piece(strRec,",",3)
+				set dtDate	= $piece(strRec,",",4)
+				continue:intCnt<2
+				set intCnt	= intCnt-1
+				set intCount= intCount+1
+				set intTime	= intLast-intStart
+				set strDay	= $get(@strGlo@("d",strKey,dtDate))
+				set intDayCnt	= $piece(strDay,",",1)+intCnt
+				set intDayTime	= $piece(strDay,",",2)+intTime
+				set intDayAve	= +$j(intDayTime/intDayCnt,0,5)
+				set @strGlo@("d",strKey,dtDate)	= intDayCnt_","_intDayTime_","_intDayAve
+				if dtLT'=$h {
+					set dtLT	= $h
+					write !,$zdt($h)," ",intCount," ",intEC
+				}
+			}	
+		}
+	}
+	zw @strGlo@("d")
+
+CheckCostEntries()
+	;-------------------------------------------------------------------------------
+	; Check that the INAvgCost entries exist for INRECLines
+	;
+	; Returns:
+	;
+	; History:
+	; 14-May-2014	SCR		SESDF-1387: Created
+	;-------------------------------------------------------------------------------
+	new dtDate,dtProc,dtTime,idCC,idCost,idItem,idLine,idRec,intNoC,intNotOK,intOK
+	new objItem,objResultSet,sc,strGlo,strRef,strSQL
+
+	$$$VAR
+	set strGlo			= "^CacheTempSOHTBCC("""_$znspace_""")"
+	kill @strGlo
+	set intOK			= 0
+	set intNotOK		= 0
+	set intNoC			= 0
+	set strSQL			= "select ID,Item,CostCentre,Date1,Time1,IncomingGoodsRef from INAvgCost"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute()
+	if sc {
+		while objResultSet.Next() {
+			set idCost	= objResultSet.Data("ID")
+			set idItem	= objResultSet.Data("Item")
+			set idCC	= objResultSet.Data("CostCentre")
+			set dtDate	= objResultSet.Data("Date1")
+			set dtTime	= objResultSet.Data("Time1")
+			set strRef	= objResultSet.Data("IncomingGoodsRef")
+			set idRec	= $piece(strRef,",",6)
+			set idLine	= $piece(strRef,",",7)
+			if (idRec'="")&&(idLine'="") {
+				set @strGlo@("r",idItem,idRec,idLine)=idCost
+			}
+		}
+	}
+	if 'sc {
+		write !,"Error ",sc
+		quit
+	}
+	set strSQL			= "select H.ReceiptNumber,LineNumber,Item,ProcessedDate from INREC as H "
+	set strSQL			= strSQL_" inner join INRECline as L on L.ReceiptNumber = H.ReceiptNumber"
+	set strSQL			= strSQL_" where h.type=2 and h.status=1"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute()
+	if sc {
+		while objResultSet.Next() {
+			set idRec	= objResultSet.Data("ReceiptNumber")
+			set idLine	= objResultSet.Data("LineNumber")
+			set idItem	= objResultSet.Data("Item")
+			set dtProc	= objResultSet.Data("ProcessedDate")
+			set objItem	= $get(^INART(YM,idItem,1))
+			if $$$INARTItemWithoutInventoryMaint(objItem) {
+				set intNoC	= intNoC + 1
+				continue
+			}
+			if '$data(@strGlo@("r",idItem,idRec,idLine)) {
+				write !,idRec," ",idLine," ",idItem
+				set @strGlo@("e",$zdt(dtProc,3),idItem,idRec,idLine)=""	
+				set intNotOK= intNotOK + 1	
+			} else {
+				set intOK	= intOK + 1
+			}
+		}
+	}
+	write !," Missing Cost Count ",intNotOK
+	write !," OK Count           ",intOK
+	write !," Without Maint      ",intNoC
+
+
+DuplicatedPost(pstrRef,pidType,pbnlKill=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Remove older Historys for the same Document
+	;
+	; Returns:
+	;
+	; History:
+	; 14-May-2014	SCR		HEVA-1387: Make Delete History Common
+	; 29-Jan-2013	SCR		HEVA-1343: Created
+	;-------------------------------------------------------------------------------
+	new blnFail,idHist,idLine,idRef,idType,intCount,intKilled,intSkipped,objHist
+	new sc,strGlo
+	
+	set strGlo			= "^CacheTempSOHTBDP("""_$znspace_""")"
+	kill @strGlo
+	tstart:pbnlKill
+	
+	$$$VAR
+	if pstrRef="" write !,"Must Enter a Reference" quit
+	if pidType="" write !,"Must Enter a Type" quit
+	set intCount	= 0
+	set intKilled	= 0
+	set blnFail		= 0
+	set intSkipped	= 0
+	set idHist		= ""
+	set sc			= 1
+	for {
+		set idHist	= $order(^alSOH.dStockHistoryD(idHist))
+		quit:idHist=""
+		quit:'sc
+		set objHist	= ##class(alSOH.dStockHistory).%OpenId(idHist)
+		set idRef	= objHist.Reference
+		set idType	= objHist.MovementType.MovementTypeId
+		set idLine	= objHist.LineNumber
+		if (idType=pidType)&&(idRef=pstrRef) {
+			set @strGlo@("l",idLine,idHist)=""
+		}
+	}
+	set idLine	= ""
+	for {
+		set idLine	= $order(@strGlo@("l",idLine))
+		quit:idLine=""
+		set idHist	= ""
+		for {
+			set idHist	= $order(@strGlo@("l",idLine,idHist))
+			if $order(@strGlo@("l",idLine,idHist))=""  { ; dont do the last line
+				write !,"Skipping History Line ",idLine," ID ",idHist
+				set intSkipped = intSkipped+1
+				quit
+			}
+			quit:idHist=""  ; This should not happen
+			set objHist	= ##class(alSOH.dStockHistory).%OpenId(idHist)
+			set sc = $$RemoveHistAct(objHist,pbnlKill)
+			set intCount	= intCount + 1
+			if pbnlKill {
+				if $$$ISOK(sc) {
+					set intKilled	= intKilled + 1
+				} else {
+					set blnFail	= 1
+				}
+			}
+		}
+	}
+	write !,"History Count ",intCount," Removed ",intKilled," Skipped ",intSkipped
+	if blnFail {
+		write !,"At least 1 Save Failed Rolling Back"
+		trollback
+	}
+	quit
+	
+RepairMPA(pidItem,pidLoc,pidBundle)
+	;-------------------------------------------------------------------------------
+	; Repiar Missing Program Attribute
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Jul-2014	SCR		SESDF-1323: Created
+	;-------------------------------------------------------------------------------
+	
+	new YFROM,arrAttributes,idAdj,idBSOH,idNewBundle,idOldBundle,idRC,idStorage
+	new intSOH,objAdj,objBSOH,objBundleAttribute,objItem,objLine1,objLine2,objNewBundle
+	new objOldBundle,objResultSet,sc,strAttr,strHash,strHashKey,strNewHash,strNewHashKey
+	new strSQL,strStatus
+	
+	ts
+	$$$VAR
+	set strStatus		= $$$OK
+	set YLOCATION		= pidLoc
+	set YBED			= "SUPORTE"
+	set idRC			= 0 ; Reason Code
+	set strSQL			= "SELECT ID FROM alSOH.dBundleStock "
+	set strSQL			= strSQL_" WHERE Item=? AND Storage->Location = ? AND Bundle = ?"
+	set objResultSet	= ##class(%Library.ResultSet).%New()
+	set sc				= objResultSet.Prepare(strSQL)
+	set:sc sc			= objResultSet.Execute(pidItem,pidLoc,pidBundle)
+	if sc {
+		while objResultSet.Next() {
+			set idBSOH	= objResultSet.Data("ID")
+			set objBSOH	= ##class(alSOH.dBundleStock).%OpenId(idBSOH)
+			if objBSOH="" {
+				write !,"Can not open Bundle stock for id ",idBSOH
+				quit
+			}
+			write !,"Checking id ",idBSOH
+			set idStorage		= objBSOH.Storage.Code
+			set objOldBundle	= objBSOH.Bundle
+			set idOldBundle		= objOldBundle.%Id()
+			write " Bundle ",idOldBundle
+			set strHashKey		= objOldBundle.HashKey
+			set strHash			= $$GetBase64Decode^COMUtilStr(strHashKey)
+			if strHash["Program" {
+				write !,"Bundle has a Program Attribute"
+				quit
+			}
+			set strNewHash		= strHash_"Program"
+			set strNewHashKey	= $$GetBase64Encode^COMUtilStr(strNewHash)
+			
+			set intSOH		= objBSOH.QtyOnHand
+			if 'intSOH {
+				write !,"No Stock on Hand"
+				quit				
+			}
+			
+			set idNewBundle = ##class(alSOH.iBundle).GetBundleIDforHashKey(strNewHashKey)
+			if idNewBundle'=$$$NULLOID {
+				set objNewBundle = ##class(alSOH.dBundle).%OpenId(idNewBundle,0,.sc)
+				write !,"Using existing bundle ",idNewBundle	
+			} else {
+			// create new bundle based on policy and attributes passed in
+				if '$tlevel {
+					write !,"Not in a Transaction "
+					quit
+				}
+				if $$$ISOK(sc) {
+					write !,"Creating New Bundle"
+					set objNewBundle = ##class(alSOH.dBundle).%New()
+					set objNewBundle.ItemPolicy = objOldBundle.ItemPolicy
+					set objNewBundle.Item       = objOldBundle.Item
+					set arrAttributes("Program")=""
+					set strAttr = ""
+					for {
+						set strAttr = $order(arrAttributes(strAttr))
+						quit:strAttr=""
+						
+						set objBundleAttribute = ##class(alSOH.dBundleAttribute).%New()
+						set objBundleAttribute.Bundle         = objNewBundle
+			 			set objBundleAttribute.AttributeName  = strAttr
+			 			set objBundleAttribute.AttributeValue = arrAttributes(strAttr)
+						if $$$SOHLockLevel=0 {  ; SR17611 vvvvvv
+							do objBundleAttribute.%DowngradeConcurrency(0)
+						}						; SR17611 ^^^^^^
+					}
+					set sc = objNewBundle.%Save()
+					set idNewBundle	= objNewBundle.%Id()
+					write !,"New bundle id=",idNewBundle
+				}
+			}
+			set objAdj		= ""
+			set YFROM		= "INADJ"
+			set objItem		= $get(^INART(YM,pidItem,1))
+			set $$$INADJReasonCode(objAdj)	= idRC
+			set $$$INADJSiteLocation(objAdj)= pidLoc
+			set $$$INADJStatus(objAdj)		= 0
+			set idAdj		= $$^WWWNEXT("INADJ")
+			write !,"Creating Adjustment ",idAdj," Qty ",intSOH
+			set strStatus	= $$$Save("INADJ",idAdj,objAdj,$$$YES)
+			set objLine1	= ""
+			set $$$INADJLineItem(objLine1)			= pidItem
+			set $$$INADJLineStockLocation(objLine1) = idStorage
+			set $$$INADJLineBaseQuantity(objLine1)	= -intSOH
+			set $$$INADJLineQuantity(objLine1)		= -intSOH
+			set $$$INADJLineUnit(objLine1)			= $$$INARTUnitofMeasure(objItem)
+			set $$$INADJLineReasonCode(objLine1)	= idRC
+			set $$$INADJLineBundle(objLine1)		= idOldBundle
+			
+			set $$$INADJLineItem(objLine2)			= pidItem
+			set $$$INADJLineStockLocation(objLine2) = idStorage
+			set $$$INADJLineBaseQuantity(objLine2)	= intSOH
+			set $$$INADJLineQuantity(objLine2)		= intSOH
+			set $$$INADJLineUnit(objLine2)			= $$$INARTUnitofMeasure(objItem)
+			set $$$INADJLineReasonCode(objLine2)	= idRC
+			set $$$INADJLineBundle(objLine2)		= idNewBundle
+			if $$$ISOK(strStatus) {
+				set strStatus	= $$$Save("INADJLine",idAdj_",1",objLine1,$$$YES)
+			}
+			if $$$ISOK(strStatus) {
+				set strStatus	= $$$Save("INADJLine",idAdj_",2",objLine2,$$$YES)
+			}
+			if $$$ISOK(strStatus) {
+				set ^CacheTempINADJBundleFix	= 1 ; This will keep the Bundles as is
+				set strStatus	= $$PostTxn^INADJ(idAdj)
+				kill ^CacheTempINADJBundleFix
+			}
+			if $$$ISOK(strStatus) {
+				write !,"Ajdustment Posted OK"
+			} else {
+				write !,"Error ",$$$Text(strStatus)
+			}
+		}
+	}
+	
+	if ('sc)||('strStatus){
+		trollback  
+		write !,"********* Rolling back *********"
+	} else {
+		tcommit
+		write !,"Committed"
+	}
+	quit
+
+]]></Routine>
+</Export>

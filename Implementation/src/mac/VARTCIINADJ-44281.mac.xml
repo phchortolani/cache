@@ -1,0 +1,605 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARTCIINADJ" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARTCIINADJ
+#include %occInclude
+#include COMSYS
+#include INConst
+#include COMGridEdit31
+
+#define FORMFldINADJLineQuantity	 3
+
+ 	
+ 	
+   	
+SelectLines()
+ 	;CallBack('SelectLines^VARTCIINADJ')
+
+	;SelectLines(pYKEY)
+ 	;CallBack('SelectLines^VARTCIINADJ',document.WWW2.YVARTCIINADJP1.value)
+
+
+	/*
+	/* SQL da tela de Requisições aguardando expedição
+	/*
+	
+	"SELECT INReq.ID FROM INReq INNER JOIN INReqLine ON INReq.ReqNum = INReqLine.ReqNumber WHERE INReqLine.FromStockLocn = "_YLOCATION_" AND INReq.Status <> 8 AND INReq.Status <> 9 GROUP BY ReqNum")
+
+		do AddExternalFilter^COMViewFilter("INReqIssue","D"_$$$FldINReqStatus,1,$$$EnumCOMVIEWCOMPARATORNotEquals,$$$ANNO)
+
+		; should be based on Issue Status if it has one, atm its based on req status
+		do AddExternalFilter^COMViewFilter("INReqIssue","D"_$$$FldINReqStatus,7,$$$EnumCOMVIEWCOMPARATORNotEquals,$$$ANNO)
+		do AddExternalFilter^COMViewFilter("INReqIssue","D"_$$$FldINReqStatus,8,$$$EnumCOMVIEWCOMPARATORNotEquals,$$$ANNO)
+		do AddExternalFilter^COMViewFilter("INReqIssue","D"_$$$FldINReqStatus,9,$$$EnumCOMVIEWCOMPARATORNotEquals,$$$ANNO)
+
+	INReq.Status <> 8 - Encerrado pelo Usuário
+	INReq.Status <> 9 - Encerrado Automaticamente
+
+	INReqIssue.Status <> 1 - Aberto
+	INReqIssue.Status <> 7 - Ativo/Pendente
+	INReqIssue.Status <> 8 - Encerrado pelo Usuário
+	INReqIssue.Status <> 9 - Encerrado	
+	
+	
+	*/
+
+	do Initialise^COMViewCustom("INReq",,1)
+	;do AddFilter^COMViewCustom("D1","in",vStatusIn,,$$$YES)
+	do AddFilter^COMViewCustom("D1","'=",1,,$$$YES)		;1 - Aberto (Não processado)
+	do AddFilter^COMViewCustom("D1","'=",8,,$$$YES)		;8 - Encerrado pelo Usuário
+	do AddFilter^COMViewCustom("D1","'=",9,,$$$YES)		;9 - Encerrado Automaticamente
+	;do AddFilter^COMViewCustom("D4","=",YLOCATION)
+	do Start^COMViewCustom("WWW2.YINADJD30")
+ 	
+    quit
+ 	
+ 	
+
+OnAfterSaveVARHook(pYKEY,pYFELD)
+	;$$OnAfterSaveVARHook^VARTCIINADJ(YKEY,YFELD)
+
+	set strStatus = $$$OK
+	
+	;Só chama a rotina que popula a INADJLine se não existir
+	;nenhum registro já gravado nela para a mesma INADJ
+	if '$D(^INADJLine(YM,pYKEY)) {
+		set strStatus = $$InserirLinhasAjuste(pYKEY)	
+	}
+
+	quit strStatus
+ 	
+ 	
+InserirLinhasAjuste(pYKEY)
+	;$$InserirLinhasAjuste^VARTCIINADJ(YKEY)
+
+	if $G(YM) = "" {
+		do ^WWWVAR
+	}
+	
+	new objAdj,pNumReq,objReq,StatusReq,vLocalOrigem,idReqLine
+	new objReqLine,StatusReqLine,vProduto,vQtdeExpedida,vQtdeAprovada
+	new vQtdePendente,vQtdePendenteNeg,sEndereco,sQuantidade,sLote
+	new sValidade,vRazao,vUOM,vCustoMedio,TotalAux,vCustoTotal,objAdjLine
+	new TotalAjuste
+	
+	set strStatus = $$$OK
+	 
+	if (pYKEY=""){
+		quit strStatus
+	}
+	
+	set objAdj = $G(^INADJ(YM,pYKEY,1))
+	if objAdj="" {
+		quit strStatus
+	}
+	
+	set pNumReq = $piece(objAdj,Y,30)
+	if (pNumReq="") {
+		quit strStatus
+	}	
+	
+	set objReq = $G(^INReq(YM,pNumReq,1))
+	if objReq = ""{
+		quit strStatus
+	}
+	set StatusReq    = $piece(objReq,Y,1) 
+	set vLocalOrigem = $piece(objReq,Y,4) 
+
+	;1 - Aberto (Não processado)
+	;8 - Encerrado pelo Usuário
+	;9 - Encerrado Automaticamente
+	
+	if (StatusReq = 1) || (StatusReq = 8) || (StatusReq = 9) {
+		quit strStatus
+	}
+	
+	set TotalAjuste = 0
+	set idReqLine = ""
+	for {
+		set idReqLine = $order(^INReqLine(YM,pNumReq,idReqLine))
+		quit:idReqLine=""
+		
+		if $$$ISERR(strStatus){
+			quit	;quit for
+		}
+		
+		set objReqLine = $get(^INReqLine(YM,pNumReq,idReqLine,1))
+		continue:objReqLine=""
+		
+		set StatusReqLine = $piece(objReqLine,Y,10)
+		;2 - Confirmado 
+		;7 - Ativo/Pendente
+		if (StatusReqLine'=2)&&(StatusReqLine'=7){
+			continue
+		}
+		
+		set vProduto    = $piece(objReqLine,Y,1)
+		
+		set sEndereco   = ""
+		set sQuantidade = ""
+		set sLote       = ""
+		set sValidade   = ""
+				
+		;Verifica se tem quantidade em estoque vencida
+		&sql(SELECT alSOH.dBundleStock.Storage->Code,
+		 		+alSOH.dBundleStock.QtyOnHand,
+		 		alSOH.dBundleStock.Bundle->LotNumber,
+		 		alSOH.dBundleStock.Bundle->UseByDate
+		     INTO :sEndereco,:sQuantidade,:sLote,:sValidade
+		     FROM alSOH.dBundleStock
+		     WHERE alSOH.dBundleStock.Item = :vProduto
+               AND alSOH.dBundleStock.Storage->Location = :vLocalOrigem
+               AND alSOH.dBundleStock.Bundle->UseByDate < CURRENT_DATE
+               AND ((Storage->StorageIsBlocked = 0) OR (Storage->StorageIsBlocked is null))
+               AND ((Storage->Physical->StorageIsBlocked = 0) OR (Storage->Physical->StorageIsBlocked is null))
+		    )
+		
+		if (SQLCODE '= 0) {
+			continue
+		}
+		
+		if (sEndereco = "") || (sQuantidade="") || (sLote="") || (sValidade="") {
+			continue
+		}
+		
+		set vQtdeExpedida    = +$piece(objReqLine,Y,8)
+		set vQtdeAprovada    = $piece(objReqLine,Y,3)
+		set vQtdePendente    = vQtdeAprovada - vQtdeExpedida 
+		
+		;Se QtdePendente for MAIOR que a QtdeDisponivel em estoque
+		;usa a Qtde Disponível em Estoque
+		if vQtdePendente > sQuantidade {
+			set vQtdePendente = sQuantidade
+		}
+		
+		;Multiplica por -1 para ficar negativo,
+		;isso indica uma saída do estoque
+		set vQtdePendenteNeg = (vQtdePendente * -1)
+		
+		
+		;Se possuir quantidade em estoque vencida insere linha na INADJLine
+	
+		set vRazao      = 0	;Consumo de Produto Vencido
+		set vUOM        = $$LoadUnitOfMeasureList^INARTUtilities(vProduto)
+		set vCustoMedio = $$GetCost^INARTKOST(vProduto)
+		set TotalAux    = (vQtdePendenteNeg * vCustoMedio)
+		;Arredondando para 2 casas, a função WWWTR não funcionou corretamente
+		set vCustoTotal = $justify(TotalAux,0,2)
+		set TotalAjuste = TotalAjuste + vCustoTotal
+		
+		;Achei melhor usar a mesma linha da Requisição
+		;set idAdjLine  = $$^WWWNEXT1("INADJLine",pYKEY,2)
+		
+		set objAdjLine = ""
+		set $$$INADJLineItem(objAdjLine)                = vProduto
+		set $$$INADJLineStockLocation(objAdjLine)       = sEndereco
+		
+		;FREE1 -  Qtde à Entregar
+		;as Demais Quantidades precisa multiplicar por -1 para
+		;ficar negativo, isso indica uma saída do estoque
+		;vvvv
+		set $piece(objAdjLine,Y,9)                      = vQtdePendente
+		set $$$INADJLineBaseQuantity(objAdjLine)        = vQtdePendente*-1
+		set $$$INADJLineQuantity(objAdjLine)            = vQtdePendente*-1
+
+		set $$$INADJLineUnit(objAdjLine)                = vUOM
+		set $$$INADJLineReasonCode(objAdjLine)          = vRazao
+		set $$$INADJLineUnitCost(objAdjLine)            = vCustoMedio
+		set $$$INADJLineTotalCost(objAdjLine)           = vCustoTotal
+		set $$$INADJLineLotNumber(objAdjLine)           = sLote
+		set $$$INADJLineExpirationDate(objAdjLine)      = sValidade
+		
+		
+		
+		set strStatus = $$OnBeforeSave^INADJLine(YM,"INADJLine",pYKEY_","_idReqLine,objAdjLine,$$$YES)
+		if $$$ISOK(strStatus) {
+			set strStatus = $$$Save("INADJLine",pYKEY_","_idReqLine,objAdjLine,$$$YES)
+		}
+				
+	
+	}
+	
+	
+	if ($$$ISOK(strStatus)) && (TotalAjuste '= 0) {
+		set $$$INADJTotalCost(objAdj) = TotalAjuste
+		set strStatus = $$$Save("INADJ",pYKEY,objAdj,1)
+	}
+	
+	
+	quit strStatus
+ 	
+
+ 	
+ 	
+OnBlurQtdeSeparada(pYKEY,pidClassField,&pobjLine)
+	;do OnBlurQtdeSeparada^VARTCIINADJ(YKEY,YLFN,.YFELD)
+	
+	if $$$KEY1(pYKEY) = "" {
+		quit
+	}
+
+	if $$$KEY2(pYKEY) = "" {
+		quit
+	}
+	
+	
+	set idItem = $$$INADJLineItem(pobjLine)
+	
+	if pidClassField = 9 {	;9 = FREE1 - Qtde Separada
+	
+		if idItem="" {
+			set qtdeSeparada = 0
+		} else {
+			set qtdeSeparada = $piece(pobjLine,Y,9)
+		}
+		
+		
+		;Verifica se a qtdeSeparada é negativa
+		if qtdeSeparada < 0 {
+			set strMessage = "Quantidade Separada não pode ser negativa."
+			set $piece(pobjLine,Y,9) = 0
+			
+			set $$$INADJLineQuantity(pobjLine)      = 0
+			set $$$INADJLineBaseQuantity(pobjLine)	= 0
+			set $$$INADJLineTotalCost(pobjLine) 	= 0
+			
+			&js<
+				alert("<%=strMessage%>");
+			>
+			quit
+		}
+		
+		;Busca QtdePendente no Item da Requisição (INReqLine)
+		set objAdj = $G(^INADJ(YM,$$$KEY1(pYKEY),1))
+		quit:objAdj=""
+
+		set pNumReq = $piece(objAdj,Y,30)
+		quit:pNumReq=""
+		
+		set idAdjLine = $$$KEY2(pYKEY)
+		
+		set objReqLine = $get(^INReqLine(YM,pNumReq,idAdjLine,1))
+		quit:objReqLine=""
+		set vQtdeExpedida = +$piece(objReqLine,Y,8)
+		set vQtdeAprovada = $piece(objReqLine,Y,3)
+		set vQtdePendente = vQtdeAprovada - vQtdeExpedida
+		
+		;Verifica se a Qtde Separada é maior que a Qtde Pendente da Requisição
+		if (qtdeSeparada > vQtdePendente) {
+			set DescUnidade = $$SQLGetSiglaUnit^VARTCISQL($$$INADJLineUnit(pobjLine))_"-"_$$SQLGetDescUnit^VARTCISQL($$$INADJLineUnit(pobjLine))
+			set strMessage = "O produto "_idItem_" possui apenas "_vQtdePendente_" ("_DescUnidade_") restantes para atender na requisição Núm. "_pNumReq_".\n"_"Informe uma quantidade menor ou igual a "_vQtdePendente_"."
+			set $piece(pobjLine,Y,9) = 0
+			
+			set $$$INADJLineQuantity(pobjLine)      = 0
+			set $$$INADJLineBaseQuantity(pobjLine)	= 0
+			set $$$INADJLineTotalCost(pobjLine) 	= 0
+			
+			&js<
+				alert("<%=strMessage%>");
+			>
+			quit
+		}
+		
+		
+		set sQuantidadeOnHand = 0
+		set vLocalOrigem      = $$$INADJSiteLocation(objAdj)
+		
+		;Verifica se a Qtde Separada é MAIOR que a Qtde Disponível
+		&sql(SELECT +alSOH.dBundleStock.QtyOnHand
+		     INTO :sQuantidadeOnHand
+		     FROM alSOH.dBundleStock
+		     WHERE alSOH.dBundleStock.Item = :idItem
+               AND alSOH.dBundleStock.Storage->Location = :vLocalOrigem
+               AND alSOH.dBundleStock.Bundle->UseByDate < CURRENT_DATE
+               AND ((Storage->StorageIsBlocked = 0) OR (Storage->StorageIsBlocked is null))
+               AND ((Storage->Physical->StorageIsBlocked = 0) OR (Storage->Physical->StorageIsBlocked is null))               
+               AND +alSOH.dBundleStock.QtyOnHand > 0
+		    )
+		    
+		if (SQLCODE '= 0) {
+			set strMessage = "Erro na consulta: "_$SYSTEM.SQL.SQLCODE(SQLCODE)	
+			&js<
+				alert("<%=strMessage%>");
+			>
+			quit		
+		}
+		    
+		if (qtdeSeparada > sQuantidadeOnHand) {
+			set DescUnidade = $$SQLGetSiglaUnit^VARTCISQL($$$INADJLineUnit(pobjLine))_"-"_$$SQLGetDescUnit^VARTCISQL($$$INADJLineUnit(pobjLine))
+			set strMessage = "O produto "_idItem_" possui apenas "_sQuantidadeOnHand_" ("_DescUnidade_") disponíveis para esse Endereço/Lote/Validade.\n"_"Informe uma quantidade menor ou igual a "_sQuantidadeOnHand_"."
+			set $piece(pobjLine,Y,9) = 0
+			
+			set $$$INADJLineQuantity(pobjLine)      = 0
+			set $$$INADJLineBaseQuantity(pobjLine)	= 0
+			set $$$INADJLineTotalCost(pobjLine) 	= 0
+			
+			&js<
+				alert("<%=strMessage%>");
+			>
+			quit
+
+		}
+		
+		
+		;Multiplica por -1 para ficar negativo,
+		;isso indica uma saída do estoque
+		set $$$INADJLineQuantity(pobjLine) = (qtdeSeparada * -1)
+		
+		do AddReference^COMGridEdit31Interface($$$FldINADJLineQuantity)
+		do ScreenUpdateStyle^COMGridEdit31S("pY"_GROW_"_"_$$$FORMFldINADJLineQuantity)   ; F3
+		
+		set curUnit = $$$INADJLineUnitCost(pobjLine)
+		set idUnit  = $$$INADJLineUnit(pobjLine)
+		// Update base qty and total cost
+		set fltQuantity = $$CalculateBaseQuantity^INUOMConversion(idItem,idUnit,$$$INADJLineQuantity(pobjLine))
+		set $$$INADJLineBaseQuantity(pobjLine)	= fltQuantity
+		set $$$INADJLineTotalCost(pobjLine) 	= $$GetCost^INARTKOST(idItem,fltQuantity)
+		
+		
+	}
+	
+	
+	quit
+ 	
+
+	
+OnBeforeSaveVARHook(pYKEY,pYFELD,pYFELDOLD)
+	;$$OnBeforeSaveVARHook^VARTCIINADJ(YKEY,YFELD,YFELDOLD)
+	set strStatus = $$$OK
+	
+	;set ^zzPetik(pYKEY,"old") = "YFELD OLD = "_pYFELDOLD
+	;set ^zzPetik(pYKEY,"new") = "YFELD = "_pYFELD
+
+	;Só chama se o campo ProcessadoEm estava em branco e foi preenchido
+	if ($$$INADJProcessedDate(pYFELDOLD) = "") && ( $$$INADJProcessedDate(pYFELDOLD) '= $$$INADJProcessedDate(pYFELD) ) {
+		set strStatus = $$AfterProcessINADJVARHook(pYKEY,pYFELD)
+	}
+
+	quit strStatus
+	
+	
+	
+AfterProcessINADJVARHook(pYKEY,pYFELD)
+	;$$AfterProcessINADJVARHook^VARTCIINADJ(YKEY)
+	
+	;set ^zzPetik(pYKEY,"AfterProcess") = "Entrou"
+	
+	if $G(YM) = ""{
+		do ^WWWVAR
+	}
+	
+	set strStatus = $$$OK
+	 
+	if (pYKEY=""){
+		;set ^zzPetik(pYKEY,"pYKEY") = pYKEY
+		quit strStatus
+	}
+
+	;Se o registro não estiver processado sai, pois é um Save normal.
+	set ProcessadoEm = $$$INADJProcessedDate(pYFELD)
+	if ProcessadoEm = "" {
+		;set ^zzPetik(pYKEY,"ProcessadoEm") = ProcessadoEm
+		quit strStatus
+	}
+	
+	set pNumAdj = pYKEY
+	set objAdj = $G(^INADJ(YM,pNumAdj,1))
+	if objAdj="" {
+		;set ^zzPetik(pYKEY,"objAdj") = objAdj
+		quit strStatus
+	}
+	
+	
+	set pNumReq = $piece(objAdj,Y,30)
+	if (pNumReq="") {
+		;set ^zzPetik(pYKEY,"pNumReq") = pNumReq
+		quit strStatus
+	}	
+	
+	set objReq = $G(^INReq(YM,pNumReq,1))
+	if objReq = ""{
+		;set ^zzPetik(pYKEY,"objReq") = objReq
+		quit strStatus
+	}
+	set objReqOld = objReq
+	
+	set StatusReq    = $piece(objReq,Y,1) 
+	set vLocalOrigem = $piece(objReq,Y,4) 
+
+	;1 - Aberto (Não processado)
+	;8 - Encerrado pelo Usuário
+	;9 - Encerrado Automaticamente
+	
+	if (StatusReq = 1) || (StatusReq = 8) || (StatusReq = 9) {
+		;set ^zzPetik(pYKEY,"StatusReq") = StatusReq
+		quit strStatus
+	}
+	
+	;Para cada linha do Ajuste altera quantidades
+	;e status da INReqLine correspondente
+	;vvvvv
+	set idAdjLine = ""
+	for {
+		set idAdjLine = $order(^INADJLine(YM,pNumAdj,idAdjLine))
+		quit:idAdjLine=""
+		
+		if $$$ISERR(strStatus){
+			;set ^zzPetik(pYKEY,"strStatus for idAdjLine") = strStatus
+			quit	;quit for
+		}
+
+		set idReqLine = idAdjLine
+		
+		set objAdjLine = $get(^INADJLine(YM,pNumAdj,idAdjLine,1))
+		continue:objAdjLine=""
+		
+		set QtdeSeparada = $piece(objAdjLine,Y,9)
+		
+		;Usei o mesmo item da INReqLine quando criei a INADJLine
+		set objReqLine = $get(^INReqLine(YM,pNumReq,idReqLine,1))
+		continue:objReqLine=""
+		
+		set objReqLineOld = objReqLine
+
+		set StatusReqLine = $piece(objReqLine,Y,10) 
+		;2 - Confirmado 
+		;7 - Ativo/Pendente
+		
+		;Altera as quantidades da INReqLine
+		set $$$INReqLineQtyIssued(objReqLine)   = $$$INReqLineQtyIssued(objReqLine) + QtdeSeparada
+		set $$$INReqLineQtyReceived(objReqLine) = $$$INReqLineQtyReceived(objReqLine) + QtdeSeparada
+		
+ 		;Altera Status da INReqLine
+		if ( $$$INReqLineQtyRequired(objReqLine) > $$$INReqLineQtyIssued(objReqLine) ) {
+			set NovoStatus = 7	;7 - Ativo/Pendente
+		}
+		else{
+			set NovoStatus = 9 	;9 - Encerrado
+		}
+		
+		set $$$INReqLineStatus(objReqLine) = NovoStatus
+
+		set strStatus = $$OnBeforeSave^INReqLine(pNumReq_","_idReqLine,.objReqLine)
+		if $$$ISOK(strStatus) {
+			set strStatus = $$$Save("INReqLine",pNumReq_","_idReqLine,objReqLine,$$$YES)
+			;W !, "Alterado INReqLine - Status "_strStatus
+			;W !, "de  : "_objReqLineOld
+			;W !, "para: "_objReqLine
+		}
+		else{
+			;set ^zzPetik(pYKEY,"strStatus OnBeforeSave^INReqLine") = strStatus
+			
+			quit	;quit for
+		}
+		
+	
+	}
+	
+	if $$$ISOK(strStatus) {
+	
+		;Após ajustar as quantidades e status da INReqLine
+		;verifica se o status de todas elas é igual a 9 - Encerrado
+		;altera o status da InReq para 9 - Encerrado Automaticamente
+		set PodeEncerrarRequisicao = $$$NO
+		set idReqLine = ""
+		for {
+			set idReqLine = $order(^INReqLine(YM,pNumReq,idReqLine))
+			quit:idReqLine=""
+		
+			set objReqLine = $get(^INReqLine(YM,pNumReq,idReqLine,1))
+			continue:objReqLine=""
+		
+			if $$$INReqLineStatus(objReqLine) = 9 {	;9 - Encerrado
+				set PodeEncerrarRequisicao = $$$YES
+			}
+			else{
+				set PodeEncerrarRequisicao = $$$NO
+				;Se achou algum cai fora do for
+				quit	;quit for
+			}
+	
+		}
+	
+		if (PodeEncerrarRequisicao) {
+			set $$$INReqStatus(objReq) = 9	;9 - Encerrado Automaticamente
+	
+			set strStatus = $$$Save("INReq",pNumReq,objReq,$$$YES)
+			;W !, "Alterado INReq - Status "_strStatus
+			;W !, "de  : "_objReqOld
+			;W !, "para: "_objReq
+	
+	
+		}
+	
+	}
+	
+
+	quit strStatus
+	
+	
+CanViewReportComprovante(pYKEY)
+	if pYKEY="" {
+		quit
+	}
+	
+	set objAdj = $get(^INADJ(0,pYKEY,1))
+	
+	set vStatus = $piece(objAdj,Y,9)
+	
+	if vStatus '= 1 {
+		new strStatus
+	    set strStatus = "Não é possível gerar Comprovante de Entrega."	
+	    $$$YQHandler(strStatus)
+	
+	}
+	quit 
+	
+	
+AjusteNaoProcessado(pRequisicao)
+	;$$AjusteNaoProcessado^VARTCIINADJ(pRequisicao)
+	
+	if (pRequisicao = "") {
+		quit 0
+	} 
+	
+	new NumAdj
+	set NumAdj = 0
+	
+	&sql(SELECT TOP 1 NVL(StockAdjustmentNumber,0)
+		 INTO :NumAdj
+		 FROM INADJ
+		 WHERE FREE20 = :pRequisicao
+		 AND Status = 0
+		)
+		
+	if (SQLCODE '= 0) {
+		quit ""
+	}		
+
+	quit NumAdj	
+
+	
+OnBlurRequisicao(pYINHALT,&pYFELD)
+	;do OnBlurRequisicao^VARTCIINADJ(YINHALT,.YFELD)
+
+	;Verifica se já existe um ajuste NÃO PROCESSADO para a mesma
+	;requisição, se existir redireciona para o Ajuste existente
+	
+	if (pYINHALT = "") {
+		quit
+	}
+	
+	set NumAjuste = $$AjusteNaoProcessado(pYINHALT)
+	if (NumAjuste '= 0) {
+	    SET strMessage = "Já existe uma Expedição criada e não processada para essa Requisição.\nVocê será redirecionado para ela."
+		&js<
+			alert("<%=strMessage%>");
+		>
+		set pYFELD = ""
+		do GoToForm^COMUtilForm("INADJ",NumAjuste)
+					
+	}
+
+	quit	
+]]></Routine>
+</Export>

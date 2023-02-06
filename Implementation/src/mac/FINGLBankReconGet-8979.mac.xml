@@ -1,0 +1,425 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLBankReconGet" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLBankReconGet
+ 
+#include FINConst
+#include COMSYS
+#include FINSYS
+ 
+GetOpeningBalance(pidBankRecon,pobjBankRecon="")
+	; ---------------------------------------------------------------------------
+	;
+	; History
+	; 27-Oct-2005	JW		SR13754: Test self-match
+	; 25-Oct-2005	JW&SS	SR13216: Index by dtePosted, don't rely on order of BankRecon ids
+	; 28-Jan-2005	JW		Index account number
+	; 09-Jun-2004	shobby	Moved from FINGLBankRecon
+	; 24-Mar-2003	shobby	Used more meaningful variable name 'objBankRecon'
+	; ---------------------------------------------------------------------------
+	new fltBalance,idAccount,idBankRecon,objBankRecon,dtePosted
+	
+	set fltBalance=0
+	if $get(pidBankRecon)'="" && $data(^FINGLBankRecon(YM,pidBankRecon,1)) {
+		set objBankRecon=$get(^FINGLBankRecon(YM,pidBankRecon,1))
+		
+	} else {
+		set objBankRecon = pobjBankRecon
+	}
+	set idAccount=$$$FINGLBankReconBankAccount(objBankRecon)
+	set idAccount = $$Index^COMUtils(idAccount)
+	if idAccount'="" {
+		
+		set dtePosted = $order(^FINGLBankRecons(YM,2,idAccount,""),-1)
+		
+		if dtePosted'="" {
+			set idBankRecon = $order(^FINGLBankRecons(YM,2,idAccount,dtePosted,""))
+			
+			if idBankRecon'=$get(pidBankRecon) {				//SR13754
+				set objBankRecon=$get(^FINGLBankRecon(YM,idBankRecon,1))
+				set fltBalance=$$$FINGLBankReconClosingBalance(objBankRecon)
+			}
+		}
+	}
+ 
+	quit fltBalance
+	
+ 
+GetTotalDeposits(pidBankRecon)
+	;------------------------------------------------------------------------------
+	;
+	; History
+	; 20-Sep-2005	JW			SR13309: Split into 3 functions
+	; 09-Jun-2004	shobby		Moved from FINGLBankRecon
+	; 18-Jun-2003	shobby		Defined a variable
+	; -----------------------------------------------------------------------------
+	
+	quit $$GetCleared(pidBankRecon) +
+		$$GetChargesInterest(pidBankRecon) +
+		$$GetPreCleared(pidBankRecon)
+	
+ 
+GetTotalWithdrawals(pidBankRecon)
+	;------------------------------------------------------------------------------
+	;
+	; History
+	; 20-Sep-2005	JW			SR13309: Split into 3 functions
+	; 09-Jun-2004	shobby		Moved from FINGLBankRecon
+	; 18-Jun-2003	shobby		Defined a variable
+	; -----------------------------------------------------------------------------
+	
+	quit $$GetCleared(pidBankRecon,$$$NO) + 
+		$$GetChargesInterest(pidBankRecon,$$$NO) +
+		$$GetPreCleared(pidBankRecon,$$$NO)
+ 
+GetCleared(pidBankRecon,pblnDeposits=$$$YES)
+    ;-------------------------------------------------------------------------------
+    ; Get Cleared Deposits or Withdrawals
+    ;
+    ; Params:
+    ; pidBankRecon: The id of the bank reconciliation record
+    ; pblnDeposits: Whether to show deposits or withdrawls.
+    ;
+    ; Returns: The cleared amounts
+    ;
+    ; History:
+    ; 07-Mar-2006	Steve S	SR14126: Don't sum if cleared with a Pre Clear entry
+    ; 16-Feb-2006	RPW		SR13675: Rewrote to use FINGLBankReconMatched.
+    ; 05-Dec-2005	RPW		SR13813: Created
+    ;-------------------------------------------------------------------------------
+	new curDeposits,idField,idLine,objBankReconMatched
+	
+	set curDeposits=0
+	set idField = $select(pblnDeposits:$$$FldFINGLBankReconMatchedDeposit,1:$$$FldFINGLBankReconMatchedWithdrawal)
+	
+	set idLine=""
+	for {
+		set idLine=$order(^FINGLBankReconMatcheds(YM,1,$$$YES,pidBankRecon,idLine))
+		quit:idLine=""
+		
+		set objBankReconMatched=$get(^FINGLBankReconMatched(YM,pidBankRecon,idLine,1))
+		
+		set curDeposits=curDeposits+$piece(objBankReconMatched,Y,idField)
+	}
+	
+	quit curDeposits
+ 
+GetChargesInterest(pidBankRecon,pblnDeposits=$$$YES) 
+    ;-------------------------------------------------------------------------------
+    ; Get Charges or Interest
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 20-Sep-2005	JW		SR13309: Created
+    ;-------------------------------------------------------------------------------
+	new curDeposits,idBankReconLine,objBankReconLine,idField
+	
+	set curDeposits=0
+	set idField = $select(pblnDeposits:$$$FldFINGLBankReconLineDebit,1:$$$FldFINGLBankReconLineCredit)
+	
+	set idBankReconLine=""
+	for {
+		set idBankReconLine=$order(^FINGLBankReconLine(YM,pidBankRecon,idBankReconLine))
+		quit:idBankReconLine=""
+		
+		set objBankReconLine=$get(^FINGLBankReconLine(YM,pidBankRecon,idBankReconLine,1))
+		set curDeposits=curDeposits+$piece(objBankReconLine,Y,idField)
+	}
+	quit curDeposits
+ 
+ 
+GetPreCleared(pidBankRecon,pblnDeposits=$$$YES) 
+    ;-------------------------------------------------------------------------------
+    ; Get Pre Cleared Deposits or Withdrawals
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 09-Mar-2006	RPW		SR13305: Cleaned up the checks so that only the correct entries
+    ; 						are used, ie blank and not cleared and created here and cleared.
+    ; 07-Mar-2006	Steve S	SR14126: GL Tran line check
+    ; 10-Feb-2006	RPW		SR14135: Show the precleared that are created here.
+    ; 20-Sep-2005	JW		SR13309: Created
+    ;-------------------------------------------------------------------------------
+	new curAmount,idPreCleared,objPreCleared,idField,idCleared,idRecon,blnCleared
+	
+	set idField = $select(pblnDeposits:$$$FldFINGLBankReconPreClearedDebit,1:$$$FldFINGLBankReconPreClearedCredit)
+	set curAmount=0
+	
+	set idPreCleared=""
+	for {
+		set idPreCleared=$order(^FINGLBankReconPreCleared(YM,pidBankRecon,idPreCleared))
+		quit:idPreCleared=""
+		
+		set objPreCleared=$get(^FINGLBankReconPreCleared(YM,pidBankRecon,idPreCleared,1)) // SR13305
+		set idCleared=$$$FINGLBankReconPreClearedReverse(objPreCleared) // SR13305
+		set idRecon=$$$KEY1(idCleared) // SR13305
+		set blnCleared=''$$$FINGLBankReconPreClearedCleared(objPreCleared) // SR13305
+		
+		if ((idCleared="")&&('blnCleared))||((idRecon=pidBankRecon)&&(blnCleared)) { // SR13305
+			set curAmount=curAmount+$piece(objPreCleared,Y,idField)
+		}
+	}
+	quit curAmount
+ 
+ 
+GetUnallocated(pidBankRecon)
+	; ------------------------------------------------------------------------------
+	;
+	; History
+	; 09-Jun-2004	shobby	Moved from FINGLBankRecon
+	; 
+	; ------------------------------------------------------------------------------
+	new curUnallocated,objBankRecon
+ 	
+	set curUnallocated=0
+	if $get(pidBankRecon)'="" {
+		if $data(^FINGLBankRecon(YM,pidBankRecon,1)) {
+			set objBankRecon=$get(^FINGLBankRecon(YM,pidBankRecon,1))
+			set curUnallocated=curUnallocated-$$$FINGLBankReconClosingBalance(objBankRecon)
+			set curUnallocated=curUnallocated+$$$FINGLBankReconOpeningBalance(objBankRecon)		//$$GetOpeningBalance(pidBankRecon)
+			set curUnallocated=curUnallocated+$$GetTotalDeposits(pidBankRecon)
+			set curUnallocated=curUnallocated-$$GetTotalWithdrawals(pidBankRecon)
+		}
+	}
+	quit curUnallocated
+ 
+GetWithdrawal(pidBankRecon,pidTran,pidTranLine) 
+    ;-------------------------------------------------------------------------------
+    ; Get the current withdrawal for this transaction line
+    ;
+    ; Params:
+    ; pidBankRecon: The id of the Banking Reconciliation record
+    ; pidTran     : The id of the Transaction
+    ; pidTranLine : The id of the Transaction Line
+    ;
+    ; Returns:
+    ; curWithdrawal: The amount of the withdrawal
+    ; 
+    ; History:
+    ; 13-Sep-2005	RobertW		SR13306: Created
+    ;-------------------------------------------------------------------------------
+	new curWithdrawal,objTranLine
+ 	
+	set curWithdrawal=0
+	
+	quit:($get(pidBankRecon)="")||($get(pidTran)="")||($get(pidTranLine)="") curWithdrawal
+	
+	set objTranLine=$get(^FINGLTranLine(YM,pidTran,pidTranLine,1))
+	if objTranLine'="" {
+		set curWithdrawal=$$$FINGLTranLineCredit(objTranLine)
+	}
+	
+	quit curWithdrawal		
+ 
+ 
+GetDeposit(pidBankRecon,pidTran,pidTranLine) 
+    ;-------------------------------------------------------------------------------
+    ; Get the current deposit for this transaction line
+    ;
+    ; Params:
+    ; pidBankRecon: The id of the Banking Reconciliation record
+    ; pidTran     : The id of the Transaction
+    ; pidTranLine : The id of the Transaction Line
+    ; 
+    ; Returns:
+    ; curDeposit: The amount of the deposit
+    ;
+    ; History:
+    ; 13-Sep-2005	RobertW		SR13306: Created
+    ;-------------------------------------------------------------------------------
+ 	new curDeposit,objTranLine
+ 	
+	set curDeposit=0
+	
+	quit:($get(pidBankRecon)="")||($get(pidTran)="")||($get(pidTranLine)="") curDeposit
+	
+	set objTranLine=$get(^FINGLTranLine(YM,pidTran,pidTranLine,1))
+	if objTranLine'="" {
+		set curDeposit=$$$FINGLTranLineDebit(objTranLine)
+	}
+	
+	quit curDeposit		
+ 
+GetUnallocatedFast(pidBankRecon) 
+    ;-------------------------------------------------------------------------------
+    ; Get the unallocated amount
+    ;
+    ; Params:
+    ; pidBankRecon: The id of the Banking Reconciliation record
+    ; 
+    ; Returns:
+    ; curUnallocated: The amount unallocated
+    ;
+    ; History:
+    ; 13-Sep-2005	RobertW		SR13306: Created
+    ;-------------------------------------------------------------------------------
+ 
+	new curUnallocated,objBankRecon
+ 
+	set curUnallocated=0
+	if pidBankRecon'="" {
+		if $data(^FINGLBankRecon(YM,pidBankRecon,1)) {
+			set objBankRecon=$get(^FINGLBankRecon(YM,pidBankRecon,1))
+			set curUnallocated=curUnallocated-$$$FINGLBankReconClosingBalance(objBankRecon)
+			set curUnallocated=curUnallocated+$get(^CacheTempBankRecon(YUSER,"OB"))
+			set curUnallocated=curUnallocated+$get(^CacheTempBankRecon(YUSER,"TD"))
+			set curUnallocated=curUnallocated-$get(^CacheTempBankRecon(YUSER,"TW"))
+		}
+	}
+	quit curUnallocated
+	
+	
+GetOpenDate(pYFELD="")
+    ;-------------------------------------------------------------------------------
+    ; Get the opening date of a bank recon.
+    ;
+    ; Returns: date
+    ;
+    ; History:
+    ; 19-Sep-2005	Steve S		SR13308: Created
+    ;-------------------------------------------------------------------------------
+	new dteOpenDate,idBankAcc,idBankAccIdx,dteLastStatement
+ 
+	set dteOpenDate=""
+	
+	set idBankAcc=$$$FINGLBankReconBankAccount(pYFELD)
+	if (idBankAcc'="") {
+		set idBankAccIdx=$$$Index(idBankAcc)
+		if (idBankAccIdx'="") {
+			set dteLastStatement=$order(^FINGLBankRecons(YM,1,idBankAccIdx,""),-1)
+			if dteLastStatement'="" set dteOpenDate=dteLastStatement+1
+		}
+	}	
+ 
+	quit dteOpenDate
+	
+GetReconGLDate(pYFELD)
+	quit $$$FINGLBankReconClosingDate(pYFELD)
+	
+	
+	
+	
+	
+UpdateBalances(pidBankRecon,pcurWithdrawal,pcurDeposit,pblnClear,pblnHeader=$$$YES) 
+	;-------------------------------------------------------------------------------
+	; General Method to update the balances on the form.
+	;
+	; Params:
+	; pidBankRecon  : The id of the bank reconciliation record
+	; pcurWithdrawal: The sum of the withdrawals
+	; pcurDeposit   : The sum of the deposits
+	; pblnClear     : Whether we need to reverse the signs or not
+	; pblnHeader    : Whether we should update the header
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Jul-2010	shobby	SR17411: Reversed innerText change.
+	; 17-May-2010	shobby	SR17253: innerText replacement for firefox.
+	; 03-Mar-2006	RPW		SR13305: Created
+	;-------------------------------------------------------------------------------
+	
+	if pblnClear {
+		set pcurWithdrawal=-pcurWithdrawal
+		set pcurDeposit=-pcurDeposit
+	}
+		
+	set ^CacheTempBankRecon(YUSER,"TW")=$get(^CacheTempBankRecon(YUSER,"TW"))-pcurWithdrawal
+	set ^CacheTempBankRecon(YUSER,"TD")=$get(^CacheTempBankRecon(YUSER,"TD"))-pcurDeposit
+	set ^CacheTempBankRecon(YUSER,"UN")=$$GetUnallocatedFast(pidBankRecon) ; SR13306
+	
+	if pblnHeader {
+		write "document.all.td102.innerText='"_$$FormatCurrency^COMTable($get(^CacheTempBankRecon(YUSER,"TD")))_"';"
+		write "document.all.td103.innerText='"_$$FormatCurrency^COMTable($get(^CacheTempBankRecon(YUSER,"TW")))_"';"
+		write "document.all.td105.innerText='"_$$FormatCurrency^COMTable($get(^CacheTempBankRecon(YUSER,"UN")))_"';"
+	}
+	
+	quit
+	
+SetDifference(pidBankRecon,pstrGrid,pintRow,&pstrYFELD,pfldDeposit,pfldWithdrawal)
+	;-------------------------------------------------------------------------------
+	; This is used when there are deposit/withdrawal fields on the grid and one clears
+	; the other. We need to remember the previous amounts.
+	; 
+	; ie. W=50, then change D to 60, clear the W
+	; W=50, then change W to 40,  remove the 10 difference
+	;
+	; Params:
+	; pidBankRecon  : The id of the bank reconciliation record
+	; pstrGrid      : either Pre Cleared or GL Adj.
+	; pintRow       : The grid row that was changed
+	; pstrYFELD     : The YFELD of the changed grid row
+	; pfldDeposit   : The deposit field (according to the form)
+	; pfldWithdrawal: The withdrawal field (according to the form)
+	;
+	; ByRefs:
+	; pstrYFELD : Allow edits to get back to the screen.
+	;
+	; Returns:
+	;
+	; History:
+	; 06-Mar-2006	RPW		SR13305: Created
+	;-------------------------------------------------------------------------------
+ 
+	new curPrevDeposit,curPrevWithdrawal,curDeposit,curWithdrawal,curDepositDif,curWithdrawalDif
+	new blnIsZeroDeposit,blnIsZeroWithdrawal
+ 
+	set curPrevDeposit=+$get(^CacheTempBankReconCD(YUSER,pstrGrid,pintRow,pfldDeposit))
+	set curPrevWithdrawal=+$get(^CacheTempBankReconCD(YUSER,pstrGrid,pintRow,pfldWithdrawal))
+	
+	set curDeposit=$piece(pstrYFELD,Y,pfldDeposit)
+	set curWithdrawal=$piece(pstrYFELD,Y,pfldWithdrawal)
+	
+	set blnIsZeroDeposit=curDeposit=""
+	set curDeposit=+curDeposit
+	
+	set blnIsZeroWithdrawal=curWithdrawal=""
+	set curWithdrawal=+curWithdrawal
+ 
+	set curDepositDif=0
+	set curWithdrawalDif=0
+	
+	if (curPrevDeposit=0)&&(curDeposit'=0) {
+		set $piece(pstrYFELD,Y,pfldWithdrawal)=""
+		set curWithdrawal=""
+		set curDepositDif=curDeposit
+		set curWithdrawalDif=-curPrevWithdrawal
+	} elseif(curPrevWithdrawal=0)&&(curWithdrawal'=0) {
+		set $piece(pstrYFELD,Y,pfldDeposit)=""
+		set curDeposit=""
+		set curWithdrawalDif=curWithdrawal
+		set curDepositDif=-curPrevDeposit
+	} elseif (curPrevDeposit'=0)&&((curDeposit'=0)||(blnIsZeroDeposit)) {
+		set curDepositDif=curDeposit-curPrevDeposit
+	} elseif (curPrevWithdrawal'=0)&&((curWithdrawal'=0)||(blnIsZeroWithdrawal)) {
+		set curWithdrawalDif=curWithdrawal-curPrevWithdrawal
+	}
+	
+	set ^CacheTempBankReconCD(YUSER,pstrGrid,pintRow,pfldDeposit)=curDeposit
+	set ^CacheTempBankReconCD(YUSER,pstrGrid,pintRow,pfldWithdrawal)=curWithdrawal
+	
+	do UpdateBalances(pidBankRecon,curWithdrawalDif,curDepositDif,$$$YES)
+	
+	quit
+	
+RemoveDifference(pidBankRecon,pstrGrid,pintRow,&pstrYFELD,pfldDeposit,pfldWithdrawal)
+	new curDeposit,curWithdrawal
+	
+	set curDeposit=$$$FINGLBankReconLineDebit(pstrYFELD)
+	set curWithdrawal=$$$FINGLBankReconLineCredit(pstrYFELD)
+	
+	do UpdateBalances(pidBankRecon,curWithdrawal,curDeposit,$$$NO)
+	
+	kill ^CacheTempBankReconCD(YUSER,pstrGrid,pintRow)
+	
+	quit
+]]></Routine>
+</Export>

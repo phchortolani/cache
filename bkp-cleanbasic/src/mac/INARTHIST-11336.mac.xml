@@ -1,0 +1,995 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INARTHIST" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INARTHIST(ARTIKEL="",TEXT="",BETRIEB="",PLUS="",MINUS="",MOVE="",LIEFKUN,BETRAG="",LAGER="",INVENTUR,LAGERALT="",AUF,POS,BETRALT="",NOPOST=0,TRANTYPE,OBERTEIL="",FIBUREF="",Reason="",DISPATCH="",pAudit="",pstrSourceForm="",pidSourceId="")
+#include COMSYS
+#include INConst
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^INARTHIST("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	;***************************************
+	; DEPRECATED ROUTINES - still called in a few places
+	; INFINInterface replaces
+	;***************************************
+	
+	
+	;------------------------------------------------------------------------------
+	; Description of Function :
+	;		ARTIKELHISTORY   /   Item History
+	;      EINSPRUNG AUCH AUS INTAGES OHNE TEXT (NEUANLAGE)
+	;	    RE-ENTRY POINT ALSO FROM INTAGES WITHOUT TEXT (NEW INSTALLATION)
+	;
+	; Inputs : 
+	;   1 ARTIKEL  = ITEM
+	;   2 TEXT     = INFORMATION TEXT  (May contain quantity)
+	;   3 BETRIEB  = LOCATION                         TO Site Location		<<<<  3
+	;   4 PLUS     = INCREASE                         Quantity
+	;   5 MINUS    = DECREASE                         Quantity
+	;   6 MOVE     = RELOCATION                       Quantity
+	;   7 LIEFKUN  = LIEFERANT/KUNDE (WE/VERSAND)     Supplier/Customer
+	;   8 BETRAG   = GESAMTBETRAG                     Amount
+	;   9 LAGER    = LAGERPLATZ                       TO Stock Location		<<<<  9
+	;   	May contain semicolon-delimited sub-fields, each specifying breakdown of the quantity by storage
+	;			idLocn | idStorage | (dteSource DEPRECATED) | fltQty
+	;  10 INVENTUR = MERKER FÜR INVENTUR              "Edited By Inventory"         to stocktaking 
+	;  11 LAGERALT = ALTER LAGERPLATZ                 FROM Stock Location	<<<< 11
+	;  12 AUF      = AUFTRAG                          Order Number
+	;  13 POS      = POS                              Order Line
+	;  14 BETRALT  =                                  FROM Site Location	<<<< 14
+	;  15 NOPOST   = KEINE BUCHUNG BEI HISTORY   	;next to 
+	;  16 TRANTYPE = TRANSACTION TYPE (ISS,REC,...)
+	;  17 OBERTEIL =                                  Parent Item
+	;  18 FIBUREF  = Finance Transaction Reference
+	;  19 Reason   = Reason Code for Adjustment
+	;  20 DISPATCH =                                  Populated by INWEAUF    		added to arg list SR12333
+	;  21 pAudit   = Audit string                	; added SR14203
+	;  22 pstrSourceForm                            ; added SRBR014754
+	;  23 pidSourceId                               ; added SRBR014754
+	;
+	; ------------------------------------------------------------		
+	;  NOTE : It appears that Arg 3/9 are the primary location and        <<<<<  READ THIS
+	;  14/11 the secondary so that the usage is ;                         <<<<<  READ THIS
+	;                                                                     <<<<<  READ THIS
+	;						3/9			   14/11                          <<<<<  READ THIS
+	;  		ISSUE			From		   N/A                            <<<<<  READ THIS
+	;		RECEIVE			To			   N/A                            <<<<<  READ THIS
+	;		MOVE			To			   From                           <<<<<  READ THIS
+	;		REVALUATION		DeleteLocn     AdjustedLocn                   <<<<<  READ THIS
+	; ------------------------------------------------------------
+	; 
+	; Implicit Inputs :
+	; 	blnREVAL		Revaluation Flag from INStockValAdjust
+	; 
+	; ByRef :
+	;
+	;
+	; Returns : nothing
+	;
+	; History :
+	; 14-Sep-2009	DWR		SR16880: Calls to FIBU are being moved to its own V2
+	; 							class only go through this old code if manufaturing
+	; 							order as that has no V2 class active for that txn.
+	; 19-Feb-2008	GRF		SRBR014899: Removed older comments including OldFIBU
+	; 25-Jan-2008	shobby	SRBR014754: Default value for OBERTEIL,FIBUREF,reason,pAudit parameters.
+	; 25-Jan-2008	shobby	SRBR014754: More detailed auditing. pstrSourceForm,pidSourceId
+	; 17-Sep-2007	GRF		SRBR014717: Pass DeleteLocation
+	; 27-Dec-2006	GRF		SR15227: Clarify New Item code
+	; 21-Nov-2006	GRF		SR15216: Reverse NOPOST switch on Update/PreUpdate since
+	; 							need to update INARTHISTL for Customer Orders where
+	; 							FIBU processing is deferred until Invoice printed.
+	; 							Update excludes calls from Reservation code
+	; 							(Information Only with Quantity))
+	; 20-Nov-2006	GRF		SR15226: Revised processing - replace FIBU
+	; 16-Nov-2006	GRF		SR15227: DON'T quit if Item History switch set to "2".
+	; 						Further work may be required.
+	; 16-Nov-2006	GRF		SR15226: StockLocn may contain a location if quantity is
+	; 							all sourced from a single location or a list of the
+	; 							source locations and quantities; clear out old
+	; 							commented code.
+	; 13-Nov-2006	GRF		SR15216: Apply NOPOST flag to Update as well as FIBU;
+	; 							mark Update as "PRIVATE".
+	; 29-Jun-2006	GRF		SR14707: Send BETRAG through as currency amount or two
+	; 						currency amounts separated by a vertical separator
+	; 31-May-2006	JW		SR14680: Release lock immediately
+	; 23-Mar-2006	GRF		SR14203: Don't pass locn X into revaluation INARTHIST;
+	; 							move Update^INStockVal into FIBU to avoid
+	; 							unnecessary INARTHIST/L records for normal locn
+	; 							equalisation records.
+	; 14-Mar-2006	JW		SR14389: Moved INStockVal update into FIBU routine.
+	; 31-Jan-2006	GRF		SR14203: Add Audit String to arguments
+	; 22-Nov-2005	JW		SR13877: Reverted 9-Jun-2005 change. May be called     <<<
+	; 							from a WWWKILL (eg INAUF) where vars are not scoped.
+	; 08-Nov-2005	GRF		SR13085: Process variation to MAT rather than BDN
+	; 27-Jul-2005	GRF		SR13024: split Manufacturing Order "REC" amounts
+	; 05-Jul-2005	shobby	SR12333: New parameter DISPATCH.
+	; 16-Jun-2005	Steve S	Clean up new INARTHISTL code; fix LIEKUN in arg list
+	; 14-Jun-2005	GRF		Ensure Site and Stock Locns exist in argument list
+	; 09-Jun-2005	Steve S	Use WWWSPEI for saving the history global              <<<
+	; 06-Jun-2005	GRF		Clean up
+	; 05-May-2005	GRF		SR10478: Add Reason Code
+	; 12-Apr-2005	GRF		SR10478: Add Finance Transaction Reference
+	; 							(INWEAUF D115 => INFIBBUCH D104)
+	; 12-Apr-2005	GRF		Correct descriptions against BUCHUNG fields
+	; 09-Apr-2005	GRF		Doco in header
+	; 30.08.2000	DT
+	;-----------------------------------------------------------------------------*/
+	new BELEGNO,blnUpdate,DATE,DIR,idDeleteLocn,LOCATION,objINVORG,QTY,StockLocn,TIME,VORG
+	new WorkOrder
+	
+	$$$LogR("INARTHIST",ARTIKEL_","_(PLUS+MINUS+MOVE)_","_BETRAG_","_BETRIEB_"||"_LAGER_","_$get(TRANTYPE))
+	
+	quit:ARTIKEL=""
+	if BETRIEB="" set BETRIEB = $get(YLOCATION)
+	
+	; the text string can contain the quantity - use this if not found elsewhere
+	; FIXME : Reliant on hardcoded English text <GRF>
+	if (PLUS="") && (MINUS="") && (MOVE="") && (TEXT'="") {
+		set QTY=+TEXT
+		if QTY>0 {
+			set PLUS=QTY
+		} elseif QTY<0 {
+			set MINUS = -QTY
+		} else {
+			if $find(TEXT,$$^WWWTEXT(31407)_":") {
+			;	"Quantity:###"
+				set MOVE = +$piece(TEXT,$$^WWWTEXT(31407)_":",2)
+			}
+		}
+	}
+	set objINVORG    = $get(^INVORG(YM,YM,1))
+	set VORG         = $$$INVORGItemHistory(objINVORG)		     ; D193
+	set idDeleteLocn = $$$INVORGDeleteStockLocation(objINVORG)   ; D87
+	
+	if (PLUS'="") || (MINUS'="") if $$$INVORGDRPOnlyForNetChange(objINVORG)=$$$YES SET ^INDRPNETCHANGE(YM,ARTIKEL,1)=""  ;FIS;29.04.05;SR12200  ; D217
+	
+	;QUIT:VORG=2     ;Don't save history ;;FAN;28.09.04;26431
+	if VORG=1 if PLUS="" if MINUS="" if MOVE="" if $get(blnREVAL)="" QUIT       ;Don't save info only msgs if "1"  ; SR15227
+	
+	;++++++++++++++++++++++++++++++++++++++++++++
+	; If this item has never had a transaction,
+	; create an initial "New Item Created" record
+	;++++++++++++++++++++++++++++++++++++++++++++
+	;09-Jun-2005 Steve S -- Use @NetManager Save, do NOT directly set the global  SR13877: Reverted - Set global directly
+	if '$data(^INARTHIST(YM,ARTIKEL)) {
+	;	"New Item Created"    ; ARTIKEL NEU ANGELEGT
+	;	do Save^COMUtils("INARTHIST",ARTIKEL_","_+$H_","_$PIECE($H,",",2),$$^WWWTEXT(33245)_Y_$GET(YBED)_Y_BETRIEB,1)   ; SR13877
+		SET ^INARTHIST(YM,ARTIKEL,+$HOROLOG,$PIECE($HOROLOG,",",2),1)=$$^WWWTEXT(33245)_Y_$GET(YBED)_Y_BETRIEB
+	}
+	
+	; NOTE: it appears SR14918 has nothing to do with this code.  No reference to SR14918 in comments. <GRF>
+	QUIT:TEXT=""  ;NEUANLAGE ; New Installation ; SR14918: Don't waste numbers and time getting WWWNEXT for this ; SR14918
+	
+	SET BELEGNO=$$^WWWNEXT("INARTHIST")   	;NUMMER IN BELEG ; voucher number ; SR14918
+	
+	;++++++++++++++++++++++++++++++++++++++++++++
+	; Save Item History - 
+	;  may be phased out by ^INARTHISTL below
+	;++++++++++++++++++++++++++++++++++++++++++++
+	if $DATA(^INARTHIST(YM,ARTIKEL)) {
+		LOCK +^INARTHIST(YM,ARTIKEL):1  ;EINDEUTIGEN KEY SICHERSTELLEN;FIS;26.01.04
+		SET DATE = +$HOROLOG
+		SET TIME = $PIECE($HOROLOG,",",2)
+		IF $DATA(^INARTHIST(YM,ARTIKEL,DATE,TIME)) FOR  QUIT:'$DATA(^INARTHIST(YM,ARTIKEL,DATE,TIME))  SET TIME=TIME+1
+		
+		; vvv New block SR14203
+		set StockLocn = LAGER
+		if $get(blnREVAL) && BETRAG {
+			set StockLocn=LAGERALT  ;FROM LOCATION
+		}
+		SET ^INARTHIST(YM,ARTIKEL,DATE,TIME,1)=TEXT_Y_$GET(YBED)_Y_BETRIEB_Y_PLUS_Y_MINUS_Y_MOVE_Y_StockLocn_Y_$GET(INVENTUR)_Y_BELEGNO
+		
+		; ^^^ Replaces block vvv
+		; SR13877: Set global directly
+		;;09-Jun-2005 Steve S -- Use @NetManager Save, do NOT directly set the global
+		;;do Save^COMUtils("INARTHIST",ARTIKEL_","_DATE_","_TIME,TEXT_Y_$GET(YBED)_Y_BETRIEB_Y_PLUS_Y_MINUS_Y_MOVE_Y_LAGER_Y_$GET(INVENTUR)_Y_BELEGNO,1)
+		;SET ^INARTHIST(YM,ARTIKEL,DATE,TIME,1)=TEXT_Y_$GET(YBED)_Y_BETRIEB_Y_PLUS_Y_MINUS_Y_MOVE_Y_LAGER_Y_$GET(INVENTUR)_Y_BELEGNO
+		; ^^^ End Block */
+		
+		LOCK -^INARTHIST(YM,ARTIKEL)#"I"  ;FIS;26.01.04		;SR14680 - Added immediate
+	}
+	
+	;IF $GET(LAGER)'="" IF $FIND(LAGER,"|") SET LAGER=$PIECE(LAGER,"|",2)             ; SR15226
+	
+	; Don't update INARTHISTL if message passed from Reservation code.
+	set blnUpdate = ($get(pAudit)'["^INWER")     ; SR15216 21-Nov-2006
+	
+	;++++++++++++++++++++++++++++++++++++++++++++
+	; SAVE ITEM HISTORY BY LOCATION FILE                ;FIS;15.06.05;SR12333
+	; If the block below is changed, also change the same block in FIBU^INARTHIST
+	;++++++++++++++++++++++++++++++++++++++++++++
+	if (+PLUS'=0) || (+MINUS'=0) || (+MOVE'=0) {
+		FOR DIR=0,1  {
+		; DIRECTION: 0 = SALES (OUT), 1 = RECEIVING (IN)
+			set QTY = +MOVE                               ;IN &  OUT
+			if QTY=0 set QTY=$select(DIR:+PLUS,1:+MINUS)  ;IN or OUT
+			
+			set LOCATION = BETRIEB
+			if (DIR=0) {
+				if $GET(BETRALT)'="" set LOCATION = BETRALT  ;FROM LOCATION
+			}
+			
+			
+			; ----------------------- Stock Location
+			set StockLocn = LAGER
+			if MOVE && (DIR=0) set StockLocn = LAGERALT   ;FROM LOCATION 
+			
+			if QTY {
+	;			do:blnUpdate PreUpdate(ARTIKEL,LOCATION,StockLocn,QTY,''MOVE,DIR,TEXT,$GET(TRANTYPE),DISPATCH,BETRAG) ; SR15216 revised
+				do:blnUpdate PreUpdate(ARTIKEL,LOCATION,StockLocn,QTY,''MOVE,DIR,TEXT,$GET(TRANTYPE),DISPATCH,BETRAG,idDeleteLocn,pstrSourceForm,pidSourceId) ; SRBR014717 ;BR014754
+				
+				;if 'NOPOST do Update^INStockVal(ARTIKEL,LOCATION,StockLocn,DIR,QTY,BETRAG)		;SR12920	SR14389
+			}
+		}
+	} elseif $get(blnREVAL) && BETRAG { ; SR12920: Stock revaluation when amt'=0 (BETRAG)
+		; FIXME : ? Probable problem - what happens if we have goods receipt on import
+		;           where the goods themselves are free but shipping charges apply?
+		;           BETRAG would be zero (or zero|ShippingCosts under 29-June-2006 revision)
+		;           and may not have blnREVAL to generate record for INFIBBUCH41 to apply
+		;           Shipping Costs. <GRF>
+		
+	;	do:blnUpdate Update(ARTIKEL,BETRALT,LAGERALT,0,0,0,TEXT,$GET(TRANTYPE),DISPATCH,BETRAG)  ; SR15216 revised
+		do:blnUpdate Update(ARTIKEL,BETRALT,LAGERALT,0,0,0,TEXT,$GET(TRANTYPE),DISPATCH,BETRAG,idDeleteLocn,pstrSourceForm,pidSourceId) ; SRBR014717  ;BR014754
+		
+	;	do Update^INStockVal(ARTIKEL,BETRALT,LAGERALT,0,0,BETRAG)  ;  relocated SR14203
+	}
+	
+	
+	; FIXME : If quit when TEXT="" above, why is this line relevant.
+	;         Are there situations where TEXT is null and shouldn't quit above? <GRF>
+	IF TEXT="" SET TEXT=BELEGNO
+ 
+	;++++++++++++++++++++++++++++++++++++++++++++
+	; Record Financial Transactions
+	;++++++++++++++++++++++++++++++++++++++++++++
+	;IF 'NOPOST DO FIBU(ARTIKEL,PLUS,MINUS,MOVE,TEXT,BETRIEB,$GET(LIEFKUN),BETRAG,$GET(AUF),$GET(POS),LAGER,LAGERALT,BETRALT,$GET(TRANTYPE),$GET(OBERTEIL),$get(FIBUREF),$get(Reason))  ; SR14203
+	IF 'NOPOST DO FIBU(ARTIKEL,PLUS,MINUS,MOVE,TEXT,BETRIEB,$GET(LIEFKUN),BETRAG,$GET(AUF),$GET(POS),LAGER,LAGERALT,BETRALT,$GET(TRANTYPE),$GET(OBERTEIL),$get(FIBUREF),$get(Reason),$get(pAudit))
+	quit
+	
+	
+Information(pidItem,pstrText,pidLocation,pfltPlus="",plftMinus="",plftMove="",pidStockLoc,pAudit="")
+	;-------------------------------------------------------------------------------
+	; Wrapper for information only item history entries     #15 : DO NOT POST
+	; Feel free to add more paramaters to match main call
+	;
+	; Params:	As in main call - 1:6 -> 1:6,  7 -> 9
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 21-Aug-2006	GRF		SR15216: Add Audit parameter
+	; 23-Aug-2006	JW		SR14934: Created
+	;-------------------------------------------------------------------------------
+	;				1		2		3			4			5		6	   7 8	9		 	10-14		15         21
+	do ^INARTHIST(pidItem,pstrText,pidLocation,pfltPlus,plftMinus,plftMove, , ,pidStockLoc, , , , , ,$$$YES,,,,,,pAudit)
+	
+	quit
+	
+ ;PreUpdate(ARTIKEL,LOCATION,LAGER,QTY,pblnMOVE,DIR,TEXT,TRANTYPE,DISPATCH,BETRAG) PRIVATE     ; Internal Tag  ; SRBR014717
+PreUpdate(ARTIKEL,LOCATION,LAGER,QTY,pblnMOVE,DIR,TEXT,TRANTYPE,DISPATCH,BETRAG,pidDeleteLocn,pstrSourceForm="",pidSourceId="") PRIVATE     ; Internal Tag ;BR014754
+	;-------------------------------------------------------------------------------
+	; May need to split multiple sourcing into separate lines
+	;  
+	;  ABC|A99|60000|3;ABC|X01|60000|2
+	;   = 3 sourced from stock location A99 & 2 from X01 in site location ABC
+	;
+	; History:
+	; 25-Jan-2008	shobby	SRBR014754: More detailed auditing. pstrSourceForm,pidSourceId
+	; 17-Sep-2007	GRF		SRBR014717: Pass DeleteLocation
+	; 16-Nov-2006	GRF		SR15226: Created
+	;-------------------------------------------------------------------------------
+	new EntryCnt,idSiteLocn,idStockLocn,objEntry,Quantity
+	
+	if LAGER [ "|" {
+		for EntryCnt=1:1:$length(LAGER,$$$SEMICOLON) {
+			set objEntry = $piece(LAGER,$$$SEMICOLON,EntryCnt)
+			
+			set idSiteLocn  = $piece(objEntry,"|",1)
+			set idStockLocn = $piece(objEntry,"|",2)
+		;	set dteSource   = $piece(objEntry,"|",3)
+			set Quantity    = $piece(objEntry,"|",4)
+		
+		;	do Update(ARTIKEL,idSiteLocn,idStockLocn,Quantity,pblnMOVE,DIR,TEXT,TRANTYPE,DISPATCH,BETRAG)  ; SRBR014717
+			do Update(ARTIKEL,idSiteLocn,idStockLocn,Quantity,pblnMOVE,DIR,TEXT,TRANTYPE,DISPATCH,BETRAG,pidDeleteLocn,pstrSourceForm,pidSourceId) ;BR014754
+		}
+		
+	} else {
+	;	do Update(ARTIKEL,LOCATION,LAGER,QTY,pblnMOVE,DIR,TEXT,TRANTYPE,DISPATCH,BETRAG)  ; SRBR014717
+		do Update(ARTIKEL,LOCATION,LAGER,QTY,pblnMOVE,DIR,TEXT,TRANTYPE,DISPATCH,BETRAG,pidDeleteLocn,pstrSourceForm,pidSourceId) ;BR014754
+	}
+	
+	quit
+	
+ ;Update(ARTIKEL,LOCATION,LAGER,QTY,pblnMOVE,DIR,TEXT,TRANTYPE,DISPATCH,BETRAG) PRIVATE     ; Internal Tag  ; SRBR014717
+Update(ARTIKEL,LOCATION,LAGER,QTY,pblnMOVE,DIR,TEXT,TRANTYPE,DISPATCH,BETRAG,pidDeleteLocn,pstrSourceForm="",pidSourceId="") PRIVATE     ; Internal Tag  ;BR014754
+	;-------------------------------------------------------------------------------
+	; Update the Item History by Location (INARTHISTL)
+	; 
+	; Params:
+	; 		   1      2       3      4     5    6    7     8         9      10
+	;		idItem,SiteLocn,StkLocn,Qty,Yes/No,+/-,Text,TranType,idDispatch,$
+	;	also uses - BETRALT,BETRIEB,AUF,POS,INVENTUR
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Mar-2011	GRF		-: replace $$$INARTHIST* macros to permit routine to
+	;							compile until ready to remove
+	; 19-Feb-2008	GRF		SRBR014899: Removed older comments
+	; 07-Feb-2008	shobby	SRBR014890: Redirected save to 'SimpleSave'
+	; 25-Jan-2008	shobby	SRBR014754: More detailed auditing. pstrSourceForm,pidSourceId
+	; 24-Sep-2007	GRF		SRBR014716: Take direction into account for BinQty; move
+	; 						"old history" code and add $$$Index calls
+	; 17-Sep-2007	GRF		SRBR014717: Don't keep running total for DeleteLocation
+	; 18-Dec-2006	GRF		SR15312: Use revised INARTMENGE subroutines
+	; 13-Nov-2006	GRF		SR15216: mark Update as "PRIVATE".
+	; 27-Sep-2006	Steve S	SR14952: Update running Qty In Bin
+	; 17-Mar-2006	JW		SR14405: Add reference for movements
+	; 21-Jan-2006	GRF		SR14074: Add RESMEN=9 option to INARTMENGE call to include
+	; 						quantities at blocked stock locations
+	; 05-Jul-2005	shobby	SR12333 included DISPATCH parameter
+	;-------------------------------------------------------------------------------
+ 	new dteToday,dteDate,fltQty,idSeq,KEY,objOldHist,SATZ,SEQNO
+ 	
+	set KEY      = ARTIKEL_$$$COMMA_LOCATION_$$$COMMA_(+$HOROLOG)
+	set SEQNO    = $$^WWWNEXT1("INARTHISTL",KEY,4)
+	set KEY      = KEY_$$$COMMA_SEQNO
+	set SATZ     = ""
+	set dteToday = +$horolog
+	
+	set $piece(SATZ,"~",1)	= $PIECE($HOROLOG,",",2)
+	set $piece(SATZ,"~",2)	= QTY
+	set $piece(SATZ,"~",3)  = DIR
+	set $piece(SATZ,"~",4)  = LAGER
+	set $piece(SATZ,"~",5)  = TEXT
+	set $piece(SATZ,"~",6)  = $get(BETRAG)
+	;set $$$INARTHISTLTime1(SATZ)		   = $PIECE($HOROLOG,$$$COMMA,2)
+	;set $$$INARTHISTLQuantity(SATZ)       = QTY
+	;set $$$INARTHISTLSalesDirection(SATZ) = DIR
+	;set $$$INARTHISTLStockLocation(SATZ)  = LAGER
+	;set $$$INARTHISTLText(SATZ)           = TEXT
+	;set $$$INARTHISTLValue1(SATZ)         = $get(BETRAG)
+	
+	if $data(^CacheTempHistoryTracking(YUCI,YUSER)) {
+		set $piece(SATZ,"~",15) = $get(^CacheTempHistoryTracking(YUCI,YUSER,"SourceForm"))   ;BR014754
+		set $piece(SATZ,"~",17)	= $get(^CacheTempHistoryTracking(YUCI,YUSER,"SourceId"))     ;BR014754
+	} else {
+		set $piece(SATZ,"~",15) = pstrSourceForm   						  				   ;BR014754
+		set $piece(SATZ,"~",17)	= pidSourceId     						                   ;BR014754
+	}
+	set $piece(SATZ,"~",16)	    = $$ClassUsedInForm^WWW120($piece(SATZ,"~",15))    ;BR014754
+	;if $data(^CacheTempHistoryTracking(YUCI,YUSER)) {
+	;	set $$$INARTHISTLSourceForm(SATZ) = $get(^CacheTempHistoryTracking(YUCI,YUSER,"SourceForm"))   ;BR014754
+	;	set $$$INARTHISTLSourceId(SATZ)	  = $get(^CacheTempHistoryTracking(YUCI,YUSER,"SourceId"))     ;BR014754
+	;} else {
+	;	set $$$INARTHISTLSourceForm(SATZ) = pstrSourceForm   						  				   ;BR014754
+	;	set $$$INARTHISTLSourceId(SATZ)	  = pidSourceId     						                   ;BR014754
+	;}
+	;set $$$INARTHISTLSourceClass(SATZ)	  = $$ClassUsedInForm^WWW120($$$INARTHISTLSourceForm(SATZ))    ;BR014754
+	
+	; ----------------------- Sales Type
+	
+	if ($get(AUF)'="") && ($get(POS)'="") {
+		set $piece(SATZ,"~",7)  = AUF_"-"_POS
+		set $piece(SATZ,"~",11) = 0                            ;SALES IN ORDER
+	}
+	if pblnMOVE=0 {
+		if $find(TEXT," #") set $piece(SATZ,"~",11)=2  ;PRODUCTION
+		if TRANTYPE="ADJ"   set $piece(SATZ,"~",11)=4  ;ADJUSTMENTS
+		set $piece(SATZ,"~",8) = $get(DISPATCH)        ;SHOBBY SR12333
+		set $piece(SATZ,"~",7) = $get(AUF)			   ; SR14405
+	} else {
+		if (TRANTYPE="MVI") || (TRANTYPE="MVO") {
+			set $piece(SATZ,"~",11) = 5          ;MOVEMENT
+		} else {
+			; ISS/REC
+			set $piece(SATZ,"~",11) = 3          ;INTERWAREHOUSE TRAFFIC
+			set $piece(SATZ,"~",8)  = $get(DISPATCH,$get(AUF)) ;SR12333
+		}
+	}
+	;if ($get(AUF)'="") && ($get(POS)'="") {
+	;	set $$$INARTHISTLReference(SATZ)=AUF_$$$MINUS_POS
+	;	set $$$INARTHISTLSalesType(SATZ)=0                            ;SALES IN ORDER
+	;}
+	;if pblnMOVE=$$$NO {
+	;	if $find(TEXT," #") set $$$INARTHISTLSalesType(SATZ)=2  ;PRODUCTION
+	;	if TRANTYPE="ADJ"   set $$$INARTHISTLSalesType(SATZ)=4  ;ADJUSTMENTS
+	;	set $$$INARTHISTLDispatchNo(SATZ) = $get(DISPATCH)           ;SHOBBY SR12333
+	;	set $$$INARTHISTLReference(SATZ)  = $get(AUF)			; SR14405
+	;	
+	;} else {
+	;	if (TRANTYPE="MVI") || (TRANTYPE="MVO") {
+	;		set $$$INARTHISTLSalesType(SATZ)  = 5          ;MOVEMENT
+	;	} else {
+	;		; ISS/REC
+	;		set $$$INARTHISTLSalesType(SATZ)  = 3          ;INTERWAREHOUSE TRAFFIC
+	;		set $$$INARTHISTLDispatchNo(SATZ) = $get(DISPATCH,$get(AUF)) ;SR12333
+	;	}
+	;}
+	
+	if $get(INVENTUR)=1       set $piece(SATZ,"~",11)=4  ;ADJUSTMENTS (STOCKTAKING)
+	if $piece(SATZ,"~",11)="" set $piece(SATZ,"~",11)=4  ;OTHERS
+	;if $get(INVENTUR)=1                set $$$INARTHISTLSalesType(SATZ)=4  ;ADJUSTMENTS (STOCKTAKING)
+	;if $$$INARTHISTLSalesType(SATZ)="" set $$$INARTHISTLSalesType(SATZ)=4  ;OTHERS
+	
+	; ++++++++++++++++++++++++++++++++++++++
+	; Quantities for both sides have already been adjusted at this stage for Goods Relocation.
+	; If both stock locations are within the same site location
+	; the final figure will appear for both the OUT and IN sides.
+	; ++++++++++++++++++++++++++++++++++++++
+	
+	set $piece(SATZ,"~",12) = $$QtyForAvgCost^INARTMENGE(ARTIKEL,LOCATION)
+	;set $$$INARTHISTLStockOnHand(SATZ) = $$QtyForAvgCost^INARTMENGE(ARTIKEL,LOCATION)
+	
+	if (LAGER'=pidDeleteLocn) && (LAGER'="") {	                            ; SRBR014717
+		set dteDate = dteToday                       ; FIXME : perhaps better as dteHistory than dteDate
+		set idSeq = $$GetOldHistory(LAGER,ARTIKEL,LOCATION,.dteDate,SEQNO)
+		
+		; DIRECTION: 0 = SALES (OUT), 1 = RECEIVING (IN)                    ; SRBR014716 vvv
+		if idSeq'="" {
+			set objOldHist = $get(^INARTHISTL(YM,ARTIKEL,LOCATION,dteDate,idSeq,1))
+			set fltQty = (QTY * $select(DIR=0:-1,1:1)) + $piece(objOldHist,"~",13)
+	;		set fltQty = (QTY * $select(DIR=0:-1,1:1)) + $$$INARTHISTLQuantityinBin(objOldHist)
+		} else {
+			set fltQty = (QTY * $select(DIR=0:-1,1:1))
+		}
+		set $piece(SATZ,"~",13) = fltQty
+	;	set $$$INARTHISTLQuantityinBin(SATZ) = fltQty
+	}
+	
+	do SimpleSave^INARTHISTLUtils(ARTIKEL,LOCATION,dteToday,SEQNO,SATZ,$get(YFORM))
+	quit
+	
+	
+GetOldHistory(pidBin,pidItem,pidLocn,&pdteDate,pidSeqNo)
+	;-------------------------------------------------------------------------------
+	; Update the Item History by Location (INARTHISTL)
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 24-Sep-2007	GRF		SRBR014716: Isolate for testability; correction of Item
+	; 						& Locn not being in WWWUMLAU format
+	;-------------------------------------------------------------------------------
+	new idSeq,idxBin,idxItem,idxLocn
+	
+	set idxBin  = $$$Index(pidBin)
+	set idxItem = $$$Index(pidItem)
+	set idxLocn = $$$Index(pidLocn)
+	
+	set idSeq = $order(^INARTHISTLs(YM,5,idxBin,idxItem,idxLocn,pdteDate,pidSeqNo),-1)
+	if idSeq="" {
+		set pdteDate = $order(^INARTHISTLs(YM,5,idxBin,idxItem,idxLocn,pdteDate),-1)
+		if pdteDate'="" {
+			set idSeq = $order(^INARTHISTLs(YM,5,idxBin,idxItem,idxLocn,pdteDate,""),-1)
+		}
+	}
+	
+	quit idSeq
+	
+	
+FIBU(pidItem="",PLUS="",MINUS="",MOVE="",TEXT="",BETR="",LIEFKUN="",pcurValue=0,AUF="",POS="",LAGER="",LAGERALT="",BETRALT="",TRANTYPE="",OBERTEIL="",FIBUREF="",Reason="",pAudit="")
+	/*------------------------------------------------------------------------------
+	; BESTANDSVERÄNDERUNG IN DIE FIBU ÜBERTRAGEN / POST TO GENERAL LEDGER
+	; 
+	; *** FIBU also called directly from external routines ***
+	; 
+	; Updates :
+	; 				^INStockVal			(Create, Modify, Kill)
+	; 				^INFIBBUCH			(Create)
+	; 
+	; History :
+	; 24-Sep-2009	GRF		SR16880: bypass if processed under V2 (not noted)
+	; 20-Nov-2006	GRF		SR15226: Revised processing - cope with composite stock
+	; 						location details
+	; 29-Jun-2006	GRF		SR14707: BETRAG/pcurValue contains Cost without and with service
+	; 						charges since INFIBBUCH41 adds the charges in separately
+	; 						but INStockVal needs them now.
+	;  8-May-2006	JW		SR14508: Allow -ve movements
+	; 23-Mar-2006	GRF		SR14203: move Update^INStockVal into FIBU to avoid
+	; 						unnecessary INARTHIST/L records for normal location
+	; 						equalisation records.
+	; 14-Mar-2006	JW		SR14389: Moved INStockVal update into this routine.
+	; 						Log error conditions.
+	; 01-Feb-2006	GRF		SR14203: ensure pAudit defined
+	; 31-Jan-2006	GRF		SR14203: Add Audit String to arguments; store in D11
+	; 09-Aug-2005	GRF		SR13182: Multiply burden by parent quantity
+	; 09-Aug-2005	GRF		SR13162: Ensure input amount (BETRAG/pcurValue) is whole cents
+	; 						when processed to Finance
+	; 29-Jul-2005	GRF		SR13120: set basic MATAmount to total amount and modify
+	; 						as required.
+	; 26-Jul-2005	GRF		SR13024: Add extra breakdown of amounts for Manufacturing
+	; 						Order where finished goods are being received.
+	; 18-Jun-2005	GRF		SR12693: Locations are passed in as primary & secondary
+	; 						rather than from and to except for movement.  Thus will
+	; 						need to manage which goes where in BUCHUNG.
+	; 14-Jun-2005	GRF		From and To Locations were reversed; Don't need extra
+	; 						BETR variable; Set QTY rather than rechecking TYP.
+	; 10-May-2005	GRF		SR12335:  Checkbox is too dangerous - use DCM to block
+	; 						transmissions to finance.
+	; 05-May-2005	GRF		SR10478: Add Reason Code
+	; 12-Apr-2005	GRF		SR10478: Add Finance Transaction Reference
+	; 						(INWEAUF D115 => INFIBBUCH D104)
+	; 31-Mar-2005	GRF		English documentation; || replaces !
+	;-----------------------------------------------------------------------------*/
+	new arrSplit,curValuePlusSC,curSplitVal,curSplitValPlusSC,FromSiteLocn,FromStockLocn
+	new idEntry,idSiteLocn,idStockLocn,KONTOCOGS,KONTOH,KONTOS
+	new objBUCHUNG,objINART,objINKSTL,objINVORG,Qty,SORTI,SplitQty,STEUERKZ,ToSiteLocn,ToStockLocn,TYP,WAGR
+	
+	if $get(YUSER)="" set YUSER= " "
+	
+	if $get(^CacheTemp(YUSER,"FIBURecord"))=$$$YES {   ; SR16880
+		kill ^CacheTemp(YUSER,"FIBURecord")
+		quit             ; *** EXIT - already processed through alSFI.dStockFin & INFINInterface ***
+	}	
+	
+	;---------------------------------------
+	; TYP  = 0	WARENEINGANG    / RECEIVING GOODS
+	;      = 1	WARENAUSGANG    / SHIPPING GOODS
+	;      = 2	WARENUMLAGERUNG / STOCK CHANGING
+	;---------------------------------------
+	set TYP=""
+	if +PLUS>0 || $get(blnREVERSE)  set TYP=0 set Qty = PLUS
+	if +MINUS>0                     set TYP=1 set Qty = MINUS
+	if (+MOVE) || $get(blnREVAL)    set TYP=2 set Qty = MOVE     ; includes zero quantity revaluation based on "ADJ" with Delete Locn in 3/9
+	quit:TYP=""
+	
+	;---------------------------------------
+	; Split composite value
+	;---------------------------------------
+	if pcurValue["|" {
+		set curValuePlusSC = $piece(pcurValue,"|",2)
+	} else {
+		set curValuePlusSC = pcurValue
+	}
+	
+	set curValuePlusSC = $justify(+curValuePlusSC,0,2)     ; CostWithServiceCharges
+	set pcurValue      = $justify(+pcurValue,0,2)          ; CostWithoutServiceCharges
+	
+	;---------------------------------------
+	; Location
+	;---------------------------------------
+	
+	IF BETR="" {
+		SET BETR=$GET(YLOCATION)
+		do Dump^COMPatch("SR14389","Location not defined")	;SR14389
+	}
+	IF BETR="" SET BETR=1                     ; FIXME : Installation may not have a site location "1" <GRF>
+	
+	set objINVORG = $get(^INVORG(YM,YM,1))
+	set objINART  = $get(^INART(YM,pidItem,1))
+	
+	;---------------------------------------
+	; Item Group
+	;---------------------------------------
+	set WAGR = $$$INARTItemGroup(objINART)
+	if WAGR="" set WAGR = $$$INVORGDefaultItemGroup(objINVORG)
+	if WAGR="" set WAGR = 1                                ; FIXME : This group may not exist <GRF>
+
+	;---------------------------------------
+	; Initial Accounts - may be subject to Account ID Matrix
+	;---------------------------------------
+	set SORTI    = $$$INARTCategory(objINART)
+	set STEUERKZ = 0                 ; Tax Type : 0 = KEINE STEUER / NO TAXES 
+	
+	set objINKSTL = $get(^INKSTL(YM,BETR,WAGR,STEUERKZ,4,1))                                 ;ACCOUNTS OUT OF DFLT. PARAMETER
+	if objINKSTL="" if SORTI'="" set objINKSTL = $get(^INKSTL1(YM,BETR,SORTI,STEUERKZ,4,1))  ;SORTIMENT
+	if objINKSTL=""              set objINKSTL = $get(^INKSTL(YM,BETR,0,STEUERKZ,4,1))       ;AUS VORGABE SONSTIGES ;out of default 
+	
+	; Cost of Goods Sold Account
+	set KONTOCOGS=$piece(objINKSTL,Y,4)
+	if KONTOCOGS="" set KONTOCOGS = $piece($get(^INFIBPAR(0,YM,BETR,1)),Y,34)
+	if KONTOCOGS="" set KONTOCOGS = 99999
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;   TYP=0 : Receive Goods
+	;+++++++++++++++++++++++++++++++++++++++
+	if TYP=0 {
+		set KONTOH=$piece($get(^INFIBPAR(0,YM,BETR,1)),Y,31)  set:KONTOH="" KONTOH = 99999      ; Stock On Hand
+		set KONTOS=$piece(objINKSTL,Y,2)                      set:KONTOS="" KONTOS = 99999      ; Receiving
+		
+		set objBUCHUNG = $$BuildBaseRecord(pidItem,TYP,TEXT,KONTOCOGS,KONTOH,KONTOS,AUF,POS,STEUERKZ,TRANTYPE,OBERTEIL,FIBUREF,Reason,pAudit,LIEFKUN)
+		
+		do Receipt(pidItem,Qty,pcurValue,curValuePlusSC,BETR,LAGER,objBUCHUNG,TRANTYPE,TEXT)
+		
+		
+	;+++++++++++++++++++++++++++++++++++++++
+	;   TYP=1 : Issue Goods
+	;+++++++++++++++++++++++++++++++++++++++
+	} elseif TYP=1 {
+		set KONTOH=$piece(objINKSTL,Y,3)                      set:KONTOH="" KONTOH = 99999      ; Shipping
+		set KONTOS=$piece($get(^INFIBPAR(0,YM,BETR,1)),Y,31)  set:KONTOS="" KONTOS = 99999      ; Stock On Hand
+		
+		set objBUCHUNG = $$BuildBaseRecord(pidItem,TYP,TEXT,KONTOCOGS,KONTOH,KONTOS,AUF,POS,STEUERKZ,TRANTYPE,OBERTEIL,FIBUREF,Reason,pAudit,LIEFKUN)
+
+		do Split(BETR,LAGER,Qty,pcurValue,curValuePlusSC,.arrSplit)
+		
+		set idEntry=""
+		for {
+			set idEntry = $order(arrSplit(idEntry))
+			quit:idEntry=""
+			
+			set idSiteLocn        = arrSplit(idEntry,"Site")
+			set idStockLocn       = arrSplit(idEntry,"Stk")
+			set SplitQty          = arrSplit(idEntry,"Qty")
+			set curSplitVal       = arrSplit(idEntry,"Val")
+			set curSplitValPlusSC = arrSplit(idEntry,"ValP")
+			
+			do Issue(pidItem,SplitQty,curSplitVal,curSplitValPlusSC,idSiteLocn,idStockLocn,objBUCHUNG,TRANTYPE,TEXT)
+		}
+		
+		
+	;+++++++++++++++++++++++++++++++++++++++
+	;   TYP=2 : Movements and Adjustments
+	;+++++++++++++++++++++++++++++++++++++++
+	} else {
+		set KONTOH = $piece($get(^INFIBPAR(0,YM,BETR,1)),Y,31)  set:KONTOH="" KONTOH = 99999      ; Stock On Hand
+		set KONTOS = $piece(objINKSTL,Y,2)                      set:KONTOS="" KONTOS = 99999      ; Receiving
+		
+		set objBUCHUNG = $$BuildBaseRecord(pidItem,TYP,TEXT,KONTOCOGS,KONTOH,KONTOS,AUF,POS,STEUERKZ,TRANTYPE,OBERTEIL,FIBUREF,Reason,pAudit,LIEFKUN)
+		
+		set FromSiteLocn  = BETRALT
+		set FromStockLocn = LAGERALT
+		set ToSiteLocn    = BETR
+		set ToStockLocn   = LAGER
+		
+		do Split(FromSiteLocn,FromStockLocn,Qty,pcurValue,curValuePlusSC,.arrSplit)
+		
+		set idEntry=""
+		for {
+			set idEntry = $order(arrSplit(idEntry))
+			quit:idEntry=""
+		
+			set idSiteLocn        = arrSplit(idEntry,"Site")
+			set idStockLocn       = arrSplit(idEntry,"Stk")
+			set SplitQty          = arrSplit(idEntry,"Qty")
+			set curSplitVal       = arrSplit(idEntry,"Val")
+			set curSplitValPlusSC = arrSplit(idEntry,"ValP")
+		
+			do Movement(pidItem,Qty,pcurValue,curValuePlusSC,idSiteLocn,idStockLocn,ToSiteLocn,ToStockLocn,objBUCHUNG,TRANTYPE,TEXT)
+		}
+	}
+	kill ^CacheTemp(YUSER,"FIBURecord")
+	quit
+	
+BuildBaseRecord(pidItem,TYP,TEXT,KONTOCOGS,KONTOH,KONTOS,AUF,POS,STEUERKZ,TRANTYPE,OBERTEIL,FIBUREF,Reason,pAudit,LIEFKUN)
+	;-------------------------------------------------------------------------------
+	; Update the Item History by Location (INARTHISTL)
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-May-2007	HeberB	BR014304: Web Services Update
+	;-------------------------------------------------------------------------------
+	new BUCHUNG
+	; BR014304
+	new strSearchText
+ 
+	set BUCHUNG=""
+	set $piece(BUCHUNG,Y,2)   = +$horolog       ; DATUM                DATE
+	set $piece(BUCHUNG,Y,4)   = KONTOS          ; SOLLKONTO            DEBIT ACCOUNT 
+	set $piece(BUCHUNG,Y,5)   = KONTOH          ; HABENKONTO           CREDIT ACCOUNT
+	set $piece(BUCHUNG,Y,6)   = STEUERKZ        ; STEUERKENNZEICHEN    TAX
+	set $piece(BUCHUNG,Y,8)   = TEXT            ; BUCHUNGSTEXT         POSTING INFORMATION
+	set $piece(BUCHUNG,Y,9)   = TYP             ; EIN/AUSGANG          Receipt/Shipment
+	set $piece(BUCHUNG,Y,11)  = pAudit          ; Audit Text
+	set $piece(BUCHUNG,Y,22)  = LIEFKUN         ; KOSTENSTELLE         COST CENTRE
+	set $piece(BUCHUNG,Y,27)  = AUF             ; AUFTRAG              Order Number 
+	set $piece(BUCHUNG,Y,28)  = POS             ; POSITION             Order Line
+	set $piece(BUCHUNG,Y,29)  = pidItem         ; ARTIKEL              Item
+	set $piece(BUCHUNG,Y,35)  = KONTOCOGS       ; COST OF GOODS SOLD ACCOUNT
+	set $piece(BUCHUNG,Y,42)  = OBERTEIL        ; PARENT ITEM
+	set $piece(BUCHUNG,Y,50)  = TRANTYPE        ; TRANSACTION TYPE (ISS,REC,...)
+	set $piece(BUCHUNG,Y,103) = Reason          ; Characteristic - Adj Reason Code
+	set $piece(BUCHUNG,Y,104) = FIBUREF         ; Finance Transaction Reference
+ 
+	; BR014304
+	set strSearchText = $$GetWebServiceText()
+	if TEXT [ strSearchText {
+		set $piece(BUCHUNG,Y,36) = $piece(TEXT,strSearchText,2)
+	}
+ 
+	quit BUCHUNG
+	
+	
+Receipt(pidItem,pQty,pcurValue,pcurValuePlusSC,pToSiteLocn,pToStockLocn,pobjBUCHUNG,TRA]]><![CDATA[NTYPE,TEXT)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 04-Dec-2006	GRF		SR15261: Boolean corrected
+	;-------------------------------------------------------------------------------
+	new BUCHUNG,OK,WorkOrder
+	
+	if pToStockLocn["|" set pToStockLocn = $piece(pToStockLocn,"|",2)     ; Was previously performed before FIBU called
+	
+	do Update^INStockVal(pidItem,pToSiteLocn,pToStockLocn,$$$YES,pQty,pcurValuePlusSC)
+	
+	set BUCHUNG = pobjBUCHUNG
+	set $piece(BUCHUNG,Y,16)  = pToSiteLocn
+	set $piece(BUCHUNG,Y,30)  = pToStockLocn
+	set $piece(BUCHUNG,Y,32)  = pQty
+	set $piece(BUCHUNG,Y,3)   = pcurValue
+	set $piece(BUCHUNG,Y,56)  = pcurValue         ; Materials Amount defaults to total amount
+	
+	set WorkOrder = $piece($piece(TEXT,"#",2)," ",1)
+	if (TRANTYPE="REC") && (WorkOrder'="") set BUCHUNG = $$Manufacture(BUCHUNG,WorkOrder,pQty,pcurValue)
+	
+	;ÜBERLEITEN IN FIBU ;within 
+	set OK=$$^INFIBBUCH(BUCHUNG,pToSiteLocn,"","",3)
+	;QUIT:OK=""
+	
+	quit
+	
+	
+Issue(pidItem,pQty,pcurValue,pcurValuePlusSC,pFromSiteLocn,pFromStockLocn,pobjBUCHUNG,TRANTYPE,TEXT)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 04-Dec-2006	GRF		SR15261: Boolean corrected
+	;-------------------------------------------------------------------------------
+	new BUCHUNG,OK,WorkOrder
+	
+	do Update^INStockVal(pidItem,pFromSiteLocn,pFromStockLocn,$$$NO,pQty,pcurValuePlusSC)
+	
+	set BUCHUNG = pobjBUCHUNG
+	set $piece(BUCHUNG,Y,16)  = pFromSiteLocn
+	set $piece(BUCHUNG,Y,30)  = pFromStockLocn
+	set $piece(BUCHUNG,Y,32)  = pQty
+	set $piece(BUCHUNG,Y,3)   = pcurValue
+	set $piece(BUCHUNG,Y,56)  = pcurValue         ; Materials Amount defaults to total amount
+	
+	set WorkOrder = $piece($piece(TEXT,"#",2)," ",1)
+	if (TRANTYPE="REC") && (WorkOrder'="") set BUCHUNG = $$Manufacture(BUCHUNG,WorkOrder,pQty,pcurValue)
+	
+	;ÜBERLEITEN IN FIBU ;within 
+	set OK=$$^INFIBBUCH(BUCHUNG,pFromSiteLocn,"","",3)
+	;QUIT:OK=""
+	
+	quit
+	
+Movement(pidItem,pQty,pcurValue,pcurValuePlusSC,pFromSiteLocn,pFromStockLocn,pToSiteLocn,pToStockLocn,pobjBUCHUNG,TRANTYPE,TEXT)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 04-Dec-2006	GRF		SR15261: use Boolean Macros
+	;-------------------------------------------------------------------------------
+	new BUCHUNG,OK,WorkOrder
+	
+	if pQty {
+		do Update^INStockVal(pidItem,pFromSiteLocn,pFromStockLocn,$$$NO, pQty,pcurValuePlusSC)
+		do Update^INStockVal(pidItem,pToSiteLocn,  pToStockLocn,  $$$YES,pQty,pcurValuePlusSC)
+	} else {
+	;	Value only Adjustments
+		do Update^INStockVal(pidItem,pFromSiteLocn,pFromStockLocn,$$$NO,0,pcurValuePlusSC)
+	}
+	
+	set BUCHUNG = pobjBUCHUNG
+	set $piece(BUCHUNG,Y,16)  = pFromSiteLocn
+	set $piece(BUCHUNG,Y,30)  = pFromStockLocn
+	set $piece(BUCHUNG,Y,33)  = pToSiteLocn
+	set $piece(BUCHUNG,Y,31)  = pToStockLocn
+	set $piece(BUCHUNG,Y,32)  = pQty
+	set $piece(BUCHUNG,Y,3)   = pcurValue
+	set $piece(BUCHUNG,Y,56)  = pcurValue         ; Materials Amount defaults to total amount
+	
+	set WorkOrder = $piece($piece(TEXT,"#",2)," ",1)
+	if (TRANTYPE="REC") && (WorkOrder'="") set BUCHUNG = $$Manufacture(BUCHUNG,WorkOrder,pQty,pcurValue)
+	
+	;ÜBERLEITEN IN FIBU ;within 
+	set OK = $$^INFIBBUCH(BUCHUNG,pToSiteLocn,"","",3)
+	;QUIT:OK=""
+	
+	quit
+	
+Split(pSiteLocn,pstrSource,pQty,pcurValue,pcurValuePlusSC,&arrSplit)
+	;-------------------------------------------------------------------------------
+	; May need to split multiple sourcing into separate lines
+	; If pstrSource only contains the stock location, build a single array entry for it.
+	; 
+	;  
+	;  ABC|A99|60000|3;ABC|X01|60000|2
+	;   = 3 sourced from stock location A99 & 2 from X01 in site location ABC
+	;   
+	;  Any rounding balance is simply assigned to the entry with the highest proportion
+	;  to cause the smallest fluctuation.
+	;
+	; History:
+	; 17-Nov-2006	GRF		SR15226: Created
+	;-------------------------------------------------------------------------------
+	new curSourceVal,curSourceValPlus,curUnallocVal,curUnallocValPlus,fltHighEntry
+	new idEntry,idHighEntry,objEntry,Proportion,SourceQty
+	
+	if pstrSource [ "|" {
+		set curUnallocVal     = pcurValue
+		set curUnallocValPlus = pcurValuePlusSC
+		
+		set idHighEntry   = ""
+		set fltHighEntry  = 0
+		
+		for idEntry=1:1:$length(pstrSource,$$$SEMICOLON) {
+			set objEntry = $piece(pstrSource,$$$SEMICOLON,idEntry)
+			
+			set arrSplit(idEntry,"Site") = $piece(objEntry,"|",1)
+			set arrSplit(idEntry,"Stk")  = $piece(objEntry,"|",2)
+		;	set arrSplit(idEntry,"Date") = $piece(objEntry,"|",3)
+			set SourceQty                = $piece(objEntry,"|",4)
+			set arrSplit(idEntry,"Qty")  = SourceQty
+			set Proportion               = SourceQty / pQty
+			
+			if Proportion > fltHighEntry {
+				set idHighEntry  = idEntry
+				set fltHighEntry = Proportion
+			}
+			set curSourceVal             = +$justify(pcurValue * Proportion,0,2)
+			set arrSplit(idEntry,"Val")  = curSourceVal
+			set curUnallocVal            = curUnallocVal - curSourceVal
+			
+			set curSourceValPlus         = +$justify(pcurValuePlusSC * Proportion,0,2)
+			set arrSplit(idEntry,"ValP") = curSourceValPlus
+			set curUnallocValPlus        = curUnallocValPlus - curSourceValPlus
+			
+		}
+		if curUnallocVal {
+			set arrSplit(idHighEntry,"Val")  = arrSplit(idHighEntry,"Val")  + curUnallocVal
+		}
+		if curUnallocValPlus {
+			set arrSplit(idHighEntry,"ValP") = arrSplit(idHighEntry,"ValP") + curUnallocValPlus
+		}
+		
+	} else {
+		set arrSplit(1,"Site") = pSiteLocn
+		set arrSplit(1,"Stk")  = pstrSource
+		set arrSplit(1,"Qty")  = pQty
+		set arrSplit(1,"Val")  = pcurValue
+		set arrSplit(1,"ValP") = pcurValuePlusSC
+	}
+	
+	quit
+	
+ 
+Manufacture(BUCHUNG,pWorkOrder,pQty,pcurValue)
+	;-------------------------------------------------------------------------------
+	; Split amount for REC of Finished Goods on Manufacturing Order
+	;-------------------------------------------------------------------------------
+	new AmountBDN,AmountLAB,AmountMAT,AmountMBD,AUFKey,Burden,DATEI,Depth,Depth0,Difference,Duration
+	new idOrder,idOrdLine,ItemNo,ItemType,Machine,NoOfWorkers
+	new objINAUF,objINAUFPXL,objINPROXR,ParentQty,PartCost,PartKey,ServiceOH,Status
+	
+	set objINPROXR = $get(^INPROXR(YM,pWorkOrder,1))
+	set idOrder    = $piece(objINPROXR,Y,1)			; e.g. ^INPROXR(0,100101,1)="200345~1~"     Finished Item
+	set idOrdLine  = $piece(objINPROXR,Y,2)			;      ^INPROXR(0,100102,1)="200345~1~3"    SubAssy
+	set PartKey    = $piece(objINPROXR,Y,3)			;      ^INPROXR(0,100103,1)="200345~1~3,5"  SubAssy of SubAssy
+	
+	set AmountMAT   = 0
+	set AmountLAB   = 0
+	set AmountMBD   = 0
+	set AmountBDN   = 0
+	set Status      = $$$NO
+	
+	if (idOrder'="") && (idOrdLine'="") {
+		set objINAUF = $get(^INAUF(YM,idOrder,1))
+		if $$$INAUFOrderType(objINAUF)=1 {     ; Manufacturing Order
+			set Status      = $$$OK
+			
+			if $data(^INAUFPXL(YM,idOrder,idOrdLine)) {
+				set AUFKey = "0,"_idOrder_$$$COMMA_idOrdLine
+				if PartKey'="" set AUFKey = AUFKey_$$$COMMA_PartKey
+				
+				set DATEI = "^INAUFPXL("_$$^WWWKEYBUILD(AUFKey)_")"
+				set Depth0 = $qlength(DATEI)+1
+				
+				;-----------------------
+				; Process Parent
+				;-----------------------
+				set objINAUFPXL = @DATEI      ; Parent Item
+				set ParentQty   = pQty
+				set AmountMBD   = AmountMBD + $piece(objINAUFPXL,Y,74)     ; Tool Costs
+				set AmountBDN   = AmountBDN + $piece(objINAUFPXL,Y,75)     ; Additional Expenses
+				
+				; TODO : Value of preparation time => LBR? <GRF>
+				
+				;-----------------------
+				; Process Parts
+				;-----------------------
+				for {
+					set DATEI = $query(@DATEI)
+					quit:DATEI=""
+					set Depth = $qlength(DATEI)
+					quit:Depth<Depth0             ; BOM finished at Main or SubAssy level
+					
+					if ($qsubscript(DATEI,2)'=idOrder) || ($qsubscript(DATEI,3)'=idOrdLine) quit
+					
+					if Depth=Depth0 {    ; skip lower Sub-Assemblies
+						set objINAUFPXL = @DATEI  ; Parts
+						
+						set ItemNo   = $piece(objINAUFPXL,Y,4)
+						set ItemType = $piece(objINAUFPXL,Y,26)
+						
+						if ItemType=2 {   ;Service
+							set Duration    = $piece(objINAUFPXL,Y,45)   ; in seconds
+							set Machine     = $piece(objINAUFPXL,Y,57)
+							set NoOfWorkers = $piece(objINAUFPXL,Y,49)
+							set Burden    = 0
+							if Machine'="" {
+								set ServiceOH = $piece($get(^INMASCH(YM,Machine,1)),Y,46)
+								set Burden    = $justify(ServiceOH * Duration * ParentQty / 3600,0,2)
+								set AmountBDN = AmountBDN + Burden
+							}
+							set PartCost  = $piece(objINAUFPXL,Y,250)    ; SR13142 - this includes Service Overhead so need to deduct
+							; FIXME : It appears the amounts being stored in #250 are
+							;         ***NOT*** always inclusive of the Service Overhead. <GRF>
+							;         This may have been corrected now.  <GRF> 31-Aug-2005
+							set AmountLAB = AmountLAB + (PartCost * ParentQty) - Burden	
+						
+						} else {      ; Materials
+							; TODO ? Calculate MBD for items with INKALKART entries? <GRF>
+							set PartCost  = $piece(objINAUFPXL,Y,250)
+							set AmountMAT = AmountMAT + (PartCost * ParentQty)
+						}
+					}
+				}  ; end for
+			}
+		}
+	}
+	
+	if Status=$$$OK {
+		set Difference = pcurValue - (AmountMAT + AmountLAB + AmountMBD + AmountBDN)
+	;	set AmountBDN  = AmountBDN	+ Difference               ; TODO : Verify this is desired action
+		set AmountMAT  = AmountMAT	+ Difference               ; SR13085
+		
+		set $piece(BUCHUNG,Y,56)  = AmountMAT		; Materials Amount
+		set $piece(BUCHUNG,Y,57)  = AmountLAB		; Labour Amount
+		set $piece(BUCHUNG,Y,58)  = AmountMBD		; Material Overhead Amount
+		set $piece(BUCHUNG,Y,59)  = AmountBDN		; Service Burden Amount
+	} else {
+		set $piece(BUCHUNG,Y,56)  = pcurValue       ; if unable to split, leave all as Materials
+	}
+	
+	quit BUCHUNG
+	
+	
+Deferred(lst) 
+    /*-------------------------------------------------------------------------------
+	; Fix for SR13800. Do this deferred history call (params put in list)
+	;
+	; Params: list of params
+	;
+	; Returns: nil
+	;
+	; History:
+	; 28-Jan-2008	shobby	SRBR014754: Additional auditing information
+	; 21-Nov-2005	JW		SR13800: Created
+	;-------------------------------------------------------------------------------*/
+	do ^INARTHIST($listget(lst,1),$listget(lst,2),$listget(lst,3),$listget(lst,4),$listget(lst,5),
+				$listget(lst,6),$listget(lst,7),$listget(lst,8),$listget(lst,9),$listget(lst,10),
+				$listget(lst,11),$listget(lst,12),$listget(lst,13),$listget(lst,14),$listget(lst,15),
+				$listget(lst,16),$listget(lst,17),$listget(lst,18),$listget(lst,19),$listget(lst,20),
+				$listget(lst,21),$listget(lst,22),$listget(lst,23)) ;BR014754
+	quit
+	
+	
+GetWebServiceText()
+	;-------------------------------------------------------------------------------
+	; Returns string to be used to log web service operations and to recover
+	; reference text to Interface Batch 
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns: 
+	;
+	; History:
+	; 29-May-2007	HeberB		SRBR014304: created
+	;-------------------------------------------------------------------------------
+	new SPRACHE
+	
+	set SPRACHE="EN"
+	quit $$^WWWTEXT("Com00270")_" : "       ; "Update Stock"
+	
+]]></Routine>
+</Export>

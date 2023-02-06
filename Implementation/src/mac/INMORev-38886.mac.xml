@@ -1,0 +1,581 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INMORev" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INMORev
+	
+#include COMSYS
+#include INConst
+#include COMConst
+#include COMSYSNum
+#include %occConstant
+	
+	/******************************************************************************/
+	/*************** ON HOLD MOVED TO LATER 04-May-2010 ***************************/
+	/******************************************************************************/
+	
+OnBeforeSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Aug-2010	PPP		SR16573/1: Check for Reversal Qty
+	; 30-Apr-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$IsReturnDefaultDefined($$$INMORevSupplyingLocation(pYFELD)) {
+		set strStatus = $$$MakeStatus("IN01252",$$$INMORevSupplyingLocation(pYFELD))
+	} ; "No Customer Storage found for location %1"
+	
+	if $$$ISOK(strStatus) {
+		if ($$$INMORevReverseQuantity(pYFELD) > $$$INMORevReceivedQuantity(pYFELD)) {
+			set strStatus = $$$MakeStatus("IN01247")
+		 ; "Reverse Quantity cannot be greater than Received Quantity"
+	
+		} elseif ('$$$INMORevReverseQuantity(pYFELD) || ($$$INMORevReverseQuantity(pYFELD)<0)) {
+			set strStatus = $$$MakeStatus("IN00805")
+		 ; "Invalid Quantity"
+	
+		} else {
+			set strStatus = $$CheckInStock(pYKEY,+$$$INMORevReverseQuantity(pYFELD))
+		}
+	
+		if $$$ISOK(strStatus) {
+			set strStatus = $$$GRIDSave(YKEY)
+		}
+	}
+		
+	if $$$ISERR(strStatus) {	
+		do ReturnError^COMUtilError(strStatus)
+		set Q=$$$QDontSave
+	}
+	quit
+	
+	
+CheckInStock(pYKEY,pfltRev)
+	;-------------------------------------------------------------------------------
+	; Check if enough SOH for the Bundle in question
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Aug-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new arrBundles,fltQOH,idBundle,idItem,idReceipt,idRecLine,idStorage
+	new objRecLine,objRev,sc,strStatus
+	
+	//set objRev    = $get(^INMORev(0,pidRev,1))
+	//set fltRevQty = $$$INMORevReverseQuantity(objRev)
+	
+	set (strStatus,sc) = $$$OK
+	set idReceipt = $order(^INRECs(0,3,$$$Index(pYKEY),""))
+	
+	if idReceipt'="" {
+		set idRecLine  = $order(^INRECLine(0,idReceipt,""))
+		set objRecLine = $get(^INRECLine(0,idReceipt,idRecLine,1))
+		
+		set idItem     = $$$INRECLineItem(objRecLine)
+		set idStorage  = $$$INRECLineLocation(objRecLine)_"||"_$$$INRECLineStockLocation(objRecLine)
+	//	set idBundle   = $$$INRECLineBundle(objRecLine)
+
+		set sc 	= ##class(alSOH.iStockHistory).GetBundlesForRecLine(idItem,$$$INRECLineLocation(objRecLine),idReceipt,idRecLine,.arrBundles)
+
+		if $$$ISOK(sc) {		
+			set fltQOH =  0
+			set idBundle = ""
+			for {
+				set idBundle = $order(arrBundles(idBundle))
+				quit:idBundle=""
+				
+				set fltQOH = fltQOH + ##class(alSOH.iBundleStock).BundleSOH(idItem,idStorage,idBundle)	
+			}		
+		
+			if pfltRev > fltQOH {
+				set strStatus = $$$MakeStatus("IN01249",fltQOH,$$$INRECLineLocation(objRecLine),$$$INRECLineStockLocation(objRecLine))
+			} ; "Insufficient Stock available (%1) at Location %2 and Storage %3 to perform Reversal"
+		
+		} else {
+			set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+		}
+		
+	} else {
+		set strStatus = $$$MakeStatus("IN01250")		//Unable to continue Reversal as Receipt unavailable.
+	}
+	quit strStatus
+
+	
+OnBeforeButtonLine(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; Set form to readonly if not editable
+    ;
+    ; Params:	pYKEY		- Req id
+    ;
+    ; ByRef: 
+    ; 	YVOR		WWW122 record
+    ;
+    ; History:
+	; 11-May-2010	PPP		SR16573: Created
+    ;-------------------------------------------------------------------------------
+	if '$$Editable(pYKEY) {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+	}
+	quit
+	
+	
+Editable(pidMO) 
+    ;-------------------------------------------------------------------------------
+    ; Is form editable (unprocessed) ?
+    ;
+    ; Params:	pidMO - MO id
+    ;
+    ; Returns:	status
+    ;
+    ; History:
+	; 04-May-2010	PP		SR16573: Created
+    ;-------------------------------------------------------------------------------
+	new objMO,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$$$NoKey(pidMO) {
+		set objMO = $get(^INMORev(0,pidMO,1))
+		
+	 	if $$$INMORevStatus(objMO) > 0 {
+		 	set strStatus = $$$MakeStatus("IN01216")       ; "Order has been Firmed"
+	 	}
+	}
+	quit strStatus
+	
+	
+OnAfterPrimaryKey(pYKEY, &pYFELD)
+    ;-------------------------------------------------------------------------------
+    ; Update fields 
+    ;
+    ; Params:	pYKEY		- PO id
+    ;
+    ; ByRef: 
+    ;
+    ; History:
+	; 11-May-2010	PP		SR16573: Created
+    ;-------------------------------------------------------------------------------
+	new objINMO
+	
+	quit:pYKEY=""
+
+	set objINMO = $get(^INMO(0,pYKEY,1))
+	set $$$INMORevReceivedQuantity(pYFELD) = $$$INMOReceipt(objINMO)
+	
+	quit
+	
+	
+OnAfterDataFields(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 04-May-2010	PP		SR16573: Created
+	;-------------------------------------------------------------------------------	
+	new idIssue,idREC
+	
+	quit:pYKEY=""
+	
+	if $data(^INMORev(0,pYKEY)) {
+		if '$data(^INMORevLine(0,pYKEY)) {
+			do CreateRevLines(pYKEY,pYFELD)
+		    if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+				do GoToForm^COMUtilForm(YFORM,YKEY)
+			}
+		}
+		
+		//Create the Rev/Dismantle Lines if not yet created
+		do LoadINMORevLine(pYKEY,pYFELD)	
+	}
+		
+	quit
+	
+	
+LoadINMORevLine(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-May-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------	
+	new YFORM,YKEY,YAUSWAHL,YFELD
+	
+	set YFORM = "INMORevLine"			
+	set YKEY =  $get(pYKEY)
+ 
+	set $$$COMGridEditParameterSharedForm(YAUSWAHL)			= $$$YES
+	set $$$COMGridEditParameterMaximumHeight(YAUSWAHL)		= 200
+	set $$$COMGridEditParameterGridName(YAUSWAHL) 			= YFORM
+	set $$$COMGridEditParameterUpdateFields(YAUSWAHL) 		= ""
+	set $$$COMGridEditParameterClearFields(YAUSWAHL) 		= ""
+	set $$$COMGridEditParameterDefaultFields(YAUSWAHL) 		= ""
+	set $$$COMGridEditParameterContainer(YAUSWAHL) 			= "INMORev"
+	set $$$COMGridEditParameterEnabled(YAUSWAHL)			= ($$$INMORevStatus(pYFELD) = 0) ; open
+	set $$$COMGridEditParameterDontUpdateContainer(YAUSWAHL)= $$$YES
+	
+	do ^COMGridEdit31
+	do ^WWWVAR
+	
+	quit
+
+
+CreateRevLines(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Create the PO Rev Lines based on the Issue Lines and Receipt Lines
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Jan-2015	shobby	HEVA-1686.3: Try and get the correct line number from the new index on INIssueLine
+	; 14-Jan-2015	shobby	HEVA-1686: $$$Index should not be used on the ProductionOrder field.
+	; 11-May-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,fltIssued,fltQty,fltRevQty,idItem,idLine,idUnit
+	new objINMO,objINMOLine,objINMORevLine,strStatus
+	new idINMOIssue,idINMOIssueLine ;HEVA-1686.3
+	
+	set fltRevQty = $$$INMORevReverseQuantity(pYFELD)
+	
+	set objINMO = $get(^INMO(0,pYKEY,1))
+	set fltQty	= $$$INMOMinimumQuantity(objINMO)	
+	
+	set idLine = ""
+	for {
+		set idLine = $order(^INMOLine(0,pYKEY,idLine))
+		quit:idLine=""
+
+		set objINMOLine = $get(^INMOLine(0,pYKEY,idLine,1))
+
+		set idItem		= $$$INMOLineItem(objINMOLine)
+		set idUnit 		= $$$INMOLineUnit(objINMOLine)
+		set fltIssued	= $$$INMOLineQtyOrdered(objINMOLine)
+		set fltConv 	= $$GetUOMConversion^INUOMConversion(idItem, idUnit)
+		set objINMORevLine=""
+	    if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+			;HEVA-1686 set idINMOIssue = $order(^INIssues(YM,6,$$$Index(pYKEY),""))
+			set idINMOIssue = $order(^INIssues(YM,6,pYKEY,"")) 								;HEVA-1686 ;INIssue uses CacheIndex and doesn't require $$$Index
+			
+			; Following line is a bit strange.  The 'Reference' field contains the id of the Issue.
+			; I would have thought it should have been the INMO here.
+			set idINMOIssueLine=$order(^INIssueLines(0,1,$$$Index(idINMOIssue),$$$Index(idLine),idINMOIssue,""))		;HEVA-1686.3
+			
+			; New records have the Index.  If not use the idLine and hope for the best.		;HEVA-1686.3
+			if $translate(idINMOIssueLine," ")="" set idINMOIssueLine=idLine				;HEVA-1686.3
+			set objINMOIssueLine = ^INIssueLine(YM,idINMOIssue,idINMOIssueLine,1)			;HEVA-1686.3
+			;HEVA-1686.3 set objINMOIssueLine = ^INIssueLine(YM,idINMOIssue,idLine,1)
+			set $$$INMORevLineBundle(objINMORevLine)				= $$$INIssueLineBundle(objINMOIssueLine)
+		}
+		
+		set $$$INMORevLineItem(objINMORevLine)					= idItem
+		set $$$INMORevLineUnit(objINMORevLine)					= idUnit
+		//set $$$INMORevLineUnitQuantity(objINMORevLine) 			= fltIssued
+		//set $$$INMORevLineIssuedQuantity(objINMORevLine)		= fltConv * fltIssued
+		set $$$INMORevLineUnitQuantity(objINMORevLine) 			= (fltIssued/fltQty) * fltRevQty
+		set $$$INMORevLineIssuedQuantity(objINMORevLine)		= fltConv * $$$INMORevLineUnitQuantity(objINMORevLine)
+		set $$$INMORevLineReversedUnitQuantity(objINMORevLine)	= (fltIssued/fltQty) * fltRevQty
+		set $$$INMORevLineReversedQuantity(objINMORevLine)		= fltConv * $$$INMORevLineReversedUnitQuantity(objINMORevLine)
+		set strStatus = $$$Save("INMORevLine",pYKEY_","_idLine,objINMORevLine,1)		
+	}
+	quit
+	
+	
+IsFirmable(pidMORev)
+	;-------------------------------------------------------------------------------
+	; Checks whether the INMORev record can be firmed or not
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 11-May-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new blnFirmable,idRevLine,objINMORev,objINMORevLine,strStatus
+	
+ 	set strStatus   = $$$OK
+	set blnFirmable = $$$YES
+	
+	if (pidMORev'="") {
+		set objINMORev = $get(^INMORev(0,pidMORev,1))
+		
+		if ($$$INMORevStatus(objINMORev) > 0) {
+			set strStatus = $$$MakeStatus("IN00377")     ; "Record already processed"
+		
+		} elseif '$data(^INMORevLine(0,pidMORev)) {
+			set strStatus = $$$MakeStatus("IN00682")     ; "Please click save to enable"
+			
+		} else {
+			set idRevLine=""
+			for {
+				set idRevLine = $order(^INMORevLine(0,pidMORev,idRevLine))
+				quit:idRevLine=""
+				
+				set objINMORevLine = $get(^INMORevLine(0,pidMORev,idRevLine,1))
+				
+				if ($$$INMORevLineReversedQuantity(objINMORevLine)="") || ($$$INMORevLineBundle(objINMORevLine)="") {
+					set blnFirmable = $$$NO
+				} else {
+					set blnFirmable = $$$YES
+				}
+			}
+
+			if 'blnFirmable {
+				set strStatus = $$$MakeStatus("IN01225")
+			} ; "Please enter 'Reversed Quantity' and 'Lot' (select from the grid below) for all the lines"
+		}
+	}
+ 	$$$YQHandler(strStatus)
+ 	quit strStatus	
+	
+	
+FirmReverse(pidRev)
+	;-------------------------------------------------------------------------------
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Apr-2012	PPP		SR17983 : Ensure that the process cannot be duplicated
+	;						Cannot be run more than once.
+	; 11-May-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new fltQty,idLine,idMO,objINMO,objRec,strStatus
+	
+	//SR17983
+	set strStatus = $$IsFirmable(pidRev)
+
+	if $$$ISOK(strStatus) {
+		set strStatus = $$Transaction^COMTransaction("PostTxn^INMORev("""_pidRev_""")",$$$YES)
+	
+		if $$$ISOK(strStatus) {
+			if pidRev '="" {
+				set objINMO = $get(^INMO(0,pidRev,1))		
+				set $$$INMOStatus(objINMO) = 6				//Reversed
+				set strStatus = $$$Save("INMO",pidRev,objINMO,$$$YES)		
+			}
+		
+		}
+	
+	}
+
+	do ReloadForm^COMUtilForm()
+
+	quit strStatus
+	
+	
+UpdateHeader(pidRev) 
+	;-------------------------------------------------------------------------------
+	; Update INMORev record after processing
+	;
+	; Params:	pidRev - INMORev key
+	;
+	; ByRefs:
+	;
+	; Returns:	Status
+	;
+	; History:
+	; 12-May-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new objRevHeader,prevYBED,strStatus
+	
+	set objRevHeader = $get(^INMORev(0,pidRev,1))
+	
+	set $$$INMORevStatus(objRevHeader)     = $$$EnumINSTATUSProcessed
+	set $$$INMORevModifiedAt(objRevHeader) = $horolog
+	set $$$INMORevModifiedBy(objRevHeader) = $get(YBED,"UNKNOWN")
+	
+	//set prevYBED = YBED                                         ; FIXME : <GRF> This shouldn't be necessary - if it is
+	set strStatus = $$$Save("INMORev",pidRev,objRevHeader,$$$YES) ;     we need to fix where the problem is occurring
+	//set YBED = prevYBED
+	
+	quit strStatus
+	
+	
+PostTxn(pidRev)
+	;-------------------------------------------------------------------------------
+	; Post the Production Reverse Record
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Aug-2010	GRF		SR16573: Include Parent Item
+	; 13-Aug-2010	PPP		SR16573/1: Added check for existing Stock for Finished Product
+	; 11-May-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new arrRecDate,enumOrderUnit,fltOrderConv,fltRequiredQty,fltRevQty,idItem
+	new idOrder,idOrderLine,idParentItem,idReceipt,idRecLine,idRevLine,idStorage
+	new idSupplyLocn,objLine,objMO,objMove,objRec,objRec15,objRev,objULoc,objUStorage
+	new sc,strStatus
+	
+	set objRev       = $get(^INMORev(0,pidRev,1))
+	set idSupplyLocn = $$$INMORevSupplyingLocation(objRev)
+	set fltRevQty    = $$$INMORevReverseQuantity(objRev)
+
+	//SR16573/1
+	set strStatus = $$CheckInStock(pidRev,+fltRevQty)
+	
+	if $$$ISOK(strStatus) set strStatus = $$UpdateHeader(pidRev)
+	
+	set sc = $$$OK
+	set objMO 			= $get(^INMO(0,pidRev,1))
+	set idParentItem = $$$INMORevItemCode(objMO)
+	
+	; Reverse Header
+	;---------------------------------------
+	if $$$ISOK(strStatus) {
+		set idReceipt = $order(^INRECs(0,3,$$$Index(pidRev),""))
+
+		if idReceipt'="" {
+			set idRecLine = ""
+			for {
+				set idRecLine = $order(^INRECLine(0,idReceipt,idRecLine))
+				quit:idRecLine=""
+			
+				set objLine  = $get(^INRECLine(0,idReceipt,idRecLine,1))
+				set objRec15 = ##class(alREC.dUReceiptLine).%OpenId("0||"_idReceipt_"||"_idRecLine)
+			
+			//	set objMove  = ##class(alDRP.dMovement).%New()
+			//	set objMove.MovementType = ##class(alDRP.dMovementType.ManufacturingReceiptReverse).%New()
+				set objMove  = ##class(alMAN.dMovementReceiptReverse).%New()
+		
+				set idItem      = $$$INRECLineItem(objLine)
+				set idOrder     = $$$INRECLineOrder1(objLine)
+				set idOrderLine = $$$INRECLineOrderLine(objLine)
+			
+				set objMove.Item         = ##class(alINV.iUINV).GetItem(idItem)
+				set objMove.FromLocn     = ""
+				set objMove.FromStorage  = ""
+				set objMove.ToLocn       = ##class(alLOC.iLOC).GetLocation($$$INRECLineLocation(objLine))
+				set objMove.ToStorage    = ##class(alLOC.iLOC).GetStorage($$$INRECLineLocation(objLine),$$$INRECLineStockLocation(objLine))
+				set objMove.Reference    = pidRev
+				set objMove.LineNumber   = ""
+				set objMove.QtyPicked    = 0
+				set objMove.QtyReceived  = fltRevQty
+				set objMove.Supply       = ""
+				set objMove.Demand       = ""
+				set objMove.Completed    = $$$NO
+				set objMove.ExtendedCost = $justify(fltRevQty*$$$INRECLineEach(objLine),0,YDECIMALLEN)
+				set objMove.UnitCost     = $$$INRECLineEach(objLine)
+				set objMove.ReceiptDate  = +$horolog
+			
+				set objMove.QtyRequired  = fltRevQty
+			
+				set objMove.Bundle       = objRec15.Bundle
+				set objMove.OrderNumber  = idOrder
+				set objMove.OrderLine    = idOrderLine
+					
+				if $$$ISOK(sc) set sc = objMove.ChangeState(4)
+			
+				set:$$$ISERR(sc) strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+				quit:$$$ISERR(strStatus)
+		
+			}
+
+		}
+	
+	; Reverse Lines
+	;---------------------------------------
+		if $$$ISOK(strStatus) {
+			//set objRev = $get(^INMORev(0,pidRev,1))
+	
+			; Create Movement
+			;-----------------------------------
+			set idRevLine = ""
+			for {
+			
+				set idRevLine = $order(^INMORevLine(0,pidRev,idRevLine))
+				quit:idRevLine=""
+		
+				set objLine  = $get(^INMORevLine(0,pidRev,idRevLine,1))
+				set objMove  = ##class(alDRP.dMovement).%New()
+				set objMove.MovementType = ##class(alDRP.dMovementType.ManufacturingIssueReverse).%New()
+
+				set idItem       = $$$INMORevLineItem(objLine)
+				set objMove.Item = ##class(alINV.iUINV).GetItem(idItem)
+			//	set idOrder      = $$$INRECLineOrder1(objLine)
+			//	set idOrderLine  = $$$INRECLineOrderLine(objLine)
+		
+				set objMove.FromLocn    = ""
+				set objMove.FromStorage = ""
+
+				set objULoc				= ##class(alLOC.dULocation).%OpenId("0||"_idSupplyLocn)
+				set objUStorage 		= objULoc.GetDefaultManuReturnStorage(idItem,.sc)
+			
+				quit:$$$ISERR(sc)
+			
+				set idStorage 			= $piece(objUStorage.%Id(),"||",3)
+				set objMove.ToLocn   	= ##class(alLOC.iLOC).GetLocation(idSupplyLocn)
+				set objMove.ToStorage	= ##class(alLOC.iLOC).GetStorage(idSupplyLocn,idStorage)			
+			
+			 	set objMove.Bundle      = ##class(alSOH.dBundle).%OpenId($$$INMORevLineBundle(objLine))
+			 	; FIXME : should create bundle at receiving side
+ 
+	 		//	set objMove.DueDate     = %this.                      ; Not Implemented yet
+				set objMove.Reference   = pidRev
+				set objMove.LineNumber  = idRevLine
+				set objMove.QtyPicked   = 0
+				set objMove.QtyReceived = $$$INMORevLineReversedQuantity(objLine)
+				set objMove.QtyRequired = 0
+				set objMove.Supply      = ""
+				set objMove.Demand      = ""
+				set objMove.Completed   = $$$NO
+				set objMove.ParentItem	= idParentItem
+
+				if $$$ISOK(sc) set sc = objMove.ChangeState(4)	
+				quit:$$$ISERR(sc)
+			}
+			if $$$ISERR(sc) set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+		}
+	}	
+	quit strStatus
+
+
+IsReturnDefaultDefined(pidLoc)
+	;-------------------------------------------------------------------------------
+	; Check if the Default Manufacturing Return Storage is defined for Location
+	;
+	; Params:	pidLoc - ID of Location
+	;
+	; ByRefs:
+	;
+	; Returns:	Boolean
+	;
+	; History:
+	; 12-Aug-2010	PPP		SR16573: Created
+	;-------------------------------------------------------------------------------
+	new blnDefined,objULoc,objUStorage,sc
+	
+	set blnDefined = $$$NO
+	
+	set objULoc		= ##class(alLOC.dULocation).%OpenId("0||"_pidLoc)
+	set objUStorage = objULoc.GetDefaultManuReturnStorage(,.sc)
+
+	if objUStorage'=$$$NULLOREF set blnDefined = $$$YES
+
+	quit blnDefined
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VAREstoqueZerado" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[VAREstoqueZerado
+
+	#include COMSYS
+	#include VARConst
+
+	quit
+	
+	
+OnAfterSave
+	;OnAfterSave^VAREstoqueZerado
+	new Local
+	set Local = $get(VORG(1))
+	
+	set $piece(^VARTempEstoqueZerado(YBED),Y,1) = VORG(1)
+	set $piece(^VARTempGridEnable(YBED),Y,1)    = $$$YES
+	set $piece(^VARTempEstoqueZerado(YBED),Y,2)	= VORG(2)
+	set $piece(^VARTempEstoqueZerado(YBED),Y,3)	= VORG(3)
+	set $piece(^VARTempEstoqueZerado(YBED),Y,4)	= VORG(4)
+	
+	do VARLogAfterSave^VARUtil(YBED,YFORM)
+ 	do GoToForm^COMUtilForm("VAREstoqueZerado",Local,,,,,) 	
+	
+	quit	
+	
+	
+	
+OnAfterDataFields
+	;OnAfterDataFields^VAREstoqueZerado
+	
+	//Só apresenta os resultados da consulta caso o usuário tenha clicado no botão 'Ok' do form.
+	quit:('$$isAfterSaveLogged^VARUtil(YBED,YFORM))
+	do ClearVARLogAterSave^VARUtil(YBED,YFORM)
+	
+	set GridEnable = $piece(^VARTempGridEnable(YBED),Y,1)
+
+	if (GridEnable = $$$YES){
+		do MontaGrid
+	}
+	
+	quit
+	
+
+MontaGrid
+	;MontaGrid^VAREstoqueZerado
+	;
+	;Histórico
+	;
+	;2012-06-15		Lucas		Verificação do campo ControlarAutorizacaoProdutos na VARParametroCliente para filtrar na INDRPITEM ou não.
+	;2012-03-16		RGB			Refactoring da rotina, a rotina não deve utilizar a INDRPITEM para filtrar por local.
+	;							A INDRPITEM não é obrigatória nas versões recentes do alphalinc, assim, não é utilizada em alguns clientes.
+	;							Correção na pesquisa de grupo para pesquisar pelo código do grupo pai também
+	;2011-12-30		SLV			Adicionada a coluna "Grupo" e o filtro de ordenação.
+	;2010-07-07		Sósthenes	Correção da consulta e retirado a coluna de Custo Médio
+	;2010-04-26		Sósthenes	Ajustado a consulta SQL e modificado o método de geração do grid
+	;							para o devido funcionamento do filtro de local
+
+	new Produto,DescProduto,Unidade,CustoMedio,UltimoMovto
+
+	new filterItem, Item, Local, Storage, Quantidade, Lote, Validade, totalQty, isBlockedStorage,
+		prefixStyle, posfixStyle, reasonBlocked, descBlocked, checkAutorizacao
+		
+	set objAutorizacao   = ^VARParametroCliente(0,0,1)
+	set checkAutorizacao = $$$VARParametroClienteControlarAutorizacaoProdutos(objAutorizacao)
+	
+	set filterLocal = $get(VORG(1))
+	set filterMov   = $get(VORG(2))
+	set filterOrder = $get(VORG(3)) //1 - Código produto, 2 - Descrição produto,  3 - Data de Movimentação
+	set filterGrupo = $get(VORG(4))
+	
+	Set EstoqueZerado = ##class(%ResultSet).%New()  ;Create Result Set Object
+	/*
+	if filterLocal="" {
+	 	set meuSQL = "SELECT DISTINCT "
+		set meuSQL = meuSQL_"INART.ItemNumber as Produto, "
+		set meuSQL = meuSQL_"INART.SearchName as Descricao, "
+		set meuSQL = meuSQL_"$$SQLGetDescCompletaUnit^VARSQL(INART.UnitOfMeasure) as UnidadeMedida, "
+		set meuSQL = meuSQL_"INART.ItemGroup as Grupo, "
+	}else {
+		set meuSQL = "SELECT DISTINCT "
+		set meuSQL = meuSQL_"INDRPITEM.ItemNo as Produto, "
+		set meuSQL = meuSQL_"INDRPITEM.Description as Descricao, "
+		set meuSQL = meuSQL_"$$SQLGetDescCompletaUnit^VARSQL(INDRPITEM.UnitOfMeasure) as UnidadeMedida, "
+		set meuSQL = meuSQL_"$$SQLGetGrupoItem^VARSQL(INDRPITEM.ItemNo) as Grupo, "
+	}
+	*/
+	set meuSQL = "SELECT DISTINCT "
+	set meuSQL = meuSQL_"INART.ItemNumber as Produto, "
+	set meuSQL = meuSQL_"INART.SearchName as Descricao, "
+	set meuSQL = meuSQL_"$$SQLGetDescCompletaUnit^VARSQL(INART.UnitOfMeasure) as UnidadeMedida, "
+	set meuSQL = meuSQL_"INART.ItemGroup as Grupo, "
+	set meuSQL = meuSQL_"max(alSOH.dStockHistory.DateConfirmed) as Data, "
+	; DEPRECATED set meuSQL = meuSQL_"$$GetCostAsAtDate^INARTAVG(INART.ItemNumber) as CustoMedio, "
+	; set meuSQL = meuSQL_"$$GetCost^INItemCost(INART.ItemNumber,"_filterLocal_",9) as CustoMedio, " **Retirado
+	set meuSQL = meuSQL_"to_char(max(alSOH.dStockHistory.DateConfirmed),'DD/MM/YYYY') as UltimoMovto, "
+	set meuSQL = meuSQL_"nvl(alSOH.dStockHistory.Location->Code,1) as LocalUltimoMovto "
+	/*
+	if filterLocal="" {
+		set meuSQL = meuSQL_"FROM SQLUser.INART "
+		set meuSQL = meuSQL_"LEFT JOIN alSOH.dStockHistory on (INART.ItemNumber = alSOH.dStockHistory.Item) "
+		set meuSQL = meuSQL_"WHERE "
+		set meuSQL = meuSQL_"UPPER(INART.HoldReason) <> '1' AND "
+		set meuSQL = meuSQL_"INART.ItemNumber NOT IN (SELECT alSOH.dBundleStock.Item "
+	} else {
+		set meuSQL = meuSQL_"FROM SQLUser.INDRPITEM "
+		set meuSQL = meuSQL_"LEFT JOIN alSOH.dStockHistory on (INDRPITEM.ItemNo = alSOH.dStockHistory.Item) "
+		set meuSQL = meuSQL_"JOIN SQLUser.INART on alSOH.dStockHistory.Item = INART.ItemNumber "
+		set meuSQL = meuSQL_"WHERE "
+		set meuSQL = meuSQL_"UPPER(INART.HoldReason) <> '1' AND "
+		set meuSQL = meuSQL_"INDRPITEM.Location='"_filterLocal_"' "
+		set meuSQL = meuSQL_"AND INDRPITEM.ItemNo NOT IN (SELECT alSOH.dBundleStock.Item "
+	}
+	*/
+	set meuSQL = meuSQL_"FROM SQLUser.INART "
+	if (checkAutorizacao '= ""){
+		set meuSQL = meuSQL_"JOIN SQLUser.INDRPITEM on (INDRPITEM.ItemNo = INART.ItemNumber) "
+	}
+	if (checkAutorizacao '= ""){
+		set meuSQL = meuSQL_"LEFT JOIN alSOH.dStockHistory on (INDRPITEM.ItemNo = alSOH.dStockHistory.Item)  "
+	} else {
+		set meuSQL = meuSQL_"LEFT JOIN alSOH.dStockHistory on (INART.ItemNumber = alSOH.dStockHistory.Item) "
+	}
+	set meuSQL = meuSQL_"WHERE "
+	set meuSQL = meuSQL_"UPPER(INART.HoldReason) <> '1' AND "
+	
+	if (filterLocal '= "") {
+		if (checkAutorizacao '=""){
+			set meuSQL = meuSQL_"INDRPITEM.Location = '"_filterLocal_"' AND "	
+		}
+	}
+	set meuSQL = meuSQL_"INART.ItemNumber NOT IN (SELECT alSOH.dBundleStock.Item "
+	set meuSQL = meuSQL_"FROM alSOH.dBundleStock "
+	set meuSQL = meuSQL_"WHERE "
+	set meuSQL = meuSQL_"nvl(+alSOH.dBundleStock.QtyOnHand,0) > 0 "
+	if (filterLocal '= "") {
+		set meuSQL = meuSQL_"AND alSOH.dBundleStock.Storage->Location = '"_filterLocal_"' "
+	}
+	set meuSQL = meuSQL_"GROUP BY alSOH.dBundleStock.Item) "
+	if (filterMov = "1") {
+		set meuSQL = meuSQL_"AND alSOH.dStockHistory.DateConfirmed is not null "
+	}
+	if (filterMov = "2") {
+		set meuSQL = meuSQL_"AND alSOH.dStockHistory.DateConfirmed is null "
+	}
+	/*
+	if filterLocal="" {
+		if (filterGrupo '="") {
+			set meuSQL = meuSQL_"AND INART.ItemGroup = '"_filterGrupo_"' "
+		}
+		set meuSQL = meuSQL_"GROUP BY INART.ItemNumber "
+		if ((filterOrder = "") || (filterOrder = "1")) {
+			set meuSQL = meuSQL_"ORDER BY INART.ItemNumber"
+		} else {
+			set meuSQL = meuSQL_"ORDER BY INART.SearchName"
+		}
+	}else {
+		if (filterGrupo '="") {
+			set meuSQL = meuSQL_"AND $$SQLGetGrupoItem^VARSQL(INDRPITEM.ItemNo) = '"_filterGrupo_"' "
+		}
+		set meuSQL = meuSQL_"GROUP BY INDRPITEM.ItemNo "
+		if ((filterOrder = "") || (filterOrder = "1")) {
+			set meuSQL = meuSQL_"ORDER BY INDRPITEM.ItemNo "
+		} else {
+			set meuSQL = meuSQL_"ORDER BY INDRPITEM.Description"
+		}
+	}
+	*/
+	if (filterGrupo '="") {
+		set meuSQL = meuSQL_"AND (INART.ItemGroup = '"_filterGrupo_"' or $$SQLCompareGroupHierarchy^VARSQL(INART.ItemGroup,'"_filterGrupo_"')=1) "
+	}
+	set meuSQL = meuSQL_"GROUP BY INART.ItemNumber "
+	
+	if ((filterOrder = "") || (filterOrder = "1")) {
+		
+		set meuSQL = meuSQL_"ORDER BY INART.ItemNumber"
+		
+	} elseif (filterOrder = "2") {
+		
+		set meuSQL = meuSQL_"ORDER BY INART.SearchName"
+		
+	}elseif ((filterOrder = "3") && (filterMov = "1")) {
+		
+		set meuSQL = meuSQL_" ORDER BY Data"
+	} else {
+		$$$Alert("Só se pode ordenar por ""Data de Movimentação"" se o tipo de Movimentação for ""Somente com Movimentação""")
+		do GoToForm^COMUtilForm("VAREstoqueZerado","",,,,,)
+		quit
+		 	
+	}
+	Do EstoqueZerado.Prepare(meuSQL)  ;Prepare Query
+	Do EstoqueZerado.Execute()  ;Execute Query
+
+	
+	;do PrintHeader(filterItem)
+	
+	//Tabela
+   	new lstHeader
+ 	set lstHeader = ""
+  	//set lstHeader = lstHeader_$listbuild("Cód.","Produto","Unidade","Custo Médio (R$)","Último Movto.")
+  	set lstHeader = lstHeader_$listbuild("Cód.","Produto","Unidade","Grupo","Último Movto.")
+  	if $$Start^COMTable(lstHeader) {
+		set count = 0
+		set totalQty = 0
+		set ValorTotal = 0
+		
+		While (EstoqueZerado.Next()) {
+			
+			set Produto    			= EstoqueZerado.GetData(1)
+			set DescProduto			= EstoqueZerado.GetData(2)
+			set Unidade      		= EstoqueZerado.GetData(3)
+			set Grupo	      		= EstoqueZerado.GetData(4)
+			;set CustoMedio    		= EstoqueZerado.GetData(4) **Retirado
+			set UltimoMovto 		= EstoqueZerado.GetData(6)
+			set LocalUltimoMovto	= EstoqueZerado.GetData(7)	
+			
+			set TotalItem = 0
+		 	set objItem = $get(^INART(YM,Produto,1))
+		 	continue:objItem=""
+		 	continue:Produto=2
+			
+			//if Validade '= "" set Validade = $zdate(Validade,4)
+			
+			do NewLine^COMTable()
+	    	;do InsertCell^COMTable(count)
+	    	do InsertCell^COMTable(Produto)
+	    	do InsertCell^COMTable(DescProduto,,,,,,,,,1)
+	    	do InsertCell^COMTable(Unidade)
+	    	do InsertCell^COMTable("("_Grupo_") "_$$SQLGetDescGrupoItem^VARSQL(Grupo),,,,,,,,,1)
+	    	//do InsertCell^COMTable($$^WWWTR(0,12,CustoMedio,4),,,,"RIGHT") **Retirado
+	    	do InsertCell^COMTable(UltimoMovto,,,,"CENTER")
+	    	do EndLine^COMTable()
+		}
+		
+		do Stop^COMTable()	
+  	}
+	
+	do EstoqueZerado.Close()	
+	
+	quit
+	
+checkIfBlockedStorage(pidLocal,pidStorage)
+	if pidStorage = "" quit ""
+	quit $piece($get(^INLP(YM,pidLocal,pidStorage,1)),Y,8)	
+	
+	
+OnBeforeButtonLine(pYFELD)	
+	do LoadListaLocaisDeEstoque
+	quit
+ 	
+	
+LoadListaLocaisDeEstoque
+	;
+	;Popula COMTempList apenas com Locais de Estoque
+	;
+	
+	new CodLocal, NomeLocal, objLista, objUsuario, perfilUsuario,
+		locaisPermitidos
+	
+	set objLista = ""
+	
+	set objUsuario = $get(^WWW013(YM,YBED,1))		
+    set perfilUsuario = $$$WWW013UserAccess(objUsuario)
+	set locaisPermitidos = $$$WWW013AllowedLocations(objUsuario)
+	
+ 	kill ^COMTempList(YM,YUSER,"VARLocais")
+ 
+	&sql(
+		DECLARE CursorLocais CURSOR FOR 
+		SELECT Location, LocationName
+		INTO :CodLocal, :NomeLocal
+		FROM WWW0121
+ 		WHERE COMPANY = :YM
+ 		AND StorageLocn = 1
+ 		ORDER BY to_number(Location) )
+ 		
+	
+	&sql(OPEN CursorLocais)
+    IF (SQLCODE) {
+		QUIT
+    }
+    
+   	FOR { &sql(FETCH CursorLocais)
+		QUIT:SQLCODE
+		
+		; Caso o usuário não seja administrador e o local não esteja na
+		; lista de locais permitidos ao usuário, não popula
+		if ((perfilUsuario '= 1) &&
+			('$find(";"_locaisPermitidos_";", ";"_CodLocal_";"))) {
+			continue
+		}
+
+		set $piece(objLista, Y, 1) = NomeLocal
+		set ^COMTempList(YM,YUSER,"VARLocais",CodLocal,1)=objLista
+   	}
+ 
+   	&sql(CLOSE CursorLocais)
+ 
+	quit  
+	
+	
+Imprimir()
+	;do Imprimir^VAREstoqueZerado()
+	
+	set idLocal 		 = $get(VORG(1))
+	set idMovimentacao   = $get(VORG(2))
+	set idOrdenacao 	 = $get(VORG(3))
+	set idItemGroup		 = $get(VORG(4))
+	
+	set $piece(^VARTempGridEnable(YBED),Y,1) = $$$NO
+
+	
+	do RunReportEstoqueZerado^VARJasperRunReport(idLocal,idMovimentacao,idOrdenacao,idItemGroup)
+	
+	quit	
+	
+GetLocalFormulario()
+	if ($data(VORG(1)) = 0){
+		set $piece(^VARTempEstoqueZerado(YBED),Y,1) = YLOCATION
+	}
+	else {
+		set $piece(^VARTempEstoqueZerado(YBED),Y,1) = VORG(1)
+	}
+	set local = $piece(^VARTempEstoqueZerado(YBED),Y,1)
+	
+	quit local]]></Routine>
+</Export>

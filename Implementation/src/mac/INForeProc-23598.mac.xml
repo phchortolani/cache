@@ -1,0 +1,462 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INForeProc" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INForeProc  ; Forecast Process
+	
+#include INConst
+#include COMSYS
+	
+#def1arg TempStore(%1) ^CacheTemp(YUCI,YUSER,%1)
+	
+AfterDataField(Key="") 
+    ;-------------------------------------------------------------------------------
+    ; AfterDataFields
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 14-Sep-2004		SCR			Created
+    ;-------------------------------------------------------------------------------
+    if Key'="" {
+		do AfterDataField^COMSchedule(Key,"INFOREPROC","Process^INForeProc(´"_Key_"´)")
+    }
+    quit
+    
+Process(Key="")
+    ;-------------------------------------------------------------------------------
+    ; Process a Forecast
+    ;
+    ; Returns:1
+    ;
+    ; History:
+    ; 14-Sep-2006	JW			SRBR014083: Language text
+    ; 13-Apr-2005	Paul K		Return 1 to stop <command> error when called from COMSchedule.
+    ; 14-Sep-2004	SCR			Created
+    ;-------------------------------------------------------------------------------
+    new Log
+	  
+	do StartLog^COMLog($$$Text($listbuild("IN00542",Key)),.Log) 	;Forecast number %1		BR014083
+	job Start(Key,YUSER,YM,Log)
+ 
+	hang 2 ;wait for the process to start up
+ 
+	; Ready to goto the Detail form
+	do RedirectForm^COMUtils("COMMsg",Log,",","","")
+	quit 1
+ 
+OnBeforeDelete(pYKEY)
+    ;-------------------------------------------------------------------------------
+    ; If the process is being deleted then remove any schedules associated with it.
+    ; Otherwise the schedule will continue to run.
+    ;
+    ; Returns:1
+    ;
+    ; History:
+    ; 08-Oct-2007	shobby	SRBR014743:	Created
+    ;-------------------------------------------------------------------------------
+ 	new idSchedule,idINForeProc,strStatus
+ 	
+ 	set strStatus = $$$OK
+	
+	if '$$$NoKey(pYKEY) {
+		$$$Order4(^COMSchedules,YM,1,"INFOREPROC",idINForeProc)
+			if idINForeProc=pYKEY {
+				$$$Order5(^COMSchedules,YM,1,"INFOREPROC",idINForeProc,idSchedule)
+					set strStatus=$$$Kill("COMSchedule",idSchedule)
+					quit:$$$ISERR(strStatus)
+				$$$End
+			}
+			quit:$$$ISERR(strStatus)
+		$$$End
+	}
+	quit strStatus
+ 
+ 
+Start(Key="",YUSER="",Company="",Log="") 
+	;-------------------------------------------------------------------------------
+	; Start a Forecast Process
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Oct-2007	shobby	SRBR014743: Schedule should not recreate the process if
+	; 							it has been deleted.
+	; 13-Sep-2006	JW		SRBR014083: Added blnUpdate. Cleaned up. Lang texts.
+	; 21-Mar-2005	Paul K	Added Compile Lock
+	; 02-Mar-2005	Paul K	Reduce incidence of calling WWWVAR (SR#11305)
+	; 24-Nov-2004	SCR		Recompile Rule
+	; 21-Oct-2004	SCR		Added Create Demand Option
+	; 15-Sep-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+ 	new StartTime,ProcRec,Location,Suppliers,Planners,Groups
+ 	new Supplier,Planner,Group,LastTime,Item,ItemCount,Count
+ 	new LogEntry,ItemRec,DRPGroupRec,DRPItemRec,Add,idGroup,idPlanner,idSupplier
+ 	new RunDate,Rule,Create,blnUpdate
+ 	
+	set $ZTRAP="StartError"
+	
+	set StartTime=$zhorolog
+	kill ^mtemp($job)
+	if $get(Y)="" do ^WWWVAR
+	set:Company'="" YM=Company
+	if Log'="" do AddMessage^COMLog(Log,$$$Text("IN00535"))  ;Recompiling Rules		SRBR014083
+	do CompileAll^INForeRule(YM)
+	
+	lock +^INForeLock($job,$horolog)
+ 	
+	if Log'="" do AddMessage^COMLog(Log,$$$Text("IN00536"))  ;Forecast Started		SRBR014083
+	
+	if Key="" set Key=" "
+	set ProcRec=$get(^INForeProc(YM,Key,1))
+	if ProcRec'="" {   ;BR014743
+		set Location  = $$$INForeProcLocation(ProcRec)
+		set Rule      = $$$INForeProcBaseRule(ProcRec)
+		set RunDate   = $$$INForeProcRunDate(ProcRec)
+	 	set Create    = $$$INForeProcCreateDemands(ProcRec)
+	 	set blnUpdate = $$$INForeProcUpdateDRPSettings(ProcRec)		//SRBR014083
+	 	
+		if Location="" set Location=" "
+		set Count=0
+		set LastTime=$h
+	 
+		if Log'="" do AddMessage^COMLog(Log,$$$Text("IN00537"))  ;Removing results from last process run.	SRBR014083
+		do RemoveResultsForProcess^INForeRest(Key)
+		
+		if Log'="" do AddMessage^COMLog(Log,$$$Text("IN00538"),.LogEntry)	;Building Item List		SRBR014083
+	 
+		set Item=""
+		for ItemCount=0:1 {
+			set Item=$order(^INART(YM,Item))
+			quit:Item=""
+			
+			set idGroup=$$$INARTItemGroup($get(^INART(YM,Item,1)))
+			if ($$$INForeProcGroup1(ProcRec)="")||($find(";"_$$$INForeProcGroup1(ProcRec)_";",";"_idGroup_";")) {
+				set idPlanner=$$GetPlanner(Item,Location,idGroup,$$$INForeProcPlanners(ProcRec))
+				if ($$$INForeProcPlanners(ProcRec)="")||(idPlanner'="") {
+					set idSupplier=$$GetSupplier(Item,Location,idGroup,$$$INForeProcSuppliers(ProcRec))
+					if ($$$INForeProcSuppliers(ProcRec)="")||(idSupplier'="") {
+						set Count=Count+1
+						set ^mtemp($job,"i",Item)=idPlanner_Y_idGroup_Y_idSupplier
+					}
+				}
+			}
+			
+			if LastTime'=$h {
+				if Log'="" do AddMessage^COMLog(Log,$$$Text($listbuild("IN00539",ItemCount,Count)),.LogEntry)		;Building Item List, Checked %1 Found %2	SRBR014083
+				set LastTime=$h
+			}
+		}
+		if Log'="" do AddMessage^COMLog(Log,$$$Text($listbuild("IN00539",ItemCount,Count)),.LogEntry)		;Building Item List, Checked %1 Found %2	SRBR014083
+		kill LogEntry
+			
+		; Process Found Items
+		set Item=""
+		for ItemCount=0:1 {
+			set Item=$order(^mtemp($job,"i",Item))
+			quit:Item=""
+			
+			if LastTime'=$h {
+				if Log'="" do AddMessage^COMLog(Log,$$$Text($listbuild("IN00541",Item,ItemCount,Count)),.LogEntry)	;Processing, Item %1 %2 of %3		SRBR014083
+			}
+			do Run(Location,Item,Rule,RunDate,$piece($get(^mtemp($job,"i",Item)),Y,2),$piece($get(^mtemp($job,"i",Item)),Y,1),Create,$piece($get(^mtemp($job,"i",Item)),Y,3),Key,blnUpdate)
+	 
+		}
+		if Log'="" {
+			do AddMessage^COMLog(Log,$$$Text("IN00540"))	  ;Forecast Complete	SRBR014083
+		}
+		set $$$INForeProcProductCount(ProcRec) = Count
+		set $$$INForeProcLastRun(ProcRec)      = $horolog
+		set $$$INForeProcDuration(ProcRec)     = $zh-StartTime
+		
+		set ^INForeProc(YM,Key,1)=ProcRec
+	}
+ 	lock
+	
+	quit
+	
+ 
+StartError ; Internal Tag for Error Processing
+	if $get(Log)'="" do AddMessage^COMLog(Log,$$$Text(33029)_": "_$$$HTMLText($zerror))  ;Error		SRBR014083
+	quit
+	
+	
+GetPlanner(pidItem="",pidLocation="",pidGroup="",pstrApprovedPlanners="")
+	;-------------------------------------------------------------------------------
+	; Returns a planner for an item, will return nothing if planner not
+	; in pre-approved list.
+	;
+	; Returns:Planner(User)
+	;
+	; History:
+	; 09-Jun-2005	GRF		$$$INVORGDefaultItemGroup - name updated
+	; 21-Mar-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new idPlanners,idSuperGroup,arrPlanners,idPlanner,PlannerLoop
+	
+	set idPlanners=""
+	if pidItem'="" {
+		if pidGroup="" set pidGroup=$$$INARTItemGroup($get(^INART(YM,pidItem,1)))
+		if pidLocation'="" {
+			set idPlanners=$$$INDRPITEMPlanner($get(^INDRPITEM(YM,pidLocation,pidItem,1)))
+			if (idPlanners="") && (pidGroup'="") {
+				set idPlanners=$$$INDRPITEMPlanner($get(^INDRPITEMS(YM,pidLocation,pidGroup,1)))
+			}
+		}
+	}
+	if (idPlanners="") && (pidLocation'="") {
+		set idSuperGroup=$$$INVORGDefaultItemGroup($get(^INVORG(YM,YM,1)))
+		if (pidGroup'=idSuperGroup)&&(idSuperGroup'="") {
+			set idPlanners=$$$INDRPITEMPlanner($get(^INDRPITEMS(YM,pidLocation,idSuperGroup,1)))
+		}
+	}
+	
+	set idPlanner=""
+	if idPlanners'="" {
+		for PlannerLoop=1:1:$length(idPlanners,";") {
+			quit:idPlanner'=""
+			if (pstrApprovedPlanners="")||($find(";"_pstrApprovedPlanners_";",";"_$piece(idPlanners,";",PlannerLoop)_";")) {
+				set idPlanner=$piece(idPlanners,";",PlannerLoop)
+			}
+		}
+	}
+	quit idPlanner
+	
+	
+GetSupplier(pidItem="",pidLocation="",pidGroup="",pstrApprovedSuppliers="")
+	;-------------------------------------------------------------------------------
+	; Returns a supplier for an item, will return nothing if supplier not
+	; in pre-approved list.
+	;
+	; Returns:ID (Supplier)
+	;
+	; History:
+	; 09-Jun-2005	GRF		$$$INVORGDefaultItemGroup - name updated
+	; 08-Apr-2005	Paul K	Get supplier from INARTK if not in DRP (SR#12074)
+	; 21-Mar-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new idSupplier,idSuperGroup,arrPlanners,idPlanner
+	
+	set idSupplier=""
+	if pidItem'="" {
+		if pidGroup="" set pidGroup=$$$INARTItemGroup($get(^INART(YM,pidItem,1)))
+		if pidLocation'="" {
+			set idSupplier=$$$INDRPITEMSupplierOfStockOrder($get(^INDRPITEM(YM,pidLocation,pidItem,1)))
+			if (idSupplier="") && (pidGroup'="") {
+				set idSupplier=$$$INDRPITEMSupplierOfStockOrder($get(^INDRPITEMS(YM,pidLocation,pidGroup,1)))
+			}
+		}
+	}
+	if idSupplier="" {
+		set idSuperGroup=$$$INVORGDefaultItemGroup($get(^INVORG(YM,YM,1)))
+		if (pidGroup'=idSuperGroup)&&(idSuperGroup'="") {
+			set idSupplier=$$$INDRPITEMSupplierOfStockOrder($get(^INDRPITEMS(YM,pidLocation,idSuperGroup,1)))
+		}
+	}
+	if idSupplier="" {
+		if pidItem'="" {
+			set idSupplier=$order(^INARTK(YM,pidItem,""))
+		}
+	}
+	if (pstrApprovedSuppliers'="")&&('$find(";"_pstrApprovedSuppliers_";",";"_idSupplier_";")) {
+		set idSupplier=""
+	}
+	quit idSupplier
+	
+	
+Code(pidRule,pstrParameters) 
+    ;-------------------------------------------------------------------------------
+    ; Create Code to run
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 23-Nov-2004	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new strCode
+	set strCode="Rule^"_$$Rtn(pidRule)_"("_pstrParameters_")"  ; 
+	quit strCode
+	
+	
+Rtn(pidRule)
+    ;-------------------------------------------------------------------------------
+    ; Routine Name
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 23-Nov-2004	SCR		Created
+    ;-------------------------------------------------------------------------------
+	quit "INForeRuleComp"_YM_pidRule
+	
+	
+Run(Location="",Item="",Rule="",RunDate="",Group="",Planner="",Create=$$$NO,Supplier="",Process="",pblnUpdate=$$$NO) 
+    ;-------------------------------------------------------------------------------
+    ; Run Rule
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 04-Dec-2009	SCR		SRBR014376: Change INForeRestSet Primary key to counter
+	; 07-Apr-2008	STEVER	SRBR014376: Update Supplier
+    ; 13-Sep-2006	JW		SRBR014083: Added pblnUpdate. Cleaned up.
+    ; 10-May-2005	Paul K	Set supplier to "" if Supplier is " " (shouldn't populate with " ")
+    ; 17-Mar-2005	Paul K	Added return param to store result.
+    ; 23-Nov-2004	SCR		Changed Rule Access
+    ; 21-Oct-2004	SCR		Added Create Option
+    ; 20-Oct-2004	SCR		Added Group & Planner
+    ; 05-Oct-2004	SCR		Added Save Result Code (^INForeRest)
+    ; 16-Sep-2004	SCR		Created
+    ;-------------------------------------------------------------------------------
+	new Data,objResult,Duration,blnStoreResult,idRestSet
+	
+	quit:Rule=""
+ 
+	if Location="" set Location = " "
+	if Item=""     set Item     = " "	
+	if RunDate=""  set RunDate  = $horolog
+	if Supplier="" set Supplier = " "
+	set Duration = $zh
+	
+	if Create {
+		set Data("o","Create")=$$$YES
+		do RemoveDemands^INForeRun(Item,Location)
+	}
+	set Data("o","Update") = pblnUpdate			// SRBR014083
+ 	
+ 	set blnStoreResult = $$$NO
+	set objResult = ""
+ 	
+	xecute "set blnStoreResult=$$"_$$Code(Rule,"Item,Location,0,RunDate,.Data,.objResult,Planner,Supplier") 
+ 	
+ 	if blnStoreResult {
+	 	if Supplier=" " set Supplier = ""
+	 	
+	 	set Duration = $zh-Duration
+		
+	 	set $$$INForeRestCreated(objResult)  = RunDate
+	 	set $$$INForeRestDuration(objResult) = Duration
+	 	set $$$INForeRestPlanner(objResult)  = Planner
+	 	set $$$INForeRestGroup1(objResult)   = Group
+	 	set $$$INForeRestRule(objResult)     = Rule
+	 	set $$$INForeRestSupplier(objResult) = Supplier
+	 	set $$$INForeRestProcess(objResult)  = Process
+	 	do Save^COMUtils("INForeRest",Location_","_Item,objResult,1)
+		new intTemp,intData,objSet
+	
+		set intData = ""  ; begining of the Masterfile entries
+		for {   ; for each masterfile set
+			set intData = $order(Data("Masterfile",intData))
+			quit:intData=""
+			set objSet=$get(Data("Masterfile",intData))
+			do RemoveRestSet($$$INForeRestSetMasterfile(objSet),$$$INForeRestSetPrimaryKey(objSet))
+			
+			set idRestSet=$$^WWWNEXT("INForeRestSet")
+			do Save^COMUtils("INForeRestSet",idRestSet,objSet)
+		}
+ 	}
+ 
+	quit
+
+RemoveRestSet(pstrClass,pidKey)
+	;-------------------------------------------------------------------------------
+	; Remove existing Master Sets for the Class and Key
+	;
+	; Inputs: Class & Key
+	;
+	; Returns: Status
+	;
+	; History:
+	; 09-Dec-2009	SCR		SRBR014376: Created
+	;-------------------------------------------------------------------------------
+	new rs,sc,strStatus,strSQL,idRestSet,strID,intPK
+	
+	set strStatus=$$$OK
+	set rs=##class(%ResultSet).%New()
+	set strSQL = "select id from INForeRestSet where Masterfile = ? and PrimaryKey = ? "
+			
+	set sc=rs.Prepare(strSQL)
+	if $$$ISOK(sc) {
+		set sc=rs.Execute(pstrClass,pidKey) 
+	}
+	if $$$ISOK(sc) {		
+		for {
+			quit:'rs.Next()
+			set strID=rs.Data("ID")
+			set idRestSet=""
+			for intPK=2:1:$length(strID,"||") {
+				set $piece(idRestSet,",",intPK-1)=$piece(strID,"||",intPK)
+			}
+			set strStatus = $$$Kill("INForeRestSet",idRestSet)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	if $$$ISERR(sc) {
+		set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	}
+		
+	quit strStatus
+	
+	; FIXME : "p" prefixes and data type prefixes not present <GRF>
+RunIndependantRule(Location="",Item="",Rule="",RunDate="",Process="") 
+    ;-------------------------------------------------------------------------------
+    ; Run Rule
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 30-Apr-2009	PPP		SR16504: Created
+    ;-------------------------------------------------------------------------------
+	new blnStoreResult,Data,Duration,idGroup,idPlanner,idSupplier
+	new objResult,strData,strReturn
+ 
+	quit:Rule=""
+	quit:Item=""
+	quit:Location=""
+ 
+ 	if '$data($$$TempStore(Rule_"Run",Item,Location)) {
+		set idGroup    = $$$INARTItemGroup($get(^INART(YM,Item,1)))
+		set idPlanner  = $$GetPlanner(Item,Location,idGroup)
+		set idSupplier = $$GetSupplier(Item,Location,idGroup)
+		set $$$TempStore(Rule_"Run",Item,Location)=idGroup_Y_idPlanner_Y_idSupplier
+ 	
+ 	} else {
+		set strData    = $get($$$TempStore(Rule_"Run",Item,Location))
+		set idGroup    = $piece(strData,Y,1)
+		set idPlanner  = $piece(strData,Y,2)
+		set idSupplier = $piece(strData,Y,3)
+ 	}
+	
+	if RunDate=""    set RunDate    = $horolog
+	if idSupplier="" set idSupplier = " "
+	if idPlanner=""  set idPlanner  = " "
+ 
+	set Duration  = $zh
+	set strReturn = ""
+	
+ 	set blnStoreResult = $$$NO
+	set objResult      = ""
+ 	
+	xecute "set blnStoreResult=$$"_$$Code(Rule,"Item,Location,0,RunDate,.Data,.objResult,idPlanner,idSupplier") 
+ 	
+ 	if blnStoreResult {
+	 	if idSupplier=" " set idSupplier=""
+	 	
+	 	set Duration=$zh-Duration
+		
+	 	set $$$INForeRestCreated(objResult)  = RunDate
+	 	set $$$INForeRestDuration(objResult) = Duration
+	 	set $$$INForeRestPlanner(objResult)  = idPlanner
+	 	set $$$INForeRestGroup1(objResult)   = idGroup
+	 	set $$$INForeRestRule(objResult)     = Rule
+	 	set $$$INForeRestSupplier(objResult) = idSupplier
+	 	set $$$INForeRestProcess(objResult)  = Process
+	 	do Save^COMUtils("INForeRest",Location_","_Item,objResult,1)
+	
+	 	set strReturn = $get(Data("v",Rule_" Return"))
+ 	}
+  
+	quit strReturn
+ 
+ 
+]]></Routine>
+</Export>

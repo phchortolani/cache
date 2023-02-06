@@ -1,0 +1,487 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INWEAUF1" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INWEAUF1
+#include COMSYS
+#include INConst
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		VORGABE DER RECHNUNGSMENGEN
+	;
+	; Inputs : 
+	;
+	;
+	; ByRef :
+	; 	YKEY		idOrder,idOrderLine
+	; 	YFELD		objINWEAUF, objINWEAUFVOR (+?)
+	;
+	;
+	; Returns :
+	;
+	;
+	; History :
+	; 12-Oct-2006	GRF		Doco
+	; 24-Mar-2006	JW		SR14422: Encapsulated code
+	; 26-Oct-2005	PO		SR13702: Mantain greater level of accuracy for U/Ps
+	; 12-Oct-2005	PO		SR13608: Store the U/P without the Conversion Factor applied.
+	; 10.10.2000	DT
+	;-------------------------------------------------------------------------------
+	NEW AUF,POS,ME,ART,QKON
+	
+	set AUF = $$$KEY1(YKEY)     quit:AUF=""
+	set POS = $$$KEY2(YKEY)     quit:POS=""
+	
+	if $translate(YFELD,Y)="" { ;No data
+		set YFELD = $$GetDefaults(AUF,POS,.BETRIEB,.LAGERPLATZ,.WEDAT)
+	}
+	
+	quit
+	
+GetLocation(pidOrder,pidLine,&pidLocn,&pidStorage)
+	;-------------------------------------------------------------------------------
+	; Called By: GetDefaults
+	; 
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Apr-2009	GRF		Standard variables
+	; 29-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new QKON,idItem
+	
+	if pidLocn="" set pidLocn = $$$INAUFLocation($get(^INAUF(YM,pidOrder,1)))
+	if pidLocn="" set pidLocn = $get(YLOCATION)
+	if pidLocn="" set pidLocn = 1					//FIXME - may not have this location
+	
+	if (pidStorage'="") && '$data(^INLP(YM,pidLocn,pidStorage)) set pidStorage="" ; clear invalid storage
+	
+	; Determine storage
+	if pidStorage="" {
+		set QKON = $$$INAUFPQualityControl($get(^INAUFP(YM,pidOrder,pidLine,1)))
+		if QKON'="" {
+			set pidStorage = $$$INQPRUEFStockLocation($get(^INQPRUEF(YM,pidLocn,QKON,1)))  ; QA storage ;LAGERPLATZ GEM. QUALITÄTSPRÜFUNG
+		}
+		
+		set idItem = $$$INAUFPItemNumber($get(^INAUFP(YM,pidOrder,pidLine,1)))
+		
+		if (pidStorage="") && (idItem'="") {
+			set pidStorage = $order(^INARTLP(YM,idItem,pidLocn,""))  ;First item stock location 
+		}
+		
+		if pidStorage="" set pidStorage = $$$INVORGBOnHandLocation($get(^INVORGB(YM,YM,pidLocn,1)))  ; default storage 
+		if pidStorage="" set pidStorage = $order(^INLP(YM,pidLocn,""))                 ; no default - use first
+		if pidStorage="" set pidStorage = 0		//FIXME - will not have this storage if $order didn't return one
+	}
+	
+	quit
+	
+	
+GetDefaults(AUF,POS,&BETRIEB="",&LAGERPLATZ="",&WEDAT,pblnUpdateAll=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Get the defaults for a INWEAUF record.
+	;
+	; Called By: ^INWEAUF1, INReceiptLine, INRECLine, INWEAUFVOR
+	; 
+	; Params:	AUF 			- order
+	; 			POS				- order line
+	; 			pblnUpdateAll 	- update YFELD with extra data
+	;
+	; ByRefs:	BETRIEB			- (optional) location - updated if null
+	; 			LAGERPLATZ 		- (optional) storage  - updated if null
+	; 			WEDAT			- receipt date
+	;
+	; Returns:	nil
+	;
+	; History:
+	; 09-Apr-2009	PP/GRF	SR16478: make wider use of $$DPforInventoryCost^INVORG()
+	; 26-Jun-2006	GRF		SR14742: Doco
+	; 10-Apr-2006	JW		SR14421: Encapsulated GetLocation functionality
+	; 22-Mar-2006	JW		SR14422: Created. Encapsulated functionality from ^INWEAUF.
+	; 						Increment dated, added pblnUpdateAll
+	;-------------------------------------------------------------------------------
+	new ART,curSupUnitPrice,intDecPlaces,ME,objOrderSupp,QKON,VERFALL,WEMERKER,WEMENGE,VERSION,YFELD
+	
+	set WEDAT = +$horolog
+	set intDecPlaces = $$DPforInventoryCost^INVORG()
+	
+	;set BETRIEB  = ""
+	set VERFALL  = ""
+	set WEMERKER = ""
+	set WEMENGE  = ""
+	set VERSION  = ""
+	
+	do GetLocation(AUF,POS,.BETRIEB,.LAGERPLATZ)  ; validate Location & storage - replace with defaults if fails
+	
+	;---------------------------------------
+	;  Initialise ^INWEAUF from ^INAUFP, ^INART, ^INWESCHNELL, ^INERECH1, ^INAUFPK,
+	;                           ^INLIEF, ^WWWWAE, ^INAUFPA, ^INSHIPINFO, ^INSHIPINFOCOSTS
+	;    and returned values from $$^INARTKOST, $$^INQTYUNIT, IMPORT^INWEAUF1,
+	;                             $$IsDutiable^INWEAUF1, SetCountryOfOrigin^INWEAUF1
+	;  
+	;  D4		$$$INWEAUFIncomingGoodsQuantity()
+	;  D7		$$$INWEAUFSupplier()
+	;  D8		$$$INWEAUFUnitPrice()
+	;  D10		$$$INWEAUFIncomingGoodsFlags()
+	;  D11		$$$INWEAUFOrderDate()
+	;  D18		$$$INWEAUFQuantityUnit()
+	;  D25		$$$INWEAUFExpirationDate()
+	;  D48		$$$INWEAUFVersionRev()
+	;  D110		$$$INWEAUFPriceForeignCurrency()
+	;  D111		$$$INWEAUFExchangeRate()
+	;  D112		$$$INWEAUFCountryOfOrigin()
+	;  D115		$$$INWEAUFFinanceTxRef()
+	;---------------------------------------
+	
+	;WENN NEU KEINE VORGABE? ;when recent no 
+	;IF $PIECE(YFELD,Y,4)="" SET $PIECE(YFELD,Y,4)=$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5)  ;MENGE
+	SET $PIECE(YFELD,Y,7) = $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,12)  ;LIEFERANT ;supplier 
+	
+	;IF +$PIECE(YFELD,Y,4)'=0 SET $PIECE(YFELD,Y,8)=$J($PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,47)/$PIECE(YFELD,Y,4),0,4)  ;EK
+	SET ART = $$$INAUFPItemNumber($GET(^INAUFP(YM,AUF,POS,1)))
+	
+	//SR14422 - moved increment date into INWEAUFVOR
+	;IF $DATA(^INWEAUF(YM,AUF,POS,BETRIEB,LAGERPLATZ,WEDAT)) FOR  QUIT:'$DATA(^INWEAUF(YM,AUF,POS,BETRIEB,LAGERPLATZ,WEDAT))  SET WEDAT=WEDAT+1
+	
+	;VERSION BESTIMMEN ;ordain 
+	SET VERSION = $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,252)  ;VERSION LT. AUFTRAG ;order 
+	IF VERSION="" IF ART'="" DO
+	. SET VERSION = $PIECE($GET(^INART(YM,ART,1)),Y,203)  ;AKTUELLE ARTIKELVERSION
+	
+	;MENGE UND WE-MERKER AUS KURZERFASSUNG ÜBERNEHMEN ;quantity And out of assume 
+	IF ART'="" IF $DATA(^INWESCHNELL(YM,ART,BETRIEB,AUF,POS)) DO
+	. IF $PIECE(YFELD,Y,7)="" SET $PIECE(YFELD,Y,7)=$ORDER(^INWESCHNELL(YM,ART,BETRIEB,AUF,POS,""))
+	. QUIT:$PIECE(YFELD,Y,7)=""
+	. SET WEMENGE  = $PIECE($GET(^INWESCHNELL(YM,ART,BETRIEB,AUF,POS,$PIECE(YFELD,Y,7),1)),Y,1)
+	. SET WEMERKER = $PIECE($GET(^INWESCHNELL(YM,ART,BETRIEB,AUF,POS,$PIECE(YFELD,Y,7),1)),Y,2)
+	
+	IF ART'="" DO  ;VERFALLSDATUM
+	. IF $PIECE($GET(^INART(YM,ART,1)),Y,204)'="" SET VERFALL=$HOROLOG+$PIECE($GET(^INART(YM,ART,1)),Y,204)
+	
+	;ARTIKELKOSTEN = EINZULAGERNDER EINZEL-EK ;COST OF ITEM
+	;------------------------------------------------------
+	IF ART'="" SET $PIECE(YFELD,Y,8) = $$^INARTKOST(ART)  ;EK ;Planned Cost
+	IF $PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,47)'="" DO
+	. NEW MENGE,KOSTX
+	. ;
+	. ; FIXME : SR15107 - Use D109 Received quantity if non-null? <GRF>  using INERECH1 D16 so effectively
+	. ; 		doing this but what if received and not invoiced?    <DEFERRED FOR PURCHASE ORDER REVIEW>
+	. ; 
+	. SET MENGE=$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5)
+	. IF +MENGE=0 SET MENGE=1
+	. SET KOSTX=0
+	. IF $DATA(^INERECH1(YM,AUF,POS)) DO  //RECHNUNG BEREITS ERFASST ;INVOICE RECEIVED;FIS;21.07.04
+	. . NEW MENGEX,LIE,RECH,FACTOR
+	. . SET MENGEX=0
+	. . SET LIE=""
+	. . FOR  SET LIE=$ORDER(^INERECH1(YM,AUF,POS,LIE)) QUIT:LIE=""  DO
+	. . . SET RECH=""
+	. . . FOR  SET RECH=$ORDER(^INERECH1(YM,AUF,POS,LIE,RECH)) QUIT:RECH=""  DO
+	. . . . QUIT:$PIECE($GET(^INERECH1(YM,AUF,POS,LIE,RECH,1)),Y,80)'=""          ;SERVICE COSTS;FIS;11.04.05;27509
+	. . . . SET MENGEX(1) = +$PIECE($GET(^INERECH1(YM,AUF,POS,LIE,RECH,1)),Y,16)  ;RECHNUNGSMENGE
+	. . . . SET FACTOR    =  $PIECE($GET(^INAUFPK(YM,AUF,POS,1)),Y,41)            ;UMRECHNUNGSFAKTOR
+	. . . . IF +FACTOR'=0 SET MENGEX(1)=$JUSTIFY((MENGEX(1)/FACTOR),0,2)          ;VERARBEITUNGSEINHEIT
+	. . . . SET MENGEX = MENGEX+MENGEX(1)
+	. . . . SET KOSTX  = KOSTX+$PIECE($GET(^INERECH1(YM,AUF,POS,LIE,RECH,1)),Y,13)  ;FIS;23.02.05;27391
+	. . ;
+	. . IF MENGEX=0 SET KOSTX=0  ;KOSTEN OHNE MENGE NICHT BERÜCKSICHTIGEN;FIS;23.02.05;27391
+	. . IF MENGEX'=0 IF KOSTX'=0 SET MENGE=MENGEX  //RECHNUNGEN ERST TEILWEISE ERFASST; NOT ALL INVOICES RECEIVED YET
+	. ;
+	. ; SR16478 vvvvv
+	. ;IF KOSTX'=0 IF +MENGE'=0 SET $PIECE(YFELD,Y,8)=$JUSTIFY(KOSTX/MENGE,0,6)  ;EK ;Planned Cost
+	. ;IF KOSTX=0 SET $PIECE(YFELD,Y,8)=$JUSTIFY($PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,47)/MENGE,0,6)  ;FIS;23.02.05;27391
+	. if KOSTX'=0 if +MENGE'=0 set $piece(YFELD,Y,8) = +$justify(KOSTX/MENGE,0,intDecPlaces)  ;Planned Cost
+	. if KOSTX=0 do
+	. . set objOrderSupp = $get(^INAUFPK(YM,AUF,POS,1))
+	. . set curSupUnitPrice = $$$INAUFPKUnitPrice(objOrderSupp)
+	. . if 'curSupUnitPrice do
+	. . . if +MENGE'=0     set $piece(YFELD,Y,8) = +$justify($piece($get(^INAUFP(YM,AUF,POS,1)),Y,47)/MENGE,0,intDecPlaces)
+	. . if curSupUnitPrice set $piece(YFELD,Y,8) = +$justify(curSupUnitPrice,0,intDecPlaces)
+	. ; SR16478 ^^^^^
+	. SET $PIECE(YFELD,Y,8) = ($PIECE(YFELD,Y,8)*$$^INQTYUNIT(,AUF,POS))  ;RÜCKHOLEN PREIS PER PREISEINHEIT;FIS;28.02.05
+ 
+	; FOREIGN CURRENCY               FIS:26316;;25.08.04
+	;---------------------------------------
+	IF $PIECE(YFELD,Y,7)'="" IF $PIECE($GET(^INLIEF(YM,$PIECE(YFELD,Y,7),1)),Y,51)'="" IF $PIECE($GET(^INLIEF(YM,$PIECE(YFELD,Y,7),1)),Y,51)'=YWHR DO
+	. IF $DATA(^INAUFPK(YM,AUF,POS)) IF +$PIECE($GET(^INAUFPK(YM,AUF,POS,1)),Y,68)'=0 DO
+	. . if $$$INAUFPKConversionFactorQuantity($GET(^INAUFPK(YM,AUF,POS,1))) '= "" do
+	. . . ;SET $PIECE(YFELD,Y,110)=$justify($PIECE($GET(^INAUFPK(YM,AUF,POS,1)),Y,68) * $$$INAUFPKConversionFactorQuantity($GET(^INAUFPK(YM,AUF,POS,1))),0,2) ; SR13608
+	. . . SET $PIECE(YFELD,Y,110)=$PIECE($GET(^INAUFPK(YM,AUF,POS,1)),Y,68) * $$$INAUFPKConversionFactorQuantity($GET(^INAUFPK(YM,AUF,POS,1))) ; SR13608
+	. . . set $piece(YFELD,Y,110) = $justify($piece(YFELD,Y,110),0,intDecPlaces) ; SR13702
+	. . if $$$INAUFPKConversionFactorQuantity($GET(^INAUFPK(YM,AUF,POS,1))) = "" do
+	. . . SET $PIECE(YFELD,Y,110)=$PIECE($GET(^INAUFPK(YM,AUF,POS,1)),Y,68)
+	. . SET $PIECE(YFELD,Y,111)=$PIECE($GET(^INAUFPK(YM,AUF,POS,1)),Y,78)
+	. . IF $PIECE(YFELD,Y,111)="" SET $PIECE(YFELD,Y,111)=$PIECE($GET(^WWWWAE(0,$PIECE($GET(^INLIEF(YM,$PIECE(YFELD,Y,7),1)),Y,51),1)),Y,5)
+	. . SET $PIECE(YFELD,Y,8)=$JUSTIFY($PIECE(YFELD,Y,110)*$PIECE(YFELD,Y,111),0,2)
+	. . ;SET $PIECE(YFELD,Y,8)=(($PIECE(YFELD,Y,8)*(MENGE/$$^INQTYUNIT(,AUF,POS)))/MENGE)  ;FIS;PREISEINHEIT;28.02.05
+	. ;
+	. IF $DATA(^INAUFPA(YM,AUF,POS,$PIECE(YFELD,Y,7))) DO
+	. . NEW ABNR
+	. . SET ABNR=$ORDER(^INAUFPA(YM,AUF,POS,$PIECE(YFELD,Y,7),""),-1)
+	. . IF ABNR'="" IF +$PIECE($GET(^INAUFPA(YM,AUF,POS,$PIECE(YFELD,Y,7),ABNR,1)),Y,68)'=0 DO
+	. . . SET $PIECE(YFELD,Y,110)=$PIECE($GET(^INAUFPA(YM,AUF,POS,$PIECE(YFELD,Y,7),ABNR,1)),Y,68)
+	. . . SET $PIECE(YFELD,Y,111)=$PIECE($GET(^INAUFPA(YM,AUF,POS,$PIECE(YFELD,Y,7),ABNR,1)),Y,78)
+	. . . IF $PIECE(YFELD,Y,111)="" SET $PIECE(YFELD,Y,111)=$PIECE($GET(^INAUFPK(YM,AUF,POS,1)),Y,78)
+	. . . IF $PIECE(YFELD,Y,111)="" SET $PIECE(YFELD,Y,111)=$PIECE($GET(^WWWWAE(0,$PIECE($GET(^INLIEF(YM,$PIECE(YFELD,Y,7),1)),Y,51),1)),Y,5)
+	. . . SET $PIECE(YFELD,Y,8)=$JUSTIFY($PIECE(YFELD,Y,110)*$PIECE(YFELD,Y,111),0,2)
+	. . . ;SET $PIECE(YFELD,Y,8)=(($PIECE(YFELD,Y,8)*(MENGE/$$^INQTYUNIT(,AUF,POS)))/MENGE)  ;FIS;PREISEINHEIT;28.02.05
+	. ;
+	. IF $DATA(^INERECH1(YM,AUF,POS)) DO     ; "Edit Line Item Invoice"
+	. . NEW RECH,NKOMMA
+	. . SET RECH=$ORDER(^INERECH1(YM,AUF,POS,$PIECE(YFELD,Y,7),""),-1)
+	. . IF RECH'="" IF +$PIECE($GET(^INERECH1(YM,AUF,POS,$PIECE(YFELD,Y,7),RECH,1)),Y,68)'=0 DO
+	. . . ;SET NKOMMA=$PIECE($GET(^INERECH1(YM,AUF,POS,$PIECE(YFELD,Y,7),RECH,1)),Y,25)  ; FIXME : D25 is Supplier Invoice No <GRF>
+	. . . ;IF +NKOMMA=0 SET NKOMMA=$PIECE($GET(^INAUFPK(YM,AUF,POS,1)),Y,25)
+	. . . ;IF +NKOMMA=0 IF ART'="" SET NKOMMA=$PIECE($GET(^INARTK(YM,ART,$PIECE(YFELD,Y,7),1)),Y,25)
+	. . . ;IF +NKOMMA<2!(NKOMMA>4) SET NKOMMA=2
+	. . . SET NKOMMA=2
+	. . . SET $PIECE(YFELD,Y,110) = $PIECE($GET(^INERECH1(YM,AUF,POS,$PIECE(YFELD,Y,7),RECH,1)),Y,68)
+	. . . SET $PIECE(YFELD,Y,111) = $PIECE($GET(^INERECH1(YM,AUF,POS,$PIECE(YFELD,Y,7),RECH,1)),Y,78)
+	. . . IF $PIECE(YFELD,Y,111)="" SET $PIECE(YFELD,Y,111) = $PIECE($GET(^INAUFPK(YM,AUF,POS,1)),Y,78)
+	. . . IF $PIECE(YFELD,Y,111)="" SET $PIECE(YFELD,Y,111) = $PIECE($GET(^WWWWAE(0,$PIECE($GET(^INLIEF(YM,$PIECE(YFELD,Y,7),1)),Y,51),1)),Y,5)
+	. . . SET $PIECE(YFELD,Y,8) = $JUSTIFY($PIECE(YFELD,Y,110)*$PIECE(YFELD,Y,111),0,NKOMMA)
+	. . .;SET $PIECE(YFELD,Y,8)=(($PIECE(YFELD,Y,8)*(MENGE/$$^INQTYUNIT(,AUF,POS)))/MENGE)  ;FIS;PREISEINHEIT;28.02.05
+ 
+	DO IMPORT  ;IMPORT SERVICE COSTS;FIS;11.04.05;27509
+	
+	if $$$INWEAUFVORCDV(YFELD)="" set $$$INWEAUFVORCDV(YFELD)=$$$INWEAUFVORUnitPrice(YFELD) ;SR12408
+	
+	;SET $PIECE(YFELD,Y,8)=$JUSTIFY($PIECE(YFELD,Y,8),0,2) ; SR13702
+	SET $PIECE(YFELD,Y,8) = $JUSTIFY($PIECE(YFELD,Y,8),0,intDecPlaces)
+	;IF $GET(YFORM)="INWEAUFVOR"!($GET(YFORM)="INWEAUFVORAP") SET EINZELEK=$PIECE(YFELD,Y,8)
+	
+	IF $$$INWEAUFOrderDate(YFELD)="" SET $$$INWEAUFOrderDate(YFELD)=$$$INAUFPOrderPrintedDate($GET(^INAUFP(YM,AUF,POS,1)))  ;BESTELLUNG VOM ;sales order 
+	
+	SET ME=$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,40)   ; Order Unit
+	;IF ME'="" SET $PIECE(YFELD,Y,18)=$PIECE($GET(^WWW101(0,"EINHEIT",SPRACHE,ME,1)),Y,1)
+	IF ME'="" SET $PIECE(YFELD,Y,18)=ME  ;FIS:18.01.05;27189;NICHT ALS TEXT SPEICHERN
+ 	
+ 	if pblnUpdateAll {		//SR14422
+		SET $$$INWEAUFVersionRev(YFELD)  			= VERSION
+		SET $$$INWEAUFExpirationDate(YFELD) 		= VERFALL
+		SET $$$INWEAUFIncomingGoodsFlags(YFELD) 	= WEMERKER
+		SET $$$INWEAUFIncomingGoodsQuantity(YFELD)	= WEMENGE
+ 	}
+ 	
+	QUIT YFELD
+	
+IMPORT
+	;-------------------------------------------------------------------------------
+    ; ADD IMPORT SERVICE COSTS TO ITEM COST
+	;
+	; Called By: GetDefaults^INWEAUF1, ^INWEGESAMT
+	; 
+	; Returns:
+	; 
+	; ByRef:
+	; 	YFELD		INWEAUF, INWEAUFVOR, INWEGESAMT (+?)   [D112,115]
+	;
+	; History:
+	; 29-Sep-2006	GRF		Doco
+	; 09-Jun-2006	GRF		Doco
+	; 08-Jul-2005	shobby	SR12745 : (change not recorded)
+	; 10-Jun-2005	shobby	Was using incorrect POSX1.  SR12408
+	; 08-Jun-2005	shobby	Modified to apply service costs only if CUSTOMS duty is
+	; 						payable and the INSHIPINFOCOSTS is marked as 'Dutiable
+	; 						items only' SR12408
+	; 11.04.2005	FIS		27509
+	;-------------------------------------------------------------------------------
+	NEW ACKN,AUFX,COST,COSTTYPE,ESTCOST,IMPORT,POSX,POSX1,TOTAL,VOLUME
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;  COSTTYPE1	objINSHIPINFOCOSTS
+	;  POSX1		objINAUFP            (reset after calculating TOTAL)
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	IF $PIECE(YFELD,Y,7)'="" IF $DATA(^INAUFPA(YM,AUF,POS,$PIECE(YFELD,Y,7))) DO
+	. SET ACKN = ""
+	. FOR  SET ACKN = $ORDER(^INAUFPA(YM,AUF,POS,$PIECE(YFELD,Y,7),ACKN)) QUIT:ACKN=""  DO
+	. . SET IMPORT = $PIECE($GET(^INAUFPA(YM,AUF,POS,$PIECE(YFELD,Y,7),ACKN,1)),Y,61)
+	. . QUIT:IMPORT=""
+	. . ;
+	. . SET COSTTYPE = ""
+	. . FOR  SET COSTTYPE = $ORDER(^INSHIPINFOCOSTS(YM,IMPORT,COSTTYPE)) QUIT:COSTTYPE=""  DO
+	. . . SET COSTTYPE1 = $GET(^INSHIPINFOCOSTS(YM,IMPORT,COSTTYPE,1))
+	. . . IF +$PIECE(COSTTYPE1,Y,2)'=0 SET $PIECE(COSTTYPE1,Y,1)=$PIECE(COSTTYPE1,Y,2)  ;ACTUAL COSTS ALREADY EXISTS
+	. . . QUIT:+$PIECE(COSTTYPE1,Y,1)=0                           ;NO ESTIMATED COSTS
+	. . . QUIT:(+$PIECE(COSTTYPE1,Y,9)=0)&&(COSTTYPE'="CUSTOMS")  ;NO COST ALLOCATION , ignore if CUSTOMS SR12408
+	. . . QUIT:$PIECE(COSTTYPE1,Y,6)=""                           ;NO SERVICE SUPPLIER
+	. . . ;
+	. . . SET IMPORT(1)=$$^WWWUMLAU(IMPORT,1)
+	. . . SET TOTAL=0
+	. . . IF $PIECE(COSTTYPE1,Y,9)'=6 SET AUFX="" FOR  SET AUFX=$ORDER(^INAUFPAs(YM,2,IMPORT(1),AUFX)) QUIT:AUFX=""  DO
+	. . . . SET POSX=""
+	. . . . FOR  SET POSX=$ORDER(^INAUFPAs(YM,2,IMPORT(1),AUFX,POSX)) QUIT:POSX=""  DO
+	. . . . . SET POSX1=$GET(^INAUFP(YM,AUFX,POSX,1))
+	. . . . . IF +$PIECE(COSTTYPE1,Y,9)=6 QUIT               ;NO APPORTION, JUST ALLOCATION OF DUTY
+	. . . . . if $$IsDutiable(IMPORT,COSTTYPE1,AUFX,POSX) DO
+	. . . . . . ;If dutiable items and customs duty is to be paid SR12408
+	. . . . . . IF +$PIECE(COSTTYPE1,Y,9)=5 SET TOTAL=TOTAL+1                   ;APPORTION EVENLY
+	. . . . . . IF +$PIECE(COSTTYPE1,Y,9)=4 SET TOTAL=TOTAL+$PIECE(POSX1,Y,5)   ;APPORTION BY QUANTITY
+	. . . . . . IF +$PIECE(COSTTYPE1,Y,9)=3 SET TOTAL=TOTAL+$PIECE(POSX1,Y,43)  ;APPORTION BY WEIGHT
+	. . . . . . IF +$PIECE(COSTTYPE1,Y,9)=1 SET TOTAL=TOTAL+$PIECE(POSX1,Y,47)  ;APPORTION BY VALUE
+	. . . . . . IF +$PIECE(COSTTYPE1,Y,9)=2 DO                                  ;APPORTION BY VOLUME
+	. . . . . . . SET VOLUME = $PIECE(POSX1,Y,44)
+	. . . . . . . IF +VOLUME=0 IF $PIECE(POSX1,Y,40)=18  DO  ;VOLUMEN RECHNEN ;volume have faith in 
+	. . . . . . . . QUIT:+$PIECE(POSX1,Y,15)=0               ;LÄNGE  ;length 
+	. . . . . . . . QUIT:+$PIECE(POSX1,Y,16)=0               ;BREITE ;width 
+	. . . . . . . . QUIT:+$PIECE(POSX1,Y,17)=0               ;HÖHE   ;height 
+	. . . . . . . . SET VOLUME = $JUSTIFY(($PIECE(POSX1,Y,15)/1000)*($PIECE(POSX1,Y,16)/1000)*($PIECE(POSX1,Y,17)/1000),0,4)
+	. . . . . . . ;
+	. . . . . . . IF +VOLUME=0 IF ($PIECE(POSX1,Y,40)=5) || ($PIECE(POSX1,Y,40)=6) || ($PIECE(POSX1,Y,40)=12)  DO  ;VOLUMEN RECHNEN ;volume have faith in 
+	. . . . . . . . QUIT:+$PIECE(POSX1,Y,15)=0               ;LÄNGE  ;length
+	. . . . . . . . QUIT:+$PIECE(POSX1,Y,16)=0               ;BREITE ;width 
+	. . . . . . . . QUIT:+$PIECE(POSX1,Y,17)=0               ;HÖHE   ;height
+	. . . . . . . . SET VOLUME = $JUSTIFY(($PIECE(POSX1,Y,15)*$PIECE(POSX1,Y,16)*$PIECE(POSX1,Y,17)),0,4)
+	. . . . . . . ;
+	. . . . . . . SET TOTAL = TOTAL+VOLUME
+	. . . ;
+	. . . IF ($PIECE(COSTTYPE1,Y,9)'=6) && (COSTTYPE'="CUSTOMS") QUIT:TOTAL=0  ;FIS;19.11.2004;26593 ;SR12408 no total for customs
+	. . . ;
+	. . . ; Allocate the proportion of the total cost except when COSTTYPE=CUSTOMS in which case use the
+	. . . ; CUSTOMS calculation.
+	. . . SET POSX1=$GET(^INAUFP(YM,AUF,POS,1)) ;SR12408
+	. . . if COSTTYPE="CUSTOMS" do
+	. . . . // SR12745: Cannot round here because this COST is for a single unit
+	. . . . SET COST = $$DutiableRate(IMPORT,AUF,POS)*$$$INAUFPCost(POSX1)			// FIXME JW SR15142 - Cost already includes cutoms!!
+	. . . . do SetCountryOfOrigin(IMPORT,.YFELD)  ;SR12408
+	. . . ;
+	. . . if COSTTYPE'="CUSTOMS" do
+	. . . . SET COST=0
+	. . . . if $$IsDutiable(IMPORT,COSTTYPE1,AUF,POS) DO
+	. . . . . IF +$PIECE(COSTTYPE1,Y,9)=5 SET COST=($PIECE(COSTTYPE1,Y,1)/TOTAL)                       ;APPORTION EVENLY
+	. . . . . IF +$PIECE(COSTTYPE1,Y,9)=4 SET COST=($PIECE(COSTTYPE1,Y,1)/TOTAL)*$PIECE(POSX1,Y,5)     ;APPORTION BY QUANTITY
+	. . . . . IF +$PIECE(COSTTYPE1,Y,9)=3 SET COST=($PIECE(COSTTYPE1,Y,1)/TOTAL)*$PIECE(POSX1,Y,43)    ;APPORTION BY WEIGHT
+	. . . . . IF +$PIECE(COSTTYPE1,Y,9)=1 SET COST=($PIECE(COSTTYPE1,Y,1)/TOTAL)*$PIECE(POSX1,Y,47)    ;APPORTION BY VALUE
+	. . . . . IF +$PIECE(COSTTYPE1,Y,9)=2 DO                                                           ;APPORTION BY VOLUME
+	. . . . . . SET VOLUME=$PIECE(POSX1,Y,44)
+	. . . . . . IF +VOLUME=0 IF $PIECE(POSX1,Y,40)=18  DO  ;VOLUMEN RECHNEN ;volume have faith in 
+	. . . . . . . QUIT:+$PIECE(POSX1,Y,15)=0               ;LÄNGE  ;length 
+	. . . . . . . QUIT:+$PIECE(POSX1,Y,16)=0               ;BREITE ;width 
+	. . . . . . . QUIT:+$PIECE(POSX1,Y,17)=0               ;HÖHE   ;height
+	. . . . . . . SET VOLUME=$JUSTIFY(($PIECE(POSX1,Y,15)/1000)*($PIECE(POSX1,Y,16)/1000)*($PIECE(POSX1,Y,17)/1000),0,4)
+	. . . . . . ;
+	. . . . . . IF +VOLUME=0 IF ($PIECE(POSX1,Y,40)=5) || ($PIECE(POSX1,Y,40)=6) || ($PIECE(POSX1,Y,40)=12)  DO  ;VOLUMEN RECHNEN ;volume have faith in 
+	. . . . . . . QUIT:+$PIECE(POSX1,Y,15)=0               ;LÄNGE  ;length 
+	. . . . . . . QUIT:+$PIECE(POSX1,Y,16)=0               ;BREITE ;width 
+	. . . . . . . QUIT:+$PIECE(POSX1,Y,17)=0               ;HÖHE   ;height
+	. . . . . . . SET VOLUME=$JUSTIFY(($PIECE(POSX1,Y,15)*$PIECE(POSX1,Y,16)*$PIECE(POSX1,Y,17)),0,4)
+	. . . . . . ;
+	. . . . . . SET COST=(($PIECE(COSTTYPE1,Y,1)/TOTAL)*VOLUME)
+	. . . . . ;
+	. . . . . IF $PIECE(COSTTYPE1,Y,9)=6 DO  ;ALLOCATION OF DUTY ;FIS;19.11.04;26593
+	. . . . . . NEW DUTY,CODE,ORIGIN
+	. . . . . . SET CODE=$PIECE(POSX1,Y,3)   ;WARENNUMMER; DUTY CODE
+	. . . . . . IF CODE="" IF $PIECE(POSX1,Y,4)'="" SET CODE=$PIECE($GET(^INART(YM,$PIECE(POSX1,Y,4),1)),Y,3)
+	. . . . . . SET ORIGIN=""                ;URSPRUNGSLAND; COUNTRY OF ORIGIN
+	. . . . . . SET ORIGIN=$PIECE(YFELD,Y,112)
+	. . . . . . IF ORIGIN="" IF $PIECE(POSX1,Y,4)'="" IF $PIECE(POSX1,Y,12)'="" SET ORIGIN=$PIECE($GET(^INARTK(YM,$PIECE(POSX1,Y,4),$PIECE(POSX1,Y,12),1)),Y,27)
+	. . . . . . SET DUTY=0
+	. . . . . . IF CODE'="" IF ORIGIN'="" SET DUTY=$PIECE($GET(^INZOLLSATZ(YM,CODE,ORIGIN,1)),Y,1)  ;DRITTLAND; 3RD COUNTRY
+	. . . . . . IF +$PIECE(POSX1,Y,250)=0 SET $PIECE(POSX1,Y,250)=$PIECE(POSX1,Y,47)                ;URSPRÜNGLICHE KOSTEN ;ORIGIN ITEM COSTS
+	. . . . . . SET COST=(($PIECE(POSX1,Y,250)/100)*DUTY)
+	. . . ;
+	. . . ; Calculate Unit Cost
+	. . . ;	D5		$$$INAUFPQuantity()
+	. . . IF +$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5)'=0 SET COST=(COST/$PIECE($GET(^INAUFP(YM,AUF,POS,1)),Y,5))
+	. . . ;SET COST=$JUSTIFY(COST,0,2) ;SR12262  ;TODO
+	. . . ;
+	. . . ;;SET $PIECE(YFELD,Y,8)=$PIECE(YFELD,Y,8)+COST  ;INCREASE UNIT COST; NOT HERE -> ONLY FOR INWE
+	. . . SET $PIECE(YFELD,Y,115) = $PIECE(YFELD,Y,115)_"%3B"_COSTTYPE_"%7C"_COST  ;SAVE COST ELEMENT BREAKDOWN
+	
+	QUIT
+	
+SetCountryOfOrigin(pidImport="",YFELD="")
+    ;-------------------------------------------------------------------------------
+    ; Sets a default value for the country of origin if taken from INSHIPINFO
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 08-Jun-2005	shobby		Created SR12408
+    ;-------------------------------------------------------------------------------
+    new objINSHIPINFO
+    
+	if pidImport'="" {
+		set objINSHIPINFO = $get(^INSHIPINFO(YM,pidImport,1))
+		set $$$INWEAUFVORCountryOfOrigin(YFELD) = $$$INSHIPINFOCountryOfOrigin(objINSHIPINFO)
+	}
+	quit
+	
+	
+IsDutiable(pidImport="",pobjINSHIPINFOCOSTS="",pidOrder="",pidLine="")
+    ;-------------------------------------------------------------------------------
+    ; Determines if CUSTOMS is payable on this item.
+    ; Used to determine where a Service Cost that is marked as 'Dutiable Items Only'
+    ; is to be included in the allocation of the total service cost.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 08-Jun-2005	shobby	Created SR12408
+    ;-------------------------------------------------------------------------------
+	new blnFlag
+	
+	if $$$INSHIPINFOCOSTSDutiableItemsOnly(pobjINSHIPINFOCOSTS) {
+		set blnFlag = (+$$DutiableRate(pidImport,pidOrder,pidLine)'=0)
+	} else {
+		set blnFlag = $$$YES
+	}
+ 
+	quit blnFlag
+ 
+DutiableRate(pidImport,pidOrder,pidLine)
+    ;-------------------------------------------------------------------------------
+    ; Determines the rate of CUSTOMS payable on this item.
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 08-Jun-2005	shobby	Created SR12408
+    ;-------------------------------------------------------------------------------
+	new objINSHIPINFO,idItem,idSupplier,idCountry,idDate,objINAUFP,fltRate
+	
+	set fltRate = 0
+	if (pidOrder'="") && (pidLine'="") && (pidImport'="") {
+		set objINAUFP     = $get(^INAUFP(YM,pidOrder,pidLine,1))
+		set idItem        = $$$INAUFPItemNumber(objINAUFP)
+		set idSupplier    = $$$INAUFPSupplier(objINAUFP)
+	
+		set objINSHIPINFO = $get(^INSHIPINFO(YM,pidImport,1))
+		set idCountry     = $$$INSHIPINFOCountryOfOrigin(objINSHIPINFO)
+		set idDate        = $$$INSHIPINFOCustomsClearance(objINSHIPINFO)
+	
+		set fltRate = $$GetRate^INARTKCountryCustom(idItem_","_idSupplier_","_idCountry,idDate)/100
+	}
+	quit fltRate
+ 
+INFO ;DISPLAY COST INFORMATIONS;FIS;11.04.05;27509
+	new objLine
+	
+	if ($$$KEY1(YKEY)'="") && ($$$KEY2(YKEY)'="") {
+		set objLine = $get(^INAUFP(YM,$$$KEY1(YKEY),$$$KEY2(YKEY),1))
+		
+		if ($$$INAUFPPriceUnit(objLine)>1) {  ; if multiple units - e.g. price based on 100 cartons
+			write $$^INARTPE($$$INAUFPItemNumber(objLine),$$$INAUFPQuantityUnit(objLine))  ; FIXME : Verify don't want D449 now
+		}
+	}
+	
+	IF $PIECE(YFELD,Y,115)'="" IF $FIND(YFELD,"%3B") DO
+	. NEW YI
+	. WRITE "<BR><B><U>"_$$^WWWFELDNAME("INSHIPINFOCOSTS","P",2)_"</U></B>"
+	. FOR YI=1:1  QUIT:$PIECE($PIECE(YFELD,Y,115),"%3B",YI,YI+99)=""  DO
+	. . SET YI(1) = $PIECE($PIECE($PIECE(YFELD,Y,115),"%3B",YI),"%7C",1)
+	. . SET YI(2) = $PIECE($PIECE($PIECE(YFELD,Y,115),"%3B",YI),"%7C",2)
+	. . IF (YI(1)="") || (+YI(2)=0) QUIT  ;NO SERVICE COST
+	. . WRITE "<BR>"
+	. . WRITE $PIECE($GET(^INPARA(YM,"KOSTENARTEN",SPRACHE,YI(1),1)),Y,1)
+	. . WRITE ":&nbsp;"
+	. . WRITE $$^WWWZAHL(YI(2),0,2,YWHR)
+	
+	QUIT
+	
+]]></Routine>
+</Export>

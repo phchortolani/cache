@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INStocktakeCount" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INStocktakeCount
+#include COMSYS
+#include INConst
+#include %occInclude
+	
+CreateFirstCount(pidStocktake)
+	;-------------------------------------------------------------------------------
+	; Create the first count. Now very simple and direct.
+	;
+	; Params:
+	; 	pidStocktake, the stocktake number
+	;
+	; Returns: 
+	;
+	; History:
+	; 23-Sep-2008	GRF		SR15810: Rewritten to remove unnecessary extra calls
+	; 15-Nov-2007	PJones  BR014770, created
+	;-------------------------------------------------------------------------------
+	new idLine,objCount
+	
+	set idLine=""
+	for {
+		set idLine=$order(^INWEINV(YM,pidStocktake,idLine))
+		quit:idLine=""
+		
+		set objCount = $$CreateCount(pidStocktake,idLine,1,"","")
+	}
+	do IncrementStocktakeCount(pidStocktake)
+  	quit
+  	
+	
+CreateCount(pidStocktake,pidLine,pidCount,pfltQty,ptmeCounted)
+	;-------------------------------------------------------------------------------
+	; originally (fltQty,time,pidStocktake,pidLine,pidCount) 
+	; Create a new stocktake count object and save it into INWEINVCount table
+	; 
+	; INWEINVCount holds the per-count information about a particular stocktake snapshot line
+	; History:
+	; 23-Sep-2008	GRF		SR15810: Rewritten to remove unnecessary extra calls
+	;-------------------------------------------------------------------------------
+	new objStocktakeCount,strKeys,strStatus
+	
+	set objStocktakeCount = ""
+	set $$$INWEINVCountQuantity(objStocktakeCount)   = pfltQty
+	set $$$INWEINVCountTimestamp1(objStocktakeCount) = ptmeCounted
+ 
+	set strKeys   = pidStocktake_$$$COMMA_ pidLine_$$$COMMA_ pidCount
+	set strStatus = $$$Save("INWEINVCount",strKeys,objStocktakeCount,1)
+	quit strStatus
+	
+	
+IncrementStocktakeCount(pidStocktake)
+	;-------------------------------------------------------------------------------
+	;-------------------------------------------------------------------------------
+	new objStocktake,strStatus
+	
+	set objStocktake = $get(^INWEINVP(YM,pidStocktake,1))
+	set $$$INWEINVPNumberofCounts(objStocktake) = $$$INWEINVPNumberofCounts(objStocktake) + 1
+	set strStatus = $$$Save("INWEINVP",pidStocktake,objStocktake,1)
+	quit
+	
+	
+CloseCountButton(pidStocktake)
+	;-------------------------------------------------------------------------------
+	; The "close count" button on INWEINVD should call this routine, 
+	; it will call the main close function and then follow through to the next form
+	; 
+	; This routine exists to separate the user-interface action from the model logic
+	; and could be over-ridden if necessary
+	; 
+	; Params: 
+	;	pidStocktake, the stocktake id
+	;
+	; Returns: the status from trying to close the count
+	;
+	; History:
+	; 14-Oct-2008	GRF		SR15810: Reworked from CloseCountButtonHandler^INStocktaking
+	; 							with Unique Bundle check
+	; 21-Jan-2008	GRF		Added missing SR details below
+	; 13-Nov-2007	shobby	SRBR014557: Redirect to the same form with the key loaded.
+	; 09-Nov-2007	PJones	SRBR014771: created
+	;-------------------------------------------------------------------------------
+	new intMaxCounts,objStocktake,strStatus
+	
+	set objStocktake = $get(^INWEINVP(YM,pidStocktake,1))
+ 
+	set intMaxCounts = $$$INVORGStocktakeMaxCount($get(^INVORG(YM,YM,1)))
+	set strStatus    = $$CheckIfCanClose(pidStocktake,objStocktake,intMaxCounts)
+	if $$$ISOK(strStatus) {
+		set strStatus = $$CheckUnique(pidStocktake,$$$INWEINVPRemark(objStocktake))
+	}
+ 
+	if $$$ISOK(strStatus) {
+		set $$$INWEINVPStatus(objStocktake) = $$$EnumINSTOCKTAKESTATUSCountComplete
+		set strStatus = $$$Save("INWEINVP",pidStocktake,objStocktake,1)
+	
+	} else {
+		$$$Alert(strStatus)
+		$$$YQHandler(strStatus)
+	}
+	do RedirectForm^COMUtilForm(YFORM,pidStocktake,YBACK,YPARA,YSEITE)
+	;do GoToForm^COMUtilForm("COMMsg",idLog)   ; Ready to goto the Detail form    ; TODO - can we do this instead of displaying idLog in alert?
+ 
+	quit strStatus
+	
+	
+CanCloseCount(pidStocktake,pidCount="")
+	;-------------------------------------------------------------------------------
+	; Wrapper for CheckIfCanClose
+	; 
+	; Called By: INWEINVD - Button 9 via routine INWEINVD
+	; 
+	; History:
+	; 14-Oct-2008	GRF		SR15810: Created
+	;-------------------------------------------------------------------------------
+	new objStocktake
+	
+	set objStocktake = $get(^INWEINVP(YM,pidStocktake,1))
+	quit $$CheckIfCanClose(pidStocktake,objStocktake,pidCount)
+	
+	
+CheckIfCanClose(pidStocktake,pobjStocktake,pidCount="") private
+	;-------------------------------------------------------------------------------
+	; Returns : $$$OK if we can close a particular count for this stocktake
+	; 
+	; Note : you can only close a count if *all* INWEINVCounts have 
+	; had some value entered into them and you are in a CountOpen status
+	;	
+	; Params: 
+	;	pidStocktake, the stocktake id
+	;	pidCount, which count number do we want to close?
+	;
+	; History:
+	; 14-Oct-2008	GRF		SR15810: Reworked from CanCloseCount^INStocktaking;
+	; 							added bundle check; Correct status if not open; do
+	; 							NOT get global records through routine calls
+	; 05-Nov-2007	PJones	SRBR014730: created (also SRBR014771)
+	;-------------------------------------------------------------------------------
+	new idLine,idCount,objCount,objSTLine,strStatus
+	
+	set strStatus = $$$OK
+	
+	if pidCount = "" {
+		; if count arg is not given or empty, we'll use the latest
+		set pidCount = $$$INWEINVPNumberofCounts(pobjStocktake)
+		if 'pidCount set pidCount=1
+	}
+	
+	if $$$INWEINVPStatus(pobjStocktake) '= $$$EnumINSTOCKTAKESTATUSCountOpen {
+		set strStatus = $$$MakeStatus("IN00780")   ; "It was not possible to close the counting due to wrong status."
+	}
+	
+	if $$$ISOK(strStatus) {
+		set idLine=""
+		for {
+			set idLine=$order(^INWEINV(YM,pidStocktake,idLine))
+			quit:idLine="" 
+			
+			set objCount = $get(^INWEINVCount(YM,pidStocktake,idLine,pidCount,1))
+			if objCount '= "" {
+				set objSTLine = $get(^INWEINV(YM,pidStocktake,idLine,1))
+				if ($$$INWEINVCountQuantity(objCount) = "") && ($$$INWEINVStockType(objSTLine) '= "R") {
+					set strStatus = $$$MakeStatus("IN00789",idLine)
+			;	"You can't close the count because some items have not been counted. Check the snapshot line %1"
+					quit
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+CheckUnique(pidStocktake,pstrRemark)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 14-Oct-2008	GRF		SR15810: Apply to Count Close check since Pre-Post check
+	; 							is too late.
+	;-------------------------------------------------------------------------------
+	new arrMatches,idBundle,idItem,idLocn,idLog,idStore,strLines,strStatus
+	
+	set strStatus = $$$OK
+	if pstrRemark'="" {
+		set pstrRemark = " ("_pstrRemark_")"
+	}
+	
+	if '$$AreBundlesUnique^INStocktakeUtil(pidStocktake,.arrMatches) {
+		; "Close Stocktake Count Check"
+		do StartLog^COMLog($$$Text("IN00846")_" "_pidStocktake_pstrRemark,.idLog)
+		set strStatus = $$$MakeStatus("IN00845",idLog)   ; "Cannot close while duplicated entries exist - See Message Log %1 for details"
+		do AddMessage^COMLog(idLog,$$$Text("IN00843"))   ; "Cannot close while duplicated entries exist"
+		
+		set idItem = ""
+		for {
+			set idItem = $order(arrMatches(idItem))
+			quit:idItem=""
+			
+			set idLocn = ""
+			for {
+				set idLocn = $order(arrMatches(idItem,idLocn))
+				quit:idLocn=""
+				
+				set idStore = ""
+				for {
+					set idStore = $order(arrMatches(idItem,idLocn,idStore))
+					quit:idStore=""
+					
+					set idBundle = ""
+					for {
+						set idBundle = $order(arrMatches(idItem,idLocn,idStore,idBundle))
+						quit:idBundle=""
+						
+						set strLines = $get(arrMatches(idItem,idLocn,idStore,idBundle))
+						do AddMessage^COMLog(idLog,$$$Text("IN00844")_": "_strLines)  ; "Duplication on stocktake lines"
+					}
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+]]></Routine>
+</Export>

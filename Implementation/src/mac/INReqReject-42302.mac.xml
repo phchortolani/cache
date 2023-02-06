@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INReqReject" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INReqReject
+	
+#include COMGridEdit31
+#include COMSYS
+#include COMConst
+#include COMGridEdit31
+#include INConst
+#include %occInclude
+	
+#define FormFldINReqRejectAll  13
+	
+OnBeforeDelete(pYM,pYFORM,pstrKey,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 22-Apr-2010	shobby	SR17267: Created - call INReq equivalent method
+	;-------------------------------------------------------------------------------
+	do OnBeforeDelete^INReq(pYM,pYFORM,pstrKey,pYFELD,"INReqRejectLine")
+	quit
+	
+	
+OnBeforeButtonLine(pYM,pYFORM,pintPage,pYKEY,&pYFELD)
+	;-------------------------------------------------------------------------------
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 21-Jan-2009	HQN		SR19296: Created
+	;-------------------------------------------------------------------------------
+	set YOPTION = 2
+	if '$$IsRejectable^INReq(pYKEY) {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+	}
+	if ($$$INReqStatus(pYFELD) = 8) || ($$$INReqStatus(pYFELD) = 9) {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+	}
+	quit
+	
+	
+OnAfterDataFields(pYM,pYFORM,pintPage,pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 21-Jan-2009	HQN		SR19296: Created
+	;-------------------------------------------------------------------------------
+	new strOldYFORM
+	
+	if (pintPage = 1) && (pYKEY '= $$$NULLOREF) {
+		kill ^CacheTempLocked(YUSER)
+		do ClearOld^WWWMultiLock(YUSER)
+		set strOldYFORM = YFORM
+		set YFORM = "INReqLineReject"
+		set $$$COMGridEditParameterSharedForm(YAUSWAHL)    = $$$YES
+		set $$$COMGridEditParameterMaximumHeight(YAUSWAHL) = 400
+		set $$$COMGridEditParameterGridName(YAUSWAHL)      = YFORM
+		set $$$COMGridEditParameterContainer(YAUSWAHL)     = "INReqReject"
+		set $$$COMGridEditParameterEnabled(YAUSWAHL)       = $$$YES
+		if '$$IsRejectable^INReq(pYKEY) {
+			set $$$COMGridEditParameterEnabled(YAUSWAHL)   = $$$NO
+		}
+		
+		do Start^COMGridEdit31(YFORM,pYKEY)
+		set YFORM = strOldYFORM
+	}
+	quit
+	
+	
+OnBeforeSave(pYM,pYFORM,pstrKey,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Validate that either the INReq has a reason or at least one line is marked as
+	; Rejected and has a corresponding reason
+	; 
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 15-Jul-2009	DWR		SR :     added missing digit in IN(0)1056
+	; 22-Jan-2009	HQN		SR19296: Created
+	;-------------------------------------------------------------------------------
+	new blnReasonFound,dteToday,loopLines,strStatus
+	
+	set strStatus = $$$OK
+	set Q = $$$QSave
+
+	set dteToday = +$horolog
+	if $$$INReqReasonRejection(pYFELD) = "" {         ; find reasons on lines
+		set blnReasonFound = $$$NO
+		for loopLines=1:1:^WWWDATEN(0,dteToday,YUSER,"INReqLineReject","V","ROWCOUNT") {
+			if ^WWWDATEN(0,dteToday,YUSER,"INReqLineReject","V","Y"_loopLines_"_"_$$$GetFormField("INReqLineReject",$$$FldINReqLineRejected),1)=$$$YES {
+				if ^WWWDATEN(0,dteToday,YUSER,"INReqLineReject","V","Y"_loopLines_"_"_$$$GetFormField("INReqLineReject",$$$FldINReqLineReasonRejection),1)'= "" {
+					set blnReasonFound = $$$YES
+					quit ; for break
+				}
+			}
+		}
+		if 'blnReasonFound {
+			set strStatus = $$$MakeStatus("IN01056")       ; "Cannot process without a reason"
+			set Q = $$$QDontSave
+		}
+	}
+ 	if Q=$$$QSave {
+	 	if $$$ISOK(strStatus) set strStatus = $$$GRIDSave(pstrKey)
+ 	}
+ 	if $$$ISERR(strStatus) {
+	 	do ReturnError^COMUtilError(strStatus)
+	 	set Q = $$$QDontSave
+ 	}
+	quit
+	
+	
+OnAfterSave(pYM,pYFORM,pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Save of reasons ok, attempt to manually-close
+	; 
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 21-Apr-2010	GRF		-: Logic reversal for clarity
+	; 15-Jun-2009	DWR		SR16544: replaced DEV0000 with language text entry
+	; 22-Jan-2009	HQN		SR19296: Created
+	;-------------------------------------------------------------------------------
+	new idReqLine,loopLines,objReqLine,blnAllClosed,objUReq,objUReqLine,strStatus,sc
+	
+	set strStatus = $$$OK
+	set sc        = $$$OK
+		
+	; Only manually-close header if header flagged, otherwise close marked lines
+	if $$$INReqReasonRejection(pYFELD) '= "" {
+		set objUReq = ##class(alREQ.dUReq).%OpenId("0||"_pYKEY,,.sc)
+		if objUReq = $$$NULLOREF {
+			set strStatus = $$$MakeStatus("IN01045",pYKEY)      ; "Unable to load Req: %1"
+			
+		} else {
+			set objUReq.Rejected = $$$YES
+			for loopLines=1:1:objUReq.ReqLines.Count() {
+				set objUReqLine = objUReq.ReqLines.GetAt(loopLines)
+				if (objUReqLine.Status.StatusCode'=8) && (objUReqLine.Status.StatusCode'=9) {
+					set objUReqLine.Rejected        = $$$YES
+					set objUReqLine.ReasonRejection = $$$INReqReasonRejection(pYFELD)
+					set objUReqLine.DateRejection   = +$horolog
+				}
+			}
+			set sc = objUReq.ManuallyClose()
+		}
+	
+	} else {
+		set blnAllClosed = $$$YES
+		set idReqLine = ""
+		for {
+			set idReqLine = $order(^INReqLine(0,pYKEY,idReqLine))
+			quit:idReqLine=""
+
+			; vvvv HEVA-1142 Needed to reject more than 1 line of Requisition at the same time. 
+			set objUReqLine = ##class(alREQ.dUReqLine).%OpenId("0||"_pYKEY_"||"_idReqLine,,.sc)
+			if (objUReqLine '= $$$NULLOREF) {
+				if (('objUReqLine.IsClosed()) && (objUReqLine.Rejected)) {
+					set objUReqLine.DateRejection = +$horolog
+					
+					set sc  = objUReqLine.ManuallyClose()
+					set sc  = objUReqLine.%Save()
+				}
+			}
+			; ^^^^ HEVA-1142
+			
+			set objReqLine = $get(^INReqLine(0,pYKEY,idReqLine,1))
+			if ($$$INReqLineStatus(objReqLine) < 7) { ;HEVA-1142
+				set blnAllClosed = $$$NO
+			}
+		}
+		if blnAllClosed {   ; Auto-Close header
+			set objUReq = ##class(alREQ.dUReq).%OpenId("0||"_pYKEY,,.sc)
+			if objUReq = $$$NULLOREF {
+				set strStatus = $$$MakeStatus("IN01045",pYKEY)    ; "Unable to load Req: %1"
+			} else {
+				set sc = objUReq.AutoClose()
+			}
+		}
+	}
+	if $$$ISERR(sc) {
+		set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	}
+	$$$YQHandler(strStatus)
+	quit
+	
+	
+SetReject(pYKEY)
+	do SetRejectVal(pYKEY,$$$INReqCloseAllLines(YFELD))
+	quit
+	
+	
+SetRejectVal(pYKEY,blnSet)
+	;-------------------------------------------------------------------------------
+	; sets the lines on a the grid to show all the remaining values for all lines 
+	; if reject whole requisition
+	;	
+	; Called by: OnBlur Manual field 13 (checkbox) INReqCancel
+	; 
+	; Inputs: YKEY, blnSet (YES or NO)
+	;
+	; Returns:
+	;
+	; History:
+    ; 22-Aug-2012 	SCR 	SR18088: If Received QTY > Required QTY set balance to 0
+	; 14-Sep-2011	GRF		SR17823: Already have Qty in Inventory Units
+	; 25-May-2011	GRF		SR17250: call common function for decimal places
+	; 29-Mar-2011	GRF		SR17579: QtyOrdered is in Order Units; QtyReceived and
+	;							QtyRejected are in Invent Units; adjust dec places
+	; 10-Apr-2010	GRF		SR17177: GRID Macros
+	; 24-Nov-2009	SHOBBY	SR17038: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,fltRejected,id,idForm,idInventUnit,idItem
+	new intDecPlaces,intFormFld,objReqLine
+	
+	$$$GRIDGetContents(.arrGrid)
+	
+	set idForm = $get(^CacheTemp(YUSER,"Grid","Name"))  ; SR17250
+	
+	set id = ""
+	for {
+		set id = $order(arrGrid(pYKEY,id))
+		quit:id=""
+		
+		set objReqLine = arrGrid(pYKEY,id)
+		if blnSet {
+			set idItem  = $$$INReqLineItem(objReqLine)
+			if idItem'="" {
+				set idInventUnit = $$$INARTUnitofMeasure($get(^INART(0,idItem,1)))
+			} else {
+				set idInventUnit = ""
+			}
+		;	set fltRejected  = ($$$INReqLineQtyOrdered(objReqLine)*fltConv) - $$$INReqLineQtyReceived(objReqLine) ; SR17823
+		;	set fltRejected  = $$$INReqLineQtyRequired(objReqLine) - $$$INReqLineQtyReceived(objReqLine)
+            set fltRejected  = $select($$$INReqLineQtyReceived(objReqLine)>$$$INReqLineQtyRequired(objReqLine):0,1:$$$INReqLineQtyRequired(objReqLine)-$$$INReqLineQtyReceived(objReqLine) ) ; SR18088		
+			set intFormFld   = $$$GetFormField(idForm,$$$FldINReqLineQtyRejected)
+			set intDecPlaces = $$GetDecimalPlaces^COMUtilNum(idForm,intFormFld,idInventUnit,objReqLine,"") ; SR17250
+			if intDecPlaces>0 set fltRejected = +$justify(fltRejected,0,intDecPlaces)
+			set $$$INReqLineQtyRejected(objReqLine) = fltRejected
+		
+		} else {
+			set $$$INReqLineQtyRejected(objReqLine) = 0
+		}
+		set arrGrid(pYKEY,id) = objReqLine
+	}
+	$$$GRIDSetContents(.arrGrid)
+	quit
+	
+	/*
+	new arrGrid,fltConv,fltRejected,id,idForm,idInventUnit,idItem
+	new intDecPlaces,intFormFld,objReqLine
+	
+	$$$GRIDGetContents(.arrGrid)
+	
+	set idForm = $get(^CacheTemp(YUSER,"Grid","Name"))  ; SR17250
+	
+	set id = ""
+	for {
+		set id = $order(arrGrid(pYKEY,id))
+		quit:id=""
+		
+		set objReqLine = arrGrid(pYKEY,id)
+		if blnSet {
+	; SR17579 vvv
+	;		set $$$INReqLineQtyRejected(objReqLine) = $$$INReqLineQtyOrdered(objReqLine) - $$$INReqLineQtyReceived(objReqLine)
+			set idItem  = $$$INReqLineItem(objReqLine)
+			set fltConv = $$GetUOMConversion^INUOMConversion(idItem,$$$INReqLineUnit(objReqLine),.idInventUnit)
+			set fltRejected = ($$$INReqLineQtyOrdered(objReqLine)*fltConv) - $$$INReqLineQtyReceived(objReqLine)
+			
+	;		set intDecPlaces = $$GetDecimalsForItemUnit^COMUnit(idItem,idInventUnit)                       ; SR17250 vvv
+			set intFormFld   = $$$GetFormField(idForm,$$$FldINReqLineQtyRejected)
+			set intDecPlaces = $$GetDecimalPlaces^COMUtilNum(idForm,intFormFld,idInventUnit,objReqLine,"") ; SR17250 ^^^
+			if intDecPlaces>0 set fltRejected = +$justify(fltRejected,0,intDecPlaces)
+			set $$$INReqLineQtyRejected(objReqLine) = fltRejected
+	; SR17579 ^^^
+		
+		} else {
+			set $$$INReqLineQtyRejected(objReqLine) = 0
+		}
+		set arrGrid(pYKEY,id) = objReqLine
+	}
+	$$$GRIDSetContents(.arrGrid)
+	quit
+	*/
+]]></Routine>
+</Export>

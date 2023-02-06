@@ -1,0 +1,879 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INBPPGenRule" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INBPPGenRule
+	
+#include COMSYS
+#include INConst
+#include COMConst
+	 
+#;Set theory functions
+#define Equals(%1,%2,%3,%4)		(%1=%3)&&(%2=%4)
+#define Contains(%1,%2,%3,%4)	(%1>=%3)&&(%2>=%4)
+#define Intersects(%1,%2,%3,%4)	(%1<=%3)&&(%2<=%4)&&(%2>=%3)
+	
+Generate(pidRuleHeader)
+	;-------------------------------------------------------------------------------
+	; Generate a price plan based on the rules provided
+	;
+	; Params:
+	; pidRuleHeader - Price Plan Generation Rule id
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 11-Dec-2006	RPW		SR15268: Clean up the average prices
+	; 05-Dec-2006	PO		SR15268: Created
+	;-------------------------------------------------------------------------------
+	new objRuleHeader,idGenHeader,objPlanHeader,strStatus,blnNeedSave,idRelated
+ 
+	set strStatus = $$$OK
+	
+	kill ^CacheTempItemAverageCosts(YUCI,YUSER)
+	
+	set objRuleHeader = $get(^INPPGenRule(YM,pidRuleHeader,1))
+	
+	set idRelated = $$$INPPGenRuleRelatedParentRule(objRuleHeader)
+	
+	set $$$INPPGenRuleStatus(objRuleHeader) = $$$EnumCOMSYSSTATUSProcessing
+	set strStatus = $$$Save("INPPGenRule",pidRuleHeader,objRuleHeader,$$$YES)
+	
+	quit:'$$IsRelatedGenRuleGenerated(idRelated) $listbuild("IN00565",idRelated)  ;Related price plan "%1" must be generated first.
+	
+	set idGenHeader = $$$INPPGenRulePricePlanID(objRuleHeader)
+	if idGenHeader'="" {
+		set strStatus=$$$Kill("INPricePlan",idGenHeader)
+		if $$$ISOK(strStatus) set strStatus = $$KillChildren^COMUtils("INPricePlanLine",idGenHeader)
+		if $$$ISOK(strStatus) set strStatus = $$KillChildren^COMUtils("INPricePlanLineQty",idGenHeader)
+	}
+	
+	quit:$$$ISERR(strStatus) strStatus
+ 
+	;if $$$INPPGenRulePricePlanID(objRuleHeader) = "" {
+		set:idGenHeader="" idGenHeader = $$^WWWNEXT("INPricePlan")
+		set blnNeedSave = $$$YES
+	;} else {
+	;	set idGenHeader = $$$INPPGenRulePricePlanID(objRuleHeader)
+	;	set blnNeedSave = $$$YES
+	;}
+ 
+	set $$$INPricePlanValidFromDate(objPlanHeader)     = $$$INPPGenRuleValidFromDate(objRuleHeader)
+	set $$$INPricePlanValidToDate(objPlanHeader)       = $$$INPPGenRuleValidToDate(objRuleHeader)
+	set $$$INPricePlanDescription(objPlanHeader)       = $$$INPPGenRuleDescription(objRuleHeader)
+	set $$$INPricePlanPricePlanType(objPlanHeader)     = $$$INPPGenRulePricePlanType(objRuleHeader)
+	set $$$INPricePlanStatus(objPlanHeader)            = $$$EnumCOMSYSSTATUSBuilding
+	set $$$INPricePlanNotes(objPlanHeader)             = $$$INPPGenRuleNotes(objRuleHeader)
+	set $$$INPricePlanSourceRule(objPlanHeader)        = pidRuleHeader
+	set $$$INPricePlanRelatedParentRule(objPlanHeader) = $$$INPPGenRuleRelatedParentRule(objRuleHeader)
+ 
+ /*
+	// This needs to be done at the form level code
+	if $$$INPPGenRuleAverageCostPoint(objRuleHeader) = "" {
+		set $$$INPricePlanAverageCostPoint(objPlanHeader) = +$horolog
+	} else {
+		set $$$INPricePlanAverageCostPoint(objPlanHeader) = $$$INPPGenRuleAverageCostPoint(objRuleHeader)
+	}
+ */
+ 
+ 	set $$$INPricePlanCostPoint(objPlanHeader) = $$$INPPGenRuleCostPoint(objRuleHeader)
+ 	
+	if blnNeedSave {
+		set $$$INPPGenRulePricePlanID(objRuleHeader) = idGenHeader
+		set $$$INPPGenRuleStatus(objRuleHeader) = $$$EnumCOMSYSSTATUSGenerating
+		set strStatus = $$$Save("INPPGenRule",pidRuleHeader,objRuleHeader,$$$YES)
+	}
+ 
+	if $$$ISOK(strStatus) set strStatus = $$$Save("INPricePlan",idGenHeader,objPlanHeader,$$$YES)
+	if $$$ISOK(strStatus) set strStatus = $$GenerateLines(pidRuleHeader,idGenHeader,idRelated,$$$INPPGenRuleCostPoint(objRuleHeader))
+ 
+ 	if $$$ISOK(strStatus) {
+ 		set $$$INPricePlanStatus(objPlanHeader) = $$$EnumCOMSYSSTATUSGenerated
+ 		set strStatus = $$$Save("INPricePlan",idGenHeader,objPlanHeader,$$$YES)
+ 	}
+ 	
+ 	set $$$INPPGenRuleStatus(objRuleHeader) = $$$EnumCOMSYSSTATUSGenerated
+	set strStatus = $$$Save("INPPGenRule",pidRuleHeader,objRuleHeader,$$$YES)
+ 	
+ 	kill ^CacheTempItemAverageCosts(YUCI,YUSER)
+ 
+	quit strStatus
+	
+	
+GenerateLines(pidRuleHeader,pidGenHeader,pidRelated,pdteCostPoint)
+	;-------------------------------------------------------------------------------
+	; Generate price plan lines
+	;
+	; Params:
+	; pidRuleHeader - Price Plan Generation Rule id
+	; pidGenHeader - Price Plan id
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 11-Dec-2006	RPW		SR15268: Modified to get the correct parent pricing.
+	; 							Note each line may generate multiple price plan
+	; 							lines due to the related/parent price plan
+	; 06-Dec-2006	RPW		SR15279: Get the item's category
+	; 05-Dec-2006	PO		SR15268: Created
+	;-------------------------------------------------------------------------------
+	new arrLines,blnIsDefault,idCustCat
+	new idRuleLine,idGenLine,idItem,idItemGroup,idxItemGroup
+	new idLocation,idPriority
+	new idPriceCategory,idLine,idRelated,idDefault,objItem,objPlanLine,objRuleLine,strStatus
+	
+	set idGenLine = 1
+	set strStatus = $$$OK
+	set arrLines  = ""
+	
+	//set idDefault=$order(^INPPLineGenRules(YM,3," "," "," "," ",pidRuleHeader,""))
+	
+	if pidRelated="" set arrLines(0) = ""
+	
+	set idRuleLine = ""
+	for {
+		set idRuleLine = $order(^INPPLineGenRule(YM,pidRuleHeader,idRuleLine))
+		quit:idRuleLine=""
+		
+		set objRuleLine = $get(^INPPLineGenRule(YM,pidRuleHeader,idRuleLine,1))
+		set idLocation  = $$$INPPLineGenRuleLocation(objRuleLine)
+		set idItemGroup = $$$INPPLineGenRuleItemGroup(objRuleLine)
+		set idItem      = $$$INPPLineGenRuleItem(objRuleLine)
+		set idPriority  = $$$INPPLineGenRulePriority(objRuleLine)
+		set idCustCat   = $$$INPPLineGenRulePriceCategoryType(objRuleLine)
+		set objPlanLine = ""
+		
+		set blnIsDefault = ((idItem="") && (idItemGroup=""))
+				
+		// Find related lines
+		// if location is blank, it matches ALL locations including blank
+		// if category is blank, it matches ALL categories including blank
+		// item/itemgroup can not be blank
+		
+		if pidRelated'="" {	
+			do FindRelated(pidRelated,idItem,idItemGroup,idCustCat,idLocation,.arrLines)
+		}
+		
+		set idLine = ""
+		for {
+			set idLine = $order(arrLines(idLine))
+			quit:idLine=""
+
+			set objPlanLine = ""
+			set idRelated   = pidRelated
+			if idRelated'="" {
+				set idRelated = idRelated_$$$COMMA_idLine
+				set idCustCat = arrLines(idLine)
+			}
+			
+			if idItemGroup = "" {
+				set $$$INPricePlanLineLocation(objPlanLine) = idLocation								
+				set $$$INPricePlanLinePriority(objPlanLine) = idPriority
+	 
+				if idItem = "" {
+					set objPlanLine = ""
+					set $$$INPricePlanLineLocation(objPlanLine) = idLocation								
+					set $$$INPricePlanLinePriority(objPlanLine) = idPriority
+				//	set idPriceCategory=$$GetPriceCategoryForProduct^INCategory(idItem) // SR15279
+					set $$$INPricePlanLineCustomerCategory(objPlanLine) = $$$COMMA_idCustCat // SR15279
+					
+					set $$$INPricePlanLineItem(objPlanLine) = idItem
+					set strStatus = $$CreateLine(pidRuleHeader_$$$COMMA_idRuleLine,pidGenHeader_$$$COMMA_idGenLine,objPlanLine,idRelated,pdteCostPoint,blnIsDefault)
+					set idGenLine = idGenLine + 1
+				} else {
+					set idPriceCategory=$$GetPriceCategoryForProduct^INCategory(idItem) // SR15279
+					set $$$INPricePlanLineCustomerCategory(objPlanLine) = idPriceCategory_$$$COMMA_idCustCat // SR15279
+				
+					set $$$INPricePlanLineItem(objPlanLine) = idItem
+					set strStatus = $$CreateLine(pidRuleHeader_$$$COMMA_idRuleLine,pidGenHeader_$$$COMMA_idGenLine,objPlanLine,idRelated,pdteCostPoint,blnIsDefault)
+					set idGenLine = idGenLine + 1
+				}
+				
+			} else {
+				
+				do GetNodes^INBItemGroup(idItemGroup)		// NOTE JW: Need to change this to get ALL decendants
+				
+				set idItemGroup = ""
+				for {
+					set idItemGroup = $order(^CacheTempItemGroup(YUCI,YUSER,idItemGroup))
+					quit:idItemGroup=""
+					
+					set idxItemGroup = $$Index^COMUtils(idItemGroup)
+					set idItem = ""
+					for {
+						set idItem = $order(^INARTs(YM,40,idxItemGroup,idItem))
+						quit:idItem=""
+						
+						set objItem = $get(^INART(YM,idItem,1))
+						continue:$$$INARTItemGroup(objItem)'=idItemGroup
+	 
+						set $$$INPricePlanLineLocation(objPlanLine) = idLocation
+						
+						set idPriceCategory=$$GetPriceCategoryForProduct^INCategory(idItem) // SR15279
+						set $$$INPricePlanLineCustomerCategory(objPlanLine) = idPriceCategory_$$$COMMA_idCustCat // SR15279
+						set $$$INPricePlanLineItem(objPlanLine) = idItem
+						set $$$INPricePlanLinePriority(objPlanLine) = idPriority
+	 
+						set strStatus = $$CreateLine(pidRuleHeader_$$$COMMA_idRuleLine,pidGenHeader_$$$COMMA_idGenLine,objPlanLine,idRelated,pdteCostPoint,blnIsDefault)
+						set idGenLine = idGenLine + 1
+						quit:$$$ISERR(strStatus)
+					}
+				}
+				
+				kill ^CacheTempItemGroup(YUCI,YUSER)
+			}
+			quit:$$$ISERR(strStatus)
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	
+	quit strStatus
+	
+	
+CreateLine(pidRuleLineKey,pidGenLineKey,pobjPlanLine,pidRelated,pdteCostPoint,pblnIsDefault)
+	;-------------------------------------------------------------------------------
+	; Create Price Plan Line and all the associated quantity breaks
+	;
+	; Params:
+	; pidRuleLineKey - Price Plan Generation Rule (Header & Line) ids
+	; pidGenLineKey  - Price Plan (Header & Line) ids
+	; pobjPlanLine   - Price Plan Line record
+	;
+	; ByRefs: None
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 04-Nov-2009	GRF		SR16871: INAvgCost replaces INARTAVG
+	; 11-Dec-2006	RPW		SR15268: Modified to get the correct parent pricing.
+	; 							This generates a merging of the quantity breaks and
+	; 							the parents generated ones.
+	; 05-Dec-2006	PO		SR15268: Created
+	;-------------------------------------------------------------------------------
+	new arrRelated,arrRule,arrStructure,blnDynamic,fltAvgCost,fltMin
+	new idCostCentre,idGenLineQty,idItem,idLine,idRuleHeader,idRuleLine,idRuleLineQty
+	new idxRuleHeader,objPlanLineQty,objRuleLine,objRuleLineQty
+	new strPriceFormula,strStatus
+ 
+	set strStatus = $$$OK
+	set $$$INPricePlanLineSourceRule(pobjPlanLine) = pidRuleLineKey
+ 
+	set strStatus = $$$Save("INPricePlanLine",pidGenLineKey,pobjPlanLine,$$$YES)
+ 
+	set idRuleHeader  = $$$KEY1(pidRuleLineKey)
+	set idRuleLine    = $$$KEY2(pidRuleLineKey)
+ 
+	set idxRuleHeader = $$$Index(idRuleHeader)
+	set idGenLineQty  = 1
+ 
+ 	do GetGenStructure(pidRuleLineKey,.arrRule)
+ 	
+ 	set idItem       = $$$INPricePlanLineItem(pobjPlanLine)
+ 	set idCostCentre = $$GetCostCentre^INCostCentre($$$INPricePlanLineLocation(pobjPlanLine))  ; SR16871
+ 	
+	if pidRelated {
+		do GetPlanStructure(pidRelated,.arrRelated)
+		do GenerateStructure(.arrRule,.arrRelated,.arrStructure)
+	} else {
+		merge arrStructure = arrRule
+	}
+ 
+	if idItem'="" {	
+		if '$data(^CacheTempItemAverageCosts(YUCI,YUSER,idItem)) {
+		;	set ^CacheTempItemAverageCosts(YUCI,YUSER,idItem) = $$GetCostAsAtDate^INARTAVG(idItem,pdteCostPoint)  ; SR16871
+			set ^CacheTempItemAverageCosts(YUCI,YUSER,idItem) = $$GetCostForCC^INAvgCost(idItem,idCostCentre,pdteCostPoint)
+		}
+	
+		set fltAvgCost = $get(^CacheTempItemAverageCosts(YUCI,YUSER,idItem))
+	} else {
+		set fltAvgCost = ""
+	}
+	
+	set idLine = ""
+	for {
+		set idLine = $order(arrStructure(idLine))
+		quit:idLine=""
+		
+		set fltMin        = $get(arrStructure(idLine,"Min"))
+		set idRuleLineQty = $get(arrStructure(idLine,"Calc"))
+		
+		if (idRuleLineQty="") {
+			set idRuleLineQty = idLine-1              ; FIXME : is this right?
+		}
+		
+		if pidRelated {
+			set idRuleLineQty = idRuleLineQty-1
+		}
+		
+		set blnDynamic = $get(arrStructure(idLine,"Dyn"))
+		
+		if idRuleLineQty=0 {
+			set objRuleLine     = $get(^INPPLineGenRule(YM,idRuleHeader,idRuleLine,1))
+			set strPriceFormula = $$$INPPLineGenRulePricingFormula(objRuleLine)
+		} else {
+			set objRuleLineQty  = $get(^INPPLineQtyGenRule(YM,idRuleHeader,idRuleLine,idRuleLineQty,1))
+			set strPriceFormula = $$$INPPLineQtyGenRulePricingFormula(objRuleLineQty)
+		}
+		
+		set objPlanLineQty = ""
+		set $$$INPricePlanLineQtyDynamic(objPlanLineQty)         = blnDynamic
+		set $$$INPricePlanLineQtyMinQuantity(objPlanLineQty)     = fltMin
+		set $$$INPricePlanLineQtyPricingFormula(objPlanLineQty)  = $$GetPricingFormula(strPriceFormula,blnDynamic,idItem,fltMin,pidRelated,fltAvgCost,$$$YES,pblnIsDefault,pdteCostPoint)
+		if blnDynamic && (pidRelated="") {
+			set $$$INPricePlanLineQtyAverageCost(objPlanLineQty) = fltAvgCost
+		}
+ 
+		set strStatus = $$$Save("INPricePlanLineQty",pidGenLineKey_$$$COMMA_idLine,objPlanLineQty,$$$YES)
+		quit:$$$ISERR(strStatus)
+	}
+	
+	quit strStatus
+ 
+GetPricingFormula(pstrRulePricingFormula,pblnDynamic,pidItem,pfltQuantity,pidRelated,pfltAvgCost=0,pblnGenerate=$$$NO,pblnIsDefault=$$$NO,pdteAverage="",pstrValue="")
+	;-------------------------------------------------------------------------------
+	; Construct the pricing formula, will either be a static value or a formula
+	;
+	; Params:
+	; pstrRulePricingFormula - Pricing Formula
+	; pblnDynamic - Whether price plan is to include formula or static value
+	; pidItem - Item Id
+	; pidRelated - Related Generation rule
+	; pblnGenerate: Is this generating the price structure or calculating the price
+	;
+	; ByRefs: None
+	;
+	; Returns: Either a static value or a formula
+	;
+	; History:
+	; 20-Dec-2006	RPW		SR15326: Modified to allow F3 function for Store Managed Plans.
+	; 06-Dec-2006	PO		SR15270: Created
+	;-------------------------------------------------------------------------------
+	new strPlanPricingFormula,arrFunctions
+	
+	if pblnIsDefault&&pblnGenerate set pblnDynamic=$$$YES
+ 
+	if (pblnDynamic)&&(pblnGenerate) {
+		set strPlanPricingFormula = pstrRulePricingFormula
+	} else {
+		set arrFunctions("F0") = "$$GetCost^INBPPGenRule("""_pidItem_""","""_pidRelated_""","""_pblnDynamic_""","""_pfltAvgCost_""","""_pfltQuantity_""","""_pblnGenerate_""")"
+		set arrFunctions("F1") = "$$GetMarketingCost^INBPPGenRule("""_pidItem_""","""_pidRelated_""","""_pfltQuantity_""","""_pblnDynamic_""","""_pfltAvgCost_""","""_pblnGenerate_""")"
+		
+		if pblnIsDefault {
+			if pblnDynamic {
+				set pdteAverage = +$horolog
+			} else {
+				set pblnDynamic = $$$YES
+			}
+		}
+		
+		set arrFunctions("F2")="$$GetCost^INBPPGenRule("""_pidItem_""","""_pidRelated_""","""_pblnDynamic_""","""_pfltAvgCost_""","""_pfltQuantity_""","""_pblnGenerate_""","""_pblnIsDefault_""","""_pdteAverage_""")"
+		set arrFunctions("F3")="$$GetPrice^INPricePlan("""_pidItem_""","""_$piece(pstrValue,Y,2)_""","""_$piece(pstrValue,Y,3)_""","""_$piece(pstrValue,Y,4)_""","""_pblnGenerate_""",0)"
+		set strPlanPricingFormula = $$Calculator^COMExpression(pstrRulePricingFormula,,.arrFunctions)
+	}
+ 
+	quit strPlanPricingFormula
+	
+	
+GetMarketingCost(pidItem,pidRelated,pfltQuantity,pblnDynamic,pfltAvgCost,pblnGenerate=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Get the marketing cost, regardless of the level we are at.
+	;
+	; Params:
+	; pidItem     - Item Id
+	; pidRelated  - Related Generation rule
+	; pblnDynamic - Is this price generated dynamically
+	; pfltAvgCost - The formula to calculate the cost
+	;
+	; ByRefs:
+	;
+	; Returns:
+	; Cost
+	;
+	; History:
+	; 07-Dec-2006	RPW		SR15270: Created
+	;-------------------------------------------------------------------------------
+	new objRelated,fltCost
+	
+	set fltCost = 0
+	
+	set objRelated = $get(^INPPGenRule(YM,pidRelated,1))
+	if $$$INPPGenRulePricePlanType(objRelated)=$$$EnumINITEMPRICETYPEMarketingCost {
+		set fltCost = $$GetCost(pidItem,pidRelated,pblnDynamic,pfltAvgCost,pfltQuantity,pblnGenerate)
+	} else {
+		set fltCost = $$GetMarketingCost(pidItem,$$$INPPGenRuleRelatedParentRule(objRelated),pfltQuantity,pblnDynamic,pfltAvgCost,pblnGenerate)
+	}
+	
+	quit fltCost
+	
+	
+GetCost(pidItem,pidRelated,pblnDynamic,pfltAvgCost,pfltQuantity=0,pblnGenerate=$$$NO,pblnIsDefault=$$$NO,pdteAverage="")
+	;-------------------------------------------------------------------------------
+	; Get the item cost
+	;
+	; Params:
+	; pidItem - Item Id
+	; pidRelated - Related Generation rule
+	; pblnDynamic: Is this price generated dynamically
+	; pfltAvgCost: The average cost for the item
+	; pblnGenerate: Is this generating the price structure or calculating the price
+	; 
+	; ByRefs: None
+	;
+	; Returns: Cost
+	;
+	; History:
+	; 04-Nov-2009	GRF		SR16871: INAvgCost replaces INARTAVG
+	; 06-Dec-2006	RPW		SR15270: Created
+	;-------------------------------------------------------------------------------
+	new fltCost,idCostCentre,idCustomer,objLine,objRelated
+	
+	set fltCost = 0
+	
+	//set pblnDynamic = (pblnDynamic && pblnGenerate)
+	
+	if pidRelated="" {
+		if pblnDynamic || pblnIsDefault {
+			if pdteAverage="" set pdteAverage = +$horolog
+		;	set fltCost = $$GetCostAsAtDate^INARTAVG(pidItem,pdteAverage)    ; SR16871 - 3 lines
+			set idCostCentre = $$GetCostCentre^INCostCentre(YLOCATION)
+			set fltCost      = $$GetCostForCC^INAvgCost(pidItem,idCostCentre,pdteAverage)
+		} else {
+			set fltCost = pfltAvgCost
+		}
+		
+	} else {
+		set objRelated = $get(^INPPGenRule(0,$$$KEY1(pidRelated),1))
+		//set idCustomer=YLOCATION // This should find the customer who has Marketing Location YLOCATION!
+		set idCustomer = $order(^INKUNDEs(0,31,$$$Index(YLOCATION),""))
+		if $$$KEY2(pidRelated)'="" {
+			set objLine = $get(^INPPLineGenRule(0,$$$KEY1(pidRelated),$$$KEY2(pidRelated),1))
+		
+			if $$$INPPLineGenRulePriceCategoryType(objLine)="" {
+				set idCustomer=""
+			}
+		}
+		
+		if $$$INPPGenRulePricePlanType(objRelated)'=$$$EnumINITEMPRICETYPEMarketingCost {
+			set fltCost = $$GetPrice^INPricePlan(pidItem,"","",pfltQuantity,pblnGenerate,$$$NO)
+		} else {
+			set fltCost = $$GetPrice^INPricePlan(pidItem,idCustomer,YLOCATION,pfltQuantity,pblnGenerate,$$$NO)
+		}
+	}
+	quit fltCost
+	
+	
+IsRelatedGenRuleGenerated(pidRelated)
+	;-------------------------------------------------------------------------------
+	; Determine whether the related generation rules price plan exists
+	;
+	; Params:
+	; pidRelated - Related Generation Rule
+	;
+	; ByRefs: None
+	;
+	; Returns: $$$YES if pidRelated blank or related generation rules price plan exists, else $$$NO
+	;
+	; History:
+	; 06-Dec-2006	RPW		SR15270: Created
+	;-------------------------------------------------------------------------------
+	new idRelatedPP
+	
+	quit:pidRelated="" $$$YES
+	
+	set idRelatedPP = $$$INPPGenRulePricePlanID($get(^INPPGenRule(YM,pidRelated,1)))
+	
+	quit (idRelatedPP'="") && $data(^INPricePlan(YM,idRelatedPP))
+	//quit ''$data(^INPricePlan(YM,$$$INPPGenRulePricePlanID($get(^INPPGenRule(YM,pidRelated,1)))))
+	
+	
+GetPlanStructure(pidRelated,&parrRelated)
+	;-------------------------------------------------------------------------------
+	; Get the INPricePlanQty structure.
+	;
+	; Params:
+	; pidRelated : The id of the related price plan generator
+	; parrRelated: The array of related information to be returnd
+	;
+	; History:
+	; 11-Dec-2006	RPW		SR15268: Created
+	;-------------------------------------------------------------------------------
+	new idRelated,strStructure
+ 
+	set idRelated    = $$$INPPGenRulePricePlanID($get(^INPPGenRule(YM,$$$KEY1(pidRelated),1)))
+	set strStructure = "^INPricePlanLineQty("_YM_","_idRelated_","_$$$KEY2(pidRelated)_")"
+	
+	do GetStructure(strStructure,idRelated_$$$COMMA_$$$KEY2(pidRelated),.parrRelated,$$$FldINPricePlanLineQtyMinQuantity,$$$FldINPricePlanLineQtyDynamic,$$$NO)
+	quit
+	
+	
+GetGenStructure(pidGen,&parrGen)
+	;-------------------------------------------------------------------------------
+	; Get the INPPLineQtyGenRule structure.
+	;
+	; Params:
+	; pidGen : The id of the price plan generator line
+	; parrGen: The array of quantity break generator information to be returnd
+	;
+	; History:
+	; 11-Dec-2006	RPW		SR15268: Created
+	;-------------------------------------------------------------------------------
+	new strStructure
+	
+	set strStructure="^INPPLineQtyGenRule("_YM_","_pidGen_")"
+	do GetStructure(strStructure,pidGen,.parrGen,$$$FldINPPLineQtyGenRuleMinQuantity,$$$FldINPPLineQtyGenRuleDynamic,$$$YES)
+	quit
+	
+	
+GetStructure(pstrStructure,pidStructure,&parrStructure,pfldQuantity,pfldDynamic,pblnZeroLine)
+	;-------------------------------------------------------------------------------
+	; This generates the min, max and dynamic features of a particular data structure.
+	;
+	; Params:
+	; pstrStructure: The string to query on for the structure
+	; pidStructure : The id of the existing structure, this make exiting the loop work
+	; parrStructure: The array of the structure to be returned
+	; pfldQuantity : The field for the quantity
+	; pfldDynamic  : The field for the dynamic flag
+	; pblnZeroLine : Should we generate a zero line or does one exist?
+	;
+	; History:
+	; 12-Dec-2006	PO		SR15268: Added missing quit in for loop
+	; 11-Dec-2006	RPW		SR15268: Created
+	;-------------------------------------------------------------------------------
+	new idPrevious,fltMin,idQty,objStructure,intIncrement
+	
+	if pblnZeroLine {
+		set idPrevious=1
+		set parrStructure(idPrevious,"Min") = 0
+		set objStructure = $$$DATA("INPPLineGenRule",pidStructure)
+		set parrStructure(idPrevious,"Dyn") = +$piece(objStructure,Y,$$$FldINPPLineGenRuleDynamic)
+		set intIncrement = 1
+	} else {
+		set idPrevious   = ""
+		set intIncrement = 0
+	}
+	
+	for {
+		set pstrStructure = $query(@pstrStructure)
+		quit:pstrStructure=""
+		quit:($qsubscript(pstrStructure,2)_$$$COMMA_$qsubscript(pstrStructure,3))'=pidStructure
+		
+		set objStructure = @pstrStructure
+		set fltMin = $piece(objStructure,Y,pfldQuantity)
+		set idQty  = $qsubscript(pstrStructure,4)+intIncrement
+		set parrStructure(idQty,"Min") = fltMin
+		set parrStructure(idQty,"Dyn") = +$piece(objStructure,Y,pfldDynamic)
+		if idPrevious'="" {
+			set parrStructure(idPrevious,"Max")=fltMin-1
+		}
+		set idPrevious=idQty
+	}
+	
+	quit
+	
+	
+GenerateStructure(&parrGen,&parrPlan,&parrNew)
+	;-------------------------------------------------------------------------------
+	; This uses set theory to construct a matrix of values given two existing matrices
+	; 
+	; P| 0  |  G | 0 |   | 0 (1) |   Expanded P| 0  8  |   G| 0 3 |   | 0  3 (1) |
+	;  | 9  | +  | 4 | = | 4 (1) |             | 9  19 | +  | 4   | = | 4  8 (1) |
+	;  | 20 |            | 9 (2) |             | 20    |              | 9  19(2) |
+	;                    | 20(3) |                                    | 20   (3) |
+	; 
+	; The numbers in brackets refer to the originating line of the Plan matrix
+	; 
+	; This is a constructed maxtrix based on Equals entries, Contains entries and Intersects entries
+	; 
+	; Equals means the min and calculated max are on both sides
+	; Contains means that the min and calculated max are equal or between.
+	; Intersects means minimum on the Gen is less than the minimum on the Plan, and the gen maximum is less than or equal
+	; to the maximum on the on the plan, and is also greater than or equal to the plan minimum.
+	; 
+	; Note that something that is equal can also be considered contained, though Equals is considered a higher
+	; priority than Contains.
+	; 
+	; Params:
+	; parrGen: The plan data structure (from GetPlanStructure)
+	; parrPlan : The genereated data structure (from GetGenStructure)
+	; parrNew : The resultant structure which is the combination of the two above using set theory.
+	;
+	; History:
+	; 11-Dec-2006	RPW		SR15268: Created
+	;-------------------------------------------------------------------------------
+	new idPlan,idGen,fltGenMin,fltGenMax,fltPlanMin,fltPlanMax,idLine,idGenMax,idPlanMax
+	
+	set idPlan = 1
+	set idLine = 1
+	set idGen  = 1
+	
+	set idPlanMax = $order(parrPlan(""),-1)
+	set idGenMax  = $order(parrGen(""),-1)
+	set parrPlan(idPlanMax,"Max") = 1E16	// Some big number
+	set parrGen(idGenMax,"Max")   = 1E16    // Some big number
+	
+	for {
+		quit:idGen>idGenMax
+		quit:idPlan>idPlanMax
+	
+		set fltGenMin  = +$get(parrGen(idGen,"Min"))
+		set fltGenMax  = +$get(parrGen(idGen,"Max"))
+		set fltPlanMin = +$get(parrPlan(idPlan,"Min"))
+		set fltPlanMax = +$get(parrPlan(idPlan,"Max"))
+		
+		if $$$Equals(fltGenMin,fltGenMax,fltPlanMin,fltPlanMax) {
+			set parrNew(idLine,"Min")=fltGenMin
+			set parrNew(idLine,"Max")=fltGenMax
+			set parrNew(idLine,"Calc")=idGen
+			set parrNew(idLine,"Dyn")=parrPlan(idPlan,"Dyn")||parrGen(idGen,"Dyn")
+			// Skip to next Plan and plan entries
+			set idLine = idLine+1
+			set idPlan = idPlan+1
+			set idGen  = idGen+1
+			
+		} elseif $$$Contains(fltGenMin,fltGenMax,fltPlanMin,fltPlanMax) {
+			set parrNew(idLine,"Min")  = fltPlanMin
+			set parrNew(idLine,"Max")  = fltPlanMax
+			set parrNew(idLine,"Calc") = idGen
+			set parrNew(idLine,"Dyn")  = parrPlan(idPlan,"Dyn")||parrGen(idGen,"Dyn")
+			// Skip to next Plan entry
+			set parrGen(idGen,"Min")   = fltPlanMax+1
+			set idLine = idLine+1
+			set idPlan = idPlan+1
+			
+		} elseif $$$Intersects(fltGenMin,fltGenMax,fltPlanMin,fltPlanMax) {
+			set parrNew(idLine,"Min")  = fltPlanMin
+			set parrNew(idLine,"Max")  = fltGenMax
+			set parrNew(idLine,"Calc") = idGen
+			set parrNew(idLine,"Dyn")  = parrPlan(idPlan,"Dyn")||parrGen(idGen,"Dyn")
+			set parrPlan(idPlan,"Min") = fltGenMax+1
+			// Skip to next plan entry
+			set idLine = idLine+1
+			set idGen  = idGen+1
+			
+		} else {
+			// This is an error state and should never happen!?!
+		}
+	}
+	
+	kill parrNew(idLine-1,"Max") // Remove this as it's not needed.
+	
+	quit
+	
+	
+CopyToUnposted(pidRuleHeader,&pidNewRuleHeader,pstrCreationMechanism)
+	;-------------------------------------------------------------------------------
+	; Create a copy of the Price Plan Generation Rule with status unposted
+	;
+	; Params:
+	; pidRuleHeader - Price Plan Rule Id
+	; pidNewRuleHeader - The Id of the created price plan generation rule
+	; pstrCreationMechanism - Message detailing
+	;
+	; ByRefs: pidNewRuleHeader
+	;
+	; Returns: strStatus - $$$OK if successful, otherwise error message
+	;
+	; History:
+	; 08-Dec-2006 PO  SR15295: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	set strStatus = $$CopyToStatus^INDPPGenRule(pidRuleHeader,$$$EnumCOMSYSSTATUSBuilding,.pidNewRuleHeader,pstrCreationMechanism)
+	quit strStatus
+	
+	
+FindRelated(pidRelated,pidProduct,pidItemGroup,pidCategory,pidLocation,&parrLines)
+	;-------------------------------------------------------------------------------
+	; Find all lines on the related Price Plan whose lines match my details.
+	; 
+	; The query is constructed dynamically, if the pidProduct is blank, use the pidItemGroup.
+	; 
+	; Note that a blank pidCategory means ALL, not none, so if it's blank, then nothing about category
+	; is added to the query.
+	;
+	; Params:
+	; pidRelated  : The id of the related generator
+	; pidProduct  : The id of the Product
+	; pidItemGroup: The id of the Item Group
+	; pidCategory : The id of the Customer Category
+	; pidLocation : The id of the location (not currently in use)
+	; parrLines   : The array lines that match. The structure is parrLines(idLine)=idCustCat
+	; 
+	; History:
+	; 11-Dec-2006	RPW		SR15268: Created
+	;-------------------------------------------------------------------------------
+	new strSql,objResult
+ 
+	set strSql = "select PricePlanGenerationRuleLi As LineId,PriceCategoryType from INPPLineGenRule"_
+	             " where PricePlanGenerationRule='"_pidRelated_"' and Company='"_YM_"'"
+				
+	if pidProduct'="" {
+		set strSql = strSql_" and Item='"_pidProduct_"'"
+	} else {
+		set strSql = strSql_" and ItemGroup='"_pidItemGroup_"'"
+	}
+	
+	if pidCategory'="" {
+		set strSql = strSql_" and PriceCategoryType='"_pidCategory_"'"
+	}
+	
+	set objResult = ##class(%Library.ResultSet).%New()
+	if $$$ISOK(objResult.Prepare(strSql)) {
+		if $$$ISOK(objResult.Execute()) {
+			for {
+				quit:'objResult.Next()
+				set parrLines(objResult.Data("LineId")) = objResult.Data("PriceCategoryType")
+			}
+		}
+	}
+	
+	if '$data(parrLines) {
+		set strSql = "select PricePlanGenerationRuleLi As LineId,PriceCategoryType from INPPLineGenRule"_
+		             " where PricePlanGenerationRule'"_pidRelated_"' and Company='"_YM_"'"
+					
+		if pidProduct'="" {
+			set strSql = strSql_" and Item='"_pidProduct_"'"
+		} else {
+			set strSql = strSql_" and ItemGroup='"_pidItemGroup_"'"
+		}
+		
+		set strSql=strSql_" and PriceCategoryType IS NULL"
+		
+		set objResult = ##class(%Library.ResultSet).%New()
+		if $$$ISOK(objResult.Prepare(strSql)) {
+			if $$$ISOK(objResult.Execute()) {
+				for {
+					quit:'objResult.Next()
+					set parrLines(objResult.Data("LineId")) = objResult.Data("PriceCategoryType")
+				}
+			}
+		}
+	}
+	quit
+	
+	
+FindFunctionErrors(pidRuleHeader,pidLine,pstrPriceFormula,pintPricePlanType,pstrStoreManagedError,
+				   pstrNonDefaultError,pstrDefaultError,pstrMarketingError)
+	;-------------------------------------------------------------------------------
+	; This is the body method used to implement the rules
+	; Marketing can only use function F0
+	; Selling can only use functions F0 and F1
+	; Store Managed can only use function F3
+	; Default lines can only use function F2 (these have no item or item group)
+	;
+	; Params:
+	;
+	; ByRefs: This is not really needed as we use & for ByRef parameters now.
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Dec-2006	RPW		SR15326: Modified to check for Function 3 usage and errors.
+	; 19-Dec-2006	RPW		SR15326: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+ 
+	if (pstrStoreManagedError="") || ($$IsStoreManagedRule^INDPPGenRule(pidRuleHeader)) {
+		set strStatus = $$$OK
+	} else {
+		set strStatus = $$FindFunction^COMExpression(pstrPriceFormula,3,pstrStoreManagedError,$$$YES)
+	}
+		
+	if $$$ISOK(strStatus) set strStatus = $$CheckUnusedFunctions(pstrPriceFormula)
+				
+	if $$$ISOK(strStatus) set strStatus = $$CheckF2Usage(pidRuleHeader,pidLine,pstrPriceFormula,pstrNonDefaultError,pstrDefaultError)
+		
+	if $$$ISOK(strStatus) {
+		if pintPricePlanType=$$$EnumINITEMPRICETYPEMarketingCost {  ;Marketing Plan lines can not use the F1 function.
+			// Marketing can only use F0
+			set strStatus = $$FindFunction^COMExpression(pstrPriceFormula,1,pstrMarketingError,$$$YES)
+		}
+	}
+	quit strStatus
+	
+	
+CheckF2Usage(pidRuleHeader,pidLine,pstrPriceFormula,pstrNonDefaultError,pstrDefaultError)
+	;-------------------------------------------------------------------------------
+	; This is used to check what happens on a default line. A default line can use F2,
+	; nothing else is allowed to.
+	;
+	; Params:
+	;
+	; ByRefs: This is not really needed as we use & for ByRef parameters now.
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Dec-2006	RPW		SR-: Created
+	;-------------------------------------------------------------------------------
+	new blnIsDefault,strStatus
+	
+	set blnIsDefault = $$IsLineDefault^INDPPLineGenRule(pidRuleHeader,pidLine)
+	
+	if blnIsDefault {
+		set strStatus = $$FindFunction^COMExpression(pstrPriceFormula,2,pstrDefaultError,$$$NO)
+	} else {
+		set strStatus = $$FindFunction^COMExpression(pstrPriceFormula,2,pstrNonDefaultError,$$$YES)
+	}
+	
+	quit strStatus
+	
+CheckUnusedFunctions(pstrPricingForumula)
+	;-------------------------------------------------------------------------------
+	; This checks functions F4-F9, they are not defined and therefore can not be used
+	;
+	; Params:
+	;
+	; ByRefs: This is not really needed as we use & for ByRef parameters now.
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Dec-2006	RPW		SR-: Created
+	;-------------------------------------------------------------------------------
+	new loop,strStatus
+	
+	set strStatus = $$$OK
+	
+	for loop=4:1:9 {  ;Only functions F0-F3 are in use for Price Plan Generation.
+		set strStatus = $$FindFunction^COMExpression(pstrPricingForumula,loop,"IN00592",$$$YES)
+		quit:$$$ISERR(strStatus)
+	}
+ 
+	quit strStatus
+	
+	
+SetMyChildrenToStatus(pidGenRule,penumStatus)
+	;-------------------------------------------------------------------------------
+	; Set all the marketing parents children to status x.
+	;
+	; Params:
+	;
+	; ByRefs: This is not really needed as we use & for ByRef parameters now.
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Dec-2006	RPW		SR-: Created
+	;-------------------------------------------------------------------------------
+	new loop,strChildren,strStatus
+	
+	set strStatus   = $$$OK
+	set strChildren = ""
+	if $$IsMarketingRule^INDPPGenRule(pidGenRule) {
+		set strChildren = $$RelatedChildrenOfMarketingPlan^INDPPGenRule(pidGenRule)
+	}
+	
+	if strChildren'="" {
+		for loop=1:1:$length(strChildren,$$$COMMA) {
+			set strStatus = $$SetStatus^INDPPGenRule($piece(strChildren,$$$COMMA,loop),penumStatus)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	quit strStatus
+	
+]]></Routine>
+</Export>

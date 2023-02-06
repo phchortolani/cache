@@ -1,0 +1,492 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INTempARTKOST" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INTempARTKOST(ARTIKEL,MENGE,KOSTENART,NOEXTRA,NOZUSCHL)
+#include COMSYS
+#include INConst
+#include WWWConst
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		ARTIKELSELBSTKOSTEN
+	;	DIESES PROGRAMM ERRECHNET DIE SELBSTKOSTEN EINES PRODUKTES AUS PRODUKTION UND EK
+	;	This programme who total production costs out of production And Planned Cost 
+	;	THIS PROGRAM CALCULATES THE FIRST COST OF A PRODUCT BY PRODUCTION AND Planned Cost
+	;	DIE AUSWAHL DES PREISES ERFOLGT NACH VORGABE AUS ^INVORG FELD 15
+	;	THE SELECTION OF THE PRICE TAKES PLACE AFTER DEFAULT FROM ^INVORG FIELD 15 [$$$INVORGDefaultCostType]
+	;
+	; Inputs : 
+	;	ARTIKEL			Item No
+	;	MENGE			Quantity
+	;	KOSTENART		Cost Type - from ^WWW101("HERSTELLKOSTEN")
+	;						e.g. 1 = Cost Of Ordered Items
+	;						     2 = Manufacturing Costs
+	;						     3 = Lowest Cost 
+	;						     4 = Highest Cost
+	;						     5 = Highest Manufacturing Costs Incl. Stock 
+	;						     7 = First In, First Out
+	;						     8 = Last In, First Out
+	;						     9 = Average Cost
+	;						    10 = Fixed Costs
+	;	NOEXTRA 		=1 : RÜCKGABE DER HERSTELLKOSTEN OHNE ZUSATZKOSTEN      (EXTRAKOSTEN/WERKZEUGKOSTEN)
+	;						 Return MANUFACTURING COSTS WITHOUT AUXILIARY COSTS (ADDITIONAL EXPENSES/TOOLING EXPENSES)
+	;	NOZUSCHL		=1 : OHNE MATERIALKOSTENZUSCHLAG / FERTIGUNGSKOSTENZUSCHLAG 
+	;						 WITHOUT Additional MATERIAL / PRODUCTION COSTS
+	; plus...
+	;	EINHEIT			Unit
+	;   YBED			User
+	;   
+	; ByRef :
+	;
+	;
+	; Returns :
+	;	SELBSTKOST		Autocost
+	;
+	; History :
+	; 24-Jul-2007	GRF		SR15579: quits
+	; 27-Nov-2006	JW		BR014285: Item group change
+	; 31-Aug-2005	GRF		SR13215 : Pass Service overhead as part of cost.
+	; 19-Aug-2005	GRF		SR13215 : block justification - COPIED FROM INARTKOST
+	; 19-Aug-2005	GRF		SR13142 : Cost returned is expected to be without burden?
+	; 15-Aug-2005	GRF		SR13215 : Standard Correction to Machine Cost Calculation;
+	; 						use objINMATERIAL & price variables
+	; 08-Aug-2005	GRF		SR13142 : Add Burden to total Labour cost; only divide by 3600 once
+	; 02-Aug-2005	GRF		SR13142 : Doco
+	; 19-Jul-2005	GRF		SR13024 : Doco
+	; 13-Jul-2005	GRF		SR12027 : Macro Conversion; doco
+	; DT	01.04.2000  
+	;-------------------------------------------------------------------------------
+	new CurMarketPrice,KALK,KOST,KOST1,KOST2,KOST3,KOST4,KOST7,KOST8,LIEF,MASCHINE
+	new MachineCost,MachineRate,Material,objINMASCH,objINMATERIAL
+	new PERSONEN,PROTOKOLL,PROTOKOLLVK,SELBSTKOST,SELBSTKOSTALT
+	new ServiceOverhead,SKOST,SPRACHE,StandardPrice,WG,WorkerRate,YFELD,YKALK,idxItem
+	
+	
+	
+	; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	; Data Records :
+	; 	  -				objINARTK			Supplier Item Details
+	;	YFELD			objINART			Item Masterfile
+	;	YKALK			objINKALK			Calculation Rules (Locn, Group)
+	;	         or		objINKALKART		Calculation Rules (Locn, Item)
+	;	  -				objINMASCH			Machine
+	;	ARTIKEL1		objINARTT			Parts List
+	;	  -				objINMATERIAL		Material
+	; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+	SET SPRACHE=$$^WWWLANGU(YBED)
+	; FIXME : is this assumption reasonable or should the system provide a
+	;         user-definable default language as well as a currency? <GRF>
+	IF YBED="UNKNOWN" IF $$$WWW012StandardCurrency($get(^WWW012(0,YM,1)))="EUR" SET SPRACHE="DE"
+	SET SELBSTKOST=0
+	
+	SET YFELD=""
+	IF $GET(ARTIKEL)'="" SET YFELD=$GET(^INART(YM,ARTIKEL,1))   ;ARTIKEL DATENSATZ ;item data record 
+	IF YFELD="" QUIT SELBSTKOST
+	
+	; --------------------------------------
+	
+	;  HERSTELLKOSTEN ; Production Cost
+	SET SELBSTKOSTALT=$$$INARTProductionCosts(YFELD)
+	
+	;  ARTIKELART ; Item type (7 - Item To Configure)
+	;  ----------------------------------------------
+	;IF $PIECE(YFELD,Y,26)=7 DO  QUIT SELBSTKOST  ;FIS;31.03.03;23155;KONFIGURATIONSARTIKEL=KEIN WERT
+	;. ;SET $PIECE(^INARTPREISLOG(YM,ARTIKEL,+$H,$PIECE($H,",",2),1),Y,1)=$PIECE($GET(^WWW101(0,"ARTIKEL-ART",SPRACHE,7,1)),Y,1)  ;ABGESCHALTET LAUT TYBD;22.09.04
+	;. QUIT
+	IF $$$INARTItemType(YFELD)=7 QUIT SELBSTKOST  ;FIS;31.03.03;23155;KONFIGURATIONSARTIKEL=KEIN WERT
+	
+	; --------------------------------------
+	
+	SET KOSTENART=$GET(KOSTENART)  ;MANUELLE VORGABE ;Cost Type 
+	
+	;PREISPROTOKOLLIERUNG IN DEN EINZELNEN UNTERSCHRITTEN, ULM,19.03.03,
+	SET PROTOKOLL=$$^WWWDATE(+$HOROLOG)  ; WEM;10.06.2003;FÜR DIE AUSGABE DES PROTOKOLLS IM ARTIKELSTAMM ;to who expenses 
+	IF KOSTENART'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33354)_"= "_$PIECE($GET(^WWW101(0,"HERSTELLKOSTEN",SPRACHE,KOSTENART,1)),Y,1)  ; "Cost Type"
+	
+	SET EINHEIT =  $GET(EINHEIT)
+	SET MENGE   = +$GET(MENGE)    ;MENGE WEGEN RÜSTZEIT ; setup quantity 
+	IF MENGE=0 SET MENGE=1
+	;IF $FIND(EINHEIT,"/")  IF +$PIECE(EINHEIT,"/",2)'=0 IF MENGE>1 SET MENGE=$JUSTIFY(MENGE/$PIECE(EINHEIT,"/",2),0,0)  ;WENN Z.B. MENGENEINHEIT= /100 ;when e.g. 
+	;IF '$FIND(EINHEIT,"/") IF +$PIECE(YFELD,Y,138)'=0   IF MENGE>1 SET MENGE=$JUSTIFY(MENGE/$PIECE(YFELD,Y,138),0,0)    ;WENN Z.B. PEISEINHEIT JE 100  ;TYBD 15.09.2002 ;when e.g. once 
+	SET NOEXTRA=$GET(NOEXTRA)
+	
+	;KALKULATIONSVORGABEN AUS BETRIEBSDATEI SUCHEN ;out of seek 
+	IF $GET(BETR)="" SET BETR=$GET(YLOCATION)          ;VORGABE BETRIEB ;default 
+	IF $GET(BETR)="" SET BETR=$ORDER(^INKALK(YM,""))   ;VORGABE BETRIEB ;default 
+	
+	
+	;WARENGRUPPE/KALKULATION SUCHEN ;seek 
+	SET WG=$$$INARTItemGroup(YFELD)
+	IF WG="" SET WG=$$$INVORGDefaultItemGroup($get(^INVORG(YM,YM,1)))
+	
+	;IF WG'="" IF '$DATA(^INKALK(YM,BETR,WG)) DO       ;BEC;24.04.03;25408;
+	IF (WG'="") && (BETR'="") && '$DATA(^INKALK(YM,BETR,WG)) { 
+		SET WG=$$$INVORGDefaultItemGroup($get(^INVORG(YM,YM,1)))   ;DFLT WARENGRUPPE = 1.
+	}
+	
+	SET YKALK=""
+	IF (BETR'="") && (WG'="") {
+		SET YKALK=$GET(^INKALK(YM,BETR,WG,1))
+	}
+	IF BETR'="" IF ARTIKEL'="" IF $DATA(^INKALKART(YM,BETR,ARTIKEL)) SET YKALK=$GET(^INKALKART(YM,BETR,ARTIKEL,1))
+	
+	
+	SET PERSONEN=+$$$INARTNumberOfWorkers(YFELD)  ;ANZAHL DER PERSONEN DIE PRODUZIEREN ;Number who produce 
+	IF PERSONEN=0 SET PERSONEN=1
+	
+	SET KOST  = 0
+	SET KOST1 = 0
+	SET KOST2 = 0
+	SET KOST3 = 0
+	SET KOST4 = 0
+	SET KOST7 = 0
+	SET KOST8 = 0
+	
+	;ERRECHNEN SELBSTKOSTEN, NUR WENN ARTIKEL KEINE TEILE HAT WIRD GERECHNET
+	;CALCULATE FIRST COST, ONLY IF ARTICLE DOES NOT HAVE PARTS COUNTED
+	
+	IF '$DATA(^INARTT(YM,ARTIKEL)) DO
+	. NEW YI,TEIL,EK,ZEIT,WERT,ARTIKEL1
+	. ;KALKULIEREN DER ZEITEN UND DES MASCHINENEINSATZES ;Calculate times and machine usage
+	. ;
+	. SET ZEIT     = $$$INARTExecutionTime(YFELD)                 ;FERTIGUNGSZEIT
+	. SET MASCHINE = $$$INARTMachine(YFELD)
+	. ;
+	. IF MASCHINE'="" DO
+	. . set objINMASCH = $get(^INMASCH(YM,MASCHINE,1))
+	. . set MachineRate     = $$$INMASCHMachineCostPerHour(objINMASCH)         ; SR13215
+	. . set WorkerRate      = $$$INMASCHWorkerCostPerHour(objINMASCH)
+	. . set WERT            = $$$INMASCHProductionCostPerHour(objINMASCH)      ;WERT IN STUNDE ;hourly rate 
+	. . set ServiceOverhead = $$$INMASCHServiceOverhead(objINMASCH)
+	. .;set MachineCost = $justify(WERT*ZEIT/3600,0,2)*MENGE*PERSONEN  ;SEKUNDENKOSTEN*SEKUNDENDAUER*MENGE                       ;SR13142
+	. .;set MachineCost = $justify((WERT+ServiceOverhead)*ZEIT/3600,0,2)*MENGE*PERSONEN  ;SEKUNDENKOSTEN*SEKUNDENDAUER*MENGE     ;SR13215
+	. .;set MachineCost = $justify((MachineRate+ServiceOverhead+(WorkerRate*PERSONEN))*ZEIT/3600,0,2)*MENGE       ; SR13142 20050819
+	. .;set MachineCost = $justify((MachineRate+(WorkerRate*PERSONEN))*ZEIT/3600,0,2)*MENGE                       ; SR13215
+	. .;set MachineCost = (MachineRate+(WorkerRate*PERSONEN))*ZEIT/3600*MENGE
+	. . set MachineCost = (MachineRate+ServiceOverhead+(WorkerRate*PERSONEN))*ZEIT/3600*MENGE                     ; SR13215 31-Aug-2005
+	. . SET KOST = KOST+MachineCost
+	. . ;                  MASCHINENKOSTEN / MASCHINE      "Machine Cost / " Machine = Cost   
+	. . SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32875)_" / "_$PIECE($GET(^INMASCH(YM,MASCHINE,1)),Y,2)_" = "_$$^WWWZAHL(MachineCost)  ;$JUSTIFY(KOST,0,2)  ;ULM  ;WEM Änderung (IFs) 19.05.2003
+	. ;
+	. IF MASCHINE="" DO
+	. . ;		D1		$$$INKALKAverageLaborCost()
+	. . SET WERT=$PIECE(YKALK,Y,1)
+	. . QUIT:+ZEIT=0                 ;FIS;02.05.03
+	. .;set MachineCost = ($justify(WERT*ZEIT/3600,0,2)*MENGE*PERSONEN)  ;SEKUNDENKOSTEN*SEKUNDENDAUER*MENGE     ;SR13215
+	. . set MachineCost = ($justify(WERT*PERSONEN*ZEIT/3600,0,2)*MENGE)  ;SEKUNDENKOSTEN*SEKUNDENDAUER*MENGE
+	. . SET KOST = KOST+MachineCost
+	. . ;                          MASCHINENKOSTEN / WARENGRUPPE  "Machine Cost / Item Group" Group = Cost
+	. . //IF WG'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32875)_" / "_$$^WWWTEXT(32082)_" "_$PIECE($GET(^INPARA(YM,"WARENGRUPPE",SPRACHE,WG,1)),Y,1)_" = "_$$^WWWZAHL(MachineCost)  //BR014285
+	. . IF WG'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32875)_" / "_$$^WWWTEXT(32082)_" "_$$GetDescription^INDItemGroup(WG)_" = "_$$^WWWZAHL(MachineCost)  ;ULM ;WEM Änderung (IF) 19.05.2003 ;Modify Only 
+	. ;
+	. ; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	. ;IF $PIECE(YFELD,Y,70)'="" DO  ;RÜSTZEIT       
+	. ;. SET WERT=$PIECE(YKALK,Y,1)/3600
+	. ;. SET KOST=KOST+(WERT*$PIECE(YFELD,Y,70)*PERSONEN)
+	. ;IF $PIECE(YFELD,Y,73)'="" DO  ;RUHEZEIT
+	. ;. SET WERT=$PIECE(YKALK,Y,1)/3600
+	. ;. SET KOST=KOST+(WERT*$PIECE(YFELD,Y,73)*MENGE*PERSONEN)
+	. ; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DISABLED BLOCK END
+	. ; 
+	. QUIT:NOEXTRA=1  ;KEINE ZUSATZKOSTEN ;no additional costs 
+	. ;
+	. ; vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv DISABLED BLOCK START
+	. ;IF $PIECE(YFELD,Y,74)'="" DO  ;WERKZEUGKOSTEN
+	. ;. SET WERT=$PIECE(YFELD,Y,74)
+	. ;. SET KOST=KOST+(WERT*MENGE)
+	. ;IF $PIECE(YFELD,Y,75)'="" DO  ;EXTRAKOSTEN
+	. ;. SET WERT=$PIECE(YFELD,Y,75)
+	. ;. SET KOST=KOST+(WERT*MENGE)
+	. ; ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ DISABLED BLOCK END
+	
+	;HERSTELLKOSTEN AUS BESTELLUNG ;out of sales order 
+	IF $DATA(^INARTK(YM,ARTIKEL)) DO  ;IF '$DATA(^INARTT(YM,ARTIKEL)) DO    ;SONDER EK DES LIEFERANTEN
+	. NEW BIS,EK,OHNESKTO,objINARTK
+	. SET OHNESKTO=+$PIECE($GET(^INVORG(YM,YM,1)),Y,43)   ;OHNE SKONTO ;without account
+	. SET EK(1)=""
+	. SET LIEF(1)=""   ;GÜNSTIGSTER LIEFERANT ;cheapest supplier 
+	. SET LIEF(2)=""   ;TEUERSTER LIEFERANT   ;dearest supplier 
+	. SET ARTIKEL1=$GET(^INART(YM,ARTIKEL,1))
+	. ;
+	. ; ------------------------------------
+	. ;  NIEDRIGSTEM KOSTEN ;lowest cost 
+	. ; ------------------------------------
+	. ; 
+	. SET KOST1=9999999999
+	. SET LIEF=""
+	. FOR  SET LIEF=$ORDER(^INARTK(YM,ARTIKEL,LIEF)) QUIT:LIEF=""  DO
+	. . set objINARTK = $get(^INARTK(YM,ARTIKEL,LIEF,1))
+	. . SET BIS  =$$$INARTKPriceValidUntil(objINARTK)
+	. . IF BIS'="" IF BIS<+$HOROLOG QUIT  ;NICHT MEHR GÜLTIG ;Not more legitimate 
+	. . SET EK(1)=$$$INARTKNetPurchasePrice(objINARTK)
+	. . ;                                            NETTO EK                                
+	. . IF EK(1)'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32281)_" / "_$PIECE($GET(^INLIEF(YM,LIEF,1)),Y,8)_" = "_$$^WWWZAHL(EK(1))  ;ULM  
+	. . ;
+	. . IF OHNESKTO=1 DO   ;OHNE SKONTOS ;without 
+	. . . SET EK(1)=$JUSTIFY(EK(1)*100/(100-$$$INARTKDealersDiscount(objINARTK)),0,2)
+	. . . ;KEINE SKONTOPROTOKOLLIERUNG                                                                     % Skonto                                ;no 
+	. . . ;IF EK(1)'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32090)_": "_$$^WWWZAHL($PIECE(objINARTK,Y,7))_" = "_$$^WWWZAHL(EK(1))  ;ULM
+	. . ;
+	. . IF +$$$INARTKConversionFactor(objINARTK)'=0 DO
+	. . . SET EK(1)=EK(1)*$$$INARTKConversionFactor(objINARTK)
+	. . . ;                                            neue Mengeneinheit (Umrechnungsfaktor)                                  
+	. . . IF +EK(1)'=0 SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32622)_": "_$$^WWWZAHL($$$INARTKConversionFactor(objINARTK))_" = "_$$^WWWZAHL(EK(1))  ;ULM 
+	. . ;
+	. . IF +EK(1)'=0 IF EK(1)<KOST1 SET KOST1=EK(1) SET LIEF(1)=LIEF
+	. ;                                                                      Lieferant                                                            NIEDRIGSTE EK           
+	. IF EK(1)'="" IF LIEF(1)'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32022,,1)_": "_$PIECE($GET(^INLIEF(YM,LIEF(1),1)),Y,8)_" / "_$$^WWWTEXT(33021)_" = "_$$^WWWZAHL(KOST1)  ;ULM
+	. ;
+	. IF KOST1=9999999999 SET LIEF="" FOR  SET LIEF=$ORDER(^INARTK(YM,ARTIKEL,LIEF)) QUIT:LIEF=""  DO
+	. . set objINARTK = $get(^INARTK(YM,ARTIKEL,LIEF,1))
+	. . SET EK(1)=$$$INARTKNetPurchasePrice(objINARTK)
+	. . IF OHNESKTO=1 DO   ;OHNE SKONTO ;without 
+	. . . SET EK(1)=$JUSTIFY(EK(1)*100/(100-$$$INARTKDealersDiscount(objINARTK)),0,2)
+	. . ;
+	. . IF +$$$INARTKConversionFactor(objINARTK)'=0 DO
+	. . . SET EK(1)=EK(1)*$$$INARTKConversionFactor(objINARTK)
+	. . ;
+	. . IF +EK(1)'=0 IF EK(1)<KOST1 SET KOST1=EK(1) SET LIEF(1)=LIEF
+	. . ;                                                ungültiger Lieferant                                                                                             niedrigste ek               
+	. . IF EK(1)'="" IF LIEF(1)'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33332,,1)_": "_$PIECE($GET(^INLIEF(YM,LIEF(1),1)),Y,8)_" / "_$$^WWWTEXT(33021)_" = "_$$^WWWZAHL(EK(1))  ;ULM
+	. ;
+	. IF KOST1=9999999999 SET KOST1=0  ;KEINEN GEFUNDEN
+	. ;
+	. ; ------------------------------------
+	. ;  HÖCHSTEN KOSTEN ;Highest cost 
+	. ; ------------------------------------
+	. ; 
+	. SET KOST2=0
+	. SET LIEF=""
+	. FOR  SET LIEF=$ORDER(^INARTK(YM,ARTIKEL,LIEF)) QUIT:LIEF=""  DO
+	. . set objINARTK = $get(^INARTK(YM,ARTIKEL,LIEF,1))
+	. . SET BIS  =$$$INARTKPriceValidUntil(objINARTK)
+	. . IF BIS'="" IF BIS<+$HOROLOG QUIT                                     ;NICHT MEHR GÜLTIG ;Not more legitimate 
+	. . SET EK(1)=$$$INARTKNetPurchasePrice(objINARTK)
+	. . IF OHNESKTO=1 DO   ;OHNE SKONTO ;without 
+	. . . QUIT:+$$$INARTKDealersDiscount(objINARTK)=100
+	. . . SET EK(1)=$JUSTIFY(EK(1)*100/(100-$$$INARTKDealersDiscount(objINARTK)),0,2)
+	. . ;
+	. . IF +$$$INARTKConversionFactor(objINARTK)'=0 DO
+	. . . SET EK(1)=EK(1)*$$$INARTKConversionFactor(objINARTK)
+	. . IF +EK(1)'=0 IF EK(1)>KOST2 SET KOST2=EK(1) SET LIEF(2)=LIEF
+	. ;
+	. IF KOST2=0 SET LIEF="" FOR  SET LIEF=$ORDER(^INARTK(YM,ARTIKEL,LIEF)) QUIT:LIEF=""  DO
+	. . set objINARTK = $get(^INARTK(YM,ARTIKEL,LIEF,1))
+	. . SET EK(1)=$$$INARTKNetPurchasePrice(objINARTK)
+	. . IF OHNESKTO=1 DO                                      ;OHNE SKONTO ;without account
+	. . . SET EK(1)=$JUSTIFY(EK(1)*100/(100-$$$INARTKDealersDiscount(objINARTK)),0,2)
+	. . IF +$$$INARTKConversionFactor(objINARTK)'=0 DO
+	. . . SET EK(1)=EK(1)*$$$INARTKConversionFactor(objINARTK)
+	. . IF +EK(1)'=0 IF EK(1)<KOST2 SET KOST1=EK(1) SET LIEF(2)=LIEF         ;LIEFEARNT
+	. ;                                                                      HÖCHSTE EK
+	. IF +KOST2'=0 IF LIEF(2)'="" DO
+	. . SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32022,,1)_": "_$PIECE($GET(^INLIEF(YM,LIEF(2),1)),Y,8)_" / "_$$^WWWTEXT(33022)_" = "_$$^WWWZAHL(KOST2)  ;ULM
+	
+	;DURCHSCHNITTLICHER EK   ; average   ;BEC;24767;01.04.03
+	DO
+	. SET KOST4=$PIECE($GET(^INART(YM,ARTIKEL,1)),Y,140)  ;ERRECHNETER DURCHSCHNITTS-EK
+	. IF +KOST4=0 IF '$DATA(^INWE(YM,ARTIKEL)) IF '$DATA(^INWEALT(YM,ARTIKEL)) SET KOST4=KOST1  ;WENN NEU, DANN DER EK LT LIFERANTEN KONDITION
+	. ;                                        durchschnitts-ek
+	. IF KOST4'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33333,,1)_" = "_$$^WWWZAHL(KOST4)  ;ULM
+	
+	SET SKOST=+$$$INVORGDefaultCostType($get(^INVORG(YM,YM,1)))  ;WELCHEN PREISQ
+	IF KOSTENART'="" SET SKOST=KOSTENART  ;PREIS LT. EINSPRUNG-PARAMETER ;price 
+	;		D26		$$$INARTItemType()  2: Service  3: Make
+	IF SKOST=9 SET NOEXTRA=1  ;FIS;17.08.05;SR13253
+	;IF $PIECE(YFELD,Y,26)=2 IF SKOST=9 SET SKOST=4  ;WENN LEISTUNG     DANN NICHT NACH DURCHSCHNITT  ;when performance Not within average 
+	;IF $PIECE(YFELD,Y,26)=3 IF SKOST=9 SET SKOST=4  ;WENN SELBSTKOSTEN DANN NICHT NACH DURCHSCHNITT  ;when total production costs Not within average 
+	IF $PIECE(YFELD,Y,26)=2 IF KOSTENART'=9 IF SKOST=9 SET SKOST=4  ;when performance Not within average            ;ONLY IF EXPLICIT WISHED;17.08.05;FIS;SR13253
+	IF $PIECE(YFELD,Y,26)=3 IF KOSTENART'=9 IF SKOST=9 SET SKOST=4  ;when total production costs Not within average ;ONLY IF EXPLICIT WISHED;17.08.05;FIS;SR13253
+	
+	;                                         SPEICHERUNG PROTOKOLL, ULM
+	;IF SKOST=9 SET SELBSTKOST=KOST4 IF PROTOKOLL'="" SET $PIECE(^INARTPREISLOG(YM,ARTIKEL,+$H,$PIECE($H,",",2),1),Y,1)=PROTOKOLL QUIT $JUSTIFY(SELBSTKOST,0,2)  ;DURCHSCHNITTLICHER EK ;OHNE PROTOKOLL LT. TYBD;22.09.04
+	IF SKOST=9 SET SELBSTKOST=KOST4 IF PROTOKOLL'="" QUIT $JUSTIFY(SELBSTKOST,0,2)  ;DURCHSCHNITTLICHER EK           ;Planned Cost 
+	
+	IF SKOST=5 DO  ;EK AUS LAGERBESTAND ;Planned Cost out of 
+	. NEW BET,LAP,WED,WEN
+	. SET BET=""
+	. FOR  SET BET=$ORDER(^INWE(YM,ARTIKEL,BET)) QUIT:BET=""  DO                ;BETRIEB
+	. . SET LAP=""
+	. . FOR  SET LAP=$ORDER(^INWE(YM,ARTIKEL,BET,LAP)) QUIT:LAP=""  DO          ;LAGERPLATZ ;stock location 
+	. . . SET WED=""
+	. . . FOR  SET WED=$ORDER(^INWE(YM,ARTIKEL,BET,LAP,WED)) QUIT:WED=""  DO    ;WEDATUM
+	. . . . SET WEN=$GET(^INWE(YM,ARTIKEL,BET,LAP,WED,1))
+	. . . . IF $PIECE(WEN,Y,8)>KOST3 SET KOST3=$PIECE(WEN,Y,8)
+	. ;                                                        EK AUS LAGERBESTAND
+	. IF KOST3>KOST2 SET KOST2=KOST3 SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33335,,1)_" = "_$$^WWWZAHL(KOST3)  ;ULM ;WENN WARE TEUER, DANN ÜBERTRAGEN  
+	
+	set idxItem = $$^WWWUMLAU(ARTIKEL,1)
+	
+	;FIRST IN FIRST OUT       FAN 23.11.2001 ;top within top buff 
+	IF SKOST=7 DO
+	. NEW BET,LAP,WED,WEN
+	. SET WED=$ORDER(^INWEs(YM,7,idxItem,""))   ;WED ÄLTERST
+	. QUIT:WED=""
+	. SET BET=$ORDER(^INWEs(YM,7,idxItem,WED,ARTIKEL,""))
+	. QUIT:BET=""
+	. SET LAP=""
+	. FOR  SET LAP=$ORDER(^INWEs(YM,7,idxItem,WED,ARTIKEL,BET,LAP)) QUIT:LAP=""  DO     ;LAGERPLATZ ;campsite 
+	. . SET WEN=$GET(^INWE(YM,idxItem,BET,LAP,WED,1))
+	. . SET KOST7=$PIECE(WEN,Y,8)  ;                                          EK fifo
+	. . IF KOST7'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33336,,1)_" = "_$$^WWWZAHL(KOST7)  ;ULM
+	
+	;LAST IN FIRST OUT       FAN 23.11.2001 ;charge within top buff 
+	IF SKOST=8 DO
+	. NEW BET,LAP,WED,WEN
+	. SET WED=$ORDER(^INWEs(YM,7,idxItem,""),-1)   ;WED ÄLTERST
+	. QUIT:WED=""
+	. SET BET=$ORDER(^INWEs(YM,7,idxItem,WED,ARTIKEL,""))
+	. QUIT:BET=""
+	. SET LAP=""
+	. FOR  SET LAP=$ORDER(^INWEs(YM,7,idxItem,WED,ARTIKEL,BET,LAP)) QUIT:LAP=""  DO     ;LAGERPLATZ ;campsite 
+	. . SET WEN=$GET(^INWE(YM,idxItem,BET,LAP,WED,1))
+	. . SET KOST8=$PIECE(WEN,Y,8)             ;                  ek LAST IN/FIRST OUT ;charge 
+	. . IF PROTOKOLL'="" IF KOST8'="" SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33337,,1)_" = "_$$^WWWZAHL(KOST8)  ;ULM
+	
+	IF SKOST=0 SET SKOST=1
+	DO
+	. IF +KOST'=0 IF +KOST1=0                               QUIT   ;NUR EIGENFERTIGUNG VORHANDEN ;only on hand 
+	. IF SKOST=1                             SET KOST=KOST1 QUIT   ;WERT NACH BESTELLWARE HIER IST NIEDRIGSTEM WERT VON LIEF ;worthy within here is worthy 
+	. ;IF SKOST=2 IF +KOST=0 IF +KOST1'=0    SET KOST=KOST1 QUIT   ;WERT NACH EIGENFERTIGUNG, ABER NUR BESTELLWARE VORHANDEN
+	. IF (SKOST=2)||(SKOST=3) IF +KOST=0 IF +KOST1'=0 SET KOST=KOST1 QUIT   ;WERT NACH EIGENFERTIGUNG, ABER NUR BESTELLWARE VORHANDEN
+	. IF SKOST=2                                            QUIT   ;WERT NACH EIGENFERTIGUNG ;worthy within 
+	. IF SKOST=3 IF KOST>KOST1               SET KOST=KOST1 QUIT   ;NACH NIEDRIGSTEM WERT ;within worthy 
+	. IF (SKOST=4)||(SKOST=5)  IF KOST<KOST2 SET KOST=KOST2 QUIT   ;NACH HÖCHSTEM WERT SET LIEF(1)=LIEF(2) ;within worthy table-mat 
+	. IF SKOST=7 SET KOST=KOST1 IF +KOST7'=0 SET KOST=KOST7
+	. IF SKOST=8 SET KOST=KOST1 IF +KOST8'=0 SET KOST=KOST8
+	
+	IF '$DATA(^INARTT(YM,ARTIKEL)) DO 
+	. set Material = $$$INARTMaterial(YFELD)
+	. quit:Material=""
+	. quit:'$DATA(^INMATERIAL(YM,Material,1))
+	. set objINMATERIAL=$get(^INMATERIAL(YM,Material,1))		;SR13215
+	. set StandardPrice  = +$piece(obkINMATERIAL,Y,4)           ;NORMAL PREISE
+	. set CurMarketPrice = +$piece(obkINMATERIAL,Y,5)           ;TAGES PREISE
+	. quit:StandardPrice=0
+	. quit:CurMarketPrice=0
+	. SET KOST=KOST*CurMarketPrice/StandardPrice
+	. ;             FAKTOR MATERIALART          "Factor Of Material"
+	. SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33338,,1)_" = "_$$^WWWZAHL(CurMarketPrice/StandardPrice)
+	. ;          EK FÜR ARTIKEL OHNE UNTERTEIL  "Cost For Item With No Parts"
+	. SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33339,,1)_" = "_$$^WWWZAHL(KOST)
+	
+	;ERRECHNEN SELBSTKOSTEN UNTERTEILE ;total production costs
+	IF $DATA(^INARTT(YM,ARTIKEL)) DO   
+	. NEW YI,TEIL,EK,ZEIT,WERT,ARTIKEL1,XKOST
+	. ;
+	. ;		D26		$$$INARTItemType()
+	. IF +KOST'=0 QUIT:$PIECE(YFELD,Y,26)=1   ;KEINE TEILERECHNUNG, WENN BESTELLTEIL ;TYBD 01.06.2002
+ 	. IF +KOST'=0 IF KOSTENART=9 QUIT  ;NO CALCULATION IF AVERAGE COST;SR13253;FIS;16.08.05
+	. SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33341,,1) ;SELBSTKOSTEN UNTERTEILE ;total production costs 
+	. ;SELBSTKOSTEN DER TEILE ;total production costs the 
+	. SET XKOST=0  ;NEURECHNEN
+	. SET TEIL=""
+	. FOR  SET TEIL=$ORDER(^INARTT(YM,ARTIKEL,TEIL)) QUIT:TEIL=""  DO  IF XKOST>1000000000000 SET XKOST="" QUIT 
+	. . SET ARTIKEL1=$GET(^INARTT(YM,ARTIKEL,TEIL,1))      ;ARTIKELTEILEINFO
+	. . QUIT:ARTIKEL=$PIECE(ARTIKEL1,Y,1)                  ;GLEICHES TEIL;TYBD;28,11,2004;26567
+	. . SET XKOST=XKOST+$PIECE(ARTIKEL1,Y,8)               ;WERT DES TEILS ;value of parts
+	. . ;                                                                     UNTERTEIL
+	. . SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33275,,1)_": ("_$EXTRACT($PIECE(ARTIKEL1,Y,1),1,12)_") "_$PIECE(ARTIKEL1,Y,4)_" = "_$$^WWWZAHL($PIECE(ARTIKEL1,Y,8))  
+	. ;                            SUMME KOSTEN UNTERTEILE ;sum of cost of parts 
+	. SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33340,,1)_" = "_$$^WWWZAHL(XKOST) 
+	. ;
+	. ;WENN ARTIKELART NICHT AUSSCHLIESSLICH BESTELLWARE, GELTEN IMMER DIE KOSTEN AUS DEN UNTERTEILEN !  ;FIS,11.06.02
+	. ;AUSNAHME: MANUELLE VORGABE DER KOSTENART  ;FIS, 24.07.02
+	. IF KOSTENART="" IF +XKOST'=0                                 SET KOST=XKOST
+	. IF KOSTENART=2  IF +XKOST'=0                                 SET KOST=XKOST QUIT  ;WERT NACH EIGENFERTIGUNG ;worthy within 
+	. IF KOSTENART=3  IF +XKOST'=0 IF KOST>XKOST                   SET KOST=XKOST QUIT  ;NACH NIEDRIGSTEM WERT ;within worthy 
+	. IF (KOSTENART=4) || (KOSTENART=5) IF +XKOST'=0 IF KOST<XKOST SET KOST=XKOST QUIT  ;NACH HÖCHSTEM WERT SET LIEF(1)=LIEF(2) ;within worthy table-mat 
+	
+	;FERTIGUNGS/MATERIALKOSTENAUFSCHLAG
+	;		YKALK		D9		$$$INKALKOverheadCostManufacturing()   <Appears to be % rather than rate>
+	;		YKALK		D10		$$$INKALKMaterialBurden()
+	;		YFELD		D26		$$$INARTItemType()		0 : Make or Buy  2 : Service  3 : Make
+	IF $GET(NOZUSCHL)'=1 DO
+	. IF +$PIECE(YKALK,Y,10)'=0 IF '$DATA(^INARTT(YM,ARTIKEL)) IF $DATA(^INARTTs(YM,1,idxItem)) DO  QUIT  ;MATERIAL
+	. . ;		
+	. . QUIT:$PIECE(YFELD,Y,26)=2   ;LEISTUNG 		;Service 
+	. . QUIT:$PIECE(YFELD,Y,26)=3   ;EIGENFERTIGUNG ;Make
+	. . SET KOST=KOST+(KOST/100*$PIECE(YKALK,Y,10))  ;Materialgemeinkosten Zukaufteile 
+	. . ;                 MATERIALKOSTENAUFSCHLAG    "Surcharge for Material"
+	. . SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33343,,1)_" = "_$$^WWWZAHL((KOST/100*$PIECE(YKALK,Y,10)))         ;ULM
+	. ;
+	. IF +$PIECE(YKALK,Y,9)'=0 IF $DATA(^INARTT(YM,ARTIKEL)) IF '$DATA(^INARTTs(YM,1,idxItem)) DO  QUIT  ;MATERIAL
+	. . IF $PIECE(YFELD,Y,26)'=0  IF $PIECE(YFELD,Y,26)'=3 QUIT  ;KEINE EIGENFERTIGUNG ;no 
+	. . SET KOST=KOST+(KOST/100*$PIECE(YKALK,Y,9))  ;MATERIALGEMEINKOSTEN eigenfertigung ; Material overheads for own production
+	. . ;               fertigungskostenaufschlag    "Surcharge for Production"
+	. . SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(33342,,1)_" = "_$$^WWWZAHL(KOST/100*$PIECE(YKALK,Y,9))            ;ULM
+	
+	; 33343			"Surcharge for Material"
+	; 33342			"Surcharge for Production"
+	; 32878/33233	"Additional Costs  "	"Tool  "
+	; 32867			"Extra Costs  "
+	
+	; FIXME : These cost should be "per Lot" but the quantity passed into this
+	;         routine is rarely other than 1 or null which defaults to 1 <GRF>
+	
+	;		D74			$$$INARTToolCosts()
+	;		D75			$$$INARTExtraCosts()
+	IF NOEXTRA'=1 DO  ;ZUSATZKOSTEN ;additional costs 
+	. IF $PIECE(YFELD,Y,74)'="" DO     ;WERKZEUGKOSTEN   
+	. . SET WERT=$PIECE(YFELD,Y,74)    ;ZUSATZKOSTEN             WERKZEUG ;additional costs tool 
+	. . SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32878,,1)_" "_$$^WWWTEXT(33233,,1)_" = "_$$^WWWZAHL((WERT*MENGE))  ;ULM 
+	. . SET KOST=KOST+(WERT*MENGE)
+	. ;
+	. IF $PIECE(YFELD,Y,75)'="" DO   ;EXTRAKOSTEN
+	. . SET WERT=$PIECE(YFELD,Y,75)  ;   - Extrakosten  ;Extra Costs 
+	. . SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32867,,1)_" = "_$$^WWWZAHL((WERT*MENGE))  ;ULM 
+	. . SET KOST=KOST+(WERT*MENGE)
+	
+	;		D47			$$$INARTProductionCosts()
+	;		D355		$$$INARTFixedPurchasePrice()
+	IF (SKOST=10)||(+KOST=0) DO                ;TYBD;22.04.2004;FIXKOSTEN/3,5,2004
+	. SET KOST=$PIECE(YFELD,Y,355)            ;FIXKOSTEN ;volume expense 
+	. IF SKOST=10 QUIT                        ;BEI FIXKOSTEN IMMER FIXKOSTEN;FIS;28.05.04;25594
+	. IF +KOST=0 SET KOST=$PIECE(YFELD,Y,47)
+	
+	;SET SELBSTKOST=$JUSTIFY(KOST,0,2)            ;SELBSTKOSTEN ;total production costs
+	SET SELBSTKOST=KOST            ;SR13215 <GRF>
+	IF SELBSTKOST>100000000000 SET SELBSTKOST=0  ;FALSCHER PREIS!
+	
+	;                            32716  - HERSTELLkosten
+	SET PROTOKOLL=PROTOKOLL_"|"_$$^WWWTEXT(32326,,1)_" = "_$$^WWWZAHL(SELBSTKOST)      ;ULM 
+	
+	;---;WEM;#23629;16.05.2003
+	SET PROTOKOLLVK=""
+	DO  ;VK ;Sale 
+	. NEW OFFSET,PK,VK,YI  ; VARIABLEN FÜR DATENFELDNUMMERN(INART): AUFSCHLAG, PREISKENNZEICHEN, VERKAUFSPREIS UND EINE ZÄHLVARIABLE 
+	. ;
+	. SET YI=0
+	. SET VK=0
+	. SET PK=0
+	. ;		OFFSET									VK									PK
+	. ;		D86			$$$INARTCalculation()		D88		$$$INARTSalesPrice()		D90		$$$INARTPriceIdentifier()
+	. ;		D96			$$$INARTCalculation1()		D98		$$$INARTSalesPrice1()		D100	$$$INARTPriceIdentifier1()
+	. ;		D106		$$$INARTCalculation2()		D108	$$$INARTSalesPrice2()		D110	$$$INARTPriceIdentifier2()
+	. ;		D116		$$$INARTCalculation3()		D118	$$$INARTSalesPrice3()		D120	$$$INARTPriceIdentifier3()
+	. SET OFFSET=76
+	. FOR YI=1:1:4  DO     ; 4 DURCHLÄUFE, DA 4 REIHEN MIT AUFSCHLAG, VERKAUFSPREIS, PREISKENNZEICHEN
+	. . SET OFFSET=OFFSET+10
+	. . SET VK=OFFSET+2
+	. . SET PK=VK+2
+	. . IF $PIECE(YFELD,Y,OFFSET)'="" DO    ; WENN AUFSCHLAG NICHT LEER -> PROTOKOLLIERE ;when overcharge Not void 
+	. . . ;                                      Aufschlag 1,2,3,4               
+	. . . SET PROTOKOLLVK=PROTOKOLLVK_"|"_$$^WWWTEXT(32322,,1)_" "_YI_" = "                    
+	. . . ;
+	. . . DO  ;           MINDESTAUFSCHLAGSSATZ         Aufschlag                                                            Aufschlag ;Surcharge 
+	. . . . ;		D11		$$$INVORGMinimumOrderMarkup()
+	. . . . IF $PIECE($GET(^INVORG(YM,YM,1)),Y,11)>$PIECE(YFELD,Y,OFFSET) SET PROTOKOLLVK=PROTOKOLLVK_"@"_"<font color="_YRED_">"_"@"_$PIECE(YFELD,Y,OFFSET)_"@"_"</font>"_"@" QUIT
+	. . . . SET PROTOKOLLVK=PROTOKOLLVK_$PIECE(YFELD,Y,OFFSET)
+	. . . ;             VK                 PREISKENNZEICHEN                                                     PREISKENNZEICHEN von Key(PK) -> Namen(PK)                                   VK                                                         ;Sale 
+	. . . IF $PIECE(YFELD,Y,VK)'="" IF $PIECE(YFELD,Y,PK)'="" SET PROTOKOLLVK=PROTOKOLLVK_" / "_$PIECE($GET(^INPARA(YM,"PREISKENNZEICHEN",SPRACHE,$PIECE(YFELD,Y,PK),1)),Y,1)_" = "_$PIECE(YFELD,Y,VK)
+	
+	; FIXME : Not using WWWSPEI <GRF>
+	;--ENDE--;WEM;#23629;16.05.2003
+	IF +SELBSTKOSTALT'=+SELBSTKOST {
+		SET ^INARTPREISLOG(YM,ARTIKEL,+$HOROLOG,$PIECE($HOROLOG,",",2),1)=PROTOKOLL_Y_PROTOKOLLVK  ;WEM;#23629;16.05.2003 HINZUGEFÜGT-> _Y_PROTOKOLLVK
+	}
+	
+	QUIT SELBSTKOST
+	
+]]></Routine>
+</Export>

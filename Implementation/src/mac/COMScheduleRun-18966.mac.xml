@@ -1,0 +1,406 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMScheduleRun" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+COMScheduleRun
+	;-------------------------------------------------------------------------------
+	; History:
+	; 08-Aug-2006	JW		Removed % from function calls
+	; 14-Dec-2005	GRF		Boolean Macros
+	; 10-Dec-2004	GRF		SR11208 : Replace include ref to "SYSDisc" with "COMSYS"
+	;-------------------------------------------------------------------------------
+#include COMConst
+#include COMSYS
+	
+	;-------------------------------------------------------------------------------
+	; Note: $zu(5) is used intead of $znspace
+	;       and do $zu(5,NameSpace) is used instead of zn to resolve error trapping 
+	;       issues arising out of this code. Change back at your own peril.
+	;-------------------------------------------------------------------------------
+	
+Process
+	;-------------------------------------------------------------------------------
+	; History:
+	; 18-Oct-2010	GRF		-: Boolean macros; clean out old commented code
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule and don't handle nsp
+	;							changing anymore
+	; 10-Mar-2006	RPW		SR14402: Set the nsp before calling ProcessForNameSpace.
+	; 04-Jan-2006	RPW		SR14131: Changed ProcessForNameSpace to call the local
+	;							version, not the in-memory one. This means each
+	;							namespace's version will be the run version.
+	;-------------------------------------------------------------------------------
+	new lstNameSpaces,numNamespaces,lngNamespace,strNameSpace,namespace,thisNamespace
+	
+	set $ztrap="ProcessError"
+	
+	lock ^COMScheduler:2 else  quit
+	set ^COMScheduler("Start") = $$$YES
+	kill ^COMScheduler("LastMethod")
+	kill ^COMScheduler("Error")
+	do LOW^%PRIO                       ; Make this process low priority
+	
+	set thisNamespace=$zutil(5)
+	for {
+		quit:$$GetStart()'=$$$YES    ;loop until we are told to stop
+		
+		do ProcessForNameSpace^COMScheduleRun(thisNamespace)
+		hang $$GetSecondsToWait()
+	}
+	lock
+	quit
+	
+ProcessError	; Internal Tag
+	;-------------------------------------------------------------------------------
+	; History
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule, do not set the namespace
+	;-------------------------------------------------------------------------------
+	set $ztrap=""
+	set strNameSpace = $zutil(5)
+	do $zutil(5,"%SYS")
+	set ^COMScheduler("Error","Error") = $zerror
+	set ^COMScheduler("Error","Date")  = $horolog
+	lock
+	quit
+	
+	
+ProcessForNameSpace(namespace)
+	;-------------------------------------------------------------------------------
+	; Loop through schedules for namespace and run if nescesary
+	;
+	; History:
+	; 29-Jan-2009	shobby	SR16324: If clock has been set to the future at some
+	;							point, resetting it back to the correct time would
+	;							leave the scheduler waiting until the 'future' time
+	;							arrives again.
+	;							Now if the 'Last Run' is in the future the scheduler
+	;							is allowed to proceed and recover.	
+	;							A 3 minute margin of error is allowed to handle the
+	;							situation where PC clocks are resynchronised with a
+	;							server, normally an adjustment of a few seconds.
+	; 08-Oct-2007	shobby	SRBR014743: The COMSchedule record may have been deleted
+	;							in the time taken to run the process.  If so, then
+	;							don't attempt to save it.
+	; 02-Sep-2005	Steve S	SR13385: Loop through valid companies only
+	; 22-Feb-2005	Paul K	Reduce incedence of calling WWWVAR (SR#11305)
+	; 21-Feb-2005	PO		Kill ^WWWUSER after finished.
+	;-------------------------------------------------------------------------------
+	new Company,idSchedule,objSchedule,strCode,idRef,strStatus
+	
+	set $ztrap = "ProcessForNameSpaceError"
+	if $get(Y)="" do ^WWWVAR
+	
+	set Company = ""
+	for {
+		set Company = $order(^WWW012(0,Company))      ;  valid companies only - deprecated now - only zero
+		quit:Company=""
+		
+		set idSchedule = ""
+		for {   ; loop through each schedule for the company for the namespace
+			set idSchedule = $order(^COMSchedule(Company,idSchedule))
+			quit:idSchedule=""
+			
+			set objSchedule = $get(^COMSchedule(Company,idSchedule,1))
+			; Do we need to run this schedule job?
+			if ($$DateDiff^COMUtilDate($$$COMScheduleLastTimeRun(objSchedule),$horolog)<-180) ||
+			   ($$DateDiff^COMUtilDate($$$COMScheduleNextRunTime(objSchedule),$horolog)>0)    ||
+			   ($$$COMScheduleRunNow(objSchedule))                                               {
+				
+				set strCode = $$$COMScheduleCode(objSchedule)
+				set idRef   = $$$COMScheduleTypeReference(objSchedule)
+				do ExecuteCode(Company,idSchedule,strCode,idRef)
+				set $$$COMScheduleLastTimeRun(objSchedule) = $horolog
+				if '$$$COMScheduleRunNow(objSchedule) set $$$COMScheduleNextRunTime(objSchedule) = $$GetNextRunDate(Company,idSchedule)
+				set $$$COMScheduleRunNow(objSchedule)      = 0
+				set YM        = Company
+				set YFORM     = "COMSchedule"
+				set YBED      = YFORM
+				set strStatus = $$$OK
+				if $data(^COMSchedule(Company,idSchedule,1)) {
+					set strStatus = $$^WWWSPEI(YFORM,idSchedule,objSchedule,1)
+				}
+				if strStatus'=$$$YES do NotifyAdmin^COMUtils("COMSchedule",$$DecodeError^COMUtilError($listbuild("Com00063",idSchedule)))
+			} ; "Unable to save Schedule %1 for Scheduler"
+		}
+	}
+	if $get(YUSER)'="" kill ^WWWUSER(0,YUSER)
+	quit
+	
+ProcessForNameSpaceError	; Internal Tag
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule, do not set the namespace
+	;-------------------------------------------------------------------------------
+	set $ztrap=""
+	do $zutil(5,"%SYS")
+	set ^COMScheduler("Error","Error") = $zerror
+	set ^COMScheduler("Error","Date")  = $horolog
+	quit
+	
+	
+ExecuteCode(pCompany,pidSchedule,pstrCode,pidRef)
+	;-------------------------------------------------------------------------------
+	; 
+	; History:
+	; 26-Feb-2013	SCR		HEVA-845: check lock before running code
+	; 15-Feb-2013	SCR		HEVA-845: re lock
+	; 30-Oct-2008	shobby	BR014985: Allow calls to ClassMethods
+	; 18-Jun-2007	GRF		SR15546: identify source of error
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule, do not set the namespace
+	; 21-Feb-2005	RobertW	SR11273: tcommit needs the $tlevel check, not the trollback
+	; 05-Jan-2005	GRF		SR11415 : Use Macros
+	;-------------------------------------------------------------------------------
+	new strMessage,YM,%code,savedTlevel,fltStartTime,fltEndTime
+	
+	set $ztrap = "ExecuteCodeError"
+	
+	set fltStartTime   = $zhorolog
+	set strMessage     = ""
+	set YM             = pCompany
+	set %("%KEY","YM") = YM
+	set ^COMScheduler("LastMethod","Code")       = pstrCode
+	set ^COMScheduler("LastMethod","Company")    = YM
+	set ^COMScheduler("LastMethod","Successful") = $$$NO
+	set ^COMScheduler("LastMethod","Started")    = $horolog
+	set %code=$translate(pstrCode,$$$ACUTE,$$$DBLQUOTE)
+	
+	;*************************************** May leave open transaction - dealt with below.
+	; HEVA-845 vvvv
+	if '$data(^$Lock("^COMScheduler")) {   ; Called routine has cleared the lock
+		do NotifyAdmin^COMUtils("COMSchedule",$$$Text($listbuild("Com00351",pstrCode)))
+		;Lock removed BEFORE running code %1
+		lock ^COMScheduler:2 
+	} 
+	; HEVA-845 ^^^^
+		set savedTlevel=$TLEVEL
+	if $extract(%code,1,2)="##" {
+		set %code="set strMessage="_%code
+	} else {
+		set %code="set strMessage=$$"_%code
+	}
+	xecute %code
+	;***************************************
+	set ^COMScheduler("LastMethod","Successful") = $$$YES
+	
+	; Check execute process has been well behaved
+	if (savedTlevel'=$TLEVEL) {                  ; Called routine has changed TLEVEL
+	;***************************************
+		trollback
+	;***************************************
+		do NotifyAdmin^COMUtils("COMSchedule",$$$Text($listbuild("Com00037",pstrCode,strMessage_" (Ref:37031)")))
+		; "Transaction Level not maintained by called routine: %1 returned: %2"
+		
+	} elseif '$data(^$Lock("^COMScheduler")) {   ; Called routine has cleared the lock
+		do NotifyAdmin^COMUtils("COMSchedule",$$$Text($listbuild("Com00066",pstrCode)))
+		lock ^COMScheduler:2  ; HEVA-845
+	} ; "Lock removed by code %1"
+	
+	set fltEndTime=$zhorolog
+	if strMessage'="" do AddMessage(pCompany,pidSchedule,strMessage,fltEndTime-fltStartTime)
+	quit
+	
+ExecuteCodeError	; Internal Tag
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule, do not set the namespace
+	;-------------------------------------------------------------------------------
+	set $ztrap=""
+	set ^COMScheduler("Error","Error") = $zerror
+	set ^COMScheduler("Error","Date")  = $horolog
+	do RaiseError^COMUtilError($listbuild("Com00002",pidSchedule,pstrCode,$zerror,pidRef),"COMSchedule",pidSchedule)
+	; "An error occured executing schedule %1. Code "%2" caused error "%3". (Ref ID %4)"
+	quit
+	
+	
+AddMessage(pCompany,pidSchedule,pstrMessage,pfltTimeTaken)
+	;-------------------------------------------------------------------------------
+	; NOTE : appends leading zeros onto the time component, so the index works better.
+	;-------------------------------------------------------------------------------
+	new YM,lngNumber,dteCurrent,YFORM
+	
+	set YM         = pCompany
+	set lngNumber  = $order(^COMScheduleMessage(YM,pidSchedule,""),-1)+1
+	set dteCurrent = +$horolog_","_$translate($justify($piece($horolog,",",2),5)," ",0)
+	set YFORM      = "COMScheduleMessage"
+	do ^WWWSPEI(YFORM,pidSchedule_YKOMMA_lngNumber,pstrMessage_Y_pfltTimeTaken_Y_dteCurrent,1)
+	quit
+	
+	
+GetSecondsToWait()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	new lngSeconds
+	
+	set lngSeconds = $get(^COMScheduler("Wait"))
+	if lngSeconds'>0 set lngSeconds = 1
+	quit lngSeconds
+	
+	
+GetStart()
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Mar-2007	RPW		SR10754: Do not use ^%COMSchedule
+	;-------------------------------------------------------------------------------
+	quit $get(^COMScheduler("Start"))
+	
+	
+GetCompatableNamespaces()
+	;-------------------------------------------------------------------------------
+	; Find all namespaces that potentially have schedules
+	; 
+	; History:
+	; 04-Jun-2003	Paul K	Return to current namespace after finishing
+	;-------------------------------------------------------------------------------
+	new lstNameSpaces,intCount,strNameSpace,arrNameSpaces,strCurrentNamespace
+	
+	set lstNameSpaces       = ""
+	set strCurrentNamespace = $zutil(5)
+		
+	for intCount=1:1:$zutil(90,0) {
+		set strNameSpace = $zutil(90,2,0,intCount)
+		quit:strNameSpace=""
+		
+		set arrNameSpaces(strNameSpace)=""
+	}
+	
+	; Return a sorted list of namespaces without duplicates.
+	set strNameSpace = ""
+	for {
+		set strNameSpace = $order(arrNameSpaces(strNameSpace))
+		quit:strNameSpace=""
+		
+		if ($$CheckCompatableNamespace(strNameSpace)) set lstNameSpaces = lstNameSpaces_$listbuild(strNameSpace)
+	}
+	do $zutil(5,strCurrentNamespace)
+	quit lstNameSpaces
+	
+	
+CheckCompatableNamespace(strNameSpace) 
+	;-------------------------------------------------------------------------------
+	; Excludes namespaces that are marked in the CacheTempECP variable.
+	; Running scheduled operations on ECP linked databases is time consuming and unnecessary.
+	; Also checks for the existence of the COMScheduleRun code, older databases won't have this.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Sep-2008	GRF		Don't repeat first two tests
+	; 14-May-2006	shobby	SRBR014022: Change to use a global in %SYS namespace... 
+	;							CacheTemp were not persistent.
+	; 24-Apr-2006	shobby	SRBR014022: Excluded ECP namespaces
+	; ??-???-20??	??????	Created.
+	;-------------------------------------------------------------------------------*/
+	new Result
+	
+	set Result = $$$NO
+	set $ztrap = "CheckCompatableNamespaceError"
+	
+	do $zutil(5,strNameSpace)
+	if ($zutil(5)=strNameSpace) && $data(^ROUTINE("COMSchedule")) {
+		set Result = $$$YES
+		if $data(^ROUTINE("COMScheduleRun")) && '$find($get(^["%SYS"]AlphaLincECP),";"_strNameSpace_";") {
+			set ^["%SYS"]AlphalincSchedule=$zutil(5)
+		}
+	}
+	quit Result
+	
+CheckCompatableNamespaceError	; Internal Tag
+	set $ztrap=""
+	quit $$$NO
+	
+	
+GetNextRunDate(pidCompany,pidSchedule)
+	;-------------------------------------------------------------------------------
+	; Get the next run date for the schedule
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Sep-2008	GRF		&& rather than &
+	; 19-May-2006	RPW		SR14606: Sunday is Day 7 in the enum, but treated as Day
+	;							0 in code, there is a major mismatch which causes
+	;							schedules for Sunday to scheduling incorrectly.
+	;-------------------------------------------------------------------------------
+	new dteLastRunDate,dteNext,intLoop,intTimeIncrement
+	new lngCurrentDay,lngDay,lngDayofMonth,lngDaysInMonth,lngDaysToAdd
+	new lngMonth,lngNextDay,lngYear,objSchedule,strDays,strMonths
+	
+	set objSchedule    = $get(^COMSchedule(pidCompany,pidSchedule,1))
+	set dteLastRunDate = $horolog
+	
+	set intTimeIncrement = $$$COMScheduleTimeIncrement(objSchedule)
+	
+	if intTimeIncrement=$$$EnumCOMTIMEINCREMENTSeconds {
+		set dteNext = $$AddSeconds^COMUtilDate(dteLastRunDate,$$$COMScheduleIncrementValue(objSchedule))
+		
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTMinutes {
+		set dteNext = $$AddSeconds^COMUtilDate(dteLastRunDate,$$$COMScheduleIncrementValue(objSchedule)*60)
+		
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTHours {
+		set dteNext = $$AddSeconds^COMUtilDate(dteLastRunDate,$$$COMScheduleIncrementValue(objSchedule)*60*60)
+		
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTDaysofWeek {
+		set lngCurrentDay = dteLastRunDate+4#7
+		set strDays = ";"_$$$COMScheduleDaysOfWeek(objSchedule)_";"
+		; Make the days mod 7 of each other
+		for intLoop=2:1:$length(strDays,";")-1 {
+			set $piece(strDays,";",intLoop) = $piece(strDays,";",intLoop)#7
+		}
+		
+		for lngDaysToAdd=1:1:7 {
+			set lngDay=";"_(lngCurrentDay+lngDaysToAdd#7)_";"
+			quit:$find(strDays,lngDay)
+		}
+		set dteNext = (dteLastRunDate+lngDaysToAdd)_","_$$$COMScheduleTimeToRun(objSchedule)
+		
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTDaysofMonth {
+		set dteNext        = dteLastRunDate
+		set strDays        = ";"_$$$COMScheduleMultiDaysOfMonth(objSchedule)_";"
+		set lngDaysInMonth = $$GetDaysInMonth^COMUtilDate(dteLastRunDate)
+		
+		for {
+			set dteNext = dteNext+1
+			set lngDayofMonth = +$piece($zdate(dteNext,3),"-",3)
+			quit:$find(strDays,";"_lngDayofMonth_";")
+			quit:((lngDayofMonth=lngDaysInMonth) && $find(strDays,";32;"))
+			quit:((lngDayofMonth=lngDaysInMonth) && (lngDaysInMonth<31) && $find(strDays,";31;"))  ; current month has < 31 days and 31 is selected
+			quit:((lngDayofMonth=lngDaysInMonth) && (lngDaysInMonth<30) && $find(strDays,";30;"))  ; current month has < 30 days and 30 is selected
+			quit:((lngDayofMonth=lngDaysInMonth) && (lngDaysInMonth<29) && $find(strDays,";29;"))  ; current month has < 29 days and 29 is selected
+		}
+		
+		set dteNext = dteNext_","_$$$COMScheduleTimeToRun(objSchedule)
+		
+	} elseif intTimeIncrement=$$$EnumCOMTIMEINCREMENTMonthsofYear {
+		set lngMonth  = $piece($zdate(dteLastRunDate,3),"-",2)
+		set lngYear   = $piece($zdate(dteLastRunDate,3),"-",1)
+		set strMonths = ";"_$$$COMScheduleMonthsOfYear(objSchedule)_";"
+		for {
+			set lngMonth = lngMonth+1
+			if lngMonth>12 {
+				set lngMonth = 1
+				set lngYear  = lngYear+1
+			}
+			quit:$find(strMonths,";"_lngMonth_";")
+		}
+		set dteNext        = lngYear_"-"_lngMonth_"-01"  ;need to determine how many days in the month in case the day of month>current month
+		set lngDaysInMonth = $$GetDaysInMonth^COMUtilDate($zdateh(dteNext,3))
+		set lngNextDay     = $$$COMScheduleSingleDOM(objSchedule)
+		if lngNextDay>lngDaysInMonth set lngNextDay = lngDaysInMonth
+		
+		set dteNext=$zdateh(lngYear_"-"_lngMonth_"-"_lngNextDay,3)_","_$$$COMScheduleTimeToRun(objSchedule)
+		
+	} else {  ; time increment not set, we will not set the next time to run.
+		set dteNext=""
+	}
+	quit dteNext
+	
+]]></Routine>
+</Export>

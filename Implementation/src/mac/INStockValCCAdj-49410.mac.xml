@@ -1,0 +1,604 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INStockValCCAdj" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INStockValCCAdj
+	
+#include COMSYS
+#include INConst
+#include FINEnum
+	
+#define enumAverageCost		9
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^INStockValCCAdj("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+DefaultCostCentre() ; Not Implemented - YPARA, YKEY & COSTCENTRE not maintained
+	;-------------------------------------------------------------------------------
+	; Preserve changed Cost Centre value for Refresh Information Button
+	; 
+	; @$$DefaultCostCentre^INStockValCCAdj()
+	; 
+	; History:
+	; 30-Oct-2009	GRF		SR16871: 
+	;-------------------------------------------------------------------------------
+	new idCostCentre
+	
+	set idCostCentre = $get(COSTCENTRE)  ;   Unsuccessful attempt to set cost centre and have it retained when button refreshes form <GRF>
+	if idCostCentre="" {
+		set idCostCentre = $$GetCostCentre^INCostCentre($get(YLOCATION))
+	}
+	quit idCostCentre
+	
+	
+Adjust(pidKeys,pblnPrePost=$$$NO,pblnRefresh=$$$YES) 
+	;-------------------------------------------------------------------------------
+	; Work out values for adjustment and post (if want)
+	; Posts as "INTRAN" Finance Interface batches
+	; 
+	; Called By: ReverseTxn^INRECReverse                   ($$$NO, $$$NO)
+	;            AfterDataFields^INStockValCCAdjPre        ($$$YES,$$$YES)
+	;            Form INStockValCCAdj : Button 1 "Adjust"  ($$$NO, $$$YES)
+	; 
+	; 
+	; Params: 	pidKeys     - ^INStockValCCAdj keys
+	; 			pblnPrePost - whether we are posting or just preposting
+	; 			pblnRefresh - need to refresh screen?
+	;
+	; Returns: status
+	;
+	; History:
+	; 23-Mar-2011	GRF		SR17668: Audit string to include "ValueAdjust" rather
+	;							than just "Adjust".
+	; 12-Jul-2010	SCR		SR17387: Pass Source Details to Finance
+	; 13-Nov-2009	GRF		SR16871: use INFINInterface instead of INARTHIST
+	; 29-Oct-2009	GRF		SR16871: Copied from INStockValAdjust; INAvgCost with
+	; 							location replaces INARTAVG
+	; 31-Mar-2009	GRF		SR16461: Explicitly show INARTAVG parameters
+	; 08-May-2006	GRF		SR14622: Lock management
+	; 11-Apr-2006	GRF		SR14529: Patch to change pidItem => idItem
+	; 06-Apr-2006	GRF		SR14529: Don't process Non-stock items
+	; 23-Mar-2006	GRF		SR14203: moved strDesc down with second parameter for "IN00378"
+	; 30-Jan-2006	GRF		SR14203: IgnoreCost & curAdjVal; Saved copy of Adjust reverted
+	; 01-Dec-2005	RPW		SR12920: Do not start a transaction if not pre-post.
+	; 04-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	new blnAddSource,blnREVAL,curAdjVal,curIgnoreCost,curNewCost,curNewVal,curOldVal
+	new fltQty,fltSrcQty,idAdj,idCostCentre,idDeleteLocn,idItem,idLocn,idReason
+	new idSource,idSrcLocn,idSrcStore,idStore
+	new objAdjust,objItem,objStockVal,strAudit,strDesc,strReasonCode,strStatus
+	new strSourceDetail,strSourceForm,strSourceRecord
+	
+	$$$LogR("Adjust",pidKeys_$$$COMMA_pblnPrePost_$$$COMMA_pblnRefresh)
+	
+	set idItem       = $$$KEY1(pidKeys)
+	set idCostCentre = $$$KEY2(pidKeys)
+	set idAdj        = $$$KEY3(pidKeys)
+	
+	set strStatus = $$$OK
+	
+	if idItem=""                                           quit strStatus
+	set objItem = $get(^INART(0,idItem,1))
+	if $$$INARTItemWithoutInventoryMaint(objItem)=$$$YES   quit strStatus
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	if 'pblnPrePost tstart
+	;+++++++++++++++++++++++++++++++++++++++
+		
+	set objAdjust = $get(^INStockValCCAdj(0,idItem,idCostCentre,idAdj,1))
+	
+	if '$$Editable(objAdjust) {
+		set strStatus = $listbuild("IN00377")  ; "Record already processed"
+		
+	} else {
+		set curNewCost   = $$$INStockValCCAdjNewCost(objAdjust)
+		set blnAddSource = $$$NO
+		
+		if 'pblnPrePost { 	; Update average cost
+			do UpdateValues(.objAdjust,idItem,idCostCentre)
+			set curIgnoreCost = $$ResetCost^INAvgCost(idItem,idCostCentre,curNewCost,idAdj)
+			set blnREVAL      = $$$YES				
+			set idDeleteLocn  = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+			set idReason      = $$$INStockValCCAdjReason(objAdjust)
+			
+		} else {	// Get the source details - as they won't have been adjusted yet
+			kill ^CacheTempINStock(YUSER,"Adjust",idItem)
+			set idSource = $$$INStockValCCAdjSource(objAdjust)
+			if idSource'="" {
+				do GetDetails^INRECLine(idSource,.fltSrcQty,.idSrcLocn,.idSrcStore)
+				set blnAddSource = $$$YES
+			}
+		}
+				
+		set idLocn = ""
+		for {
+			set idLocn = $order(^INStockVal(0,idItem,idLocn))
+			quit:idLocn=""
+			continue:$$GetCostCentre^INCostCentre(idLocn)'=idCostCentre
+			
+			set idStore = ""
+			for {
+				set idStore = $order(^INStockVal(0,idItem,idLocn,idStore))
+				quit:idStore=""
+				
+				lock +^INStockVal(0,idItem,idLocn,idStore):10        ; force through if time out
+				set objStockVal = $get(^INStockVal(0,idItem,idLocn,idStore,1))
+				
+				set fltQty    = $$$INStockValQuantity(objStockVal)
+				set curOldVal = $$$INStockValValue1(objStockVal)
+				
+				if blnAddSource && (idSrcLocn=idLocn) && (idSrcStore=idStore) {		; update qty for pre-post
+					set fltQty       = (fltQty - fltSrcQty)
+					set blnAddSource = $$$NO
+					set $$$INStockValLastModified(objStockVal)="***"	; Mark this entry
+				}
+				
+				if +curOldVal || +fltQty {
+					set curNewVal = $justify(fltQty*curNewCost,0,2)		; Calculate updates
+					set curAdjVal = curNewVal - curOldVal
+					
+					if pblnPrePost {	; Just store detail for Pre-Post
+						set ^CacheTempINStock(YUSER,"Adjust",idItem,idLocn,idStore) = objStockVal_Y_curNewVal_Y_curAdjVal
+						
+					} else {			; Post
+						set strDesc         = $$$Text($listbuild("IN00378",idAdj,fltQty))  ; "Stock revalued via cost adjustment %1 (%2)"
+					;	set strAudit        = "Adjust|"_pidKeys       ; SR17668
+						set strAudit        = "ValueAdjust|"_pidKeys
+						set strSourceDetail = "34353,"_pidKeys     ; "Cost Adjustment Item %1, Cost Centre %2, Adjustment %3"
+						set strSourceForm   = "INStockValCCAdj"
+						set strSourceRecord = pidKeys
+						if curAdjVal {
+							 ;do PostToFin^INFINInterface($$$EnumMove,"ADJ",strAudit,strDesc,
+						     ;                            idItem,"",-curAdjVal,idLocn,
+						     ;                            idStore,idLocn,idDeleteLocn,,
+						     ;                            ,,,,idReason)
+							 do PostToFin^INFINInterface($$$EnumMove,"ADJ",strAudit,strDesc,
+						                                 idItem,"",-curAdjVal,idLocn,
+						                                 idStore,idLocn,idDeleteLocn,,
+						                                 ,,,,
+						                                 idReason,,,strSourceDetail,
+						                                 strSourceForm,strSourceRecord) ; SR17387
+						}
+					}
+				}
+				lock -^INStockVal(0,idItem,idLocn,idStore)#"I"
+			}
+		}
+	}
+			
+	if 'pblnPrePost {	; Update header record
+		if $$$ISOK(strStatus) {
+			set $$$INStockValCCAdjStatus(objAdjust)        = $$$EnumINSTATUSProcessed
+			set $$$INStockValCCAdjProcessedBy(objAdjust)   = $get(YBED,"UNKNOWN")
+			set $$$INStockValCCAdjProcessedDate(objAdjust) = $horolog
+			set strStatus = $$$Save("INStockValCCAdj",idItem_$$$COMMA_idCostCentre_$$$COMMA_idAdj,objAdjust,$$$YES)
+		}
+				
+	;+++++++++++++++++++++++++++++++++++++++
+		if $$$ISOK(strStatus) {
+			if $tlevel>0 tcommit
+			if pblnRefresh do ReloadForm^COMUtilForm()
+			
+		} else {
+			trollback
+			if pblnRefresh do ReturnError^COMUtilError(strStatus)	
+		}
+	;+++++++++++++++++++++++++++++++++++++++
+	}
+	
+	quit strStatus
+	
+	
+AutoUpdate(pstrSource,pstrRef,pidItem,pidCostCentre,pcurNewCost,pobjStockFin)
+	;-------------------------------------------------------------------------------
+	;	Apply New Average Cost to BALANCE all existing Stock On Hand records within
+	;	the specified Cost Centre and post to the General Ledger.
+	;	
+	;	Doesn't create an INStockValAdjust record since sourced from input transaction.
+	;	
+	;	This is a "value only" adjustment of the difference between the new total
+	;	value at each stock location (current quantity * new average cost) and the
+	;	previous total value there.
+	;
+	; Called By: alDRP.dMovementType.Receipt, alDRP.dMovementType.ReceiptReverse,
+	;            ReviseHistory^INAvgCost, UpdateStockVal^INCostCentre
+	;     
+	;     Not converted from INStockValAdjust but need verifying truely DEPRECATED :
+	;            ReceiptWithOrderMovement^INStockMovementRec,
+	;            ReceiptWithOutOrderMovement^INStockMovementRec,
+	;
+	; Params: 
+	; 	pstrSource		Transaction Type generating AutoUpdate e.g. "INWEFREI" - allows trace if necessary
+	;	pstrRef			Reference String to identify source transaction
+	; 	pidItem			Item Number
+	; 	pidCostCentre	Only change details for locations in this cost centre
+	;	pcurNewCost		New Average Cost
+	;   pobjStockFin    alSFI.dStockFin.cls used for Passing Source Details to finance
+	;	
+	; Returns: status
+	;
+	; Updates :		^INStockVal			(Create, Modify, Kill)
+	; 				^INFIBBUCH			(Create)
+	;
+	; History:
+	; 23-Mar-2011	GRF		SR17668: Audit string to include "ValueAdjust" rather
+	;							than just "Adjust".
+	; 04-Aug-2010	SCR		SR17387: Pass in Stock Fin Object for Source detail
+	; 29-Oct-2009	GRF		SR16871: Copied from INStockValAdjust
+	;-------------------------------------------------------------------------------
+	new curAdjVal,curNewVal,curOldVal,fltQty,idDeleteLocn,idLocn
+	new idReason,idStore,objINVORG,objStockVal,strAudit,strDesc,strStatus
+	new strSourceRec,strSourceForm,strSourceDetail
+	
+	; SR17387 vvvv
+	set strSourceRec	= ""
+	set strSourceForm	= ""
+	set strSourceDetail	= ""
+	if $data(pobjStockFin) {
+		set strSourceRec	= pobjStockFin.SourceRec
+		set strSourceForm	= pobjStockFin.SourceForm	
+		set strSourceDetail	= pobjStockFin.SourceDetail
+	}	
+	; SR17387 ^^^^
+
+	$$$LogR("AutoUpdate",pstrSource_$$$COMMA_pstrRef_$$$COMMA_pidItem_$$$COMMA_pidCostCentre_$$$COMMA_pcurNewCost)
+	
+	set objINVORG    = $get(^INVORG(0,0,1))
+	set strStatus    = $$$OK
+	set idDeleteLocn = $$$INVORGDeleteStockLocation(objINVORG)    ; D87
+	set idReason     = $$$INVORGAutoAvgCostReason(objINVORG)      ; D2
+	;set strAudit     = pstrSource_"|"_pstrRef        ; SR17668
+	set strAudit     = "ValueAdjust,"_pstrSource_"|"_pstrRef
+	set strDesc      = $$^WWWTEXT(33352)              ; "Average Cost Update"
+	
+	set idLocn=""
+	for {
+		set idLocn = $order(^INStockVal(0,pidItem,idLocn))
+		quit:idLocn=""
+		continue:$$GetCostCentre^INCostCentre(idLocn)'=pidCostCentre
+		
+		set idStore = ""
+		for {
+			set idStore = $order(^INStockVal(0,pidItem,idLocn,idStore))
+			quit:idStore=""
+			
+	$$$LogRx("AU1:"_pidItem_$$$COMMA_idLocn_$$$COMMA_idStore)
+	;+++++++++++++++++++++++++++++++++++++++
+			lock +^INStockVal(0,pidItem,idLocn,idStore):10        ; force through if time out
+	;+++++++++++++++++++++++++++++++++++++++
+			set objStockVal = $get(^INStockVal(0,pidItem,idLocn,idStore,1))
+			
+			set fltQty    = $$$INStockValQuantity(objStockVal)   ; D1
+			set curOldVal = $$$INStockValValue1(objStockVal)     ; D2
+			
+			if curOldVal || fltQty {
+				set curNewVal = $justify(fltQty*pcurNewCost,0,2)		// Calculate updates
+				set curAdjVal = curNewVal - curOldVal
+	$$$LogRx("AU2:"_curOldVal_$$$COMMA_curNewVal_$$$COMMA_curAdjVal)
+				
+				if curAdjVal {
+
+				 ; do PostToFin^INFINInterface($$$EnumMove,"ADJ",strAudit,strDesc,
+				 ;                                pidItem,"",-curAdjVal,idLocn,
+				 ;                                idStore,idLocn,idDeleteLocn,,
+				 ;                                ,,,,idReason)
+				 do PostToFin^INFINInterface($$$EnumMove,"ADJ",strAudit,strDesc,
+				                                 pidItem,"",-curAdjVal,idLocn,
+				                                 idStore,idLocn,idDeleteLocn,,
+				                                 ,,,,idReason
+				                                 ,,,strSourceDetail,strSourceForm,strSourceRec) ; SR17387
+					;  FIXME :  what is correct processing?
+					;   1)  set ^CacheTemp(YUSER,"FIBURecord") = $$$YES 
+					;   2)  perform alSFI.dStockFin or PostToFin^INFINInterface ?
+				}
+			}
+	;+++++++++++++++++++++++++++++++++++++++
+			lock -^INStockVal(0,pidItem,idLocn,idStore)#"I"
+	;+++++++++++++++++++++++++++++++++++++++
+		}
+	}
+	
+	quit strStatus
+	
+	
+BeforeButtonLine(pidKeys,&pobjAdjust) 
+	;-------------------------------------------------------------------------------
+	; Set record to readonly if:
+	; (1) Not editable, or
+	; (2) Created from another source
+	;
+	; Called By: Form INStockValCCAdj : Execute Before Buttonline
+	; 
+	; Params:
+	; 	pidKeys     ^INStockValCCAdj keys
+	;	pobjAdjust	^INStockValCCAdj record   (ByRef not currently altered)
+	;
+	; ByRef:
+	; 	YVOR
+	;
+	; History:
+	; 29-Oct-2009	GRF		SR16871: Copied from INStockValAdjust
+	; 03-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	if '$$$NoKey(pidKeys) && ('$$Editable(pobjAdjust) || ($$$INStockValCCAdjSource(pobjAdjust)'="")) {
+		set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+	}
+	quit
+	
+	
+AfterPrimaryKey(pidKeys,&pobjAdjust,pidItem,pidCostCentre)
+	;-------------------------------------------------------------------------------
+	; Update SOH, current average cost if editable
+	;
+	; Called By: Form INStockValCCAdj : Execute After Primary Key
+	; 
+	; Params: Keys, objAdjustment, ItemNo
+	;
+	; ByRef:
+	;	pobjAdjust		^INStockValCCAdj record
+	;
+	; History:
+	; 29-Oct-2009	GRF		SR16871: Copied from INStockValAdjust
+	; 06-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	if $$$NoKey(pidKeys) || $$Editable(pobjAdjust) {
+		do UpdateValues(.pobjAdjust,pidItem,pidCostCentre)
+	}
+	quit
+	
+	
+UpdateValues(&pobjAdjust,pidItem,pidCostCentre) private
+	;-------------------------------------------------------------------------------
+	; Retrieve current SOH & current average cost for Cost Adjustment record.
+	; 
+	; Called by : Adjust, AfterPrimaryKey, Create
+	; 
+	; Params: objAdjustment, ItemNo
+	;
+	; ByRef:
+	;	pobjAdjust		^INStockValCCAdj record
+	;
+	; History:
+	; 16-Mar-2011	GRF		SR17643: Use correct macros - same pieces
+	; 29-Oct-2009	GRF		SR16871: Copied from INStockValAdjust
+	; 15-Sep-2009	PPP		SR16892: Get the Average Cost Qty for a Locn (Entity Qty)
+	; 07-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	$$$LogR("UpdateValues",pidItem_$$$COMMA_pobjAdjust)
+	
+	if $get(pidItem)'="" {
+		set $$$INStockValCCAdjOldCost(pobjAdjust)     = $$GetCost^INItemCost(pidItem,"",$$$enumAverageCost,"","",pidCostCentre)
+		set $$$INStockValCCAdjStockonHand(pobjAdjust) = $$QtyForCC^INARTMENGE(pidItem,pidCostCentre)
+	}
+	
+	$$$LogRx("UV:"_pobjAdjust)
+	quit
+	
+	
+Editable(pYFELD) 
+	;-------------------------------------------------------------------------------
+	; Should the form be editable?
+	; 
+	; Params: objAdjustment
+	;
+	; Returns: Boolean
+	;
+	; History:
+	; 29-Oct-2009	GRF		SR16871: Copied from INStockValAdjust
+	; 03-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	quit ($$$INStockValCCAdjStatus(pYFELD) = $$$EnumINSTATUSUnprocessed)     ; D4 = 0
+	
+	
+AfterDataFields(pidItem,pidCostCentre)   ; SR16871 : TODO pass cost centre from form
+	;-------------------------------------------------------------------------------
+	; Run after data fields
+	;
+	; Called By: Form INStockValCCAdj : Execute After Data Fields
+	; 
+	; Returns: nothing
+	;
+	; History:
+	; 29-Oct-2009	GRF		SR16871: Copied from INStockValAdjust
+	; 03-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	if pidItem'="" {
+		do ShowAverages(pidItem,pidCostCentre)
+	}
+	quit
+	
+	;-------------------------------------------------------------------------------
+	; Average Cost History for Cost Centre XX (Desc)                                  ShowAverages
+	;-------------------------------------------------------------------------------
+	; Items per page: [   20]  1 2 3 4                                                Query^COMQuery
+	;-------------------------------------------------------------------------------
+	;Date|Time|Quantity|Incoming Goods|  Current   | Incoming |  New       |Source |
+	;    |    |On Hand |   Quantity   |Average Cost|Goods Cost|Average Cost|       |
+	;----+----+--------+--------------+------------+----------+------------+-------+
+	;    |    |        |              |            |          |            |   **  |  ** AverageQueryLoop
+	;----+----+--------+--------------+------------+----------+------------+-------+
+	;    |    |        |              |            |          |            |       |
+	;----+----+--------+--------------+------------+----------+------------+-------+
+	;    |    |        |              |            |          |            |       |
+	;----+----+--------+--------------+------------+----------+------------+-------+
+	;    |    |        |              |            |          |            |       |
+	;-------------------------------------------------------------------------------
+	
+	
+ShowAverages(pidItem,pidCostCentre)
+	;-------------------------------------------------------------------------------
+	; Show average cost history
+	; 
+	; Called By: MANU^INARTPREISKO, AfterDataFields^INStockValCCAdj
+	; 
+	; Params:
+	;
+	; History:
+	; 28-Oct-2009	GRF		SR16871: INAvgCost with cost centre replaces INARTAVG
+	; 25-Jan-2006	GRF		SR14203: Add quit
+	; 06-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	new arrKeys,arrQuery,loop,strCCDesc
+	
+	quit:$get(pidCostCentre)=""
+	
+	if pidCostCentre'="" {
+		set strCCDesc = $$$INKOSTLDesignation($get(^INKOSTL(0,pidCostCentre,1)))
+	}
+	if $get(strCCDesc)'="" {
+		set strCCDesc = pidCostCentre_" ("_strCCDesc_")"
+	} else {
+		set strCCDesc = pidCostCentre
+	}
+	
+	set arrQuery("Name")  = "INAvgCost"
+	set arrQuery("Class") = "INAvgCost"
+	set arrQuery("Title") = $$$Text($listbuild("IN00373",strCCDesc))  ; "Average Cost History for Cost Centre %1"
+	
+	set arrQuery("Col",1) = "P~3"                              ; Date
+	set arrQuery("Col",2) = "P~4"                              ; Time
+	
+	; Qty On Hand  |  Incoming Goods Qty  |  Current Avg Cost  |  Incoming Goods Cost  |  New Avg Cost
+	for loop=3:1:7 {
+		set arrQuery("Col",loop) = "D~"_(loop-2)
+	}
+	set arrQuery("Col",8)      = "D~1~L~R~ ~Type~~"_$$$Text(32042)  ; "Source"
+	set arrQuery("Ref","Type") = "id(5)"
+	
+	set arrQuery("Get")      = "set id=id(1)"
+	set arrQuery("Loop")     = "AverageQueryLoop^INStockValCCAdj"
+	set arrQuery("PageSize") = 20
+	
+	set arrKeys(1) = pidItem
+	set arrKeys(2) = pidCostCentre
+	do Query^COMQuery(.arrQuery,.arrKeys)
+	quit 
+	
+	
+AverageQueryLoop(&Query,&Storage,&parrKeys)
+	;-------------------------------------------------------------------------------
+	; Called from ShowAverages for COMQuery
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Oct-2009	GRF		SR16871: INAvgCost with cost centre replaces INARTAVG
+	; 04-Nov-2005	JW		SR12920: Created
+	;-------------------------------------------------------------------------------
+	new id,idCostCentre,idItem,intCount,objAvg,strAdj,strOth,strRec,strRef
+	
+	set idItem       = parrKeys(1)
+	set idCostCentre = parrKeys(2)
+	
+	set intCount  = 0
+	set strRec = $$$Text(32045)		   ; "Receipt"
+	set strAdj = $$$Text("IN00374")	   ; "Adjustment"
+	set strOth = $$$Text(31614)		   ; "Other"
+	
+	set id(3) = ""                     ; Effect Date
+	for {
+		set id(3) = $order(^INAvgCost(0,idItem,idCostCentre,id(3)),-1)
+		quit:id(3)=""
+		
+		set id(4) = ""                 ; Effect Time
+		for {
+			set id(4) = $order(^INAvgCost(0,idItem,idCostCentre,id(3),id(4)),-1)
+			quit:id(4)=""
+			
+			set objAvg = $get(^INAvgCost(0,idItem,idCostCentre,id(3),id(4),1))
+			if $$$INAvgCostIncomingGoodsRef(objAvg)'="" {              ; D10
+				set strRef = strRec
+				
+			} elseif ($$$INAvgCostAdjRef(objAvg)'="") {  ; This will also apply to CC Change
+				set strRef = strAdj_": "_$$$INAvgCostAdjRef(objAvg)
+			
+			} else {
+				set strRef = strOth
+			}
+			set id(1) = objAvg
+			set id(5) = strRef
+			
+			merge @Storage@($increment(intCount)) = id
+		}
+	}
+	quit intCount
+	
+	
+Create(pidItem,pidCostCentre,pcurCost,pidReason,pidSource="")
+	;-------------------------------------------------------------------------------
+	; Create a stock adjustment record
+	; 
+	; Called By: OnAfterSave^INRECReverseLine
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Nov-2005	JW		SR13222: Created
+	;-------------------------------------------------------------------------------
+	new idAdj,objAdj,strStatus
+	
+	$$$LogR("Create",pidItem_$$$COMMA_pidCostCentre_$$$COMMA_pcurCost_$$$COMMA_pidSource)
+	
+	set idAdj = $$^WWWNEXT("INStockValCCAdj")
+	
+	set $$$INStockValCCAdjNewCost(objAdj)     = pcurCost
+	set $$$INStockValCCAdjStatus(objAdj)      = $$$EnumINSTATUSUnprocessed
+	set $$$INStockValCCAdjCreatedBy(objAdj)   = YBED
+	set $$$INStockValCCAdjCreatedDate(objAdj) = $horolog
+	set $$$INStockValCCAdjReason(objAdj)      = pidReason
+	set $$$INStockValCCAdjSource(objAdj)      = pidSource
+	do UpdateValues(.objAdj,pidItem,pidCostCentre)
+	
+	set strStatus = $$$Save("INStockValCCAdj",pidItem_$$$COMMA_pidCostCentre_$$$COMMA_idAdj,objAdj,$$$YES)
+	
+	quit idAdj
+	
+	
+UpdateNewCost(pidItem,pidCostCentre,pidAdj,pcurCost)
+	;-------------------------------------------------------------------------------
+	; Called By: OnAfterSave^INRECReverseLine
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 07-Nov-2005	JW		SR13222: Created
+	;-------------------------------------------------------------------------------
+	new objAdjust,strStatus
+	
+	$$$LogR("UpdateNewCost",pidItem_$$$COMMA_pcurCost_$$$COMMA_pidAdj)
+	
+	set objAdjust = $get(^INStockValCCAdj(0,pidItem,pidCostCentre,pidAdj,1))
+	
+	if $$$INStockValCCAdjNewCost(objAdjust)'=pcurCost {
+		set $$$INStockValCCAdjNewCost(objAdjust) = pcurCost
+		set strStatus = $$$Save("INStockValCCAdj",pidItem_$$$COMMA_pidCostCentre_$$$COMMA_pidAdj,objAdjust,$$$YES)
+	}
+	
+	quit
+	
+	
+OnBeforeFormConstruction()
+	;-------------------------------------------------------------------------------
+	; Key data that is normally preserved through form operation but that needs
+	; to be reset when [NEW] button is pressed are killed here.
+	; 
+	; Called by : ^WWWFORM via CallEvent^COMGridEdit31Events
+	; 
+	; History:
+	; 22-Dec-2009	GRF		SR17095: created
+	;-------------------------------------------------------------------------------
+	quit:$get(%(YQUERY,"YEXEC"))'=""
+	quit:$get(%(YQUERY,"QueryPage"))'=""
+	
+	if $get(YUSER)'="" kill ^CacheTempINStock(YUSER,"Item")
+	quit
+
+]]></Routine>
+</Export>

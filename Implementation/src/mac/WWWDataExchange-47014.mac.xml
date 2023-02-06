@@ -1,0 +1,1393 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWWDataExchange" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWWDataExchange	;Data Exchange System
+	
+#include WWWConst
+#include COMSYS
+#include COMConst
+	
+AllOut(pstrType,pstrGlobal)
+	;-------------------------------------------------------------------------------
+	; Resend all contents of global through data exchange.
+	; 
+	; Inputs:
+	; 	pstrType	: Type of Action to perform.
+	; 					Save
+	; 					Delete
+	; 	pstrGlobal	: Record to send (eg INART).
+	;
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Sep-2009	shobby		SR16906: Out routine expects id's to be in quotes. ^INART(0,"2",1) not ^INART(0,2,1)
+	; 24-Sep-2009	shobby		SR16906: Created
+	;-------------------------------------------------------------------------------
+
+	new idGlobal,id,intCount
+	
+	$$$VAR
+	
+	set intCount=0
+	set idGlobal = "^"_pstrGlobal
+	for {
+		set idGlobal = $query(@idGlobal)
+		quit:idGlobal=""
+		
+		set id=$piece(idGlobal,",",2)
+		if $extract(id)'="""" {
+			set id=""""_id_""""
+			set $piece(idGlobal,",",2)=id
+		}
+		;continue:(+$translate(id,"""")>5)
+		write !,idGlobal
+		set intCount=intCount+1
+		do Out(pstrType,idGlobal,@idGlobal,$$$YES)
+	}
+	write !,!,intCount_" records sent."
+	quit
+
+	
+	
+ConvertAsciiCode(pidText)
+	;-------------------------------------------------------------------------------
+	; Finds the ASCII code of the relevant Application Parameter code.  Used in
+	; the mapping of data exchange fields.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Nov-2008	shobby	SR16126: Return the default string if not a code
+	; 07-Nov-2008	shobby	SRBR014985: Created
+	;-------------------------------------------------------------------------------
+	new intAsciiCode,idxSourceValue,strValue
+	
+	set intAsciiCode=""
+	set idxSourceValue=$$Index^COMUtils(pidText)
+	if idxSourceValue'="" {
+		set intAsciiCode=$order(^WWW101s(0,1,idxSourceValue,"COMDELIMITER","EN",""))
+	}
+	if intAsciiCode="" {
+		set strValue=pidText
+	} else {
+		set strValue=$char(intAsciiCode)
+	}
+	quit strValue
+	
+	
+Out(pstrType,pstrGlobal,pobjRecord="",pblnForce=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; put data in queue for exchanging with other systems
+	;
+	; Inputs : 
+	; pstrType   = Sync Type: "Save" / "Delete"
+	; pstrGlobal = global string: ^TEST(0,1,1)
+	; pobjRecord = record string: DATA~DATA~DATA
+	;
+	; History :
+	; 21-Oct-2009	SCR		SR16929:  Added Data to Message Send Class	
+	; 24-Sep-2009	shobby	SR16906:  New flag pblnForce.  Puts records on the queue even if they have not changed.
+	; 									As when called from AllOut
+	; 09-Sep-2009	FIS		SR16881:  new YSKEY as it caused trouble in WWWSPEI (save within save)
+	; 20-Apr-2009	shobby	SR16438:  Call out to notify external systems that data
+	; 									is on the queue.
+	; 09-Apr-2009	shobby	SR16479:  Reviewed 'newing' of variables.
+	; 28-Nov-2008	shobby	BR014985: Subroutined some code and added support for
+	; 									calculated fields.
+	; 05-Nov-2008	shobby	BR014985: Force the value of a checkbox to be 0 if unchecked.
+	; 04-Nov-2008	shobby	BR014985: Moved the $$Interested check and rearranged
+	; 									some continue commands.
+	; 31-Oct-2008	shobby	BR014985: Only if enabled.
+	; 29-Oct-2008	shobby	BR014985: Always do KILL
+	; 22-Oct-2008	shobby	BR014985: Default value for pobjRecord.  Used during
+	; 							'kill' operation.
+	; 21-Oct-2008	shobby	BR014985: Exclude records based on specified keys
+	; 29-Apr-2008 	CHINMAY Created
+	;-------------------------------------------------------------------------------
+	new idMsgProp,intPropNum,intRule,objExMsgData,objMessage,objMsgProp,objRuleset
+	new strDelimiter,strDisplayField,strGlobalName,strGlobalSortName,strMsgNo,strMultiVal
+	new strResolveClass,strResolvePKey,strSourcePropName,strStatus,strTargetProperty,strValue
+	new strData
+	
+	new YSKEY  //causes trouble in @net Manager because of save within save process
+ 
+	quit:pstrGlobal="" 0 
+	
+	set strGlobalName = $piece($piece(pstrGlobal,"^",2),"(",1)
+	set strGlobalSortName = $$$Index(strGlobalName)
+
+	if $data(^WWWDataExchanges(0,1,strGlobalSortName)) {
+		set intRule = ""
+		for {
+			set intRule = $order(^WWWDataExchanges(0,1,strGlobalSortName,intRule))
+			quit:intRule=""
+			
+			set objRuleset = $get(^WWWDataExchange(0,intRule,1))
+ 
+			continue:($$$WWWDataExchangeActsAs(objRuleset) = 1) //not if remote system is master
+			continue:'$$$WWWDataExchangeEnabled(objRuleset)	    ;Only if enabled.
+			continue:($$Access(intRule,objRuleset) = 1)
+			continue:($$$WWWDataExchangeRemoteSystem(objRuleset) = "") //recipient required
+			continue:'(pblnForce||(pstrType = "Delete")||$$CheckData($$$WWWDataExchangeMessageType(objRuleset),pstrGlobal,pobjRecord))
+
+			set objExMsgData = $get(^WWWDataExMessage(0,$$$WWWDataExchangeMessageType(objRuleset),1))
+			continue:'$$Interested(pstrGlobal,$$$WWWDataExMessageSourceKeys(objExMsgData))  ;BR014985
+			continue:$$Excluded($$$WWWDataExchangeMessageType(objRuleset),pobjRecord,pstrGlobal) ;SR16437
+			
+			//build message if there are some changes in the record
+			set strMsgNo = $$^WWWNEXT("WWWDataExMsgNo")
+			set objMessage = ""
+			set $$$WWWDataExMessageSendType(objMessage) = "Update"
+			if (pstrType = "Delete") {
+				set $$$WWWDataExMessageSendType(objMessage) = "Delete"
+			
+			} elseif ('$data(@pstrGlobal)) {
+				set $$$WWWDataExMessageSendType(objMessage) = "New"
+			}
+			set $$$WWWDataExMessageSendTimestampCreated(objMessage)=$horolog
+			set $$$WWWDataExMessageSendMessageType(objMessage)= $$$WWWDataExchangeMessageType(objRuleset)
+			set $$$WWWDataExMessageSendDataClass(objMessage)=strGlobalSortName
+			set strData   = ""
+			set strStatus = $$$OK
+ 
+			if $$$ISOK(strStatus) {
+				// run through the Exchange message properties
+				set idMsgProp = ""
+				for {
+					set idMsgProp = $order(^WWWDataExMessageProp(0,$$$WWWDataExchangeMessageType(objRuleset),idMsgProp))
+					quit:idMsgProp="" 
+									
+					set objMsgProp = $get(^WWWDataExMessageProp(0,$$$WWWDataExchangeMessageType(objRuleset),idMsgProp,1))
+					set strSourcePropName = $$$WWWDataExMessagePropSourcePropertyName(objMsgProp)
+					set strTargetProperty = $$$WWWDataExMessagePropTargetPropertyName(objMsgProp)
+					set strResolveClass   = $$$WWWDataExMessagePropResolveRelationClass(objMsgProp)
+					set strResolvePKey    = $$$WWWDataExMessagePropResolveRelationalPrimaryK(objMsgProp)
+					set strDisplayField   = $$$WWWDataExMessagePropResolveRelationalDisplayF(objMsgProp)
+					set strDelimiter      = $char($$$WWWDataExMessageDelimeterASCII(objExMsgData))				
+					// pick up each property, get data out of pobjRecord (use Source Property Name)
+					
+					// run through the primary fields and get the property number
+					set intPropNum = "" 
+					if (strSourcePropName'="") {
+						set intPropNum = $order(^WWW002s(0,3,strGlobalSortName,$$$Index(strSourcePropName),strGlobalName,intPropNum))
+						if (intPropNum'="") {
+							set strValue = $piece($piece(pstrGlobal,",",intPropNum+1),"""",2) //get the value from pstrGlobal.Incremented by one since the first value is company id.
+						;	set strValue = $translate($piece(pstrGlobal,",",intPropNum+1),"""") //get the value from pstrGlobal.Incremented by one since the first value is company id.
+							// Do resolution of relation files
+							if (strResolveClass'="") {
+								set strValue = $$ResolveRltnClass(strResolveClass,strResolvePKey,strDisplayField,strValue,strDelimiter)
+							}
+							set strStatus=$$SaveMessageData(strMsgNo,idMsgProp,objMsgProp,objExMsgData,strTargetProperty,strSourcePropName,strValue)
+							set strData=strData_","_strValue ; SR16929:
+						}
+					}
+					
+					// run through the data fields and get the property number
+					set intPropNum = "" 
+					if (strSourcePropName'="") { 
+						set intPropNum = $order(^WWW003s(0,3,strGlobalSortName,$$$Index(strSourcePropName),strGlobalName,intPropNum)) ;BR014985
+						if (intPropNum'="") {
+							set strValue = $piece(pobjRecord,Y,intPropNum)
+							if $$GetDataType(strGlobalName,intPropNum)= 2 {
+								; If this is a yes/no field, force an unchecked state to equal 0 BR014985
+								set strValue=+strValue
+							}
+							// Do resolution of relation files
+							if (strResolveClass'="") {
+								set strMultiVal = $$ResolveRltnClass(strResolveClass,strResolvePKey,strDisplayField,strValue,strDelimiter)
+								// if the value is for a multi select the embed inside double quotes
+								if (($length(strMultiVal,";")>1)||($length(strMultiVal,"|")>1)) {
+									set strValue = """"_strMultiVal_""""     			// Embed the multi select data String inside double quotes
+								} else {
+									set strValue = strMultiVal
+								}
+							}
+							set strStatus=$$SaveMessageData(strMsgNo,idMsgProp,objMsgProp,objExMsgData,strTargetProperty,strSourcePropName,strValue)
+							set strData=strData_","_strValue ; SR16929:
+						}
+					}
+ 
+					// calculated fields
+					set intPropNum = "" 
+					if (strSourcePropName'="") {
+						set intPropNum = $order(^WWW003Calcs(0,1,$$$Index(strSourcePropName),strGlobalName,intPropNum))
+						if (intPropNum'="") {
+							set strValue =$$GetCalculatedValue^COMViewFilter(strGlobalName,"x"_intPropNum,$qsubscript(pstrGlobal,2),pobjRecord," ")
+							set strStatus=$$SaveMessageData(strMsgNo,idMsgProp,objMsgProp,objExMsgData,strTargetProperty,strSourcePropName,strValue)
+							set strData=strData_","_strValue ; SR16929:
+						}
+					}
+ 
+				}
+			if $$$ISOK(strStatus) {													; SR16929
+				set $$$WWWDataExMessageSendData(objMessage)=$extract(strData,2,999)	; Save the Message data	
+				set $$$WWWDataExMessageSendRule(objMessage)=intRule					; Save the Rule ( Used by the Slave Push )
+				set strStatus = $$$Save("WWWDataExMessageSend",$$$WWWDataExchangeRemoteSystem(objRuleset)_","_strMsgNo,objMessage)
+			}
+			if $$$ISOK(strStatus) job NotifyExternalSystems^WWWDataExchangePoke()  ;16438
+			}
+		}
+	}
+	
+	quit 1
+ 
+ 
+SaveMessageData(pstrMsgNo,pidMsgProp,pobjMsgProp,pobjExMsgData,pstrTargetProperty,pstrSourcePropName,pstrValue)
+	;-------------------------------------------------------------------------------
+	;
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Nov-2008	shobby	SRBR014985: Common code brought out of 'Out' method.
+	;-------------------------------------------------------------------------------
+	new objMsgData
+	
+	set pstrValue=$$UndoMappingClass(pobjMsgProp,pstrValue)
+ 
+	// set data into data file:
+	set objMsgData = ""
+	set $$$WWWDataExMessageDataValue1(objMsgData)=pstrValue
+	if (pstrTargetProperty="") {
+		set pstrTargetProperty = pstrSourcePropName	
+	}
+	if +$$$WWWDataExMessageFileType(pobjExMsgData)=0 set pstrTargetProperty = pidMsgProp  //save seq. no. as property if delimetered string
+	quit $$$Save("WWWDataExMessageData",pstrMsgNo_","_pstrTargetProperty,objMsgData)						
+ 
+ 
+GetDataType(pidGlobal,pintField)
+	;-------------------------------------------------------------------------------
+	; Determines what the data type is.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Nov-2008	shobby	BR01985: Created
+	;-------------------------------------------------------------------------------
+	new objWWW003
+	
+	set objWWW003 = $get(^WWW003(0,pidGlobal,pintField,1))
+	quit $$$WWW003InputType(objWWW003)
+	
+	 
+Interested(pstrGlobal,pstrSourceKeys)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; Check to see if we are interested in excluding records based on subscripts
+	; defined in the SourceKeys property
+	;
+	; Inputs : 
+	; pstrGloba = Record being tested
+	; pstrSourceKeys = Only the keys specified should be sent
+	;
+	; History :
+	; 21-Oct-2008   shobby	BR014985: Created
+	;-------------------------------------------------------------------------------
+	new blnInterested,loop,strSubscript
+	
+	set blnInterested=$$$YES
+	if pstrSourceKeys'="" {
+		for loop=1:1:$length(pstrSourceKeys) {
+			set strSubscript = $piece(pstrSourceKeys,",",loop)
+			continue:strSubscript=""
+			
+			if '($extract(strSubscript)="""") {
+				set strSubscript=@strSubscript
+			
+			} else {
+				set strSubscript=$translate(strSubscript,"""")
+			}
+			if strSubscript'=$qsubscript(pstrGlobal,loop+1) {
+				set blnInterested=$$$NO
+			}
+		}
+	}
+	quit blnInterested
+ 
+Excluded(pidMessageType,pobjRecord="",pstrGlobal="")
+	;-------------------------------------------------------------------------------
+	; See if any rules will exclude this record from DataExchange.
+	;
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Apr-2009	shobby	SR16479: Reviewed 'newing' of variables.
+	; 27-Mar-2009	shobby	SR16347: Additional test of the existing 'on disk' value.
+	; 							This caters for the following situation.  An Item
+	; 							becomes excluded from DataExchange if the 'Hold
+	; 							Reason' is set to an inactive state.  However we
+	; 							still want to send a notification that the 'Hold
+	; 							Reason' has changed, to the remote system.
+	; 							Thereafter it should be excluded, but not the 'first
+	; 							save' that makes it excluded.
+	; 25-Mar-2009	shobby	SR16437: Created
+	;-------------------------------------------------------------------------------
+	new idNumber,objWWWDataExMessageRulesD,blnInclude,intField,strTest,blnExcluded
+	
+	set blnExcluded=$$$NO
+	set idNumber = ""
+	for {
+		set idNumber = $order(^WWWDataExMessageRulesD(0,pidMessageType,idNumber))
+		quit:idNumber=""
+		quit:blnExcluded
+		
+		set objWWWDataExMessageRulesD = $get(^WWWDataExMessageRulesD(0,pidMessageType,idNumber,1))
+		if objWWWDataExMessageRulesD'="" {
+			set intField = $$$WWWDataExMessageRulesDSourcePropertyName(objWWWDataExMessageRulesD)
+			set strTest  = $$$WWWDataExMessageRulesDValue1(objWWWDataExMessageRulesD)
+			set blnExcluded = $$TestRule($$$WWWDataExMessageRulesDTest(objWWWDataExMessageRulesD),$piece(pobjRecord,Y,intField),strTest)
+			if blnExcluded && $data(@pstrGlobal) {
+				set blnExcluded = $$TestRule($$$WWWDataExMessageRulesDTest(objWWWDataExMessageRulesD),$piece(@pstrGlobal,Y,intField),strTest)
+			}
+		}
+	}
+	quit blnExcluded
+ 
+ 
+TestRule(pstrRule,pstrValue,pstrTest)
+	;-------------------------------------------------------------------------------
+	; See if the rule applies in this case
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Mar-2009	shobby		SR16437: Created
+	;-------------------------------------------------------------------------------
+	new blnExcluded
+	
+	set blnExcluded = $$$NO
+	if pstrRule=$$$EnumCOMVIEWCOMPARATORGreaterThan {
+		set blnExcluded = (pstrValue>pstrTest)
+	
+	} elseif pstrRule=$$$EnumCOMVIEWCOMPARATORLessThan {
+		set blnExcluded = (pstrValue<pstrTest)
+	
+	} elseif pstrRule=$$$EnumCOMVIEWCOMPARATOREquals {
+		set blnExcluded = (pstrValue=pstrTest)
+	
+	} elseif pstrRule=$$$EnumCOMVIEWCOMPARATORNotEquals {
+		set blnExcluded = (pstrValue'=pstrTest)
+	
+	} elseif pstrRule=$$$EnumCOMVIEWCOMPARATORStartsWith {
+		set blnExcluded = ($extract(pstrValue,1,$length(pstrTest))=pstrTest)
+	
+	} elseif pstrRule=$$$EnumCOMVIEWCOMPARATORContains {
+		set blnExcluded = (pstrValue[pstrTest)
+	}
+ 
+	quit blnExcluded
+	
+	
+ResolveRltnClass(pstrResolveClass,pstrResolvePKey,pstrDisplayField,pstrValue,pstrDelimiter)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; check the incoming new data record with the existing data record.
+	;
+	; Inputs : 
+	; pstrResolveClass = Relation Class Name
+	; pstrResolvePKey = Relation Class Primary Key 
+	; pstrDisplayField = Relation Class Display Field
+	; pstrValue = Data Value
+	; pstrDelimiter = Delimiter 
+	;
+	; History :
+	; 09-Apr-2009	shobby	SR16479: Reviewed 'newing' of variables.
+	; 07-Jun-2008	CHINMAY	Created
+	;-------------------------------------------------------------------------------
+	new strResolveClass,strVal,strTempValue,loop,strResolveCls,objResolveClass
+ 
+	set strVal=""
+	set strResolveClass="^"_pstrResolveClass
+	for loop=1:1:$length(pstrValue,";") {
+		set strTempValue =""
+		// if the relation primary key property in WWWDataExMessageProp is present
+		if (pstrResolvePKey'="") && ($piece(pstrValue,";",loop)'="") {
+			set strResolveCls=strResolveClass_"(0,"_pstrResolvePKey_","""_$piece(pstrValue,";",loop)_""",1)"
+			set objResolveClass = $get(@strResolveCls)
+			if (objResolveClass '= "") {
+				if (pstrDisplayField'="") {
+					set strTempValue = $piece(objResolveClass,Y,pstrDisplayField)   // set the value to the display field value 
+				}
+			}
+		
+		} elseif ($piece(pstrValue,";",loop)'="")  {  // if the relation primary key property in WWWDataExMessageProp is not present
+			set objResolveClass = $get(@strResolveClass@(0,$piece(pstrValue,";",loop),1))
+			if (objResolveClass '= "") {
+				if (pstrDisplayField'="") {
+					set strTempValue = $piece(objResolveClass,Y,pstrDisplayField)	// set the value to the display field value 
+				}
+			}
+		}
+		if (strVal="") {
+			set strVal=strTempValue
+		
+		} else {  // To build the data value for multiple select
+			if (pstrDelimiter'=";") {
+				set strVal=strVal_";"_strTempValue
+			} else {
+				set strVal=strVal_"|"_strTempValue
+			}
+		}
+	}
+	
+	quit strVal
+	
+	
+CheckData(pidMsgType,pstrGlobal,pobjRecord)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; check the incoming new data record with the existing data record.
+	;
+	; Inputs : 
+	; pidMsgType = id of WWWDataExMessage
+	; pstrGlobal = global string: ^TEST(0,1,1) 
+	; pobjRecord = record string: DATA~DATA~DATA
+	;
+	; History :
+	; 09-Apr-2009	shobby	SR16479: Reviewed 'newing' of variables.
+	; 05-Nov-2008	shobby	SRBR014985: Don't continue checking if we have found a change.
+	; 04-Nov-2008	shobby	SRBR014985: strGlobalSortName should only be $$$Index'd
+	; 							for the first occurence in the WWW003s global.
+	; 23-May-2008	CHINMAY	Created
+	;-------------------------------------------------------------------------------
+	new idMsgProp,objMsgProp,objOldRecord,blnFlag,strNewValue,strOldValue,strSourcePropName,intPropNum
+	new idxGlobalSortName,strGlobalName
+ 
+	set objOldRecord      = $get(@pstrGlobal)
+	set strGlobalName     = $piece($piece(pstrGlobal,"^",2),"(",1)
+	set idxGlobalSortName = $$$Index(strGlobalName)
+	
+	set blnFlag = $$$NO 
+	
+	// Run through the data fields to check for if there are any difference between the old value and new value or not
+	set idMsgProp = ""
+	for {
+		quit:blnFlag
+		set idMsgProp = $order(^WWWDataExMessageProp(0,pidMsgType,idMsgProp))
+		quit:idMsgProp=""
+		
+		set objMsgProp        = $get(^WWWDataExMessageProp(0,pidMsgType,idMsgProp,1))
+		set strSourcePropName = $$$WWWDataExMessagePropSourcePropertyName(objMsgProp)
+		set intPropNum        = ""
+ 
+		if (strSourcePropName'="") {          //get the property number from the ^WWW003 global
+			set intPropNum = $order(^WWW003s(0,3,idxGlobalSortName,$$$Index(strSourcePropName),strGlobalName,intPropNum))
+			if (intPropNum'="") {
+				set strNewValue = $piece(pobjRecord,Y,intPropNum)
+				set strOldValue = $piece(objOldRecord,Y,intPropNum) //get the old Value from @pstrGlobal
+				//compare the new value with old, if any changes then set boolean to true
+				if (strNewValue'=strOldValue) {
+					set blnFlag = $$$YES
+				}
+			}
+		}
+	}
+	quit blnFlag
+	
+	
+In(pstrSender)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; Read data in exchange queue and save
+	; 
+	; Inputs : 
+	; pstrSender = Sending Remote System (make sure message was fore this sender)
+	;
+	; History :
+	; 30-Apr-2009	shobby	SR16438: If no WWWDataExchange message is set up, don't
+	; 							use the last in the loop.
+	; 09-Apr-2009	shobby	SR16479: Reviewed 'newing' of variables.
+	; 07-Nov-2008	shobby	BR014985: Empty key may return double quotes.  Strip before testing.
+	; 05-Nov-2008	shobby	BR014985: Use the definitions of the properties in the
+	; 							data exchange setup as the loop to populate the record.
+	; 							This handles the case where there are required fields
+	; 							with default values that don't come from the remote system.
+	; 04-Nov-2008	shobby	BR014985: Some changes to allow for default values if
+	; 							required.  Fields in Alphalinc are not known in the
+	; 							remote system.
+	; 29-Oct-2008	shobby	BR014985: More rewrites for multiple keys
+	; 27-Oct-2008	shobby	BR014985: Start of work to support multiple keys
+	; 22-Oct-2008  	FIS		BR014985: Kill Record if Action Type = Delete
+	; 21-05-2008  	VIJAY	Modified
+	; 05-05-2008  	KALYAN	Created
+	;-------------------------------------------------------------------------------
+	// TO DO	
+	new idMsgReceive,objMsgReceive,idMsgProperty,objMsgData
+	new idMsgType,objDataClass,idGlobal,strGlobal,objWWWDataExMessageProp
+	new strPrimaryKey,idMsgPrimaryKey,idPrimaryKey,objGlobalData
+	new strDataItem,strStatus,errcode,objMsgSrcProp,idMsgSrcProp,strSrcProp,blnNewRecord
+	// run through the WWWDataExMessageReceive
+	 
+	set $ztrap = "DataError"
+	set errcode = 1
+	set idMsgReceive = ""
+	for {
+		set idMsgReceive= $order(^WWWDataExMessageReceives(0,1," ",pstrSender,idMsgReceive))
+		quit:idMsgReceive=""
+		
+		set objMsgReceive = $get(^WWWDataExMessageReceive(0,pstrSender,idMsgReceive,1))
+	;	FIXME : Get $$$WWWDataExMessageReceiveMessageType(objMsgReceive) here rather than inside next loop. <GRF>
+		
+		//Loop for getting the DataClass from the MessageType setting
+		set idMsgType = ""
+		for {
+			set idMsgType = $order(^WWWDataExchange(0,idMsgType))
+			quit:idMsgType=""
+			set objDataClass = $get(^WWWDataExchange(0,idMsgType,1))
+			quit:(($$$WWWDataExMessageReceiveMessageType(objMsgReceive)=$$$WWWDataExchangeMessageType(objDataClass)) && ($$$WWWDataExchangeRemoteSystem(objDataClass)=pstrSender))
+			
+			set objDataClass=""
+		}
+		quit:objDataClass="" 
+		set idGlobal = $$$WWWDataExchangeDataClass(objDataClass)
+		set strGlobal = "^"_idGlobal
+		
+		// read data out of WWWDataExMessageData
+		set strPrimaryKey=$$GetPrimaryKey(idGlobal,idMsgReceive,.idMsgPrimaryKey)
+		quit:$translate(strPrimaryKey,"""")=""
+		
+		//Delete Record
+		if $$$WWWDataExMessageReceiveType(objMsgReceive) = "Delete" {
+			if (strPrimaryKey '= "") {
+				do ^WWWSKILL(idGlobal,strPrimaryKey)
+			}
+			set strStatus = $$$OK
+		
+		} else {
+			//Save Records
+			xecute "set objGlobalData = $get("_strGlobal_"(0,"_strPrimaryKey_",1))"
+			
+			set blnNewRecord  = (objGlobalData="")
+			set idMsgProperty = idMsgPrimaryKey
+			for {
+				set idMsgProperty = $order(^WWWDataExMessageProp(0,$$$WWWDataExchangeMessageType(objDataClass),idMsgProperty))
+				quit:idMsgProperty=""
+				
+				set objWWWDataExMessageProp = $get(^WWWDataExMessageProp(0,$$$WWWDataExchangeMessageType(objDataClass),idMsgProperty,1))
+				set strSrcProp  = $$$WWWDataExMessagePropSourcePropertyName(objWWWDataExMessageProp)
+				set strDataItem = "" ; FIXME : determine $$$Index(idGlobal) *OUTSIDE* of for loop <GRF>
+				set strDataItem = $order(^WWW003s(0,3,$$$Index(idGlobal),$$$Index(strSrcProp),idGlobal,strDataItem))
+				
+			;	FIXME : Should not new inside block - scope is not the same as for dot level format
+				new strDefaultValue
+				
+				set strDefaultValue=$$$WWWDataExMessagePropDefaultValue(objWWWDataExMessageProp)
+				
+				if $data(^WWWDataExMessageData(0,idMsgReceive,idMsgProperty,1)) {
+					set $piece(objGlobalData,Y,strDataItem) = $get(^WWWDataExMessageData(0,idMsgReceive,idMsgProperty,1))
+				
+				} else {
+					if (strDefaultValue'="") && (blnNewRecord) {
+						if ($extract(strDefaultValue,1)="{") && ($extract(strDefaultValue,$length(strDefaultValue))="}") {
+							set strDefaultValue = $extract(strDefaultValue,2,$length(strDefaultValue)-1)
+							set $piece(objGlobalData,Y,strDataItem) = $get(^WWWDataExMessageData(0,idMsgReceive,$$GetPropertyNumber($$$WWWDataExchangeMessageType(objDataClass),strDefaultValue),1))
+						
+						} else {
+							set $piece(objGlobalData,Y,strDataItem) = strDefaultValue
+						}
+					}
+				}
+			}
+			// save data in globals
+			set strStatus = $$$Save(idGlobal,strPrimaryKey,objGlobalData,$$$YES)
+		}
+		// mark message as processed
+		if $$$ISOK(strStatus) {
+			set $$$WWWDataExMessageReceiveTimestampProcessed(objMsgReceive)=$horolog
+			set strStatus = $$$Save("WWWDataExMessageReceive",pstrSender_","_idMsgReceive,objMsgReceive,$$$YES)
+			do ClearDataContainer(idMsgReceive)
+		
+		} else {
+			set errcode = 0
+		}
+	}
+	quit errcode
+	
+	
+GetPropertyNumber(pidDataClass,pstrProperty)
+	;-------------------------------------------------------------------------------
+	; From the description find the number of the property
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Nov-2008	shobby	SRBR014965: Created
+	;-------------------------------------------------------------------------------
+	new intNumber
+	
+	set intNumber = $order(^WWWDataExMessageProps(0,1,$$$Index(pstrProperty),pidDataClass,""))
+	quit intNumber
+ 
+ 
+GetPrimaryKey(pidGlobal,pidMsgReceive,&pidMsgPrimaryKey)
+	;-------------------------------------------------------------------------------
+	; Gets the primary key, supports multi part primary keys
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Apr-2009	shobby	SR16479: WWWDataExMessageData was using 0 not YM
+	; 27-Oct-2008	shobby	SRBR014985: Created
+	;-------------------------------------------------------------------------------
+	new idWWW002,strPrimaryKey,intKey,intId,strValue,intPiece
+	
+	set strPrimaryKey    = ""
+	set idWWW002         = ""
+	set pidMsgPrimaryKey = 0
+	set intPiece         = 0
+	
+	for {
+		set idWWW002 = $order(^WWW002(0,pidGlobal,idWWW002))
+		quit:(idWWW002="")
+		set pidMsgPrimaryKey = $order(^WWWDataExMessageData(0,pidMsgReceive,pidMsgPrimaryKey))
+		quit:pidMsgPrimaryKey=""
+		
+		set strValue = $$$WWWDataExMessageDataValue1($get(^WWWDataExMessageData(0,pidMsgReceive,pidMsgPrimaryKey,1)))
+		set strValue = $$DoMappingClass("Primary Key",strValue)
+		set $piece(strPrimaryKey,$$$COMMA,$increment(intPiece)) = strValue_$$$COMMA   ; FIXME : This puts 2 pieces in position - $$$COMMA suffix not required <GRF>
+	}
+	set strPrimaryKey=$$^WWWKEYBUILD(strPrimaryKey)
+	quit strPrimaryKey
+	
+	
+GetDataExMessage(pidRecipient,pidMessage,pidDataExMessage)
+	;-------------------------------------------------------------------------------
+	; Updates the message with an error if there is a problem
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Apr-2009	shobby	SR16479: Reviewed 'newing' of variables.
+	; 08-Dec-2008	shobby	BR014985: Created
+	;-------------------------------------------------------------------------------
+	new objDataExMessage,objWWWDataExMessageSend,strStatus
+	
+	set objDataExMessage = $get(^WWWDataExMessage(0,pidDataExMessage,1))
+	if objDataExMessage="" {
+		set objWWWDataExMessageSend = $get(^WWWDataExMessageSend(0,pidRecipient,pidMessage,1))
+		set $$$WWWDataExMessageSendStatus(objWWWDataExMessageSend) = 0      ;Error
+		set strStatus = $$$Save("WWWDataExMessageSend",pidRecipient_","_pidMessage,objWWWDataExMessageSend,$$$YES)
+	}
+	quit objDataExMessage
+	
+	
+GetData(pstrRecipient,&strData="",&syncMsg="",&blnEncrypt=$$$NO)    ; FIXME : prefixes <GRF>
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; pick up data out of message queue	
+	;
+	; This will be called from Webservice "alWEB.WS.DataExchange.cls"
+	;
+	; Inputs : 
+	; pstrRecipient = Data Recipient (to validate access)
+	; ByRef Data = data file string
+	; ByRef syncMsg = Message No. (for confirmation)
+	; ByRef blnEncrypt = Encrypt Message yes/no
+	;
+	; History :
+	; 22-Oct-2008	FIS		BR014985: Action Type added to the delimitered string
+	; 29-May-2008	CHINMAY	The structure of the Data String sent over webservice is
+	; 							changed to contain only modified data.
+	; 02-May-2008	CHINMAY	Changed the structure of XML and Delimitered Data String 
+	; 30-Apr-2008	SRINIVAS RAPOL	created
+	;-------------------------------------------------------------------------------
+	new strDataExMsgKey,objDataExMsg,idMsgQueue,objMsgData,strFileType
+	new strMsgProps,strDelimeter,idTargetProp,objMsgQueue
+ 
+ 	// search for next message (oldest, not processed message)
+	set idMsgQueue = $order(^WWWDataExMessageSends(0,1," ",pstrRecipient,""))
+	
+	if (idMsgQueue '= "") {
+		set objMsgQueue  = $get(^WWWDataExMessageSend(0,pstrRecipient,idMsgQueue,1))
+		set objDataExMsg = $$GetDataExMessage(pstrRecipient,idMsgQueue,$$$WWWDataExMessageSendMessageType(objMsgQueue))
+ 		if objDataExMsg'="" {
+	 		if ($$$WWWDataExMessageFileType(objDataExMsg)=0) { ;File Types:1.Delimitered
+				// read data out of WWWDataExMessageData and form the delimitered String data
+				set strDelimeter = $char($$$WWWDataExMessageDelimeterASCII(objDataExMsg))
+				if strDelimeter="" set strDelimeter = $char(126)  ;~
+				set strData = strData_strDelimeter_$$$WWWDataExMessageSendMessageType(objMsgQueue)  ;piece2 = Message Type
+				set strData = strData_strDelimeter_idMsgQueue                                       ;piece3 = Message Id
+				set strData = strData_strDelimeter_$$$WWWDataExMessageSendType(objMsgQueue)         ;piece4 = Action Type
+				set idTargetProp = ""
+				for {
+					set idTargetProp = $order(^WWWDataExMessageData(0,idMsgQueue,idTargetProp))
+					quit:idTargetProp=""
+					
+					set objMsgData=$get(^WWWDataExMessageData(0,idMsgQueue,idTargetProp,1))
+					
+					if (idTargetProp'=$$$WWWDataExMessageSendMessageType(objMsgQueue)) {
+						set $piece(strData,strDelimeter,idTargetProp+9)=$$$WWWDataExMessageDataValue1(objMsgData)  ;piece10-n = Data
+					}
+				}
+				if $$$WWWDataExMessageEncryptMessage(objDataExMsg)=1 {
+					set blnEncrypt = $$$YES
+				}
+			
+			} else {
+				// create  XML structured string in any case ;File Types:1.XML
+				// read data out of WWWDataExMessageData and form the Xml String data
+				set strData = strData_"<Message"
+				set strData = strData_" Type="_""""_$$$WWWDataExMessageSendMessageType(objMsgQueue)_""""
+				set strData = strData_" Action="_""""_$$$WWWDataExMessageSendType(objMsgQueue)_""""
+				set strData = strData_" Id="_""""_idMsgQueue_""""
+				set strData = strData_">"
+				set idTargetProp = ""
+				for {
+					set idTargetProp = $order(^WWWDataExMessageData(0,idMsgQueue,idTargetProp))
+					quit:idTargetProp=""
+					
+					set objMsgData=$get(^WWWDataExMessageData(0,idMsgQueue,idTargetProp,1))
+					
+					if (idTargetProp'=$$$WWWDataExMessageSendMessageType(objMsgQueue)) {
+						set strData = strData_"<"_idTargetProp_">"_$$$WWWDataExMessageDataValue1(objMsgData)_"</"_idTargetProp_">"
+					}
+				}
+				set strData = strData_"</Message>"
+			}
+			set syncMsg = idMsgQueue
+ 		}
+	}
+	quit 1
+	
+	
+FlagProcessed(pstrRecipient,pstrMessageNo)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; kill data out of queue, mark message as processed
+	;
+	; Inputs : 
+	; pstrRecipient = Data Recipient (to validate kill)
+	; pstrMessageNo = Messege Queue No.
+	;
+	; History :
+	; 08-Dec-2008	shobby	BR014985: Clear out status in case there was an error previously
+	; 17-May-2008	SUDHA	created
+	; 07-May-2008	CHINMAY	Modified : To update the timestamp processed flag and
+	; 							delete the data for data class
+	;-------------------------------------------------------------------------------
+	new strStatus,idTargetProp,objMsg
+	
+	set strStatus=0
+	if ($get(pstrRecipient)'="") && ($get(pstrMessageNo)'="") {
+		set objMsg=$get(^WWWDataExMessageSend(0,pstrRecipient,pstrMessageNo,1))
+		if objMsg'="" {
+			// mark message as processed i.e. update the TimeStampProcessed property
+			set $$$WWWDataExMessageSendTimestampProcessed(objMsg)=$horolog
+			set $$$WWWDataExMessageSendStatus(objMsg)=""
+			set strStatus = $$$Save("WWWDataExMessageSend",pstrRecipient_","_pstrMessageNo,objMsg,$$$YES)
+			
+			// kill data out of queue
+			do ClearDataContainer(pstrMessageNo)
+		}
+	}
+ 
+	quit strStatus
+	
+	
+ClearDataContainer(pstrMessageNo)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; clear WWWDataExMessageData data
+	;
+	; Inputs : 
+	; pidMsgType = id of WWWDataExMessage
+	; pstrGlobal = global string: ^TEST(0,1,1) 
+	; pobjRecord = record string: DATA~DATA~DATA
+	;
+	; History :
+	; 23-May-2008	CHINMAY	Created
+	;-------------------------------------------------------------------------------
+	new idTargetProp,strStatus
+	
+	// kill data out of queue
+	set idTargetProp = ""
+	for {
+		set idTargetProp = $order(^WWWDataExMessageData(0,pstrMessageNo,idTargetProp))
+		quit:idTargetProp=""
+		
+		set strStatus = $$$Kill("WWWDataExMessageData",pstrMessageNo_","_idTargetProp)
+	}
+	quit
+	
+		
+AddDefaultKeys(pstrData,pintFirstPiece)
+	;-------------------------------------------------------------------------------
+	; This routine adds in the default values when a multi key message has fixed components
+	; ie for Units of Measure the EINHEIT part of WWW101 is fixed and the remote system
+	; need not send that key
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Nov-2008	shobby	SRBR014985: Created
+	;-------------------------------------------------------------------------------
+	new idMessageType,strDelimiter,objWWWDataExMessage,strSourceKeys,i]]><![CDATA[ntLoop
+	
+	set strDelimiter  = $extract(pstrData,1)
+	set idMessageType = $piece(pstrData,strDelimiter,2)
+	set objWWWDataExMessage = $get(^WWWDataExMessage(0,idMessageType,1))
+	set strSourceKeys = $$$WWWDataExMessageSourceKeys(objWWWDataExMessage)
+	if strSourceKeys'="" {
+		for intLoop=1:1:$length(strSourceKeys,",") {
+			if $piece(strSourceKeys,",",intLoop) '="" {
+				set $piece(pstrData,strDelimiter,pintFirstPiece+intLoop) = $translate($piece(strSourceKeys,",",intLoop),"""")
+			}
+		}
+	}	
+	quit pstrData
+ 
+ 
+PushData(pstrSender,strData)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; get the data from xml or delimitered string and save in into data container
+	; The structure of data is : 1.String Delimitered
+	; 						     2.Xml
+	;
+	; Inputs : 
+	; pstrSender = Data Sender (to validate access)
+	; strData = data file
+	;
+	; History :
+	; 09-Apr-2009	shobby	SR16479: Reviewed 'newing' of variables.
+	; 09-Apr-2009	shobby	SR16479: Changed to objDataReceive
+	; 03-Nov-2008	shobby	BR014985: Call to AddDefaultKeys
+	; 03-Nov-2008	shobby	BR014985:Quit when a rule is found
+	; 22-Oct-2008	FIS		BR014985: Start Data from piece 10 (in delimitered string)
+	; 							Save Action Type in Receive Header
+	; 09-Jun-2008	CHINMAY	Modified
+	; 07-May-2008	CHINMAY	created
+	;----------------------------------------------------------------------------------
+	set $ztrap="DataError"
+	new strDelimiter,strDataExMsgKey,objDataExMsg,strMsgNo,strStatus,objMsgData,strValue,reader,SC
+	new objDataReceive,loop,strMsgPropDet,strActVal,idMsgProp,objMsgProp,idDataEx,objDataEx,idMsgType
+	new idMapping,objMapping,strResolveClass,strRltnClass,strRltnClassObj,idResolve,objResolve,strPropName
+	new blnAccess,idRule,objRuleset,errcode,strTemp,strMsgVal,strTempDelimiter,strMsgProp
+	
+	set strStatus = $$$NO
+	set errcode   = $$$NO
+	
+	if ($get(strData) '= "") {
+		set strTemp = $extract(strData,1,8)	                        // extract the first character to check for the delimiter(if the value :- '<' , its a XML string						
+		
+		//file type : Delimitered String
+		//------------------------------
+		if (strTemp '= "<Message") {
+			set strDelimiter = $extract(strData,1)                  // Since the first character is a delimiter in Delimitered string
+			set strMsgNo = $$^WWWNEXT("WWWDataExMsgNo")
+			
+			set blnAccess = $$$NO
+			set idRule    = ""
+			for {
+				set idRule = $order(^WWWDataExchange(0,idRule))
+				quit:idRule=""
+				
+				set objRuleset = $get(^WWWDataExchange(0,idRule,1))
+				if ($$$WWWDataExchangeRemoteSystem(objRuleset) = pstrSender)                     &&    //Sender
+				   ($$$WWWDataExchangeMessageType(objRuleset) = $piece(strData,strDelimiter,2))  &&    //Message Type
+				   ($$$WWWDataExchangeActsAs(objRuleset) = 1)                                       {  //Sender Is Master
+						set blnAccess = $$$YES
+						quit
+				}
+			}
+			
+			if (blnAccess = $$$YES) {
+				set strData=$$AddDefaultKeys(strData,10) ;BR014985
+				for loop=10:1:$LENGTH(strData,strDelimiter) {  //piece2=message type, piece3=messageid, piece4=action type, piece10-n:data  ;BR014985
+					set idMsgProp  = (loop-9)                 //(piece-9) = property id  ;BR014985
+					set strMsgProp = $$$WWWDataExMessagePropTargetPropertyName($get(^WWWDataExMessageProp(0,$piece(strData,strDelimiter,2),(loop-9),1)))
+					if strMsgProp="" set strMsgProp = $$$WWWDataExMessagePropSourcePropertyName($get(^WWWDataExMessageProp(0,$piece(strData,strDelimiter,2),(loop-9),1)))
+					set strActVal  = $piece(strData,strDelimiter,loop)    //   Value  
+					set strTempDelimiter=""        // Variable that holds the value of delimiter of multiple selects 
+					if (strDelimiter '= ";") {
+						if ($length(strActVal,";") > 1) {
+							set strTempDelimiter = $char(59)                  //Delimiter used in multiple select
+							set strActVal        = $piece(strActVal,"""",2)   //only 1st value
+						}
+					} else {
+						if ($length(strActVal,"|") > 1) {
+							set strTempDelimiter = $char(124)                 //Delimiter used in memo field
+							set strActVal        = $piece(strActVal,"""",2)   //only 1st value
+						} 
+					}
+					
+					set objMsgProp = $get(^WWWDataExMessageProp(0,$piece(strData,strDelimiter,2),idMsgProp,1))
+					set strMsgVal = ""
+	 
+					if (objMsgProp '= "") {
+						// check if mapping table property in WWWDataExMessageProp class is not empty
+						if ($$$WWWDataExMessagePropMappingTable(objMsgProp)'="") {
+							set strMsgVal = $$UndoMappingClass(objMsgProp,strActVal)
+							;if strMsgVal'="" set strActVal = strMsgVal
+						}
+						
+						// check if resolve relation class property in WWWDataExMessageProp class is not empty
+						if ($$$WWWDataExMessagePropResolveRelationClass(objMsgProp)'="") {
+							set strMsgVal = $$UnResolveRltnClass(objMsgProp,strTempDelimiter,strActVal)
+						}
+						
+						// if the data is not successfully mapped or resolved then set errcode to true
+						if (($$$WWWDataExMessagePropResolveRelationClass(objMsgProp)'="") ||
+						    ($$$WWWDataExMessagePropMappingTable(objMsgProp)'=""))           {
+							if ($length(strActVal,strTempDelimiter) > 1) {   // check for multiple select value
+								if ($length(strMsgVal,";") = $length(strActVal,strTempDelimiter)) {
+									set strActVal = strMsgVal
+								} else {
+									set errcode = $$$MakeStatus("Mapping or Resolve Relation Error")
+								}
+							} else {
+								if (strMsgVal '= "") {          // check for single data value
+									set strActVal = strMsgVal
+								} elseif (strActVal '="" ) {
+									set errcode = $$$MakeStatus("Mapping or Resolve Relation Error")
+								}  ; FIXME : Any else case to process? <GRF>
+							}
+						}
+					}
+					quit:errcode'=$$$NO
+					//save the data in WWWDataExMessageData
+					set objMsgData = ""
+					set $$$WWWDataExMessageDataValue1(objMsgData)=strActVal
+					set strStatus = $$$Save("WWWDataExMessageData",strMsgNo_","_strMsgProp,objMsgData)
+				}
+				if (errcode = $$$NO) {
+					set objDataReceive = ""
+					set $$$WWWDataExMessageReceiveTimestampCreated(objDataReceive) = $horolog
+					set $$$WWWDataExMessageReceiveType(objDataReceive) = $piece(strData,strDelimiter,4)  ;Action Type ;BR014985
+					set $$$WWWDataExMessageReceiveMessageType(objDataReceive) = $piece(strData,strDelimiter,2)
+					//Run through the WWWDataExchange to get the value of DataClass
+					set idDataEx=""
+					for {
+						set idDataEx=$order(^WWWDataExchange(0,idDataEx))
+						quit:idDataEx=""
+						
+						set objDataEx=$get(^WWWDataExchange(0,idDataEx,1))
+						if ($$$WWWDataExchangeRemoteSystem(objDataEx)=pstrSender)                    &&
+						   ($$$WWWDataExchangeMessageType(objDataEx)=$piece(strData,strDelimiter,2))    {
+							set $$$WWWDataExMessageReceiveDataClass(objDataReceive)=$$$WWWDataExchangeDataClass(objDataEx)
+						}
+					}
+					set strStatus = $$$Save("WWWDataExMessageReceive",pstrSender_","_strMsgNo,objDataReceive,$$$YES)	
+				} else {
+				    // kill saved data from data Container
+					do ClearDataContainer(strMsgNo)
+				}
+			} else {
+				set errcode = $$$MakeStatus("No Access")
+			}
+			
+		//file type : xml String
+		//------------------------------
+		} else {
+			set strValue=""
+			set idMsgType=""
+			set strActVal=""
+			set strDelimiter=" "
+			set strMsgNo = $$^WWWNEXT("WWWDataExMsgNo")     //generate the next sequence unique message no			
+			// Create a new XML Reader class
+			set reader = ##class(%XML.Reader).%New() 	
+			// Create an instance of %XML.TextReader
+		    set SC = ##class(%XML.TextReader).ParseString(strData,.reader)
+		    if $$$ISOK(SC) {
+		        // Read all elements within the document
+		        while (reader.Read()) {	 
+			        if (reader.NodeType = "element") { 
+					    set strValue = reader.Name                 //The target property name from data string
+					    if (reader.MoveToAttributeName("Type")) {   //from the message node take out the type attribute
+						   set idMsgType=reader.Value
+						}
+				    }
+			    	if (reader.NodeType = "chars") {
+					    // the the content between elements
+				    	if (strValue'="Message") {
+							set strMsgVal   = ""
+					    	set strActVal   = reader.Value    // get the value from data string
+					    	set strPropName = strValue 
+					    	if ($length(strActVal,";") > 1) {
+								set strActVal = $piece(strActVal,"""",2)
+							}        
+							set idMsgProp=""
+							for {
+								set idMsgProp = $order(^WWWDataExMessageProp(0,idMsgType,idMsgProp))
+								quit:idMsgProp=""
+								
+								set objMsgProp = $get(^WWWDataExMessageProp(0,idMsgType,idMsgProp,1))
+								
+								
+								//If Targetproperty name is blank then  the value is set to SourceProperty Name
+								if ($$$WWWDataExMessagePropTargetPropertyName(objMsgProp)="") {
+									set $$$WWWDataExMessagePropTargetPropertyName(objMsgProp)=$$$WWWDataExMessagePropSourcePropertyName(objMsgProp)
+								}
+								//check if the target property name equals to the property name contained in data string 
+								if ($$$WWWDataExMessagePropTargetPropertyName(objMsgProp)=strPropName) {
+									// check if mapping table property in WWWDataExMessageProp class is not empty
+									if ($$$WWWDataExMessagePropMappingTable(objMsgProp)'="") {
+										set strMsgVal = $$UndoMappingClass(objMsgProp,strActVal)
+										if strMsgVal'="" set strActVal = strMsgVal
+									}
+									// check if resolve relation class property in WWWDataExMessageProp class is not empty
+									if ($$$WWWDataExMessagePropResolveRelationClass(objMsgProp)'="") {
+										set strMsgVal = $$UnResolveRltnClass(objMsgProp,";",strActVal)
+									}
+									// if the data is successfully mapped or resolved then set errcode to true
+									if (($$$WWWDataExMessagePropResolveRelationClass(objMsgProp)'="") || ($$$WWWDataExMessagePropMappingTable(objMsgProp)'="")) {
+										if ($length(strActVal,";") > 1) {   // check for multiple select value
+											if ($length(strMsgVal,";") = $length(strActVal,";")) {
+												set strActVal = strMsgVal
+												set errcode = $$$YES
+											} else {
+												set errcode = $$$NO
+												quit
+											}
+										} else {
+											if (strMsgVal '= "") {          // check for single data value
+												set strActVal = strMsgVal
+												set errcode = $$$YES
+											} elseif(strActVal '= "") {
+												set errcode = $$$NO
+												quit
+											}
+										}
+									}
+								}
+							}
+							quit:errcode=0
+							//save the data in WWWDataExMessageData
+							set objMsgData = ""
+							set $$$WWWDataExMessageDataValue1(objMsgData)=strActVal
+							set strStatus = $$$Save("WWWDataExMessageData",strMsgNo_","_strValue,objMsgData)
+					    }
+			    	}
+		        }
+		    }
+		    if (strStatus) {
+			    // save data information in WWWDataExMessageReceive
+				set objDataReceive = ""
+				set $$$WWWDataExMessageReceiveTimestampCreated(objDataReceive) = $horolog
+				set $$$WWWDataExMessageReceiveMessageType(objDataReceive)      = idMsgType
+				set idDataEx=""
+				for {
+					set idDataEx=$order(^WWWDataExchange(0,idDataEx))
+					quit:idDataEx=""
+					set objDataEx=$get(^WWWDataExchange(0,idDataEx,1))
+					if ($$$WWWDataExchangeRemoteSystem(objDataEx)=pstrSender)         &&
+					   ($$$WWWDataExchangeMessageType(objDataEx)=$piece(strData,Y,1))    {
+						set $$$WWWDataExMessageReceiveDataClass(objDataReceive) = $$$WWWDataExchangeDataClass(objDataEx)
+					}
+				}
+				set strStatus = $$$Save("WWWDataExMessageReceive",pstrSender_","_strMsgNo,objDataReceive,$$$YES)
+		    } else {
+			    // kill saved data from data Container
+				do ClearDataContainer(strMsgNo)
+			}
+		}
+	}
+	if (errcode = $$$NO) quit 1
+	quit errcode
+	
+DataError
+	set $zerror=" "
+	quit $$$MakeStatus("Internal Error") 
+	
+ 
+DoMappingClass(pidMappingTable,pstrValue,pintDirection=1)
+	;-------------------------------------------------------------------------------
+	; Translates fields based on mapping setups
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Feb-2009	shobby	SR16126: Don't try and translate if the string is empty.
+	; 20-Nov-2008	shobby	SR16126: Rewrote to handle both directions
+	; 07-Nov-2008	shobby	SRBR014985: Created
+	;-------------------------------------------------------------------------------
+	new objMapping,idSourceValue,intAsciiCode,strText
+ 
+	if pstrValue'="" {
+		if (pidMappingTable'="") {
+			set objMapping = $get(^WWWDataExDataMapping(0,pidMappingTable,pstrValue,1))
+			if (objMapping'="") {
+				set pstrValue=$$$WWWDataExDataMappingTargetValue(objMapping)
+			} else {
+				set idSourceValue=""
+				for {
+					set idSourceValue=$order(^WWWDataExDataMapping(0,pidMappingTable,idSourceValue))
+					quit:idSourceValue=""
+					set intAsciiCode(pintDirection) =$$ConvertAsciiCode(idSourceValue)
+					set objMapping = $get(^WWWDataExDataMapping(0,pidMappingTable,idSourceValue,1))
+					set intAsciiCode('pintDirection)=$$ConvertAsciiCode($$$WWWDataExDataMappingTargetValue(objMapping))
+					set pstrValue=$$FullReplace^COMUtilStr(pstrValue,intAsciiCode(1),intAsciiCode(0))
+				}
+			}
+		}
+	}
+	quit pstrValue
+ 
+ 
+UndoMappingClass(pobjMsgProp,pstrActVal)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; undo mapping class
+	;
+	; Inputs : 
+	; pobjMsgProp = WWWDataExMessageProp class object
+	; pstrActVal = Data Value 
+	;
+	; History :
+	; 09-June-2008       CHINMAY       created
+	;----------------------------------------------------------------------------------
+ 	quit $$DoMappingClass($$$WWWDataExMessagePropMappingTable(pobjMsgProp),pstrActVal,0)
+ 	
+	
+UnResolveRltnClass(pobjMsgProp,pstrDelimiter,pstrMsgVal)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; undo resolving of relation class . Used in the PushData routine.
+	;
+	; Inputs : 
+	; pobjMsgProp   = WWWDataExMessageProp class object
+	; pstrDelimiter = Delimiter
+	; pstrMsgVal    = data value 
+	;
+	; History :
+	; 09-Jun-2008	CHINMAY	created
+	;----------------------------------------------------------------------------------
+	new strResolveClass,strResRltnClsDisplay,strMsgVal,strTempVal,strMultiVal,strVal,strRltnClass,count,strRltnClassObj
+ 
+	set strResRltnClsDisplay = $$$WWWDataExMessagePropResolveRelationalDisplayF(pobjMsgProp)
+	set strMsgVal = pstrMsgVal
+	set strVal = ""
+	// check if resolve relation class property in WWWDataExMessageProp class is not empty
+	if ($$$WWWDataExMessagePropResolveRelationClass(pobjMsgProp)'="") {
+		set strResolveClass = "^"_$$$WWWDataExMessagePropResolveRelationClass(pobjMsgProp)
+		//  if primarykey property in WWWDataExMessageProp class is present
+		if ($$$WWWDataExMessagePropResolveRelationalPrimaryK(pobjMsgProp) '= "") {
+			set strRltnClass    = strResolveClass_"("""_YM_""","_$$$WWWDataExMessagePropResolveRelationalPrimaryK(pobjMsgProp)_",idResolve)"
+			set strRltnClassObj = strResolveClass_"("""_YM_""","_$$$WWWDataExMessagePropResolveRelationalPrimaryK(pobjMsgProp)_",idResolve,1)"
+			//  if contains data for multiple select field or not
+			if ($length(strMsgVal,pstrDelimiter) > 1) {
+				set strMultiVal=""
+				// run through the individual values in the multiple select msg value to pick its respective Id
+				for count=1:1:$length(strMsgVal,pstrDelimiter) {
+					set strTempVal = ""
+					set strTempVal = $$ResolveWithPKey(strRltnClass,strRltnClassObj,$piece(strMsgVal,pstrDelimiter,count),strResRltnClsDisplay)
+					// to build the actual multiple select msg value
+					if (strMultiVal = "") {
+						set strMultiVal = strTempVal
+					} else {
+						if (strTempVal'="") {
+							set strMultiVal = strMultiVal_";"_strTempVal
+						}
+					}
+				}
+				// assign it to actual value variable
+				set strVal = strMultiVal
+			
+			// if the value is for single select field 
+			} else {
+				// assign it to actual value variable
+				set strVal = $$ResolveWithPKey(strRltnClass,strRltnClassObj,strMsgVal,strResRltnClsDisplay)
+			}						
+			
+		} else {     // if primary key not present for relation class
+			
+			// if the value is for multiple select field 
+			if ($length(strMsgVal,pstrDelimiter) > 1) {
+				set strMultiVal = ""
+				for count=1:1:$length(strMsgVal,pstrDelimiter) {
+					set strTempVal = ""
+					set strTempVal = $$ResolveWithoutPKey(strResolveClass,$piece(strMsgVal,pstrDelimiter,count),strResRltnClsDisplay)
+					// to build the actual multiple select msg value
+					if (strMultiVal = "") {
+						set strMultiVal = strTempVal
+					} else {
+						set strMultiVal = strMultiVal_";"_strTempVal
+					}
+				}
+				// assign it to actual value variable
+				set strVal = strMultiVal
+			 
+			} else {   // if the value is for single select field
+				set strVal = $$ResolveWithoutPKey(strResolveClass,strMsgVal,strResRltnClsDisplay)
+			}
+		}
+	}
+	quit strVal
+ 
+ResolveWithoutPKey(pstrResolveClass,pstrMsgVal,pstrResRltnClsDisplay)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; resolve relation class without primary key. Used in the UnResolveRltnClass routine.
+	;
+	; Inputs : 
+	; pstrResolveClass = Relation Class Name
+	; pstrMsgVal = data value 
+	; pstrResRltnClsDisplay = Relation class display field
+	;
+	; History :
+	; 09-Apr-2009	shobby	SR16479: Reviewed 'newing' of variables.
+	; 09-Jun-2008	CHINMAY	created
+	;----------------------------------------------------------------------------------
+	new strTempVal,idResolve,objResolve
+	
+	set strTempVal=""
+	set idResolve=""
+	for {
+		set idResolve=$order(@pstrResolveClass@(0,idResolve))
+		quit:idResolve=""
+		
+		set objResolve=$get(@pstrResolveClass@(0,idResolve,1))
+		// if the value in the data string is same as the value in the relation class object
+		if (pstrMsgVal=$piece(objResolve,Y,pstrResRltnClsDisplay)) {
+			set strTempVal=idResolve
+		}
+	}
+ 
+	quit strTempVal
+ 
+ResolveWithPKey(pstrResolveClass,pstrResolveClassObj,pstrMsgVal,pstrResRltnClsDisplay)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; resolve relation class with primary key. Used in the UnResolveRltnClass routine.
+	;
+	; Inputs : 
+	; pstrResolveClass      = Relation Class Name for using in $order
+	; pstrResolveClassObj   = Relation class Name for getting the object
+	; pstrMsgVal            = data value 
+	; pstrResRltnClsDisplay = Relation class display field
+	;
+	; History :
+	; 09-Apr-2009	shobby	SR16479: Reviewed 'newing' of variables.
+	; 09-Jun-2008	CHINMAY	created
+	;----------------------------------------------------------------------------------
+	new idResolve,objResolve,strTempVal
+	
+	set strTempVal=""
+	set idResolve=""
+	for {
+		set idResolve=$order(@pstrResolveClass)
+		quit:idResolve=""
+		
+		set objResolve = $get(@pstrResolveClassObj)
+		// if the value in the data string is same as the value in the relation class object
+		if (pstrMsgVal=$piece(objResolve,Y,pstrResRltnClsDisplay)) {
+			set strTempVal = idResolve
+		}
+	}
+ 
+	quit strTempVal
+	
+Access(pintRule,pObjRule)
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	; To grant access for a slave to become a master and vice versa temporarily .
+	;
+	; Inputs : 
+	; pintRule = rule Id
+	;
+	; History :
+	; 27-June-2008	VIJAY	Modified
+	; 05-June-2008	KALYAN	created
+	;----------------------------------------------------------------------------------
+	new errcode,intDifference,intTimeStamp,strStatus
+	
+	set errcode = $$$YES
+	quit:($$$WWWDataExchangeTimeStampCreated(pObjRule)="") $$$NO
+	
+	set intTimeStamp  = $$$WWWDataExchangeTimeStampCreated(pObjRule)
+	set intDifference = $$DateDiff^COMUtilDate(intTimeStamp,$horolog)
+	if (($$$WWWDataExchangeAccessTime(pObjRule))>intDifference) {   ;time period in seconds
+		if ($$$WWWDataExchangeActsAs(pObjRule)=1) set errcode = $$$YES
+	
+	} else {
+		set $$$WWWDataExchangeTimeStampCreated(pObjRule) = ""
+		set $$$WWWDataExchangeAccessTime(pObjRule)       = ""
+		set $$$WWWDataExchangeActsAs(pObjRule)           = 0  ;always Slave '$$$WWWDataExchangeActsAs(pObjRule)
+		set strStatus = $$$Save("WWWDataExchange",pintRule,pObjRule,$$$YES)					
+	 	set errcode   = $$$NO
+	}
+	quit errcode
+ 
+ 
+ChangeAccessRights(pstrSender,pstrRuleId,pintAccessPeriod)
+	;-------------------------------------------------------------------------------
+	; Gets the Rule Id and Changes The Access Rights of the Remote System from Master to Client or Vice versa
+	;
+	; This will be called from Webservice "alWEB.WS.DataExchange.cls"
+	;
+	; Params:
+	; pstrSender = Sending Remote System 
+	; pstrRuleId = RuleId from "WWWDataExchange"to which the Remote system Wants the access to be changed
+	; pintAccessPeriod = Period for which a Remote System will Change its Access Rights
+	; 
+	; History:
+	; 27-Jun-2008	VIJAY	Modified
+	; 05-Jun-2008	VIJAY	Created
+	;-------------------------------------------------------------------------------
+	new objDataExchange,strStatus
+	
+	set strStatus = 0
+	if ($get(pstrRuleId) '= "") && ($get(pintAccessPeriod) '= "") {
+		set objDataExchange = $get(^WWWDataExchange(0,pstrRuleId,1))
+		if (objDataExchange '="") {
+			if (pintAccessPeriod '= 0) {
+				set $$$WWWDataExchangeTimeStampCreated(objDataExchange) = $horolog
+				set $$$WWWDataExchangeAccessTime(objDataExchange)       = pintAccessPeriod
+				set $$$WWWDataExchangeActsAs(objDataExchange)           = 1  //always Master '$$$WWWDataExchangeActsAs(objDataExchange)
+			
+			} else {
+				set $$$WWWDataExchangeTimeStampCreated(objDataExchange) = ""
+				set $$$WWWDataExchangeAccessTime(objDataExchange)       = ""
+				set $$$WWWDataExchangeActsAs(objDataExchange)           = 0  //always Slave '$$$WWWDataExchangeActsAs(objDataExchange)
+			}
+		}
+		set strStatus = $$$Save("WWWDataExchange",pstrRuleId,objDataExchange,$$$YES)
+	}
+	
+	quit strStatus
+	
+	
+ClearMessages()
+	;-------------------------------------------------------------------------------
+	; Clear out the message queues
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Nov-2008	shobby	SRBR014985: Created
+	;-------------------------------------------------------------------------------
+	kill ^WWWDataExMessageSend
+	kill ^WWWDataExMessageSends
+	kill ^WWWDataExMessageReceive
+	kill ^WWWDataExMessageReceives
+	kill ^WWWDataExMessageData
+	kill ^WWWDataExMessageData
+	quit
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,505 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPInvPostCost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPInvPostCost
+	;-------------------------------------------------------------------------------
+	;   The actual update of the cost records for an invoice.
+	;-------------------------------------------------------------------------------
+#include FINConst
+#include COMSYS
+#include INConst
+	
+#define LogR(%1,%2)	;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^FINAPInvPostCost("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+UpdateAverageCosts(pidInvoice="")
+	;-------------------------------------------------------------------------------
+	; Creates the Invoice Line (INERECH1)
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Nov-2009	GRF		SR16871: Add Cost Centre parameter to GetPrePost call
+	; 08-Apr-2009	GRF		SR16363: standard prefixes; logging (throughout)
+	; 17-Jun-2005	JW		SR12484: Use GetPrePostInformation
+	; 19-May-2005	Paul K	Removed from FINAPInvPost to here (Post was getting too
+	; 							big), update cost fields on line. SR:12360
+	; 14-Apr-2005	JW		SR11802: Create dummy order for RWO.
+	; 07-Apr-2005	RobertW	SR11836: Modified OpenQuantity to UnmatchedQuantity,
+	; 							removed duplicate line
+	; 24-Mar-2005	PO		SR11349 FC support
+	; 15-Feb-2005	shobby	Resurrected from obsolete code, we are going to do it
+	; 							this way again.
+	; 14-Dec-2004	Shobby	Created (SR10061)
+	;-------------------------------------------------------------------------------
+	new idCostCentre,idLine,objInvLine,strStatus
+	
+	$$$LogR(">>>>>  UpdateAverageCosts",pidInvoice)
+	
+	set strStatus = $$$OK
+	if pidInvoice'="" {
+		set idLine = ""
+		for {
+			set idLine = $order(^FINAPInvLine(0,pidInvoice,idLine))
+			quit:idLine=""
+			continue:idLine="Total"
+			
+			set objInvLine   = $get(^FINAPInvLine(0,pidInvoice,idLine,1))    ; SR16871 vvv
+			set idCostCentre = $$GetCostCentre^INCostCentre($$$FINAPInvLineReceiveLocation(objInvLine))
+			
+		;	do GetPrePostInformation^FINAPInvPrePostCost(pidInvoice,idLine) // This actually updates the PrePost info on the line
+			do GetPrePostInformation^FINAPInvPrePostCost(pidInvoice,idLine,,,,,,idCostCentre) // This actually updates the PrePost info on the line ; SR16871 ^^^
+			set strStatus = $$UpdateLine(pidInvoice,idLine)
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	$$$LogR("<<<<<  UpdateAverageCosts",strStatus)
+	quit strStatus
+	
+	
+UpdateLine(pidInvoice="",pidLine="")
+	;-------------------------------------------------------------------------------
+	; Pulled from UpdateAverageCosts for modularity
+	;
+	; Returns:
+	;
+	; History:
+	; 03-Nov-2009	GRF		SR16871: only simple variables in FC macros
+	; 07-Apr-2009	GRF		SR16363: KEY macros; storage
+	; 15-Jan-2007	GRF		SR15357: Keep FC details in curTotal and pass rounding
+	; 							info to Divd^COMSYSFC
+	; 10-Jan-2007	GRF		SR15357: update existing INERECH record rather than
+	; 							replacing it; use QtyInvoice & curInvTotal
+	; 15-Jul-2006	GRF		SR14471: pass Receive Storage to PRUEF1^INERECH1
+	; 							via PostINERECH
+	; 06-Jul-2006	GRF		SR14471: Replace "GetReceiptAverageCost" with meaningful
+	; 							subroutine name
+	; 14-Jun-2006	GRF		SR14471/14694: renamed "...AverageCost" to "...UnitCost"
+	; 							to lessen confusion; doco
+	; 14-Jun-2006	GRF		SR14471/14694: Doco
+	; 15-Jun-2005	JW/RW	SR12484: Pass in receipt average cost
+	; 26-May-2005	RW		SR12447: Corrected usage of objLine instead of objINERECH1
+	; 19-May-2005	Paul K	Created SR:12360
+	;-------------------------------------------------------------------------------
+	new blnFromOrder,curBase,curInvoiceEach,curInvTotal,curOrderEach,curReceiptUnitCost,curTotal
+	new idInvoice,idLocn,idOrder,idOrderLine,idStorage,idSupplier
+	new objINERECH1,objInvoice,objLine,QtyInvoice,QtyTotal,strStatus
+	
+	$$$LogR("UpdateLine",pidInvoice_","_pidLine)
+	
+	set strStatus = $$$OK
+	if (pidInvoice'="") && (pidLine'="") {
+		set objInvoice     = $get(^FINAPInv(0,pidInvoice,1))
+		set objLine        = $get(^FINAPInvLine(0,pidInvoice,pidLine,1))
+		set idOrder        = $$$KEY1($$$FINAPInvLineOrderNumber(objLine))
+		set idOrderLine    = $$$KEY2($$$FINAPInvLineOrderNumber(objLine))
+		set idSupplier     = $$$FINAPInvSupplier(objInvoice)
+		set idInvoice      = $$$FINAPInvSuppliersInvoiceNumber(objInvoice)	
+		set curInvoiceEach = $$GetAllocatedVarianceCost^FINAPInvPrePostCost(pidInvoice,pidLine)   ; (may return a FC string)
+		
+		; Preserve Receipt Locations    15-Jul-2006
+		set idLocn    = $$$FINAPInvLineReceiveLocation(objLine)
+		set idStorage = $$$FINAPInvLineReceiveStockLocation(objLine)
+		
+	$$$LogRx("UL1:"_idOrder_"<"_idOrderLine_"<"_idSupplier_"<"_idInvoice_"<"_idLocn_"<"_idStorage_"<")
+		
+		;For received without orders - we create a temporary order line.
+		if idOrder="" { // Received without order
+			set blnFromOrder = $$$NO
+			set strStatus    = $$CreateDummyOrder(.idOrder,.idOrderLine,pidInvoice,pidLine)
+		} else {
+			set blnFromOrder = $$$YES
+		}
+		
+		;+++++++++++++++++++++++++++++++++++
+		;  TODO : Is it possible for us to get
+		;  returns processed through here as well?
+		;     - hence check for QtyTotal = 0
+		;     
+		;  curInvoiceEach should still be +ve
+		;  
+		;+++++++++++++++++++++++++++++++++++
+		
+		if $$$ISOK(strStatus) {
+			if (idOrder'="") && (idOrderLine'="") && (idSupplier'="") && (idInvoice'="") {
+				;TODO shobby - need to work out how to handle Invoice without receive.
+				
+				set QtyInvoice  = $$$FINAPInvLineInvoiceQuantity(objLine)
+				set curInvTotal = $$$FCMult2(curInvoiceEach,QtyInvoice)
+				
+		;-----------------------------------
+		; UPDATE EXISTING RECORD
+		;-----------------------------------
+				if $data(^INERECH1(0,idOrder,idOrderLine,idSupplier,idInvoice,1)) {
+					set objINERECH1 = $get(^INERECH1(0,idOrder,idOrderLine,idSupplier,idInvoice,1))
+					
+					set curBase  = $$$INERECH1BasePurchasePrice(objINERECH1)
+					set curTotal = $$$FCAdd(curBase,curInvTotal)     ; SR16871
+					set QtyTotal = $$$INERECH1InvoiceQuantity(objINERECH1)   + QtyInvoice
+					
+					if QtyTotal {    ; leave as is if total qty = 0
+		;+++++++++++++++++++++++++++++++++++
+		; Specifically NOT Divd2
+		; 
+		; Expressed in full rather than using macro since may need to
+		; reconsider macros and didn't want to make a major change there
+		; at this stage. <GRF>
+		;+++++++++++++++++++++++++++++++++++
+						if curTotal["@" {
+							set $$$INERECH1UnitBasePrice(objINERECH1) = $$Divd^COMSYSFC(curTotal,QtyTotal,$$$YES,"FINAPInvLine",$$$FldFINAPInvLineInvoiceEach)
+						} else {
+							set $$$INERECH1UnitBasePrice(objINERECH1) = curTotal / QtyTotal
+						}
+					}
+					
+					set $$$INERECH1InvoiceQuantity(objINERECH1)   = QtyTotal
+					
+					set $$$INERECH1BasePurchasePrice(objINERECH1) = curTotal
+					set $$$INERECH1NetPurchasePrice(objINERECH1)  = curTotal
+					set $$$INERECH1InvoiceAmount(objINERECH1)     = curTotal
+					
+					if QtyInvoice'=$$$FINAPInvLineUnmatchedQuantity(objLine) {
+						set $$$INERECH1InvoiceFlags(objINERECH1) = 15 ; Quantity is wrong
+					} else {
+						set $$$INERECH1InvoiceFlags(objINERECH1) = 0  ; Receipt OK
+					}
+					
+					set curOrderEach = $$$FINAPInvLineOrderEach(objLine)   ; SR16871
+					if '$$$FCIsEqual(curInvoiceEach,curOrderEach) {
+						set $$$INERECH1TransferNetPurchasePriceI(objINERECH1) = $$$YES   ;Transfer net purchase price to inventory
+			; FIXME : ? There *** MAY *** be a reason to exclude delimiters within
+			;           the following field but Locn/Storage pairs 1/23 and 12/3
+			;           will be equivalent <GRF>  SR15378
+						set $$$INERECH1MatchedIncomingGoods(objINERECH1)      = $$$FINAPInvLineReceiveLocation(objLine)_$$$FINAPInvLineReceiveStockLocation(objLine)_$$$FINAPInvLineReceiveDate(objLine)
+					} else {
+						set $$$INERECH1TransferNetPurchasePriceI(objINERECH1) = $$$NO ;Don't Transfer net purchase price to inventory
+					}
+					
+		;-----------------------------------
+		; CREATE NEW RECORD
+		;-----------------------------------
+				} else {
+					set objINERECH1=""
+					set $$$INERECH1SupplierInvoiceNo(objINERECH1) = idInvoice	
+					set $$$INERECH1InvoiceDate(objINERECH1)       = $$$FINAPInvInvoiceDate(objInvoice)
+					set $$$INERECH1InvoiceQuantity(objINERECH1)   = QtyInvoice
+					set $$$INERECH1UnitBasePrice(objINERECH1)     = curInvoiceEach
+					
+					set $$$INERECH1BasePurchasePrice(objINERECH1) = curInvTotal
+					set $$$INERECH1NetPurchasePrice(objINERECH1)  = curInvTotal
+					set $$$INERECH1InvoiceAmount(objINERECH1)     = curInvTotal
+					
+					; TODO shobby investigate whether this flag when not set won't update average costs.
+					if QtyInvoice'=$$$FINAPInvLineUnmatchedQuantity(objLine) {
+						set $$$INERECH1InvoiceFlags(objINERECH1) = 15 ; Quantity is wrong
+					} else {
+						set $$$INERECH1InvoiceFlags(objINERECH1) = 0  ; Receipt OK
+					}
+					
+					set curOrderEach = $$$FINAPInvLineOrderEach(objLine)   ; SR16871
+					if '$$$FCIsEqual(curInvoiceEach,curOrderEach) {
+						set $$$INERECH1TransferNetPurchasePriceI(objINERECH1) = $$$YES ;Transfer net purchase price to inventory
+			; FIXME : ? There *** MAY *** be a reason to exclude delimiters within
+			;           the following field but Locn/Storage pairs 1/23 and 12/3
+			;           will be equivalent <GRF>  SR15378
+						set $$$INERECH1MatchedIncomingGoods(objINERECH1)      = $$$FINAPInvLineReceiveLocation(objLine)_$$$FINAPInvLineReceiveStockLocation(objLine)_$$$FINAPInvLineReceiveDate(objLine)
+					} else {
+						set $$$INERECH1TransferNetPurchasePriceI(objINERECH1) = $$$NO ;Don't Transfer net purchase price to inventory
+					}
+				}
+				
+				set strStatus = $$$Save("INERECH1",idOrder_","_idOrderLine_","_idSupplier_","_idInvoice,objINERECH1,$$$YES)
+				
+				; GetReceiptUnitCost is the Unit cost for the invoice line calculated
+				;  as total/qty - *NOT* Weighted Average Cost for the item.
+				
+				if $$$ISOK(strStatus) {
+					set curReceiptUnitCost = $$GetReceiptUnitCost^FINAPInvPrePostCost(pidInvoice,pidLine)     ; 06-Jul-2006
+		;			do PostINERECH(idOrder_","_idOrderLine_","_idSupplier_","_idInvoice,objINERECH1,curReceiptUnitCost,blnFromOrder)  ; 15-Jul-2006
+					do PostINERECH(idOrder_","_idOrderLine_","_idSupplier_","_idInvoice,objINERECH1,curReceiptUnitCost,blnFromOrder,idLocn,idStorage)
+					
+					if 'blnFromOrder { // Kill temporary order line
+						do KillDummyOrder(idOrder,idOrderLine,objLine)
+					}
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+PostINERECH(pidINERECH1="",pobjINERECH1="",pcurReceiptUnitCost=0,pblnFromOrder=$$$YES,pidLocn,pidStorage)
+	;-------------------------------------------------------------------------------
+	; Pulled From Update Line for modularity
+	;
+	; History:
+	; 15-Jul-2006	GRF		SR14471: pass Receipt Location to PRUEF1^INERECH1
+	; 06-Jul-2006	GRF		SR14471: pass Variables as arguments to PRUEF wrapper
+	; 14-Jun-2006	GRF		SR14471/14694: renamed "...AverageCost" to "...UnitCost"
+	; 							to lessen confusion.
+	; 17-Jun-2005	shobby	Code Check
+	; 15-Jun-2005	JW/RW	SR12484: Pre-calculate unit cost
+	; 19-May-2005	Paul K	Created SR:12360
+	;-------------------------------------------------------------------------------
+	new YDATEI,YFELD,YKEY
+	
+	$$$LogR("PostINERECH",pidINERECH1)
+	
+	set YKEY   = pidINERECH1
+	set YFELD  = pobjINERECH1
+	set YDATEI = "INERECH1"
+	
+	do PRUEF1^INERECH1(YKEY,YFELD,YDATEI,pcurReceiptUnitCost,pidLocn,pidStorage)
+	
+	if pblnFromOrder do KOPIE^INERECH1	// Not necessary for Receive Without Order
+	do ^INARTK                  ; can modify and re-save INERECH1, INAUFP, INARTK
+	quit
+	
+	
+KillDummyOrder(pidOrder,pidOrderLine,pobjInvLine)
+	;-------------------------------------------------------------------------------
+	; Kill the dummy order records
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Oct-2009	GRF		SR16361: Implement changed code
+	; 17-Sep-2009	GRF		SR16361: Remove INWEAUF processing
+	; 11-Apr-2005	JW		Created SR11802
+	;-------------------------------------------------------------------------------
+	new dteRecvd,idLocn,idStorage,strStatus
+	
+	$$$LogR("KillDummyOrder",pidOrder_","_pidOrderLine)
+	
+	if (pidOrder'="") && (pidOrderLine'="") && (pobjInvLine'="") {
+	/*	         ; SR16361
+		set idLocn    = $$$FINAPInvLineReceiveLocation(pobjInvLine)
+		set idStorage = $$$FINAPInvLineReceiveStockLocation(pobjInvLine)
+		set dteRecvd  = $$$FINAPInvLineReceiveDate(pobjInvLine)
+		
+		set strStatus = $$$Kill("INWEAUF",pidOrder_","_pidOrderLine_","_idLocn_","_idStorage_","_dteRecvd)
+	*/; SR16361
+		set strStatus = $$$Kill("INAUFP",pidOrder_","_pidOrderLine) // This also kills the INERECH1 record
+	}
+	
+	quit
+	
+	
+CreateDummyOrder(pidOrder,pidOrderLine,pidInvoice,pidInvoiceLine)
+	;-------------------------------------------------------------------------------
+	; Retroactively create an Order Line (INAUFP) if dealing with a receive without Order.
+	; This is an attempt to solve the updating of average costs by creating an INERECH1
+	; which requires an Order as a primary key.
+	; Also create an Incoming Goods (INWEAUF) record.
+	; These will be killed later.
+	;
+	; Returns: status
+	;
+	; History:
+	; 02-Oct-2009	GRF		SR16361: Implement changed code
+	; 17-Sep-2009	GRF		SR16361: Remove INWEAUF processing
+	; 14-Apr-2005	JW		SR11802: Completed
+	; 16-Feb-2005	Shobby	Created
+	;-------------------------------------------------------------------------------
+	new dteRecvd,idLocn,idStorage,keyINWEAUF,objINAUFP,objInv,objInvLine,objINWEAUF,strStatus
+	
+	$$$LogR("CreateDummyOrder",pidOrder_","_pidOrderLine)
+	
+	set strStatus = $$$OK
+	
+	if ($get(pidInvoice)'="") && ($get(pidInvoiceLine)'="") {
+		set objInv     = $get(^FINAPInv(0,pidInvoice,1))
+		set objInvLine = $get(^FINAPInvLine(0,pidInvoice,pidInvoiceLine,1))
+		
+		// Create Dummy Order Number
+		set pidOrder = "RWO"
+		while($data(^INAUFP(0,pidOrder,1))) {
+			set pidOrder = pidOrder_$random(1000)
+		}
+		set pidOrderLine = pidInvoiceLine
+		
+	/*  ; SR16361
+		set idLocn    = $$$FINAPInvLineReceiveLocation(objInvLine)
+		set idStorage = $$$FINAPInvLineReceiveStockLocation(objInvLine)
+		set dteRecvd  = $$$FINAPInvLineReceiveDate(objInvLine)
+		
+		set keyINWEAUF = pidOrder_","_pidOrderLine_","_idLocn_","_idStorage_","_dteRecvd
+		set $$$INWEAUFIncomingGoodsQuantity(objINWEAUF) = $$$FINAPInvLineReceivedQuantity(objInvLine)
+		set strStatus = $$$Save("INWEAUF",keyINWEAUF,objINWEAUF,$$$YES)
+	*/ ; SR16361
+		
+		if $$$ISOK(strStatus) {
+			set $$$INAUFPItemNumber(objINAUFP) = $$$FINAPInvLineItem(objInvLine)
+			set $$$INAUFPQuantity(objINAUFP)   = $$$FINAPInvLineReceivedQuantity(objInvLine)
+			set strStatus = $$$Save("INAUFP",pidOrder_","_pidOrderLine,objINAUFP,$$$YES)
+		}
+	}
+	quit strStatus
+	
+	
+PostCostsNow(pidInvoice,pobjInvoice="",pblnPostable)
+	;-------------------------------------------------------------------------------
+	; Updates the Inventory side of posting.
+	;
+	; Called By:	PostCost^FINAPInvPostCost; Post^FINAPInvPost
+	; 
+	; History:
+	; 18-Oct-2005	PO		SR12972: Moved from FINAPInvPost
+	; 12-Aug-2005	JW		SR12410: Added lock parameter
+	; 15-Jun-2005	JW/RW	SR12484: Fixed. Post MatchCache
+	; 07-Feb-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new strStatus,objInvoice
+	
+	$$$LogR("PostCostsNow",pidInvoice_","_$get(pblnPostable))
+	
+	set strStatus=+$get(pblnPostable)
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	tstart
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	if $$$ISOK(strStatus) {
+		if '$$$FINAPInvCostsPosted(pobjInvoice) {
+			set strStatus = $$PostInvCosts(pidInvoice)  ; SR16871
+			if $$$ISOK(strStatus) {
+				set strStatus = $$CloseOrders^FINAPInvPost(pidInvoice)
+				if $$$ISOK(strStatus) {
+					set $$$FINAPInvCostsPosted(pobjInvoice)=$$$YES
+					set strStatus = $$$Save("FINAPInv",pidInvoice,pobjInvoice,$$$YES) //SR12410
+					
+					if $$$ISOK(strStatus) {
+						set strStatus = $$Post^FINAPInvMatchCache(pidInvoice)
+					}
+				}
+			}
+		}
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+	} else {
+		trollback
+	}
+	;+++++++++++++++++++++++++++++++++++++++
+	quit strStatus
+	
+	
+	;PostCosts(pidInvoice)
+PostInvCosts(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Update INWE with the new average cost and recalculate the average cost on the product
+	;
+	; Called By : PostCostsNow^FINAPInvPostCost
+	;
+	; History:
+	; 03-Nov-2009	GRF		SR16871: Tag PostCosts is too close to PostCost - use
+	; 							PostInvCosts instead
+	; 02-Oct-2009	GRF		SR16361: Implement changed code
+	; 21-Sep-2009	GRF		SR16361: Remove INWE processing
+	; 08-Apr-2009	GRF		Internal call replaces external call
+	; 18-Oct-2005	PO		SR12972: Moved from FINAPInvPost
+	; 10-Jun-2005	JW/RW	SR12484: Don't save cost in INWE. Done in INERECH1
+	; 26-May-2005	RobertW SR12447: Removed average cost update as it doesn't appear 
+	; 							 to be necessary and is not correct for non Average 
+	; 							 Cost Costing
+	; 19-May-2005	Paul K	Moved UpdateAverageCosts to another routine SR:12360
+	; 15-Feb-2005	shobby	****** Need to verify UpdateAverageCosts
+	; 07-Feb-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idLine,objLine,idProduct,objCost,objProduct,strRef
+	new idLocn,idStorage,dteRecvd,objINWE,objInvoice,curCost
+	
+	$$$LogR("PostCosts",$get(pidInvoice))
+	
+	set strStatus = $$UpdateAverageCosts(pidInvoice)
+	
+	/*  SR16361
+	if $$$ISOK(strStatus) {
+		set objInvoice = $get(^FINAPInv(0,pidInvoice,1)) ; TODO/FIXME (MS) pidInvoice could be undef or null here!!!
+		
+		set idLine = ""
+		for {
+			set idLine = $order(^FINAPInvLine(0,pidInvoice,idLine))
+			quit:idLine=""
+			
+			set objLine = $get(^FINAPInvLine(0,pidInvoice,idLine,1))
+			
+			if $$$FINAPInvLineClosed(objLine) {
+				set idProduct = $$$FINAPInvLineItem(objLine)
+				set idLocn    = $$$FINAPInvLineReceiveLocation(objLine)
+				set idStorage = $$$FINAPInvLineReceiveStockLocation(objLine)
+				set dteRecvd  = $$$FINAPInvLineReceiveDate(objLine)
+				
+				if (idProduct'="") && (idLocn'="") && (idStorage'="") && (dteRecvd'="") {
+					set objINWE = $get(^INWE(0,idProduct,idLocn,idStorage,dteRecvd,1))
+					
+					if objINWE '= "" {
+						; TODO shobby
+					;	set $$$INWEUnitPrice(objINWE)     = $$GetAllocatedVarianceCost(pidInvoice,idLine) ;SR12484
+						set $$$INWEInvoiceNumber(objINWE) = pidInvoice
+						set $$$INWEInvoiceDate(objINWE)   = $$$FINAPInvInvoiceDate(objInvoice)
+						
+	;---------------------------------------
+	;
+	; *** UPDATE INWE POINT ***
+	; 
+	; This comment marks where the INWE class is being
+	; saved or killed as an indication of where a
+	; common method may need to be located.     <GRF>
+	;
+	;---------------------------------------
+						set strStatus = $$Save^COMUtils("INWE",idProduct_","_idLocn_","_idStorage_","_dteRecvd,objINWE,1)
+					}
+				}
+			}
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	*/  ; SR16361
+	quit strStatus
+	
+	
+PostCost(pidInvoice)
+	;-------------------------------------------------------------------------------
+	; Run from the front end to post costs then return to the screen.
+	; (wrapper for PostCostsNow)
+	; 
+	; Called By: Form FINAPInv Button 8 "Update Costs"
+	; 
+	; Returns:Status
+	;
+	; History:
+	; 18-Oct-2005	PO		SR12972: Moved from FINAPInvPost
+	;  9-Aug-2005	JW		Should be 4th parameter set to $$$YES
+	; 10-Feb-2005	shobby	Remove undefined variables under PK's guidance.
+	; 07-Feb-2005	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new strStatus,objInvoice
+	
+	$$$LogR("***PostCost***",$get(pidInvoice))
+	
+	set strStatus = $$$OK
+	do Update^FINAPInv2()
+	
+	if $get(pidInvoice)'="" {
+		set strStatus = $$Postable^FINAPInvPost(pidInvoice,,,$$$YES)
+		
+		if $$$ISOK(strStatus) {
+			set objInvoice = $get(^FINAPInv(0,pidInvoice,1)) 
+			set strStatus  = $$PostCostsNow(pidInvoice,objInvoice,$$$ISOK(strStatus))
+		}
+	}
+	
+	if $$$ISOK(strStatus) {
+		do GoToForm^COMUtilForm("FINAPInvPrePostCost",pidInvoice,YSEITE,"")
+	} else {
+		do ReturnError^COMUtilError(strStatus)
+	}
+	
+	quit strStatus
+	
+]]></Routine>
+</Export>

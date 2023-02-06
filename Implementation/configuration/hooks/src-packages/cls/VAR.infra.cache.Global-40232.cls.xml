@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="Cache for Windows (x86-32) 2008.2 (Build 615U)">
+<Class name="VAR.infra.cache.Global">
+<ClassType/>
+<Import>VAR.infra.util</Import>
+<ProcedureBlock>1</ProcedureBlock>
+<Super>%RegisteredObject</Super>
+<Method name="ListSizes">
+<Description><![CDATA[
+Refactored from %GSIZE.int]]></Description>
+      <ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[
+	if ($$isrem^%SYS.GLO) {
+		write !, *7, $znspace, " does not currently support default global directory"
+		write !, "  located on a remote system."
+		quit
+	}
+	if ('$zbitget($zversion(0), 21)) {
+		write !, *7, $znspace, " only runs on big database system code."
+		quit
+	}
+
+	set dbDir = $zutil(12, "")
+	if ($length(dbDir) = "") quit
+
+	if ($zbitget($zversion(0), 21)) {
+		set dirInfo = $zutil(49, dbDir)
+		if (+dirInfo < 0) {
+			write !, *7, dbDir, " is not available"
+			quit
+		}
+
+		set bigDb = $piece(dirInfo, ",", 21)
+		set blockSize = $piece(dirInfo, ",", 2)
+	}
+	else {
+	    set bigDb = 0
+    	set blockSize = 2048
+	}
+	set dataSize = $case(blockSize, 2048: 2036, :(blockSize - $zutil(40, 32, 10)))
+
+	set (totalBytes, totalBlocks, totalContiguousBlocks) = 0
+
+	set globalName = $order(^$GLOBAL(""))
+	while ($length(globalName) > 0) {
+		write ?6, $extract(globalName, 2, $length(globalName))
+		if ($x > 18) write !
+
+		set status = ..GetSizeInfo(dbDir, bigDb, blockSize, dataSize,
+			$extract(globalName, 2, $length(globalName)), .bytes, .blocks,
+			.contiguousBlocks)
+		if ($$$ISERR(status)) quit
+
+		write ?18, $justify($fnumber(blocks, ","), 8)
+		write ?28, $justify($fnumber(bytes, ","), 15), ?45
+		if (blocks = 0) write $justify(0, 5, 0), " %"
+		if (blocks '= 0) write $justify(100 * (bytes / (blocks * dataSize)), 5, 0), " %"
+		write ?55, $justify($fnumber(contiguousBlocks, ","), 7), !
+
+		set totalBytes = totalBytes + bytes
+		set totalBlocks = totalBlocks + blocks
+		set totalContiguousBlocks = totalContiguousBlocks + contiguousBlocks
+
+		set globalName = $order(^$GLOBAL(globalName))
+	}
+
+	write !!?6, "TOTAL"
+	write ?18, "  Blocks", ?28, "     Bytes Used", ?45, "Packing", ?55, "Contig.", !
+	write ?6, "--------", ?18, "--------", ?28, "---------------", ?45, "-------", ?55, "-------", !
+	write ?18, $justify($fnumber(totalBlocks, ","), 8)
+	write ?28, $justify($fnumber(totalBytes, ","), 15)
+	if (totalBlocks) write ?45, $justify(100 * (totalBytes / (totalBlocks * dataSize)), 5, 0), " %"
+	write ?55, $justify($fnumber(totalContiguousBlocks, ","), 7)
+]]></Implementation>
+    </Method>
+    <Method name="GetSizeInfo">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>dbDir:%String,bigDb:%String,blockSize:%Integer,dataSize:%Integer,globalName:%String,&amp;bytes:%Integer,&amp;blocks:%Integer,&amp;contiguousBlocks:%Integer</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set (bytes, blocks, contiguousBlocks) = 0
+
+	set rc = $$GetGlobalPointers^%SYS.DATABASE(dbDir, globalName, , .data)
+	if ('rc) {
+		do DecomposeStatus^%SYS.DATABASE(rc, .msgList, 0, "")
+		write !, "Error:"
+		for i = 1:1:msgList write !, msgList(i)
+		quit 0
+	}
+
+	open 63:"^^"_dbDir
+	while (data) {
+		view data
+		set blockType = $case(bigDb, 0: $view(2043, 0, 1), :$view($zutil(40, 32, 1), 0, 1))
+		if ((blockType - 8) && (blockType - 12)) {
+			write !, "Error: unexpected type of block '"_blockType_"' at offset "_data
+			quit
+		}
+
+		// Normal data blocks
+		set bytes = bytes + $case(bigDb, 0: $view(2046, 0, 2),
+			:$view($zutil(40, 32, 0), 0, 4) + $zutil(40, 32, 10)),
+			blocks = blocks + 1
+		// Adjust number for header bytes
+		set bytes = bytes - $case(bigDb, 0: 0, :$zutil(40, 32, 10))
+
+		set i = 1
+		while ($length($view(i * 2 - 1, -6)) > 0) {
+			set dataInfo = $view(i * 2, -6)
+			if (($ascii(dataInfo) '= 5) &&
+				($ascii(dataInfo) '= $case(bigDb, 0: 9, :7)) &&
+				($ascii(dataInfo) '= 3)) {
+				set i = i + 1
+				continue
+			}
+
+			set numBlocks = $piece(dataInfo, ",", 2)
+			set bytesLastBlock = $piece(dataInfo, ",", 3)
+
+			set bytes = bytes + ((numBlocks - 1) * blockSize) + bytesLastBlock
+			set blocks = blocks + (numBlocks - 1) + ''bytesLastBlock
+
+			set i = i + 1
+		}
+
+		set nextPos = data + 1
+		set data = $case(bigDb, 0: $view(2040, 0, "3O"), :$view($zutil(40, 32, 4), 0, 4))
+		set contiguousBlocks = contiguousBlocks + (nextPos = data)
+	}
+
+	close 63 
+
+	quit $$$OK
+]]></Implementation>
+    </Method>
+    <Method name="GetGlobalTreeText">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>namespace:%String,global:%String,filter:%String,lineRef:%Integer,htmlFormat:%Boolean,&amp;text:%String</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[
+	set text = ""
+
+	set completeGlobal = "^["""_namespace_"""]"_global
+	set traverser = $query(@completeGlobal)
+	set count = 0
+	while ($data(traverser) && ($length(traverser) > 0))
+	{
+		if ($find(traverser, completeGlobal_"("_filter) =
+		      ($length(completeGlobal_"("_filter) + 1))
+		{
+			if ((count >= (lineRef * 100)) && (count < ((lineRef + 1) * 100)))
+			{
+				set key = traverser
+				if ($find(key, "[") > 0)
+				{
+					set keyPos = $find(key, "]")
+					set key = $extract(key, keyPos, $length(key))
+				}
+	 
+				set lineText = key_"="_$get(@traverser)
+				if (htmlFormat)
+				{
+					set lineText = ##class(Strings).Replace(lineText, "<", "&lt;")
+				}
+				if ($length(text) > 0)
+				{
+					set text = text_$char(13)_$char(10)
+				}
+				set text = text_lineText
+			}
+
+			set count = $increment(count)
+		}
+
+		set traverser = $query(@traverser)
+	}
+	
+	quit ($length(text) > 0)
+]]></Implementation>
+    </Method>
+    <Method name="KillGlobal">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>namespace:%String,globalName:%String</FormalSpec>
+<Implementation><![CDATA[
+	quit:('..ExistsGlobalName(namespace, "^"_globalName))
+
+	set globalNameKill = "^["""_namespace_"""]"_globalName
+
+	write "Killing global '", globalNameKill, "' ...", !
+	kill @globalNameKill
+]]></Implementation>
+    </Method>
+    <Method name="KillGlobals">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>namespace:%String,initialName:%String</FormalSpec>
+<Implementation><![CDATA[
+	if (..ExistsGlobalName(namespace, "^"_initialName))
+	{
+		set globalName = "^"_initialName
+	}
+	else
+	{
+		set globalName = ..GetNextGlobalName(namespace, "^"_initialName)
+	}
+
+	while ((globalName '= "") &&
+	       ($extract(globalName, 2, $length(initialName) + 1) = initialName))
+	{
+		set globalNameKill = globalName
+		set globalName = ..GetNextGlobalName(namespace, globalName)
+
+		do ..KillGlobal(namespace, $extract(globalNameKill, 2,
+			$length(globalNameKill)))
+		set lastGlobalName = globalNameKill
+	}
+]]></Implementation>
+    </Method>
+    <Method name="ExistsGlobalName">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>namespace:%String,globalName:%String</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[	quit ($data(^$[namespace]global(globalName)) > 0)
+]]></Implementation>
+    </Method>
+    <Method name="GetFirstGlobalName">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>namespace:%String</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[	quit ..GetNextGlobalName(namespace, "")
+]]></Implementation>
+    </Method>
+    <Method name="GetNextGlobalName">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>namespace:%String,globalName:%String</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[	quit $order(^$[namespace]global(globalName))
+]]></Implementation>
+    </Method>
+  </Class>
+</Export>

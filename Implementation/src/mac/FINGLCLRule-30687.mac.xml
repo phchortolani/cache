@@ -1,0 +1,415 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLCLRule" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLCLRule  ; GL Consolidated Ledger Rule
+	
+#include COMSYS
+#include FINConst
+
+
+Activate()
+	;-------------------------------------------------------------------------------
+	; Activate Consolidation
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Jul-2005	RPW		SR12527: Fixed Status usage for ReturnError
+	; 16-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+	new Status,Rec
+	
+	set $ztrap="ActivateError"
+	set Status=$$$OK
+	set Status=$$BuildDestinations()
+	set Rec=$get(^FINGLCLSetup(0,0,1))
+	if $$$ISOK(Status) {
+		set $$$FINGLCLSetupSourceActive(Rec)=1
+		set $$$FINGLCLSetupSourceActiveDate(Rec)=+$HOROLOG
+		set $$$FINGLCLSetupSourceActiveMessage(Rec)=""
+	} else {
+		set $$$FINGLCLSetupSourceActive(Rec)=0
+		set $$$FINGLCLSetupSourceActiveDate(Rec)=+$HOROLOG
+		set $$$FINGLCLSetupSourceActiveMessage(Rec)=$$$Text(Status)
+	}
+	do Save^FINSYS("FINGLCLSetup",0,Rec,1)
+
+	if $$$ISERR(Status) {	
+		do ReturnError^COMUtils((Status))
+	} else {
+		do ^WWWFORM
+	}
+	quit Status
+ 
+ActivateError
+	trollback ;FIXME where is the tstart/tcommit ??
+	quit 0  ; This need more work ?????
+
+	quit
+	
+
+AccountDestinations(Account="",Destinations) 
+	;-------------------------------------------------------------------------------
+	; Get Account Destinations
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+ 	new Rec,Status
+	
+	set Status=$$$OK
+	
+	if Account="" set Account=" "
+	
+	set Rec=$get(^FINGLCLSetup(0,0,1))  ; Check if Consolidations is turned on.
+	if $$$FINGLCLSetupSourceActive(Rec)'=1 {
+		set Status='$$$OK
+	}
+	if Status=$$$OK { ; Consolidation is on
+		if $get(^CacheTempGLCL(0))<$horolog {
+			do BuildDestinations() 
+		}
+		merge Destinations=^CacheTempGLCL(0,Account)
+	}
+	quit Status
+	
+	
+KillCache() 
+	;-------------------------------------------------------------------------------
+	; Kill Cache
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+	kill ^CacheTempGLCL(0)
+	quit
+	
+	
+BuildDestinations() 
+	;-------------------------------------------------------------------------------
+	; Build Destination Accounts
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+ 	new Account,Status,Rec,SendAccount,Destinations
+ 	
+ 	set Status=$$$OK
+ 	
+ 	Lock +^FINGLCOCheck(0)
+ 	kill ^CacheTemp($job)
+ 	
+ 	; Get a List of Accounts to Send to for each Acoount
+ 	set Account=""
+ 	for {
+	 	set Account=$order(^FINGLAccount(0,Account))
+	 	quit:Account=""
+		do BuildAccountDestinations(Account)
+ 	}
+ 	
+ 	; For each Transaction Account find the Destination
+ 	set Account=""
+ 	for {
+	 	set Account=$order(^FINGLAccount(0,Account))
+	 	quit:Account=""
+	 	quit:Status'=$$$OK
+	 	set Rec=$get(^FINGLAccount(0,Account,1))
+	 	if $$$FINGLAccountAccountUsage(Rec)=$$$EnumFINGLACCOUNTUSAGETransaction {
+			set Status=$$GetAccountDestinations(Account,.Destinations)
+			merge ^CacheTemp($job,"Tran",Account)=Destinations
+	 	}
+	 	
+ 	}
+ 	kill ^CacheTempGLCL(0)
+ 	if Status=$$$OK {
+	 	set ^CacheTempGLCL(0)=+$horolog
+ 		merge ^CacheTempGLCL(0)=^CacheTemp($job,"Tran")
+ 	} else {
+	 	set ^CacheTempGLCL(0)="Error"
+ 	}
+ 	Lock -^FINGLCOCheck(0)
+ 	kill ^CacheTemp($job)
+ 	
+ 	quit Status
+	
+	
+GetAccountDestinations(Account="",Destinations) 
+	;-------------------------------------------------------------------------------
+	; Find the Sending Accounts for a Transaction
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Jul-2005	RPW		SR12527: Fixed Status usage for ReturnError
+	; 17-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+	new Status,Done,ToSite,ToCompany,TransactionAccount,Rec
+	
+	set Status=$$$OK
+	kill Destinations
+	
+	set TransactionAccount=Account
+	if Account="" set Account=" "
+	
+	set ToSite=""
+	set Done=$$$NO
+	for {
+		set ToSite=$order(^CacheTemp($job,"Destination",ToSite))
+		quit:ToSite
+		quit:Done=$$$YES
+		set ToCompany=""
+		for {
+			set ToCompany=$order(^CacheTemp($job,"Destination",ToSite,ToCompany))
+			quit:ToCompany=""
+			quit:Done=$$$YES
+			for {
+				quit:Done=$$$YES
+				if $data(^CacheTemp($job,"ToAccount",Account,ToSite,ToCompany)) {
+					set Destinations(ToSite,ToCompany)=$get(^CacheTemp($job,"ToAccount",Account,ToSite,ToCompany))
+					set Done=$$$YES
+				} else {
+					set Rec=$get(^FINGLAccount(0,Account,1))
+					set Account=$$$FINGLAccountParent(Rec)
+					if Account="" {
+						set Status=$listbuild("Fin00248",TransactionAccount,ToSite,ToCompany)  ;Account '%1' has no Consolidation Account in Site '%2' Company  %3
+						set Done=$$$YES
+					}
+				}
+			}
+		}
+	}
+
+	quit Status
+	
+	
+BuildAccountDestinations(Account="")
+	;-------------------------------------------------------------------------------
+	; Get Destination Accounts from the Rule
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+ 	new SendAccount,Site,SiteI,FromI,Entry,Ok,RuleRec,ToAccount,Score,ToSite,ToCompany
+ 	
+ 	set SendAccount=""
+ 	if Account="" set Account=" "
+ 	
+ 	; Step 2: Scan the rules for this site.
+ 	set Site=$$getCurrentLocation^COMDCMUtilities()
+ 	set SiteI=$$Index^FINSYS(Site)
+ 	set FromI=""
+ 	for {
+	 	set FromI=$order(^FINGLCLRules(0,1,SiteI,FromI))
+	 	quit:FromI=""
+	 	set Entry=""
+	 	for {
+		 	set Entry=$order(^FINGLCLRules(0,1,SiteI,FromI,Entry))
+		 	quit:Entry=""
+		 	set RuleRec=$get(^FINGLCLRule(0,Entry,1))
+		 	set Ok=$$$YES
+		 	if Site'=$$$FINGLCLRuleFromSite(RuleRec) set Ok=$$$NO
+		 	if Ok=$$$YES {
+			 	set Score=$$Score(RuleRec,Account,.ToAccount)
+			 	if Score {
+				 	set ToSite=$$$FINGLCLRuleToSite(RuleRec)
+				 	if ToSite="" set ToSite=" "
+				 	set ToCompany=$$$FINGLCLRuleToCompany(RuleRec)
+				 	if ToCompany="" set ToCompany=" "
+				 	if Score>$get(^CacheTemp($job,"Score",Account,ToSite,ToCompany)) {
+					 	set ^CacheTemp($job,"Score",Account,ToSite,ToCompany)=Score
+					 	set ^CacheTemp($job,"ToAccount",Account,ToSite,ToCompany)=ToAccount
+					 	set ^CacheTemp($job,"Destination",ToSite,ToCompany)=""
+				 	}
+			 	}
+		 	}
+	 	}
+ 	}
+ 	quit SendAccount
+ 	
+ 	
+Score(RuleRec="",Account="",ToAccount)
+	;-------------------------------------------------------------------------------
+	; Score the Match Rule with the Account
+	; The Best Account is the Transaction Account or the closest parent account in the tree
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+ 	new FromMatch,ToCode,Score
+ 	
+	set FromMatch=$$$FINGLCLRuleFromAccountMatch(RuleRec)
+	set ToCode=$$$FINGLCLRuleToAccountCode(RuleRec)
+	set ToAccount=""
+	set Score=0
+	if Account?@FromMatch {
+		set ToAccount=Account
+		xecute ToCode ; This can modify the ToAccount , See OnBeforeSave
+		set Score=$$$FINGLCLRuleFromOrder(RuleRec)+1
+	}
+	quit Score
+	
+	
+OnBeforeSave(Rec="")
+	;-------------------------------------------------------------------------------
+	; Update the 'From Account Match' and the 'To Account Code' fields
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Jul-2005	RPW		SR12527: Fixed Status usage for ReturnError
+	; 17-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+	new FromMatch,ToMatch,FromList,ToCode,Status
+	
+	set Status=$$$OK
+	if $$$ISOK(Status) {
+		set Status=$$MakeMatch($$$FINGLCLRuleFromAccount(Rec),.FromMatch,$$$NO)
+	}
+	if Status=$$$OK {
+		set Status=$$MakeMatch($$$FINGLCLRuleToAccount(Rec),.ToCode,$$$YES)
+	}	
+	if Status=$$$OK {
+		set $$$FINGLCLRuleFromAccountMatch(Rec)=FromMatch
+		set $$$FINGLCLRuleToAccountCode(Rec)=ToCode
+ 	} else {
+		set Q=1
+		do ReturnError^COMUtils(Status)
+	}
+	do KillCache() ; Kill the Cache
+ 	quit
+	
+	
+MakeMatch(Spec="",Code,ToFlag=0)
+	;-------------------------------------------------------------------------------
+	; Make Match Code
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Jul-2005	RPW		SR12527: Fixed Status usage for ReturnError
+	; 17-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+	new Mode,Char,Pos,Type,Index,Status,String,Size
+	
+	set Status=$$$OK
+	set Mode=-1
+	kill Code
+	set Code=""
+	set Index=0
+	for Pos=1:1:$length(Spec) {
+		set Char=$extract(Spec,Pos)
+		set Type=$select(Char="*":1,Char="?":2,1:0)
+		if Type=0 { ; Character
+			if (Mode=-1)!(Mode=1)!(Mode=2) {
+				set Index=Index+1
+				set Code(Index,"Type")=0
+			}
+			set Code(Index,"String")=$get(Code(Index,"String"))_Char
+			set Mode=0
+		}
+		if Type=1 { ; * Wild Card
+			if (Mode=-1)!(Mode=0)!(Mode=2) {
+				set Index=Index+1
+				set Code(Index,"Type")=1
+			}
+			set Mode=1
+		}
+		if Type=2 { ; ? Wild Card
+			if (Mode=1)!(Mode=0)!(Mode=1) {
+				set Index=Index+1
+				set Code(Index,"Type")=2
+			}
+			set Code(Index,"Size")=$get(Code(Index,"Size"))+1
+			set Mode=2
+		}	
+	}
+	if 'ToFlag {
+		set Index=""
+		for {
+			set Index=$order(Code(Index))
+			quit:Index=""
+			set Type=$get(Code(Index,"Type"))
+			if Type=0 {
+				set Code=Code_"1"""_$get(Code(Index,"String"))_""""
+			}
+			if Type=1 {
+				set Code=Code_".E"
+			}
+			if Type=2 {
+				set Code=Code_$get(Code(Index,"Size"))_"E"
+			}
+		}
+	} else {
+		set Pos=0
+		set Index=""
+		for {
+			set Index=$order(Code(Index))
+			quit:Index=""
+			set Type=$get(Code(Index,"Type"))
+			if Type=0 {
+				if Pos=-1 {
+					set Status="Fin00247"  ;Can not resolve 'To Account' patter match
+				}
+				set String=$get(Code(Index,"String"))
+				set Size=$length(String)
+				set Code=Code_"set $extract(ToAccount,"_(Pos+1)_","_(Pos+Size)_")="""_String_""" "
+				if (Index=1)&&('$order(Code(Index))) {
+					set Code="set ToAccount="""_String_""""
+				}
+				set Pos=Pos+Size
+			}
+			if Type=1 {
+				set Pos=-1
+			}
+			if (Type=2)&&(Pos'=-1) {
+				set Pos=Pos+$get(Code(Index,"Size"))
+			}
+		}
+	}	
+	
+	quit Status
+	
+	
+DisplayStatus()
+	;-------------------------------------------------------------------------------
+	; Display Status of Ledger Consolidation
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Feb-2004	SCR		Creation
+	;-------------------------------------------------------------------------------
+	new Rec,SourceActive,Status,DestinationActive
+	
+	set Rec=$get(^FINGLCLSetup(0,0,1))
+	set SourceActive=$$$FINGLCLSetupSourceActive(Rec)
+	set DestinationActive=$$$StrFINGLCLSetupDestinationActive
+	set Status=""
+	if SourceActive=$$$YES {
+		set Status=$$$Text("Fin00242")  ;Ledger Consolidation Active
+	}
+	if DestinationActive=$$$YES {
+		if SourceActive=$$$YES {
+			set Status=Status_" & "
+		} 
+		set Status=Status_$$$Text("Fin00243")  ;Consolidation Destination Active
+	}
+	if Status="" {
+		set Status=$$$Text("Fin00241")  ;Ledger Consolidation not Active
+	}
+	write Status
+
+	quit
+	
+]]></Routine>
+</Export>

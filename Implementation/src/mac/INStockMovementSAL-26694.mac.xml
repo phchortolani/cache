@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INStockMovementSAL" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INStockMovementSAL
+#include COMSYS
+#include INConst
+ 
+ConfirmMovement(pidItem,pobjBundle,pfltBalanceQty,pidFromLocn,pidFromStorage,pidToLocn,pidToStorage,pstrTxType,pidOrder,pidOrderLine)
+	;-------------------------------------------------------------------------------
+	; Process the Movement Record
+	; 	1.    Get the stock from the From Storage
+	; 	
+	; 	2.    Start with oldest "INWE bundle" by received date
+	; 	      Must match bundle attributes (Lot No, Expiry Date)  (Purchase Cost deprecated)
+	; 	
+	; 	3.    Apply the stock on hand in the "INWE bundle" to the movement balance qty
+	; 	      While MvQty > 0 repeat...
+	; 	  a.    If SOH <= 0         : skip
+	; 	  b.    If SOH >= MvQty     : newSOH   = SOH - MvQty
+	; 	                            : newMvQty = 0
+	; 	                            : Update ToStorage, etc.
+	; 	  c.    If SOH <  MvQty     : newSOH   = 0
+	; 	                            : newMvQty = newMvQty - SOH
+	; 	                            : Update ToStorage, etc.
+	; 	                            
+	; 	4.    If MvQty>0 take SOH negative if permitted.     ???
+	; 	  
+	; Params:
+	;	pidItem				Stock Item
+	;	objBundle			dBundle object
+	;	pfltBalanceQty		Quantity being moved (Relocation, Requisition or Transfer)
+	;	pidFromLocn			
+	;	pidFromStorage		
+	;	pidToLocn			
+	;	pidToStorage		
+	;	pstrTxType			Based on Applicn Param "UMSATZART1"
+	;	pidTxNo				perhaps should only apply to orders
+	;	pidTxLine			perhaps should only apply to orders
+	;
+	; Returns: status
+	;
+	; History:
+	; 13-Aug-2008	HQN	SR15811: Copied from INStockMovement
+	;-------------------------------------------------------------------------------
+	new blnBundleMatch,dteRecvd,fltOrderQty,idINWE,loop,objAttr,objSOH,strINWE,strINWEDate,strStatus,enumAllowNegative,OK,blnNOPOST
+		$$$VAR
+	set strStatus = $$$OK
+	set strINWE   = pidItem_$$$COMMA_pidFromLocn_$$$COMMA_pidFromStorage_$$$COMMA ; <FIXME> not used anywhere <DavidR>
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;  Update existing INWE records
+	;+++++++++++++++++++++++++++++++++++++++
+	set dteRecvd = ""
+	for {
+		set dteRecvd = $order(^INWE(YM,pidItem,pidFromLocn,pidFromStorage,dteRecvd))
+		quit:dteRecvd=""  
+		quit:pfltBalanceQty'>0
+		set objSOH     = $get(^INWE(YM,pidItem,pidFromLocn,pidFromStorage,dteRecvd,1))
+		continue:$$$INWEQuantity(objSOH)<=0
+		
+		; 09-May-2008 vvvvv
+		set blnBundleMatch = $$$YES
+		for loop=1:1:pobjBundle.Attributes.Count() {
+			set objAttr = pobjBundle.Attributes.GetAt(loop)
+			set:((objAttr.AttributeName = "Lot Number")    && ($$$INWELotNo(objSOH) '= objAttr.AttributeValue)) blnBundleMatch = $$$NO
+			set:((objAttr.AttributeName = "Purchase Cost") && ($$$INWEUnitPrice(objSOH) '= objAttr.AttributeValue)) blnBundleMatch = $$$NO
+			set:((objAttr.AttributeName = "Use By Date")   && ($$$INWEUseableUntilDate(objSOH) '= objAttr.AttributeValue)) blnBundleMatch = $$$NO
+		}
+		
+		continue:(blnBundleMatch = $$$NO)
+	; ReceiveDate
+	; ReceiptNo 
+		; 09-May-2008 ^^^^^
+		
+		set fltOrderQty = pfltBalanceQty
+		if $$$INWEQuantity(objSOH) >= pfltBalanceQty {
+			set pfltBalanceQty=0         ; can satisfy from this bundle
+		} else {
+			;set $$$INWETransferQuantity(objSOH) = fltINWEQty     ; D34
+			set pfltBalanceQty = pfltBalanceQty - $$$INWEQuantity(objSOH)   ; apply whole of bundle and search for remainder
+		}
+		
+		set enumAllowNegative = 2  /* Stock not allowed to enter negative */
+		; Directly remove stock from INWE and update INARTHISTL
+		set blnNOPOST = $$$NO
+		SET OK=$$^INARTMINUS(pidOrder,pidOrderLine,pidItem,fltOrderQty,,pidFromStorage,"",enumAllowNegative,,,dteRecvd,,pidFromLocn,blnNOPOST)
+		;                    1        2            3       4 - Qty      6                  8                   11        13          14
+		;                    OrderNumber           Item
+		;                             OrderLineNumber
+		IF (OK '= 0) || (OK = "") {
+			set strStatus = $$$MakeStatus(33361)   ; "Attention! Insufficient Items In Stock!"
+			quit ; for break
+		} else {
+			set strStatus = $$$OK ; INARTMINUS modifies it ByRef!!
+			set pfltBalanceQty = OK
+				}
+	}
+	if pfltBalanceQty '= 0{
+		set strStatus = $$$MakeStatus(33361)   ; "Attention! Insufficient Items In Stock!"
+	}
+	
+	quit strStatus
+]]></Routine>
+</Export>

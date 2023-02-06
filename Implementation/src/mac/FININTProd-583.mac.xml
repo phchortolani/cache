@@ -1,0 +1,443 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FININTProd" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FININTProd
+#include COMSYS
+	;-------------------------------------------------------------------------------
+	; Production related Interface
+	;-------------------------------------------------------------------------------
+	
+	
+Production(Tran)
+	;-------------------------------------------------------------------------------
+	; Product Costs
+	;
+	; Returns:
+	;
+	; History:
+	; 24-Aug-2005	GRF		SR13191 : Transmit Parent Item; rearrange Ref/Param/Source
+	; 13-Jul-2005	GRF		SR12863 : Add extra info to batch line reference; correct
+	; 						logic on null account tests
+	; 01-Jul-2005	GRF		SR12843 : Added new Application Parameters (PRWIP &
+	; 						PREXP) to FININTBatchType to provide better distinction
+	; 						from reused "INPROD".  Applied here.  Reverse signs.
+	; 18-Apr-2005	GRF		SR10478 : Activated
+	; 01-Apr-2005	GRF		SR10478 : Created
+	;-------------------------------------------------------------------------------
+	new Amount,AppliedAcct,arrAccts,arrChars,arrCSTKey,Batch,BlockNo,Company,CSTVals
+	new Date,idx,Line,Locn,Order,OrderType,ParentItem,Prefix,Profile,Ref,Reference
+	new SourceGroup,Status,StockLocn,TranType,WIPAcct
+	
+	set $zt="ProductionError"
+	
+	;***************************************
+	tstart
+	;***************************************
+	
+	set Status  = $$$OK
+	set Batch   = ""
+	set BlockNo = ""
+	set Prefix  = "@Tran@("		; from argument list
+	
+	; TranType could be LBR, BDN, MBN
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("TranType",     .TranType, Prefix,1)
+	
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("OrderType",    .OrderType,Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Company",      .Company,  Prefix)
+	if Company="" set Company = YM
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Order",        .Order,    Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Date",         .Date,     Prefix,1)
+ 
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Location",     .Locn,     Prefix)
+	;if Status=$$$OK set Status=$$GetValue^FINSYSDCM("StockLocation",.StockLocn,Prefix)
+	if (Status=$$$OK)&&(Locn="") set Locn="None"               ; Default Location
+	
+	
+	if Status=$$$OK set Status=$$Allocate^FININTBatch(.Batch,.BlockNo,"INPROD",Locn,Date)
+	
+	set CSTVals=""
+	if Status=$$$OK {
+		set Line=""
+		for {
+			set Line=$order(@Tran@("Lines",Line))
+			quit:(Line="")||(Status'=$$$OK)
+			
+			set Prefix="@Tran@(""Lines"",Line,"
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Amount",     .Amount,     Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("WIPAccount", .WIPAcct,    Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("SourceGroup",.SourceGroup,Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Parent",     .ParentItem, Prefix)     ; SR13191
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Reference",  .Ref,        Prefix,1)
+			if Status=$$$OK {
+			;	set Reference = Ref_","_Locn   ;_","_StockLocn					; SR13191
+				set Reference = Ref_","_ParentItem
+			}
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("AppliedAccount",.AppliedAcct,Prefix)
+			
+			; Extract Characteristic Values
+			if Status=$$$OK {
+				kill arrChars
+				merge arrChars=@Tran@("Lines",Line,"CharVal")
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			if (Status=$$$OK)&&($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+				kill arrAccts
+				set arrAccts(1) = WIPAcct
+				set arrAccts(2) = AppliedAcct
+				
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+				set CSTVals = CSTVals_Y_Locn_Y_SourceGroup
+				
+				; Handle ledger profiles returned from Account Identification Matrices
+				set idx=""
+				for {
+					set idx=$order(arrAccts(idx))
+					quit:idx=""
+					
+					set Profile=arrAccts(idx)
+					if Profile["{" {
+						set Status=$$SALConvert^FINGLProfileConv(.Profile,Locn,SourceGroup)
+						if $$$ISOK(Status) set arrAccts(idx)=Profile
+					}
+				}
+				; FIXME : Are these the wrong way around? Don't think so. <GRF>
+				set WIPAcct     = arrAccts(1)
+				set AppliedAcct = arrAccts(2)
+			}
+			
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			; Expense Allocation
+			; 
+			;   Debit         Work In Progress       PRWIP
+			;      Credit        Expense Recovery    PREXP
+			;                    (LAB, BDN, MBD)
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			
+			; pidBatch,pintBlockNumber,pidAccount,pcurAmount,pidInterfaceType,
+			; pstrParameters,pstrSource,pstrReference,pblnReverse,pstrUser,
+			; pstrDepartment,pstrCSTMat,pstrCSTVals
+			
+			; SR12843 : Reverse Signs
+			; SR12863 : correct null tests
+			if (Status=$$$OK)&&(WIPAcct'="") {
+			;	set Status=$$AddLine^FININTBatch(Batch,BlockNo,WIPAcct,Amount,"PRWIP",			; SR13191
+			;									 Order_","_Ref,Locn,Reference,,,
+			;	                                 ,$get(arrCSTKey(1)),$get(CSTVals))
+				set Status=$$AddLine^FININTBatch(Batch,BlockNo,WIPAcct,Amount,"PRWIP",
+												 Reference,Order,ParentItem,,,
+				                                 ,$get(arrCSTKey(1)),$get(CSTVals))
+			}
+			
+			if (Status=$$$OK)&&(AppliedAcct'="") {
+			;	set Status=$$AddLine^FININTBatch(Batch,BlockNo,AppliedAcct,-Amount,"PREXP",		; SR13191
+			;									 Order_","_Ref,Locn,Reference,,,
+			;	                                 ,$get(arrCSTKey(2)),$get(CSTVals))
+				set Status=$$AddLine^FININTBatch(Batch,BlockNo,AppliedAcct,-Amount,"PREXP",
+												 Reference,Order,Ref,,,
+				                                 ,$get(arrCSTKey(2)),$get(CSTVals))
+			}
+		}
+	}
+	
+	
+	if Status=$$$OK set Status=$$PostBlock^FININTBatch(Batch,BlockNo)
+	if Status=$$$OK {
+		if $tlevel>0 tcommit
+		set Status=$$$OK_Y_Batch_","_BlockNo
+	} else {
+		trollback
+		set Status=$$$NO_Y_$$$Text(Status)
+	}
+	
+	quit Status
+ 
+ProductionError
+	trollback
+	quit "0~Error in Production Cost Post "_$ze	
+	
+ProdIssue(Ship,OrderType)
+	;-------------------------------------------------------------------------------
+	; Post an Issue for a Production Order
+	;
+	; Returns:DCM Status (0/1_Y_Message)
+	;
+	; History:
+	; 27-Jul-2005	GRF		SR13024 : Pass In Parent Item and Group and call
+	; 07-Jul-2005	GRF		SR12863 : CusShipTxn split so Production Orders can be
+	; 						handled elsewhere 
+	; 01-Jul-2005	GRF		SR12843 : Added new Application Parameters (PRWIP &
+	; 						PREXP) to FININTBatchType to provide better distinction
+	; 						from reused "INPROD".  Applied here.
+	; 16-Jun-2005	GRF		SR12585 : Temporary ADRAD reassignment of Location for
+	; 						CST Matrix Calc
+	;-------------------------------------------------------------------------------
+	new arrAccts,arrChars,arrCSTKey,Batch,BlockNo,CSTVals,Customer,Date,GINILocn
+	new idx,Invoice,Line,LineRef,Location,Order,ParentGroup,ParentItem,Prefix,Profile
+	new ShipAccount,ShipAmount,SOHAccount,SourceGroup,SourceLocn,Status,TranType
+	
+	set Status  = $$$OK
+	set Batch   = ""
+	set BlockNo = ""
+	set Prefix  = "@Ship@("
+	
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Date",     .Date,     Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("TranType", .TranType, Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("GINILocn", .GINILocn, Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Customer", .Customer, Prefix)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Order",    .Order,    Prefix)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Invoice",  .Invoice,  Prefix)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Location", .Location, Prefix)
+	
+	if (Status=$$$OK)&&(Location="") set Location="None"         ; Default Location
+	
+	if Status=$$$OK set Status=$$Allocate^FININTBatch(.Batch,.BlockNo,"INPROD",Location,Date)
+	
+	set SourceLocn(1) = Location
+	set SourceLocn(2) = GINILocn
+	
+	set CSTVals=""
+	if Status=$$$OK {
+		set Line=""
+		for {
+			set Line=$order(@Ship@("Lines",Line))
+			quit:(Line="")||(Status'=$$$OK)
+			
+			set Prefix="@Ship@(""Lines"",Line,"
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineSOHAccount", .SOHAccount, Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineShipAccount",.ShipAccount,Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineShipAmount", .ShipAmount, Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineRef",        .LineRef,    Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("SourceGroup",    .SourceGroup,Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("ParentItem",     .ParentItem, Prefix)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("ParentGroup",    .ParentGroup,Prefix,1)
+			
+			;++++++++++++++++++++++++++++++++++++++++++++++
+			; Extract Characteristic Values
+			; 
+			; Account Type 1 : Inventory        (based on Component   - use IC#  )
+			;              2 : Work In Progress (based on Parent Item - use P-IC#)
+			;++++++++++++++++++++++++++++++++++++++++++++++
+			if Status=$$$OK {
+				kill arrChars
+				merge arrChars=@Ship@("Lines",Line,"CharVal")
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			if (Status=$$$OK)&&($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+				kill arrAccts,CSTVals
+				set arrAccts(1) = SOHAccount
+				set arrAccts(2) = ShipAccount
+				
+ 
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+				set CSTVals(1) = CSTVals_Y_Location_Y_SourceGroup
+				set CSTVals(2) = CSTVals_Y_GINILocn_Y_ParentGroup
+	
+				kill arrAccts(3)
+				
+				set Status = $$ExtractProfile^FININTSale(.arrAccts,.SourceLocn,SourceGroup)
+				
+				set SOHAccount  = arrAccts(1)
+				set ShipAccount = arrAccts(2)
+			}
+			
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			; Stock Issued
+			; 
+			;   Debit        Work In Progress (Prodn Order)
+			;      Credit        Stock On Hand
+			;      
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			
+			; pidBatch,pintBlockNumber,pidAccount,pcurAmount,pidInterfaceType,
+			; pstrParameters,pstrSource,pstrReference,pblnReverse,pstrUser,
+			; pstrDepartment,pstrCSTMat,pstrCSTVals
+			
+			if (Status=$$$OK) && (SOHAccount'="") {
+				set Status=$$AddLine^FININTBatch(Batch,BlockNo,SOHAccount,-ShipAmount,"SOH",
+												 ParentItem_","_LineRef,Order,LineRef,,,
+												 ,$get(arrCSTKey(1)),CSTVals(1))
+			}
+			if (Status=$$$OK) && (ShipAccount'="") {
+				set Status=$$AddLine^FININTBatch(Batch,BlockNo,ShipAccount,ShipAmount,"PRWIP",
+												 ParentItem_","_LineRef,Order,ParentItem,,,
+												 ,$get(arrCSTKey(2)),CSTVals(2))
+			}
+		}
+	}
+	if Status=$$$OK set Status=$$PostBlock^FININTBatch(Batch,BlockNo)
+	if Status=$$$OK set Status=$$$OK_Y_Batch_","_BlockNo
+	quit Status
+	
+Receive(Receipt)
+	;-------------------------------------------------------------------------------
+	; Receive Finished Goods
+	; Split from SupRec^FININTInvoice
+	;
+	; Returns:
+	;
+	; History:
+	; 01-Sep-2005	GRF		SR12120 : Allow zero value for Materials 
+	; 27-Jul-2005	GRF		SR13024 : Add special processing for amount split.
+	;-------------------------------------------------------------------------------
+	new arrAccts,arrChars,arrCSTKey,Batch,BDNAccount,BDNAmount,BDNCSTKey,BlockNo,CSTVals,Date,element,idx
+	new LBRAccount,LBRAmount,LBRCSTKey,Line,LineRef,Location
+	new MATAccount,MATAmount,MATCSTKey,MBDAccount,MBDAmount,MBDCSTKey,Order,OrderType,Prefix,Profile,RecAccount,RecAmount
+	new SOHAccount,SOHAmount,SOHCSTKey,SourceGroup,SourceLocn,Status,StatusLine,Supplier,TranType
+	
+	set $zt="ReceiveError"
+	
+	;***************************************
+	tstart
+	;***************************************
+	
+	set Status=$$$OK
+	set Batch=""
+	set BlockNo=""
+	set Prefix="@Receipt@("
+	
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Date",    .Date,      Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Location",.Location,  Prefix)
+	if (Status=$$$OK)&&(Location="") set Location="None"                           ; Default Location
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Supplier",.Supplier,  Prefix)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("Order",   .Order,     Prefix)
+	if Status=$$$OK set Status=$$Allocate^FININTBatch(.Batch,.BlockNo,"INREC",Location,Date)
+	
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("TranType",  .TranType,  Prefix,1)
+	if Status=$$$OK set Status=$$GetValue^FINSYSDCM("OrderType", .OrderType, Prefix,1)
+	
+	set CSTVals=""
+	if Status=$$$OK {
+		set Line=""
+		for {
+			set Line=$order(@Receipt@("Lines",Line))
+			quit:(Line="")||(Status'=$$$OK)
+			
+			set Prefix="@Receipt@(""Lines"",Line,"
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineReceivedAccount",.RecAccount, Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineMATAmount",      .MATAmount,  Prefix)    ; SR13120
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineLBRAmount",      .LBRAmount,  Prefix)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineMBDAmount",      .MBDAmount,  Prefix)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineBDNAmount",      .BDNAmount,  Prefix)
+			
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineSOHAccount",     .SOHAccount, Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineSOHAmount",      .SOHAmount,  Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("LineRef",            .LineRef,    Prefix,1)
+			if Status=$$$OK set Status=$$GetValue^FINSYSDCM("SourceGroup",        .SourceGroup,Prefix,1)
+			
+			; Work In Progress Accounts - "Order Contra" in Matrix
+			set MATAccount = RecAccount
+			set LBRAccount = RecAccount
+			set MBDAccount = RecAccount
+			set BDNAccount = RecAccount
+			
+			; Extract Characteristic Values
+			if Status=$$$OK {
+				kill arrChars
+				merge arrChars=@Receipt@("Lines",Line,"CharVal")
+			}
+			
+			; Override Accounts from Characteristics Matrix if used
+			
+			if (Status=$$$OK)&&($$EXIST^%R("CSTMatrix.OBJ",$get(YUCI))) {
+				kill arrAccts,CSTVals,SourceLocn
+				set SourceLocn(1) = Location
+				set SourceLocn(2) = Location
+				
+			; SOH	- tran Type "REC"
+				set arrAccts(1) = SOHAccount
+				set arrAccts(2) = RecAccount
+				
+				do GetAccts^CSTMatrix(TranType,OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set SOHCSTKey = arrCSTKey(1)
+				set CSTVals = $$ArrayToString^COMUtilStr(.arrChars,$$$COMMA,$$$YES,";",$$$NO)
+				set CSTVals = CSTVals_Y_Location_Y_SourceGroup
+	
+				set Status = $$ExtractProfile^FININTSale(.arrAccts,.SourceLocn,SourceGroup)
+				
+				set SOHAccount = arrAccts(1)
+			
+			;------------------
+			; MAT
+				set arrAccts(1) = RecAccount
+				set arrAccts(2) = MATAccount
+				do GetAccts^CSTMatrix("ISS",OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set MATCSTKey = arrCSTKey(2)
+				set Status = $$ExtractProfile^FININTSale(.arrAccts,.SourceLocn,SourceGroup)
+				set MATAccount = arrAccts(2)
+			
+			;------------------
+			; LBR 
+				set arrAccts(1) = LBRAccount
+				set arrAccts(2) = RecAccount
+				do GetAccts^CSTMatrix("LBR",OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set LBRCSTKey = arrCSTKey(1)
+				set Status = $$ExtractProfile^FININTSale(.arrAccts,.SourceLocn,SourceGroup)
+				set LBRAccount = arrAccts(1)
+			
+			;------------------
+			; MBD
+				set arrAccts(1) = MBDAccount
+				set arrAccts(2) = RecAccount
+				do GetAccts^CSTMatrix("MBD",OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set MBDCSTKey = arrCSTKey(1)
+				set Status = $$ExtractProfile^FININTSale(.arrAccts,.SourceLocn,SourceGroup)
+				set MBDAccount = arrAccts(1)
+			
+			;------------------
+			; BDN 
+				set arrAccts(1) = BDNAccount
+				set arrAccts(2) = RecAccount
+				do GetAccts^CSTMatrix("BDN",OrderType,Date,.arrChars,.arrAccts,.arrCSTKey)
+				set BDNCSTKey = arrCSTKey(1)
+				set Status = $$ExtractProfile^FININTSale(.arrAccts,.SourceLocn,SourceGroup)
+				set BDNAccount = arrAccts(1)
+			
+			}
+			
+			
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			; Stock Received
+			; 
+			;   Debit         Stock On Hand
+			;      Credit        Work In Progress (Components)
+			;                    Work In Progress (Labour)
+			;                    Work In Progress (Material O/H)
+			;                    Work In Progress (Service O/H)
+			;+++++++++++++++++++++++++++++++++++++++++++++++++++
+			
+			;                                                Batch,BlockNo,Account,Amount,InterfaceType,Params,Source,Ref,blnReverse,User,Dept,CSTMat,CSTVals
+			if Status=$$$OK set Status=$$AddLine^FININTBatch(Batch,BlockNo,SOHAccount,SOHAmount,"SOH",LineRef_","_Order,Order,LineRef,,,,$get(SOHCSTKey),CSTVals)
+			
+			; TODO : Don't send if amt is zero
+			if Status=$$$OK set Status=$$AddLine^FININTBatch(Batch,BlockNo,MATAccount,-MATAmount,"PRWIP",LineRef_","_Order,Order,"WIP",,,,$get(MATCSTKey),CSTVals)
+			if Status=$$$OK set Status=$$AddLine^FININTBatch(Batch,BlockNo,LBRAccount,-LBRAmount,"PRWIP",LineRef_","_Order,Order,"LBR",,,,$get(LBRCSTKey),CSTVals)
+			if Status=$$$OK set Status=$$AddLine^FININTBatch(Batch,BlockNo,MBDAccount,-MBDAmount,"PRWIP",LineRef_","_Order,Order,"MBD",,,,$get(MBDCSTKey),CSTVals)
+			if Status=$$$OK set Status=$$AddLine^FININTBatch(Batch,BlockNo,BDNAccount,-BDNAmount,"PRWIP",LineRef_","_Order,Order,"BDN",,,,$get(BDNCSTKey),CSTVals)
+		}
+	}
+	
+	if Status=$$$OK set Status=$$PostBlock^FININTBatch(Batch,BlockNo)
+	;***************************************
+	if Status=$$$OK {
+		if $tlevel>0 tcommit
+		set Status=$$$OK_Y_Batch_","_BlockNo
+	} else {
+		trollback
+		set Status=$$$NO_Y_$$$Text(Status)
+	}
+	;***************************************
+	quit Status
+	
+ReceiveError
+	trollback
+	quit "0~Error in Production REC Post "_$ze	
+	;***************************************
+	
+	
+ 
+]]></Routine>
+</Export>

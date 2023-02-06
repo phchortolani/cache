@@ -1,0 +1,1279 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="COMViewSQL" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[COMViewSQL
+    ;-------------------------------------------------------------------------------
+    ; Code generating/supporting SQL strings.
+    ;-------------------------------------------------------------------------------
+#include WWWConst
+#include COMConst
+#include COMSYS
+#include COMView
+	
+#define Where(%1)		$select($increment(%1)=1:"where ",1:" and ")
+#define MapAccentMark	+$$$COMViewConfigMapAccentMark($get(^COMViewConfig(0,YM,1)))  
+	
+GenerateSQLForFilter(pidClass,pidField="")
+    ;-------------------------------------------------------------------------------
+    ; This procedure generates an SQL string that can then be used by GenerateSQL as a filter
+    ;
+    ; Params: Class and Field ID
+    ;
+    ; Returns: An SQL string
+    ;
+    ; History:
+    ; 04-Sep-2006	RPW		SR15005: Incidental to SR, removed ^COMViewSQL from
+    ; 							GenerateSQL call
+    ; 22-Jun-2006	Pablo	SR14221: Removed hard coding 'User' package
+    ; 20-Jul-2005	PO		SR12682: Created
+    ;-------------------------------------------------------------------------------
+    new strSQL
+ 	
+	set strSQL = ""
+	
+	kill ^CacheTempView(YUSER)
+	merge ^CacheTempView(YUSER) = ^CacheTempFixedField(YUSER,$get(^CacheTempFixedField(YUSER,"CurrentField")," "))
+	
+	if $get(pidClass)'="" {
+		set strSQL = $$GenerateSQL(pidClass,,,,,,pidField)
+	}
+	quit strSQL
+	
+	
+GenerateSQL(pidClass,plstColumns="",pstrRef="",pblnGroupLevel=$$$NO,pstrSafeMode=$$$NO,
+			pblnSelectAll=$$$NO,pidField="",pintMaxCount=0,pblnInForm=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Generates a String of SQL code to passed into the result set. based
+    ; on fixed primary keys,readonly hidden filters and user filters.
+    ;
+    ; Params:	pintMaxCount - what is the maximum count of rows, 0 = all
+    ;
+    ; Returns:String
+    ;
+    ; History:
+    ; 30-May-2014	shobby	CORE-385.5: ^VARParametroCliente may not exist
+    ; 29-Jan-2014	shobby	CORE-311: Removed CoreChanges made in task SESDF-466
+	; 04-Oct-2012	shobby	SR18119: Bug in 'between' search.
+    ; 08-Sep-2010	shobby	SR17346: Removed $$Index from startswith and contains.
+    ; 12-May-2010	shobby	SR17283: strValue may be changed in call to ConvertField
+    ; 03-Mar-2010	GRF		SR17214: $$$EnumCOMVIEWCOMPARATORWithin - Remove
+    ; 							duplicated call to WWWKEYBUILD from SR17023; Test
+    ; 							for SQL query rather than actual values in strValue;
+    ; 							Commented code cleanup; if + if not merged into if/else
+    ; 08-Dec-2009	shobby	SR17075: Call out to OnBeforeSQL
+    ; 11-Nov-2009	PPP		SR17023: When creating SQL, check if the property class
+    ; 							is serial to use _ (underscore)
+	; 15-Oct-2009	shobby	SR16944: Corrected an issue where strField variable was
+	; 							used incorrectly, should have been strProperty.
+	; 28-Sep-2009	shobby	SR16708: Reworked how the condition of the SQL is 
+	; 							created to allow for 'or' conditions when a value
+	; 							such as a barcode is translated to an item number
+	; 							but we also want to return item numbers that match
+	; 							the actual entered text.
+    ; 10-Feb-2009	shobby	SR16126: Made previous change optional based on a
+    ; 							company parameter.
+    ; 12-Nov-2008	shobby	SR16126: Simulate commas in a primary key.
+	; 07-Oct-2008	PPP		SR15960: Updated Column Heading to include Parent Field.
+    ; 02-Oct-2008	HQN		SR15915: Correcting cases which do null value comparisons
+    ; 							SQL building logic moved from ConvertField into here.
+	; 26-Sep-2008	shobby	SRBR014982: Include the 'within' selection criteria on
+	; 							all texts (not just those with a relationship to
+	; 							another class)
+    ; 09-Sep-2008	PP		SR15866:Update COMView to Objects
+    ; 20-Feb-2008	shobby	SRBR014900: RelationFilter
+    ; 29-Jan-2008	shobby	SRBR014551: Support direct SQL
+    ; 13-Mar-2007	HeberB	BR014367: Translate to characters with no accent mark
+    ; 09-Feb-2007	RPW		SR15426: If we are in form only order in one direction
+    ; 							and by the last primary key
+    ; 25-Oct-2006	RPW		SR14709: Removed #define and modified $$$Where calls
+	; 04-Sep-2006	RPW		SR15005: Limit the count if pintMaxCount<>0 and added 
+	; 							pintMaxCount, removed all code in regards to
+	; 							pblnNewWhere as this is no longer needed.
+    ; 29-Aug-2006	JW		SR14763: Added pblnNewWhere to encapsulate keeping the
+    ; 							last where clause
+    ; 19-Jul-2006	JW		SR14832: Support 'between' clause
+    ; 22-Jun-2006	Pablo	SR14221: Removed hard coding 'User' package
+    ; 29-May-2006	Steve S	SR14675: Support 'like' clause
+    ; 19-Apr-2006	JW		SR14429: Support for views
+    ; 28-Oct-2005	JW		SR13074: Exchange Rate type
+    ; 20-Jul-2005	PO		SR12682: Made which value is selected in the SQL
+    ; 							statement configurable ie. no longer hard coded to
+    ; 							always include the SQL key "ID", also not converting
+    ; 							values that are flagged to not be converted.
+    ; 11-Mar-2004 	Paul K	Fixed for groups. (SR#11478)
+    ; 30-Nov-2004	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new ClassLoop,FieldLoop,FilterLoop,blnNoConversion,blnObj,blnWhereUsed,favorito
+	new idClass,idClassN,idFieldClass,idFilter,idFirstField,idLastField,idOrigField
+	new idParentForm,idSortField,idSortFieldClass,idView,intFieldNumber,intType
+	new lstClasses,lstProps,newFilter,newOrder,objCalculatedField,objCompiledClass
+	new objFilter,objView,produtosP,pstrExecute,strAddField,strClasses,strComp
+	new strCondition,strDirection,strField,strFieldDesc,strFieldN,strFilterType
+	new strFilterTypes,strGroupBy,strGrpProperties,strProperty,strSQL,strSelectProperties
+	new strTableName,strValue,strValue3
+	; FIXME : names too similar
+	;         strField/strFieldN,
+	;         idClass/idClassN,
+	;         strProperty/strProperties,
+	;         strFilterType/strFilterTypes
+	
+	set blnObj = +$get(^CacheTempObj(YUSER,"Object"))
+	set strSQL = $$GetCurrentSQL^COMView(pidClass)
+
+	if strSQL="" {
+		set pintMaxCount = pintMaxCount+1
+		set blnWhereUsed = 0
+		
+		if pidField = "" {
+			set pidField = "ID"
+		} else {
+			set pidField = $$$WWW002PropertyName($$GetRelation^COMViewUtils(pidClass,pidField))
+		}
+		set strGroupBy  = ""
+		set pstrExecute = ""     ; FIXME : Not used in this routine (byref elsewhere?) <GRF>
+		set lstProps    = ""
+		set lstClasses  = $listbuild($$SQLClass(pidClass))
+		
+		set strSelectProperties = ""
+		set strGrpProperties    = ""
+		
+		for FieldLoop=1:1:$listlength(plstColumns) {
+			set strField = $listget(plstColumns,FieldLoop)
+			kill ^CacheTempSQL($$$SQLID,"RelationFilter",strField)
+			do ConvertField(pidClass,.strField,"","",.intType,pstrSafeMode)
+			
+			if 'blnObj {
+				if $find(",4,8,11,12,18,",","_intType_",") {
+					set strSelectProperties=strSelectProperties_",SUM("_strField_") AS "_$listget(plstColumns,FieldLoop)
+				}
+			
+			} else {
+				set idOrigField  = $listget(plstColumns,FieldLoop)                       //Storage->Code
+				set idFieldClass = $$GetClass^COMViewObject(pidClass,idOrigField)        //alLOC.dStorage
+ 				set idFirstField = $piece(idOrigField,"->")                              //Storage
+ 				set idLastField  = $piece(idOrigField,"->",$length(idOrigField,"->"))    //Code
+	 			set strFieldDesc = $translate(idOrigField,"->","_")			//15960
+ 				
+				//SR17023 				
+ 				if $$IsClassSerial^COMViewObject(idFieldClass) {
+ 	 				set strField = $translate(strField,"->","_")
+ 				}
+ 				
+				//Only if a relation class				
+				if pidClass'=idFieldClass {
+					set strAddField = $$GetRelation^COMViewObject(idFieldClass,idLastField)  //alLOC.dStorage,Code
+					if strAddField '= "" {
+						set strAddField = idFirstField_"->"_strAddField                      //Storage->Remarks
+						do ConvertField(pidClass,.strAddField,"","",.intType,pstrSafeMode)         //%upper(alSOH.dBundleStock.Storage->Remarks)
+						set strField = strField _" || ' - ' || COALESCE("_ strAddField_","""")"    //%upper(alSOH.dBundleStock.Storage->Code) || '-' || %upper(alSOH.dBundleStock.Storage->Remarks)
+					}
+				}
+ 
+				if $find(",alSYS.dt.dtInteger,alSYS.dt.dtFloat,alSYS.dt.dtCurrency,",","_intType_",") {
+					set strGrpProperties = strGrpProperties_", SUM("_strField_") AS "_strFieldDesc
+				}  else {
+					set strGrpProperties = strGrpProperties_", "_strField_" AS "_strFieldDesc
+				}
+				set strSelectProperties  = strSelectProperties_", "_strField_" AS "_strFieldDesc
+			}
+		}
+		if pidClass'="" {
+			set strTableName = pidClass
+			if ($length(strTableName, ".") > 1) {
+				if ##Class(%Dictionary.CompiledClass).%ExistsId(strTableName) {
+					set objCompiledClass = ##Class(%Dictionary.CompiledClass).%OpenId(strTableName)
+					set strTableName     = objCompiledClass.SqlSchemaName_"."_objCompiledClass.SqlTableName
+					do objCompiledClass.%Close()
+				}
+			}
+	 
+			if $get(^CacheTempView(YUSER,"View")) {
+				set strSQL = strSQL_"select * "
+			} else {
+				if pintMaxCount>1 {
+					;CORE-311
+					set strSQL = strSQL_"select DISTINCT top "_pintMaxCount_" "_strTableName_"."_pidField
+				} else {
+					set strSQL = strSQL_"select DISTINCT "_strTableName_"."_pidField
+				}
+			}
+			set strSQL = strSQL_"#### from **** "
+			
+			if 'blnObj {
+				if '$$$WWW001SharedFile($get(^WWW001(0,pidClass,1))) set strSQL = strSQL_$$$Where(blnWhereUsed)_strTableName_".company = "_YM_" "
+			}
+			
+			if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+				set idView = $$GetCurrentView^COMView(pidClass)
+				set objView = $get(^COMView(0,pidClass,idView,1))
+				set favorito = $$GetTextForFavourite^COMView(pidClass, idView, objView)
+
+				if (favorito = "Admissões Disponíveis"){
+					set newFilter = ""
+					if ($$CheckVincularPacAdmAtivas^VARINDispenseToPatient()){
+						set newFilter = " and %upper(DateDischarged) = ' ' "
+					}
+					else {
+						set newFilter = " and ((CAST(DateDischarged as VARCHAR) IS NULL) or (DateAdmitted >= (CURRENT_DATE-3))) "
+					}
+					set strSQL = strSQL_newFilter
+				}	
+			}
+			
+			if ( (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) || 
+			(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))  ||
+			(+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ) {
+				
+				set produtosP 		= ""
+				set idParentForm    = ""
+				
+				set produtosP 	= $piece($get(^VARParametroCliente(YM,YM,1)),Y,76) ;CORE-385.5
+				
+				if ($get(^CacheTempView(YUSER,"CallingForm")) = "INReqLine") {
+					if (produtosP = 1) {
+						set strSQL = strSQL_" and INART.FREE5 = 1 "
+					}
+				}
+				
+			}
+			
+			set strFilterTypes = "FixedFilter,Filter"
+			for FilterLoop=1:1:$length(strFilterTypes,",") {
+				set strFilterType = $piece(strFilterTypes,",",FilterLoop)
+				
+				set idFilter = ""
+				for {
+					set idFilter = $order(^CacheTempView(YUSER,strFilterType,idFilter))
+					quit:idFilter=""
+					
+					set strCondition = "" ;16708A
+					set strValue3    = "" ;16708A
+					
+					set objFilter = $get(^CacheTempView(YUSER,strFilterType,idFilter))
+					set strField  = $$$COMViewFilterField(objFilter)
+					set strComp   = $$$COMViewFilterComparator(objFilter)
+					set strValue  = $$$COMViewFilterValue1(objFilter)
+					if ($extract(strField)="P") && $$SimulateCommainPrimaryKey^WWW012() {
+						set strValue = $translate(strValue,",",$$$FAKECOMMA)
+					}
+					set blnNoConversion = +$$$COMViewFilterNoconversion(objFilter) ; Do not convert filter value
+
+					// Adaptado do V1 - 26/12/2013
+					// Frank: modificação no core para fazer com que o COMView ignore o filtro
+					// se ele não estiver preenchido.
+					if ((pidClass = "VARAlertaLocalLinha") || (pidClass = "VARAlertaLocal")) {
+						if strValue = "" continue
+					
+						// Nesse caso só podemos ignorar se o filtro for do tipo booleano.
+						// Apenas para campos calculados, pois não podemos colocar uma relação
+						// de num campo calculado.
+						if (strValue = 0 && $find(strField, "C")) {
+					
+							;new intFieldNumber, objCalculatedField
+							set intFieldNumber 	   = $extract(strField, 2, $length(strField))
+							set objCalculatedField = $get(^WWW003Calc(0, pidClass, intFieldNumber, 1))
+							if ($piece(objCalculatedField, Y, 3) = "%Boolean") continue
+						}
+					}
+
+					if $$$COMViewFilterGroupBy(objFilter) {
+						set strProperty = strField
+						if 'pblnSelectAll {
+							if pstrRef="" {
+								set idClass = pidClass
+								do ConvertField(.idClass,.strProperty,"","","",pstrSafeMode,,$$$COMViewFilterDisplay(objFilter))
+								if strGroupBy'="" set strGroupBy = strGroupBy_","
+								set strGroupBy = strGroupBy_strProperty
+								
+								if '$listfind(lstClasses,idClass) {
+									set lstClasses = lstClasses_$listbuild(idClass)
+								}
+								
+								if $find(strField,".") set lstProps = lstProps_$listbuild(strField)
+								
+							} else {
+								set strValue = $$GetValue(pidClass,strProperty,pstrRef)	;SR16944
+								
+								do ConvertField(pidClass,.strProperty,.strValue,"","",pstrSafeMode,,$$$COMViewFilterDisplay(objFilter))	;SR16944
+													
+								if strValue="" {
+									set strCondition = "(%1 in ("""","" "") or %1 is null) "   ;SR16708
+								;	set strSQLPiece  = $$$Where(blnWhereUsed)_"("_strField_" in ("""","" "") or "_strField_" is null) " ;SR16708
+								} else {
+									set strCondition = "%1 = %2"	;SR16708
+								;	set strSQLPiece  = $$$Where(blnWhereUsed)_strField_" = "_$$$AddQuotes(strRefValue)_" "	;SR16708
+								}
+							}
+						}
+					}
+					
+					if strField="Custom" {
+						set strCondition = "%2 "	;SR16708
+					;	set strSQLPiece  = $$$Where(blnWhereUsed)_strValue_" "	;SR16708
+						
+					} elseif (strField'="") && ((strValue'="") || $find(",3,4,",","_strComp_",")) {
+					;	set strSQLPiece  = $$$Where(blnWhereUsed) 	;SR16708
+						set idClass = pidClass
+ 			;SR17283	set strValue3 = $zcvt(strValue,"U")		;SR17225 
+						if $find(strField,".") {
+							set lstProps = lstProps_$listbuild(strField)
+							set ^CacheTempSQL($$$SQLID,"RelationFilter",strField,strFilterType) = idFilter
+						}
+
+						if blnNoConversion { ; Do not convert filter value
+							do ConvertField(.idClass,.strField,"",.strComp,"",pstrSafeMode,,$$$COMViewFilterDisplay(objFilter))
+ 
+						} else {
+							if blnObj {		//SR15866
+								set idClassN  = $$GetClass^COMViewObject(idClass,.strField)
+								set strFieldN = $piece(strField,"->",$length(strField,"->"))
+								do ConvertField(idClassN,strFieldN,.strValue,.strComp,"",pstrSafeMode,,$$$COMViewFilterDisplay(objFilter))
+							}
+ 
+							do ConvertField(.idClass,.strField,.strValue,.strComp,"",pstrSafeMode,,$$$COMViewFilterDisplay(objFilter))
+						}
+ 						set strValue3 = $zcvt(strValue,"U")		;SR17225 ;SR17283
+						if '$listfind(lstClasses,idClass) {
+							set lstClasses = lstClasses_$listbuild(idClass)
+						}
+						
+						if strComp=$$$EnumCOMVIEWCOMPARATORGreaterThan {
+							set strCondition = "%1 > %2"	;SR16708
+						;	set strSQLPiece  = strField_" > "_strValue_" "	;SR16708
+						
+						} elseif strComp=$$$EnumCOMVIEWCOMPARATORLessThan {
+							set strCondition ="%1 < %2"	;SR16708
+						;	set strSQLPiece  = strField_" < "_strValue_" "	;SR16708
+						
+						} elseif strComp=$$$EnumCOMVIEWCOMPARATOREquals {
+							; strValue gets quoted, so a null is 2*$$$DBLQUOTE
+							if ($translate(strValue," ")="""") || ($translate(strValue,$$$DBLQUOTE) = "") {
+		; alternative?		; if $translate($translate(strValue," "),$$$DBLQUOTE) = "" {
+								set strCondition = "(%1 is null or %1 in ("" "",%2)) "	;SR16708
+							;	set strSQLPiece  = "("_strField_" is null or "_strField_" in ("" "","_strValue_")) "	;SR16708
+							} else {
+								set strCondition = "%1 = %2"	;SR16708
+							;	set strSQLPiece  = strField_" = "_strValue_" "	;SR16708
+							}
+						
+						} elseif strComp=$$$EnumCOMVIEWCOMPARATORNotEquals {
+							if $translate($translate(strValue," "),$$$DBLQUOTE) = "" {
+								if ((((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+	      				 			 (+$$$WWWClientParamCoreChangesHCB($get(^WWWClientParam(YM,YM,1))))  || 
+	      				 		 	 (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))))) &&
+																		(pidClass = "INReq")) {
+									set strCondition = "(1=1) "
+								}
+								else {
+									set strCondition = "%1 is not null AND %1 not in ("" "",%2) "  ;SR16708
+								}
+							;	set strSQLPiece  = strField_" is not null AND "_strField_" not in ("" "","_strValue_]]><![CDATA[") "  ;SR16708
+							
+							} else {
+								if $translate(strValue,"""")=$translate(strValue3,"""") {   ;SR17225
+									set strCondition = "(%1 <> %2 OR %1 IS NULL) "          ;SR16708  ;SR17225
+								} else {
+									set strCondition = "((%1 IS NULL) OR ((%1 <> %2) and (%1 <> %3))) "  ;SR16708 ;SR17225
+								}
+							;	set strSQLPiece  = "("_strField_" <> "_strValue_" OR "_strField_" IS NULL) "  ;SR16708
+							}
+						
+						} elseif strComp=$$$EnumCOMVIEWCOMPARATORStartsWith {
+							set strCondition = "%1 %startswith %2 "                     ;SR16708 ;SR17225 ;SR17346
+				;SR17346 	set strCondition = "%UPPER(%1) %startswith %UPPER(%2) "     ;SR16708 ;SR17225
+						;	set strCondition = "$$Index^COMUtils(%1) %startswith %2 "   ;SR16708 ;SR17225
+						;	set strCondition = "$$Index^COMUtils(%1) %startswith $$Index^COMUtils(%2) "    ;SR16708 ;SR17225
+						;	set strSQLPiece = strField_" %startswith "_strValue_" "     ;SR16708
+						
+						} elseif strComp=$$$EnumCOMVIEWCOMPARATORContains {
+							set strCondition = "$find(%1,%2) > 1 "                      ;SR16708 ;SR17225 ;SR17346
+				;;SR17346 	set strCondition = "$find($$Index^COMUtils(%1),%2) > 1 "    ;SR16708 ;SR17225
+						;	set strSQLPiece = "$find("_strField_","_strValue_") > 1 "   ;SR16708
+							
+							//SR17023
+						} elseif strComp=$$$EnumCOMVIEWCOMPARATORFindIn {
+							set strCondition = "$find(%2,%1) > 1 "
+							
+							// FIXME JW - Within does not work for multiple values entered...
+						} elseif strComp=$$$EnumCOMVIEWCOMPARATORWithin {
+							if '$find($$$UPPER(strValue),"SELECT ") &&
+							   '$find($$$UPPER(strValue)," FROM ")     {         ; SR17214 add test for other SQL Query
+								
+								set strValue = $$^WWWKEYBUILD($translate(strValue,""""))
+							}
+						;	set strSQLPiece  = strField_" in ("_$$^WWWKEYBUILD($translate(strValue,""""))_")" ;BR014982	;SR16708
+						//	set strCondition = "%1 in (%2)" ;BR014982	;SR16708
+							//SR17023  - Comma separated list
+				;			set strCondition = strField_" in ("_$$^WWWKEYBUILD($translate(strValue,""""))_")"  ; SR17214/SR17023
+							set strCondition = strField_" in ("_strValue_")"
+							
+						} elseif strComp=$$$EnumCOMVIEWCOMPARATORLike {
+							set strCondition = "%1 like %2"	;SR16708
+						;	set strSQLPiece  = strField_" like "_strValue	;SR16708
+							
+						} elseif strComp=$$$EnumCOMVIEWCOMPARATORBetween { 		//SR14832
+							if $extract(strValue)=$$$DBLQUOTE {		// Remove quotes
+								set strValue = $extract(strValue,2,$length(strValue)-1)
+							}
+							if $piece(strValue,"&",1) = "" {		// If only one value, use >= or <=
+								set strValue = $$$QUOTE($piece(strValue,"&",2))
+								set strCondition = "%1 <= %2"	;SR16708
+							;	set strSQLPiece  = strField_" <= "_$$$QUOTE($piece(strValue,"&",2))	;SR16708
+							
+							} elseif $piece(strValue,"&",2) = "" {
+								set strValue=$$$QUOTE($piece(strValue,"&",1))
+							;	set strSQLPiece  = strField_" >= "_$$$QUOTE($piece(strValue,"&",1))	;SR16708
+								set strCondition = "%1 >= %2"	;SR16708
+							
+							} else {
+							;	set strSQLPiece = strField_" between "_$$$QUOTE($piece(strValue,"&",1))_" and "_$$$QUOTE($piece(strValue,"&",2))  ;SR16708
+								set strValue3    = $$$QUOTE($piece(strValue,"&",2)) ;SR16708 ;SR18119
+								set strValue     = $$$QUOTE($piece(strValue,"&",1)) ;SR16708 ;SR18119
+								set strCondition = "%1 between %2 and %3"           ;SR16708
+							}
+						}
+					}
+					set strSQL = strSQL_$$AddSQL(strCondition,strValue,strValue3,pidClass,strField,.blnWhereUsed)	;SR16708
+				}
+			}
+			
+			if pblnInForm {
+				// Always order by the last primary key
+				set idSortField = "P"_$order(^WWW002(0,pidClass,""),-1)
+				do ConvertField(pidClass,.idSortField,"","","",pstrSafeMode,1,$$$COMViewFilterDisplay(objFilter))
+				set strDirection = 1
+				
+			} else {
+				set idSortField = $$GetSort^COMViewFilterColumn(pidClass,.strDirection)
+ 
+				if 'blnObj {
+					if $find(idSortField,".") {
+						set idClass  = pidClass
+						set lstProps = lstProps_$listbuild(idSortField)
+						do ConvertField(.idClass,.idSortField,"","","",pstrSafeMode,1,$$$COMViewFilterDisplay(objFilter))
+						if '$listfind(lstClasses,idClass) set lstClasses = lstClasses_$listbuild(idClass)
+					} elseif idSortField'=""  {
+						do ConvertField(pidClass,.idSortField,"","","",pstrSafeMode,1,$$$COMViewFilterDisplay(objFilter))
+					}
+				} else {
+					set idSortFieldClass = $$GetClass^COMViewObject(pidClass,idSortField)       //"alSOH.dPeriodBalance","QtySubType->QtyFree1" = alSOH.dPeriodSubType
+					if idSortField'="" set idSortField = pidClass_"."_idSortField
+					
+	 				if $$IsClassSerial^COMViewObject(idSortFieldClass) {   //SR17023
+	 	 				set idSortField = $translate(idSortField,"->","_")
+	 				}
+				
+				}
+ 
+			}
+			set strSQL = strSQL_$$MatchClasses(pidClass,lstProps,pstrSafeMode,.blnWhereUsed)
+			set strSQL = $$OnBeforeSQL(pidClass,strSQL,.blnWhereUsed)  ;SR17075
+			
+			set strClasses = ""
+			for ClassLoop=1:1:$listlength(lstClasses) {
+				if ClassLoop'=1 set strClasses = strClasses_","
+				set strClasses = strClasses_$listget(lstClasses,ClassLoop)
+			}
+			set strSQL = $$Replace^COMUtilStr(strSQL,"****",strClasses)
+			
+			if $listfind(plstColumns,"RowCount") {
+				set strSelectProperties = strSelectProperties_",COUNT("_pidClass_".ID) AS RowCount"
+			}
+			
+			if blnObj {   ; SR17214
+				if strGroupBy'="" set strSelectProperties = strGrpProperties
+				set strSQL = $$Replace^COMUtilStr(strSQL,"####",strSelectProperties)
+			
+			} else {
+				if strGroupBy="" set strSelectProperties = ""
+				set strSQL = $$Replace^COMUtilStr(strSQL,"####",strSelectProperties)
+			}
+			
+			if strGroupBy'="" {
+				set strSQL = strSQL_" group by "_strGroupBy_" "
+			}
+			if idSortField'="" {
+				set strSQL = strSQL_" order by "_idSortField_" "
+				if strDirection=-1 {
+					set strSQL = strSQL_"desc"
+				}
+			}
+		}
+	} 
+	set strSQL = $$RemoveMark(strSQL) 
+	if (+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) {
+		set idView = $$GetCurrentView^COMView(pidClass)
+		set objView = $get(^COMView(0,pidClass,idView,1))
+		set favorito = $$GetTextForFavourite^COMView(pidClass, idView, objView)
+		if ( favorito = "Por Produto/Paciente") ||
+		   ( favorito = "Por Produto")
+		{
+			set strSQL = $Replace(strSQL,"$$Index^COMUtils"," ")
+		}
+		
+		elseif (favorito = "Presc. Aguard. Dispensação"){
+			set newOrder =  " $$CheckUrgent^VARDispensacaoViaPrescricaoLinha(SQLUser.MEDPrescription.PrescriptionNumber) desc, "_
+							" SQLUser.MEDPrescription.FREE6 asc, "_
+							" SQLUser.MEDPrescription.PrescriptionNumber "
+			set $piece(strSQL,"order by",2) = newOrder
+		}
+	}
+	;set strSQL = $replace(strSQL,"""""","'")
+	set strSQL = $replace(strSQL,"""","'")
+	quit strSQL
+	
+	
+OnBeforeSQL(pidClass,pstrSQL,&pblnWhereUsed)
+	;-------------------------------------------------------------------------------
+	; Adds additional filter conditions.
+	; 
+	; YSQL : set by ExecuteHook (?)
+	; 
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 08-Dec-2009	shobby	SR17075: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,YSQL
+	
+	set strStatus = $$ExecuteHook^WWW001Hook(pidClass,$$$EnumWWWEVENTTYPEOnBeforeSQL,,,$get(^CacheTempView(YUSER,"CallingForm")))
+	if $get(YSQL)'="" {
+		set pstrSQL = pstrSQL_$$$Where(pblnWhereUsed)_" ID IN ("_YSQL_")"
+	}
+	quit pstrSQL
+	
+	
+AddSQL(pstrCondition,pstrValue,pstrValue3,pidClass,pstrField,&pblnWhereUsed)
+	;-------------------------------------------------------------------------------
+	; Add the new condition to the SQL
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 04-Oct-2012	shobby		SR18119: Bug in 'between' search.
+	; 28-Sep-2009	shobby		SR16708: Created
+	;-------------------------------------------------------------------------------
+	new strSQL,strSQLPiece,strSQLPiece2,strValueMod,strValue3Mod
+
+	set strSQL=""
+	if pstrCondition'="" {
+		if $extract(pstrValue)="""" set pstrValue = $piece(pstrValue,"""",2)
+		if $extract(pstrValue3)="""" set pstrValue3 = $piece(pstrValue3,"""",2) ;SR18119
+		set strSQLPiece2=""
+
+		if ($$IsSearchClass^COMQuickSearch(pidClass)) {        ;16708A
+			set strValueMod  = $$GetCode^INARTCode(pstrValue)  ;16708
+			set strValue3Mod = $$GetCode^INARTCode(pstrValue3) ;16708
+			if (pstrValue'=strValueMod) || (pstrValue3'=strValue3Mod) {
+				set strSQLPiece2 = $$DecodeString(pstrCondition,pstrField,$$$AddQuotes(strValueMod),$$$AddQuotes(strValue3Mod))
+			}
+		}
+		set strSQLPiece = $$DecodeString(pstrCondition,pstrField,$$$AddQuotes(pstrValue),$$$AddQuotes(pstrValue3))
+		if strSQLPiece2'="" {
+			set strSQL = $$$Where(pblnWhereUsed)_"("_strSQLPiece_" or "_strSQLPiece2_")"
+		} else {
+			set strSQL = $$$Where(pblnWhereUsed)_strSQLPiece
+		}
+	}
+	quit strSQL
+	
+	
+DecodeString(pstrString,pstr1="",pstr2="",pstr3="",pstr4="")
+	;-------------------------------------------------------------------------------
+	; DecodeError^COMUtilStr doesn't like the input string to contain spaces when not a code.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 28-Sep-2009	shobby	SR16708: Created
+	;-------------------------------------------------------------------------------
+	if pstr1'="" set pstrString = $$FullReplace^COMUtilStr(pstrString,"%1",pstr1)
+	if pstr2'="" set pstrString = $$FullReplace^COMUtilStr(pstrString,"%2",pstr2)
+	if pstr3'="" set pstrString = $$FullReplace^COMUtilStr(pstrString,"%3",pstr3)
+	if pstr4'="" set pstrString = $$FullReplace^COMUtilStr(pstrString,"%4",pstr4)
+	quit pstrString
+
+	
+GetValue(pidClass,pidField,pidKey)
+	new loop,strRef,strValue
+		
+	set strValue = ""
+	if $extract(pidField)="P" {
+		set strValue = $piece(pidKey,",",$extract(pidField,2,99))
+	
+	} elseif $extract(pidField)="D" {
+		set strRef = "^"_pidClass_"("_$select($$$WWW001SharedFile($get(^WWW001(0,pidClass,1))):0,1:YM)_","
+		for loop=1:1:$length(pidKey,",") {
+			set strRef = strRef_$$$AddQuotes($piece(pidKey,",",loop))_","
+		}
+		set strRef   = strRef_"1)"
+		set strValue = $piece($get(@strRef),Y,$extract(pidField,2,99))
+	}
+	quit strValue
+	
+	
+MatchClasses(pidClass,plstProperties,pstrSafeMode=0,pblnWhereUsed=$$$NO)
+    ;-------------------------------------------------------------------------------
+    ; Matches properties from other classes for the sql statement
+    ; 
+    ; Example
+    ; pidClass: "INAUFP"
+    ; property: "P1.CINAUFPA.D61"
+    ;
+    ; Returns:String
+    ;
+    ; History:
+    ; 27-Oct-2006	JW		SR15152: Initialise idKey inside loop
+    ; 25-Oct-2006	RPW		SR14709: Removed #define and modified $$$Where calls
+    ; 13-Oct-2006	Steve S	SR15085: Only use indirection for non-string literals
+    ; 							and non-pure numerics
+    ; 07-Apr-2005 	Paul K	Classes with multi-primary keys are now matched properly.
+    ; 14-Mar-2005	Paul K	Need to use $$$Where instead of hardcoded and
+	; 09-Feb-2005	PO		SR10965 Adding support for related classes.
+    ;-------------------------------------------------------------------------------
+	new arrClasses,idClass,idField,idKey,idKey2,loop,objField,objField2
+	new strRef,strRefVal,strSQL
+	
+	set strSQL=""
+ 	
+	for loop=1:1:$listlength(plstProperties) {
+		set idClass = pidClass
+		set idField = $listget(plstProperties,loop)
+		
+	; FIXME : <GRF> GetRelation^COMViewUtils is a function.
+		do GetRelation^COMViewUtils(.idClass,idField)
+		if (idClass'="") && '$data(arrClasses(idClass)) {
+			set arrClasses(idClass)=""
+			if '$$$WWW001SharedFile($get(^WWW001(0,idClass,1))) set strSQL=strSQL_$$$Where(pblnWhereUsed)_idClass_".company = "_YM_" "
+			
+			if $find(idField,".C") {
+				;for each primary key on the related class, find a matching property on the passed in class.
+				for idKey=1:1:$order(^WWW002(0,idClass,""),-1) {
+					set objField = $get(^WWW002(0,idClass,idKey,1))
+					if $$$WWW002RelationClass(objField)'="" {
+						if $$$WWW002RelationClass(objField)=pidClass {  ;use last primary key on main class
+							set strSQL = strSQL_$$LinkClass(idClass,idKey,pidClass,$order(^WWW002(0,pidClass,""),-1),.pblnWhereUsed)
+						
+						} else {  ;look on main class for this class
+							for idKey2=1:1:$order(^WWW002(0,pidClass,""),-1) {
+								set objField2 = $get(^WWW002(0,pidClass,idKey2,1))
+								if $$$WWW002RelationClass(objField2)=$$$WWW002RelationClass(objField) {
+									set strSQL = strSQL_$$LinkClass(idClass,idKey,pidClass,idKey2,.pblnWhereUsed)
+								}
+							}
+						}
+					}
+				}
+			
+			} elseif $extract(idField)="P" {
+				for idKey=1:1:$order(^WWW002(0,pidClass,""),-1) {
+					set objField = $get(^WWW002(0,pidClass,idKey,1))
+					if $$$WWW002RelationClass(objField)'="" {
+						if $$$WWW002RelationClass(objField)=idClass {  ;use last primary key on main class
+							set strSQL = strSQL_$$LinkClass(idClass,$order(^WWW002(0,idClass,""),-1),pidClass,idKey,.pblnWhereUsed)
+						} else {  ;look on main class for this class
+							for idKey2=1:1:$order(^WWW002(0,idClass,""),-1) {
+								set objField2 = $get(^WWW002(0,idClass,idKey2,1))
+								if $$$WWW002RelationClass(objField2)=$$$WWW002RelationClass(objField) {
+									set strSQL = strSQL_$$LinkClass(idClass,idKey2,pidClass,idKey,.pblnWhereUsed)
+								}
+							}
+						}
+					}
+				}
+			
+			} else {
+				set objField = $$GetRelation^COMViewUtils(pidClass,$piece(idField,".",1))
+				set idKey = 0
+				if $$$WWW003RelationalPrimaryKeys(objField)'="" {
+					for idKey=1:1:$length($$$WWW003RelationalPrimaryKeys(objField),",") {
+						set strRef    = $piece($$$WWW003RelationalPrimaryKeys(objField),",")
+						set strRefVal = $select(((strRef [ $$$DBLQUOTE)||$ISVALIDNUM(strRef)):strRef,$$$YES:@strRef)
+						set strSQL    = strSQL_$$$Where(pblnWhereUsed)_idClass_"."_$$$WWW002PropertyName($get(^WWW002(0,idClass,idKey,1)))_" = "_strRefVal_" "
+					}
+				}
+				if $data(^WWW002(0,idClass,$increment(idKey),1)) {
+					set strSQL = strSQL_$$$Where(pblnWhereUsed)_pidClass_"."_$$$WWW002PropertyName(objField)_" = "_idClass_"."_$$$WWW002PropertyName($get(^WWW002(0,idClass,idKey,1)))_" "
+				}
+			}
+		}
+	}
+	quit strSQL
+	
+	
+LinkClass(pidClass,pidKey,pidClass2,pidKey2,pblnWhereUsed)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 03-Jun-2014	shobby	SESPE-691: Removed the WWWClientParam changes that were putting $$Index on the join.
+	;								   Which was forcing @netManager not to use indices.
+	; 25-Oct-2006	RPW		SR14709: Removed #define and modified $$$Where calls
+	;-------------------------------------------------------------------------------
+	new strSQL
+
+	set strSQL = $$$Where(pblnWhereUsed)_pidClass_"."_$$$WWW002PropertyName($get(^WWW002(0,pidClass,pidKey,1)))_" = "_pidClass2_"."_$$$WWW002PropertyName($get(^WWW002(0,pidClass2,pidKey2,1)))_" "
+	;SR17225 set strSQL = $$$Where(pblnWhereUsed)_"$$Index^COMUtils("_pidClass_"."_$$$WWW002PropertyName($get(^WWW002(0,pidClass,pidKey,1)))_") = $$Index^COMUtils("_pidClass2_"."_$$$WWW002PropertyName($get(^WWW002(0,pidClass2,pidKey2,1)))_") "  ;SR17225
+
+	quit strSQL
+ 
+ 
+SQLClass(pidClass)
+	;-------------------------------------------------------------------------------
+	; Convert class into sql class. Supports Views
+	;
+	; Params:	Class id
+	;
+	; ByRefs:
+	;
+	; Returns:	sql id
+	;
+	; History:
+    ; 09-Sep-2008	PP		SR15866: Update COMView to Objects
+    ; 22-Jun-2006	Pablo	SR14221: Removed hard coding 'User' package
+	; 17-May-2006	Steve S	SR14649: Only add package if it's available
+	; 19-Apr-2006	JW		SR14429: Created
+	;-------------------------------------------------------------------------------
+	new objCompiledClass,strPackage
+	
+	if $extract(pidClass,1,4)="VIEW" {
+		set $extract(pidClass,1,4) = ""
+	}
+ 
+	if +$get(^CacheTempObj(YUSER,"Object")) quit pidClass
+	
+	set strPackage = $get(^CacheTempView(YUSER,"Package"))
+	
+	if ($length(pidClass, ".") > 1) {
+		if ##Class(%Dictionary.CompiledClass).%ExistsId(pidClass) {
+			set objCompiledClass = ##Class(%Dictionary.CompiledClass).%OpenId(pidClass)
+			set pidClass         = objCompiledClass.SqlTableName
+			do objCompiledClass.%Close()
+		}
+	}
+	
+	if strPackage'="" set pidClass = strPackage_"."_pidClass
+	
+	quit pidClass
+	
+	
+	; FIXME : Inconsistencies in which parameters are ByRef when ConvertField is called - review and correct. <GRF>
+	
+ConvertField(pidClass,pstrField,pstrValue="",pstrComp="",
+			 penumInputType="",pstrSafeMode=$$$NO,pblnOrderBy=$$$NO,
+			 pblnDisplay=$$$YES)
+    ;-------------------------------------------------------------------------------
+    ; This method attempt]]><![CDATA[s to optimise SQL searching by ad]]><![CDATA[ding %upper and other
+    ; functions so that indexes are used correctly.
+    ;
+	; History:
+	; 06-Jan-2011	GRF		SR17579: Use explicit tag for WWWTR calls
+	; 05-Jan-2010	GRF		SR15525: Call to $$Convert^WWWTR rather than $$^WWWTR
+	; 17-Nov-2009	GRF		SR16871: convert »CostCentre« into YLOCATION value
+	; 							(allow US spelling as well as English); replace
+	; 							$$$Add with $$$AddQuotes
+	; 17-Sep-2009	shobby	SR16708: Translate the entered value if searching on barcodes.
+    ; 30-Jun-2009	shobby	SR16696: Get 'Within' working.
+    ; 12-Mar-2009	PPP		SR16397: converted time to internal for SQL queries
+    ; 18-Feb-2009	HQN		SR16359: Removed null case for dates, now handled in
+    ; 							^GenerateSQL()
+    ; 02-Oct-2008	HQN		SR15915: removing SQL building logic for null value 
+    ; 							checks, now done inside GenerateSQL
+    ; 							Side Effect of:
+    ; 								$$$EnumCOMVIEWCOMPARATORNotEquals
+    ; 								$$$EnumCOMVIEWCOMPARATOREquals
+    ; 							Now built correctly in GenerateSQL no longer need
+    ; 							boolean translates
+    ; 09-Sep-2008	PP		SR15866:Update COMView to Objects
+    ; 26-Aug-2008	shobby	BR014967: Allow the option of 'ShowAll' on checkbox selectors.
+	; 13-Mar-2007	HeberB	BR014367: Add call to translate chars no accent mark, if required
+    ; 05-Mar-2007	PO		SR15466: For date fields instead of just %upper(+$p({Field},".",1))=""
+    ; 							... (%upper(+$p({Field},".",1)) = "" or {Field} is null)
+    ; 30-Nov-2006	RPW		SR14709: Type 1 works like type 14.
+    ; 01-Nov-2006	JW		SR15166: Use less likely characters for variable indirection.
+    ; 25-Oct-2006	RPW		SR14709: Cleaned up multi use of commands, and put them into variables.
+    ; 							Also made = work correctly on date handling.
+    ; 29-May-2006	Steve S	SR14675: Support 'like' clause
+    ; 19-Apr-2006	JW		SR14429: Support for views
+    ; 24-Mar-2006	JW		SR14422: Override for date (counter)
+    ; 28-Oct-2005	JW		SR13074: Exchange Rate type
+    ; 11-May-2005	Paul K	SR12199: Added Case insensitivity to everything but
+    ; 							primary key fields that don't have an index on them
+    ; 							and don't have Input type as BIG or BIGANDNOSPACE
+    ; 10-May-2005 	Paul K	SR12199: Added "Change Input Type As" support.
+    ; 09-Mar-2005	Paul K	SR11860: Fixed error when ordering by memo fields that
+    ; 							are larger than 255 characters.
+    ; 28-Feb-2005	Paul K	SR11802: Better handle dates; null comparison.
+    ; 20-Dec-2004	Paul K	Added "%" values
+    ; 30-Nov-2004	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new blnObj,idIndexKey,idInputAs,loop,objField,objProperty
+	new strField,strKeyCode,strPackage,strPlus,strUCValue,strValue
+	
+	set blnObj = +$get(^CacheTempObj(YUSER,"Object"))
+	
+	;if $$IsSearchClass^COMQuickSearch(pidClass) { ;16708
+	;		set pstrValue=$$GetCode^INARTCode(pstrValue) ;16708
+	;} ;16708
+	if 'blnObj {
+		set strKeyCode     = ""
+		set objField       = $$GetRelation^COMViewUtils(.pidClass,.pstrField,,.strKeyCode) ; Should this pass 2nd parm for changing
+		set penumInputType = $$$WWW002InputType(objField)
+
+		// Only use the % check for non-display filters
+		if ($extract(pstrValue)="»") && ($extract($reverse(pstrValue))="«") {  ; Used for things like YUSER,YBED,YLOCATION etc...
+			set strValue = $extract(pstrValue,2,$length(pstrValue)-1)
+				
+		set strUCValue = $zconvert(strValue,"u")                     ; SR16871 vvv
+		if ((strUCValue="COSTCENTRE") || (strUCValue="COSTCENTER")) && ($data(YLOCATION)=1) {
+			set pstrValue = $$GetCostCentre^INCostCentre(YLOCATION)
+		
+		} elseif (strValue'="") && ($data(@strValue)=1) {
+		;	if (strValue'="") && ($data(@strValue)=1) {              ; SR16871 ^^^
+				set pstrValue = @strValue					
+			}
+		}
+	
+		set pidClass  = $$SQLClass(pidClass)
+		set strField  = pidClass_"."_$$$WWW002PropertyName(objField)
+		set pstrField = strField
+		
+		set idIndexKey = $$$WWW002IndexKey(objField)
+	 	
+	 	if penumInputType=1 {
+		 	set pstrField = "$piece("_pstrField_",""."",1)"
+	 	}
+	 	
+		if (idIndexKey="") && ($find(",4,8,12,18,",","_penumInputType_",")) {  ;numeric fields
+			set pstrField = "+"_pstrField
+		
+		; FIXME - should first OR be an AND with subsequent clauses being grouped? <GRF>
+		; e.g.          if A && B && (C || D || E || F) {
+		; rather than   if A && B || C || D || E || F {
+		;  C,D,E,F  =  Date/Timestamp or Memo Data field or Text Data field 
+		} elseif (idIndexKey'="")   && 'pstrSafeMode       ||
+		         (penumInputType=1) || (penumInputType=14) ||
+		         ((strKeyCode="D")  && (penumInputType=3)) ||
+		         ((strKeyCode="D")  && (penumInputType=6))    {
+			// The logic is as follows :
+			//   if the $horolog format is full format, then just add the field
+			//   otherwise do a plus on the field name
+			set strPlus=""
+			if (penumInputType=14) || (penumInputType=1) { 
+				if '$find(pstrValue,",") {
+					set strPlus = "+"
+				}
+			}
+			set pstrField = "%upper("_strPlus_pstrField_")"
+		}
+		if pblnOrderBy {
+			if penumInputType=3 {
+				set pstrField = "$extract("_pstrField_",1,50)"
+			}
+		}
+		
+		if (penumInputType=6) || (penumInputType=3) {                     ; Text/Memo
+		           set pstrField = $$ToRemoveAccentMark(pstrField)
+		           if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+		              (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+		                if strKeyCode="C" set pstrValue = $zconvert(pstrValue,"U")
+		           }
+		}
+		
+		if (pstrComp'="") {
+			if (penumInputType=1) && ($translate(pstrValue," ")'="") {    ; Date   // FIXME JW - temp fix!
+				set pstrValue = $$ConvertDate(pstrValue)
+			
+			} elseif penumInputType=7 {                                   ; Time    ;SR16397
+				set pstrValue = $$GetInternal^WWWTR(7,pstrValue)		
+				
+			} elseif penumInputType=2 {                                   ; Boolean
+				if (pstrValue=2) {
+					set pstrComp  = $$$EnumCOMVIEWCOMPARATORNotEquals
+				
+				} elseif (pstrValue && (pstrComp=$$$EnumCOMVIEWCOMPARATOREquals))    ||
+				        ('pstrValue && (pstrComp=$$$EnumCOMVIEWCOMPARATORNotEquals))    {
+					set pstrComp  = $$$EnumCOMVIEWCOMPARATOREquals
+					set pstrValue = 1
+					
+				} else {
+					set pstrComp  = $$$EnumCOMVIEWCOMPARATORNotEquals
+					if ((((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+	      				 (+$$$WWWClientParamCoreChangesHCB($get(^WWWClientParam(YM,YM,1))))  || 
+	      				 (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1)))))) &&
+																		(pidClass = "SQLUser.INReq")) {
+						set pstrValue = ""
+					}
+					else {
+						set pstrValue = 1
+					}
+				}
+				
+			} elseif (penumInputType=14) || (penumInputType=1) {          ; Timestamp or Date ; FIXME : see Date ^^^ <GRF>
+				set pstrValue = """"_$$ConvertDate(pstrValue)_""""
+ 
+			} else {
+				if $translate(pstrValue," ")="" {
+					set pstrValue = $$$AddQuotes(pstrValue)
+				
+				} else {
+					// No index conversion for 'like' clause
+					if (idIndexKey'="") && 'pstrSafeMode && (pstrComp'=$$$EnumCOMVIEWCOMPARATORLike) {
+						if pstrComp=$$$EnumCOMVIEWCOMPARATORWithin {  ;SR16696
+							for loop=1:1:$length(pstrValue,",") {
+								set $piece(pstrValue,",",loop) = $$Index^COMUtils($piece(pstrValue,",",loop),$piece(pidClass,".",2)) ;CORE-303
+							}
+						} else {
+							set pstrValue = $$Index^COMUtils(pstrValue,$piece(pidClass,".",2)) ;CORE-303
+						}
+					}
+					
+					set idInputAs = $$$WWW122ChangeInputAs(objField)
+					
+					if (idInputAs=1) || (strKeyCode="D") {                ; BIG
+						set pstrValue = $zconvert(pstrValue,"U")
+					
+					} elseif idInputAs=2 {                                ; small
+						set pstrValue = $zconvert(pstrValue,"L")
+					
+					} elseif idInputAs=6 {                                ; BIGNOSPACE
+						set pstrValue = $translate($zconvert(pstrValue,"U")," ","")
+					}
+					if pstrComp'=$$$EnumCOMVIEWCOMPARATORWithin if $find(pstrValue,"""") set pstrValue = $$DoubleQuotes^COMUtilStr(pstrValue) ;SR16696
+					set pstrValue = $$$AddQuotes(pstrValue)
+				}
+			}
+		}
+	}
+	
+
+
+	if blnObj {
+		if ($extract(pstrValue)="»") && ($extract($reverse(pstrValue))="«") {  ;Used for things like YUSER,YBED,YLOCATION etc...
+			set strValue = $extract(pstrValue,2,$length(pstrValue)-1)	
+		
+		set strUCValue = $zconvert(strValue,"u")                     ; SR16871 vvv
+		if ((strUCValue="COSTCENTRE") || (strUCValue="COSTCENTER")) && ($data(YLOCATION)=1) {
+			set pstrValue = $$GetCostCentre^INCostCentre(YLOCATION)
+		
+		} elseif (strValue'="") && ($data(@strValue)=1) {
+		;	if (strValue'="") && ($data(@strValue)=1) {              ; SR16871 ^^^
+				set pstrValue = @strValue					
+			}
+		}
+		
+		set objProperty    = ##class(%Library.PropertyDefinition).%OpenId(pidClass_":"_pstrField)
+		set penumInputType = objProperty.Type
+		
+		set pidClass  = $$SQLClass^COMViewSQL(pidClass)
+		set strField  = pidClass_"."_pstrField
+		set pstrField = strField
+		
+	 	if penumInputType="alSYS.dt.dtDate" {
+		 	set pstrField = pstrField
+	 	}
+	 	
+		if $find(",alSYS.dt.dtFloat,alSYS.dt.dtCurrency,alSYS.dt.dtInteger,",","_penumInputType_",") {  //numeric fields
+			set pstrField = "+"_pstrField
+		
+		} elseif ('pstrSafeMode)||$find(",alSYS.dt.dtDate, alSYS.dt.dtTimeStamp, alSYS.dt.dtTime, alSYS.dt.dtString,",","_penumInputType_",") {
+			set strPlus = ""
+			if $find(",alSYS.dt.dtDate, alSYS.dt.dtTimeStamp,alSYS.dt.dtTime,",","_penumInputType_",") { 
+				if '$find(pstrValue,",") {
+					set strPlus = ""
+				}
+			}
+		//	set pstrField = "%upper("_strPlus_pstrField_")"
+			set pstrField = strPlus_pstrField
+		}
+		
+		if pblnOrderBy {	//Truncate if Order By
+			if penumInputType = "alSYS.dt.dtString" {
+				set pstrField = "$extract("_pstrField_",1,50)"
+			}
+		}
+		
+		if penumInputType = "alSYS.dt.dtString" {
+	 		set pstrField = $$ToRemoveAccentMark^COMViewSQL(pstrField)
+		}
+	 	
+		if (pstrComp'="") {
+			if penumInputType = "alSYS.dt.dtDate" && ($translate(pstrValue," ")'="") {       // Date
+				set pstrValue = $$ConvertDate^COMViewSQL(pstrValue)
+				
+			} elseif penumInputType = "alSYS.dt.dtTime" && ($translate(pstrValue," ")'="") { // Time
+				set pstrValue = $$ConvertTime^COMViewObject(pstrValue)
+				
+			} elseif penumInputType = "alSYS.dt.dtBoolean" {                                 // Boolean
+				if (pstrValue=2) {
+					set pstrComp  = $$$EnumCOMVIEWCOMPARATORNotEquals
+				
+				} elseif (pstrValue && (pstrComp=$$$EnumCOMVIEWCOMPARATOREquals))    ||
+				        ('pstrValue && (pstrComp=$$$EnumCOMVIEWCOMPARATORNotEquals))    {
+					set pstrComp  = $$$EnumCOMVIEWCOMPARATOREquals
+					set pstrValue = 1
+				
+				} else {
+					set pstrComp  = $$$EnumCOMVIEWCOMPARATORNotEquals
+					set pstrValue = 1
+				}
+				
+			} elseif (penumInputType="alSYS.dt.dtDate") || (penumInputType="alSYS.dt.dtTimeStamp") {	//Timestamp
+				set pstrValue = """"_$$ConvertDate^COMViewSQL(pstrValue)_""""
+				if pstrValue="""""" {
+					set pstrField = "("_pstrField
+					set pstrValue = pstrValue_" or "_strField_" is null)"
+				}
+				
+			} elseif (penumInputType="alSYS.dt.dtTime") {	//Time
+				set pstrValue = """"_$$ConvertTime^COMViewObject(pstrValue)_""""
+				if pstrValue = """""" {
+					set pstrField = "("_pstrField
+					set pstrValue = pstrValue_" or "_strField_" is null)"
+				}
+				
+			} else {
+				if $translate(pstrValue," ")="" {
+					set pstrValue = $$$AddQuotes(pstrValue)
+				
+				} else {
+					if $find(pstrValue,"""") set pstrValue = $$DoubleQuotes^COMUtilStr(pstrValue)
+					set pstrValue = $translate(pstrValue,$$$DBLQUOTE)
+					set pstrValue = $$$AddQuotes(pstrValue)
+				}
+			}
+		}
+	}
+	quit
+	
+	
+ConvertDate(pstrDate="")
+	;----------------------------------------------------------------------------
+	; Convert a date
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 06-Jan-2011	GRF		SR17579: Use explicit tag for WWWTR calls
+	; 05-Jan-2010	GRF		SR15525: Call to $$Convert^WWWTR rather than $$^WWWTR
+    ; 18-May-2009	GRF		SR16545: use strOffset
+    ; 18-May-2009	PPP		SR16545: As date filter can be a numeric, check if
+    ; 							is <1000 and add $h
+	; 30-Nov-2006	RPW		SR14709: Don't touch dates with & in them
+	;-------------------------------------------------------------------------------
+ 	new strOffset
+ 	
+	set pstrDate  = $zconvert(pstrDate,"U")
+	set strOffset = $translate(pstrDate," ")
+	
+	if $find(pstrDate,"W") {
+		set pstrDate = $$AddWeek^COMUtilDate(+$horolog,$piece(pstrDate,"W",1),$piece(pstrDate,"W",2))
+		
+	} elseif $find(pstrDate,"M") {
+		set pstrDate = $$AddMonth^COMUtilDate(+$horolog,$piece(pstrDate,"M",1),$piece(pstrDate,"M",2))
+		
+	} elseif '$find(pstrDate,"&") && (+strOffset=strOffset) {
+		set:strOffset<10000 pstrDate = $$GetInternal^WWWTR(1,$horolog+strOffset)
+		
+	} elseif '$find(pstrDate,"&") {
+		set pstrDate = $$GetInternal^WWWTR(1,pstrDate)
+	}
+	quit pstrDate
+	
+	
+Group()
+    ;-------------------------------------------------------------------------------
+    ; Determines whether the SQL statement is grouping on a property, if it is
+    ; then return true.
+    ;
+    ; Returns:Boolean
+    ;
+    ; History:
+    ; 17-Jan-2005	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new idFilter,loop,strFilterType
+	
+	set idFilter = ""
+	for loop=1:1:$length("FixedFilter,Filter",",") {
+		set strFilterType = $piece("FixedFilter,Filter",",",loop)
+		for {
+			set idFilter = $order(^CacheTempView(YUSER,strFilterType,idFilter))
+			quit:idFilter=""
+			quit:$$$COMViewFilterGroupBy($get(^CacheTempView(YUSER,strFilterType,idFilter)))
+		}
+		quit:idFilter'=""
+	}
+	quit idFilter'=""
+	
+	
+LastWhereClause(&pstrWhere)
+	;-------------------------------------------------------------------------------
+	; Returns the last where claused used, if there has been a search
+	;
+	; Params:
+	;
+	; ByRefs:	pstrWhere (the clause)
+	;
+	; Returns: 	boolean - whether there was a previous SQL search at all
+	;
+	; History:
+	; 25-Aug-2006	JW		SR14763: Moved from COMViewFilterColumn, rewrote, added group by.
+	; 13-Jun-2006	Steve S	SR14613: Created
+	;-------------------------------------------------------------------------------
+	new blnSQL,idx,strSQL
+ 	
+ 	set blnSQL    = $$$NO
+	set pstrWhere = ""
+	
+	set idx = $get(^CacheTempView(YUSER,"LastSQL"))
+	if (idx'="") {
+		set strSQL = $get(^CacheTempView(YUSER,"History",idx,"SQL"))
+		if strSQL'="" {
+			set blnSQL = $$$YES
+			
+			set pstrWhere = $piece(strSQL," where ",2)
+			set pstrWhere = $piece(pstrWhere," order by ",1)
+			set pstrWhere = $piece(pstrWhere," group by ",1)
+		}
+	}
+	quit blnSQL
+	
+	
+RemoveMark(pstrValue,pidCompany=0,pstrNamespace="")
+	;-------------------------------------------------------------------------------
+	; Returns string with no accent marks
+	; 
+	; Params: pstrValue
+	;
+	; ByRefs:	
+	;
+	; Returns: 	string
+	;
+	; History:
+    ; 20-Apr-2007	HeberB	BR014367: Added YUCI subscript to CacheTempWWWUMLAU
+	; 03-Apr-2007	HeberB	BR014367: improve performance
+	; 27-Mar-2007	HeberB	BR014367: use of CacheTempWWWUMLAU
+	; 21-Mar-2007	HeberB	BR014367: fix boolean usage - stop using floating vars
+	; 09-Mar-2007	HeberB	BR014367: Created
+	;-------------------------------------------------------------------------------
+	new idWWWUMLAU,objWWWUMLAU,strAccentMark,strNoAccentMark,strResult
+  	
+ 	set strResult = pstrValue
+	set strAccentMark   = ""
+	set strNoAccentMark = ""
+	
+	if $get(YM)=""   set YM   = pidCompany
+	if $get(YUCI)="" set YUCI = pstrNamespace
+ 
+	; to remove accent marks
+	if ($$$MapAccentMark) {
+		if ($get(pstrValue) '= "") {
+			if '$data(^CacheTempWWWUMLAU(YUCI)) {
+				merge ^CacheTempWWWUMLAU(YUCI)=^WWWUMLAU
+			}
+ 
+			if ($get(^CacheTempWWWUMLAU(YUCI,0))="") ||
+			   ($get(^CacheTempWWWUMLAU(YUCI,1))="")    { 
+				
+				set idWWWUMLAU = ""
+				; load mapping from WWWUMLAU
+				for {
+					set idWWWUMLAU = $order(^CacheTempWWWUMLAU(YUCI,0,idWWWUMLAU))
+					quit:(idWWWUMLAU="")
+					
+					set objWWWUMLAU = $get(^CacheTempWWWUMLAU(YUCI,0,idWWWUMLAU,1))
+					; check whether fields are defined (not empty)		
+					if ($$$WWWUMLAUCharacter1(objWWWUMLAU)'= "") && ($$$WWWUMLAUNoAccentMark(objWWWUMLAU)'= "") {
+						set strAccentMark   = strAccentMark _ $$$WWWUMLAUCharacter1(objWWWUMLAU)
+						set strNoAccentMark = strNoAccentMark _ $$$WWWUMLAUNoAccentMark(objWWWUMLAU)
+					}
+				}
+				; CacheTempWWWUMLAU is killed when WWWUMLAU is updated
+				set ^CacheTempWWWUMLAU(YUCI,0) = strAccentMark
+				set ^CacheTempWWWUMLAU(YUCI,1) = ]]><![CDATA[strNoAccentMark		
+			}
+			set strResult = $TRANSLATE(pstrValue,$get(^CacheTempWWWUMLAU(YUCI,0)),$get(^CacheTempWWWUMLAU(YUCI,1)))
+		
+		} else {
+			; When this subroutine is called from a sql query and pstrValue is null, the null is returned making the
+			; query return invalid rows, since the query has filters: <> "" .. or ..!= " ". So, when pstrValue is "",
+			; a " " is returned for the second filter to be valid.
+			set strResult = " "	
+		}
+	}
+	quit strResult 
+	
+	
+ToRemoveAccentMark(pstrValue) 
+	;-------------------------------------------------------------------------------
+	; Returns string to be added to SQL query with call to remove accent marks
+	;
+	; Params: pstrValue
+	;
+	; ByRefs:	
+	;
+	; Returns: 	empty if user doesn´t required translation
+	;
+	; History:
+	; 07-Jan-2014	shobby	CORE-303: Don't use the RemoveMark on 'Company'.  There are no marks anyway and it just interferes with optimum index selection with SQL.
+	; 17-Oct-2012	SVL		SR18152:  Excluding some fields from MEDPatient
+	; 20-Apr-2007	HeberB	BR014367: Added YUCI to call
+	; 27-Mar-2007	HeberB	BR014367: use macro
+	; 21-Mar-2007	HeberB	BR014367: fix bollean usage - stop using floating vars
+	; 09-Mar-2007	HeberB	BR014367: Created
+	;-------------------------------------------------------------------------------
+	if $piece($piece(pstrValue,")",1),".",3)="Company" quit "Company" ;CORE-303
+	
+	if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+		if (($piece(pstrValue,".",2) = "MEDPatient") && (($piece($replace(pstrValue,")",""),".",3) = "SSN") || 
+		    											 ($piece($replace(pstrValue,")",""),".",3) = "PatientID")))  {
+			quit pstrValue
+		}
+	} 
+	if ((+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+	   (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+		if (($piece(pstrValue,".",2) = "INREC") && (($piece($replace(pstrValue,")",""),".",3) = "Status"))) {
+			quit $piece(pstrValue,"%upper",2)
+		}
+	} 
+	quit $select($$$MapAccentMark:" $$RemoveMark^COMViewSQL("_pstrValue_","""_YM_""","""_YUCI_""") ",1:pstrValue)
+
+
+RemoveAccentMarkFunc(pstrValue)
+	;-------------------------------------------------------------------------------
+	; Remove the $$RemoveMark function from a string to avoid slow searches.
+	;	Ex: Order by $$RemoveMark^COMViewSQL(SQLUser.MEDPatient.PatientID,"0","CORE-V1_70_4_BR")
+	;
+	; Params: pstrValue
+	;
+	; ByRefs:	
+	;
+	; Returns: 	converted value
+	;
+	; History:
+	; 11-Oct-2012	SLV 	SR18152: Created
+	;-------------------------------------------------------------------------------
+	quit:(pstrValue="") ""
+	
+	new strConvertedValue
+	
+	set strConvertedValue = pstrValue
+	
+	if $find(pstrValue,"SQLUser") {
+		if $find(pstrValue,"%upper") {
+			set strConvertedValue = $extract(pstrValue,(($find(pstrValue,"SQLUser"))-7),($find(pstrValue,",")-3))
+		} 
+		else {
+			set strConvertedValue = $extract(pstrValue,(($find(pstrValue,"SQLUser"))-7),($find(pstrValue,",")-2))
+		}
+	}
+	
+	quit strConvertedValue]]></Routine>
+</Export>

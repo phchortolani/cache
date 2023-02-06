@@ -1,0 +1,751 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="WWWFieldRules" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+WWWFieldRules
+	
+#include WWWConst
+#include COMSYS
+	
+ChangeInputAs(&pstrInput,pidType)
+	;-------------------------------------------------------------------------------
+	; Process the Change Input As option
+	; 
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-Jan-2007	JW		SR15384: Encapsulated
+	;-------------------------------------------------------------------------------
+	new strNoSpace,loop
+	
+	if pidType=7 {			; no special characters
+		set pstrInput = $translate(pstrInput,"][\}{|~,()@#$%^&*_=+<>?/-.:´`§²³!°µ")
+		
+	} else {
+		if pidType=1 {			 	    ; BIG
+			set pstrInput = $$$UPPER(pstrInput)
+			
+		} elseif pidType=2 {			; small
+			set pstrInput = $$$LOWER(pstrInput)
+			
+		} elseif pidType=3 {			; Title
+			set pstrInput = $$$UPPER($extract(pstrInput))_$extract($$$LOWER(pstrInput),2,999)
+			
+		} elseif pidType=4 {			; Spaced
+			set strNoSpace = $translate(pstrInput," ")
+			set pstrInput = ""
+			for loop=1:1:$length(strNoSpace) {
+				$$$Append(pstrInput," "_$extract(strNoSpace,loop))
+			}
+			set $extract(pstrInput) = ""
+			
+			// Need to look at this - think WWWEVENT and SAVE are diff. SAVE adds extra space?
+			
+		} elseif pidType=5 {			; No Spaces
+			set pstrInput = $translate(pstrInput," ")
+			
+		} elseif pidType=6 {			; BIG and no spaces
+			set pstrInput = $$$UPPER($translate(pstrInput," "))
+		}
+	}
+	quit
+	
+	
+TranslateDate(&pstrDate)
+	;-------------------------------------------------------------------------------
+	; Date translation
+	; 
+	; Called By : FIELD^WWWEVENT, VARIBLE^WWWEVENT
+	;
+	; Params:	pstrInput	- user input (ByRef)
+	;
+	; Returns:	storage value (+$h)
+	;
+	; History:
+	; 02-Jun-2010	GRF		SR17146: Revised to use common code in WWWDATE1
+	;-------------------------------------------------------------------------------
+	new dteInternal,strDelim,strFormat
+	
+	do GetDateFormat^COMUtilLocale(.strFormat,.strDelim,SPRACHE)
+	
+	do LitToStdLit^WWWDATE1(.pstrDate,SPRACHE)
+	set dteInternal = $$StdLitToInt^WWWDATE1(pstrDate,strFormat,strDelim)
+	
+	if dteInternal="" {
+		set %TXT(1)   = "§"_$$^WWWTEXT(272)    ; "Wrong Date Format"   (Alert & Focus)
+		set pstrDate = ""
+	} else {
+		set pstrDate = $$^WWWDATE(dteInternal)
+	}
+	quit dteInternal
+	
+	
+v2TranslateDate(&pstrInput)
+	;-------------------------------------------------------------------------------
+	; Date translation
+	; 
+	; Called By : FIELD^WWWEVENT, VARIBLE^WWWEVENT
+	;
+	; Params:	pstrInput	- user input (ByRef)
+	;
+	; Returns:	storage value (+$h)
+	;
+	; History:
+	; 02-Feb-2010	GRF		SR17146: MM/DD/YYYY was treating inputs as DD/MM/YYYY
+	; 08-May-2009	GRF		SR16522: revised; Handle YYYY*MM*DD & YYYYMMDD; doco
+	; 27-Aug-2008	heber	SRBR014945a: fixing date masking automatic
+	; 30-May-2008	heber	SRBR014945: added date masking to grid fields
+	; 19-Jan-2007	JW		SR15384: Encapsulated
+	;-------------------------------------------------------------------------------
+	new dteReturned,dteToday,intBaseLen,intDate,intToday,intYear
+	new strBaseDate,strDelim,strFormat,strToday,strType
+	
+	set dteReturned = ""
+	set dteToday    = +$horolog
+	set strToday    = $zdate(dteToday,3)   ; as YYYY-MM-DD
+	
+	;---------------------------------------
+	;  Part 1
+	;  
+	;  "."  "+n"  "-n"  "Wn"  "nW"
+	;  ","                (not standard in WWWDATE1)
+	;---------------------------------------
+	
+	if (pstrInput=".") || (pstrInput=",") {	                     ; today
+		set dteReturned = dteToday
+	
+	} elseif $extract(pstrInput)="-" {                           ; today - days
+		set dteReturned = dteToday - $extract(pstrInput,2,9)
+		
+	} elseif $extract(pstrInput)="+" {                           ; today + days
+		set dteReturned = dteToday + $extract(pstrInput,2,9)
+		
+	} elseif pstrInput?2A {                                      ; 2 char day of week (mo,tu,we,...,su) case insensitive
+		set intDate = $order(^WWW101s(0,1,$$$Index(pstrInput),"COMDAYSOFWEEKSHORT",SPRACHE,""))
+		if intDate'="" {
+			set intToday    = $$$DayOfWeek(dteToday)
+			set dteReturned = dteToday - intToday + intDate      ; +$h for corresponding day of *THIS* week Mon-Sun
+		}
+	
+	;---------------------------------------
+	;  Part 2
+	;  
+	;  Delimiter "*" used below can be ".-,;:\/"
+	;  though may not all be properly managed by WWWDATE1.
+	;  
+	;  Today is represented by DD MM and YYYY or CCYY
+	;          pstrInput                                 strBaseDate            pstrInput                 FELDFORMAT
+	;  Wn or Wn.yyyy => string date in FELDFORMAT format          intBaseLen
+	;     then processed as follows...
+	;  yyyyddmm                                           yyyyddmm  8       => yyyy-mm-dd                     any
+	;  yyyy*mm*dd                                         yyyyddmm  8              do                      YYYY*MM*DD
+	;  dd*mm*yyyy                                         ddmmyyyy  8              do                      DD*MM*YYYY
+	;  mm*dd*yyyy                                         mmddyyyy  8              do                      MM*DD*YYYY
+	;  d      or dd       (add current month and year)       dd     2       => YYYY-MM-dd                     any
+	;  ddmm   or dd*mm    (add current year)                ddmm    4       => YYYY-mm-dd                  DD*MM*YYYY
+	;  ddmmyy or dd*mm*yy (extend current year)            ddmmyy   6       => CCyy-mm-dd (-95/+5)         DD*MM*YYYY
+	;  mmdd   or mmdd     (add current year)     ?          mmdd    4       => YYYY-mm-dd           YYYY*MM*DD or MM*DD*YYYY
+	;  mmddyy or mm*dd*yy (extend current year)  ?         mmddyy   6       => CCyy-mm-dd (-95/+5)         MM*DD*YYYY
+	;  nnn...                                              nnn...  odd      => error (null in dteReturned)
+	;---------------------------------------
+	
+	} elseif (pstrInput'="") {    ; convert various forms to YYYY-MM-DD -  (no else)
+		do GetDateFormat^COMUtilLocale(.strFormat,.strDelim,SPRACHE)
+		set strType = $extract(strFormat,1)    ; D = DD*MM*YYYY, M = MM*DD*YYYY, Y = YYYY*MM*DD
+		
+		if $find(pstrInput,"W") || $find(pstrInput,"w") {	     ; week number  Wn or Wn.yyyy or Wn.yy or nW, etc.
+			set pstrInput = $$^WWWWEEK1(pstrInput)               ; returns monday of matching week
+		}
+		
+		set strBaseDate = $translate(pstrInput,"-.,;:\/ ")
+		set intBaseLen  = $length(strBaseDate)
+		
+		if $extract(strBaseDate)?1.8N {
+			if intBaseLen = 1 { 
+				set pstrInput = "0"_pstrInput 
+				set intBaseLen = 2	
+			}	
+			
+			if intBaseLen = 2 {                ; only DD
+				set pstrInput = $piece(strToday,"-",1,2)_"-"_pstrInput
+				
+			} elseif intBaseLen = 4 {          ; only DDMM or MMDD depending on strFormat (D or M/Y)
+				if strType = "D" {
+					set pstrInput = $piece(strToday,"-",1)_"-"_$extract(strBaseDate,3,4)_"-"_$extract(strBaseDate,1,2)
+					
+				} else {
+					set pstrInput = $piece(strToday,"-",1)_"-"_$extract(strBaseDate,1,2)_"-"_$extract(strBaseDate,3,4)
+				}
+				
+			} elseif intBaseLen = 6 {          ; DDMMYY or MMDDYY - needs century
+			    set intYear = $$GETYEAR^WWWDATE1($extract(strBaseDate,5,6))
+				if strType = "D" {
+					set pstrInput = intYear_"-"_$extract(strBaseDate,3,4)_"-"_$extract(strBaseDate,1,2)
+					
+				} elseif strType = "M" {
+					set pstrInput = intYear_"-"_$extract(strBaseDate,1,2)_"-"_$extract(strBaseDate,3,4)
+				
+				} else {
+					set pstrInput = ""         ; error situation
+				}
+			
+			} elseif intBaseLen = 8 {          ; DD*MM*YYYY or MM*DD*YYYY or YYYY*MM*DD or YYYYMMDD
+				
+				if pstrInput?8N  {             ; explicit YYYYMMDD regardless of strFormat
+					set pstrInput = $extract(strBaseDate,1,4)_"-"_$extract(strBaseDate,5,6)_"-"_$extract(strBaseDate,7,8)
+				
+				} elseif strType = "D" {
+					set pstrInput = $extract(strBaseDate,5,8)_"-"_$extract(strBaseDate,3,4)_"-"_$extract(strBaseDate,1,2)
+					
+				} elseif strType = "M" {
+		;			set pstrInput = $extract(strBaseDate,5,8)_"-"_$extract(strBaseDate,3,4)_"-"_$extract(strBaseDate,1,2)  ; SR17146
+					set pstrInput = $extract(strBaseDate,5,8)_"-"_$extract(strBaseDate,1,2)_"-"_$extract(strBaseDate,3,4)
+				
+				} else {
+					set pstrInput = $extract(strBaseDate,1,4)_"-"_$extract(strBaseDate,5,6)_"-"_$extract(strBaseDate,7,8)
+				}
+			
+			} else {                           ; odd number of digits
+				set pstrInput = ""             ; error situation
+			}
+		}               ; else case - dteReturned = ""
+		
+	;	pstrInput will now be either null or YYYY-MM-DD
+		set dteReturned = $zdateh(pstrInput,3,,,,,,,"")         ; return null if error
+	}                   ; else case - null input returns null dteReturned
+	
+	if dteReturned="" {
+		set %TXT(1)   = "§"_$$^WWWTEXT(272)    ; "Wrong Date Format"   (Alert & Focus)
+		set pstrInput = ""
+	} else {
+		set pstrInput = $$^WWWDATE(dteReturned)
+	}
+	quit dteReturned
+	
+	
+OldTranslateDate(&pstrInput)     ; DEPRECATED (v1)
+	;-------------------------------------------------------------------------------
+	; Date translation
+	; 
+	; Called By : WWWEVENT
+	;
+	; Params:	pstrInput	- user input
+	; 			pstrField	- field id
+	;
+	; Returns:	storage value
+	;
+	; History:
+	; 08-May-2009	GRF		SR16522: Deprecated
+	; 27-Aug-2008	heber	SRBR014945a: fixing date masking automatic
+	; 30-May-2008	heber	SRBR014945: added date masking to grid fields
+	; 19-Jan-2007	JW		SR15384: Encapsulated
+	;-------------------------------------------------------------------------------
+	new dte,dteToday,intDate,intToday,strOrig,strDelim
+	new intStrLen,strInput // SRBR014945
+	new pstrTest									//SRBR014945a	
+	
+	set dte = ""
+	set dteToday = +$horolog
+	
+	;---------------------------------------
+	;  Part 1
+	;  
+	;  Delimiter "*" used below can be ".-,;:\/"
+	;  though may not all be properly managed by WWWDATE1.
+	;  
+	;  Today is represented by DD MM and YYYY or CCYY
+	;                                                     strInput
+	;          pstrInput                                  strTest              pstrInput
+	;          
+	;  ccyyddmm    ccyy*mm*dd                             ccyyddmm  8       => YYYY-MM-cc => YYYY-yy-cc => ddmm-yy-cc
+	;  dd*mm*yyyy                                         ddmmyyyy  8       => YYYY-MM-dd => YYYY-mm-dd => yyyy-mm-dd
+	;  mm*dd*yyyy                                         mmddyyyy  8       => YYYY-MM-mm => YYYY-dd-mm => yyyy-dd-mm
+	;  d      or dd       (add current month and year)       dd     2       => YYYY-MM-dd
+	;  ddmm   or dd*mm    (add current year)                ddmm    4       => YYYY-MM-dd => YYYY-mm-dd
+	;  ddmmyy or dd*mm*yy (extend current year)            ddmmyy   6       => CCYY-MM-dd => YYYY-mm-dd => CCyy-mm-dd
+	;  mmdd   or mmdd     (add current year)     ?          mmdd    4       => YYYY-MM-mm => YYYY-dd-mm
+	;  mmddyy or mm*dd*yy (extend current year)  ?         mmddyy   6       => CCYY-MM-mm => YYYY-dd-mm => CCyy-dd-mm
+	;  nnn
+	;  nnnnn                                             nnnnn...  odd => error (null in dte)?
+	;  nnnnnnn
+	;  nnnnnnnnn ...
+	;  
+	;  Part 2
+	;  
+	;  "."  "+n"  "-n"  "Wn"  "nW"
+	;  ","                (not a standard option in WWWDATE1)
+	;---------------------------------------
+	
+	if $extract(pstrInput)?1N {		// First char is a number. Get display then internal.
+		set pstrInput = $translate(pstrInput,"-,;:\/","......")
+ 
+		set pstrTest = $translate(pstrInput,".","")		//SRBR014945a
+		; only numeric fields accepted
+		if (pstrTest?.N) {								//SRBR014945a
+			if +$piece(pstrInput,".",2)=0 {		// Day Only
+				; SRBR014945 ---vvvvv
+				; 
+				;set pstrInput = $$$DateYearMonth(dteToday)_"-"_pstrInput		// Add the year and month
+				;set dte = $zdateh(pstrInput,3,,,,,,,"")							// Set to "" if error
+				
+				set pstrInput = pstrTest	//SRBR014945a
+				
+				set intStrLen = $length(pstrInput)
+				
+				//SRBR014945a
+				if intStrLen = 1 { 
+					set pstrInput = "0" _ pstrInput 
+					set intStrLen = $length(pstrInput)	
+				}	
+				//^^^^SRBR014945a
+				
+				set strInput = pstrInput
+				if ((intStrLen = 2)||(intStrLen = 4)||(intStrLen = 6)||(intStrLen = 8)) {	//SRBR014945a
+				;if (intStrLen = 2)||(intStrLen = 4)||(intStrLen = 8)	//SRBR014945a
+					set pstrInput = $$$DateYearMonth(dteToday)_"-"_$extract(strInput,1,2)		// Add the year and month
+				}
+				if (intStrLen = 4)||(intStrLen = 6)||(intStrLen = 8) { //SRBR014945a
+				;if (intStrLen = 4)||(intStrLen = 8) {	//SRBR014945a
+					set $piece(pstrInput,"-",2) = $extract(strInput,3,4)
+				}
+				//SRBR014945a
+				if (intStrLen = 6) {
+					set $piece(pstrInput,"-",1) = $extract($piece($$$DateYear(dteToday),"-",1),1,2) _ $extract(strInput,5,6)
+				}
+				//^^^^SRBR014945a			
+				if (intStrLen = 8) {
+					set $piece(pstrInput,"-",1) = $extract(strInput,5,8)
+				}
+				set dte = $zdateh(pstrInput,3,,,,,,,"")							// Set to "" if error
+				; ---^^^^^			
+			} else {					// Have month. Translate delimiter and may add year.
+				set strDelim = $extract($$SystemDateFormat^WWWDATE(),3)
+				if strDelim'="." set pstrInput = $translate(pstrInput,".",strDelim)
+				if $piece(pstrInput,strDelim,3)="" set $piece(pstrInput,strDelim,3) = $$$DateYear(dteToday)
+				set dte = $$^WWWDATE1(pstrInput)
+			}
+		}	//SRBR014945a
+	
+	} else {		// For all others, get internal then display
+		if (pstrInput=".") || (pstrInput=",") {					// TODAY
+			set dte = dteToday
+		
+		} elseif $extract(pstrInput)="-" {					
+			set dte = dteToday - $extract(pstrInput,2,9)		// today - days
+			
+		} elseif $extract(pstrInput)="+" {
+			set dte = dteToday + $extract(pstrInput,2,9)		// today + days
+			
+		} else {		// First char is not number, lookup alpha
+			set intDate = $order(^WWW101s(0,1,$$$Index(pstrInput),"COMDAYSOFWEEKSHORT",SPRACHE,""))
+			if intDate'="" {
+				set intToday = $$$DayOfWeek(dteToday)			// Today
+				set dte = dteToday - intToday + intDate
+			}
+		}
+	}
+	
+	if dte="" {
+		set %TXT(1) = "§"_$$^WWWTEXT(272)   		;Wrong date Format
+		set pstrInput = ""
+	} else {
+		set pstrInput = $$^WWWDATE(dte)
+	}
+	quit dte
+	
+	
+CustPattern(YINHALT,pstrPattern)
+	;-------------------------------------------------------------------------------
+	; Customised pattern match
+	;
+	; Params:	YINHALT		- input
+	; 			pobjCust	- customised record. 
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Apr-2007	JW&HB	BR014420: Simplified
+	; 31-Jan-2007	JW		SR15384: Encapsulated
+	;-------------------------------------------------------------------------------
+	if (YINHALT?@pstrPattern=0) {
+		set %TXT(1) = $$$Confirm_$$^WWWTEXT(276,,1)		; "Wrong Input Format"
+	}
+	quit
+	
+	/*
+	
+	quit:$TRANSLATE(YINHALT," ")=""
+	
+	set strPattern = $$$WWW122DPatternMatch(pobjCust)		// Same for WWW121 and WWW122
+	
+	quit:(strPattern="")
+	quit:($$$StripNum(YINHALT)=$$$StripNum(strPattern))
+	quit:$TRANSLATE($$$UPPER(YINHALT),"1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZÖÄÜß{}")=$TRANSLATE($$^WWWUMLAU(strPattern),"1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZÖÄÜß{}")
+	
+	SET PATTERN1=""
+	SET I(2)=""
+	FOR loop=1:1 {
+		SET I(1)=$EXTRACT(strPattern,loop)
+		QUIT:I(1)=""
+		
+		IF I(1)="X" {
+			SET I(2)=I(2)+1
+			SET I(1)=$EXTRACT(YINHALT,I(2))   ;ALPHA
+		} elseIF I(1)="9" {
+			SET I(2)=I(2)+1
+			SET I(1)=+$EXTRACT(YINHALT,I(2))  ;NUMERIC
+		}
+		SET PATTERN1=PATTERN1_I(1)
+	}
+	
+	if YART'="P" {		// Is this apt ?
+		IF $FIND(PATTERN1,"{YBED}") SET PATTERN1=$$^WWWTRANSLATE(PATTERN1,"{YBED}",$GET(YBED))
+		IF $FIND(PATTERN1,"{YLOCATION}") SET PATTERN1=$$^WWWTRANSLATE(PATTERN1,"{YLOCATION}",$GET(YLOCATION))
+		IF $FIND(PATTERN1,"{YM}") SET PATTERN1=$$^WWWTRANSLATE(PATTERN1,"{YM}",$GET(YM))
+	}
+	IF PATTERN1'="" SET YINHALT=PATTERN1   ;TYBD;PATTERNMATCH;5,8,2004;25514;
+	
+	quit
+	*/
+	
+	
+CustomWarnings(&YXTEXT,YINHALT,pobjCustFld)
+	;-------------------------------------------------------------------------------
+	; Sondertext hinweis  ;Special Text 
+	; wenn syntax: ;when 
+	;     IF: 1 TEXT WENN INHALT=1 ;Text when 
+	;     IF: '1 TEXT WENN INHALT NICHT 1 ;Text when purport Not 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 20-Mar-2007	JW		SR15384: Encapsulated
+	;-------------------------------------------------------------------------------
+	
+	IF YINHALT'="" && (pobjCustFld'="") {
+		SET YXTEXT=$$$WWW122DIndividualWarnings(pobjCustFld)
+		
+		IF $EXTRACT(YXTEXT,1,7)="IF NOT:" SET YXTEXT="IF:'"_$EXTRACT(YXTEXT,8,999)  ;FIS;24141;11.08.03
+		IF $EXTRACT(YXTEXT,1,3)="IF:" {  ;nur wenn eintrag dann anzeige ;solely when
+			SET YXTEXT(1)=YXTEXT
+			SET YXTEXT=""
+			
+			FOR YXTEXT(2)=2:1 {
+				QUIT:$PIECE(YXTEXT(1),"IF:",YXTEXT(2))=""
+				SET YXTEXT(3)=$PIECE(YXTEXT(1),"IF:",YXTEXT(2))
+				
+				IF $EXTRACT(YXTEXT(3))=" " SET YXTEXT(3)=$EXTRACT(YXTEXT(3),2,999)
+				IF $EXTRACT(YXTEXT(3))'="'" IF YINHALT=$PIECE(YXTEXT(3)," ",1)                  SET YXTEXT=$PIECE(YXTEXT(3)," ",2,999) QUIT
+				IF $EXTRACT(YXTEXT(3))="'"  IF YINHALT'=$EXTRACT($PIECE(YXTEXT(3)," ",1),2,999) SET YXTEXT=$PIECE(YXTEXT(3)," ",2,999) QUIT
+			}
+			SET YXTEXT=$$^WWWTRANSLATE(YXTEXT,"|","'")  ;Is this appropriate here?
+		}
+	}
+	quit
+	
+	
+InputOk(YINHALT,YSATZ,YVOR)
+	;-------------------------------------------------------------------------------
+	; Check whether the input is valid
+	;
+	;
+	; 	FIXME :  Need to update YSATZ before passing it to this routine.
+	; 	         e.g. $$$Get^WWW122 for WWW122/WWW122D
+	; 	         Doesn't happen for WWW121/WWW121D but does for WWW122/WWW122D.
+	; 	         
+	; 	           
+	; 	NOTE : This is called to validate both ***KEYS*** and ***DATA***.
+	; 	  (i.e. WWW121 and WWW122 - thus common checks need to be in the same piece)
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Jun-2008	GRF		BR014945: new variable for code check
+	; 20-Mar-2007	JW		SR15384: Encapsulated
+	;-------------------------------------------------------------------------------
+	new blnMandatory,intChar,intMin,strAllow,strBlockChars,strMsg,strPattern,strTestChar
+	
+	set strMsg=""
+	
+	set blnMandatory = $$$WWW122MandatoryInputItem(YSATZ)
+	if blnMandatory && $$$WWW120CheckForMandatoryFields(YVOR) && (YART'="P") {
+		
+		// TODO - Why remove spaces before checking blank ?
+		if $translate(YINHALT," ")="" {
+			set strMsg = $$^WWWTEXT(267,,1)			; "Mandatory Field"
+		}
+	}
+	
+	if strMsg="" {
+		set strPattern = $$$WWW122PatternMatch(YSATZ)
+		if strPattern'="" {
+			if YINHALT?@strPattern=0 {
+				set strMsg = $$^WWWTEXT(276,,1)		; "Wrong Input Format"
+			}
+		}
+	}
+	
+	if strMsg="" {
+		set strAllow = $$$WWW122OnlyAllowChars(YSATZ)
+		if strAllow'="" {
+			for intChar=1:1:$length(YINHALT) {
+				if '$find(strAllow,$extract(YINHALT,intChar)) {
+					set strMsg = $$^WWWTEXT(269,,1)_" "_$piece(YSATZ,Y,17)
+					quit
+				} ; "Only Following Characters Allowed"
+			}
+		}
+	}
+	
+	if strMsg="" && (YINHALT'="") {	              ; SR12505
+		set strBlockChars = $$$WWW122DontAllowChars(YSATZ)
+		for intChar=1:1:$length(strBlockChars) {
+			set strTestChar = $extract(strBlockChars,intChar)
+			continue:strTestChar=" "
+			
+			if YINHALT[strTestChar {
+				set strMsg = $$^WWWTEXT(287,,1)_" "_strBlockChars
+				quit
+			} ; "The following characters are not allowed"
+		}
+	}
+	
+	if strMsg="" {
+		if (blnMandatory || (YINHALT'="")) {				// Don't check if mandatory and null
+			set intMin = $$$WWW122MinInputLength(YSATZ)
+			if (intMin'="") && ($length(YINHALT)<intMin) {
+				set strMsg = $$^WWWTEXT(268,,1)_" "_+intMin		; "Min. Input Length"
+			}
+		}
+	}
+	set:strMsg'="" %TXT(1) = $$$Confirm_strMsg
+	quit
+	
+	
+DateOk(&YINHALT,&pdte,pstrCheck)
+	;-------------------------------------------------------------------------------
+	; Date Validation against specification
+	; 
+	; Called By : FIELD^WWWEVENT
+	; 
+	; Params:
+	; 	YINHALT				Current value
+	; 	pdte	  (ByRef)	$$TranslateDate^WWWFieldRules(YINHALT) - May be reset to today
+	; 	pstrCheck			Date match specification string (from $$$WWW122ExecuteOnBlur for date field)
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Jun-2008	GRF		BR014945: new variable for code check
+	; 26-Mar-2007	JW		SR15384: Encapsulated
+	;-------------------------------------------------------------------------------
+	new dteToday,strMsg
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	; 				Assuming $h = 60040
+	;	
+	;			Compare		----------------------  pdte  -----------------------
+	;pstrCheck	 with		60000		60025		60040		60045		60100
+	;	-30		60010		 OK		:	  x			  x			  x			  x		Before a set date	Check
+	;	-		60040		 OK			 OK			 OK	:		  x			  x		Any Past Date		Error
+	;	.		60040		  x			  x		   : OK	:		  x			  x		Only Today			Force to Today
+	;	+		60040		  x			  x		   : OK			 OK			 OK		Any Future Date		Error
+	;	+30		60070		  x			  x			  x			  x		:	 OK		After a set date	Check
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set strMsg = ""
+	
+	if YINHALT'="" {
+		set dteToday = +$horolog
+		
+		// Past dates only
+		if $extract(pstrCheck)="-" {
+			if +$extract(pstrCheck,2,9)'=0 {
+				if pdte > (dteToday-$extract(pstrCheck,2,9)) {
+					set strMsg = $$$Confirm_$$^WWWTEXT(294,,1)_" ("_YINHALT_")"	; Is The Date Correct?
+				}
+			} elseif pdte > dteToday {
+				set strMsg = $$$AlertAndFocus_$$^WWWTEXT(271,,1)		; "Wrong Date"
+				set YINHALT=""
+			}
+			
+		// Future dates only
+		} elseif $extract(pstrCheck)="+" {
+			if +$extract(pstrCheck,2,9)'=0 {
+				if pdte < (dteToday+$extract(pstrCheck,2,9)) {
+					set strMsg = $$$Confirm_$$^WWWTEXT(294,,1)_" ("_YINHALT_")"	; Is The Date Correct?
+				}
+			} elseif pdte < dteToday {
+				set strMsg = $$$AlertAndFocus_$$^WWWTEXT(271,,1)		; "Wrong Date"
+				set YINHALT=""
+			}
+			
+		// Only today
+		} elseif (pstrCheck=".") || (pstrCheck=",") {
+			if pdte'=dteToday {
+				set pdte = dteToday
+				set YINHALT = $$^WWWDATE(dteToday)
+			}
+		}
+	}
+	set:strMsg'="" %TXT(1) = strMsg
+	quit
+	
+	
+ReadWrite(YINHALTX,YSATZ,YEART,YART)
+	;-------------------------------------------------------------------------------
+	; FREIE FELDER AUF READONLY SETZEN  ;FREE FIELDS ON READONLY SETTING 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 17-Apr-2014	shobby	SESDF-1363: Corrected problem with getting input type.
+	; 06-Jan-2011	GRF		SR17579: Use explicit tag
+	; 31-Jan-2007	JW		SR15384: Encapsulated
+	;-------------------------------------------------------------------------------
+	NEW HIDDENF,TRIGGER,YLFN1,TRIGGERN,TRIGGER1,DISPLAY,OPERA,YTYP1,blnTrigger
+	
+	IF YEART=2 {											// Is this necessary ??
+		IF YINHALTX=-1 SET YINHALTX=1  ;CHECKBOX AN ;upon
+		IF YINHALTX=0 SET YINHALTX=""  ;CHECKBOX AUS ;out of 
+	}
+	
+	SET HIDDENF=$TRANSLATE($$$WWW122READOnlyFieldsWithFieldEn(YSATZ),";",",")	// Why translate ?
+	if HIDDENF'="" {
+		
+		// Does this really make sense?
+		// We loop through each trigger, setting the fields EACH time
+		// That means, for each trigger, we update every field...
+		// Surely we should update the fields ONCE ?
+		// 
+		// And then we do the WRITE ones below. How can this work?
+		
+		SET TRIGGER1=$TRANSLATE($$$WWW122ReadOnlyTriggers(YSATZ),";",",")
+ 		
+		FOR TRIGGERN=1:1 {
+			SET TRIGGER=$PIECE(TRIGGER1,",",TRIGGERN)		;ALLE TRIGGER AUSWERTEN
+			
+			set blnTrigger = $$TriggerCheck(TRIGGER,YINHALTX,YEART)
+			set DISPLAY = $select(blnTrigger:"READ",1:"WRITE")
+			
+			FOR HIDDENF(1)=1:1 {
+				SET HIDDENF(2)=$PIECE(HIDDENF,",",HIDDENF(1))
+				QUIT:HIDDENF(2)=""
+				
+				SET YLFN1=$$$WWW122SequenceNumber($GET(^WWW122(0,YFORM,HIDDENF(2),1)))  ;datenfeld 
+				IF YLFN1="" SET YLFN1=HIDDENF(2)
+				
+				SET %TXT(1)=%TXT(1)_"#Y"_YFORM_YART_YLFN1_"~"_DISPLAY
+				
+				// What is the following block of code actually doing?
+				// For starters YART is incorrectly used, as it refers to the event field, not the field to update (HIDDENF)
+				// YTYP1 maybe incorrect - and it should also call GetInputType^WWWField.
+				
+				;SESDF-1363 SET YTYP1=""
+				;SESDF-1363 IF YART="D" SET YTYP1=$PIECE($GET(^WWW003(0,YDATEI,YLFN1,1)),Y,3)  ;FIS;01.09.04
+				;SESDF-1363 IF YART="M" SET YTYP1=$PIECE($GET(^WWW122(0,YFORM,YLFN1,1)),Y,5)   ;FIS;01.09.04
+				
+				set YTYP1=$$$WWW122InputType($$Get^WWW122(YFORM,HIDDENF(2))) ;SESDF-1363 
+				if blnTrigger {
+					IF YART="D" IF YTYP1'="" SET %TXT(1)=%TXT(1)_"#Y"_YFORM_YART_YLFN1_"~"_$$GetLiteral^WWWTR(YTYP1,$PIECE($GET(^WWWDATEN(YM,+$HOROLOG,YUSER,YFORM,YART,1)),Y,YLFN1))  ;FELDINHALT BEIBEHALTEN;FIS;09.08.04;26180  ;FIS;01.09.04
+					IF YART="D" IF YTYP1=""  SET %TXT(1)=%TXT(1)_"#Y"_YFORM_YART_YLFN1_"~"_$PIECE($GET(^WWWDATEN(YM,+$HOROLOG,YUSER,YFORM,YART,1)),Y,YLFN1)  ;FELDINHALT BEIBEHALTEN;FIS;09.08.04;26180
+					IF YART="M" SET $PIECE(^WWWDATEN(YM,+$HOROLOG,YUSER,YFORM,YART,1),Y,YLFN1)=""  ;FELDINHALT LÖSCHEN;FIS;09.08.04;26180  ;FIS;19.08.04;26300;NUR WENN READONLY
+				}
+			}
+			QUIT:$PIECE(TRIGGER1,",",TRIGGERN+1)=""
+		}
+	}
+	
+	; YEART = Field Type (Sys Parameter FELDTYP).
+	
+	;READONLY FELDER FREIGEBEN  ;READONLY FIELDS RELEASING 
+	
+	set HIDDENF=$translate($$$WWW122WriteFieldsWithFieldEntry(YSATZ),";",",")
+	if HIDDENF'="" {
+		set TRIGGER1=$translate($$$WWW122WriteTrigger(YSATZ),";",",")
+	
+		for TRIGGERN=1:1 {
+			set TRIGGER=$piece(TRIGGER1,",",TRIGGERN)
+			
+			set blnTrigger = $$TriggerCheck(TRIGGER,YINHALTX,YEART)
+			set DISPLAY = $select(blnTrigger:"WRITE",1:"READ")		// Inverse of above
+			
+			for HIDDENF(1)=1:1 {
+				set HIDDENF(2)=$piece(HIDDENF,",",HIDDENF(1))
+				quit:HIDDENF(2)=""
+				
+				set YLFN1=$piece($get(^WWW122(0,YFORM,HIDDENF(2),1)),Y,1)  ;datenfeld 
+				if YLFN1="" set YLFN1=HIDDENF(2)
+				set %TXT(1)=%TXT(1)_"#Y"_YFORM_YART_YLFN1_"~"_DISPLAY
+			}
+			quit:$piece(TRIGGER1,",",TRIGGERN+1)=""  ;ALLE TRIGGER AUSWERTEN
+		}
+		
+		// English hard coded ?
+		// Should this be an else/if to the above block ?
+		// Why only for write, not read ?
+		// %TXT(1) is overwritten ?
+		// YART is incorrect, as above
+		
+		if $find(TRIGGER1,"***") && (YINHALTX'="") {
+			
+			if '$data(^WWWCODE(YM,YINHALTX,1)) {
+				set %TXT(1)="!Wrong Code!"
+			} elseif $$$WWWCODEUsed($GET(^WWWCODE(YM,YINHALTX,1))) {
+				set %TXT(1)="!Code Used!"
+			} else {
+				set $$$WWWCODEUsed(^WWWCODE(YM,YINHALTX,1))=$$$YES
+				set %TXT(1)=""
+				for HIDDENF(1)=1:1 {
+					set HIDDENF(2)=$piece(HIDDENF,",",HIDDENF(1))
+					quit:HIDDENF(2)=""
+					set YLFN1=$piece($get(^WWW122(0,YFORM,HIDDENF(2),1)),Y,1)  ;datenfeld 
+					if YLFN1="" set YLFN1=HIDDENF(2)
+					set %TXT(1)=%TXT(1)_"#Y"_YFORM_YART_YLFN1_"~WRITE"
+				}
+			}
+		}
+	}
+	quit
+	
+	
+TriggerCheck(TRIGGER,YINHALTX,YEART)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 06-Jan-2011	GRF		SR17579: Use explicit tag
+	; 31-Jan-2007	JW		SR15384: Encapsulated.
+	;-------------------------------------------------------------------------------
+	new OPERA
+	
+	set OPERA = $zstrip(TRIGGER,"*E","","'<>=")		; Keep only '<>=
+	
+	// The following code should be optimised, and verified.
+	// Functionality doesn't seem correct. (eg. entering ' as a trigger)
+	
+	IF TRIGGER=""  IF YINHALTX'="" quit $$$YES  ;READONLY BEI FELDEINTRAG ;next to 
+	IF TRIGGER="'" IF YINHALTX=""  quit $$$YES  ;READONLY WENN KEIN FELDEINTRAG ;when no 
+	IF (OPERA="") || (OPERA="=") IF TRIGGER'="" IF YINHALTX=$TRANSLATE(TRIGGER,"=") quit $$$YES  ;READONLY BEI BESTIMMTEM EINTRAG ;next to 
+	IF (OPERA="") || (OPERA="=") IF TRIGGER'="" IF $$GetLiteral^WWWTR(YEART,YINHALTX)=$$GetLiteral^WWWTR(YEART,$TRANSLATE(TRIGGER,"=")) quit $$$YES  ;FIS;02.08.07;26180;ANZEIGEFORMAT VERGLEICHEN (Z.B. BEI WÄHRUNGEN)
+	IF OPERA="'"  IF $EXTRACT(TRIGGER,2,999)'="" IF YINHALTX'=$EXTRACT(TRIGGER,2,999) quit $$$YES  ;READONLY WENN NICHT BESTIMMTER FELDEINTRAG ;when Not 
+	IF OPERA="'=" IF $EXTRACT(TRIGGER,3,999)'="" IF YINHALTX'=$EXTRACT(TRIGGER,3,999) quit $$$YES  ;READONLY WENN NICHT BESTIMMTER FELDEINTRAG ;when Not 
+	IF OPERA="<"  IF $EXTRACT(TRIGGER,2,999)'="" IF YINHALTX<$EXTRACT(TRIGGER,2,999)  quit $$$YES  ;READONLY WENN KLEINER VORGABE ;when lesser default 
+	IF OPERA=">"  IF $EXTRACT(TRIGGER,2,999)'="" IF YINHALTX>$EXTRACT(TRIGGER,2,999)  quit $$$YES  ;READONLY WENN GROESSER VORGABE ;when default 
+	IF OPERA="'<" IF $EXTRACT(TRIGGER,3,999)'="" IF YINHALTX'<$EXTRACT(TRIGGER,3,999) quit $$$YES  ;READONLY WENN GROESSER/GLEICH VORGABE ;when default 
+	IF OPERA="'>" IF $EXTRACT(TRIGGER,3,999)'="" IF YINHALTX'>$EXTRACT(TRIGGER,3,999) quit $$$YES  ;READONLY WENN KLEINER/GLEICH VORGABE ;when default 
+	
+	quit $$$NO	// early quits above
+	
+]]></Routine>
+</Export>

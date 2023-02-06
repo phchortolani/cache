@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="VARManipulacaoMagistralTable" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+VARManipulacaoMagistralTable
+	
+#include COMSYS
+#include INConst
+#include VARConst
+#include %occInclude
+	
+#define DELIM	$char(31)
+
+	;Comment to force recompile	
+ShowItems(pidEvent,pidParameters)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Inputs : 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Oct-2013	shobby		HEVA-1148 Created
+	;-------------------------------------------------------------------------------
+	new idGrid,idItem,lstColTypes,lstHeaders,idKey,idLine,idRec
+	new objItem,objItemPolicy,objLocn,objRec,objRecLine,strFunction,strStatus
+	
+	set strStatus = $$$OK
+	set idGrid    = $$$DYNTABLEGridLineFocusGrid(pidParameters)            
+	
+	kill ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle")
+ 
+	set idKey  = $$ReferenceKey^COMGridEdit31Interface(idGrid,$$$DYNTABLEGridLineFocusRow(pidParameters))
+	set idRec  = $$$KEY1(idKey)
+	set idLine = $$$KEY2(idKey)
+
+ 	set ^CacheTempSCR($i(^CacheTempSCR))="DG Start "_idKey
+	quit:$$$NoKey(idRec)	
+	
+	if '$$Editable^VARManipulacaoMagistral(idRec) quit                       ; *** EARLY EXIT ***
+	
+	;---------------------------------------
+	
+	set objRec     = $$$GRIDYFELDContainer
+	set objRecLine = $$$GRIDGetYFELD(idLine)
+	set strStatus  = $$GetLock^WWWMultiLock("VARManipulacaoMagistral",idGrid,idRec_$$$COMMA_idLine)
+  
+	//setup JS Callback
+	set objLocn = ##class(alLOC.dLocation).%OpenId($$$VARManipulacaoMagistralProductionLocation(objRec))
+	set idItem  = $$$VARManipulacaoMagistralLineItem(objRecLine)
+	set objItem = ##class(alINV.dItem).%OpenId(idItem,0)
+		
+	if objItem '= $$$NULLOREF {
+		set objItemPolicy = objItem.ItemPolicy
+	
+		if objItemPolicy = $$$NULLOREF {     
+			set strStatus = $$$MakeStatus("alINV0100",idItem) ; "Can not access Item Policy for item : %1"
+			do DrawTable^WWW120DynTable($listbuild($$$Text(strStatus)),"dStockBundle",$listbuild($listbuild("left","display")),
+			                            pidParameters,"",pidEvent)
+		}                                      
+		
+		; Build Table below Dispense To Patient (Issue) grid lines (allows selection)
+		;-----------------------------------   e.g.
+		;  Stock Bundle              Storage         Lot Number
+		;  ABC00123||5||A||2||86     A               1234567
+		
+		if $$$ISOK(strStatus) {      
+			set strFunction = "FillLine"
+			set strStatus   = $$BuildDynTableHeader(objItemPolicy,.lstHeaders,.lstColTypes,objLocn.Code)
+			do BuildDynTableRows(objItem.%Id(),objLocn.Code)
+		
+		; setup JS Callback
+			if $$$ISERR(strStatus) {
+				write "function "_strFunction_"() {"
+				write "alert('"_$$$JSText($$$Text(strStatus))_"');"
+				write "}"
+			} else {
+				write "function "_strFunction_"() {"
+				write "CallBack(""SelectBundle^VARManipulacaoMagistralTable"", getRowNum(getFocusField()), this.DiscData[0], this.DiscData[1]);"
+				write "}"
+			}
+ 
+			//SR16599
+			//The last parameter (after pidEvent) needs to be set for the RowClick event, will be used by RowClick^WWW120DynTable
+			//	e.g. "WarehouseLine^INReqTable"
+			//	will be called with the following parameters
+			//	1. Row ID
+			//	2. Each entry in ^CacheTempDynamicTable(...,data) seperated by "~" will be a new parameter
+			//			in this routines case : do WarehouseLine^INReqTable(pidRow,idLocn) will be executed on Row click
+			do DrawTable^WWW120DynTable(lstHeaders,"dStockBundle",lstColTypes,pidParameters,strFunction,pidEvent,"SelectBundle^VARManipulacaoMagistralTable")
+		}
+	
+	} else {         ; Clear table	; "No Item Selected"    SR17566
+		do DrawTable^WWW120DynTable($listbuild($$$Text("IN01142")),
+		                            "dStockBundle",
+		                            $listbuild($listbuild("left","display")),
+		                            pidParameters,
+		                            "",
+		                            pidEvent)
+	}
+	quit
+	
+	
+SelectBundle(pidRow,pidBundleStock,pidItem)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Inputs : 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 21-Oct-2013	shobby		HEVA-1148.14: Corrected a problem loading Brand and Bundle
+	; 14-Oct-2013	shobby		HEVA-1148 Created
+	;-------------------------------------------------------------------------------
+	new blnLotNo,blnUseByDate,blnLotUnique,idItem,idStore
+	new intBrand,intOwner,intProgram,objRec,objBundle,objBundleStock,sc
+	new strBundle
+	
+	set sc = $$$OK
+	
+	set objRec   = $$$GRIDYFELDContainer
+	set LOCATION = $$$VARManipulacaoMagistralProductionLocation(objRec)
+	;---------------------------------------
+	; WARNING : "LOCATION" is required for relationship check
+	;           ReferenceKey^COMGridEdit31Interface in SetRecord^COMGridEdit31S1
+	;---------------------------------------
+	
+	set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(pidBundleStock,0,.sc)
+	if $$$ISOK(sc) {
+		set idStore   = objBundleStock.Storage.Code
+		set objBundle = objBundleStock.Bundle
+		do SetRecord^COMGridEdit31S1("VARManipulacaoMagistralLine",pidRow,$$$FldVARManipulacaoMagistralLineStockLocation_$$$COMMA_idStore)
+
+		do GetAttributes^INItemPolicyUtils(pidItem,.blnLotNo,.blnUseByDate,.blnLotUnique,.intBrand,.intOwner,.intProgram,LOCATION)
+		set strBundle=""
+		if blnLotNo {
+			if strBundle'="" set strBundle=strBundle_" | "
+			set strBundle=strBundle_"Lote:"_objBundle.LotNumber
+			do SetRecord^COMGridEdit31S1("VARManipulacaoMagistralLine",pidRow,$$$FldVARManipulacaoMagistralLineLotNumber_$$$COMMA_objBundle.LotNumber)
+		}
+		if blnUseByDate {
+			if strBundle'="" set strBundle=strBundle_" | "
+			set strBundle=strBundle_"Validade:"_objBundle.UseByDate
+			do SetRecord^COMGridEdit31S1("VARManipulacaoMagistralLine",pidRow,$$$FldVARManipulacaoMagistralLineExpirationDate_$$$COMMA_objBundle.UseByDate)
+		}
+		if (intBrand=1) || (intBrand=3) {
+			if strBundle'="" set strBundle=strBundle_" | "
+			set strBundle=strBundle_"Marca:"_objBundle.Brand
+			do SetRecord^COMGridEdit31S1("VARManipulacaoMagistralLine",pidRow,$$$FldVARManipulacaoMagistralLineBrand_$$$COMMA_objBundle.Brand) ;HEVA-1148.14 
+		}
+
+		;HEVA-1148.14 do SetRecord^COMGridEdit31S1("VARManipulacaoMagistralLine",pidRow,$$$FldVARManipulacaoMagistralLineBundle_$$$COMMA_strBundle)
+		do SetRecord^COMGridEdit31S1("VARManipulacaoMagistralLine",pidRow,$$$FldVARManipulacaoMagistralLineBundle_$$$COMMA_objBundle.%Id()) ;HEVA-1148.14 
+	}
+	quit
+	
+	
+BuildDynTableHeader(pobjItemPolicy,&plstHeaders,&plstColTypes,pidLoc)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Inputs : 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Oct-2013	shobby		HEVA-1148 Created
+	;-------------------------------------------------------------------------------
+	new arrAttrib,idAttrKey,sc,strAttrName
+	
+	//---------------------------------------  1 
+	set plstHeaders  = $listbuild($$$Text("alISS0003"))              ; "Storage"
+	set plstColTypes = $listbuild($listbuild("left","link"))
+	
+	//---------------------------------------  2
+	do DynaHeadings^INBundleUtils(pobjItemPolicy,pidLoc,.plstHeaders,.plstColTypes)
+	
+	//---------------------------------------  3     Append QOH Header
+	set plstHeaders  = plstHeaders_$listbuild($$$Text("alISS0005"))  ; "QtyOnHand"
+ 	set plstColTypes = plstColTypes_$listbuild($listbuild("right","link"))
+ 	
+	quit $$$OK
+	
+	
+BuildDynTableRows(pidItem,pidLocn)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Inputs : 
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 21-Oct-2013	shobby		HEVA-1148.15: obtain list of batches from SourceStock (same as INTFR)
+	; 14-Oct-2013	shobby		HEVA-1148 Created
+	;-------------------------------------------------------------------------------
+	new arrAttrib,arrBundleStock,dteVal,fltQtyAvailable
+	new idBundleStock,idLine,idKey,idPolicyAttr,intCol
+	new objAttr,objBundleStock,objINIssueLine,objItem,objLocn,objItemPolicy
+	new objPolicyAttr,objResultSet,objStore,sc,strAttrValues
+	new intExpiredCol
+	
+	set objItem  = ##class(alINV.iUINV).GetItem(pidItem)
+	set objLocn  = ##class(alLOC.iULOC).GetLocation(pidLocn)
+	
+	if (objItem '= $$$NULLOREF) && (objLocn '= $$$NULLOREF) {
+		kill ^CacheTempDynamicTable(YUCI,YUSER,"dBundleStock")
+		set objItemPolicy = objItem.ItemPolicy
+				
+		//Retrieve Records
+		set objResultSet = ##class(alDRP.iDRP).SourceStock(objItem,objLocn,"")   //HEVA-1148.15
+		for idLine=1:1:objResultSet.Count() {
+			set objBundleStock = objResultSet.GetAt(idLine)
+			if 1 {				
+			//	continue:objBundleStock.Storage.StorageIsBlocked     //SR17169 - Ignore blocked Storages				
+				if ((+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) 
+					&& '(+$$$WWWClientParamCoreChangesTCI($get(^WWWClientParam(YM,YM,1))))){
+					continue:objBundleStock.Storage.StorageIsBlocked     //SR17169 - Ignore blocked Storages
+				}
+				set fltQtyAvailable = objBundleStock.QtyOnHand-##class(alSOH.iSOHBalance).GetQtyPlanned(objBundleStock.Item.%Id(),objBundleStock.Storage.Location.%Id(),objBundleStock.Storage.%Id(),objBundleStock.Bundle.%Id())
+			//	continue:(fltQtyAvailable<=0)
+				
+				set ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idLine,"data") = objBundleStock.%Id()_Y_pidItem
+			
+			;-------------------------------  1
+	;SR17541.2	set strAttrValues = objBundleStock.Storage.Code_Y
+				if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+					if (YLOCATION = $$getFarmaciaAcoesJudiciais^VARParametroCliente(0)){
+						set strAttrValues = "("_objBundleStock.Storage.CodeWithTSUGet()_") "_$$SQLGetPatientName^VARSQL(objBundleStock.Storage.CodeWithTSUGet())_Y	;SR17541  ;UFH-11.16
+					}else{
+						set strAttrValues = objBundleStock.Storage.CodeWithTSUGet()_Y  ;UFH-11 
+					}
+				}else{
+					set strAttrValues = objBundleStock.Storage.CodeWithTSUGet()_Y	;SR17541.2 ;UFH-11 
+				}
+			
+			;-------------------------------  2
+				set intExpiredCol = ""
+				set intCol = 1				
+ 				set strAttrValues=strAttrValues_$$BundleAttributes^INBundleUtils(objBundleStock,.intCol,.intExpiredCol,pidLocn) ;HEVA-154.1
+			;-------------------------------  3
+				set strAttrValues = strAttrValues_fltQtyAvailable
+				set intCol = $increment(intCol)
+				
+				set ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idLine) = strAttrValues
+
+				if fltQtyAvailable<0 {
+					set $piece(^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idLine,"col"),Y,intCol) = "red"
+				}
+				//SRAdhoc
+				if intExpiredCol {
+					set $piece(^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle",idLine,"col"),Y,intExpiredCol) = "red"
+				}
+			}
+		}
+	}
+	quit
+	
+]]></Routine>
+</Export>

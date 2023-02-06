@@ -1,0 +1,473 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINSYSReview" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINSYSReview
+#include FINConst
+#include WWWConst
+#include COMSYS
+	;-------------------------------------------------------------------------------
+	;		Transaction review code
+	;		
+	; History:
+	; 10-Aug-2006	GRF		SR14582: Doco
+	;-------------------------------------------------------------------------------
+ 	
+ 	/* Classes Used:	
+ 						^FINAPADJs(0,60,
+						^FINAPPayments(0,60,
+						^FINARADJs(0,60,
+						^FINARBanks(0,60,			
+						^FINGLBankRecons(0,60,			
+						^FINGLDistributions(0,60,		
+						^FINGLJournals(0,60,
+						^FINARInvs(0,60,
+						^FINAPInvs(0,60,
+						^FINAPInvBatchs(0,60,
+ 	*/
+ 	
+Editable(pstrClass,pintStatus,&pblnPostable="",&pintSuggestedStatus="",pblnUnPosting=$$$NO,pblnIgnoreProcessing=$$$NO)
+    ; FIXME : Check Postable not used for string as well as boolean and use $$$NO if appropriate <GRF>
+    ;-------------------------------------------------------------------------------
+    ; For a given class and status, is the record editable?
+    ;
+    ; Inputs
+    ; 	pstrClass							Class : used for access check
+    ; 	pintStatus							Current Status of batch
+    ; 	pblnPostable			byRef		Can process continue?     Input with $$$YES over-rides
+    ; 	pintSuggestedStatus		byRef		What will new Status be?
+    ; 	pblnUnPosting			Currently	Only set to $$$YES when unposting Supplier Invoices
+    ; 	pblnIgnoreProcessing	Currently	Only set to $$$YES when processing Supplier Payment Lines
+    ; 	
+    ; Returns:Boolean
+    ;
+    ; History:
+    ; 06-Feb-2007	GRF		SR 15184 Peer : Doco; clean up old code changes
+    ; 30-Nov-2005	RPW		SR13933: If the status is processing, then we can not edit the record.
+    ; 21-Sep-2005	shobby	SR13213: pblnUnPosting uses the same logic when Unposting a record
+    ; 29-Sep-2004	PK		Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,objUser,objReview,strAccesses,intAccessLoop
+	new strStatus1,strStatus2,strStatus3 ; SR13933
+	;---------------------------------------
+	; (All instances are either explicit "Postable" or default "Not Postable" without return byRef)
+	;---------------------------------------
+	; pintStatus =				If POSTING
+	;   0:Unposted				"Postable" => * 2 *  "Not Postable" => * 5 *
+	;   1:Pending				              * 2 *
+	;   2:Posted				              * 1 *
+	;   3:Cancelled				"Postable" => * 2 *  "Not Postable" => * 4 *
+	;   4:Pending Cancelled		"Postable" => * 2 *  "Not Postable" => * 5 *
+	;   5:Processing			"Postable" => * 2 *  "Not Postable" => * 3 * (if not "Ignore")
+	;-----
+	; pintStatus =				If UNPOSTING
+	;   0:Unposted				"Postable" => * 2 *  "Not Postable" => * 5 *
+	;   1:Pending				"Postable" => * 2 *  "Not Postable" => * 5 *
+	;   2:Posted				"Postable" => * 2 *  "Not Postable" => * 5 *
+	;   3:Cancelled				              * 1 *
+	;   4:Pending Cancelled		              * 2 *
+	;   5:Processing			"Postable" => * 2 *  "Not Postable" => * 3 * (if not "Ignore")
+	;---------------------------------------
+	; SuggestedStatus is only changed by block * 2 *
+	;---------------------------------------
+	
+	; FIXME : Check implications of using $$$MakeStatus; better distinction
+	;         between strStatus and strStatus# - really enumStatus# <GRF>
+	set strStatus = $$$YES
+	
+	if pstrClass'="" {                 ; FIXME : Should we have an else for this? - returns $$$YES if no class <GRF>
+		if pintStatus="" {             ; FIXME : Should we have an $$$IFOK after this? <GRF>
+			set strStatus = $listbuild("Fin00371")                          ; "Invalid status code."
+		}
+		
+		if pblnUnPosting {
+			set strStatus1 = $$$EnumFINSYSSTATUSCancelled
+			set strStatus2 = $$$EnumFINSYSSTATUSPendingCancelled
+		} else {
+			set strStatus1 = $$$EnumFINSYSSTATUSPosted
+			set strStatus2 = $$$EnumFINSYSSTATUSPending
+		}
+		set strStatus3 = $$$EnumFINSYSSTATUSProcessing ; SR13933
+		
+		
+	;---------------------------------------
+	; * 1 *     POSTING 2:Posted            pintSuggestedStatus : UNCHANGED
+	;         UNPOSTING 3:Cancelled         Postable  : UNCHANGED
+	;                                       strStatus : Error
+	;---------------------------------------
+		if pintStatus=strStatus1 {
+			set strStatus = $listbuild("Fin00365")                          ; "Record already posted."
+			
+	;---------------------------------------
+	; * 2 *     POSTING 1:Pending
+	;         UNPOSTING 4:Pending Cancelled
+	;         or "Postable"
+	;-----------						pintSuggestedStatus				 Postable		strStatus
+	; If the user is authorised     :	2:Posted/3:Cancelled			"Postable"		$$$YES
+	; If the user is not authorised :	1:Pending/4:Pending Cancelled	"Not Postable"	"Invalid Security to Post"
+	; Authorisation not required    :	2:Posted/3:Cancelled			"Postable"		$$$YES or "Invalid status code."
+	;---------------------------------------
+		} elseif (pintStatus=strStatus2) || pblnPostable {
+			set objUser   = $get(^WWW013(0,YBED,1))
+			set objReview = $get(^FINSYSReview(0,pstrClass,1))
+			set pintSuggestedStatus=strStatus2
+			
+			set strAccesses = $$$FINSYSReviewReviewAccess(objReview)
+		
+	;	FIXME :
+	;	Should we use...
+	;		if $$^WWWACCESS(strAccesses,"",YBED)=$$$YES
+	;	after checking for null and Postable? Doesn't then need objUser.  <GRF>
+	;	No check for user "UNKNOWN" - may not allow system to update <GRF>
+	;	
+			if strAccesses'="" {
+				if 'pblnPostable set strStatus = $listbuild("Fin00366")     ; "Invalid Security to Post"
+				
+				set pblnPostable = $$$NO
+				for intAccessLoop = 1:1:$length(strAccesses,";") {
+					if $find(";"_$$$WWW013UserAccess(objUser)_";",";"_$piece(strAccesses,";",intAccessLoop)_";") {
+						set strStatus           = $$$YES
+						set pintSuggestedStatus = strStatus1
+						set pblnPostable        = $$$YES
+					}
+				}
+			} else {
+				set pintSuggestedStatus = strStatus1
+				set pblnPostable        = $$$YES
+			}
+			
+	;---------------------------------------
+	; * 3 *   5:Processing					pintSuggestedStatus : UNCHANGED
+	;         and "Not Postable"			Postable  : "Not Postable"
+	;         and not "Ignore Processing"	strStatus : Error
+	;---------------------------------------
+		} elseif (pintStatus=$$$EnumFINSYSSTATUSProcessing) { ; SR13933
+			if 'pblnIgnoreProcessing {
+				set pblnPostable = $$$NO
+				set strStatus    = "Fin00943"                                  ; "Please wait, processing data"
+			}
+			
+	;---------------------------------------
+	; * 4 *   POSTING 3:Cancelled			pintSuggestedStatus : UNCHANGED
+	;         and "Not Postable"			Postable  : "Not Postable"
+	;         								strStatus : Error
+	;---------------------------------------
+		} elseif pintStatus=$$$EnumFINSYSSTATUSCancelled {
+			set strStatus = "Fin00893"                                      ; "Record has been cancelled."
+		}
+	;---------------------------------------
+	; * 5 *  No Case						pintSuggestedStatus : UNCHANGED
+	; 										Postable  : UNCHANGED
+	; 										strStatus : $$$YES or "Invalid status code."
+	;---------------------------------------
+	}
+	
+	quit strStatus
+	
+	
+UnPostable(pstrClass,pintStatus="",pblnUnPost=0)
+    ;-------------------------------------------------------------------------------
+    ; For a given class and status, is the record postable?
+    ;
+    ; Note: pblnUnPost returns whether the record should be unposted, or just
+    ; 	    marked as unposted.
+    ; 	   
+    ; Returns:Status
+    ;
+    ; History:
+    ; 01-Dec-2005	RPW		SR13933: Include 'Processing' in Unpostable check.
+    ; 14-Oct-2005	Steve S	SR13216: Include 'Pending' in UnPostable check
+    ; 07-Jul-2005	PO		SR12881: Put Fin00369 in a lb instead of $$$Text and now using $$$YES/$$$NO
+    ; 01-Oct-2004	PK		Created
+    ;-------------------------------------------------------------------------------
+    new strStatus,objUser,objReview,strAccesses,intAccessLoop
+    
+    set strStatus=$$$YES
+	if pstrClass'="" {
+		if pintStatus="" {
+			set strStatus=$listbuild("Fin00371")                          ;Invalid status code.
+			
+		} elseif (pintStatus=$$$EnumFINSYSSTATUSUnposted)  ||
+		         (pintStatus=$$$EnumFINSYSSTATUSPending)   ||
+		         (pintStatus=$$$EnumFINSYSSTATUSProcessing)  { ;SR13216 ; SR13933
+			set strStatus=$listbuild("Fin00369")                          ;Record not yet posted.
+			
+		} elseif pintStatus=$$$EnumFINSYSSTATUSPosted {
+			set objUser=$get(^WWW013(0,YBED,1))
+			set objReview=$get(^FINSYSReview(0,pstrClass,1))
+			set strAccesses=$$$FINSYSReviewReviewAccess(objReview)
+			if strAccesses'="" {
+				set strStatus=$listbuild("Fin00370")                      ;Invalid Security to Un-Post.
+				for intAccessLoop=1:1:$length(strAccesses,";") {
+					if $find(";"_$$$WWW013UserAccess(objUser)_";",";"_$piece(strAccesses,";",intAccessLoop)_";") {
+						set strStatus=$$$YES
+					}
+				}
+			}
+			
+		} elseif pintStatus=$$$EnumFINSYSSTATUSCancelled {
+			set strStatus=$listbuild("Fin00893")                          ;Record has been cancelled.
+		}
+	}
+	
+	if pintStatus=$$$EnumFINSYSSTATUSPosted {
+		set pblnUnPost=$$$YES
+	} else {
+		set pblnUnPost=$$$NO
+	}
+	quit strStatus
+	
+	
+AfterDataFields(pidReview)
+	;-------------------------------------------------------------------------------
+	; Display Security grid, and a list of documents that are pending.
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Jul-2006	JW		SR14583: Don't duplicate invoices if on batch
+	; 24-Feb-2006	SC		SR14339: Encapsulate grid lines, move into PostTransactionLine
+	; 30-Jan-2006	SC		SR13548: Restrict display, only show tables for user's access level.
+	; 17-Aug-2005	JW		SR13272: Use GetClassName
+	; 17-Aug-2005	JW		SR12410: Added check for FINAPInvBatch (and FINAPInv)
+	; 20-Jan-2005	Steve S	SR10424: Added check for FINARInv class
+	; 29-Sep-2004	Paul K	Created
+	;-------------------------------------------------------------------------------
+	new idClass,idForm,idRef,intReviewAccess,intUserAccess,lstHeader
+	new objRef,objReview,objUser,strClass,strClassIndex
+	
+	;-------------------------------------------------------------------------------+
+	; Pending Records                                                               |
+	;-------------------------------------------------------------------------------+
+	;   Record Number   |   Created Date   |    User    |     Message Reference     |
+	;-------------------------------------------------------------------------------+
+	; (Transaction Type) - Review Access : (User Access Classifications)            |
+	;-------------------------------------------------------------------------------+
+	; ###########       |    dd/mm/yyyy    |  #####     |                           |
+	;-------------------------------------------------------------------------------+
+	; (Transaction Type) - Review Access : (User Access Classifications)            |
+	;-------------------------------------------------------------------------------+
+	; ###########       |    dd/mm/yyyy    |  #####     |                           |
+	; ###########       |    dd/mm/yyyy    |  #####     | ###############           |
+	; ###########       |    dd/mm/yyyy    |  #####     |                           |
+	;-------------------------------------------------------------------------------+
+	
+	if $get(YSEITE)=1 {
+		set lstHeader=""
+		set lstHeader=lstHeader_$listbuild($listbuild("Fin00378"))         ;Record Number
+		set lstHeader=lstHeader_$listbuild($listbuild("Fin00379"))         ;Created Date
+		set lstHeader=lstHeader_$listbuild($listbuild("Fin00380"))         ;User
+		set lstHeader=lstHeader_$listbuild($listbuild("Fin00144"))         ;Message Reference
+		do Start^COMTable(lstHeader,$listbuild("Fin00377"))  ;Pending Records
+		
+ 		set idClass = ""
+		for {
+			set idClass = $order(^WWW101(0,"FINSYSREVIEWTRANTYPE","EN",idClass))
+			quit:idClass=""
+			
+			;SR13548
+			set objUser   = $get(^WWW013(0,YBED,1))
+			set objReview = $get(^FINSYSReview(0,idClass,1))
+			
+			;show tables if the user has access
+ 			if $$UserAccessValid(objReview,objUser) {
+	 			set strClass      = "^"_idClass
+				set strClassIndex = strClass_"s"
+				do NewLine^COMTable("white")
+				;do InsertCell^COMTable("<font size=1><br>"_$$$WWW120FormHeaderOrImageFile($get(^WWW120(0,idClass,1)))_" "_$$GetSecurity(idClass)_"</font>","FINSYSReview",idClass,"","","",4)
+				do InsertCell^COMTable("<font size=1><br>"_$$GetClassName^COMConst(idClass)_" "_$$GetSecurity(idClass)_"</font>","FINSYSReview",idClass,"","","",4)
+				do EndLine^COMTable()
+				set idRef=""
+				for {
+					set idRef=$order(@strClassIndex@(0,60,1,idRef))
+					quit:idRef=""
+					
+					set objRef = $get(@strClass@(0,idRef,1))     ; FIXME : @strClassIndex@ used $$$Index format
+					set idForm = idClass
+					/* SR14583
+					if idClass="FINAPInv" && $$$FINAPInvIsVoucher(objRef) {
+						set idForm = "FINAPVoucher"
+					}
+					*/
+					
+					;SR14339
+					;do NewLine^COMTable()
+					;do InsertCell^COMTable(idRef,idForm,idRef)
+					if idClass="FINAPADJ" {
+						do PostTransactionLine(objRef,idForm,$$$FldFINAPADJCreatorsLocation,idRef,$$$FldFINAPADJCreatedDate,$$$FldFINAPADJCreatedBy,$$$FldFINAPADJComment) ;SR14339
+					
+					} elseif idClass="FINAPPayment" {
+						do PostTransactionLine(objRef,idForm,$$$FldFINAPPaymentLocation,idRef,$$$FldFINAPPaymentCreatedDate,$$$FldFINAPPaymentCreatedBy,"") ;SR14339
+				
+					} elseif idClass="FINARADJ" {
+						do PostTransactionLine(objRef,idForm,$$$FldFINARADJCreatorsLocation,idRef,$$$FldFINARADJCreatedDate,$$$FldFINARADJCreatedBy,$$$FldFINARADJComment) ;SR14339
+					
+					} elseif idClass="FINARBank" {			
+						do PostTransactionLine(objRef,idForm,"",idRef,$$$FldFINARBankCreatedDate,$$$FldFINARBankCreatedBy,"") ;SR14339
+					
+					} elseif idClass="FINGLBankRecon" {
+						do PostTransactionLine(objRef,idForm,$$$FldFINGLBankReconLocation,idRef,$$$FldFINGLBankReconCreatedDate,$$$FldFINGLBankReconCreatedBy,$$$FldFINGLBankReconNotes) ;SR14339
+				
+					} elseif idClass="FINGLDistribution" {
+						do PostTransactionLine(objRef,idForm,"",idRef,$$$FldFINGLDistributionCreatedDate,$$$FldFINGLDistributionCreatedBy,$$$FldFINGLDistributionDescription) ;SR14339
+				
+					} elseif idClass="FINGLJournal" {
+						do PostTransactionLine(objRef,idForm,"",idRef,$$$FldFINGLJournalCreatedDate,$$$FldFINGLJournalCreatedBy,$$$FldFINGLJournalDescription) ;SR14339
+ 
+					} elseif idClass="FINARInv" { ;SR10424
+						do PostTransactionLine(objRef,idForm,$$$FldFINARInvCreatorsLocation,idRef,$$$FldFINARInvCreatedDate,$$$FldFINARInvCreatedBy,$$$FldFINARInvNotes) ;SR14339
+						
+					} elseif idClass="FINAPInv" {
+						continue:$$$FINAPInvBatchNumber(objRef)'=""		// SR14583: Don't duplicate if on batch
+						if $$$FINAPInvIsVoucher(objRef) {
+							set idForm = "FINAPVoucher"
+						}
+						do PostTransactionLine(objRef,idForm,$$$FldFINAPInvCreatorsLocation,idRef,$$$FldFINAPInvCreatedDate,$$$FldFINAPInvCreatedBy,$$$FldFINAPInvNotes) ;SR14339
+						
+					} elseif idClass="FINAPInvBatch" {
+						do PostTransactionLine(objRef,idForm,"",idRef,$$$FldFINAPInvBatchEnteredDate,$$$FldFINAPInvBatchCreatedBy,$$$FldFINAPInvBatchNotes) ;SR14339
+					}
+				}
+			}
+		}
+		do Stop^COMTable()
+	}
+	
+	quit
+	
+	
+PostTransactionLine(pobjRef, pidForm, pintLocationPiece, pidRef, pintCell1Piece=0, pintCell2Piece=0, pintCell3Piece=0) private
+	;-------------------------------------------------------------------------------
+	; For a given transaction type, applies the location filter and prints line to 
+	; the COMTable  if location filter passes.
+	;
+	; Params: pobjRef - the record for the transaction type, pstrClass - the class name, 
+	; pintLocationPiece - piece on pobjRef containing location, pidRef - transaction id, 
+	; intCellPiece1/2/3 - piece of pobjRef containing 'Created Date', 'User', 'Message Reference'
+	; respectively, for the grid.
+	;
+	; ByRefs:
+	;
+	; Returns: none
+	;
+	; History:
+	; 27-Jul-2006	JW		SR14583: Moved FINAPInv check into calling routine.
+	; 24-Feb-2006	SC		SR14339: Created
+	;-------------------------------------------------------------------------------
+ 	new intLocation
+ 	
+	set intLocation =$get(^CacheTempFINSYSReview(YUSER))
+	/*
+	set idForm = pstrClass
+	if (pstrClass="FINAPInv") && $$$FINAPInvIsVoucher(pobjRef) {
+		set idForm = "FINAPVoucher"
+	}
+	*/ 
+	;if there is NO location filter OR record has no location OR filter = location of record				
+	if (intLocation = $piece(pobjRef,"~",pintLocationPiece)) || (intLocation = "") || ($piece(pobjRef,"~",pintLocationPiece)="")  {
+		do NewLine^COMTable()
+		do InsertCell^COMTable(pidRef,pidForm,pidRef)
+		do InsertCellDate^COMTable($piece(pobjRef,"~",pintCell1Piece),pidForm,pidRef)
+		do InsertCell^COMTable($piece(pobjRef,"~",pintCell2Piece),pidForm,pidRef)
+		do InsertCell^COMTable($piece(pobjRef,"~",pintCell3Piece),pidForm,pidRef)
+		do EndLine^COMTable()
+	}
+	
+	quit
+	
+	
+GetSecurity(pidClass)
+    ;-------------------------------------------------------------------------------
+    ; Returns a list of user accesses for posting records.
+    ;
+    ; Returns:String
+    ;
+    ; History:
+    ; 07-Oct-2004	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new strDescription,objReview,intAccessLoop,strAccesses
+	
+	set strDescription=" - "_$$$StrFINSYSReviewReviewAccess_" : "
+	if pidClass'="" {
+		set objReview=$get(^FINSYSReview(0,pidClass,1))
+		set strAccesses=$$$FINSYSReviewReviewAccess(objReview)
+		if strAccesses'="" {
+			for intAccessLoop=1:1:$length(strAccesses,";") {
+				if intAccessLoop'=1 set strDescription=strDescription_","
+				set strDescription=strDescription_$$GetEnumDescription^COMUtils("BERECHTIGUNG",$piece(strAccesses,";",intAccessLoop))
+			}
+		}
+	}
+	
+	quit strDescription
+	
+	
+Upgrade()
+    ;-------------------------------------------------------------------------------
+    ; New status fields added to several classes - populate when version upgraded
+    ; 
+    ; NOTE : Ensure ^WWWVAR has been run first.
+    ; 
+    ; History:
+    ; ??-???-2004	Paul K	Created
+    ;-------------------------------------------------------------------------------
+	new idClass,strGlobal,idRef,objRef,strStatus
+	
+	set strStatus = $$$OK
+	
+	set idClass = ""
+	for {
+		set idClass = $order(^WWW101(0,"FINSYSREVIEWTRANTYPE","EN",idClass))
+		quit:idClass=""
+		
+		set strGlobal = "^"_idClass
+		set idRef = ""
+		for {
+			set idRef = $order(@strGlobal@(0,idRef))
+			quit:idRef=""
+			
+			set objRef = $get(@strGlobal@(0,idRef,1))
+			if idClass="FINAPADJ"          set $$$FINAPADJStatus(objRef)          = $select($$$FINAPADJPostedDate(objRef)'="":2,1:0)
+			if idClass="FINAPInv"          set $$$FINAPInvStatus(objRef)          = $select($$$FINAPInvPostedDate(objRef)'="":2,1:0)
+			if idClass="FINAPPayment"      set $$$FINAPPaymentStatus(objRef)      = $select($$$FINAPPaymentPostedDate(objRef)'="":2,1:0)
+			if idClass="FINARADJ"          set $$$FINARADJStatus(objRef)          = $select($$$FINARADJPostedDate(objRef)'="":2,1:0)
+			if idClass="FINARBank"         set $$$FINARBankStatus(objRef)         = $select($$$FINARBankPostedDate(objRef)'="":2,1:0)
+			if idClass="FINGLBankRecon"    set $$$FINGLBankReconStatus(objRef)    = $select($$$FINGLBankReconPosted(objRef)'="":2,1:0)
+			if idClass="FINGLDistribution" set $$$FINGLDistributionStatus(objRef) = $select($$$FINGLDistributionPosted(objRef)'="":2,1:0)
+			if idClass="FINGLJournal"      set $$$FINGLJournalStatus(objRef)      = $select($$$FINGLJournalLastPostedDate(objRef)'="":2,1:0)
+			set strStatus = $$$Save(idClass,idRef,objRef,$$$YES)
+			quit:$$$ISERR(strStatus)
+		}
+		quit:$$$ISERR(strStatus)
+	}
+	quit strStatus
+	
+	
+	
+UserAccessValid(objReview,objUser)
+	/*------------------------------------------------------------------------------
+	; Check if user has access to a table.
+	;
+	; Params: table record, user record
+	;
+	; ByRefs:
+	;
+	; Returns: boolean
+	;
+	; History:
+	; 06-Feb-2006	SC		SR13548: Created
+	;-----------------------------------------------------------------------------*/
+	new strAccesses, intAccessLoop, blnAccessValid
+ 
+	set blnAccessValid = $$$NO
+	
+	set strAccesses = $$$FINSYSReviewReviewAccess(objReview)
+	for intAccessLoop=1:1:$length(strAccesses,";") {
+		if $find(";"_$$$WWW013UserAccess(objUser)_";",";"_$piece(strAccesses,";",intAccessLoop)_";") {
+			set blnAccessValid = $$$YES
+		}
+	}
+ 
+	quit blnAccessValid
+	
+]]></Routine>
+</Export>

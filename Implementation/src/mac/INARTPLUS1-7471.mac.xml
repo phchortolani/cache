@@ -1,0 +1,631 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INARTPLUS1" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INARTPLUS1(FERTIGNR,AUFTRAG,POS,TEIL,ART,REST,SN,LOT,HAL,VERS,NOSPEI)
+#include COMSYS
+#include INConst
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		ARTIKELBESTAND NACH FERTIGUNG ÄNDERN
+	;
+	;	ACHTUNG !! INARTMINUS UND INARTPLUS1 RUFEN SICH GEGENSEITIG AUF, 
+	;	WENN DIE BUCHUNGSMENGE NEGATIV IST !!
+	;   OB DIE KORREKTUR BEREITS ERLEDIGT IST, WIRD IN DER AUFRUFENDEN ROUTINE GEPRÜFT !!!
+	;
+	;		ARTICLE SUPPLY AFTER MANUFACTURING CHANGING
+	;	NOTE!! INARTMINUS AND INARTPLUS1 CALLS ITSELF MUTUAL UP, IF THE RESERVATION QUANTITY IS NEGATIVE!!
+	;	WHETHER THE CORRECTION IS ALREADY SETTLED IS EXAMINED, IN THE CALLING ROUTINE!!!
+	; 
+	; Called by: INARTPLUS, INARTMINUS, FERTIG^INPROSTEMPU
+	; 
+	; Inputs : 
+	;	FERTIGNR	= FERTIGUNGSNUMMER     ; Work Order No
+	;	AUFTRAG		= AUFTRAGSNUMMER       ; Production Order No
+	;	POS			= POSITIONSNUMMER      ; Order Line
+	;	TEIL		= UNTERTEILESTRUKTUR   
+	;	ART			= ARTIKEL
+	;	REST		= RESTMENGE            ; Qty of Finished Goods produced ?
+	;	SN			= SERIENNUMMER
+	;	LOT			= LOT-NUMMER
+	;	HAL			= LAGERPLATZ
+	;	VERS		= VERSION
+	;	NOSPEI		= BESTANDSBUCHUNG NICHT MERKEN    ; INVENTORY POSTING NOT Saved
+	;				  (ACHTUNG DOPPELTBUCHUNG !! NUR BEI NEGATIVEN UNTERTEILEN)
+	;				  (ATTENTION DOUBLED RESERVATION!! ONLY WITH NEGATIVE PARTS) 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; Updates :
+	;	[do SPEI]		other direct updates & saves
+	;	[do ^INARTHIST]	other saves
+	;	^INWES			Serial Number recorded
+	;	^INWE			New Record based on qty REST
+	;	^INWEAUF		
+	;	^INSNHIST		Serial Number History
+	;	^INWERKZEUG		Machine Status
+	;	
+	; History :
+	; 11-Nov-2009	GRF		SR16871: INARTAVG call changed to INAvgCost
+	; 04-Nov-2009	GRF		SR16871: Naked Reference
+	; 09-Oct-2009	GRF		SR16888: Correction to number of parameters
+	; 14-Sep-2009	PPP		SR16888: Added the Location parameter to $$INARTAVG call
+	; 24-Mar-2006	JW		SR14422: Increment date
+	; 02-Feb-2006	GRF		SR14203: INARTAVG processing was not present for ByProducts.
+	; 01-Feb-2006	GRF		SR14203: Call AutoUpdate^INStockValAdjust
+	; 19-Aug-2005	GRF		SR13215: Rename new subroutines for clarity
+	; 18-Aug-2005	FIS		SR13144/SR13253: LBR/BDN transaction / calculate Average cost
+	; 03-Aug-2005	GRF		SR13215: Add INFOTEXT, PlusQty
+	; 21-Jul-2005	GRF		SR13024: Doco
+	; 22.Oct.2001	FIS		Created
+	;-------------------------------------------------------------------------------
+	NEW BET,DATEI,FERTIG1,HALX,INFOTEXT,LAP,objItem,OK,PlusQty,SUCH,WEN
+	
+	SET OK=0
+	
+	SET $ZTRAP="^WWWERROR"
+	
+	quit:+$GET(REST)=0 OK              ;KEINE MENGE    ;no quantity
+	quit:$GET(ART)="" OK               ;KEINEN ARTIKEL ;no item 
+	quit:$GET(AUFTRAG)="" OK           ;KEINEN AUFTRAG ;no order 
+	quit:$GET(POS)="" OK               ;KEINE POSITON  ;no line no
+	SET POS=$TRANSLATE(POS,",","-")
+	quit:$TRANSLATE(POS,",;-")="" OK   ;KEINE POSITON
+	
+	;---------------------------------------
+	
+	SET FERTIGNR = $GET(FERTIGNR)      ;FERTIGUNGSNUMMER
+	SET HAL      = $GET(HAL)           ;LAGERPLATZ 
+	SET TEIL     = $GET(TEIL)          ;UNTERTEIL ?  ""=KEIN UNTERTEIL
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;  objItem			INART
+	;  WEN				INWE, INWEAUF
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set objItem = $GET(^INART(YM,ART,1))
+	IF $$$INARTItemWithoutInventoryMaint(objItem)=1 quit OK  ;KEINE BESTANDSFÜHRUNG  TYBD 16.05.2002 ;no 
+	
+	IF $$$INARTItemType(objItem)=2 quit OK  ;ACHTUNG LEISTUNG        ;Service Item 
+	IF $$$INARTItemType(objItem)=5 quit OK  ;ACHTUNG PHANTOM-ARTIKEL ;Phantom Item 
+	IF $$$INARTItemType(objItem)=6 quit OK  ;ACHTUNG Pauschale       ;Overall performances
+	IF $$$INARTItemType(objItem)=7 quit OK  ;ACHTUNG KONFIGURATION   ;Item to configure
+	
+	IF TEIL'="" SET DATEI="^INAUFPXL("_""""_YM_""""_","_""""_AUFTRAG_""""_","_POS_","_TEIL_")"
+	IF TEIL=""  SET DATEI="^INAUFP("_""""_YM_""""_","_""""_AUFTRAG_""""_","_POS_",1)"
+	quit:'$DATA(@DATEI) OK
+	
+	;	245		$$$INAUFPToStockOutOfProduction()	(date)
+	IF $GET(NOSPEI)'=1 quit:$PIECE(@DATEI,Y,245)'="" OK  ;BESTANDSVERÄNDERUNG BEREITS GEBUCHT ;change in stock yet 
+	
+	; Stock Corrected Date present - don't process again if in save mode.
+	IF FERTIGNR'="" IF $GET(NOSPEI)'=1 IF $PIECE($GET(^INPROSTEMP(YM,FERTIGNR,1)),Y,22)'=""  quit OK  ;BESTANDSVERÄNDERUNG BEREITS GEBUCHT;FIS;26.01.04;24941
+	IF FERTIGNR'="" IF $GET(NOSPEI)'=1 IF $PIECE($GET(^INPROSTEMP1(YM,FERTIGNR,1)),Y,22)'="" quit OK  ;BESTANDSVERÄNDERUNG BEREITS GEBUCHT;FIS;26.01.04;24941
+	
+	;---------------------------------------
+	
+	;BETRIEB
+	; FIXME : This was all done in INARTPLUS.  Is is necessary to do it again? <GRF>
+	SET BET=""
+	IF AUFTRAG'="" IF $DATA(^INAUF(YM,AUFTRAG)) SET BET=$PIECE($GET(^INAUF(YM,AUFTRAG,1)),Y,6)  ;ORDER LOCATION;FIS;16.06.05;SR12556
+	IF BET="" SET BET=$GET(YLOCATION)
+	IF BET="" SET BET=$ORDER(^WWW0121(0,YM,""))     ; First Location! FIXME : YLOCATION should be valid <GRF>
+	IF BET="" SET BET=1
+	
+	;NEGATIVE PRODUKTION / RÜCKBAU ;FIS;22891;15.12.03   ; Back Flush?
+	;---------------------
+	; FIXME ? : always quits with OK=1.  Is OK returned from INARTMINUS relevant? <GRF>
+	IF REST<0 DO  quit OK
+	. SET OK=$$^INARTMINUS(AUFTRAG,POS,ART,REST*-1,$GET(SN),,2,1,TEIL,,,1,,,1,FERTIGNR)  ;BESTAND BUCHEN (BUCHUNG NICHT MERKEN !!) ;Not 
+	. DO SPEI
+	. SET OK=1
+	
+	;-----------------------------------------------------------------------------
+	;LAGERPLATZ BESTIMMEN ;determine stock location
+	SET HALX=HAL
+	IF HAL="" DO  ;NOCH KEIN LAGERPLATZ ;no stock locn yet 
+	. IF $DATA(^INARTLP(YM,ART)) SET HAL=$ORDER(^INARTLP(YM,ART,BET,""))  ;FESTER LAGERPLATZ ;stock location
+	. SET QKON=$PIECE($GET(^INAUFP(YM,AUFTRAG,POS,1)),Y,174)
+	. ;SET QKON=$PIECE($GET(^INART(YM,ART,1)),Y,174)
+	. quit:QKON=""
+	. IF $PIECE($GET(^INQPRUEF(YM,BET,QKON,1)),Y,7)'="" SET HAL=$PIECE(^INQPRUEF(YM,BET,QKON,1),Y,7)  ; Quality Assurance storage  ; Naked Ref
+	
+	IF HAL="" SET HAL=$$$INVORGBOnHandLocation($GET(^INVORGB(YM,YM,BET,1)))  ; D1   ;HAND/PRODUKTIONSLAGER
+	IF HAL="" SET HAL=$ORDER(^INLP(YM,BET,""))
+	IF HAL="" SET HAL=0
+	
+	;-----------------------------------------------------------------------------
+	;		D4		$$$INWEQuantity()
+	;		D8		$$$INWEUnitPrice()
+	;-----------------------------------------------------------------------------
+	
+	DO
+	. NEW DATE,EKNEU
+	. SET DATE = +$HOROLOG
+	. SET AUF1 = $GET(^INAUF(YM,AUFTRAG,1))
+	. SET WEN  = ""
+	. ; ------------------------------------
+	. ;  Now always working with a new ^INWE record (WEN)
+	. ; ------------------------------------
+	. ;HOLEN EVTL. VORHANDENER WE ;send for In 
+	. ;;SET WEN=$GET(^INWE(YM,ART,BET,HAL,+$HOROLOG,1))
+	. ;;IF WEN'="" DO ^WWWSKILL("INWE",ART_","_BET_","_HAL_","_+$H)
+	. ;FOR  QUIT:'$DATA(^INWE(YM,ART,BET,DATE))  SET DATE=DATE+1  ;FIS;10.01.05;DAMIT PREIS NICHT ÜBERSCHRIEBEN WIRD
+	. ;SET $PIECE(WEN,Y,4)=$PIECE(WEN,Y,4)+REST  ;MENGE ;quantity
+	. 
+	. //for  quit:'$data(^INWE(YM,ART,BET,HAL,DATE))  set DATE=DATE+1  ;TYBD;19,5,2005;10494;DO NOT OVERRIDE PRICE
+	. set DATE = $$Increment^INWECounter(ART,BET,HAL,DATE)		//SR14422
+	. 
+	. ;WE BEARBEITEN ;Incoming goods working on 
+	. set $PIECE(WEN,Y,4) = REST  ;MENGE ;quantity
+	. ;
+	. ; DATEI = INAUFP (when TEIL="")   or   INAUFPXL (when TEIL'="")
+	. ;		D5		$$$INAUFPQuantity()
+	. ;		D39		$$$INAUFPOutput1()		commented
+	. ;		D47		$$$INAUFPCost()
+	. ;	TODO : TEIL test is no longer required <GRF>
+	. ;HERSTELLKOSTEN JE STÜCK !!! ACHTUNG BEI ÄNDERUNGEN ;once spare part estimation next to 
+	. IF TEIL=""  IF +REST'=0 IF +$PIECE(@DATEI,Y,5)'=0 SET $PIECE(WEN,Y,8)=$PIECE(@DATEI,Y,47)/$PIECE(@DATEI,Y,5)
+	. IF TEIL'="" IF +REST'=0 IF +$PIECE(@DATEI,Y,5)'=0 SET $PIECE(WEN,Y,8)=$PIECE(@DATEI,Y,47)/$PIECE(@DATEI,Y,5)
+	. ;IF TEIL'="" IF +REST'=0 IF +$PIECE(@DATEI,Y,39)'=0 SET $PIECE(WEN,Y,8)=$PIECE(@DATEI,Y,47)/$PIECE(@DATEI,Y,39)
+	. ;
+	. ;
+ 	.;set EKNEU = $$^INARTAVG(ART,REST,$PIECE(WEN,Y,8))   ; SR14203 (NEW moved up to retain value for INStockValAdjust call)
+ 	.;set EKNEU = $$^INARTAVG(ART,REST,$PIECE(WEN,Y,8),,$$$NO,$$$YES,BET) ; Returns New WAC & stores in ^INARTAVG ; SR16888 Add Locn Param
+ 	. set EKNEU = $$UpdateCost^INAvgCost(ART,BET,REST,$PIECE(WEN,Y,8),"")   ; SR16871
+ 	. ;
+ 	. ;
+ 	. ;DO  ;UPDATE AVERAGE COST;SR13253;FIS;16.08.05
+	. ;. NEW EKNEU
+	. ;. SET EKNEU=$$^INARTAVG(ART,REST,$PIECE(WEN,Y,8))
+	. ;. // ATTENTION !		FIXME
+	. ;. // This solution is not proper for exact calculation and can not stay !!
+	. ;. // $PIECE(WEN,Y,8) does not include the exact time stamps at this stage,
+	. ;. // so the labor costs can't be correct. It also does not include the actual
+	. ;. // material costs as per stock on hand.
+	. ;. // Problem is: INARTPLUS1 gets called, before INARTMINUS, so the actual material
+	. ;. // costs are not knows at this stage. The Labor time stamps are not being calculated
+	. ;. // before the final cost calculation (Product Costing Analysis), so they are also not
+	. ;. // known at this stage.
+	. ;. // In Fact, this new average cost is currently based on the planned cost, what is OK
+	. ;. // for Adrad, because the planned costs are based on Average what will keep updated,
+	. ;. // and they are not doing time stamps.
+	. ;
+	. do PostLabour(ART,AUFTRAG,POS,TEIL,FERTIGNR,BET,REST)  ;Labour & Burden Finance Transactions;FIS;SR13142;17.08.05
+	. ;
+	. ;SPEICHERN WARENHERKUNFT/URSPRUNG ;Save
+	. ;		D28		$$$INWESourceOrder()
+	. ;		D29		$$$INWESourceLineItem()
+	. ;		D9		$$$INWEStockLocationNote()
+	. ;	---
+	. ;		D8		$$$INAUFProject()
+	. SET $PIECE(WEN,Y,28)=AUFTRAG
+	. SET $PIECE(WEN,Y,29)=POS
+	. IF AUFTRAG'="" IF $PIECE($GET(^INAUF(YM,AUFTRAG,1)),Y,8)'="" DO    ;KOMMISSION/PROJEKT
+	. . IF $PIECE(WEN,Y,9)="" SET $PIECE(WEN,Y,9)=$PIECE(^(1),Y,8) QUIT  ;LAGERPLATZHINWEIS
+	. . SET $PIECE(WEN,Y,9)=$PIECE(WEN,Y,9)_","_$PIECE(^(1),Y,8)
+	. ;
+	. ; TODO : simplify - better when change to brace format? <GRF>
+	. ;. IF $PIECE(WEN,Y,9)'="" SET $PIECE(WEN,Y,9)=$PIECE(WEN,Y,9)_","
+	. ;. SET $PIECE(WEN,Y,9)=$PIECE(WEN,Y,9)_$PIECE(^(1),Y,8)            ;LAGERPLATZHINWEIS
+	. ;
+	. ;SERIENNUMMER
+	. IF $GET(SN)'="" DO
+	. . FOR YI=1:1  QUIT:$PIECE(SN,";",YI,99)=""  DO
+	. . . QUIT:$PIECE(SN,";",YI)=""
+	. . . IF '$DATA(^INWES(YM,ART,BET,HAL,DATE,$PIECE(SN,";",YI),1)) SET ^INWES(YM,ART,BET,HAL,DATE,$PIECE(SN,";",YI),1)=""
+	. ;
+	. ;LOTNUMMER
+	. ;		D19		$$$INWELotNo()
+	. IF $GET(LOT)'="" DO
+	. . IF $PIECE(WEN,Y,19)="" SET $PIECE(WEN,Y,19)=LOT QUIT
+	. . FOR YI=1:1  QUIT:$PIECE(LOT,";",YI,99)=""  DO
+	. . . QUIT:$PIECE(LOT,";",YI)=""
+	. . . QUIT:$FIND(";"_$PIECE(WEN,Y,19)_";",";"_$PIECE(LOT,";",YI)_";")  ;BEREITS VORHANDEN
+	. . . SET $PIECE(WEN,Y,19)=$PIECE(WEN,Y,19)_";"_$PIECE(LOT,";",YI)
+	. ;
+	. ;VERSION
+	. ;		D48		$$$INWEVersionRev()
+	. IF $GET(VERS)'="" DO
+	. . IF $PIECE(WEN,Y,48)="" SET $PIECE(WEN,Y,48)=VERS QUIT
+	. . QUIT:$FIND(";"_$PIECE(WEN,Y,48)_";",";"_VERS_";")  ;BEREITS VORHANDEN
+	. . SET $PIECE(WEN,Y,48)=$PIECE(WEN,Y,48)_";"_VERS
+	. ;
+	. ;lagerplatzhinweis ; Stock Location Reference
+	. ;		D9		$$$INWEStockLocationNote()
+	. DO
+	. . IF $PIECE(WEN,Y,9)="" SET $PIECE(WEN,Y,9)=FERTIGNR QUIT
+	. . SET $PIECE(WEN,Y,9)=$PIECE(WEN,Y,9)_";"_FERTIGNR
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ; Save On Hand figures
+	. DO   ;WE BEI LETZTEM EINGANG NUR, WENN EIGENFERTIGUNG
+	. . IF TEIL="" IF AUFTRAG'="" IF POS'="" IF $DATA(^INAUFP(YM,AUFTRAG,POS,1)) IF $PIECE(AUF1,Y,2)'=1 DO  QUIT  ;NUR EIGENAUFTRAG FÜR LAGER ;only to stock location 
+	. . . IF $PIECE(AUF1,Y,2)=0 DO
+	. . . . SET $PIECE(WEN,Y,4)=REST
+	. . . . NEW YFORM,YVOR,YOK
+	. . . . SET YOK=$$^WWWSPEI("INWEAUF",AUFTRAG_","_POS_","_BET_","_HAL_","_DATE,WEN,1)  ;FIS;03.02.04;25041
+	. . . . SET OK=1
+	. . ;
+	. . ;		26	$$$INARTItemType()  2=Service
+	. . ;		29	$$$INARTItemWithoutInventoryMaint()
+	. . QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,29)=1  ;KEINE BESTANDSFÜHRUNG  TYBD 23.05.2002 ;no 
+	. . QUIT:$PIECE($GET(^INART(YM,ART,1)),Y,26)=2  ;KEINE LEISTUNG  TYBD 23.05.2002 ;not Service item 
+	. . ; TODO : Should date be checked closer to here? Minute possibility of data change
+	. . ;        - probably okay if fixed to allow multiple entries on same date. <GRF>
+	. . SET ^INWE(YM,ART,BET,HAL,DATE,1)=WEN
+	. . DO ^WWWSSORT("INWE",ART_","_BET_","_HAL_","_DATE)  ;AUFBEREITEN SORTKEY
+	. . ; do $$$Save("INWE",ART_","_BET_","_HAL_","_DATE,WEN,$$$YES)
+	. . SET OK=1
+	. ;
+	. QUIT:OK=0  ;ABBRUCH DA FEHLER ;Stop if errors 
+	. ;
+	. IF $GET(NOSPEI)'=1 DO SPEI  ;SPEICHERN KORREKTURDATEN  ;FIS;22891;15.12.03
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ;HISTORY
+	. IF FERTIGNR="" SET FERTIGNR=" ???"  ;OHNE FERTIGUNGSAUFTRAG ;without 
+	. IF $GET(LOT)'="" SET LOT="("_LOT_")"
+	. NEW HTEXT
+	. SET HTEXT="+"_REST_" "
+	. IF $GET(NOSPEI)=1 SET HTEXT=HTEXT_"(&not;) "  ;umgekehrtes aufrufezeichen = kennzeichung umgekehrte buchung ;fis;17.12.03
+	. ;                 ... From Production Order ***-*** #***** *** ***
+	. SET HTEXT=HTEXT_$$^WWWTEXT(32515)_" "_$$^WWWTEXT(32513)_" "_AUFTRAG_"-"_POS_" #"_FERTIGNR_" "_$GET(LOT)_" "_$GET(SN)
+	. ; Marker SR13125 <GRF>
+	. ; BETRAG Arg#8 = $p(WEN,Y,4)*$p(WEN,Y,8))
+	. ;              = 
+	.;DO ^INARTHIST(ART,HTEXT,BET,REST,,,,,HAL)  ;+ MENGE AUS FERTIGUNGSAUFTRAG ;quantity from manufacturing order 
+	. DO ^INARTHIST(ART,HTEXT,BET,REST,,,,($PIECE(WEN,Y,4)*$PIECE(WEN,Y,8)),HAL,,,AUFTRAG,POS,,,"REC")  ;+ MENGE AUS FERTIGUNGSAUFTRAG ;FIS;10.01.05;26560;TRANSACTION TYPE
+	. set strStatus = $$AutoUpdate^INStockValAdjust("INARTPLUS1",AUFTRAG_","_POS,ART,EKNEU)       ; SR14203
+	. ;
+	. ;-----------------------------------------------------------------------------
+	. ; update ^INSNHIST  -  Serial Number History
+	. ; update ^INWERKZEUG to show machine is now free
+	. IF $GET(SN)'="" DO
+	. . FOR YI=1:1  QUIT:$PIECE(SN,";",YI,99)=""  DO
+	. . . QUIT:$PIECE(SN,";",YI)=""
+	. . . IF '$DATA(^INSNHIST(YM,$PIECE(SN,";",YI))) DO HIST^INSNHIST($PIECE(SN,";",YI),$$^WWWTEXT(58)_"/"_$$^WWWTEXT(32632)_" "_$$^WWWTEXT(32513)_" "_FERTIGNR,ART,AUFTRAG,POS) QUIT  ;NEUANLAGE / MIT FERTIGUNGSAUFTRAG
+	. . . DO HIST^INSNHIST($PIECE(SN,";",YI),$$^WWWTEXT(32132)_" "_$$^WWWTEXT(32632)_" "_$$^WWWTEXT(32513)_" "_FERTIGNR,ART,AUFTRAG,POS) QUIT  ;FERTIGUNG MIT FERTIGUNGSAUFTRAG
+	. ;
+	. DO STOP^INWKZHIST(AUFTRAG_","_POS_","_TEIL)  ;Save tool usage ; SPEICHERN WERKZEUGNUTZUNG;FIS;25964;09.04.07
+	. ;
+	. ;-------------------------------------
+	. ; By-Products
+	. ; NEBENPRODUKTE UND ABFÄLLE BEI PRODUKTION ;And next to production 
+	. ;-------------------------------------
+	. IF $DATA(^INARTNEBEN(YM,ART)) DO
+	. . NEW NEBEN,NEBENMENGE,PRODUKTMENGE,NEBENWE,HAL
+	. . SET NEBEN=""
+	. . FOR  SET NEBEN=$ORDER(^INARTNEBEN(YM,ART,NEBEN)) QUIT:NEBEN=""  DO
+	. . . QUIT:+$PIECE($GET(^INARTNEBEN(YM,ART,NEBEN,1)),Y,3)'=0             ;NUR WENN DURCH PRODUKTION ;only when trans-production 
+	. . . SET NEBENMENGE   = +$PIECE($GET(^INARTNEBEN(YM,ART,NEBEN,1)),Y,1)  ; Qty of by-product created for
+	. . . SET PRODUKTMENGE = +$PIECE($GET(^INARTNEBEN(YM,ART,NEBEN,1)),Y,2)  ; this quantity of finished goods
+	. . . QUIT:NEBENMENGE=0
+	. . . IF PRODUKTMENGE=0 SET PRODUKTMENGE=1
+	. . . SET HAL=""
+	. . . DO  ;FIS;24563;07.11.03;LAGERPLATZ BESTIMMEN
+	. . . . IF $DATA(^INARTLP(YM,NEBEN)) SET HAL=$ORDER(^INARTLP(YM,NEBEN,BET,""))  ;FESTER LAGERPLATZ
+	. . . . ;SET QKON=$PIECE($GET(^INART(YM,ART,1)),Y,174)
+	. . . . SET QKON=$PIECE($GET(^INAUFP(YM,AUFTRAG,POS,1)),Y,174)
+	. . . . QUIT:QKON=""
+	. . . . IF $PIECE($GET(^INQPRUEF(YM,BET,QKON,1)),Y,7)'="" SET HAL=$PIECE($GET(^(1)),Y,7)  ;LAGERPLATZ GEM. QUALITÄTSPRÜFUNG
+	. . . ;
+	. . . IF HAL="" SET HAL = HALX
+	. . . IF HAL="" SET HAL = $$$INVORGBOnHandLocation($GET(^INVORGB(YM,YM,BET,1)))  ; D1  ;HAND/PRODUKTIONSLAGER
+	. . . IF HAL="" SET HAL = $ORDER(^INLP(YM,BET,""))
+	. . . IF HAL="" SET HAL = 0
+	. . . SET NEBENWE=$GET(^INWE(YM,NEBEN,BET,HAL,+$HOROLOG,1))
+	. . . IF NEBENWE="" DO  ;NEUANLAGE WE ;In 
+	. . . . SET $PIECE(NEBENWE,Y,9) =$$^WWWTEXT(32515)_" "_FERTIGNR  ;FERTIGUNGSAUFTRAG
+	. . . . SET $PIECE(NEBENWE,Y,28)=$GET(AUFTRAG)       ;URSPRUNGSAUFTRAG
+	. . . . SET $PIECE(NEBENWE,Y,29)=$GET(POS)           ;URSPRUNGSPOSITION
+	. . . ;
+	. . . set PlusQty  = REST/PRODUKTMENGE*NEBENMENGE          ; SR13161
+	. . . SET $PIECE(NEBENWE,Y,8)=$$^INARTKOST(NEBEN)  ;HERSTELLKOSTEN
+	. . . SET $PIECE(NEBENWE,Y,4)=$PIECE(NEBENWE,Y,4)+PlusQty
+	. . . ;
+	. . . //set EKNEU=$$^INARTAVG(NEBEN,PlusQty,$PIECE(NEBENWE,Y,8))   ; SR14203
+	. . . set EKNEU=$$^INARTAVG(NEBEN,PlusQty,$PIECE(NEBENWE,Y,8),,$$$NO,$$$YES,BET)   ; SR16888
+	. . . ;
+	. . . ;		26	$$$INARTItemType()  2=Service
+	. . . ;		29	$$$INARTItemWithoutInventoryMaint()
+	. . . DO
+	. . . . QUIT:$PIECE($GET(^INART(YM,NEBEN,1)),Y,29)=1  ;KEINE BESTANDSFÜHRUNG  TYBD 23.05.2002 ;no 
+	. . . . QUIT:$PIECE($GET(^INART(YM,NEBEN,1)),Y,26)=2  ;KEINE LEISTUNG         TYBD 23.05.2002 ;not service item
+	. . . . SET ^INWE(YM,NEBEN,BET,HAL,+$HOROLOG,1)=NEBENWE
+	. . . . DO ^WWWSSORT("INWE",NEBEN_","_BET_","_HAL_","_+$HOROLOG)  ;AUFBEREITEN SORTKEY ->AUSGESCHALTET, MENGE IST KEIN SORTKEY	//SR14203
+	. . . . ; do $$$Save("INWE",NEBEN_","_BET_","_HAL_","_+$HOROLOG,NEBENWE,$$$YES) // SR14546
+	. . . 
+	. . . ; By-product From Production-order
+	. . . ; FIXME : Should byproducts have any value - may be okay but don't recognise value being held in stock <GRF>
+	. . . set INFOTEXT = "+"_PlusQty_" "_$$^WWWTEXT(32560)_" "_$$^WWWTEXT(32515)_" "_$$^WWWTEXT(32513)_" "_FERTIGNR
+	. . . DO ^INARTHIST(NEBEN,INFOTEXT,BET,PlusQty,,,,($PIECE(NEBENWE,Y,8)*PlusQty),HAL,,,$GET(AUFTRAG),$GET(POS),,,"REC")  ;+ MENGE NEBENPRODUKTE AUS FERTIGUNGSAUFTRAG  ;FIS;10.01.05;26560;TRANSACTION TYPE
+	. . . set strStatus = $$AutoUpdate^INStockValAdjust("INARTPLUS1",AUFTRAG_","_POS,NEBEN,EKNEU)       ; SR14203
+	
+	QUIT OK
+	
+SPEI
+	;-------------------------------------------------------------------------------
+	;	SPEICHERN  KORREKTURDATEN ;Save 
+	; 
+	; Inputs :
+	;	DATEI	"^INAUFPXL(..." or "^INAUFP(..."
+	;	blnDontComplete		set when called through INRECProcess
+	;						$$$YES if not to complete (normally partial receipt)
+	;						$$$NO  otherwise
+	;	
+	; Possible Updates :
+	;	^INPROSTEMP		D22
+	;	^INPROSTEMP1	D22
+	;	^INAUF			D253,254,255
+	;	^INAUFP			D264,265,266
+	;	^INAUFPT		D245
+	;	^INAUFPXL		D245
+	;	
+	; Saves :
+	;	^INDRPDEMAND	Updates D99,D115
+	;	
+	;	TODO : may be clearer if split in two based on TEIL in the first place. <GRF>
+	; 
+	; History :
+	; 03-Nov-2005	GRF/RW	SR13085 : Process from form INRECWO
+	;-------------------------------------------------------------------------------
+	DO
+	. ;SPEICHERN BESTANDSBERICHTIGUNG ;Save 
+	. IF FERTIGNR'="" DO  ;MIT FERTIGUNGSNUMMER ;by means of 
+	. . IF $DATA(^INPROSTEMP(YM,FERTIGNR,1))  SET $PIECE(^INPROSTEMP(YM,FERTIGNR,1),Y,22) =+$HOROLOG
+	. . IF $DATA(^INPROSTEMP1(YM,FERTIGNR,1)) SET $PIECE(^INPROSTEMP1(YM,FERTIGNR,1),Y,22)=+$HOROLOG
+	. ;
+	. ;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+	. ;  SR13085
+	. ;SET $PIECE(@DATEI,Y,245)=+$HOROLOG  ;INAUFPXL ODER INAUFP ;Or 
+	. ;IF TEIL'="" SET $PIECE(^INAUFPT(YM,AUFTRAG,POS,$TRANSLATE(TEIL,",",".")_"."),Y,245)=+$HOROLOG
+	. ;IF TEIL=""  SET $PIECE(^INAUFPXL(YM,AUFTRAG,POS),Y,245)=+$HOROLOG
+	. ;
+	. ;SPEICHERN PRODUKTIONSENDE IN AUFTRAGSPOSITION UND AUFTRAG ;Save within And order 
+	. ;IF TEIL="" IF AUFTRAG'="" IF POS'="" DO
+	. ;. SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,264)=+$HOROLOG                ; DATUM IN AUFTRAGSPOSITION ;Date within 
+	. ;. SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,265)=$PIECE($HOROLOG,",",2)   ; UHRZEIT IN AUFTRAGSPOSITION ;within order line
+	. ;. SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,266)=YBED                     ; BEDIENER IN AUFTRAGSPOSITION ;within 
+	. ;. QUIT
+	. ;IF TEIL="" IF AUFTRAG'="" DO
+	. ;. SET $PIECE(^INAUF(YM,AUFTRAG,1),Y,253)=+$HOROLOG                ; DATUM IN AUFTRAG ;Date within order 
+	. ;. SET $PIECE(^INAUF(YM,AUFTRAG,1),Y,254)=$PIECE($HOROLOG,",",2)   ; UHRZEIT IN AUFTRAG ;within order 
+	. ;. SET $PIECE(^INAUF(YM,AUFTRAG,1),Y,255)=YBED                     ; BEDIENER IN AUFTRAG ;within order 
+	. ;
+	. if '$get(blnDontComplete) do
+	. . SET $PIECE(@DATEI,Y,245)=+$HOROLOG  ;INAUFPXL ODER INAUFP ;Or 
+	. . IF TEIL'="" SET $PIECE(^INAUFPT(YM,AUFTRAG,POS,$TRANSLATE(TEIL,",",".")_"."),Y,245)=+$HOROLOG
+	. . IF TEIL=""  SET $PIECE(^INAUFPXL(YM,AUFTRAG,POS),Y,245)=+$HOROLOG
+	. . ;
+	. . ;SPEICHERN PRODUKTIONSENDE IN AUFTRAGSPOSITION UND AUFTRAG ;Save order line and order
+	. . ; DATUM/UHRZEIT/BEDIENER IN AUFTRAGSPOSITION/AUFTRAG ;Date/Time/User in Order Line/Order
+	. . IF TEIL="" IF AUFTRAG'="" DO
+	. . . IF POS'="" DO
+	. . . . SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,264) = +$HOROLOG
+	. . . . SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,265) = $PIECE($HOROLOG,",",2)
+	. . . . SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,266) = YBED
+	. . . SET $PIECE(^INAUF(YM,AUFTRAG,1),Y,253) = +$HOROLOG
+	. . . SET $PIECE(^INAUF(YM,AUFTRAG,1),Y,254) = $PIECE($HOROLOG,",",2)
+	. . . SET $PIECE(^INAUF(YM,AUFTRAG,1),Y,255) = YBED
+	. ;<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+	. ;
+	. ;BEDARF AUS DRP LÖSCHEN ;out of DRP Delete 	; D70
+	. IF $$$INVORGDRPActivated($GET(^INVORG(YM,YM,1)))=1 IF AUFTRAG'="" IF POS'="" DO
+	. . IF TEIL="" IF $DATA(^INAUFP(YM,AUFTRAG,POS,1)) DO
+	. . . NEW DEMAND
+	. . . SET SUCH="^INAUFPXL("_""""_YM_""""_","_""""_AUFTRAG_""""_","_POS_")"
+	. . . FOR  DO  QUIT:SUCH=""
+	. . . . SET SUCH=$QUERY(@SUCH)  ;UNTERTEILE
+	. . . . IF $TRANSLATE($PIECE(SUCH,",",2),"""")'=AUFTRAG SET SUCH="" QUIT  ;21.06.04;FAN;25794; WENN alphanumerischen Auftragsnummern SOLL DATEN AUCH AUFBAUEN.
+	. . . . ;IF $PIECE(SUCH,",",2)'=AUFTRAG SET SUCH="" QUIT  ;21.06.04;FAN;25794;  ;FALSCHER AUFTRAG
+	. . . . IF $PIECE(SUCH,",",3)=POS DO
+	. . . . . QUIT:$PIECE(@SUCH,Y,200)=""  ;KEINE DEMAND-NUMMER ;no 
+	. . . . . NEW SATZ,YFORM,YVOR,YOK
+	. . . . . SET DEMAND=$PIECE(@SUCH,Y,200)
+	. . . . . SET SATZ=$GET(^INDRPDEMAND(YM,BET,DEMAND,1))
+	. . . . . QUIT:SATZ=""
+	. . . . . SET $PIECE(SATZ,Y,99)=1  ;VORGANG ERLEDIGT
+	. . . . . ;
+	. . . . . ; FIXME : Do we want text stored in D115 with language hard-coded? <GRF>
+	. . . . . ;         Below as well
+	. . . . . ;
+	. . . . . SET $PIECE(SATZ,Y,115)=$$^WWWTEXT(33691)  ;PRODUKTION ABGESCHLOSSEN ;production 
+	. . . . . SET YOK=$$^WWWSPEI("INDRPDEMAND",BET_","_DEMAND,SATZ,1)  ;FIS;04.12.03
+	. . . . . ;DO ^WWWSKILL("INDRPDEMAND",BET_","_DEMAND,1)  ;LÖSCHEN SORTKEY
+	. . . . . ;SET $PIECE(^INDRPDEMAND(YM,BET,DEMAND,1),Y,99)=1  ;VORGANG ERLEDIGT
+	. . . . . ;DO ^WWWSSORT("INDRPDEMAND",BET_","_DEMAND)  ;NEUAUFBAU SORTKEY
+	. . ;
+	. . ;
+	. . IF TEIL'="" IF $DATA(^INAUFP(YM,AUFTRAG,POS,1)) DO
+	. . . NEW LENGTH,DEMAND
+	. . . ;
+	. . . ; FIXME : ? 3rd argument of INAUFPXL is Text.  Check whether $ql fails if
+	. . . ;           string is added without surrounding double quotes <GRF>
+	. . . ;           I think you can add double quotes around numeric values
+	. . . ;           without problems in $query loop.
+	. . . ;
+	. . . SET SUCH="^INAUFPXL("_""""_YM_""""_","_""""_AUFTRAG_""""_","_POS_","_TEIL_")"
+	. . . SET LENGTH=$QLENGTH(SUCH)
+	. . . FOR  DO  QUIT:SUCH=""
+	. . . . SET SUCH=$QUERY(@SUCH)  ;UNTERTEILE
+	. . . . IF $TRANSLATE($PIECE(SUCH,",",2),"""")'=AUFTRAG SET SUCH="" QUIT  ;21.06.04;FAN;25794; WENN alphanumerischen Auftragsnummern SOLL DATEN AUCH AUFBAUEN.
+	. . . . ;IF $PIECE(SUCH,",",2)'=AUFTRAG SET SUCH="" QUIT  ;21.06.04;FAN;25794;  ;FALSCHER AUFTRAG
+	. . . . IF $PIECE(SUCH,",",3)'=POS SET SUCH="" QUIT  ;FALSCHE POSITION
+	. . . . IF $PIECE(SUCH,",",4,LENGTH)=TEIL DO
+	. . . . . QUIT:$PIECE(@SUCH,Y,200)=""  ;KEINE DEMAND-NUMMER ;no 
+	. . . . . NEW SATZ,YFORM,YVOR,YOK
+	. . . . . SET DEMAND=$PIECE(@SUCH,Y,200)
+	. . . . . SET SATZ=$GET(^INDRPDEMAND(YM,BET,DEMAND,1))
+	. . . . . QUIT:SATZ=""
+	. . . . . SET $PIECE(SATZ,Y,99)=1  ;VORGANG ERLEDIGT
+	. . . . . SET $PIECE(SATZ,Y,115)=$$^WWWTEXT(33691)  ;PRODUKTION ABGESCHLOSSEN ;production 
+	. . . . . SET YOK=$$^WWWSPEI("INDRPDEMAND",BET_","_DEMAND,SATZ,1)  ;FIS;04.12.03
+	. . . . . ;DO ^WWWSKILL("INDRPDEMAND",BET_","_DEMAND,1)  ;LÖSCHEN SORTKEY
+	. . . . . ;SET $PIECE(^INDRPDEMAND(YM,BET,DEMAND,1),Y,99)=1  ;VORGANG ERLEDIGT
+	. . . . . ;DO ^WWWSSORT("INDRPDEMAND",BET_","_DEMAND)  ;NEUAUFBAU SORTKEY
+	
+	QUIT
+	
+	
+PostLabour(pidItem,pOrder,pLineItem,pPart,pWorkOrder,pLocn,pQty)
+	;-------------------------------------------------------------------------------
+	;	Finance TRANSACTION LBR/BDN
+	;
+	; History
+	; 31-Aug-2005	GRF		SR13215 : Revised calculation of LBR/BDN
+	; 24-Aug-2005	GRF		SR13191 : Pass Service Item to Finance
+	; 19-Aug-2005	GRF		SR13215 : Rename for clarity
+	; 18-Aug-2005	FIS		SR13183	: Save posted costs in Order Line Item
+	; 17-Aug-2005	FIS		SR13142
+	;-------------------------------------------------------------------------------
+	new BUCHUNG,Burden,intCalcPDA,intCost,intHrsCost,intOverhead,intPeriod,ItemGrp
+	new MachineNo,objSubPart,OK,ServiceItem,SubPart,TranType
+	
+	quit:$get(pidItem)=""
+	quit:$get(pOrder)=""
+	quit:$get(pLineItem)=""
+	
+	if $get(pLocn)="" set pLocn=$get(YLOCATION)
+	if +$get(pPart)=0 set pPart=""
+	
+	;calculate cost for labor by:  0=stamped time 1=stamped time if stamped only 2=always planned time
+	set intCalcPDA=+$$$INVORGServicesCalculationInCost($get(^INVORG(YM,YM,1)))  ;D168  ;dflt setup
+	if $piece($get(^INART(YM,pidItem,1)),Y,348)'="" set intCalcPDA=+$piece(^(1),Y,348)
+	if +intCalcPDA=0 quit                                                              ;WILL BE POSTED LATER
+	if +intCalcPDA=1 if $get(pWorkOrder)'="" quit:$$^INPROSTEMP0(pWorkOrder)'=0        ;WILL BE POSTED LATER
+	
+	//SEARCH FOR SERVICES OF THAT PART
+	set SubPart=$translate(pPart,",",".")_"."
+	
+	for  {
+		set SubPart=$order(^INAUFPT(YM,pOrder,pLineItem,SubPart))
+		quit:SubPart=""
+	;	quit:($EXTRACT(SubPart,1,$length($translate(pPart,",",".")_".")))'=($translate(pPart,",",".")_".")
+		
+		if pPart'="" quit:($extract(SubPart,1,$length($translate(pPart,",",".")_".")))'=($translate(pPart,",",".")_".")  ;FIS;18.08.05
+		if pPart'="" continue:$length(SubPart,".")'=($length(pPart,",")+2)
+		if pPart=""  continue:$length(SubPart,".")'=($length(pPart,",")+1)
+		
+		set objSubPart=$get(^INAUFPT(YM,pOrder,pLineItem,SubPart,1))
+		
+	;		D26		$$$INARTItemType()
+	;		D26		$$$INAUFPTItemType()	  2=Service
+		if $piece(objSubPart,Y,26)="" set $piece(objSubPart,Y,26)=$piece($get(^INART(YM,pidItem,1)),Y,26)
+		continue:$piece(objSubPart,Y,26)'=2    ;ONLY SERVICES
+		set ServiceItem = $piece(objSubPart,Y,4)                    ; SR13191
+		set intPeriod=$piece(objSubPart,Y,45)  ;time period as per order partlist
+		continue:+intPeriod=0
+		
+		;	D4		INAUFPT : Item Number (objSubPart)
+	;	set intCost    = $$^INARTKOSTT($piece(objSubPart,Y,4),$PIECE(objSubPart,Y,5),intPeriod)
+		set intCost    = $$^INARTKOSTT($piece(objSubPart,Y,4),,intPeriod)*pQty
+		set ItemGrp = $piece(objSubPart,Y,30)                                ;item group
+		if ItemGrp="" set ItemGrp = $$$INARTItemGroup($get(^INART(YM,pidItem,1)))       ; D30 ;item master
+		if ItemGrp="" set ItemGrp = $$$INVORGDefaultItemGroup($get(^INVORG(YM,YM,1)))   ; D13
+		if ItemGrp="" set ItemGrp = 1
+		
+		set BUCHUNG=""
+		set $piece(BUCHUNG,Y,2)  = +$HOROLOG        ;DATUM / DATE
+		set $piece(BUCHUNG,Y,16) = pLocn            ;BETRIEB / LOCATION
+		set $piece(BUCHUNG,Y,27) = pOrder           ;AUFTRAG / ORDER
+		set $piece(BUCHUNG,Y,28) = pLineItem        ;POSITION / L.I.
+	;	set $piece(BUCHUNG,Y,29) = pidItem          ;ARTIKEL / ITEM
+		set $piece(BUCHUNG,Y,29) = ServiceItem      ; Service          ; SR13191
+		set $piece(BUCHUNG,Y,32) = intPeriod        ;(QTY) PERIOD
+		set $piece(BUCHUNG,Y,42) = pidItem          ; Parent Item      ; SR13191
+		
+		set intHrsCost=0   ;default cost per hour
+		set intOverhead=0  ;proportional overhead/burden
+		set MachineNo   = $piece(objSubPart,Y,57)
+		
+		if MachineNo'="" {
+			;		D2		$$$INMASCHProductionCostPerHour()
+			;		D46		$$$INMASCHServiceOverhead()
+			set intHrsCost  = $piece($get(^INMASCH(YM,MachineNo,1)),Y,2)   ;production costs per hour from machine master
+			set intOverhead = $piece($get(^INMASCH(YM,MachineNo,1)),Y,46)  ;proportional Overhead costs
+		}
+		if (+intHrsCost=0 && $data(^INKALK(YM,pLocn,ItemGrp,1))) {  ;production costs as per default calculation of item group
+			set intHrsCost =$piece($get(^INKALK(YM,pLocn,ItemGrp,1)),Y,1)   ;FERTIGUNGSKOSTEN
+			set intOverhead=$piece($get(^INKALK(YM,pLocn,ItemGrp,1)),Y,40)  ;ANTEILIGE intOverheadOSTEN
+		}
+		
+		;TRANSACTION FOR 1: SERVICE AND 2: SERVICE OVERHEAD
+		;--------------------------------------------------
+		
+		; SR13215 replacing code
+		; ----------------------
+		set Burden=$justify(intPeriod*intOverhead/3600,0,2)*pQty     ;SERVICE OVERHEAD COSTS
+		;-----------------------------------
+		set TranType="LBR"
+		set $piece(BUCHUNG,Y,50)=TranType        ;TRANSACTION TYPE
+		set $piece(BUCHUNG,Y,3)=intCost-Burden
+		set OK=$$^INFIBBUCH(BUCHUNG,YLOCATION,"","",4)
+		do SaveService(pOrder,pLineItem,TranType,$piece(BUCHUNG,Y,3))  ;FIS;18.08.05;SR13183
+ 
+		; ----------------------------------
+		set TranType="BDN"
+		set $piece(BUCHUNG,Y,50)=TranType        ;TRANSACTION TYPE
+		set $piece(BUCHUNG,Y,3) = Burden
+		set OK=$$^INFIBBUCH(BUCHUNG,YLOCATION,"","",4)
+		do SaveService(pOrder,pLineItem,TranType,$piece(BUCHUNG,Y,3))  ;FIS;18.08.05;SR13183
+		
+		; SR13215 replaced code
+		; ---------------------
+	;	for TranType="LBR","BDN" {
+	;		set $piece(BUCHUNG,Y,50)=TranType        ;TRANSACTION TYPE
+	;		
+	;		if TranType="LBR" {  ;LBR = costs without overhead
+	;			if +intHrsCost=0 {
+	;				set $piece(BUCHUNG,Y,3)=intCost
+	;			} else {
+	;				set $piece(BUCHUNG,Y,3)=$justify(intCost-((intCost/intHrsCost)*intOverhead),0,2)  ;SERVICE COSTS
+	;			}
+	;		}
+	;		if TranType="BDN" {  ;BDN = overhead only
+	;			if +intHrsCost=0 {
+	;				set $piece(BUCHUNG,Y,3)=0
+	;			} else {
+	;				set $piece(BUCHUNG,Y,3)=$justify(((intCost/intHrsCost)*intOverhead),0,2)  ;SERVICE OVERHEAD COSTS
+	;			}
+	;		}
+	;		;post to finance
+	;		set OK=$$^INFIBBUCH(BUCHUNG,YLOCATION,"","",4)   ;SERVICE COSTS
+	;		do SaveService(pOrder,pLineItem,TranType,$piece(BUCHUNG,Y,3))  ;FIS;18.08.05;SR13183
+	;	}
+	}
+	quit
+	
+SaveService(pOrder,pLineItem,pTranType,pCost)
+	;-------------------------------------------------------------------------------
+	;	Save Posted costs in Order Line Item
+	; 
+	; History :
+	; 19-Aug-2005	GRF		SR13215 : Rename for clarity
+	; 18.Aug.2005	FIS		SR13183
+	;-------------------------------------------------------------------------------
+	NEW objLineItem,YFORM,YOK,YVOR
+	
+	quit:$GET(pOrder)=""
+	quit:$GET(pLineItem)=""
+	quit:$GET(pTranType)=""
+	quit:+$GET(pCost)=0
+	
+	SET objLineItem=$GET(^INAUFP(YM,pOrder,pLineItem,1))
+	
+	IF pTranType="LBR" {
+		SET $PIECE(objLineItem,Y,434)=($PIECE(objLineItem,Y,434)+pCost)
+		SET $PIECE(objLineItem,Y,436)=($PIECE(objLineItem,Y,436)+pCost)
+	}
+	IF pTranType="BDN" {
+		SET $PIECE(objLineItem,Y,435)=($PIECE(objLineItem,Y,435)+pCost)
+		SET $PIECE(objLineItem,Y,437)=($PIECE(objLineItem,Y,437)+pCost)
+	}
+	
+	SET YOK=$$^WWWSPEI("INAUFP",pOrder_","_pLineItem,objLineItem,1)
+	quit
+	
+	
+]]></Routine>
+</Export>

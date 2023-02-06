@@ -1,0 +1,842 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FININTBatch" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FININTBatch
+	
+#include COMSYS
+#include FINConst
+#include WWWConst
+ 
+#define Lock(%1)		lock +^FININTBatch(YM,%1):2
+#define UnLock(%1)		lock -^FININTBatch(YM,%1)#"I"
+ 
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^FININTBatch("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+	/*------------------------------------------------------------------------------
+	; FINANCE Interface Batch
+	; 
+	; History:
+	; 19-Sep-2005	GRF		SR13481 : include - FIN changed to COMSYS
+	; 11-Apr-2005	GRF		Correct comment
+	; 16-Feb-2005	GRF		Macro replacement of logical values
+	; 08-Jul-2003	SCR		Bug Fixes from Code Checking 
+	;-----------------------------------------------------------------------------*/
+	
+Allocate(&pidBatch,&pidBlock,pidBatchType="",pidLoc="",pdteTrans="",
+         pdteDoc="",pidUser="",pidDepartment="",pidSourceForm="",pidSourceRec="",
+         pSourceDetail="",pblnInterCompany="",pComment="")
+	;-------------------------------------------------------------------------------
+	; returns the current batch and blocknumber for an interface transaction
+	; 
+	;  1 pidBatch         	= byRef : Pass Back Batch Number
+	;  2 pidBlock      		= byRef : Pass Back Block Number
+	;  3 pidBatchType       = Type of Batch
+	;  4 pidLoc         	= Location code
+	;  5 pdteTrans        	= Transaction Date
+	;  6 pdteDoc          	= Document Date (Invoice Date) optional, will default to Trans Date
+	;  7 pidUser            = User Id, optional, will default to YBED
+	;  8 pidDepartment	    = User Department, optional, will default to user's Home Department.
+	;  9 pidSourceForm    	= The Source form id, used for drill down
+	; 10 pidSourceRec     	= The Source record id, used for drill down
+	; 11 pSourceDetail    	= Extra Detail for the transaction, See notes for format details
+	; 12 pblnInterCompany	=
+	; 13 pComment         	= Audit comment for special processing
+	; 
+	; Notes:
+	; 	The format of the pidSourceDetail is a comma delimited string.
+	; 	Piece one = language text id, remaining pieces contain parameters for the language text
+	; 	Example: The details = "FIN123,Miles,34,400.31"0 and Language Text FIN123 = "Supplier Invoice for %1, Number %2, Value %3" 
+	; 		would show Supplier Invoice for Miles, Number 34, Value 400.31
+	; 	The amount and type of details is dependent on the transaction type.
+	; 
+	; 
+	; History:
+	; 28-Jul-2009	GRF		Order macro removed
+	; 09-Mar-2007	JW		SR15184: Lock should be before posted check!
+	; 12-Feb-2007	JW		SR15184: Indexed location. Clean up. Locking.
+	; 10-Mar-2006	GRF		Doco above
+	; 09-Feb-2006	GRF		SR14105: Add pComment
+	; 25-Jan-2006	RPW		SR13087: Added the InterCompany details for then Batch.
+	; 							The fact it is intercompany is also on the
+	; 							BatchBlock for completeness.
+	; 06-Nov-2005	SCR		SR13578: Added Source details for drill down and display 
+	; 11-Aug-2005	SteveS	SR11476: Use Employee Group
+	; 30-May-2005	SCR		SR12220: Changed Default Department to use User Group
+	; 19-Apr-2005	SCR		SR11476: Added FININTBatchBlock, Document Date, User,
+	; 							Department, Location Code defaults to YLOCATION
+	; 21-Sep-2004	SCR		Bug in strStatus
+	; 02-Jul-2003	SCR		Increased Checking
+	; 08-May-2003	SCR		Default pidBatch & pintBlockNumber to Num
+	;-------------------------------------------------------------------------------
+	new blnInterCompany,objBlock,objBatch,strStatus,idxLocation,blnFound
+	
+	set strStatus = $$$OK
+	
+	if pidLoc="" set pidLoc = $get(YLOCATION)
+	if pidLoc="" {
+		set strStatus = $listbuild("Fin00185")                  ; "Interface Requires a Location"
+	
+	} elseif (pidBatchType="") || '$data(^WWW101(0,"FININTBATCHTYPE",SPRACHE,pidBatchType,1)) {
+		set strStatus = $listbuild("Fin00084",pidBatchType)     ; "Batch Type %1 does not exist . Contact support." 
+	
+	} elseif (pdteTrans="") {
+		set strStatus = $listbuild("Fin00183")                  ; "Interface requires a Date"
+	
+	} else {
+		if pdteDoc="" set pdteDoc = pdteTrans	
+ 		
+ 		set blnFound    = $$$NO
+ 		set idxLocation = $$$Index(pidLoc)
+ 		set pidBatch    = ""
+ 		for {
+	 		set pidBatch = $order(^FININTBatchs(YM,1,idxLocation,pidBatchType,pdteTrans,pidBatch),-1)
+	 		quit:pidBatch=""
+	 		
+ 	;***************************************
+ 			$$$Lock(pidBatch)
+ 			if $test {
+	 			if $$$FININTBatchPostedDate($get(^FININTBatch(YM,pidBatch,1)))="" {
+		 			set blnFound = $$$YES		// Got the lock, batch is unposted.
+	 			} else {
+					$$$UnLock(pidBatch)		// Batch is posted, look for next one
+	 			}
+		 	}
+	;***************************************
+ 			quit:blnFound
+ 		}
+ 		
+ 		;-----------------------------------
+ 		; At this point either :
+ 		;    blnFound = $$$YES and Lock
+ 		; or blnFound = $$$NO  and No Lock   
+ 		;-----------------------------------
+ 		
+		if 'blnFound { ;no un-posted batch exists for pidBatchType,pidLoc and Date
+			set pidBlock = 1
+			set blnInterCompany = pblnInterCompany
+			
+			set $$$FININTBatchBatchDate(objBatch) = pdteTrans
+			set $$$FININTBatchBatchType(objBatch) = pidBatchType
+			set $$$FININTBatchLocation(objBatch)  = pidLoc
+			
+			set pidBatch = $$^WWWNEXT("FININTBatch")
+ 	;***************************************
+			$$$Lock(pidBatch)				                // This should always succeed.
+ 	;***************************************
+			if '$test {
+				set strStatus = $$$AppError("P0060000013")	// "Lock could not be acquired."   FIXME : inappropriate idError <GRF>
+			}  ; "Internal Application Error|Code: %1|Please click on the link ´support@disclinc.com´ below to report this error."
+		} else {
+			set objBatch		= $get(^FININTBatch(YM,pidBatch,1))
+			set pidBlock     	= $$$FININTBatchLastBlockNumber(objBatch)+1
+			set blnInterCompany = pblnInterCompany || $$$FININTBatchInterCompany(objBatch)
+		}
+		
+		
+		if $$$ISOK(strStatus) {
+			set $$$FININTBatchLastBlockNumber(objBatch) = pidBlock
+			set $$$FININTBatchInterCompany(objBatch)    = blnInterCompany
+			set $$$FININTBatchStatus(objBatch)          = $$$EnumFINSYSSTATUSProcessing
+			
+			set strStatus = $$$Save("FININTBatch",pidBatch,objBatch,$$$YES)
+			
+			if $$$ISOK(strStatus) {
+				if pidUser="" set pidUser = $get(YBED)
+				if (pidDepartment="") && (pidUser'="") {
+					set pidDepartment = $$$WWW013HomeDepartment($get(^WWW013(0,pidUser,1)))
+				}
+				set $$$FININTBatchBlockTransactionDate(objBlock) = pdteTrans
+				set $$$FININTBatchBlockDocumentDate(objBlock)    = pdteDoc
+				set $$$FININTBatchBlockUser1(objBlock)           = pidUser
+				set $$$FININTBatchBlockDepartment(objBlock)      = pidDepartment
+				set $$$FININTBatchBlockSourceForm(objBlock)      = pidSourceForm
+				set $$$FININTBatchBlockSourceRec(objBlock)       = pidSourceRec
+				set $$$FININTBatchBlockSourceDetails(objBlock)   = pSourceDetail
+				set $$$FININTBatchBlockInterCompany(objBlock)    = pblnInterCompany
+				set $$$FININTBatchBlockComment(objBlock)         = pComment
+		 		set $$$FININTBatchBlockStatus(objBlock)          = $$$EnumFINSYSSTATUSProcessing
+		 		
+				set strStatus = $$$Save("FININTBatchBlock",pidBatch_","_pidBlock,objBlock,$$$YES)
+				
+				/*	SR14615: TODO JW - reverted for build
+				if $$$ISOK(strStatus) && (pidSourceForm'="") {
+					set strStatus = $$Update^COMFINSource("FININTBatchBlock",pidBatch_","_pidBlock,pidSourceForm,pidSourceRec)
+				}
+				*/
+			}
+	;***************************************
+			$$$UnLock(pidBatch)								// REMOVE LOCK
+	;***************************************
+		}
+	}
+	quit strStatus
+	
+	
+AddLine(pidBatch		,pintBlockNumber		,pidAccount="",
+		pcurAmount		,pidInterfaceType=""	,pstrParameters,
+		pstrSource		,pstrReference			,pblnReverse=$$$NO,
+		pstrUser=""		,pstrDepartment=""		,pstrCSTMat="",
+		pstrCSTVals=""	,pidCompany=""			,pidCompanyAccount="",
+		pstrCleared=""	)
+	;-------------------------------------------------------------------------------
+	; Add a line the Interface
+	; 
+	; Inputs :
+	;   pstrCSTVals = CharValueList_Y_SourceLocn_Y_SourceGroup
+	;   
+	;   Validation of pidInterfaceType must occur in the calling routine since no status
+	;   set if null.
+	; 
+	; History
+	; 13-Mar-2007	GRF		SR15474: treat pstrCSTVals as three separate variables; hilight locks
+	; 13-Feb-2007	JW		SR15184: Locking.
+	; 27-Oct-2006	RPW		SR14761: If the user or department is empty, get them from
+	; 						the block record.
+	; 15-Jun-2006	RPW		SR14642: Added pstrCleared for Bank Reconciliation
+	; 21-Mar-2006	JW		SR14384: Add interface type to error message if can.
+	; 23-Jan-2006	RPW		SR13087: Set the InterCompany Details
+	; 24-Jun-2005	JW		SR12627: Use same validation as transactions
+	; 16-Feb-2005	GRF		ST10478: Preserve Characteristics in Batch Line;
+	; 						build objBatchLine first
+	; 14-Jan-2005	PO		SR11476 Add User and Department fields.
+	; 02-Jun-2004	shobby	FC changes.
+	; 24-May-2004	SCR		Foreign Currency Update
+	; 11-May-2004	shobby	FININTInterface Type is shared.
+	; 20-Apr-2004	shobby	Use the test for PostZero amounts when the amount is zero.
+	; 27-Feb-2004	shobby	Flag to allow reversing of previous transactions.
+	; 23-Feb-2004	shobby	New Major block number field.
+	; 23-Feb-2004	shobby	Use Minor block number 
+	; 02-Dec-2003	shobby	Commented the language text for Fin00193
+	; 03-Jul-2003	shobby	Check that the account exists. (TrackRecord 005531)
+	; 02-Jun-2003	SCR		Added Debug Message
+	;-------------------------------------------------------------------------------
+	new intBlockNumberMajor,intBlockNumberMinor,intLineNumber
+	new objBatchLine,objFININTInterfaceType,strBatchLineKey,strProfileGroup,strProfileLocn,strStatus
+	new blnConsolidateOnReference,objBlock
+	
+	$$$LogR("AddLine",pidAccount_"<"_pidInterfaceType_"<"_pcurAmount_"<")
+	
+	set strProfileGroup = $piece(pstrCSTVals,Y,3)
+	set strProfileLocn  = $piece(pstrCSTVals,Y,2)
+	set pstrCSTVals     = $piece(pstrCSTVals,Y,1)
+	
+	set strStatus = $$ValidateAccount^FINGLAccountTran(pidAccount,pidInterfaceType)
+	
+	if (pidInterfaceType'="") {
+		set objFININTInterfaceType = $get(^FININTInterfaceType(0,pidInterfaceType,1))
+		
+		if $$$ISERR(strStatus) {
+			; "%1. The Interface Type of the line is %3 (%2) and the Amount is %4."
+			set strStatus = $listbuild("Fin01006",$$$Text(strStatus),
+										pidInterfaceType,
+										$$$FININTInterfaceTypeDescription(objFININTInterfaceType),
+										$$FormatCurrency^COMTable(pcurAmount,,$$$FCur(pcurAmount)))
+			
+		} else {
+		;	Zero amounts are not included in a batch unless specifically required
+			if (+pcurAmount'=0) || ($$$FININTInterfaceTypePostZero(objFININTInterfaceType)) {
+				if pblnReverse set pcurAmount=$$$FCSign(pcurAmount)
+				if $io["|TNT|" write "AddLine: ",pidAccount,?20,$justify(pcurAmount,10)," :",pidInterfaceType,":",pstrParameters,":",pstrSource,":",pstrReference,!
+				set pcurAmount          = $$$FCRound(pcurAmount)
+				set intBlockNumberMajor = $piece(pintBlockNumber,".",1)
+				set intBlockNumberMinor = $piece(pintBlockNumber,".",2)
+				
+				// Populate the user and department if they are empty
+				if (pstrUser="") || (pstrDepartment="") {
+					set objBlock = $get(^FININTBatchBlock(YM,pidBatch,intBlockNumberMajor,1))
+					if pstrUser=""       set pstrUser       = $$$FININTBatchBlockUser1(objBlock)
+					if pstrDepartment="" set pstrDepartment = $$$FININTBatchBlockDepartment(objBlock)
+				}
+				
+				set $$$FININTBatchLineBlockNumber(objBatchLine)      = pintBlockNumber
+				set $$$FININTBatchLineAccount(objBatchLine)          = pidAccount
+				set $$$FININTBatchLineAmount(objBatchLine)           = pcurAmount
+				set $$$FININTBatchLineInterfaceType(objBatchLine)    = pidInterfaceType
+				set $$$FININTBatchLineParameters(objBatchLine)       = pstrParameters
+				set $$$FININTBatchLineSource(objBatchLine)           = pstrSource
+				set $$$FININTBatchLineReference(objBatchLine)        = pstrReference
+				set $$$FININTBatchLineBlockNumberMinor(objBatchLine) = intBlockNumberMinor
+				set $$$FININTBatchLineBlockNumberMajor(objBatchLine) = intBlockNumberMajor
+				set $$$FININTBatchLineUser1(objBatchLine)            = pstrUser
+				set $$$FININTBatchLineDepartment(objBatchLine)       = pstrDepartment
+				set $$$FININTBatchLineCostMatrixKeys(objBatchLine)   = pstrCSTMat
+				
+				set $$$FININTBatchLineCostMatrixValues(objBatchLine) = pstrCSTVals
+				set $$$FININTBatchLineProfileLocation(objBatchLine)  = strProfileLocn
+				set $$$FININTBatchLineProfileGroup(objBatchLine)     = strProfileGroup
+				
+				set $$$FININTBatchLineCompanyAccount(objBatchLine)   = pidCompanyAccount
+				set $$$FININTBatchLineCompany1(objBatchLine)         = pidCompany
+				set $$$FININTBatchLineCleared(objBatchLine)          = pstrCleared
+				
+ 	;***************************************
+				$$$Lock(pidBatch)
+				if $test {
+					set intLineNumber = $order(^FININTBatchLine(YM,pidBatch,""),-1)+1
+					set strStatus     = $$$Save("FININTBatchLine",pidBatch_","_intLineNumber,objBatchLine,$$$YES)
+					$$$UnLock(pidBatch)
+	$$$LogRx("BL:"_objBatchLine)
+
+				} else {
+					set strStatus = $$$AppError("P0060000013")	// Lock could not be acquired.  ; FIXME - see above.
+				}  ; "Internal Application Error|Code: %1|Please click on the link ´support@disclinc.com´ below to report this error."
+ 	;***************************************
+			}
+		}
+	}
+	quit strStatus
+	
+	
+SubBlockNumber(&pidBlock)
+	;-------------------------------------------------------------------------------
+	; Increment Sub Block Number
+	;-------------------------------------------------------------------------------
+	set $piece(pidBlock,".",2)=$piece(pidBlock,".",2)+1
+	quit
+	
+	
+PostBlock(pidBatch,pidBlock,pstrDetail) ;,pcurBalance=0
+	;-------------------------------------------------------------------------------
+	; Posts a block of lines
+	; 
+	; Params: pstrDetail - (optional) update source detail piece
+	; 
+	; History
+	; 28-Jul-2009	GRF		Remove Order macros
+	; 13-Feb-2007	JW		SR15184: Locking. Clean up.
+	; 24-Oct-2006	JW		SR15101: Index Batch number! Use Order macros.
+	; 09-Jun-2006	SC		SR14506: Added error checking inside loop. Stop errors
+	; 							being overwritten.
+	; 15-May-2006	JW		SR14615: Added pstrDetail param
+	; 11-Oct-2005	PO		SR13611: Removed curFCAmount as nolonger used
+	; 19-Apr-2005	SCR		SR:11476 Update Posted Date/Time on ^FININTBatchBlock
+	; 19-Apr-2005	Paul K	SR11349 Get current total now returns FC Amount
+	; 23-Aug-2004	SCR		Consider FC when checking Total = 0 (+Total)
+	; 23-Feb-2004	shobby	Reworked - Block may be divided into two parts (MajMin)
+	; 01-Jul-2003	SCR		Swapped AR to New Processing
+	; 12-Jun-2003	SCR		^FININTInterfaceType fix
+	; 10-Jun-2003	SCR		Handle Sub block numbers
+	; 04-Jun-2003	SCR		Added Error Trapping
+	; 21-May-2003	shobby	Some adjustments for Supplier Adjustments.
+	; 08-May-2003	SCR		Code Update
+	;-------------------------------------------------------------------------------
+	new objBlock,curFCAmount,idxBlockMinor,LineNumber,NextBlock,Rec
+	new strStatus,SubLedType,Total,Type,TypeRec,idxBatch,objBatch
+	
+	$$$LogR("PostBlock",pidBatch_","_pidBlock)
+	
+	set $ztrap="PostBlockError"
+	
+	set strStatus = $$$OK
+	set pidBlock  = pidBlock\1
+	
+	set Total = $$GetCurrentTotal(pidBatch,pidBlock) ; ,.curFCAmount
+	if (+Total'=0) {
+		set strStatus = $listbuild("Fin00059",Total) ; "Balance must be zero (%1)"
+	
+	} else {
+	 	set idxBatch      = $$$Index(pidBatch)
+	 	set idxBlockMinor = ""
+	 	for {
+		 	set idxBlockMinor = $order(^FININTBatchLines(YM,1,idxBatch,pidBlock,idxBlockMinor))  ; FININTBatchLine Index 1
+		 	quit:idxBlockMinor=""
+		 	
+ 			set LineNumber = ""
+ 			for {
+	 			set LineNumber = $order(^FININTBatchLines(YM,1,idxBatch,pidBlock,idxBlockMinor,pidBatch,LineNumber))
+	 			quit:LineNumber=""
+ 				quit:$$$ISERR(strStatus)
+ 				
+				set Rec  = $get(^FININTBatchLine(YM,pidBatch,LineNumber,1))
+				set Type = $$$FININTBatchLineInterfaceType(Rec)
+	
+				; New Process Model
+				set TypeRec=""
+				if Type'="" set TypeRec = $get(^FININTInterfaceType(0,Type,1))
+				
+				set SubLedType = $$$FININTInterfaceTypeSubLedgerInterface(TypeRec)
+				if SubLedType=$$$EnumFININTLINESLINTCustomer {
+					set strStatus = $$CreateInvoice^FINARInvoice(pidBatch,LineNumber)
+				
+				} elseif SubLedType=$$$EnumFININTLINESLINTSupplier {
+					set strStatus = $$CreateInvoice^FINAPInvoice(pidBatch,LineNumber)
+				}
+ 			}
+	 	}
+ 		
+		if $$$ISOK(strStatus) {
+			set objBlock = $get(^FININTBatchBlock(YM,pidBatch,pidBlock,1))
+			set $$$FININTBatchBlockPostedDate(objBlock) = $horolog
+			set $$$FININTBatchBlockStatus(objBlock)     = $$$EnumFINSYSSTATUSPosted
+			set:$get(pstrDetail)'="" $$$FININTBatchBlockSourceDetails(objBlock) = pstrDetail
+			set strStatus = $$$Save("FININTBatchBlock",pidBatch_","_pidBlock,objBlock,$$$YES)
+			
+	$$$LogRx("BB:"_objBlock)
+			
+		;-----------------------------------
+		;  The Batch Status is set to "Processing" while a block is being entered.
+		;  When a block is closed, a check is made to see whether all the other
+		;  blocks in the batch are closed.
+		;  
+		;  If this is the case the Batch Status is set to "Unposted" allowing the
+		;  batch to be posted to the general ledger by either a background or a
+		;  user-initiated process.
+		;-----------------------------------
+			if $$$ISOK(strStatus) {
+ 	;***************************************
+				$$$Lock(pidBatch)
+				if $test {
+					if '$data(^FININTBatchBlocks(YM,1,$$$EnumFINSYSSTATUSProcessing,pidBatch)) {
+						set objBatch = $get(^FININTBatch(YM,pidBatch,1))
+						set $$$FININTBatchStatus(objBatch) = $$$EnumFINSYSSTATUSUnposted
+						set strStatus = $$$Save("FININTBatch",pidBatch,objBatch,$$$YES)
+	$$$LogRx("B:"_objBatch)
+					}
+					$$$UnLock(pidBatch)
+				}
+ 	;***************************************
+			}
+		}
+	}
+	quit strStatus
+	
+PostBlockError		; "Internal Tag"	
+	;-------------------------------------------------------------------------------
+	; Returns: status
+	;
+	; History:
+	; 13-Feb-2007	JW		SR15184: Added ztrap, unlock, internationalise.
+	;-------------------------------------------------------------------------------
+	set $ztrap = ""
+	;***************************************
+	$$$UnLock(pidBatch)
+	;***************************************
+	set strStatus = $$Error^FINSYS($$$Text("Fin01088"))	; "Post Interface Block"
+	quit strStatus
+	
+	
+GetCurrentTotal(pidBatch,pintBlockMajor) ; ,pcurTotal=0
+	;-------------------------------------------------------------------------------
+	; Sums the totals base amount of a batch and Block
+	; 
+	; Inputs :
+	;	pidBatch
+	;	pintBlockMajor
+	; 
+	; History:
+	; 28-Jul-2009	GRF		Remove Order macros
+	; 24-Oct-2006	JW		SR15101: Index Batch number! Use Order macros.
+	; 11-Oct-2005	PO		SR13611: Replaced pcurTotal with curTotal and now using FCBase macro
+	; 17-Jun-2005	SCR		SR12670 Revert back to Base Currency
+	; 19-Apr-2005	PK/PO	SR11349 Also return the foreign currency total.
+	; 07-Apr-2005	PK		Foreign currency should not be used at this point,
+	;                       	Base Amounts must equal zero to post.
+	; 18-Jun-2004	shobby	Foreign Currency
+	; 23-Feb-2004	shobby	Change to handle the fact that Major and Minor block
+	; 							numbers are now stored in two fields.
+	; 19-Feb-2004	shobby	Fixed the $ordering through indexes which contain a .
+	; 29-Jun-2003	SCR		Bug Fix
+	; 10-Jun-2003 	SCR		Handle Block Numbers
+	;-------------------------------------------------------------------------------
+	new curTotal,idxBatch,intBlockMinor,intLineNumber,objBatchLine
+	
+	if $get(pintBlockMajor)="" set pintBlockMajor = " "
+	set curTotal = 0
+	set idxBatch = $$$Index(pidBatch)
+	
+	set intBlockMinor = ""
+	for {
+		set intBlockMinor = $order(^FININTBatchLines(YM,1,idxBatch,pintBlockMajor,intBlockMinor))
+		quit:intBlockMinor=""
+		
+		set intLineNumber = ""
+		for {
+			set intLineNumber = $order(^FININTBatchLines(YM,1,idxBatch,pintBlockMajor,intBlockMinor,pidBatch,intLineNumber))
+			quit:intLineNumber=""
+			
+			set objBatchLine = $get(^FININTBatchLine(YM,pidBatch,intLineNumber,1))
+ 			; This must be in Base currency, not foreign currency 2005-Apr-07 PJK.
+			set curTotal = curTotal+$$$FCBase($$$FININTBatchLineAmount(objBatchLine)) ;SR12670 Use base amount only.
+			;set pcurFCAmount=pcurFCAmount+$$$FCAmount($$$FININTBatchLineAmount(objBatchLine)) ; TODO: Var Inv Price is missed here
+		}
+	}
+	
+	quit curTotal
+	
+	
+PostBatches(pstrBatchType)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 22-Feb-2005	Paul K	Reduce incidence of calling WWWVAR
+	; 10-Aug-2004	shobby	SR10138: Removed transaction commands.  Already done
+	; 							inside PostBatch
+	;-------------------------------------------------------------------------------
+	new idBatch,lngProcessed,lngUnProcessed,strMessage,strStatus
+	
+	if $get(Y)="" do ^WWWVAR // TODO: MUST NOT be here, if for dev purposes put in DEV code
+	
+	set lngProcessed   = 0
+	set lngUnProcessed = 0
+	
+	set idBatch = ""
+	for {
+		set idBatch = $order(^FININTBatchs(YM,2,pstrBatchType," ",idBatch))
+		quit:idBatch=""
+		
+		set strStatus = $$PostBatch(idBatch)
+		if $$$ISOK(strStatus) {
+			do RemoveError^COMUtilError("FININTBatch",idBatch)
+			set lngProcessed = lngProcessed+1
+		} else {
+			do RaiseError^COMUtilError(strStatus,"FININTBatch",idBatch)
+			set lngUnProcessed = lngUnProcessed+1
+		}
+	}
+	
+	; "For Batch Type %1. %2 successful. %3 unsuccessful."
+	set strMessage = $$$Text($listbuild("Fin00092",pstrBatchType,lngProcessed,lngUnProcessed))
+	quit strMessage
+	
+	
+Post(pidBatch)
+    ;-------------------------------------------------------------------------------
+    ; Post Batch from @netManager form.
+    ;
+    ; Returns:strStatus
+    ;
+    ; History:
+    ; 12-Feb-2007	JW		SR15184: Cleaned up.
+    ; 30-Mar-2004	Paul K	Remove associated errors if successful.
+    ;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$PostBatch(pidBatch)
+	if $$$ISERR(strStatus) {
+		$$$Error(strStatus)
+	} else {
+		do RemoveError^COMUtilError("FININTBatch",pidBatch)
+		do ReloadForm^COMUtilForm()
+	}
+	quit strStatus
+	
+	
+IsBatchPostable(pidBatch)
+	;-------------------------------------------------------------------------------
+	; Check whether a batch can be posted before attempting to Post the batch,
+	; so as not to rely so much on Transaction Rollback if something goes wrong.
+	;
+	; History
+	; 28-Jul-2009	GRF		Remove Order macros
+	; 13-Feb-2007	JW		SR15184: Cleaned up. Check processing flag.
+	; 10-Aug-2004	shobby	Creation (SR10138) 
+	;-------------------------------------------------------------------------------
+	new strStatus,intLine,idInterfaceType,objFININTBatchLine
+	
+	set strStatus = $$Editable^FINSYSReview("FININTBatch",$$$FININTBatchStatus($get(^FININTBatch(YM,pidBatch,1))))
+	
+	if $$$ISOK(strStatus) {
+		set intLine = ""
+		for {
+			set intLine = $order(^FININTBatchLine(YM,pidBatch,intLine))
+			quit:intLine=""
+			
+			set objFININTBatchLine = $get(^FININTBatchLine(YM,pidBatch,intLine,1))
+			set idInterfaceType = $$$FININTBatchLineInterfaceType(objFININTBatchLine)  ;interface type
+			if '$data(^FININTInterfaceType(0,idInterfaceType,1)) {
+				set strStatus = $listbuild("Fin00083",idInterfaceType)  ; "Interface Type %1 does not exist. Contact support."
+			}
+			quit:$$$ISERR(strStatus)
+		}
+	}
+	
+	quit strStatus
+	
+	
+PostBatch(pidBatch,pstrTranType="BATCH",&pidTran=0)
+	;-------------------------------------------------------------------------------
+	; Post Batch to GL
+	; 
+	; History:
+	; 28-Jul-2009	GRF		Remove Order macros
+	; 09-Mar-2007	JW		SR15184: Lock should be before postable check!
+	; 13-Feb-2007	JW		SR15184: Cleaned up. Locking.
+	; 13-Jun-2006	RPW		SR14642: Added pstrTranType to allow non BATCH types to
+	; 							post correctly & pidTran to return the transaction id
+	; 28-Feb-2006	PO		SR14225: Store transaction date on the Interface Line
+	; 25-Jan-2006	RPW		SR13087: On error ROLLBACK the transaction
+	; 30-Nov-2005	Steve S	SR13936: Ensure tran line is stored, otherwise return error
+	; 18-Oct-2005	Steve S	SR13216: Store the tran line number as well
+	; 24-May-2005	Paul K	SR12244: call to GetTransactionDate - history added by PO
+	; 21-Jun-2005	SCR		SR12692: Change Call to CreateLine^FINGLTran (Reason
+	; 							parameter deleted)
+	; 17-Jun-2005	SCR		SR12670: Clear off FC amount when GL Account is not an FC
+	; 10-Jun-2005	PO		SR12523: Pass through interface type when posting
+	; 24-May-2005	Paul K	SR12244: Set the TransactionDate Property
+	; 11-Aug-2004	shobby	SR10138: Check whether a batch can be posted before
+	; 							attempting to post
+	; 25-Jun-2004	shobby	Foreign Currency.
+	; 30-Jul-2003	shobby	Quit out of the for loop when an error is found.
+	; 29-Jul-2003	SCR		Bug Fix on Posted Check
+	; 13-Jun-2003	shobby	Defined variables
+	; 12-Jun-2003	SCR		already posted check & Transaction processing &
+	; 						^FININTInterfaceType Update fix
+	;-------------------------------------------------------------------------------
+	set $ztrap="PostBatchError"
+	
+	new blnConsolidate,curAmount,curCredit,curDebit,dteTransactionDate,FCCode
+	new idAccount,idCompany,idCompanyAccount,idInterfaceType,idTran,idTranLine
+	new intLineNumber,objBatch,objFININTBatchLine,Posted
+	new strCleared,strReference,strStatus
+	
+	;***************************************
+	$$$Lock(pidBatch)
+	;***************************************
+	if $test {
+		set strStatus = $$IsBatchPostable(pidBatch)
+		if $$$ISOK(strStatus) {
+	;+++++++++++++++++++++++++++++++++++++++
+			tstart
+	;+++++++++++++++++++++++++++++++++++++++
+			set objBatch = $get(^FININTBatch(YM,pidBatch,1))
+			set dteTransactionDate = $$GetTransactionDate($$$FININTBatchBatchDate(objBatch),$$$FININTBatchBatchType(objBatch))  ;Batch Date
+			set $$$FININTBatchTransactionDate(objBatch) = dteTransactionDate
+			
+			set strStatus = $$Create^FINGLTran(.idTran,pidBatch_",FININTBatch",dteTransactionDate,pstrTranType,"BAL",$$$FININTBatchInterCompany(objBatch))
+			
+			if $$$ISOK(strStatus) {
+				set $$$FININTBatchStatus(objBatch)            = $$$EnumFINSYSSTATUSPosted
+				set $$$FININTBatchPostedDate(objBatch)        = $horolog
+				set $$$FININTBatchLedgerTransaction(objBatch) = idTran
+				set strStatus = $$$Save("FININTBatch",pidBatch,objBatch,$$$YES)
+			}
+			;*******************************
+			$$$UnLock(pidBatch)		//SR15184
+			;*******************************
+			
+			if $$$ISOK(strStatus) {
+				set intLineNumber = ""
+				for {
+					set intLineNumber = $order(^FININTBatchLine(YM,pidBatch,intLineNumber))
+					quit:intLineNumber=""
+					
+					set objFININTBatchLine = $get(^FININTBatchLine(YM,pidBatch,intLineNumber,1))
+					set idAccount    = $$$FININTBatchLineAccount(objFININTBatchLine)
+					set strReference = $$$FININTBatchLineReference(objFININTBatchLine)
+					set curDebit     = 0
+					set curCredit    = 0
+					set curAmount    = $$$FININTBatchLineAmount(objFININTBatchLine)
+					set FCCode 		 = $$GetFCCode^FINGLFC(idAccount)
+					if FCCode=""   set curAmount = +curAmount
+					if curAmount>0 set curDebit  = curAmount
+					if curAmount<0 set curCredit = $$$FCSign(curAmount)
+					set idInterfaceType  = $$$FININTBatchLineInterfaceType(objFININTBatchLine)  ;interface type
+					set idCompany        = $$$FININTBatchLineCompany1(objFININTBatchLine)
+					set idCompanyAccount = $$$FININTBatchLineCompanyAccount(objFININTBatchLine)
+					set strCleared       = $$$FININTBatchLineCleared(objFININTBatchLine)
+					
+					set blnConsolidate = $$$FININTInterfaceTypeConsolidate($get(^FININTInterfaceType(0,idInterfaceType,1)))  ;whether consolidate this line or not.
+					set strStatus = $$CreateLine^FINGLTran(idTran,idAccount,curDebit,curCredit,strReference,blnConsolidate,strCleared,idInterfaceType,,,,idCompany,idCompanyAccount) ; SR12523: SR12692 // SR14642
+					
+					; SR13936
+					if $$$ISOK(strStatus) {
+						set idTranLine = $get(^CacheTempTranLine(YUSER))
+						if idTranLine="" {
+							set strStatus = $listbuild("Fin00942",pidBatch,intLineNumber)  ; "No transaction line data - Batch %1, Line %2."	
+						} else {
+							set $$$FININTBatchLineTranLine(objFININTBatchLine)        = idTranLine
+							set $$$FININTBatchLineGLEffectiveDate(objFININTBatchLine) = dteTransactionDate
+							set strStatus = $$$Save("FININTBatchLine",pidBatch_","_intLineNumber,objFININTBatchLine,$$$YES)		
+						}
+					}
+					quit:$$$ISERR(strStatus)
+				}
+				
+				if $$$ISOK(strStatus) {
+					set strStatus = $$Post^FINGLTran(idTran)
+				}
+			}
+			
+	;+++++++++++++++++++++++++++++++++++++++
+			if $$$ISOK(strStatus) {
+				if $tlevel>0 tcommit
+				set pidTran = idTran
+			} else {
+				trollback
+			}
+	;+++++++++++++++++++++++++++++++++++++++
+		}
+	} else {
+		set strStatus = $$$MakeStatus("Fin00943")  ; "Please wait, processing data"
+	}
+	quit strStatus
+	
+PostBatchError		; "Internal Tag"	
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; Returns:
+	;
+	; History:
+	; 09-Mar-2007	JW		SR15184: Put rollback back in.
+	; 13-Feb-2007	JW		SR15184: Added ztrap, unlock, message.
+	;-------------------------------------------------------------------------------
+	set $ztrap = ""
+	;***************************************
+	$$$UnLock(pidBatch)
+	;***************************************
+	set strStatus = $$Error^FINSYS($$$Text("Fin01089"))	; "Post Interface Batch"
+	trollback
+	quit strStatus
+	
+	
+GetTransactionDate(pdteBatchDate,pidBatchType="",&pblnMove=$$$NO)
+	;-------------------------------------------------------------------------------
+	; If the all periods are closed for the batch date and the batch type allows date forwarding
+	; find the first date in the future that has all open periods.
+	;
+	; ByRefs:
+	; pblnMove: If there is a requirement to determine if this should be moved or not, return it here.
+	; 
+	; Returns:Date
+	;
+	; History:
+	; 13-Jul-2006	JW		SR14836: Corrected active check.
+	; 27-Jun-2006	RPW		SR13173: Return whether the date can be moved.
+	; 30-May-2005	PO		SR12774: Included check for whether Period Type is active
+	; 24-May-2005	Paul K	Created SR:12244
+	;-------------------------------------------------------------------------------
+	new dteEndDate,dteStartPeriod,idPeriod,objPeriod,strPeriodType
+	
+	; FIXME : Are the wrong macros specified but the data pieces
+	;         correct or has the wrong global been used for
+	;         objPeriod as comments above suggest? <GRF>       see SR16414
+	
+	if pidBatchType'="" {
+		set pblnMove = +($$$FININTBatchTypeMoveTransactionDateAround($get(^FININTBatchType(YM,pidBatchType,1))))
+	 	
+		if pblnMove {
+			for {
+				set strPeriodType = ""
+				for {
+					set strPeriodType = $order(^FINGLPeriods(YM,3,strPeriodType))
+					quit:strPeriodType=""
+					
+					set dteStartPeriod = $order(^FINGLPeriods(YM,3,strPeriodType,pdteBatchDate+1),-1)
+					quit:dteStartPeriod=""
+					
+					set idPeriod  = $order(^FINGLPeriods(YM,3,strPeriodType,dteStartPeriod,""))
+					set objPeriod = $get(^FINGLPeriodType(YM,idPeriod,1))
+					continue:'$$$FINGLPeriodTypeActive1(objPeriod)
+					
+					set dteEndDate = $$$FINGLPeriodEndDate(objPeriod) ; FIXME : D3 from FINGLPeriod is StartDate in FINGLPeriodType <GRF>
+					
+					if dteEndDate>=pdteBatchDate {
+						quit:'$$$FINGLPeriodOpentoPosting(objPeriod)  ; FIXME : D6 from FINGLPeriod is Active in FINGLPeriodType <GRF>
+					}
+	 
+				}
+				quit:strPeriodType=""
+				set pdteBatchDate = pdteBatchDate+1
+			}
+		}
+	}
+	
+	quit pdteBatchDate
+	
+	
+DummySupInv()
+	;-------------------------------------------------------------------------------
+	;
+	; History:
+	; 10-Mar-2005	RPW		Fixed TCOMMIT and TROLLBACK (SR11273)
+	;-------------------------------------------------------------------------------
+	new strStatus,idBatch,intBlockNumber
+	
+	;++++++++++++++++++++++++++++++++++++++++
+	tstart
+	;++++++++++++++++++++++++++++++++++++++++
+	
+	set idBatch        = ""
+	set intBlockNumber = ""
+	
+	set strStatus = $$Allocate^FININTBatch(.idBatch,.intBlockNumber,"SPINV",1,+$h)
+	if $$$ISOK(strStatus) set strStatus = $$AddLine^FININTBatch(idBatch,intBlockNumber,125,-5,"COGS","","TestID","Some Ref")
+	if $$$ISOK(strStatus) set strStatus = $$AddLine^FININTBatch(idBatch,intBlockNumber,128,5,"SOH","","TestID","Some Ref")
+	if $$$ISOK(strStatus) set strStatus = $$PostBlock^FININTBatch(idBatch,intBlockNumber)
+	if $$$ISOK(strStatus) set strStatus = $$PostBatch^FININTBatch(idBatch)
+	
+	
+	;++++++++++++++++++++++++++++++++++++++++
+	if $$$ISOK(strStatus) {
+		if $tlevel>0 tcommit
+	} else {
+		trollback
+	}
+	;++++++++++++++++++++++++++++++++++++++++
+	quit strStatus
+	
+	
+OnAfterDataFields(Key,pYPARA)
+	;-------------------------------------------------------------------------------
+	; Different displays at bottom of form depending on which tab is active
+	; 
+	; History
+	; 25-Oct-2006	JW		SR15101: Moved code to FININTBatchQuery
+	; 23-Mar-2005	shobby	Renamed from AfterDataFields.
+	;-------------------------------------------------------------------------------
+	if YSEITE=2 {
+		do LineQuery^FININTBatchQuery(Key,pY]]><![CDATA[PARA)
+	}
+	do BlockQuery^FININTBatchQuery(Key)
+	
+	quit
+	
+	
+CleanBatches(pidFromAccount,pidToAccount)
+	new lngCount,idBatch,idBatchLine,objBatchLine
+	
+	set lngCount = 0
+	set idBatch  = ""
+	for {
+		set idBatch = $order(^FININTBatch(YM,idBatch))
+		quit:idBatch=""
+		
+		set idBatchLine = ""
+		for {
+			set idBatchLine = $order(^FININTBatchLine(YM,idBatch,idBatchLine))
+			quit:idBatchLine=""
+			
+			set objBatchLine = $get(^FININTBatchLine(YM,idBatch,idBatchLine,1))
+			if $$$FININTBatchLineAccount(objBatchLine)=pidFromAccount {
+				set $$$FININTBatchLineAccount(objBatchLine) = pidToAccount
+				do Save^COMUtils("FININTBatchLine",idBatch_","_idBatchLine,objBatchLine,1)
+				set lngCount = lngCount+1
+				}
+			}
+		}
+	quit lngCount
+	
+	
+OnBeforeDelete(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Checks whether this item can be deleted.
+	; 
+	; Notes: (Do not remove the following notes, used by 'Structure')
+	; 		**Delete Check** FINAPInvoiceTran - FININTBatch can not be deleted.
+	; 		**Delete Check** FINARInvoiceTran - FININTBatch can not be deleted.
+	; 		**Delete Check** FININTBatchBlock - FININTBatch can not be deleted.
+	; 		**Delete Check** FININTBatchLine  - FININTBatch can not be deleted.
+	; 
+	; History
+	; 10-Mar-2004	shobby	Creation
+	;-------------------------------------------------------------------------------
+	quit $$$OK
+	
+]]></Routine>
+</Export>

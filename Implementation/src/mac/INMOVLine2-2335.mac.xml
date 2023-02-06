@@ -1,0 +1,336 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INMOVLine2" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INMOVLine2
+#include COMGridEdit31
+#include COMSYS
+#include INConst
+#include %occInclude
+	
+#define FORMFldINMOVLineLineBundle  8
+#define FORMFldINMOVLineLotNo       10
+	
+OnBeforeFormat(pstrYFIELDNAME,pstrText,pobjLine)
+	;-------------------------------------------------------------------------------
+	; Determine how particular fields on the Movement Line are to be displayed.
+	; 
+	; Called By :
+	; 	1. INMOV on loading the line
+	; 	2. ScreenUpdateStyle^COMGridEdit31S via COMGridEdit31Events as CallEvent
+	;
+	; Params:
+	;	pstrYFIELDNAME		Field name   (e.g. Y3_6)
+	;	pstrText			Not used
+	;	pobjLine			Movement Line record (INMOVLine format corresponding to
+	;							grid line from pstrYFIELDNAME)
+	; ByRefs:
+	;	YGRIDWHITE
+	;	YFONTCOLOR
+	;	YKEY
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 25-Nov-2011	PPP		SR17956: Include $$$Text for the status call
+	; 28-Jun-2011	GRF		SR17716: Revert to include $$$Text
+	; 07-Jun-2011	GRF		SR17716: Fix call to IsValidTSU^INLP
+	; 09-May-2011	PPP		SR17756: Added check for Valid TSU Storages
+	; 06-May-2011	PPP		SR17693: Added check for INTRANSIT Storages
+	; 12-Feb-2010	shobby	SR15753: Removed redundant code.
+	; 23-Nov-2009	DWR		SR17047: added a third style parameter to cgeUpdateStyle
+	; 							stops the ability to access the data after being updated.
+	; 20-Mar-2009	GRF		SR16428: Call common code for CellColours
+	; 02-Mar-2009	GRF		SR16396: Need to format LotNo even if posted so rewrite
+	; 							to check Bundle regardless of status test; don't
+	; 							need return value
+	; 12-Feb-2009	GRF		SR16281: use $$$FORMFld... rather than $$$ManFld...
+	; 10-Feb-2009	GRF		SR16328: Item Policy check; reuse objBundleStock keys
+	; 06-Feb-2009	GRF		SR16328: Bundle Description assigned to manual field.
+	; 							Functionality for hidden Bundle field amended to
+	; 							match INIssueLine; define ManFldINMOVLineLotNo;
+	; 							EnumReadOnly; use $$Get^WWW122 to include
+	; 							customisations.
+	; 09-Jan-2009	GRF		SR16247: Validation for ToStore (idStore changed to
+	; 							idFromStore)
+	; 20-Oct-2008	HQN		SR16045: Use more detailed alMOV0003/alMOV0004 messages
+	; 17-Oct-2008	HQN		SR16045: Take into account Planned Quantity
+	; 03-Oct-2008	HQN		SR15893: Corrected usage of UpdateManualField
+	; 19-Sep-2008	Luke	SR15909: general Clean up of Bundle processing (old code
+	; 								 retained below subroutine) 
+	; 								 Corrected the Updating of QTY SOH updating 
+	; 18-Sep-2008	GRF		SR15928: don't keep getting values from objMovLine in
+	;							loop; use objCompany; repeated calls to $$$GRIDYFELDContainer
+	; 20-May-2008	HQN		SR15762: Check for requesting on negative quantities
+	; 19-May-2008	HQN		SR15755: Removed news for YGRIDWHITE and YFONTCOLOR,
+	;							these are used ByRef
+	; 16-May-2008	HQN		SR15752: Corrected lookup of deleted copied lines for qty
+	;							replaced ^WWWDATEN calls with $$$WWWDATEN macro
+	; 13-May-2008	HQN		SR15737: Added Hacked ByRef YTEXT manipulation for
+	;							BundleValues column
+	; 12-May-2008	HQN		SR15728: Corrected line id comparison, copied lines use
+	;							Id's instead of line number
+	; 09-May-2008	HQN		SR15728: Check QtyRequired against existing screen entries
+	; 08-May-2008	HQN		Corrected Color Settings to use system defined colors
+	; 07-May-2008	HQN		SR15713: Set default color for item, tostorage and unit
+	;							Ignore bundle check if required keys missing
+	;							Dependent Fields checked for values before showing errors
+	; 06-May-2008	Luke	SR15713 OnBeforeFormat^INIssueLine
+	;-------------------------------------------------------------------------------
+	;
+	; FIXME <GRF>
+	; Check relationship with pobjLine and objGridLine extracted from WWWDATEN based on intRow - be wary of $sortBegin/$sortend
+	; 
+	; pstrYFIELDNAME [Y3_6] is split into intRow [3] and intCol [6]
+	; We also have YKEY being split to generate idMovNumber [ABC123] and idLineNumber [4]
+	; $$GetYKEY^COMGridEdit31Interface(intRow) being used to generate [ABC123,4] and
+	; $$GetYKEY^COMGridEdit31G(intRow)) to generate ["ABC123",4] which then produces a Line ID [4]
+	; to be checked against idGridLine which is a "REFERENCEROW" sequence
+	;
+	; TODO : Check Internationalisation throughout
+	;-------------------------------------------------------------------------------
+	new arrResult,blnError,fltQtyOnHand,fltQtyReqd,fltQtySum,fltQtyPlanned
+	new idBundle,idField,idFromStore,idGridLine,idItem,idKey,idLine,idLineNumber
+	new idLocn,idMovNumber,idToStore,intRow,intCol,intAttrCount
+	new objBundle,objBundleStock,objGridLine,objHeader,objIssueLine
+	new objItem,objPolicy,objStorage,sc,strBundleValues,strStatus
+	new strTSUStatus
+	
+	; INMOV Header
+	;---------------------------------------
+	set objHeader  = $$$GRIDYFELDContainer
+	
+	set idLocn     = $$$INMOVLocation(objHeader)
+	
+	; INMOVLine from Grid
+	;---------------------------------------
+	set idItem      = $$$INMOVLineItem(pobjLine)
+	set idFromStore = $$$INMOVLineFromStorage(pobjLine)
+	set idToStore   = $$$INMOVLineToStorage(pobjLine)
+	set idBundle    = $$$INMOVLineBundle(pobjLine)
+	set fltQtyReqd  = $$$INMOVLineQtyRequired(pobjLine)
+	
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pstrYFIELDNAME,intRow,intCol)
+	set idField = $$$GetClassField(YFORM,intCol)	
+	
+	if $$$INMOVStatus(objHeader)=2 {
+		quit:(idField '= $$$FldINMOVLineBundle)
+	}
+	
+	;---------------------------------------
+	; Cell Validation
+	;---------------------------------------
+	
+	; Bundle - Both Open and Completed records to show Bundle Attribute Values
+	;---------------------------------------
+	;	1)  New record : No Item										Blank
+	;	2)  New record : Item - No Bundle Stock (DynTable empty)		"No bundle, or bundle doesn't exist in Storage '%1'" [TODO]
+	;	3)  New record : Item - Bundles shown - idBundle blank			"Please make a selection from the table below"
+	;	4)  New record : Item - Single Bundle Stock for From Storage	Auto-population [TODO]
+	;	5)  Existing Record - Open Batch								Display attributes
+	;	6)  Existing Record - Completed Batch							Display attributes
+	;---------------------------------------
+	if (idField = $$$FldINMOVLineBundle) {
+		set objBundle = ##class(alSOH.dBundle).%OpenId(idBundle)
+		
+		if objBundle'=$$$NULLOREF {              ; Display Attributes in F10 LotNo (manual form field)
+			set strBundleValues = ##class(alSOH.iUSOH).RenderBundle(objBundle,SPRACHE)
+			set YTOOLTIP        = idBundle
+		
+		} else {
+			set strBundleValues = ""
+		}
+		
+		if (idItem'="") && (idFromStore'="") {    ; Don't bother to validate until a value exists
+			set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idItem_"||"_idLocn_"||"_idFromStore_"||"_idBundle)
+		} else {
+			set objBundleStock = $$$NULLOREF
+		}
+		
+		if $$$INMOVStatus(objHeader)'=2 {                  ; CURRENT DATA - EXTRA VALIDATION
+			if objBundle = $$$NULLOREF {
+			;	TODO : If single bundle for item/store auto-populate
+			;	TODO : If no bundles in dyntable (not yet populated) then use "alINV0102" - not just simple BundleStock check <GRF>
+				set YMANDATORY      = $$$YES
+				set strBundleValues = $$$Text("IN00899")
+			 ; "Please make a selection from the table below"
+				
+			} elseif (idFromStore '= "") {   ; May not get here - still need to select bundle if not auto-populate so intAttrCount may not matter. <GRF>
+				set strStatus = $$ItemCheck^INMOVLine(idItem,.intAttrCount)
+				set YTOOLTIP  = $$$Text($extract(strStatus,3,99999))
+				if $$$ISOK(strStatus) {
+					if intAttrCount>0 {
+						set YWARNING = $$$YES
+						set YTOOLTIP = $$$Text($listbuild("alINV0102",idFromStore))
+					} ; "No bundle, or bundle doesn't exist in Storage '%1'"
+				}
+				
+			} else {
+				; do nothing more
+			}
+		}
+		do UpdateManualField^COMGridEdit31Interface(intRow,$$$FORMFldINMOVLineLotNo,strBundleValues)
+	
+	
+	; ONLY CONSIDER OPEN RECORDS FOR OTHER FIELDS
+	;---------------------------------------
+	
+	} elseif $$$INMOVStatus(objHeader)'=2 { 
+		
+	; From Storage
+	;---------------------------------------
+		if (idField = $$$FldINMOVLineFromStorage) {
+			if idFromStore'="" {
+				set objStorage = ##class(alLOC.dUStorage).%OpenId("0||"_idLocn_"||"_idFromStore,0,.sc)
+			;	TODO : sc => strStatus
+				if $$$ISERR(sc) {
+					set YTOOLTIP = $$$Text($listbuild("IN00821",idFromStore,idLocn))
+					set YWARNING = $$$YES
+				} ; "Storage location %1 does not exist in site location %2"
+
+				//SR17693
+				if $$IsStorageInTransit^INDRPUMLKWLIST(idLocn,idFromStore) {
+					set YTOOLTIP = $$$Text("IN01296")
+					set YWARNING = $$$YES
+				} ; "Cannot Move 'To' or 'From' an InTransit Storage"
+
+			}
+			
+	; To Storage
+	;---------------------------------------
+		} elseif (idField = $$$FldINMOVLineToStorage) {
+			//SR17693
+			if (idToStore'="") {
+				if (idToStore=idFromStore) {
+					set YTOOLTIP = $$$Text("IN00855")         ; "Can not move Item to the same storage"
+					set YWARNING = $$$YES
+				}			
+				if $$IsStorageInTransit^INDRPUMLKWLIST(idLocn,idToStore) {
+					set YTOOLTIP = $$$Text("IN01296")         ; "Cannot Move 'To' or 'From' an InTransit Storage"
+					set YWARNING = $$$YES
+				
+				} else {    //SR17756, SR17716
+					set strTSUStatus = $$IsValidTSU^INLP(idLocn,idToStore)
+					if $$$ISERR(strTSUStatus) {
+						set YTOOLTIP  = $$$Text($extract(strTSUStatus,3,99999))		//SR17956
+						//set YTOOLTIP  = $extract(strTSUStatus,3,99999)
+						set YWARNING = $$$YES
+					}
+				}
+			}
+
+	; Quantity Required
+	;---------------------------------------
+		} elseif (idField = $$$FldINMOVLineQtyRequired) {
+			if fltQtyReqd = "" {
+				set YMANDATORY = $$$YES
+				
+			} elseif fltQtyReqd = 0 {
+				set YWARNING = $$$YES
+				set YTOOLTIP = $$$Text($listbuild("alMOV0001"))     ; "Required Quantity can not be 0"
+				
+			} elseif fltQtyReqd < 0 { ; SR15762
+				set YWARNING = $$$YES
+				set YTOOLTIP = $$$Text($listbuild("IN00490"))       ; "Quantity can not be negative."
+				
+			} else {
+				if (idFromStore'="") && (idItem'="") && (idBundle'="") {
+					set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idItem_"||"_idLocn_"||"_idFromStore_"||"_idBundle)
+					if objBundleStock '= $$$NULLOREF {
+						set fltQtyOnHand = objBundleStock.QtyOnHand
+						do Quantity(intRow,idItem,idFromStore,idBundle,idLocn,fltQtyReqd,fltQtyOnHand)
+						if fltQtyOnHand < fltQtyReqd {
+							set YWARNING = $$$YES
+							set YTOOLTIP = $$$Text($listbuild("alMOV0003",fltQtyOnHand))
+						}
+						
+					} else {     ; no bundle stock = zero QOH
+						set YWARNING = $$$YES
+						set YTOOLTIP = $$$Text($listbuild("alMOV0003",0))
+					}
+				}
+			}
+			
+	; Item
+	;---------------------------------------
+		} elseif (idField = $$$FldINMOVLineItem) {
+			if idItem'="" {
+				set strStatus = $$ItemCheck^INMOVLine(idItem,.intAttrCount)
+				set YTOOLTIP  = $$$Text($extract(strStatus,3,99999))
+				if $$$ISOK(strStatus) {
+				} else {
+					set YWARNING = $$$YES
+				}
+			}
+		}
+	}
+	quit
+	
+	
+Quantity(pintRow,pidItem,pidFromStore,pidBundle,pidLocn,pfltQtyReqd,pfltQtyOnHand)
+	;-------------------------------------------------------------------------------
+	; Subroutined out of previous routine and brought in line with new standards.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than arrData; GRID Macros
+	; 12-Feb-2010	shobby	SR15753: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,idGridLine,fltQtySum,objGridLine,fltQtyOnHand,fltQtyPlanned
+	new lstGridLines,YKEY
+
+	$$$GRIDGetContents(.arrGrid)
+	if $data(arrGrid) {
+		set YKEY = $order(arrGrid(""))
+
+		set fltQtySum    = 0
+		set lstGridLines = ""
+
+		set idGridLine = ""
+		for {
+			set idGridLine = $order(arrGrid(YKEY,idGridLine))
+			quit:idGridLine=""
+			
+			set objGridLine = arrGrid(YKEY,idGridLine)
+			continue:($$$INMOVLineItem(objGridLine)        '= pidItem)
+			continue:($$$INMOVLineFromStorage(objGridLine) '= pidFromStore)
+			continue:($$$INMOVLineBundle(objGridLine)      '= pidBundle)
+			
+			set fltQtySum    = fltQtySum + $$$INMOVLineQtyRequired(objGridLine)
+			set lstGridLines = lstGridLines_idGridLine_";"
+		}
+
+		set fltQtyPlanned = $$GetQtyPlanned^INMOVTable(pidItem,pidLocn,pidFromStore,pidBundle)
+
+		if (fltQtySum) > (pfltQtyOnHand-fltQtyPlanned) {
+			set YWARNING = $$$YES
+		
+			if (fltQtyPlanned > 0) {            ; "Not enough Items in Storage (Quantity = %1)(Planned Quantity = %2)"
+				set YTOOLTIP = $$$Text($listbuild("alMOV0004",pfltQtyOnHand,fltQtyPlanned))
+			} else {                            ; "Not enough Items in Storage (Quantity = %1)"
+				set YTOOLTIP = $$$Text($listbuild("alMOV0003",pfltQtyOnHand))
+			}
+		}
+	
+		;TODO  move the functionality of updating multiple lines in to @netManager
+		new YFONTCOLOR,YBACKGROUNDCOLOR
+		
+		if $get(YWARNING) {
+			set YFONTCOLOR       = "red"
+			set YBACKGROUNDCOLOR = "gainsboro"
+		} else {
+			set YFONTCOLOR       = "black"
+			set YBACKGROUNDCOLOR = "gainsboro"
+		}
+		for idGridLine=1:1:$length(lstGridLines,";")-1 {
+			do UpdateStyle^COMGridEdit31Interface("tdY"_$piece(lstGridLines,";",idGridLine)_"_3",YFONTCOLOR_Y_YBACKGROUNDCOLOR_Y_$zcvt($get(YTOOLTIP),"o","JS")_Y_YENABLED)
+		}
+	}	
+	quit
+	
+]]></Routine>
+</Export>

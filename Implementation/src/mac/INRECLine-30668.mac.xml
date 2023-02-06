@@ -1,0 +1,1526 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INRECLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INRECLine
+#include COMSYS
+#include INConst
+#include FINConst
+#include INSYS
+#include %occInclude
+	
+#define EnumINRECTypeSupplier 2
+	
+#define FORMFldINRECLineInventoryQty	4
+#define FORMFldINRECLineUnit			5
+#define FORMFldINRECLineItem			7
+#define FORMFldINRECLineRecvdUnit		32
+#define FORMFldINRECLineOrderedUnit		33
+	
+#define GetClass(%1)	$select($$Editable^INREC(%1,$$$EnumINRECSupplierReceipt):"INWEAUFVOR",1:"INWEAUF")
+	
+#define LogR(%1,%2) 	;
+#define LogR2(%1,%2) 	;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INRECLine("_%2_") : "_$zh $$$JournalOn
+#;define LogR2(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INRECLine("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+
+		
+Cost(YM,pidReceipt,pidRecLine,pfltQuantity=1)
+	;-------------------------------------------------------------------------------
+	; Calculate the total cost of a line item.
+	;
+	; ByRef :
+	;
+	; Notes:	This routine can be called by SQL so, with the exception of the
+	;			parameter YM, don't go using any other global variables such as
+	;			YBED, YLOCATION etc.
+	; 
+	; Returns: Unit Cost if pfltQuantity defaults, Total Cost otherwise
+	;
+	; History:
+	; 02-Oct-2009	GRF		SR16361: Implement changed code
+	; 11-Sep-2009	GRF		SR16361: Remove INWEAUF(VOR) processing
+	; 20-May-2009	GRF		SR16386: INWEAUFs needs $$$Index
+	; 24-Feb-2009	shobby	SR16386: Rewrote to get the data from INWEAUF
+	; 23-Feb-2009	shobby	SR16386: Created
+	;-------------------------------------------------------------------------------
+	new fltCost,objINRECLine
+	
+	$$$LogR("Cost",pidReceipt_","_pidRecLine)
+	set objINRECLine = $get(^INRECLine(0,pidReceipt,pidRecLine,1))
+	
+	; SR16361 vvv
+	set fltCost = $$$INRECLineEach(objINRECLine) * pfltQuantity
+	
+	/*
+	set idxReceiptNo   = $$$Index(pidReceipt)
+	set idxReceiptLine = $$$Index(pidRecLine)
+	
+	set fltCost = 0
+	if (pidReceipt'="") && (pidRecLine'="") {
+		set idINWEAUF = $query(^INWEAUFs(0,2,idxReceiptNo,idxReceiptLine))
+		if idINWEAUF'="" {
+			set idOrder     = $qsubscript(idINWEAUF,5)
+			set idOrderLine = $qsubscript(idINWEAUF,6)
+			set idLocn      = $qsubscript(idINWEAUF,7)
+			set idStorage   = $qsubscript(idINWEAUF,8)
+			set idDate      = $qsubscript(idINWEAUF,9)
+			
+			set objINWEAUF = $get(^INWEAUF(0,idOrder,idOrderLine,idLocn,idStorage,idDate,1))
+			set fltCost    = $$$INWEAUFUnitPrice(objINWEAUF)
+			set fltCost    = $$$FCMult(fltCost,pfltQuantity)
+		}
+	}
+	*/ ; SR16361 ^^^
+	quit fltCost
+	
+	
+GetDetails(pstrKeys,&pfltQty,&pidLocn,&pidStore) 
+	;-------------------------------------------------------------------------------
+	; Get receipt details
+	;
+	; Called By:	Adjust^INStockValAdjust
+	; 
+	; Params:
+	;	pstrKeys		key of line
+	;
+	; ByRef :
+	;	pfltQty
+	;	pidLocn
+	;	pidStore
+	;
+	; Returns: none
+	;
+	; History:
+	; 07-Nov-2005	JW		SR13222: Created
+	;-------------------------------------------------------------------------------
+	new objRECLine
+	
+	$$$LogR("GetDetails",pstrKeys)
+	
+	set objRECLine = $get(^INRECLine(0,$$$KEY1(pstrKeys),$$$KEY2(pstrKeys),1))
+	
+	set pfltQty  = $$$INRECLineQuantity(objRECLine)  ; Inventory Qty
+	set pidLocn  = $$$INRECLineLocation(objRECLine)
+	set pidStore = $$$INRECLineStockLocation(objRECLine)
+	
+	quit
+	
+	
+CreateLine(pobjREC,pidInvMatch,&pobjRECLine,pfltPartQty="",pstrLot="",pdteExpiry="")
+	;-------------------------------------------------------------------------------
+	; Create a receipt line record
+	; 
+	; Called By:
+	;	Create^INREC
+	;	OnNextPass^INREC
+	;	OnBlurItem^INRECBLine
+	;	Selected^INRECSearch
+	;	LoadLinesByOrder^INRECSearch
+	;	LoadLinesByImport^INRECSearch
+	; 
+	; Params:	pobjREC		- receipt header record
+	;			pidInvMatch	- FINAPInvMatchCache record to be receipted/reversed
+	;			pfltPartQty - partial quantity
+	;			pstrLot     - lot number
+	;			pdteExpiry  - expiry date
+	;			
+	; ByRef:	pobjRECLine - data for receipt line
+	; 
+	; Returns:	status - whether line can be created
+	;
+	; History:
+	; 10-Feb-2010	GRF		SR17138: Use new Ordered Unit data
+	; 04-Jan-2010	GRF		SR16914: include Supplier details in line
+	; 03-Nov-2009	DWR		SR16983: removed call, list of fields created via 
+	; 							OnBeforeDiaplayCombo
+	; 30-Oct-2009	GRF		SR16871: Pass Locn to INRECReverseLine
+	; 06-Oct-2009	GRF		SR16928: add original Receipt/Line details
+	; 06-Oct-2009	GRF		SR16928: created CreateLineWithoutOrder
+	; 02-Sep-2009	GRF		SR16857: reversal & initial receipt handled differently;
+	; 							keep idInventUnit, clarify idRecvdUnit; take code
+	; 							from UpdateReceiptDetails^INRECReverse to avoid
+	; 							recalc of each using INWEAUF
+	; 31-Aug-2009	DWR		SR16857: create the Items COMTempList(UOM) as load line
+	; 27-Aug-2009	GRF		SR16857: standardise conversion - ConvOtherQtyToInvQty
+	; 27-Aug-2009	DWR		SR16857: $$$INRECLineOrderedUnit, load in suppliers delivery
+	; 							unit and qty factor.
+	; 25-Aug-2009	DWR		SR16857: rearranged settings to flow better, include new 
+	;							field population and do conversions
+	; 03-Aug-2009	PPP		SR16815	Changed $$$INRECLineBaseQuantity to $$$INRECLineOrderQuantity
+	; 18-May-2009	DWR		SR16541: Reinstated copy of Unit Price, previously 
+	;							getting unit price approx 4 levels deep in the code.
+	;							Cannot use the object change state correctly. 
+	; 19-Dec-2008	SCR		SR16205: made partial receipt optional parameters
+	; 08-Dec-2008	FIS		SR16205: partial receipt with Lot Number and Expiry Date
+	; 02-Mar-2007	JW		SR15459: Removed BR014066 change.
+	; 04-Sep-2006	JW		SR14979: Initialise pobjRECLine 
+	; 25-Jul-2006	Frank	BR014066: Copying across the Unit Price value.
+	; 10-Apr-2006	JW		SR14421: Added receipting. Move form processing into
+	;							Selected^INREC.
+	; 02-Nov-2005	JW		SR13222: Created (modified from FINAPInvSearch)
+	;-------------------------------------------------------------------------------
+	; e.g. Item Inventory Unit = Each
+	;
+	;	Order    2 Boxes of 12 @ $36 per box - total order $72
+	;		D6/F6   $$$INRECLineOrderQuantity	READ ONLY
+	;		D66/F33 $$$INRECLineOrderedUnit		READ ONLY
+	;		D5/F5   $$$INRECLineUnit			HIDDEN	      <<< INReceiptLine [Received Unit]
+	;
+	;	Receive  initially in Boxes
+	;		D64/F9  $$$INRECLineUnitQuantity	ENTER		2
+	;		D65/F32 $$$INRECLineReceivedUnit	ENTER		Box  [Default Supplier Unit From INARTK or Order Unit]
+	;		
+	;		Calculated		
+	;		D4/F4   $$$INRECLineQuantity		READ ONLY	24	"Inventory Quantity"
+	;		D8/F8   $$$INRECLineEach			HIDDEN		$3  (based on Inventory Unit)
+	;-------------------------------------------------------------------------------
+	new blnReversal,fltInventQty,fltOrderQty,fltRecvdQty
+	new idInventUnit,idItem,idLocn,idOrder,idOrderLine,idOrderUnit,idRecvdUnit
+	new objInvMatch,objItem,objOrderLine,strStatus,strSupDetails
+	
+	set blnReversal = ($$$INRECType(pobjREC)=$$$EnumINRECSupplierReversal)
+	
+	set objInvMatch = $get(^FINAPInvMatchCache(0,pidInvMatch,1))
+	set idOrder		= $$$FINAPInvMatchCacheSourceOrder(objInvMatch)
+	
+	$$$LogR2("CreateLine",pidInvMatch_"<"_idOrder_"<"_blnReversal)
+	$$$LogRx("0:"_objInvMatch_"<")
+	
+	set strStatus   = $$$NO
+	set pobjRECLine = ""
+	
+	if (idOrder="") && blnReversal && $$$FINAPInvMatchCacheReceipted(objInvMatch) {   ; SR16928
+		quit $$CreateLineWithoutOrder(objInvMatch,pidInvMatch,.pobjRECLine,pfltPartQty,pstrLot,pdteExpiry)
+	}
+		
+	// Must be from order. And if reversal, must be receipted
+	if (idOrder'="") && (blnReversal = +$$$FINAPInvMatchCacheReceipted(objInvMatch)) {
+		set strStatus = $$$OK
+		
+		set idOrderLine  = $$$FINAPInvMatchCacheOrderLine(objInvMatch)
+		set idItem       = $$$FINAPInvMatchCacheItem(objInvMatch)
+		set objItem      = $get(^INART(0,idItem,1))
+		set idInventUnit = $$$INARTUnitofMeasure(objItem)  ; inventory unit
+	;	do LoadUnitOfMeasureList^INARTUtilities(idItem)    ; SR16857   ; SR16983
+		
+		set $$$INRECLineCacheLink(pobjRECLine)      = pidInvMatch
+		set $$$INRECLineOrder1(pobjRECLine)         = idOrder
+		set $$$INRECLineOrderLine(pobjRECLine)      = idOrderLine
+		set $$$INRECLineItem(pobjRECLine)           = idItem
+		
+		set $$$INRECLineLotNumber(pobjRECLine)      = pstrLot     //SR16205
+		set $$$INRECLineExpirationDate(pobjRECLine) = pdteExpiry  //SR16205
+		set $$$INRECLineReversesREC(pobjRECLine)    = $$$FINAPInvMatchCacheReceiptNumber(objInvMatch)  ; SR16928
+		set $$$INRECLineReversesLine(pobjRECLine)   = $$$FINAPInvMatchCacheReceiptLine(objInvMatch)
+		
+	; Receipt unit normally based on Order Unit - if no unit on order, use Inventory Unit in both places
+	;-----------------------------------
+		set objOrderLine  = $get(^INAUFP(0,idOrder,idOrderLine,1))
+	;	set idOrderUnit   = $$$INAUFPQuantityUnit(objOrderLine) ; order unit   ; SR17138
+		set idOrderUnit   = $$$INAUFPOrderedUnit(objOrderLine) ; order unit
+		set strSupDetails = $$GetRecDetailsForSup^INRECSummaryUtil(idOrder,idOrderLine,objOrderLine) ; SR16857
+		set idRecvdUnit   = $piece(strSupDetails,Y,2)
+		if idRecvdUnit="" set idRecvdUnit = idInventUnit        ; inventory unit
+		
+		/* ; vvv SR16857 02-Sep-2009
+		set $$$INRECLineOrderedUnit(pobjRECLine)   = idOrderUnit ;SR16857            ; D66
+		set $$$INRECLineOrderQuantity(pobjRECLine) = $$$FINAPInvMatchCacheOrderQuantity(objInvMatch)  //SR16815  ; D6
+		set $$$INRECLineUnit(pobjRECLine)          = idOrderUnit                     ; D5
+		set $$$INRECLineReceivedUnit(pobjRECLine)  = idRecvdUnit ;SR16857     D65
+	; Convert the Each Cost from the order to an Inventory Unit-based Each Cost
+	;-----------------------------------
+	;	set $$$INRECLineEach(pobjRECLine) = $$$FINAPInvMatchCacheEach(objInvMatch)  ; SR16541 ; SR16857
+		set $$$INRECLineEach(pobjRECLine) = $$GetInvCost^INRECLineUtil(idItem,idRecvdUnit,+$piece(strSupDetails,Y,3))
+		
+	; Save "Balance of Order" quantities 
+	;-----------------------------------
+	;	set $$$INRECLineQuantity(pobjRECLine)         = $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)  ; Inventory Qty
+		
+		if (pfltPartQty '= "") {                 //SR16205
+		;	set $$$INRECLineQuantity(pobjRECLine)     = $$OrderedInvQty^INRECLineUtil(idItem,idRecvdUnit,pfltPartQty)  ; Inventory Qty   ;SR16857
+			set $$$INRECLineQuantity(pobjRECLine)     = $$ConvOtherQtyToInvQty^INRECLineUtil(idItem,idRecvdUnit,pfltPartQty)  ; Inventory Qty
+			set $$$INRECLineUnitQuantity(pobjRECLine) = pfltPartQty  ; SR16857
+		
+		} else {
+		;	set $$$INRECLineQuantity(pobjRECLine)     = $$OrderedInvQty^INRECLineUtil(idItem,idRecvdUnit,$$$FINAPInvMatchCacheTotalQuantity(objInvMatch))   ;SR16857:$$$FINAPInvMatchCacheTotalQuantity(objInvMatch)
+			
+			set $$$INRECLineQuantity(pobjRECLine)     = $$ConvOtherQtyToInvQty^INRECLineUtil(idItem,idRecvdUnit,+$piece(strSupDetails,Y,1))   ;SR16857:$$$FINAPInvMatchCacheTotalQuantity(objInvMatch)
+			set $$$INRECLineUnitQuantity(pobjRECLine) = +$piece(strSupDetails,Y,1) ; SR16857
+		}
+		if blnReversal {  
+			do UpdateReceiptDetails^INRECReverse(.pobjRECLine,
+			                                     $$$FINAPInvMatchCacheLocation(objInvMatch),
+			                                     $$$FINAPInvMatchCacheStockLocation(objInvMatch),
+			                                     $$$FINAPInvMatchCacheReceiptDate(objInvMatch)     )
+		
+		} else {
+			do GetDefaults(pobjREC,.pobjRECLine)
+		}
+		*/ ; ^^^ replaced with vvv SR16857 02-Sep-2009
+		
+	$$$LogRx("1:"_idOrderUnit_"<"_idRecvdUnit_"<"_idInventUnit)
+		
+		set $$$INRECLineOrderedUnit(pobjRECLine)   = idOrderUnit                                      ; D66
+		set $$$INRECLineOrderQuantity(pobjRECLine) = $$$FINAPInvMatchCacheOrderQuantity(objInvMatch)  ; D6
+		
+		if blnReversal {
+			; Set Qty/Unit/Each all based on Inventory Unit
+			set fltOrderQty  = $$$FINAPInvMatchCacheTotalQuantity(objInvMatch)
+			set fltInventQty = $$ConvOtherQtyToInvQty^INRECLineUtil(idItem,idOrderUnit,fltOrderQty)
+			
+			set $$$INRECLineUnit(pobjRECLine)         = idInventUnit   ; D5
+			set $$$INRECLineReceivedUnit(pobjRECLine) = idInventUnit   ; D65
+			set $$$INRECLineQuantity(pobjRECLine)     = fltInventQty   ; D4
+			set $$$INRECLineUnitQuantity(pobjRECLine) = fltInventQty   ; D64
+			set $$$INRECLineEach(pobjRECLine)         = $$GetInvCost^INRECLineUtil(idItem,idOrderUnit,$$$FINAPInvMatchCacheEach(objInvMatch))  ; D8
+			
+	$$$LogRx("2a:"_fltOrderQty_"<"_fltInventQty_":"_$$$INRECLineEach(pobjRECLine)_":"_$$$FINAPInvMatchCacheEach(objInvMatch))
+			
+		} else {
+			if (pfltPartQty'="") {
+				set fltRecvdQty = pfltPartQty
+				
+			} else {
+				set fltRecvdQty = +$piece(strSupDetails,Y,1)
+			}
+			set fltInventQty = $$ConvOtherQtyToInvQty^INRECLineUtil(idItem,idRecvdUnit,fltRecvdQty)
+			set $$$INRECLineUnit(pobjRECLine)         = idOrderUnit   ; D5
+			set $$$INRECLineReceivedUnit(pobjRECLine) = idRecvdUnit   ; D65
+			set $$$INRECLineQuantity(pobjRECLine)     = fltInventQty  ; D4
+			set $$$INRECLineUnitQuantity(pobjRECLine) = fltRecvdQty   ; D64
+			; Convert the Each Cost from the order to an Inventory Unit-based Each Cost
+			set $$$INRECLineEach(pobjRECLine)         = $$GetInvCost^INRECLineUtil(idItem,idRecvdUnit,+$piece(strSupDetails,Y,3)) ; D8
+			
+	$$$LogRx("2b:"_fltOrderQty_"<"_fltRecvdQty_"<"_fltInventQty)
+		}
+		
+		if blnReversal {
+			set idLocn = $$$FINAPInvMatchCacheLocation(objInvMatch)
+			set $$$INRECLineLocation(pobjRECLine)      = idLocn
+			set $$$INRECLineStockLocation(pobjRECLine) = $$$FINAPInvMatchCacheStockLocation(objInvMatch)
+			set $$$INRECLineReceiptDate(pobjRECLine)   = $$$FINAPInvMatchCacheReceiptDate(objInvMatch)
+			set $$$INRECLineTotal(pobjRECLine)         = $justify($$$INRECLineEach(pobjRECLine) * $$$INRECLineQuantity(pobjRECLine),0,2)
+			set $$$INRECLineReverseStatus(pobjRECLine) = $$GetStatus^INRECReverse($$$INRECLineCacheLink(pobjRECLine))
+			set $$$INRECLineAverageCost(pobjRECLine)   = $$GetAverageCost^INRECReverseLine(pobjRECLine,idLocn)     ; SR16871
+			set $$$INRECLineSupplier(pobjRECLine)       = $$$FINAPInvMatchCacheSupplier(objInvMatch)               ; SR16914
+			
+		} else {
+			do GetDefaults(pobjREC,.pobjRECLine)
+		}
+		; ^^^ SR16857 02-Sep-2009
+	}
+	
+	quit strStatus
+	
+	
+CreateLineWithoutOrder(pobjInvMatch,pidInvMatch,&pobjRECLine,pfltPartQty,pstrLot,pdteExpiry) private
+	;-------------------------------------------------------------------------------
+	; Create a receipt line reversal record where the goods were received without
+	; an order.  NOTE : FAIMC is based on Inventory Unit if receipt without order.
+	; 
+	; Params : as for CreateLine + FINAPInvMatchCache record
+	; 
+	; Called By:
+	;	CreateLine^INRECLine
+	; 
+	; Returns:	status - whether line can be created
+	;
+	; History:
+	; 04-Jan-2010	GRF		SR16914: include Supplier details in line
+	; 03-Nov-2009	DWR		SR16983: removed call, list of fields created via 
+	; 							OnBeforeDiaplayCombo
+	; 30-Oct-2009	GRF		SR16871: Pass Locn to INRECReverseLine
+	; 06-Oct-2009	GRF		SR16928: created from CreateLine
+	;-------------------------------------------------------------------------------
+	new fltInventQty,idItem,idInventUnit,idLocn,objItem,strStatus
+	
+	$$$LogR2("CreateLineWithoutOrder",pidInvMatch)
+	set strStatus = $$$YES
+	
+	set idItem       = $$$FINAPInvMatchCacheItem(pobjInvMatch)
+	set objItem      = $get(^INART(0,idItem,1))
+	set idInventUnit = $$$INARTUnitofMeasure(objItem)
+	;do LoadUnitOfMeasureList^INARTUtilities(idItem)   ;SR16983
+	
+	set fltInventQty = $$$FINAPInvMatchCacheTotalQuantity(pobjInvMatch)
+	set idLocn       = $$$FINAPInvMatchCacheLocation(pobjInvMatch)
+	
+	set $$$INRECLineCacheLink(pobjRECLine)      = pidInvMatch
+	set $$$INRECLineOrder1(pobjRECLine)         = ""
+	set $$$INRECLineOrderLine(pobjRECLine)      = ""
+	set $$$INRECLineItem(pobjRECLine)           = idItem
+	
+	set $$$INRECLineLotNumber(pobjRECLine)      = pstrLot
+	set $$$INRECLineExpirationDate(pobjRECLine) = pdteExpiry
+	
+	set $$$INRECLineOrderedUnit(pobjRECLine)    = idInventUnit
+	set $$$INRECLineOrderQuantity(pobjRECLine)  = $$$FINAPInvMatchCacheOrderQuantity(pobjInvMatch)
+	
+	set $$$INRECLineUnit(pobjRECLine)           = idInventUnit
+	set $$$INRECLineReceivedUnit(pobjRECLine)   = idInventUnit
+	set $$$INRECLineQuantity(pobjRECLine)       = fltInventQty
+	set $$$INRECLineUnitQuantity(pobjRECLine)   = fltInventQty
+	set $$$INRECLineEach(pobjRECLine)           = $$$FINAPInvMatchCacheEach(pobjInvMatch)
+	set $$$INRECLineLocation(pobjRECLine)       = idLocn
+	set $$$INRECLineStockLocation(pobjRECLine)  = $$$FINAPInvMatchCacheStockLocation(pobjInvMatch)
+	set $$$INRECLineReceiptDate(pobjRECLine)    = $$$FINAPInvMatchCacheReceiptDate(pobjInvMatch)
+	set $$$INRECLineTotal(pobjRECLine)          = $justify($$$INRECLineEach(pobjRECLine) * $$$INRECLineQuantity(pobjRECLine),0,2)
+	set $$$INRECLineReverseStatus(pobjRECLine)  = $$GetStatus^INRECReverse($$$INRECLineCacheLink(pobjRECLine))
+	set $$$INRECLineAverageCost(pobjRECLine)    = $$GetAverageCost^INRECReverseLine(pobjRECLine,idLocn)   ; SR16871
+	
+	set $$$INRECLineReversesREC(pobjRECLine)    = $$$FINAPInvMatchCacheReceiptNumber(pobjInvMatch)
+	set $$$INRECLineReversesLine(pobjRECLine)   = $$$FINAPInvMatchCacheReceiptLine(pobjInvMatch)
+	set $$$INRECLineSupplier(pobjRECLine)       = $$$FINAPInvMatchCacheSupplier(pobjInvMatch)             ; SR16914
+	
+	quit strStatus
+	
+	
+GetDefaults(pobjREC,&pobjRECLine) 
+	;-------------------------------------------------------------------------------
+	; Get the defaults for the INRECLine
+	;
+	; Params:	pobjREC - header record
+	;
+	; ByRefs:	pobjRECLine - line record
+	;
+	; Returns:	
+	;
+	; History:
+	; 26-Aug-2009	GRF		SR16857: Need to blank Unit Quantity and Inventory Qty
+	;							when using blind receipting
+	; 20-May-2009	GRF		SR16541: standardise variables
+	; 28-Feb-2007	JW		SR15453: Fix error with no supplier on order line. Look at header.
+	; 04-Sep-2006	JW		SR14979: Single Pass
+	; 17-May-2006	JW		SR14646: Hide qty based on setup
+	; 29-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new idLocn,idStore,idOrder,idOrderLine,objINVORG,idSupplier
+	
+	$$$LogR("GetDefaults","")
+	
+	set idOrder     = $$$INRECLineOrder1(pobjRECLine)
+	set idOrderLine = $$$INRECLineOrderLine(pobjRECLine)
+	
+	set idLocn      = $$$INRECLocation(pobjREC)		        // Header details
+	set idStore     = $$$INRECStockLocation(pobjREC)
+	
+	do GetLocation(idOrder,idOrderLine,.idLocn,.idStore)
+	
+	set objINVORG = $get(^INVORGB(0,0,idLocn,1))
+	
+	if $$$INVORGBHideOrderQuantity(objINVORG) {	//SR14646
+		set $$$INRECLineQuantity(pobjRECLine)     = ""     ; Inventory Qty
+		set $$$INRECLineUnitQuantity(pobjRECLine) = ""     ; SR16857
+	}
+	
+	set $$$INRECLineLocation(pobjRECLine)      = idLocn
+	set $$$INRECLineStockLocation(pobjRECLine) = idStore
+	set $$$INRECLineFlag(pobjRECLine)          = $order(^INWEMERKER(0,""))
+	
+	set idSupplier = $$$INAUFPSupplier($get(^INAUFP(0,idOrder,idOrderLine,1)))
+	set:idSupplier="" idSupplier = $$$INAUFSupplierNumber($get(^INAUF(0,idOrder,1)))
+	set $$$INRECLineSupplier(pobjRECLine)      = idSupplier
+	
+	if $$$INVORGBReceiptType(objINVORG) '= $$$EnumINRECEIPTFLOWMultiPass {
+		set $$$INRECLineInclude(pobjRECLine)   = $$$YES
+	}
+	quit
+	
+	
+GetLocation(pidOrder,pidLine,&pidLocn,&pidStore)
+	;-------------------------------------------------------------------------------
+	; Calculate location and storage defaults if not in header
+	; Also validate storage if passed in
+	;
+	; Params:	pidOrder,pidLine	- order and line ids
+	;			
+	; ByRefs:	pidLocn,pidStore	- location and storage
+	;
+	; Returns:
+	;
+	; History:
+	; 20-May-2009	GRF		SR16541: standardise variables
+	; 29-Mar-2006	JW		SR14421: Created from ^INWEAUF1
+	;-------------------------------------------------------------------------------
+	new idItem,idQAStore
+	
+	$$$LogR("GetLocation",pidOrder_","_pidLine)
+	
+	if pidLocn="" set pidLocn = $$$INAUFLocation($get(^INAUF(0,pidOrder,1)))
+	if pidLocn="" set pidLocn = YLOCATION
+ 
+	set idItem = $$$INAUFPItemNumber($get(^INAUFP(0,pidOrder,pidLine,1)))
+	
+	if $$IsConsumable^INARTLOCPAR(idItem,pidLocn) {
+		set pidStore = $$$INVORGDeleteStockLocation($get(^INVORG(0,0,1)))
+		
+	} else {
+		if (pidStore'="") && '$data(^INLP(0,pidLocn,pidStore)) set pidStore = ""
+		
+		; Determine storage
+		if pidStore="" {
+			set idQAStore = $$$INAUFPQualityControl($get(^INAUFP(0,pidOrder,pidLine,1)))
+			if idQAStore'="" {
+				set pidStore = $$$INQPRUEFStockLocation($get(^INQPRUEF(0,pidLocn,idQAStore,1)))  ;QA storage 
+			}
+			
+			if pidStore="" {
+				set pidStore = $$DefaultStorage(pidLocn,idItem)
+			}
+		}
+	}
+	quit
+	
+	
+DefaultStkLoc(pidLocn,pidItem)	 ; Legacy entry point - DO NOT USE
+	quit $$DefaultStorage($get(pidLocn),$get(pidItem))
+	
+	
+DefaultStorage(pidLocn,pidItem)
+	;-------------------------------------------------------------------------------
+	; Get default storage
+	;
+	; Called By: GetLocation, CreateReceiptData^INMOIssue, GetStorage^INRECTFRLine (+VAR routines?)
+	; 
+	; Params:
+	;	pidLocn: Location ID
+	;	pidItem: Item ID
+	;
+	; ByRefs:
+	;	YM		Company ID
+	;
+	; Returns:
+	;	Storage.StockLocation or strStatus
+	;
+	; History:
+	; 06-Jan-2010	GRF		SR17080: tag change
+	; 01-Apr-2009	GRF		SR16363: Bad V2 recovery returned separately from storage
+	;							id
+	; 03-Oct-2008	HQN		SR15969: Incorrect Storage in original code!	
+	;							Find receipt storage instead of onhand storage
+	; 02-Oct-2008	HQN		SR15981: Using V1.5 based locations lookups
+	; 20-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	; SR15981 vvvv REPLACED
+	new idStore,objLocation,objStorage,sc,strStatus
+	
+	$$$LogR("DefaultStorage",pidLocn_","_pidItem)
+	
+	set idStore     = ""
+	set objLocation = ##class(alLOC.dULocation).%OpenId("0||"_pidLocn)
+	set objStorage  = objLocation.GetDefaultReceiptStorage($get(pidItem),.sc)
+	if $$$ISOK(sc) {
+		set idStore = objStorage.StockLocation
+	} else {
+	;	set idStore   = $$ISStatusToDLStatus^COMUtilError(sc)    ; SR16363
+		set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)    ; FIXME : not returned
+		set idStore   = ""
+	}
+	quit idStore
+	
+	
+OnBeforeCopy(pstrKeys,&pobjLine)
+	;-------------------------------------------------------------------------------
+	; Update the qty field with the difference between the receipt qty and what has
+	; already been entered.
+	;
+	; Params:
+	;
+	; ByRefs:	pobjLine - copied line yfeld
+	;
+	; Returns:
+	;
+	; History:
+	; 27-Aug-2009	GRF		SR16857: Convert FINAPInvMatchCache qty from order to
+	; 							received unit; update both UnitQuantity and Quantity;
+	; 							standardise conversion - ConvOtherQtyToInvQty
+	; 26-Aug-2009	GRF		SR16857: Need to blank Unit Quantity and Inventory Qty
+	;							when using blind receipting
+	; 23-Sep-2008	Luke	SR15925: Added QTY check for less than 0 (defaults to zero, if 
+	; 16-Sep-2008	GRF		SR15920: May not have any lines in the grid yet - also
+	;							test for null idLocn and idCacheLink
+	; 17-May-2006	JW		SR14646: Hide qty based on setup
+	; 06-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new fltQty,fltTempQty,fltTempRecvdQty,idCacheLink,idItem,idLocn,idOrderUnit,idRecvdUnit,objCache
+	
+	$$$LogR("OnBeforeCopy",pstrKeys)
+	
+	quit:pobjLine=""
+	set idLocn = $$$INRECLineLocation(pobjLine)    quit:idLocn=""
+	
+	if $$$INVORGBHideOrderQuantity($get(^INVORGB(0,0,idLocn,1))) {
+		set $$$INRECLineQuantity(pobjLine)     = ""        ; Inventory Qty     //SR14646
+		set $$$INRECLineUnitQuantity(pobjLine) = ""        ; SR16857
+	
+	} else {                                               // Update Qty
+		set idCacheLink = $$$INRECLineCacheLink(pobjLine)
+		if idCacheLink'="" {
+			set idItem      = $$$INRECLineItem(pobjLine)             ; SR16857 27-Aug-2009 (3 lines)
+			set idOrderUnit = $$$INRECLineOrderedUnit(pobjLine)
+			set idRecvdUnit = $$$INRECLineReceivedUnit(pobjLine)
+			
+			set objCache = $get(^FINAPInvMatchCache(0,idCacheLink,1))
+			set fltQty   = $$$FINAPInvMatchCacheTotalQuantity(objCache)                    ; in Order Units
+			set fltQty   = $$ConvOtherQtyToInvQty^INRECLineUtil(idItem,idOrderUnit,fltQty) ; in Inventory Units SR16857 27-Aug-2009
+			
+			set fltTempQty = fltQty - $$GetQtyEntered(pstrKeys)      ; in Inventory Units
+			if fltTempQty<0 set fltTempQty = 0
+			
+			if fltTempQty {                                          ; vvv SR16857 27-Aug-2009
+				set fltTempRecvdQty = $$ConvInvQtyToOtherQty^INRECLineUtil(idItem,idRecvdUnit,fltTempQty) ; in Received Units
+			} else {
+				set fltTempRecvdQty = 0
+			}
+			set $$$INRECLineUnitQuantity(pobjLine) = fltTempRecvdQty ; ^^^ SR16857 27-Aug-2009
+			set $$$INRECLineQuantity(pobjLine)     = fltTempQty      ; Inventory Qty
+		}
+	}
+	quit
+	
+	
+GetQtyEntered(pstrKeys)
+	;-------------------------------------------------------------------------------
+	; Get the quantity input on the screen for this line and its children
+	;
+	; Params:	pstrKey - keys of INRECLine
+	;
+	; ByRefs:
+	;
+	; Returns: Sum of receipted quantities for allocated receipt line, based on Inventory Unit
+	;
+	; History:
+	; 12-Apr-2010	GRF		SR17177: arrGrid rather than objGrid
+	; 05-Sep-2006	JW		SR14979: Rewrote below - wasn't finding all
+	; 29-Apr-2006	PO		Fix for Build: Quote non-numeric keys
+	; 20-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new arrGrid,fltQty,idLine,idParent,idRec
+	
+	$$$LogR("GetQtyEntered",pstrKeys)
+	
+	$$$GRIDGetContents(.arrGrid)
+	
+	set fltQty = 0
+	
+	// loop through all the lines for the same receipt.
+	set idRec    = $$$KEY1(pstrKeys)
+	set idParent = $$$KEY2(pstrKeys)\1
+	set idLine   = $order(arrGrid(idRec,idParent),-1)		// Go back one
+	
+	for {
+		set idLine = $order(arrGrid(idRec,idLine))
+		quit:idLine\1'=idParent
+		
+		set fltQty = fltQty + $$$INRECLineQuantity(arrGrid(idRec,idLine))  ; Inventory Qty
+	}
+	quit fltQty
+	
+	
+ToggleStkLoc(pobjLine)
+	;-------------------------------------------------------------------------------
+	; Disable Storage field if item is consumable
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 29-Apr-2006	SC		SR14422: Validate line item and location.
+	; 21-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	;quit:pobjLine=""
+	$$$LogR("ToggleStkLoc","")
+	
+	quit:(($$$INRECLineItem(pobjLine)="") || ($$$INRECLineLocation(pobjLine)="")) //SR14422
+	
+	if $$IsConsumable^INARTLOCPAR($$$INRECLineItem(pobjLine),$$$INRECLineLocation(pobjLine)) {
+		set YHID = 1
+	}
+	quit
+	
+	
+OnBeforeSave(pstrKeys,pobjLine)
+	;-------------------------------------------------------------------------------
+	; Save validation
+	;
+	; Params:
+	;	pobjLine	INRECLine
+	;
+	; ByRefs: YRETVAL
+	;
+	; Returns:
+	;
+	; History:
+	; 22-Jun-2009	PPP		SR16510: Updated the extra Field checks based on Item Policy
+	; 05-Jan-2008	HQN		SR16268: Added LotNumber Uniqueness check <DEPRECATED>
+	; 28-Feb-2007	JW		SR15453: Encapsulated CanSave. 
+	; 27-Jun-2006	JW		SR13755: Removed $$$Text
+	; 17-May-2006	JW		SR14646: Changed <= to < so can save with blank
+	; 27-Apr-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	$$$LogR("OnBeforeSave","")
+	set strStatus = $$CanSave^INDRECLine(pstrKeys,pobjLine)	//SR16510
+	
+	if $$$ISERR(strStatus) set YRETVAL = strStatus
+	quit
+	
+	
+OnBeforeSaveHook(pstrKeys,&pobjRECLine)
+	;-------------------------------------------------------------------------------
+	; Sets up values from the Reference records (REC, INAUFP)
+	; 
+	; Inputs:
+	;	pstrKeys		INRECLine keys YKEY
+	;	pobjRECLine		INRECLine data YFELD	ByRef
+	; 
+	; History:
+	; 13-Mar-2009	GRF		SR16421: Don't overwrite non-null values
+	; 02-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	new strStatus,idReceipt,objReceipt
+	
+	$$$LogR("OnBeforeSaveHook",pstrKeys)
+	
+	set strStatus = $$$OK
+	set idReceipt = $$$KEY1(pstrKeys)
+	
+	set objReceipt = $get(^INREC(0,idReceipt,1))
+	;set $$$INRECLineLocation(pYFELD) = $$$INRECLocation(objREC)    ; SR16421:
+	;set $$$INRECLineSupplier(pYFELD) = $$$INRECSupplier(objREC)
+	if $$$INRECLineLocation(pobjRECLine)="" set $$$INRECLineLocation(pobjRECLine) = $$$INRECLocation(objReceipt)
+	if $$$INRECLineSupplier(pobjRECLine)="" set $$$INRECLineSupplier(pobjRECLine) = $$$INRECSupplier(objReceipt)
+	
+	quit strStatus
+	
+	
+OnBlur(pYKEY,&pYFELD,pintRow,pintCol)
+	;-------------------------------------------------------------------------------
+	; BYREF: YFORM
+	; 
+	; History:
+	; 27-Aug-2009	GRF		SR16857: now call OnBlurQty for INRECLineReceivedUnit;
+	;							Clarify idClassField rather than idField
+	; 13-Feb-2009	HQN		SR16352: Force OnBeforeFormat to be called regardless
+	; 07-Jan-2009	HQN		SR16268: Suggest ExpirationDate for exisiting LotNumber
+	; 06-Jan-2009	HQN		SR16286: Created
+	;-------------------------------------------------------------------------------
+	new idClassField,idItem,loopPolicyAttr,objBundle,objRECLine,objResultSet,objUItem,sc
+	
+	$$$LogR("OnBlur",pYKEY_":"_pintRow_","_pintCol)
+	
+	set idClassField = $$$GetClassField(YFORM,pintCol)
+	
+	; F14 : Expiration Date
+	;---------------------------------------
+	if idClassField=$$$FldINRECLineExpirationDate {
+		do AddReference^COMGridEdit31Interface($$$FldINRECLineLotNumber)
+		do ScreenUpdateStyle^COMGridEdit31S("Y"_pintRow_"_"_$$$GetFormField(YFORM,$$$FldINRECLineLotNumber))
+	
+	; F13 : Lot No
+	;---------------------------------------
+	} elseif idClassField = $$$FldINRECLineLotNumber {
+		if ($$$INRECLineLotNumber(pYFELD) '= "") && ($$$INRECLineExpirationDate(pYFELD) = "") {
+			set idItem   = $$$INRECLineItem(pYFELD)
+			set objUItem = ##class(alINV.iUINV).GetItem(idItem,.sc)
+			if $$$ISOK(sc) {
+				set loopPolicyAttr = objUItem.ItemPolicy.Attributes.FindObjectId(objUItem.ItemPolicy.%Id()_"||Lot Number")
+				if (loopPolicyAttr'="") && objUItem.ItemPolicy.Attributes.GetAt(loopPolicyAttr).IsUnique {
+					set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleAttribute:GetValueForItemAttribute")
+					set sc           = objResultSet.Execute(idItem,"Lot Number")
+					if $$$ISOK(sc) {
+						while objResultSet.Next(.sc) {
+							if objResultSet.Data("AttributeValue") = $$$INRECLineLotNumber(pYFELD) {
+								set objBundle  = ##class(alSOH.dBundle).%OpenId(objResultSet.Data("Bundle"))
+								set objRECLine = $$$GRIDGetYFELD($$GetYKEY^COMGridEdit31Interface(pintRow))
+								set $$$INRECLineExpirationDate(objRECLine) = objBundle.Attributes.GetAt(objBundle.Attributes.FindObjectId(objBundle.%Id()_"||Use By Date")).AttributeValue
+								do ScreenUpdate^COMGridEdit31S("Y"_pintRow_"_"_pintCol,objRECLine,$$$GRIDGetYFELD($$GetYKEY^COMGridEdit31Interface(pintRow)),pintCol)
+								quit ; while break
+							}
+						}
+					}
+				}
+			}
+		} else {
+			do ScreenUpdateStyle^COMGridEdit31S("Y"_pintRow_"_"_$$$GetFormField(YFORM,$$$FldINRECLineLotNumber))
+		}
+	}
+	do ScreenUpdateStyle^COMGridEdit31S("Y"_pintRow_"_"_pintCol) ; SR16352
+	
+	;if idClassField = $$$FldINRECLineReceivedUnit {   SR16857 27-Aug-2009
+	;	do OnBlurQty(pYKEY,.pYFELD,pintRow,pintCol)
+	;}
+	
+	quit
+	
+	
+OnBlurQty(pstrKeys,&pobjLine,pidGridRow,pintCol)
+	;-------------------------------------------------------------------------------
+	; Called By : Execute On Blur for INRECLine F9/D64 (Unit Qty), F32/D65 Received Unit
+	; 
+	; Inputs :
+	;	pstrKeys	- INRECLine key    (YKEY)
+	;	pobjSummary	- INRECLine object (YFELD)
+	; 
+	; ByRef: YFORM
+	; 
+	; History:
+	; 27-Aug-2009	GRF		SR16857: add ScreenUpdateStyle to manage "REFERENCELIST";
+	;							Processing F32 through here; UpdateManualField to
+	;							refresh WWWDATEN for OnBeforeFormat validation.
+	; 25-Aug-2009	DWR		SR16857: Modifed from INRECSummary
+	;-------------------------------------------------------------------------------
+	new idItem
+
+	$$$LogR("OnBlurQty",pstrKeys_":"_pidGridRow_","_pintCol)
+	
+	set idItem = $$$INRECLineItem(pobjLine)
+	
+	if idItem'="" {
+		do UpdateRecQty^INRECLineUtil(.pobjLine)
+		do UpdateManualField^COMGridEdit31Interface(pidGridRow,$$$FORMFldINRECLineInventoryQty,$$$INRECLineQuantity(pobjLine))
+		do AddReference^COMGridEdit31Interface($$$FldINRECLineQuantity)  ; Inventory Qty
+	}
+	do ScreenUpdateStyle^COMGridEdit31S("Y"_pidGridRow_"_"_pintCol)
+	quit
+	
+	
+OnBeforeFormat(pstrYFIELDNAME,pstrText,pobjLine)
+	;-------------------------------------------------------------------------------
+	; Determine whether any special formatting needs to be applied to cells in the grid.
+	;
+	; Params:
+	; pstrYFIELDNAME	- Edit Grid field name
+	; pstrText			- Not in use
+	; pobjLine			- Supplier Receipt Line record
+	; 
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Aug-2011	PPP		SR17888: No check if the Order does not exist
+	; 16-Sep-2009	GRF		SR16361: Use INRECLine D66 rather than D5 for Order Unit
+	; 27-Aug-2009	GRF		SR16857: standardise conversion - ConvOtherQtyToInvQty
+	; 27-Aug-2009	GRF		SR16857: Clarify idClassField rather than idField; use
+	;							common colour function; initialise values for
+	;							Inventory Quantity
+	; 25-Aug-2009	DWR		SR16857: modified the check ordered qty t]]><![CDATA[o convert to
+	;							inventory qty just in case it isnt in it already.
+	; 03-Aug-2009	PPP		SR16815	Changed $$$INRECLineBaseQuantity to $$$INRECLineOrderQuantity
+	; 13-Feb-2009	HQN		SR16352: Clear tooltip and reset color for correct 
+	;							Expiration Date
+	; 07-Jan-2008	HQN		SR16268: Corrected algorithm, do bundle match against
+	;							LotNumber then compare against stored ExpirationDate
+	; 06-Jan-2009	HQN		SR16268: Only check if setup in itempolicy
+	; 05-Jan-2009	HQN		SR16268: Added LotNumber Uniqueness check
+	; 23-Dec-2008	HQN		SR16255: Refactor coloring, FieldColorMandatory is not
+	;							always set
+	; 29-Sep-2008	Luke	SR15877: Corrected the background colour to be mandatory
+	;							not red for Expiration Date 
+	; 23-Sep-2008	Luke	SR15877: Add Red background colour on error for
+	;							Expiration Date
+	; 15-Sep-2008	HQN		SR15913: Added zero quantity check
+	; 05-May-2008	Luke	SR15699: added language translations
+	; 28-Mar-2008	HQN		SR15640: Corrected mandatory color for lot numbers
+	; 25-Mar-2008	HQN		SR15640: Attempting to make fields aware of V2 ItemPolicies
+	; 03-Sep-2007	GM		BR014609: Included line in language text IN00514
+	; 03-Aug-2006	PO		SR14854: Created
+	;-------------------------------------------------------------------------------
+	new fltOrderQty,fltOtherQty,fltReceiveQty,idClassField,idFlag,idKey,intCol,intExceedsFlag
+	new intRow,loopPolicyAttr,objBundle,objIncomingGoodsFlag,objResultSet,objUItem,sc
+	new strDefaultColor,strDisabledColor,strRequiredColor,strWarningColor
+	
+	$$$LogR("OnBeforeFormat",pstrYFIELDNAME)
+	
+	quit:'$$Editable^INREC($$$GRIDYFELDContainer,$$$EnumINRECSupplierReceipt)
+	
+	;---------------------------------------
+	; $$$INRECLineUnit(pobjLine)          : Order Unit          FIXME : $$$INRECLineOrderedUnit? <GRF>
+	; $$$INRECLineOrderQuantity(pobjLine) : Qty Ordered [Order Unit]
+	; 
+	; fltOrderQty   : Qty Ordered                                            [Inventory Unit]
+	; fltOtherQty   : Qty Received for order/line on *OTHER* receipts        [Inventory Unit]
+	; fltReceiveQty : Sum of receipted quantities for allocated receipt line [Inventory Unit]
+	;---------------------------------------
+	
+	; Grid Position
+	;---------------------------------------
+	$$$GRIDSplitKey(pstrYFIELDNAME,intRow,intCol)
+	set idClassField = $$$GetClassField(YFORM,intCol)
+	
+	; Cell Colours
+	;---------------------------------------
+	set strDefaultColor  = $$CellColours^COMGridEditUtil(.strDisabledColor,.strRequiredColor,.strWarningColor,"","","INRECLine",intCol)
+	set YBACKGROUNDCOLOR = strDefaultColor
+	
+	; F4 : Inventory Quantity
+	;---------------------------------------
+	if (idClassField = $$$FldINRECLineQuantity) {
+		set YBACKGROUNDCOLOR = strDisabledColor       ; SR16857 27-Aug-2009
+		set YTOOLTIP = ""
+		set idFlag = $$$INRECLineFlag(pobjLine)
+	//SR17888	if idFlag'="" {
+		if (idFlag'="") && ($$$INRECLineOrder1(pobjLine)'="") {
+			set intExceedsFlag = $$$INWEMERKERReceiptExceedsOrder($get(^INWEMERKER(0,idFlag,1)))
+			if (intExceedsFlag = $$$EnumWWWTRISTATE1Warn)     ||
+			   (intExceedsFlag = $$$EnumWWWTRISTATE1Disallow)    {
+				
+				set idKey         = $$ReferenceKey^COMGridEdit31Interface(YFORM,intRow)
+			;	set fltOrderQty   = $$ConvOtherQtyToInvQty^INRECLineUtil($$$INRECLineItem(pobjLine),$$$INRECLineUnit(pobjLine),$$$INRECLineOrderQuantity(pobjLine))   ;SR16857 ; SR16361
+				set fltOrderQty   = $$ConvOtherQtyToInvQty^INRECLineUtil($$$INRECLineItem(pobjLine),$$$INRECLineOrderedUnit(pobjLine),$$$INRECLineOrderQuantity(pobjLine))
+				set fltOtherQty   = $$ReceiptQuantities(pobjLine,$$$KEY1(idKey))
+				set fltReceiveQty = $$GetQtyEntered(idKey)
+				
+			; if total on this receipt exceeds balance for order line...  [all 3 based on Inventory Unit]
+				if fltReceiveQty > (fltOrderQty - fltOtherQty) {
+					set YBACKGROUNDCOLOR = $select(intExceedsFlag=$$$EnumWWWTRISTATE1Warn:"yellow",1:strWarningColor)
+					set YTOOLTIP         = $$$Text($listbuild("IN00514",fltOtherQty,idKey))
+				}  ; "Receipt has exceeded ordered quantity in line '%2', other existing receipts account for '%1'."
+			}
+		}
+		
+		if $$$INRECLineQuantity(pobjLine) = 0 {  ; Inventory Qty   ; 15-Sep-2008 HQN SR15913
+			set YBACKGROUNDCOLOR = strWarningColor
+			set YTOOLTIP         = $$$Text("alREC0005")
+		}       ; "Unable to receive zero quantities"
+	}
+	
+	; F13 : Lot No - must be unique in some cases
+	; F14 : Expiration Date
+	; only check fields if item policy requires
+	;---------------------------------------
+	set objUItem = ##class(alINV.dUItem).%OpenId("0||"_$$$INRECLineItem(pobjLine))
+	if (objUItem.ItemPolicy '= $$$NULLOREF) {
+		if (objUItem.ItemPolicy.Description = "Use By Date Policy") {
+			if (idClassField = $$$FldINRECLineExpirationDate) {
+				if ($$$INRECLineExpirationDate(pobjLine) = "") {
+					set YBACKGROUNDCOLOR = strRequiredColor
+					set YTOOLTIP         = $$$Text($listbuild("alREC0006",intCol))
+					        ; "Expiration date cannot be null: %1"
+					
+				} else {    ; <<< SR16352
+					set YBACKGROUNDCOLOR = strRequiredColor
+					set YTOOLTIP = ""
+				}
+			}
+			
+			if (idClassField = $$$FldINRECLineLotNumber) {
+				if ($$$INRECLineLotNumber(pobjLine) = "") {
+					set YBACKGROUNDCOLOR = strRequiredColor
+				
+				} else {  ; also check uniqueness
+					set loopPolicyAttr = objUItem.ItemPolicy.Attributes.FindObjectId(objUItem.ItemPolicy.%Id()_"||Lot Number")
+					if objUItem.ItemPolicy.Attributes.GetAt(loopPolicyAttr).IsUnique {
+						set YBACKGROUNDCOLOR = strRequiredColor
+						set YTOOLTIP = ""
+						
+						if objUItem.ItemPolicy.Description = "Use By Date Policy" {
+							set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dBundleAttribute:GetValueForItemAttribute")
+							set sc = objResultSet.Execute($$$INRECLineItem(pobjLine),"Lot Number")
+							if $$$ISOK(sc) {
+								while objResultSet.Next(.sc) {
+									if $$$INRECLineLotNumber(pobjLine) = objResultSet.Data("AttributeValue") {
+										set objBundle = ##class(alSOH.dBundle).%OpenId(objResultSet.Data("Bundle"))
+										if $$$INRECLineExpirationDate(pobjLine) = objBundle.Attributes.GetAt(objBundle.Attributes.FindObjectId(objBundle.%Id()_"||Use By Date")).AttributeValue {
+											set YBACKGROUNDCOLOR = strRequiredColor
+											set YTOOLTIP = ""
+											
+										} else {  ; SR16352
+											set YBACKGROUNDCOLOR = strWarningColor
+											set YTOOLTIP         = $$$Text("IN00880")
+										}     ; "Lot Number must be unique"
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		
+		} elseif (objUItem.ItemPolicy.Description = "Lot Num Policy") {
+			if (idClassField = $$$FldINRECLineLotNumber) {
+				if ($$$INRECLineLotNumber(pobjLine) = "") {
+					set YBACKGROUNDCOLOR = strRequiredColor
+				}
+			}
+		}
+	}
+	
+	quit
+	
+	
+OrderLineReceipts(pidOrder,pidLine,pidRec,&pfltCurQty)
+	;-------------------------------------------------------------------------------
+	; Get qty received for an order line
+	; (Code moved from ReceiptQuantities^INRECLine)
+	;
+	; Params:	pidOrder		: The order number
+	;			pidLine			: The order line number
+	;			pidRec			: The receipt id to check
+	;
+	; ByRefs:	pfltCurQty		: Qty Received for order/line on current receipt  - in inventory unit
+	;
+	; Returns:  fltOtherQty     : Qty Received for order/line on *OTHER* receipts - in inventory unit
+	;
+	; History:
+	; 18-Feb-2013	SCR		HEVA-847: Check Reversed
+	; 16-Sep-2009	GRF		SR16361: Get Inventory Qty once
+	; 13-Sep-2006	SteveS	SR14954: Created (Code moved from ReceiptQuantities^INRECLine)
+	;-------------------------------------------------------------------------------
+	new fltInventoryQty,fltOtherQty,objRec,blnReverse,objRecLine,idReceipt
+	new idxOrder,idxOrderLine,idReceiptLine
+	
+	$$$LogR("OrderLineReceipts",$get(pidRec)_","_$get(pidOrder)_","_$get(pidLine))
+	
+	if pidOrder="" quit 0
+			
+	set idxOrder     = $$$Index(pidOrder)
+	set idxOrderLine = $$$Index(pidLine)
+ 
+	set fltOtherQty = 0
+	set pfltCurQty  = 0
+	
+	set idReceipt=""
+	for {
+		set idReceipt=$order(^INRECLines(0,4,idxOrder,idxOrderLine,idReceipt))
+		quit:idReceipt=""
+		
+		set objRec     = $get(^INREC(0,idReceipt,1))
+		set blnReverse = ($$$INRECType(objRec)=$$$EnumINRECSupplierReversal)
+		
+		set idReceiptLine = ""
+		for {
+			set idReceiptLine = $order(^INRECLines(0,4,idxOrder,idxOrderLine,idReceipt,idReceiptLine))
+			quit:idReceiptLine=""
+			
+			set objRecLine = $get(^INRECLine(0,idReceipt,idReceiptLine,1))
+			set fltInventoryQty = $$$INRECLineQuantity(objRecLine)
+			
+			;vvvvvvvvvvv HEVA-637
+			;if blnReverse {  ; FIXME : What if this is for the current receipt? <GRF>
+			if (blnReverse && $$$INRECStatus(objRec) = $$$EnumINSTATUSProcessed) {
+			;^^^^^^^^^^^
+				set fltOtherQty = fltOtherQty - fltInventoryQty
+				
+			} elseif $$$INRECLineInclude(objRecLine) {
+				if (idReceipt = $get(pidRec)) { 
+					set pfltCurQty  = pfltCurQty + fltInventoryQty
+				; HEVA-847 vvvv	
+				} elseif ($$$INRECStatus(objRec) = $$$EnumINSTATUSProcessed) || ($$$INRECStatus(objRec) = $$$EnumINSTATUSReversed) { 
+					set fltOtherQty = fltOtherQty + fltInventoryQty 
+				;} elseif $$$INRECStatus(objRec) = $$$EnumINSTATUSProcessed {
+				;	set fltOtherQty = fltOtherQty + fltInventoryQty
+				; HEVA-847 ^^^^	
+				}
+			}
+		}
+	}
+	quit fltOtherQty
+	
+	
+ReceiptQuantities(pobjLine,pidRec,&pfltCurQty)
+	;-------------------------------------------------------------------------------
+	; Return the quantity currently entered in to Supplier Receipts
+	;
+	; Params:	pobjLine	- Supplier Receipt Line record
+	;			pidRec		- the current Supplier Receipt Id
+	; 
+	; ByRefs:	pfltCurQty - Qty Received for order/line on current receipt - in inventory unit
+	;
+	; Returns:	Qty Received for order/line on *OTHER* receipts - in inventory unit
+	;
+	; History:
+	; 13-Sep-2006	Steve S	SR14954: Moved functionality to OrderLineReceipts
+	;  5-Sep-2006	JW		SR14979: Exclude to include. Ignore this receipt. Reverse reversals.
+	; 16-Aug-2006	JW		SR14854: Don't include excluded lines
+	; 03-Aug-2006	PO		SR14854: Created
+	;-------------------------------------------------------------------------------
+	new idOrder,idOrderLine
+	
+	$$$LogR("ReceiptQuantities",pidRec)
+	
+	set idOrder			= $$$INRECLineOrder1(pobjLine)
+	set idOrderLine		= $$$INRECLineOrderLine(pobjLine)
+	
+	quit $$OrderLineReceipts(idOrder,idOrderLine,pidRec,.pfltCurQty)	
+	
+	
+OnBeforeDisplayLine(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Check whether to display line
+	; If multi-pass, and not the line we want to go to, hide it.
+	;
+	; Called By : COMGridEdit31Events
+	; 
+	; Params:	pYKEY	- INRECLine key
+	;			pYFELD	- INRECLine object
+	;
+	; ByRefs:
+	;
+	; Returns:	boolean
+	;
+	; History:
+	; 04-Sep-2006	JW		SR14979: Created
+	;-------------------------------------------------------------------------------
+	new blnDisplay
+	
+	$$$LogR("OnBeforeDisplayLine",pYKEY)
+	
+	set blnDisplay = $$$YES
+	
+	if $$$MultiPass($$$INRECLineLocation(pYFELD)) && $$Editable^INREC($get(^INREC(0,$$$KEY1(pYKEY),1))) {	
+		if $$$INRECLineInclude(pYFELD) && ($$$KEY2(pYKEY)'=$get(^CacheTemp(YUSER,"GridLine"))) {
+			
+			set blnDisplay = $$$NO
+		}
+	}
+	quit blnDisplay
+	
+
+OnBeforeDisplayCombo(pstrKeys,pobjRec,pintCol,&pSUCH)
+	
+#define FORMFldINRECLineRecvdUnit		32
+#define FORMFldINRECLineOrderedUnit		33
+	;-------------------------------------------------------------------------------
+	; Populates the Unit with the UOM as defined in INARTPACK only, excludes
+	; units that the item does not come in.
+	; 
+	; set pSUCH as the items to be used when you override the list (set via blnOverride)
+	;
+	; Called By: COMGridEdit executable
+	; 
+	; Inputs:
+	;	pstrKeys		YKEY
+	;	pobjSummary		YFELD
+	; 
+	; Returns: $$$YES or $$$NO (override the data) 
+	;
+	; History:
+	; 15-Jul-2011	GRF		SR17669: Call common code
+	; 03-Nov-2009	DavidR	SR16983: Created
+	;-------------------------------------------------------------------------------
+	new blnOverride,enumLineType,enumUnit,idClassField,idItem
+	
+	set blnOverride = $$$NO
+	
+	; Unit
+	;---------------------------------------    ; SR17669 vvv
+	if (pintCol = $$$FORMFldINRECLineUnit)       || 
+	   (pintCol = $$$FORMFldINRECLineRecvdUnit)  ||   
+	   (pintCol = $$$FORMFldINRECLineOrderedUnit)  { 
+		set blnOverride = $$LoadCombo^INARTPACK($$$INRECLineItem(pobjRec),blnOverride,.pSUCH)
+	}
+	quit blnOverride
+	/*
+	if (pintCol = $$$FORMFldINRECLineUnit)       || 
+	   (pintCol = $$$FORMFldINRECLineRecvdUnit)  ||   
+	   (pintCol = $$$FORMFldINRECLineOrderedUnit)  { 
+		kill pSUCH
+		set pSUCH  = "SUCH"
+		set idItem = $$$INRECLineItem(pobjRec)
+		if idItem '= "" {
+			set enumUnit = ""
+			for {
+				set enumUnit = $order(^INARTPACK(YM,idItem,enumUnit))
+				quit:enumUnit=""
+				
+				set pSUCH(enumUnit) = enumUnit
+			}
+			set blnOverride = $$$YES
+		}
+	}
+	quit blnOverride
+	*/                                           ; SR17669 ^^^
+
+
+LotNumberExists(pidItem,pstrLotNumber)								
+	;-------------------------------------------------------------------------------
+	; Returns whether a lot number is unique for the pidItem
+	; 
+	; History:
+	; 05-Jan-2009	HQN		SR16268: Created
+	;-------------------------------------------------------------------------------
+	new blnExists,SQLCODE,strValue
+	
+	$$$LogR("LotNumberExists",pidItem)
+	
+	set blnExists = $$$NO
+	&sql(SELECT AttributeValue INTO :strValue FROM alSOH.dBundleAttribute
+	     WHERE Bundle->Item=:pidItem            AND
+	           %EXACT(AttributeValue)=:pstrLotNumber
+	)
+	
+	if (SQLCODE = 0) && (strValue '= "") {
+		set blnExists = $$$YES
+	}
+	quit blnExists
+
+		
+	;-------------------------------------------------------------------------------
+	;                  * * *   D E P R E C A T E D   C O D E   * * *
+	;-------------------------------------------------------------------------------
+	
+	
+OnAfterDataFields(pYM,pYFORM,pYKEY,pYFELD) ; DEPRECATED
+	;-------------------------------------------------------------------------------
+	; Executes within a <script> block
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 25-Aug-2009	DWR		SR16857: Created - not currently being used. This is
+	;							here as a test to see what is best used? currently 
+	;							this function is done on OnBeforeFormConstruction.
+	;-------------------------------------------------------------------------------
+	new idItem
+	
+	if '$$$NoKey(pYKEY) {
+		set idItem = $$$INRECLineItem(pYFELD)
+		if idItem '= "" {
+			do LoadUnitOfMeasureList^INARTUtilities(idItem)
+		}
+	}
+	quit
+	
+	
+Details() ; DEPRECATED - with removal of INWEAUF(VOR) no need for button
+	;-------------------------------------------------------------------------------
+	; Go to the old receipt record INWEAUF(VOR) for this line.
+	;
+	; Called by : INRECLine/INRECBLine Button 1 "Details"
+	; 
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new idClass,idKey
+	
+	$$$LogR("Details","")
+	
+	set idClass = $$$GetClass($$$GRIDYFELDContainer)  ; INWEAUF/INWEAUFVOR
+	set idKey   = $translate($$GetINWEAUFLink(idClass,$$$GRIDGetCurrentYKEY),$$$DBLQUOTE)
+	if idKey="" {
+		$$$GRIDReloadForm()
+	} else {
+		$$$GRIDGoToForm(idClass,idKey)
+	}
+	quit
+	
+	
+GetINWEAUFLink(pidClass,pstrKeys) ; DEPRECATED - with removal of INWEAUF(VOR) 
+	;-------------------------------------------------------------------------------
+	; Get keys of linking INWEAUF(VOR) record if exists
+	;
+	; Params:	pidClass - "INREC"              (INWEAUF(VOR)?)
+	;			pstrKeys - INRECLine keys
+	;
+	; ByRefs:	
+	;
+	; Returns:	keys of INWEAUF(VOR) record
+	;
+	; History:
+	; 31-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new strGlobal,strKeyINWEAUF,idxRec,idxLine
+	
+	$$$LogR("GetINWEAUFLink",pidClass_","_pstrKeys)
+	
+	set idxRec  = $$$Index($$$KEY1(pstrKeys))
+	set idxLine = $$$Index($$$KEY2(pstrKeys))
+	
+	set strKeyINWEAUF =""
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	; Keys : OrderNo, OrderLineNo, Locn, Storage, DateIn
+	; Indexed fields
+	;	INWEAUF/INWEAUFVOR
+	;		D1   (Goods Received No)
+	;		D118 (Incoming Goods Line)
+	;+++++++++++++++++++++++++++++++++++++++
+	
+	set strGlobal = "^"_pidClass_"s(0,2,idxRec,idxLine)"
+	if $data(@strGlobal) {
+		set strKeyINWEAUF = $piece($piece($query(@strGlobal),",",5,9),")",1)
+	}
+	quit strKeyINWEAUF
+	
+	
+GetINWEAUFKeys(pobjRECLine) ; DEPRECATED - with removal of INWEAUF(VOR) 
+	;-------------------------------------------------------------------------------
+	; Get the keys of the INWEUAF(VOR) record from the INRECLine
+	;
+	; Params:	pobjRECLine - INRECLine data
+	;
+	; ByRefs:
+	;
+	; Returns:	INWEUAF(VOR) keys
+	;
+	; History:
+	; 31-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	$$$LogR("GetINWEAUFKeys","")
+	$$$LogRx($$$INRECLineOrder1(pobjRECLine)_","_$$$INRECLineOrderLine(pobjRECLine)_","_$$$INRECLineLocation(pobjRECLine)_","_$$$INRECLineStockLocation(pobjRECLine)_","_(+$horolog))
+	
+	quit $$$INRECLineOrder1(pobjRECLine)_","_$$$INRECLineOrderLine(pobjRECLine)_","_$$$INRECLineLocation(pobjRECLine)_","_$$$INRECLineStockLocation(pobjRECLine)_","_(+$horolog)
+	
+	
+OnAfterSave(pstrKeys,pobjLine) ; DEPRECATED - with removal of INWEAUF(VOR) 
+	;-------------------------------------------------------------------------------
+	; Executed on after save of INRECLine
+	;
+	; Params:	key and data
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 02-Oct-2009	GRF		SR16361: Implement changed code
+	; 10-Sep-2009	GRF		SR16361: Remove INWEAUF(VOR) processing
+	; 09-Sep-2008	HQN		SR15815: Removed V2 population, dReceiptLine deprecated
+	; 27-Mar-2008	HQN		SR15640: Save V2, manually call ConvertOnSave because
+	;							this is a Line
+	; 31-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	quit $$$OK           ; SR16361
+	
+	; vvvvvvvvv DEPRECATED CODE BLOCK
+	new sc
+	
+	$$$LogR("OnAfterSave",pstrKeys)
+	
+	set sc = $$$OK
+	do Update($$$GetClass($$$GRIDYFELDContainer),pstrKeys,pobjLine)     ; pass INWEAUF/INWEAUFVOR   ; see Create^INREC
+	quit sc                   ; FIXME : Should this be strStatus?
+ 
+	
+OnAfterSaveHook(pYKEY,pYFELD="") ; OBSOLETE
+	;-------------------------------------------------------------------------------
+	; Ensures that Summary Lines exist for this record
+	; 
+	; 01-Apr-2009	GRF		SR16363: Add intBaseLine then found not needed
+	; 11-Mar-2009	HQN		SR16363: Only create INRECSummary for Supplier receipts
+	; 02-Mar-2009	HQN		SR16363: Created
+	;-------------------------------------------------------------------------------
+	$$$LogR("OnAfterSaveHook",pYKEY)
+	quit $$$YES
+	
+	
+OnAfterDelete(pstrKeys) ; DEPRECATED - with removal of INWEAUF(VOR) 
+	;-------------------------------------------------------------------------------
+	; Kill INWEAUF record
+	; 
+	; Called by : AfterDelete^INREC
+	; 
+	; Params:	key and data
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 02-Oct-2009	GRF		SR16361: Implement changed code
+	; 10-Sep-2009	GRF		SR16361: Remove INWEAUF(VOR) processing
+	; 10-Sep-2009	GRF		SR16361: [HQN SR15815: Removed V2 population, 
+	; 							dReceiptLine deprecated] wasn't added here
+	; 12-Aug-2008	Luke	SR15814: Corrected sc formation 
+	; 18-Oct-2006	JW		SR15131: Check for null, and kill status. Return status.
+	; 03-Apr-2006	JW		SR14221: Created
+	;-------------------------------------------------------------------------------
+	quit $$$OK           ; SR16361
+	
+	
+Update(pidClass,pstrKeys,pobjLine) ; DEPRECATED - with removal of INWEAUF(VOR) 
+	;-------------------------------------------------------------------------------
+	; Update INWEAUF(VOR) record
+	;
+	; CalledBy :	OnAfterSave^INRECLine
+	; 				Create^INREC
+	;
+	; Params:	pidClass	: INWEAUF or INWEAUFVOR depending on whether the receipt is editable
+	;			key and data
+	;
+	; ByRefs:
+	;
+	; Returns:	status
+	;
+	; History:
+	; 08-Sep-2009	GRF		SR16875: override Unit Price from GetDefaults to ensure
+	; 							based on Inventory Unit
+	; 01-Aug-2009	DWR		SR16857: put received qty to ordered unit to save to INWEAUF
+	; 18-Oct-2006	JW		SR15134: Look at Kill status
+	; 04-Sep-2006	JW		SR14979: Kill if excluding, fix factor
+	; 31-Mar-2006	JW		SR14421: Created
+	;-------------------------------------------------------------------------------
+	new blnExists,dteRecvd,fltFactor,fltOrigFactor,fltRecQty
+	new keysOldINWEAUF,keysNewINWEAUF,objINWEAUF,idOrder,idLine,strStatus
+	
+	$$$LogR2("Update",pidClass_","_pstrKeys)
+	
+	set keysOldINWEAUF = $$GetINWEAUFLink(pidClass,pstrKeys)	;includes quotes
+	set keysNewINWEAUF = $$GetINWEAUFKeys(pobjLine)
+	
+	set blnExists = (keysOldINWEAUF'="")
+	set strStatus = $$$OK
+	
+	if $$$INRECLineInclude(pobjLine) {
+		if blnExists {
+			set objINWEAUF = $get(@("^"_pidClass_"(0,"_keysOldINWEAUF_",1)"))
+			
+			// Check whether INWEAUF keys have changed (exclude date) and kill if necessary
+			set keysOldINWEAUF = $$$DEQUOTE(keysOldINWEAUF)
+			if $piece(keysOldINWEAUF,",",1,4) '= $piece(keysNewINWEAUF,",",1,4) {
+				set strStatus = $$$Kill(pidClass,keysOldINWEAUF)
+				set blnExists = $$$NO
+			}
+			
+		} else {
+			set idOrder = $$$INRECLineOrder1(pobjLine)
+			set idLine  = $$$INRECLineOrderLine(pobjLine)
+			
+			//Defaults
+			set objINWEAUF = $$GetDefaults^INWEAUF1(idOrder,idLine,$$$KEY3(keysNewINWEAUF),$$$KEY4(keysNewINWEAUF),,$$$YES)
+			
+			//Overrides
+			set $$$INWEAUFReceivingNumber(objINWEAUF)       = $$$KEY1(pstrKeys)
+			set $$$INWEAUFIncomingGoodsLine(objINWEAUF)     = $$$KEY2(pstrKeys)
+			set $$$INWEAUFVORItem(objINWEAUF)               = $$ARTIKEL^INWEAUFVOR(keysNewINWEAUF)
+			
+			set $$$INWEAUFSupplier(objINWEAUF)              = $$$INRECLineSupplier(pobjLine)
+			set $$$INWEAUFUnitPrice(objINWEAUF)             = $$$INRECLineEach(pobjLine)     ; for Inventory Unit SR16875
+		}
+		
+		if $$$ISOK(strStatus) {
+			set $$$INWEAUFIncomingGoodsFlags(objINWEAUF)    = $$$INRECLineFlag(pobjLine)
+			;vvvv SR16857 vvvv
+			set fltRecQty = $$GetRecInOrderUnits^INRECSummaryUtil($$$INRECLineOrder1(pobjLine),$$$INRECLineOrderLine(pobjLine),$$$INRECLineQuantity(pobjLine))
+		;	set $$$INWEAUFIncomingGoodsQuantity(objINWEAUF) = +$$$INRECLineQuantity(pobjLine)  ; Inventory Qty
+			set $$$INWEAUFIncomingGoodsQuantity(objINWEAUF) = fltRecQty                        ; Ordered Qty
+			;^^^^ SR16857 ^^^^
+			set $$$INWEAUFLotNo(objINWEAUF)                 = $$$INRECLineLotNumber(pobjLine)
+	; FIXME : <GRF> Do we need to save *BOTH* Batch and Lot? see SR15730
+			set $$$INWEAUFExpirationDate(objINWEAUF)        = $$$INRECLineExpirationDate(pobjLine)
+			
+			if blnExists {
+				set keysNewINWEAUF = keysOldINWEAUF
+				
+			} else {	// Increment date
+				set dteRecvd      = $$$KEY5(keysNewINWEAUF)
+				set fltOrigFactor = $$GetIncrementFactor^WWWDATE1()
+				set fltFactor     = fltOrigFactor*2	// skip first increment
+				
+				while $data(@("^"_pidClass_"(0,"_$$^WWWKEYBUILD(keysNewINWEAUF)_",1)")) {
+					set $piece(keysNewINWEAUF,",",5) = $increment(dteRecvd,fltFactor)
+					set fltFactor = fltOrigFactor	// revert to normal factor
+				}
+			}
+			// Update record
+			set strStatus = $$$Save(pidClass,keysNewINWEAUF,objINWEAUF,$$$YES)
+		}
+	} else {		// If not including, remove INWEAUF record
+		if blnExists {
+			set strStatus = $$$Kill(pidClass,keysOldINWEAUF)
+		}
+	}
+	quit strStatus
+	
+	
+	/*	TODO JW - reverted for build
+OnDisplayRightClickMenu(pYKEY="",pYFELD="",pYFORM="")
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 16-May-2006	JW		SR14615: Created
+	;-------------------------------------------------------------------------------
+	new lstNewMenuItems,blnEnabled
+	
+	set lstNewMenuItems = ""
+	set pYKEY = $translate($get(pYKEY),"""")
+	
+	quit:(pYFELD="")||(pYKEY="") lstNewMenuItems
+	
+	set blnEnabled = '$$Editable^INREC($$$GRIDYFELDContainer)
+	
+	set lstNewMenuItems = $listbuild($listbuild("i.gif","Interface Batch","CallBack(""GoToLink^COMFINSource"",""FININTBatch"",""INRECLine"","""_pYKEY_""")",,blnEnabled)) ; Show Demand
+	
+	quit lstNewMenuItems
+	*/
+	
+	/* DEPRECATED SR16983 - Replaced by OnBeforeFormConstruction
+OnBeforeFormConstruction(pidClassField,pobjLine)
+	;-------------------------------------------------------------------------------
+	; Generate data for Unit of Measure drop down before constructing Edit Grid field
+	;
+	; Params:	pidClassField - Form Field Id
+	;			pobjLine      - INREC Line record
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Aug-2009	DWR		SR16857: Created
+	;-------------------------------------------------------------------------------
+	new idItem
+	
+	if pidClassField = $$$FldINRECLineUnit {
+		set idItem = $$$INRECLineItem(pobjLine)
+		if idItem '= "" {
+			do LoadUnitOfMeasureList^INARTUtilities(idItem)
+		}
+	}
+	
+	quit
+	*/
+	
+OnBlurInvoiceDate(pYFELD)
+	;-------------------------------------------------------------------------------
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Jul-2013	Thiago		HEVA-1042: Created
+	;-------------------------------------------------------------------------------
+	if ((+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) ||
+		(+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1))))||
+		(+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))){
+			
+		quit:(pYFELD="")
+	
+		if (($piece(pYFELD,Y,16) '= "") && (+$piece(pYFELD,Y,16) > +$horolog)){
+			$$$Alert("A data de emissão da nota fiscal não pode ser posterior a data atual.")
+			set $piece(YFELD,Y,16) = ""
+		}
+	}
+
+	quit
+]]></Routine>
+</Export>

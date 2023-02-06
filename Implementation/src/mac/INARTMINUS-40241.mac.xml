@@ -1,0 +1,910 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INARTMINUS" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INARTMINUS(AUFTRAG,POS,ART,REST,SERIENNUMMER,LAGERPL,FERTIGUNG,MINUS,TEIL,KOST,WEDATUM,NACHB,VBETRIEB,NOPOST,NOSPEI,FERTNO,CHECKLP)
+#include COMSYS
+#include INConst
+#include WWWConst
+#define EnumLastInFirstOut 1
+	;-------------------------------------------------------------------------------
+	; Description of Function :
+	;		ARTIKELBESTAND ÄNDERN UND IN AUFTAG SETZEN ODER FERTIGUNG; Deducts item's stock. Called from Orders. 
+	;
+	; Inputs : 
+	;  AUFTRAG		AUFTRAGSNUMMER   O D E R  FERTIGUNGSNUMMER !   	; work order or real order number
+	;  POS			POSITIONSNUMMER  O D E R  LFN.FERTIGUNGSTEIL ! 	; order line, null/seq for work order
+	;  ART			ARTIKELNUMMER								  	; product number
+	;  REST			RESTMENGE             							; reduction quantity
+	;  SERIENNUMMER	BESITMMTE SERIENNUMMER ÃÂBERTRAGEN 			; serial number (if applicable) 
+	;  LAGERPL		LAGERPLATZ									    ; Storage
+	;  FERTIGUNG	FERTIGUNG 	 									; manufacturing with/without number
+	;  						 ""= KEINE FERTIGUNG
+	;  						 1 = MIT FERTIGUNGSNUMMER
+	;  						 2 = OHNE FERTIGUNGSNUMMER
+	;  MINUS		MINUSMENGEN ERLAUBT 1=JA 0=DFLT. 2=NEIN          	; Is Stock allowed to go Negative?
+	;  TEIL			TEILEKEY ZUR PRÃFUNG AUF ERLEDIGUNG WENN FERTIGUNG=2 	;quiz upon transaction when 
+	;  KOST			RÃCKGABEWERT=SELBSTKOSTEN                        	; (BOOLEAN) append production cost to quantity
+	;  WEDATUM		NUR VON WEDATUM ABBUCHEN                          	; only 
+	;  NACHB		NACHBUCHUNG = KEINE PRÃFUNG OB BEREITS GEBUCHT ! 	; no quiz whether yet 
+	;  VBETRIEB		BESTIMMTER BETRIEB                                  ; particular location
+	;  NOPOST		KEINE BUCHUNG BEI HISTORY                         	; no reservation with history 
+	;  					Passed as $$YES by routines INAUFWH (Source Stock) and INWORK (Display Stock)
+	;  					
+	;  NOSPEI		KEINE BESTANDSVERÃNDERUNG MERKEN/PRÃFEN (VORSICHT DOPPELBUCHUNG ! NUR BEI NEGATIVEN UNTERTEILEN)
+	;  				;change in stock only next to 
+	;  FERTNO		FERTIGUNGSNUMMER (WIRD BEI BUCHUNG NEGATIVER UNTERTEILE ZUSÃTZLICH ÃBERGEBEN) ;next to supernumerary 
+	;  CHECKLP		ABBUCHUNG VON GESPERRTEN LAGERPLÃTZEN NICHT ERLAUBT 
+	;  					DOES NOT PERMIT DEDUCTION OF CLOSED STORAGE 
+	;
+	; ByRef :
+	;
+	;
+	; Returns : OK   fltQtyRemaining ; HQN FIXME: Returns "", 0 or a number...what does that mean?
+	;
+	;
+	; History :
+	; 23-Feb-2007	GRF		SR15454: Property name clarified "INVORGBSubContractLocn"
+	; 12-Oct-2006	GRF		Naked Reference
+	; 05-Oct-2006	GRF		SR14471: $$$EnumLastInFirstOut
+	; 29-Sep-2006	GRF		SR14471: line split for clarity; FIX ME
+	; 21-SEP-2006   FAN     SR14746: Sales statistics incorrect
+	; 20-Jun-2006	JW		SR14748: Added + to qty value
+	; 04-May-2006	SC		SR14609: Remove call to WWWZAHL. Currency Translation inappropriate on
+	; 								 INARTHIST order quantity! This will prevent commas. ie "1,234". 
+	; 03-Mar-2006	GRF		SR14362: Doco
+	; 10-Jan-2006	GRF		SR14075: Not accumulating case 3 and case 4
+	; 03-Jan-2006	GRF		SR14075: Common setting of objDefaults and blnAvgCost;
+	; 						use Average Cost in 'Case 4' - was getting batch cost;
+	; 						use macros; translated comments
+	; 11-Nov-2005	GRF		SR13838: Still process value if no stock on hand; clear pre-2004 comments
+	; 16-Aug-2005	FIS		SR13253: USE ALWAYS AVERAGE COST
+	; 27-Jul-2005	GRF		SR13024: Ensure OBERTEIL (parent item) is defined
+	; 21-Jul-2005	GRF		SR13024: Doco
+	; 16.Jun.2005	FIS		SR12556: ORDER LOCATION
+	; 11-May-2005	GRF		Clarification MBD - Material Burden
+	; 26-Apr-2005	GRF		SR10478: Ensure Order Number and Line are passed through
+	; 						to INARTHIST
+	; 05.07.2000	DT		Created
+	;-------------------------------------------------------------------------------
+	;
+	;ACHTUNG !! INARTMINUS UND INARTPLUS1 RUFEN SICH GEGENSEITIG AUF, WENN DIE BUCHUNGSMENGE NEGATIV IST !!
+	;           OB DIE KORREKTUR BEREITS ERLEDIGT IST, WIRD IN DER AUFRUFENDEN ROUTINE GEPRÜFT !!!
+	;
+	;	Attention
+	;	  INARTMINUS AND INARTPLUS1 CALLS ITSELF MUTUAL UP, IF THE RESERVATION QUANTITY IS NEGATIVE!!
+	;	  WHETHER THE CORRECTION IS ALREADY SETTLED IS EXAMINED, IN THE CALLING ROUTINE
+	;-------------------------------------------------------------------------------------------
+	;LAGER-ABBUCHUNGEN BEI FERTIGUNG: ;next to 
+	;
+	;*** NEU AB 30.12.03 ;FIS;24854
+	;BEI ABBUCHUNG VON UNTERTEILEN BEI FERTIGUNG, KANN DURCH EINE ZUORDNUNGSTABELLE FESTGELEGT WERDEN, WELCHE
+	;SERIENNUMMERN ABGEBUCHT WERDEN SOLLEN. DIESER WERDEN VORRANGING (VORRANGIG?) VERSUCHT ABZUBUCHEN.
+	;
+	;	DURING DEDUCTION OF COMPONENTS WITH MANUFACTURE, CAN BY A TABLES OF CLASSIFICATION
+	;	SPECIFIED, WHICH SERIAL NUMBER DEDUCTED BEING SUPPOSED. TRIES TO DEDUCT THOSE with highest priority.
+	;
+	;BEI PROGRAMM-AUFRUF DURCH FERTIGSTELLUNG (INPROFERTIG/INPROSTEMPU/INAUFPTT2) WIRD DIE INARTMINUS 2 X AUFGERUFEN.
+	;
+	;	INARTMINUS IS CALLED twice WITH PROGRAM CALL BY COMPLETION (INPROFERTIG/INPROSTEMPU/INAUFPTT2).
+	;
+	;ZUERST WIRD VERSUCHT, ALLE MENGEN AUS DEM PRODUKTIONSLAGER ZU HOLEN. REICHT DIE MENGE AM PRODUKTIONSLAGER NICHT
+	;AUS, WIRD DIE RESTMENGE IM ZWEITEN PROGRAMMAUFRUF VON DEN ANDEREN LAGERPLÄTZEN ABGEBUCHT.
+	;
+	;	FIRST ONE TRIES to get ALL QUANTITIES FROM THE PRODUCTION stock location.
+	;	IF THE QUANTITY OF THE PRODUCTION stock location IS NOT SUFFICIENT,
+	;	THE RESIDUE IN THE SECOND PROGRAM CALL IS DEDUCTED from THE OTHER STOCK locations.
+	;
+	;IN BEIDEN FÄLLEN WIRD FOLGENDES AUSLAGERUNGSPRINZIP BEACHTET: 
+	;DAS PROGRAMM VERSUCHT, DIE KOMPLETTE MENGE VON LAGERPLÄTZEN DES EIGENEN BETRIEBES ABZUBUCHEN. REICHT DIESE MENGE
+	;NICHT AUS, WERDEN DIE LAGERPLÄTZE ANDERER BETRIEBE REDUZIERT, WENN DAS DURCH DEN SYSTEMPARAMETER 'ZUGRIFF AUF
+	;BESTÄNDE ANDERER BETRIEBE ERLAUBT' GESTATTET WIRD. 
+	;INNERHALB DER BETRIEBE GILT DAS LAGERUNGSPRINZIP (FIFO/LIFO) AUS DEN SYSTEMVORGABEN.
+	;
+	;	IN BOTH CASES THE FOLLOWING SEQUENCING PRINCIPLE IS CONSIDERED:
+	;	THE PROGRAM TRIES TO DEDUCT THE COMPLETE QUANTITY OF STOCK PILES OF THE OWN ENTERPRISE.
+	;	IF THIS QUANTITY IS NOT SUFFICIENT, THE STOCK PILES OF OTHER ENTERPRISES are reduced, IF PERMITTED
+	;	BY THE SYSTEM PARAMETER "ACCESS TO EXISTENCE OF OTHER ENTERPRISES IS PERMITTED".
+	;	WITHIN THE ENTERPRISES THE storage principle (FIFO/LIFO) FROM THE SYSTEM DEFAULTS APPLIES.
+	;
+	;BEI ABBUCHUNGEN VON FERTIGUNGSTEILEN, DIE DURCH VORHERIGE ZUBUCHUNG AUS FERTIGUNG ENTSTANDEN SIND, SUCHT DAS
+	;PROGRAMM NACH DEM EXAKTEN LAGERPLATZ DER FERTIGUNG, UM GENAU DAS TEIL EINZUBAUEN (HERSTELLKOSTEN!), DASS MIT
+	;DIESEM AUFTRAG AUCH GEFERTIGT WURDE. KANN DIESER WE ERMITTELT WERDEN (DURCH FERTIGUNGSNR. DER VORHERIGEN FERTIGUNG
+	;IM LAGERPLATZHINWEIS), WIRD DORT DIE MENGE ABGEBUCHT, EGAL WELCHES DATUM, WELCHER LAGERPLATZ ODER BETRIEB.
+	;
+	;	DURING DEDUCTIONS OF MANUFACTURING PARTS, WHICH DEVELOPED FOR BY PREVIOUS POSTING FROM MANUFACTURING,
+	;	THE PROGRAM searches AFTER THE ACCURATE STOCK PILE OF THE MANUFACTURING, IN ORDER TO INSERT EXACTLY THE
+	;	PART (MANUFACTURING COSTS!), THAT WITH THIS ORDER ALSO ONE MANUFACTURED.
+	;	CAN THIS INCOMING GOODS DETERMINES (through FERTIGUNGSNR : THE PREVIOUS MANUFACTURING IN THE STOCK PILE
+	;	REFERENCE), THE QUANTITY IS DEDUCTED THERE, ALL THE SAME WHICH DATE, WHICH STOCK PILE OR ENTERPRISE.
+	;
+	;IM FALLE EINER FREMDFERTIGUNG, WIRD DIE INARTMINUS MIT DEM LEIHLAGER-LIEFERPLATZ ALS VORGABE AUFGERUFEN, D.H. DASS
+	;ZUERST WIRD VERSUCHT, DIE MENGE AUS DEN LEIHLIEFERUNGEN ABZUBUCHEN.
+	;
+	;	IN THE CASE OF AN EXTERNAL MANUFACTURE, INARTMINUS IS CALLED WITH THE BORROWING location DELIVERY PLACE AS
+	;	DEFAULT, I.E. THAT INITIALLY TRIED TO DEDUCT THE QUANTITY FROM THE BORROWING SUPPLIES.
+	;-------------------------------------------------------------------------------------------
+	new BET,BETRIEB,blnAvgCost,CANR,DATEI1,FERT1,FERTIG1,FERTIGNR,INFOTEXT
+	new LAP,LFN,LIEF,LONR,LP,MENGE,objDefaults,objItem,objLocnParams,OK
+	new REST1,REST2,SELBSTKOST,SEN,SORT,SubContractLocn,UEBERT,VERS,WED,WEN,YI,YII
+	
+	;---------------------------------------
+	;
+	; *** UPDATE INWE POINT ***
+	; 
+	; This comment marks where the INWE class
+	; is being saved or killed as an indication
+	; of where a common method may need to be
+	; located.     <GRF>  (5 entries)
+	;
+	;---------------------------------------
+ 
+	SET $ZTRAP="^WWWERROR"
+	
+	SET OK=0
+	QUIT:+$get(REST)=0 OK  ;KEINE MENGE ;no quantity 
+	SET OK=REST
+	QUIT:$get(ART)="" OK   ;KEINEN ARTIKEL ;item 
+	
+	;	26	$$$INARTItemType()
+	QUIT:$$$INARTItemType($get(^INART(YM,ART,1)))=2 OK   ;LEISTUNG ;Service Item 
+	
+	SET AUFTRAG   = $get(AUFTRAG)
+	SET POS	      = $get(POS)
+	SET FERTIGUNG = $get(FERTIGUNG)      ;FERTIGUNG?     ; manufacture?
+	IF FERTIGUNG="" QUIT:AUFTRAG="" OK   ;KEINEN AUFTRAG ; no order
+	QUIT:POS="" OK                       ;KEINE POSITON  ; no order line
+	
+	SET TEIL	    = $get(TEIL)
+	SET LFN	        = ""
+	set objDefaults = $get(^INVORG(YM,YM,1))
+	set blnAvgCost  = ($$$INVORGDefaultCostType(objDefaults)=9)   ; (D15) Are we using Average cost?
+	
+	;---------------------------------------
+	; Is Stock allowed to go Negative?         ;MINUSBESTÄND ERLAUBEN
+	;     1 is Yes, 2 is No, 0 uses the default value
+	SET MINUS   = +$get(MINUS)
+	IF $$$INVORGMinusStockAllowed(objDefaults)=$$$YES IF MINUS'=2 SET MINUS=$$$YES
+	IF MINUS=2 SET MINUS=$$$NO
+	;---------------------------------------
+	
+	set objItem=$get(^INART(YM,ART,1))
+	IF $$$INARTItemWithoutInventoryMaint(objItem)=1 QUIT OK  ;KEINE BESTANDSFÜHRUNG  ;No Inventory History
+	
+	IF $$$INARTItemType(objItem)=2 QUIT OK  ;ACHTUNG LEISTUNG        ;Service Item     ; FIXME : we already quit above in this case <GRF>
+	IF $$$INARTItemType(objItem)=5 QUIT OK  ;ACHTUNG PHANTOM-ARTIKEL ;Phantom Item
+	IF $$$INARTItemType(objItem)=6 QUIT OK  ;ACHTUNG Pauschale       ;Overall Performance 
+	IF $$$INARTItemType(objItem)=7 QUIT OK  ;ACHTUNG KONFIGURATION   ;Item to Configure
+	
+	/*  FERTIGNR =  Work Order No
+	;   FERTIG1  :  objINPROSTEMP / objINPROSTEMP1 (NOTE : ^INPROSTEMP is killed at some stage)
+	;   AUFTRAG  <= Manufacturing Order No
+	;   POS      <= Manufacturing Order Line No
+	;
+	; when a Manufacturing Order with MO Number    ;-> WENN FERTIGUNGSAUFTRAG MIT FERTIGUNGSNUMMER    */
+	IF FERTIGUNG=1 DO
+	. SET FERTIGNR=AUFTRAG
+	. SET LFN=POS
+	. QUIT:FERTIGNR=""
+	. SET FERTIG1=$GET(^INPROSTEMP(YM,FERTIGNR,1))
+	. IF $DATA(^INPROSTEMP1(YM,FERTIGNR,1)) SET FERTIG1=$GET(^INPROSTEMP1(YM,FERTIGNR,1))
+	. SET AUFTRAG = $$$INPROSTEMPOrder1(FERTIG1)
+	. SET POS     = $$$INPROSTEMPLineItem(FERTIG1)
+	;. SET TEIL   = $PIECE($PIECE(FERTIG1,Y,6),",",3,999)
+	
+	IF AUFTRAG="" QUIT OK
+	IF POS=""     QUIT OK
+	
+	; 12-Oct-2006 Naked Reference
+	IF $DATA(^INAUF(YM,AUFTRAG,1)) IF $PIECE(^INAUF(YM,AUFTRAG,1),Y,6)'=YLOCATION NEW YLOCATION SET YLOCATION=$PIECE(^INAUF(YM,AUFTRAG,1),Y,6)  ;ORDER LOCATION;FIS;16.06.05;SR12556
+	SET BETRIEB=$GET(YLOCATION)  ;FOR HISTORY
+	
+	IF TEIL'="" SET DATEI1="^INAUFPXL("_""""_YM_""""_","_""""_AUFTRAG_""""_","_POS_","_TEIL_")"
+	IF TEIL=""  SET DATEI1="^INAUFP("_""""_YM_""""_","_""""_AUFTRAG_""""_","_POS_",1)"
+	
+	IF '$DATA(@DATEI1) QUIT OK
+	IF $GET(NACHB)'=1 IF $GET(NOSPEI)'=1 IF FERTIGUNG=2 IF $PIECE(@(DATEI1),Y,244)'="" SET OK=0 QUIT OK  ;BESTAND BEREITS BERICHTIGT ;yet 
+	; TODO: appears temp comment *CAN* be permanent
+	;		Temp comment <GRF> SR13085
+	;IF $GET(NACHB)'=1 IF $GET(NOSPEI)'=1 IF FERTIGUNG=1 IF LFN'="" IF ($PIECE($GET(^INPROSTEMPT(YM,FERTIGNR,LFN,1)),Y,6)=1)!($PIECE(@(DATEI1),Y,244)'="") SET OK=0 QUIT OK   ;ERLEDIGT ABGEBUCHT
+	
+	;-----------------------------
+	;NEGATIVE PRODUKTION / RÜCKBAU
+	;-----------------------------
+	IF REST<0 IF FERTIGUNG'="" DO  QUIT OK
+	. ; 
+	. ; FIXME : May not be using default delete location <GRF>
+	. ; 
+	. QUIT:$GET(LAGERPL)="X"                            ;KEINE BUCHUNG BEI FERTIGSTELLUNG ;no next to finishing 
+	. SET VERS=$$$INARTRevisionNo($GET(^INART(YM,ART,1)))     ;AKTUELLE ARTIKELVERSION
+	. ;
+	. ;LAGERBERICHTIGUNG AUS FERTIGUNG ;out of 
+	. SET OK=$$^INARTPLUS1($GET(FERTIGNR),AUFTRAG,POS,TEIL,ART,-REST,$GET(SERIENNUMMER),,$GET(LAGERPL),VERS,1)  ;BESTAND BUCHEN (BUCHUNG NICHT MERKEN !!) ;Not 
+	. IF FERTIGUNG=1 IF LFN'="" DO                                           ;BEI FERTIGUNG ;next to 
+	. . SET $PIECE(^INPROSTEMPT(YM,FERTIGNR,LFN,1),Y,6)=1                    ;ERLEDIGT ABGEBUCHT
+	. . SET $PIECE(^INPROSTEMPT(YM,FERTIGNR,LFN,1),Y,7)=$GET(SERIENNUMMER)   ;SERIENNUMMER
+	. ;
+	. IF FERTIGUNG'="" DO  ;IF FERTIGUNG=2 DO  ;FIS;25939;22.06.04;IMMER SPEICHERN
+	. . SET $PIECE(@DATEI1,Y,244)=+$HOROLOG
+	. . IF TEIL'="" SET $PIECE(^INAUFPT(YM,AUFTRAG,POS,$TRANSLATE(TEIL,",",".")_".",1),Y,244)=+$HOROLOG
+	. . IF TEIL=""  SET $PIECE(^INAUFPXL(YM,AUFTRAG,POS),Y,244)=+$HOROLOG
+	. ;
+	. SET OK=0
+	
+	;---------------------------
+	IF REST<0 QUIT ""                   ;MINUSMENGE NICHT BUCHEN ;Don't record negative quantities
+	;---------------------------
+	
+	KILL ^WWWSOR(YUSER_"VLP")
+	
+	SET OK=REST
+	SET POS=$TRANSLATE(POS,",","-")
+	IF POS="" QUIT OK
+	
+	;---------------------------
+	
+	SET REST1=REST
+	IF $GET(SERIENNUMMER)'="" SET REST1=1  ;NUR EINEN BEI SERIENNUMMERN ;only with a serial number 
+	SET CANR=""
+	SET LONR=""
+	SET SELBSTKOST=0
+	
+	;SET CHECKLP=0 ;table-mat 
+	SET CHECKLP = $GET(CHECKLP)  ;FIS;ALS PARAMETER VORGEBEN;26392;20.09.04
+	IF (CHECKLP="") || (FERTIGUNG'="") SET CHECKLP = +$$$INVORGStockLocnProductionBlock(objDefaults)  ; (D157) KEINE ENTNAHME VON GESPERRTEN LAGERPLÄTZEN BEI PRODUKTION
+	
+	DO
+	. ;----------------------VORSORTIEREN LAGERPLÄTZE NACH DATUM-------------------
+	. ;  Extract Storages after date to temporary lists for processing
+	. ;  
+	. KILL ^WWWSOR(YUSER,"LP1")  ;NICHT KOMPLETT WWWSOR KILLEN WEGEN INPROFERTIG ! ;Not complete - kill WWWSOR if in production (?)
+	. KILL ^WWWSOR(YUSER,"LP2")
+	. KILL ^WWWSOR(YUSER,"LP3")
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ Build WWWSOR LP1/LP2/LP3
+	. ;   LP1   INWE keys - temp list
+	. ;   LP2               second list - replaces LP1 if production  (?)
+	. ;   LP3   INWE keys - serial number list
+	. SET BET=""
+	. FOR  SET BET=$ORDER(^INWE(YM,ART,BET)) QUIT:BET=""  DO    ;BETRIEB
+	. . ; If we specify a location, only consider storages for that location
+	. . IF $get(VBETRIEB)'="" QUIT:BET'=VBETRIEB                ;FALSCHER BETRIEB
+	. . ;
+	. . set objLocnParams   = $get(^INVORGB(YM,YM,BET,1))
+	. . set SubContractLocn = $$$INVORGBSubContractLocn(objLocnParams)      ;SR15454
+	. . set LAP=""
+	. . FOR  SET LAP=$ORDER(^INWE(YM,ART,BET,LAP)) QUIT:LAP=""  DO    ;LAGERPLATZ ;storage 
+	. . . ;
+	. . . ;  Don't use any storage which starts with the SubContract Locn prefix
+	. . . ;  Both the storage and the SubContract Locn must contain "*"
+	. . . ;
+	. . . IF $GET(LAGERPL)="" IF $FIND(LAP,"*") IF SubContractLocn'="" SET YQ(1)=0 DO  QUIT:YQ(1)=1  ;LEIHLAGERPLATZ
+	. . . . NEW A,B
+	. . . . SET A = $FIND(SubContractLocn,"*")-1
+	. . . . SET B = $EXTRACT(SubContractLocn,1,A)
+	. . . . IF B=$EXTRACT(LAP,1,A) SET YQ(1)=1  ;LAGERPLATZ = LEIHLAGERPLATZ  (LEIHLAGER*FERTIGUNGSNR.) ;storage
+	. . . ;
+	. . . SET WED=""
+	. . . FOR  SET WED=$ORDER(^INWE(YM,ART,BET,LAP,WED)) QUIT:WED=""  DO    ;WEDATUM
+	. . . . ;SET WEN=$GET(^INWE(YM,ART,BET,LAP,WED,1))
+	. . . . ;
+	. . . . IF $GET(SERIENNUMMER)'="" QUIT:'$DATA(^INWES(YM,ART,BET,LAP,WED,SERIENNUMMER))  ;FALSCHE SERIENNUMMER
+	. . . . IF $GET(LAGERPL)'=""      QUIT:LAP'=LAGERPL     ;FALSCHE LAGERPLATZ 
+	. . . . IF $GET(WEDATUM)'=""      QUIT:WED'=WEDATUM     ;FALSCHES WEDATUM
+	. . . .;IF $GET(VBETRIEB)'=""     QUIT:BET'=VBETRIEB    ;FALSCHER BETRIEB -> WEITER OBEN !
+	. . . . SET ^WWWSOR(YUSER,"LP1",ART,BET,WED,LAP," ")=""
+	. ;
+	. ;SUCHEN ZUGEORDNETE SERIENNUMMERN
+	. IF FERTIGUNG'="" IF TEIL'="" IF $DATA(^INAUFPTSN(YM,AUFTRAG,POS,$TRANSLATE(TEIL,",",".")_".")) DO
+	. . NEW SN,SNANZ,BET,LAP,WED,MESS,TEIL1,MAX
+	. . SET SNANZ=0
+	. . SET TEIL1=$TRANSLATE(TEIL,",",".")_"."
+	. . SET BET=""
+	. . FOR  SET BET=$ORDER(^INWE(YM,ART,BET)) QUIT:BET=""  DO    ;BETRIEB
+	. . . IF $$$INVORGAccessOtherItemLocns(objDefaults)'=1 QUIT:BET'=YLOCATION  ;ZUGRIFF AUF BESTÄNDE ANDERER BETRIEBE NICHT ERLAUBT ! ;upon other Not permissive 
+	. . . SET LAP=""
+	. . . FOR  SET LAP=$ORDER(^INWE(YM,ART,BET,LAP)) QUIT:LAP=""  DO           ;LAGERPLATZ
+	. . . . IF CHECKLP=1 QUIT:$PIECE($GET(^INLP(YM,BET,LAP,1)),Y,8)=1          ;LAGERPLATZ GESPERRT ;storage DISABLED 
+	. . . . SET WED=""
+	. . . . FOR  SET WED=$ORDER(^INWE(YM,ART,BET,LAP,WED)) QUIT:WED=""  DO     ;WEDATUM
+	. . . . . SET MAX=$$$INWEQuantity($GET(^INWE(YM,ART,BET,LAP,WED,1)))       ;MAXIMAL VERFÜGBARE MENGE ;maximum available quantity 
+	. . . . . IF MAX>0 SET SN="" FOR  SET SN=$ORDER(^INWES(YM,ART,BET,LAP,WED,SN)) QUIT:SN=""  DO  QUIT:MAX'>0    ;SN
+	. . . . . . IF $DATA(^INAUFPTSN(YM,AUFTRAG,POS,TEIL1,SN)) DO
+	. . . . . . . SET MAX=MAX-1
+	. . . . . . . QUIT:+$PIECE($GET(^INAUFPTSN(YM,AUFTRAG,POS,TEIL1,SN,1)),Y,3)'=0  ;BEREITS BEARBEITET ;yet 
+	. . . . . . . QUIT:SNANZ'<REST
+	. . . . . . . SET ^WWWSOR(YUSER,"LP3",ART,BET,WED,LAP,SN)=""           ;SPEICHERN IN SORTDATEI 3 ;Save within 
+	. . . . . . . SET $PIECE(^INAUFPTSN(YM,AUFTRAG,POS,TEIL1,SN,1),Y,3)=1  ;SPEICHERN ABBUCHUNGSVERMERK
+	. . . . . . . IF $DATA(^WWWSOR(YUSER_"SNMESS")) SET ^WWWSOR(YUSER_"SNMESS",AUFTRAG,POS,TEIL1,SN)=1  ;FÜR ANZEIGE BEARBEITUNGSVERMERK ;to Show 
+	. . . . . . . SET SNANZ=SNANZ+1
+	. . ;
+	. . SET SN=""
+	. . FOR  SET SN=$ORDER(^INAUFPTSN(YM,AUFTRAG,POS,TEIL1,SN)) QUIT:SN=""  DO
+	. . . QUIT:+$PIECE($GET(^INAUFPTSN(YM,AUFTRAG,POS,TEIL1,SN,1)),Y,3)'=0  ;BEREITS BEARBEITET ;yet 
+	. . . SET MESS=2
+	. . . IF SNANZ'<REST SET MESS=3
+	. . . SET $PIECE(^INAUFPTSN(YM,AUFTRAG,POS,TEIL1,SN,1),Y,3)=MESS
+	. . . IF $DATA(^WWWSOR(YUSER_"SNMESS")) SET ^WWWSOR(YUSER_"SNMESS",AUFTRAG,POS,TEIL1,SN)=MESS  ;FÜR ANZEIGE BEARBEITUNGSVERMERK ;to Show 
+	. ;
+	. ;SUCHEN EXAKTEN LAGERPLATZ AUS PRODUKTION ;seek stock location out of production 
+	. IF FERTIGUNG'="" DO
+	. . NEW KEY,DATEI,BET1,LAP1,WED1,YI,KEY1,STEMP
+	. . SET STEMP = $GET(FERTIGNR)
+	. . IF FERTIGUNG=2 IF $GET(FERTNO)'="" SET STEMP=FERTNO    ; work order
+	. . IF FERTIGUNG=2 IF $GET(FERTNO)=""  SET STEMP="???"     ; no work order
+	. . ;
+	. . ;SUCHEN KEY LAGERPLATZ AUS PRODUKTION DES UNTERTEILS ;seek KEY stock location out of production 
+	. . ;  Retrieves : tilde-delimited INWE key list where keys are
+	. . ;              comma-delimited (Item,Locn,StockLocn,Date)
+	. . ;
+	. . SET KEY=$$^INPROWEMINUS(AUFTRAG,POS,STEMP,ART,$TRANSLATE(TEIL,",",".")_".")
+	. . IF KEY'="" FOR YI=1:1  QUIT:$PIECE(KEY,Y,YI,99)=""  SET KEY1=$PIECE(KEY,Y,YI) DO:KEY1'=""
+	. . . SET BET1=$PIECE(KEY1,",",2)
+	. . . SET LAP1=$PIECE(KEY1,",",3)
+	. . . SET WED1=$PIECE(KEY1,",",4)
+	. . . KILL ^WWWSOR(YUSER,"LP1",ART,BET1,WED1,LAP1," ")    ;LÖSCHEN AUS SORTDATEI 1  ;Delete from temp 1
+	. . . SET ^WWWSOR(YUSER,"LP2",ART,BET1,WED1,LAP1," ")=""  ;SPEICHERN IN SORTDATEI 2 ;Save in temp 2
+	. ;
+	. ;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ Use WWWSOR LP1/LP2/LP3, Build VLP
+	. ;
+	. ;------------------BESTÄNDE DURCHLAUFEN UND ABBUCHEN
+	. ;------------------stock pass through & deducting/write off
+	. ; Stock Allocation Method  : FIRST IN / FIRST OUT  : Normal order
+	. ;                             LAST IN / FIRST OUT  : Reverse order
+	. ;-------------------------------------
+	. SET SORT=1 
+	. IF $$$INVORGInOutPrinciple(objDefaults)=$$$EnumLastInFirstOut SET SORT=-1       ; 05-Oct-2006
+	. ;
+	. FOR LP="LP3","LP2","LP1" IF $DATA(^WWWSOR(YUSER,LP)) DO  QUIT:REST1'>0  ;ZUERST ZUGEORDNETE SN, DANN DIE DURCH DIESEN AUFTRAG ENTSTANDEN LAGERPLÄTZE, DANN REST
+	. . FOR BET=YLOCATION,"" DO
+	. . . QUIT:REST1'>0
+	. . . IF $$$INVORGAccessOtherItemLocns(objDefaults)'=1 QUIT:BET'=YLOCATION  ; (D67) ZUGRIFF AUF BESTÄNDE ANDERER BETRIEBE NICHT ERLAUBT ! ;upon other Not permissive 
+	. . . ;
+	. . . DO:BET'=""  IF BET="" FOR  SET BET=$ORDER(^WWWSOR(YUSER,LP,ART,BET)) QUIT:BET=""  IF BET'=YLOCATION DO  QUIT:REST1'>0   ;BETRIEB
+	. . . . SET WED=""
+	. . . . FOR  SET WED=$ORDER(^WWWSOR(YUSER,LP,ART,BET,WED),SORT) QUIT:WED=""  DO  QUIT:REST1'>0    ;WEDATUM
+	. . . . . SET LAP=""
+	. . . . . FOR  SET LAP=$ORDER(^WWWSOR(YUSER,LP,ART,BET,WED,LAP)) QUIT:LAP=""  DO  QUIT:REST1'>0   ;LAGERPLATZ ;stock location 
+	. . . . . . IF CHECKLP=1 QUIT:$$$INLPStockLocationIsLocked($GET(^INLP(YM,BET,LAP,1)))=$$$YES      ; (D8) LAGERPLATZ GESPERRT
+	. . . . . . SET SEN=""
+	. . . . . . IF LP'="LP3" SET SEN=" "  ;SN NUR IN LP3 SORTDATEI ;only within 
+	. . . . . . DO:SEN'=""  IF SEN="" FOR  SET SEN=$ORDER(^WWWSOR(YUSER,LP,ART,BET,WED,LAP,SEN)) QUIT:SEN=""  DO  QUIT:REST1'>0   ;SERIENNUMMER
+	. . . . . . . SET WEN=$GET(^INWE(YM,ART,BET,LAP,WED,1))  ;NEU HOLEN ! ;recent send for 
+	. . . . . . . ;
+	. . . . . . . ; Stock Qty Check     ;NUR WENN LAGERPLATZ EXAKT VORGEGEBEN
+	. . . . . . . ; (Production : set MINUS="Don't not allow -ve stock" on first call to INARTMINUS
+	. . . . . . . ;               and then repeat with MINUS="Allow -ve stock" for balance.)
+	. . . . . . . ;  1.  Not allowed to go -ve and no stock on hand : quit
+	. . . . . . . ;  2.  Allowed to go negative but argument blank when no stock on hand : quit
+	. . . . . . . ;
+	. . . . . . . IF MINUS'=1 QUIT:$$$INWEQuantity(WEN)'>0                     ; (D4)
+	. . . . . . . IF MINUS=1 IF ($GET(LAGERPL)="")||($GET(WEDATUM)="")||($GET(VBETRIEB)="") QUIT:$$$INWEQuantity(WEN)'>0
+	. . . . . . . ;
+	. . . . . . . IF $$$INWEBatchNumber(WEN)'="" SET CANR=CANR_";"_$$$INWEBatchNumber(WEN)  ; (D2)  CHARGENNUMMER
+	. . . . . . . IF $$$INWELotNo(WEN)'=""       SET LONR=LONR_";"_$$$INWELotNo(WEN)        ; (D19) LOT-NUMMER
+	. . . . . . . ;
+	. . . . . . . ; INWE contains batch costs in D8 should be current Average Cost if using that costing method
+	. . . . . . . IF blnAvgCost SET $$$INWEUnitPrice(WEN)=$$^INARTKOST(ART,,9)
+	. . . . . . . ;IF $PIECE($GET(^INVORG(YM,YM,1)),Y,15)=9 SET $PIECE(WEN,Y,8)=$$^INARTKOST(ART,,9)  ;FIS;16.08.05;SR13253;ALWAYS USE AVERAGE COST
+	. . . . . . . ;
+	. . . . . . . IF FERTIGUNG="" DO
+	. . . . . . . . SET LIEF=$PIECE(WEN,Y,7)
+	. . . . . . . . ;IF LIEF'="" IF $DATA(^INAUFP(YM,AUFTRAG,POS)) SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,12)=LIEF   //;SORTKEY // SR14746
+	. . . . . . . . ;IF +$$$INWEUnitPrice(WEN)'=0 IF $DATA(^INAUFP(YM,AUFTRAG,POS)) do
+	. . . . . . . . ;. SET $PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,47)=$JUSTIFY($$$INWEUnitPrice(WEN)*$PIECE(^INAUFP(YM,AUFTRAG,POS,1),Y,5),0,2)
+	. . . . . . . . DO
+	. . . . . . . . . NEW SATZ
+	. . . . . . . . . SET SATZ=""
+	. . . . . . . . . IF $DATA(^INAUFP(YM,AUFTRAG,POS)) SET SATZ=$GET(^INAUFP(YM,AUFTRAG,POS,1))
+	. . . . . . . . . IF LIEF'="" IF SATZ'="" SET $PIECE(SATZ,Y,12)=LIEF 
+	. . . . . . . . . IF +$$$INWEUnitPrice(WEN)'=0 IF $DATA(^INAUFP(YM,AUFTRAG,POS)) do
+	. . . . . . . . . . ;
+	. . . . . . . . . . ; FIXME : SR15107 : Use D109 Received quantity if non-null?    <GRF>    <DEFERRED FOR PURCHASE ORDER REVIEW>
+	. . . . . . . . . . ;         this is throwing away any data already collected,
+	. . . . . . . . . . ;         replacing it with (average cost * original order qty)
+	. . . . . . . . . . ;         or possibly the (batch item cost * original order qty)
+	. . . . . . . . . . ;
+	. . . . . . . . . . SET $PIECE(SATZ,Y,47)=$JUSTIFY($$$INWEUnitPrice(WEN)*$PIECE(SATZ,Y,5),0,2)
+	. . . . . . . . . set strStatus=$$$Save("INAUFP",AUFTRAG_","_POS,SATZ,$$$YES) // SR14746
+	. . . . . . . ;
+	. . . . . . . SET MENGE=+$$$INWEQuantity(WEN)	//SR14748
+	. . . . . . . ;
+	. . . . . . . IF +$$$INWEUnitPrice(WEN)'=0 SET SELBSTKOST=$$$INWEUnitPrice(WEN)   ;EINZEL-EK
+	. . . . . . . SET BETRIEB=BET  ;MERKEN FÜR HISTORY
+	. . . . . . . ;
+	. . . . . . . ; Individual Serial Number     ; EINZELNE SERIENNUMMER
+	. . . . . . . ;-------------------------
+	. . . . . . . IF LP="LP3" KILL ^WWWSOR(YUSER,LP,ART,BET,WED,LAP,SEN)  ;FALLS DOPPELTER DURCHLAUF (BETRIEBE) ;if double run 
+	. . . . . . . IF LP="LP3" IF MENGE'<1 DO  QUIT
+	. . . . . . . . DO
+	. . . . . . . . . NEW REST1,SERIENNUMMER
+	. . . . . . . . . SET REST1=1           ;temporarily => 1 (for commission & SN items) ;REST1 WIRD TEMPORÄR AUF 1 GESETZT (FÜR KOMMISSION UND SERIE)
+	. . . . . . . . . SET SERIENNUMMER=SEN  ;VORGABEN SN
+	. . . . . . . . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,1)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BET,LAP,WED)),Y,1)+REST1  ;SPEICHERN BESTROFFENE LAGERPLÄTZE ;Save 
+	. . . . . . . . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,3)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BET,LAP,WED)),Y,3)+($$$INWEUnitPrice(WEN)*REST1)  ;FIS;HERSTELLKOSTEN;17.06.04;25833
+	. . . . . . . . . ;
+	. . . . . . . . . IF $$$INWEConsignment(WEN)'="" DO KOMMISSION  ; (D60) KOMMISSIONSWARE BESTELLEN ;goods on Consignment
+	. . . . . . . . . IF FERTIGUNG="" DO
+	. . . . . . . . . . NEW WEN1
+	. . . . . . . . . . SET $$$INWEQuantity(WEN)=REST1
+	. . . . . . . . . . SET WEN1=$GET(^INWEAUF(YM,AUFTRAG,POS,BET,LAP,WED,1))
+	. . . . . . . . . . IF WEN1'="" SET $$$INWEQuantity(WEN)=$$$INWEQuantity(WEN)+$$$INWEQuantity(WEN1)
+	. . . . . . . . . . NEW YFORM,YVOR,YOK
+	. . . . . . . . . . SET YOK=$$^WWWSPEI("INWEAUF",AUFTRAG_","_POS_","_BET_","_LAP_","_WED,WEN,1)  ;AUFTRAGSBESTAND;FIS;03.02.04;25041
+	. . . . . . . . . . ;SET ^INWEAUF(YM,AUFTRAG,POS,BET,LAP,WED,1)=WEN  ;AUFTRAGSBESTAND
+	. . . . . . . . . ;
+	. . . . . . . . . DO SERIE(REST1)  ;MIT VORGABE SERIENNUMMER ! ;by means of default 
+	. . . . . . . . ;
+	. . . . . . . . ; FIXME : ? Is it correct to change ^INWE without using WWWSPEI? <GRF>
+	. . . . . . . . ;
+	. . . . . . . . SET REST1 = REST1-1
+	. . . . . . . . ;
+	. . . . . . . . ; *** UPDATE INWE POINT *** #1
+	. . . . . . . . ; 
+	. . . . . . . . SET $$$INWEQuantity(^INWE(YM,ART,BET,LAP,WED,1)) = MENGE-1  ;LAGERPLATZ ;stock location 
+	. . . . . . . ;
+	. . . . . . . ;+++++++++++++++++++++++++
+	. . . . . . . ; Case 1 : There is exactly the right quantity in this batch           ; MENGE GLEICH UND REICHT AUS
+	. . . . . . . ;          This could probably be handled by Case 2 without repeating all the code!       FIXME: <GRF> since MENGE-REST1=0
+	. . . . . . . ;+++++++++++++++++++++++++
+	. . . . . . . IF MENGE=REST1 DO  QUIT
+	. . . . . . . . SET $$$INWEQuantity(WEN) = REST1
+	. . . . . . . . ;SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,3)=($PIECE(WEN,Y,8)*REST1)  ;FIS;HERSTELLKOSTEN;17.06.04;25833
+	. . . . . . . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,1)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BET,LAP,WED)),Y,1)+REST1  ;SPEICHERN BESTROFFENE LAGERPLÄTZE ;Save 
+	. . . . . . . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,3)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BET,LAP,WED)),Y,3)+($$$INWEUnitPrice(WEN)*REST1)  ;FIS;HERSTELLKOSTEN;17.06.04;25833
+	. . . . . . . . ;
+	. . . . . . . . IF $$$INWEConsignment(WEN)'="" DO KOMMISSION  ;KOMMISSIONSWARE BESTELLEN ;goods on Reference book 
+	. . . . . . . . IF FERTIGUNG="" DO
+	. . . . . . . . . NEW WEN1
+	. . . . . . . . . SET WEN1 = $GET(^INWEAUF(YM,AUFTRAG,POS,BET,LAP,WED,1))
+	. . . . . . . . . IF WEN1'="" SET $$$INWEQuantity(WEN) = $$$INWEQuantity(WEN)+$$$INWEQuantity(WEN1)
+	. . . . . . . . . NEW YFORM,YVOR,YOK
+	. . . . . . . . . SET YOK=$$^WWWSPEI("INWEAUF",AUFTRAG_","_POS_","_BET_","_LAP_","_WED,WEN,1)  ;AUFTRAGSBESTAND;FIS;03.02.04;25041
+	. . . . . . . . ;
+	. . . . . . . . DO SERIE(REST1)
+	. . . . . . . . SET REST1=0
+	. . . . . . . . ;
+	. . . . . . . . ; *** UPDATE INWE POINT *** #2
+	. . . . . . . . ; 
+	. . . . . . . . SET $$$INWEQuantity(^INWE(YM,ART,BET,LAP,WED,1)) = 0  ;LAGERPLATZ ;stock location 
+	. . . . . . . ;
+	. . . . . . . ;+++++++++++++++++++++++++
+	. . . . . . . ; Case 2 : There is more quantity in this batch than I need            ; MENGE MEHR AUF LAGER
+	. . . . . . . ;+++++++++++++++++++++++++
+	. . . . . . . IF MENGE>REST1 DO  QUIT
+	. . . . . . . . SET $$$INWEQuantity(WEN) = REST1
+	. . . . . . . . ;SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,3)=($PIECE(WEN,Y,8)*REST1)  ;FIS;HERSTELLKOSTEN;17.06.04;25833
+	. . . . . . . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,1)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BET,LAP,WED)),Y,1)+REST1  ;SPEICHERN BESTROFFENE LAGERPLÄTZE ;Save 
+	. . . . . . . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,3)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BET,LAP,WED)),Y,3)+($$$INWEUnitPrice(WEN)*REST1)  ;FIS;HERSTELLKOSTEN;17.06.04;25833
+	. . . . . . . . ;
+	. . . . . . . . IF $$$INWEConsignment(WEN)'="" DO KOMMISSION  ; (D60) KOMMISSIONSWARE BESTELLEN ;goods on Consignment
+	. . . . . . . . IF FERTIGUNG="" DO
+	. . . . . . . . . NEW WEN1
+	. . . . . . . . . SET WEN1 = $GET(^INWEAUF(YM,AUFTRAG,POS,BET,LAP,WED,1))
+	. . . . . . . . . IF WEN1'="" SET $$$INWEQuantity(WEN) = $$$INWEQuantity(WEN)+$$$INWEQuantity(WEN1)
+	. . . . . . . . . NEW YFORM,YVOR,YOK
+	. . . . . . . . . SET YOK=$$^WWWSPEI("INWEAUF",AUFTRAG_","_POS_","_BET_","_LAP_","_WED,WEN,1)  ;AUFTRAGSBESTAND;FIS;03.02.04;25041
+	. . . . . . . . ;
+	. . . . . . . . ;
+	. . . . . . . . ; *** UPDATE INWE POINT *** #3
+	. . . . . . . . ; 
+	. . . . . . . . SET $$$INWEQuantity(^INWE(YM,ART,BET,LAP,WED,1)) = MENGE-REST1
+	. . . . . . . . DO SERIE(REST1)
+	. . . . . . . . SET REST1=0
+	. . . . . . . ;
+	. . . . . . . ;+++++++++++++++++++++++++
+	. . . . . . . ; Case 3 : There isn't enough quantity in this batch for my needs      ; MENGE ZUWENIG AUF LAGER
+	. . . . . . . ;          Reduce the required quantity and repeat the process
+	. . . . . . . ;          from the top with the next batch.
+	. . . . . . . ;+++++++++++++++++++++++++
+	. . . . . . . IF MENGE<REST1 DO  QUIT
+	. . . . . . . . SET $$$INWEQuantity(WEN) = MENGE
+	. . . . . . . . ;SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,3)=($PIECE(WEN,Y,8)*MENGE)  ;FIS;HERSTELLKOSTEN;17.06.04;25833
+	. . . . . . . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,1)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BET,LAP,WED)),Y,1)+MENGE  ;SPEICHERN BESTROFFENE LAGERPLÄTZE ;Save 
+	. . . . . . . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,3)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BET,LAP,WED)),Y,3)+($$$INWEUnitPrice(WEN)*MENGE/$$^INQTYUNIT(ART))  ;FIS;HERSTELLKOSTEN;17.06.04;25833
+	. . . . . . . . ;
+	. . . . . . . . IF $$$INWEConsignment(WEN)'="" DO KOMMISSION  ; (D60) KOMMISSIONSWARE BESTELLEN ;goods on Consignment 
+	. . . . . . . . IF FERTIGUNG="" DO
+	. . . . . . . . . NEW WEN1
+	. . . . . . . . . SET WEN1 = $GET(^INWEAUF(YM,AUFTRAG,POS,BET,LAP,WED,1))
+	. . . . . . . . . IF WEN1'="" SET $$$INWEQuantity(WEN) = $$$INWEQuantity(WEN)+$$$INWEQuantity(WEN1)
+	. . . . . . . . . NEW YFORM,YVOR,YOK
+	. . . . . . . . . SET YOK=$$^WWWSPEI("INWEAUF",AUFTRAG_","_POS_","_BET_","_LAP_","_WED,WEN,1)  ;AUFTRAGSBESTAND;FIS;03.02.04;25041
+	. . . . . . . . ;
+	. . . . . . . . DO SERIE(MENGE)
+	. . . . . . . . SET REST1  = REST1-MENGE
+	. . . . . . . . ;
+	. . . . . . . . ; *** UPDATE INWE POINT *** #4
+	. . . . . . . . ; 
+	. . . . . . . . SET $$$INWEQuantity(^INWE(YM,ART,BET,LAP,WED,1))=0
+	. . . . . . . . SET BET(1) = BET  ;MERKEN FÜR EVTL. MINUSBUCHUNG ;to 
+	. . . . . . . . SET LAP(1) = LAP
+	. . . . . . . . SET WED(1) = WED
+	. ;
+	. KILL ^WWWSOR(YUSER,"LP1")  ;NICHT KOMPLETT WWWSOR KILLEN WEGEN INPROFERTIG ! ;Not complete - kill WWWSOR if in production?
+	. KILL ^WWWSOR(YUSER,"LP2")
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	; Case 4 : All the stock has been used up and I still want some more.                ;MINUSMENGE BUCHEN
+	;          Take it from the record for today which will go (further) minus.
+	;+++++++++++++++++++++++++++++++++++++++
+	IF REST1>0 DO
+	. NEW tempSOR,WEALT,YFORM,YVOR,YOK
+	. QUIT:$GET(MINUS)'=1  ;NICHT ERLAUBT ;Not permitted to take stock negative (?) 
+	. IF $GET(BET(1))="" SET BET(1)=YLOCATION
+	. IF $GET(LAP(1))="" SET LAP(1)=$GET(LAGERPL)                                  ;BUCHEN MIT STOCK VORGABE
+	. IF LAP(1)'="" IF '$DATA(^INLP(YM,BET(1),LAP(1))) SET LAP(1)=""               ;BUCHEN MIT STOCK VORGABE
+	. IF LAP(1)=""       SET LAP(1)=$PIECE($GET(^INVORGB(YM,YM,YLOCATION,1)),Y,1)  ;HANDLAGER
+	. IF LAP(1)=""       SET LAP(1)=0
+	. IF $GET(WED(1))="" SET WED(1)=+$HOROLOG
+	. SET WEALT=$GET(^INWE(YM,ART,BET(1),LAP(1),WED(1),1))
+	. SET $$$INWEQuantity(WEALT) = $$$INWEQuantity(WEALT)-REST1                    ;MINUSMENGE
+	. ; INWE contains batch costs in #8 should be current Average Cost if using that costing method
+	. if blnAvgCost               set $$$INWEUnitPrice(WEALT) = $$^INARTKOST(ART,,9)   ; SR14075
+	. if '$$$INWEUnitPrice(WEALT) set $$$INWEUnitPrice(WEALT) = $$^INARTKOST(ART,,9)   ;set to average cost SR13838
+	. ;
+	. ; *** UPDATE INWE POINT *** #5
+	. ;
+	. SET YOK=$$^WWWSPEI("INWE",ART_","_BET(1)_","_LAP(1)_","_WED(1),WEALT,1)
+	. ; vvv start SR14075
+	. ;SET ^WWWSOR(YUSER_"VLP",BET(1),LAP(1),WED(1))=REST1_Y_Y_($$$INWEUnitPrice(WEALT)*REST1)  ;SPEICHERN BESTROFFENE LAGERPLÄTZE ;SR14075
+	. set tempSOR=$get(^WWWSOR(YUSER_"VLP",BET(1),LAP(1),WED(1)))
+	. SET $PIECE(tempSOR,Y,1)=$PIECE(tempSOR,Y,1)+REST1
+	. SET $PIECE(tempSOR,Y,3)=$PIECE(tempSOR,Y,3)+($$$INWEUnitPrice(WEALT)*REST1)
+	. set ^WWWSOR(YUSER_"VLP",BET(1),LAP(1),WED(1))=tempSOR
+	. ; ^^^  end  SR14075
+	. IF FERTIGUNG="" DO
+	. . NEW WEN1
+	. . SET WEN1 = $GET(^INWEAUF(YM,AUFTRAG,POS,BET(1),LAP(1),WED(1),1))
+	. . SET $$$INWEQuantity(WEN1) = $$$INWEQuantity(WEN1)+REST1
+	. . NEW YFORM,YVOR,YOK
+	. . SET YOK=$$]]><![CDATA[^WWWSPEI("INWEAUF",AUFTRAG_","_POS_","_BET(1)_","_LAP(1)_","_WED(1),WEN1,1)  ;AUFTRAGSBESTAND;FIS;03.02.04;25041
+	. ;
+	. SET REST1=0
+	
+	;------------------------------
+	;ENTNAHME-LAGERPLÄTZE SPEICHERN ;WITHDRAWAL STOCK PILES MEMORY ???
+	;------------------------------
+	;		155		$$$INVORGSaveStockLocationOnItemPa [rtsStructure] ()  - if $$$YES builds INAUFPT?
+	IF FERTIGUNG'="" IF TEIL'="" IF $PIECE(objDefaults,Y,155)=$$$YES DO
+	. NEW BE,LP,WE,WEN,YFORM,YVOR,DATEI,MENGE,ART,MENGEX,MENGE1
+	. ;SET BE=""
+	. ;FOR  SET BE=$ORDER(^WWWSOR(YUSER_"VLP",BE)) QUIT:BE=""  DO
+	. ;. SET LP=""
+	. ;. FOR  SET LP=$ORDER(^WWWSOR(YUSER_"VLP",BE,LP)) QUIT:LP=""  DO
+	. ;. . SET WE=""
+	. ;. . FOR  SET WE=$ORDER(^WWWSOR(YUSER_"VLP",BE,LP,WE)) QUIT:WE=""  DO
+	. ;. . . SET WEN=$GET(^INWE(YM,ART,BE,LP,WE,1))
+	. ;. . . SET $PIECE(WEN,Y,4)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BE,LP,WE)),Y,1)  ;MENGE
+	. ;. . . SET $PIECE(WEN,Y,5)=$PIECE($GET(^WWWSOR(YUSER_"VLP",BE,LP,WE)),Y,2)  ;SN
+	. ;. . . SET $PIECE(WEN,Y,94)=+$HOROLOG
+	. ;. . . SET $PIECE(WEN,Y,95)=YBED
+	. ;. . . DO ^WWWSPEI("INWEAUFPT",AUFTRAG_","_POS_","_$TRANSLATE(TEIL,",",".")_"."_","_BE_","_LP_","_WE,WEN,1)
+	. ;
+	. ;NEU: MEHRFACHMENGEN BUCHEN FIS;21.06.04;25939
+	. KILL ^WWWSOR(YUSER_"VLPX")
+	. MERGE ^WWWSOR(YUSER_"VLPX")=^WWWSOR(YUSER_"VLP")
+	. SET DATEI  = "^INAUFPXL("_""""_YM_""""_","_""""_AUFTRAG_""""_","_POS_","_TEIL_")"
+	. SET MENGEX = $PIECE(@DATEI,Y,39)
+	. SET ART	 = $PIECE(@DATEI,Y,4)
+	. SET DATEI  = $QUERY(@DATEI,-1)
+	. FOR  DO  QUIT:DATEI=""
+	. . SET DATEI=$QUERY(@DATEI)
+	. . IF $TRANSLATE($PIECE(DATEI,",",2),"""")'=AUFTRAG SET DATEI="" QUIT
+	. . IF $PIECE(DATEI,",",3)'=POS SET DATEI="" QUIT
+	. . SET TEILN=$TRANSLATE($PIECE(DATEI,",",4,99),",)","..")
+	. . IF $PIECE(TEILN,".",1,$LENGTH(TEILN,".")-2)'=$PIECE($TRANSLATE(TEIL,",",".")_".",".",1,$LENGTH($TRANSLATE(TEIL,",",".")_".",".")-2) SET DATEI="" QUIT
+	. . SET MENGE=$PIECE(@DATEI,Y,39)
+	. . IF (MENGE'=MENGEX) || ($PIECE(@DATEI,Y,4)'=ART) SET DATEI="" QUIT  ;NUR WENN GLEICH ;only when without delay 
+	. . ;
+	. . IF $PIECE(@DATEI,Y,244)'="" DO  QUIT:MENGE'>0  ;BEREITS GEBUCHT;FIS;21.06.04;25939
+	. . . NEW PRUEF
+	. . . SET PRUEF="^INWEAUFPT("_""""_YM_""""_","_""""_AUFTRAG_""""_","_POS_","_""""_TEILN_""""_")"
+	. . . IF $DATA(@PRUEF) DO  ;TEILWEISE BEREITS GEBUCHT ;yet 
+	. . . . FOR  DO  QUIT:PRUEF=""
+	. . . . . SET PRUEF=$QUERY(@PRUEF)
+	. . . . . IF $TRANSLATE($PIECE(PRUEF,",",2),"""")'=$TRANSLATE(AUFTRAG,"""") SET PRUEF="" QUIT
+	. . . . . IF $PIECE(PRUEF,",",3)'=POS                                       SET PRUEF="" QUIT
+	. . . . . IF $TRANSLATE($PIECE(PRUEF,",",4),"""")'=$TRANSLATE(TEILN,"""")   SET PRUEF="" QUIT
+	. . . . . SET MENGE=MENGE-$PIECE(@PRUEF,Y,4)
+	. . ;
+	. . SET BE=""
+	. . FOR  SET BE=$ORDER(^WWWSOR(YUSER_"VLPX",BE)) QUIT:BE=""  DO  QUIT:MENGE'>0
+	. . . SET LP=""
+	. . . FOR  SET LP=$ORDER(^WWWSOR(YUSER_"VLPX",BE,LP)) QUIT:LP=""  DO  QUIT:MENGE'>0
+	. . . . SET WE=""
+	. . . . FOR  SET WE=$ORDER(^WWWSOR(YUSER_"VLPX",BE,LP,WE)) QUIT:WE=""  DO  QUIT:MENGE'>0
+	. . . . . SET WEN=$GET(^INWE(YM,ART,BE,LP,WE,1))
+	. . . . . SET $$$INWEQuantity(WEN)     = $PIECE($GET(^WWWSOR(YUSER_"VLPX",BE,LP,WE)),Y,1)  ;MENGE
+	. . . . . SET $$$INWESerialNumber(WEN) = $PIECE($GET(^WWWSOR(YUSER_"VLPX",BE,LP,WE)),Y,2)  ;SN
+	. . . . . SET $PIECE(WEN,Y,94)         =+$HOROLOG
+	. . . . . SET $PIECE(WEN,Y,95)         = YBED
+	. . . . . IF blnAvgCost SET $$$INWEUnitPrice(WEN)=$$^INARTKOST(ART,,9)  ;FIS;16.08.05;SR13253;ALWAYS USE AVERAGE COST
+	. . . . . ;
+	. . . . . IF $$$INWEQuantity(WEN)'>MENGE DO  QUIT
+	. . . . . . DO ^WWWSPEI("INWEAUFPT",AUFTRAG_","_POS_","_$TRANSLATE($PIECE(DATEI,",",4,99),",)","..")_","_BE_","_LP_","_WE,WEN,1)
+	. . . . . . KILL ^WWWSOR(YUSER_"VLPX",BE,LP,WE)
+	. . . . . . SET MENGE = MENGE-$$$INWEQuantity(WEN)
+	. . . . . ;
+	. . . . . IF $$$INWEQuantity(WEN)>MENGE DO
+	. . . . . . SET MENGE1 = $$$INWEQuantity(WEN)
+	. . . . . . SET $$$INWEQuantity(WEN)     = MENGE
+	. . . . . . SET $$$INWESerialNumber(WEN) = $PIECE($$$INWESerialNumber(WEN),"|",1,MENGE)  ;SN
+	. . . . . . DO ^WWWSPEI("INWEAUFPT",AUFTRAG_","_POS_","_$TRANSLATE($PIECE(DATEI,",",4,99),",)","..")_","_BE_","_LP_","_WE,WEN,1)
+	. . . . . . SET $PIECE(^WWWSOR(YUSER_"VLPX",BE,LP,WE),Y,1) = MENGE1-MENGE
+	. . . . . . SET $PIECE(^WWWSOR(YUSER_"VLPX",BE,LP,WE),Y,2) = $PIECE($PIECE(^WWWSOR(YUSER_"VLPX",BE,LP,WE),Y,2),"|",(MENGE+1),999)
+	. . . . . . IF $PIECE(^WWWSOR(YUSER_"VLPX",BE,LP,WE),Y,1)'>0 KILL ^WWWSOR(YUSER_"VLPX",BE,LP,WE)
+	. . . . . . SET MENGE=0
+	. . ;
+	. . IF DATEI'=DATEI1 IF MENGE'=$PIECE(@DATEI,Y,39) DO  ;SPEICHERN ABBUCHUNG;FIS;25939;22.06.04
+	. . . QUIT:$GET(NOSPEI)=1  ;NICHT SPEICHERN
+	. . . SET $PIECE(@DATEI,Y,244)=+$HOROLOG
+	. . . SET $PIECE(^INAUFPT(YM,AUFTRAG,POS,$TRANSLATE($PIECE(DATEI,",",4,99),",)",".."),1),Y,244)=+$HOROLOG
+	. KILL ^WWWSOR(YUSER_"VLPX")
+	
+	;--------------------------------------------------
+	; ITEM HISTORY
+	;--------------------------------------------------
+	DO
+	. NEW LP,VONLAGER,GESAMTHK,KUNDE
+	. IF $EXTRACT(CANR)=";" SET CANR=$EXTRACT(CANR,2,99)
+	. IF $EXTRACT(LONR)=";" SET LONR=$EXTRACT(LONR,2,99)
+	. SET REST2=REST1-REST
+	. IF $GET(SERIENNUMMER)'="" SET REST2=-1
+	. SET INFOTEXT="" 
+	. ;
+	. ; No Production No.        ; KEINE FERTIGUNG
+	. ; "From Stock To Order"      VON BESTAND FÜR AUFTRAG
+	. IF FERTIGUNG="" DO
+	. . SET INFOTEXT=$$^WWWTEXT(32511)_" "_$$^WWWTEXT(32047)_": "_AUFTRAG_"-"_POS
+	. ;
+	. ; Production No.                      ; FERTIGUNG
+	. ; "From Stock To Production-order"      VON BESTAND FÜR FERTIGUNGSAUFTRAG
+	. IF FERTIGUNG'="" DO
+	. . SET INFOTEXT=$$^WWWTEXT(32511)_" "_$$^WWWTEXT(32513)_": "_AUFTRAG_"-"_POS
+	. . IF FERTIGUNG=1 SET INFOTEXT=INFOTEXT_" #"_FERTIGNR QUIT            ;FERTIGUNG MIT FERTIGUNGSAUFTRAG  ;with MO No 
+	. . IF FERTIGUNG=2 IF $GET(FERTNO)=""  SET INFOTEXT=INFOTEXT_" # ???"  ;FERTIGUNG OHNE FERTIGUNGSAUFTRAG ;without MO No
+	. . IF FERTIGUNG=2 IF $GET(FERTNO)'="" SET INFOTEXT=INFOTEXT_"#"_FERTNO
+	. ;
+	. IF CANR'="" SET INFOTEXT=INFOTEXT_" ("_CANR_")"
+	. IF LONR'="" SET INFOTEXT=INFOTEXT_" ("_LONR_")"
+	. IF $GET(NOSPEI)=1 SET INFOTEXT="(&not;) "_INFOTEXT
+	. SET VONLAGER=""
+	. SET GESAMTHK=0
+	. SET KUNDE=""
+	. IF FERTIGUNG="" IF AUFTRAG'="" SET KUNDE=$PIECE($GET(^INAUF(YM,AUFTRAG,1)),Y,1)  ;FIS;KUNDE AN FIBU ÜBERGEBEN;17.06.04;25833
+	. DO
+	. . NEW BE,LP,WE
+	. . SET BE=""
+	. . FOR  SET BE=$ORDER(^WWWSOR(YUSER_"VLP",BE)) QUIT:BE=""  DO
+	. . . SET LP=""
+	. . . FOR  SET LP=$ORDER(^WWWSOR(YUSER_"VLP",BE,LP)) QUIT:LP=""  DO
+	. . . . SET WE=""
+	. . . . FOR  SET WE=$ORDER(^WWWSOR(YUSER_"VLP",BE,LP,WE)) QUIT:WE=""  DO
+	. . . . . SET VONLAGER = VONLAGER_";"_BE_"|"_LP_"|"_WE_"|"_$PIECE($GET(^WWWSOR(YUSER_"VLP",BE,LP,WE)),Y,1)  ;BET|LAP|WED|MENGE
+	. . . . . SET GESAMTHK = GESAMTHK+$PIECE($GET(^WWWSOR(YUSER_"VLP",BE,LP,WE)),Y,3)           ;FIS;HERSTELLKOSTEN;17.06.04;25833
+	. ;
+	. SET VONLAGER=$EXTRACT(VONLAGER,2,999)  ;OHNE ; ;without
+	. SET OBERTEIL=""
+	. ; This appears to work back from a part in a sub-assembly to the sub-assembly but
+	. ; not from a component to the finished goods
+	. IF TEIL'="" DO  ;ÜBERTRAGEN OBERTEIL IN FIBU
+	. . NEW TEIL1,YI
+	. . SET TEIL1=""
+	. . FOR YI=1:1  QUIT:$PIECE(TEIL,",",YI+1)=""  SET TEIL1=TEIL1_$PIECE(TEIL,",",YI)_"."
+	. . IF TEIL1'="" SET OBERTEIL=$PIECE($GET(^INAUFPT(YM,AUFTRAG,POS,TEIL1,1)),Y,4)
+	. . if TEIL1=""  set OBERTEIL=$piece($get(^INAUFP(YM,AUFTRAG,POS,1)),Y,4)                ; SR13024
+	. ;
+	. ; SAVE MATERIAL VALUE AGAINST ORDER LINE ITEM   ;FIS;14.04.05;27509
+	. ; ===========================================
+	. ; 
+	. IF +REST2'=0 DO
+	. . NEW PRUEF,YI,MATERIAL,MENGEX,BET,LAP,WED,WE1,OLDVALUE,TEILX,TEILX1
+	. . ;
+	. . ; FIXME : IF TEIL ***IS*** Null then TEILX is not defined <GRF>
+	. . IF TEIL'="" SET TEILX=$TRANSLATE(TEIL,",",".")_"."
+	. . ;
+	. . SET PRUEF="^INAUFPXL("_""""_YM_""""_","_""""_AUFTRAG_""""_","_POS
+	. . IF TEIL'="" FOR YI=1:1  QUIT:$PIECE(TEIL,".",YI)=""  SET PRUEF=PRUEF_","_$PIECE(TEIL,".",YI)
+	. . SET PRUEF=PRUEF_")"
+	. . IF $DATA(@PRUEF)#2 DO  ;ONLY IF MATERIAL     ;PJK 2005-Apr-19
+	. . . ;		D26		$$$INAUFPXLItemType()
+	. . . IF $PIECE(@PRUEF,Y,26)=2 QUIT  ;KEINE LEISTUNGEN             ; Not services
+	. . . SET MATERIAL=0
+	. . . SET MENGEX=-REST2
+	. . . IF TEIL'="" IF $DATA(^INWEAUFPT(YM,AUFTRAG,POS,TEILX)) DO  ;COSTS PER STOCK FILE
+	. . . . SET BET=""
+	. . . . FOR  SET BET=$ORDER(^INWEAUFPT(YM,AUFTRAG,POS,TEILX,BET)) QUIT:BET=""  DO
+	. . . . . SET LAP=""
+	. . . . . FOR  SET LAP=$ORDER(^INWEAUFPT(YM,AUFTRAG,POS,TEILX,BET,LAP)) QUIT:LAP=""  DO
+	. . . . . . SET WED=""
+	. . . . . . FOR  SET WED=$ORDER(^INWEAUFPT(YM,AUFTRAG,POS,TEILX,BET,LAP,WED)) QUIT:WED=""  DO
+	. . . . . . . SET WE1=$GET(^INWEAUFPT(YM,AUFTRAG,POS,TEILX,BET,LAP,WED,1))
+	. . . . . . . IF '$$$INWEUnitPrice(WE1) SET $$$INWEUnitPrice(WE1)=$$^INARTKOST(ART)
+	. . . . . . . IF blnAvgCost SET $$$INWEUnitPrice(WE1)=$$^INARTKOST(ART,,9)  ;FIS;16.08.05;SR13253;ALWAYS USE AVERAGE COST
+	. . . . . . . QUIT:MENGEX'>0
+	. . . . . . . IF (MENGEX-$$$INWEQuantity(WE1))'<0 SET MATERIAL=MATERIAL+($$$INWEQuantity(WE1)*$$$INWEUnitPrice(WE1))
+	. . . . . . . IF (MENGEX-$$$INWEQuantity(WE1))<0  SET MATERIAL=MATERIAL+(MENGEX*$$$INWEUnitPrice(WE1))
+	. . . . . . . SET MENGEX = MENGEX-$$$INWEQuantity(WE1)
+	. . . ;
+	. . . ; FIXME : IF TEIL ***IS*** Null then TEILX is not defined <GRF>
+	. . . ;
+	. . . IF (+MATERIAL=0)&&($get(TEILX)'="") DO  ;PJK 2005-Apr-19
+	. . . . NEW TEILX1
+	. . . . SET TEILX1=$GET(^INAUFPT(YM,AUFTRAG,POS,TEILX,1))
+	. . . . IF +$PIECE(TEILX1,Y,5)=0 SET $PIECE(TEILX1,Y,5)=1
+	. . . . SET MATERIAL=($PIECE(TEILX1,Y,47)/$PIECE(TEILX1,Y,5)*(REST2*-1))  ;COSTS PER ORDER STRUCTURE
+	. . . ;
+	. . . IF +MATERIAL=0 DO
+	. . . . SET MATERIAL=($$^INARTKOST(ART)*REST2*-1)
+	. . . . IF blnAvgCost SET MATERIAL=($$^INARTKOST(ART,,9)*REST2*-1)  ;FIS;16.08.05;SR13253;ALWAYS USE AVERAGE COST
+	. . . ;
+	. . . QUIT:+MATERIAL=0
+	. . . ;
+	. . . ;SAVE CHANGES
+	. . . NEW POS1
+	. . . SET POS1=$GET(^INAUFP(YM,AUFTRAG,POS,1))
+	. . . ;
+	. . . ;MATERIAL COSTS
+	. . . ;==============
+	. . . ;
+	. . . SET $PIECE(POS1,Y,430)=($PIECE(POS1,Y,430)+MATERIAL)  ;SAVE NEW VALUE (POSTING IN INDRUCK72)
+	. . . SET $PIECE(POS1,Y,432)=($PIECE(POS1,Y,432)+MATERIAL)  ;SAVE NEW VALUE (POSTING IN INDRUCK72)  ;FIS;18.08.05
+	. . . ;
+	. . . ;MATERIAL OVERHEAD
+	. . . ;=================
+	. . . ;
+	. . . ;TODO : Consider when MBD is legitimately set to zero for a particular item - don't want to override <AF/GRF>
+	. . . SET MBD=$$$INKALKARTMaterialburden($GET(^INKALKART(YM,YLOCATION,ART,1)))
+	. . . IF +MBD=0 IF $$$INAUFPItemGroup(POS1)'=""                  SET MBD=$$$INKALKMaterialBurden($GET(^INKALK(YM,YLOCATION,$$$INAUFPItemGroup(POS1),1)))
+	. . . IF +MBD=0 IF $$$INARTItemGroup($GET(^INART(YM,ART,1)))'="" SET MBD=$$$INKALKMaterialBurden($GET(^INKALK(YM,YLOCATION,$$$INARTItemGroup($GET(^INART(YM,ART,1))),1)))
+	. . . IF +MBD=0 IF $$$INVORGDefaultItemGroup(objDefaults)'=""    SET MBD=$$$INKALKMaterialBurden($GET(^INKALK(YM,YLOCATION,$$$INVORGDefaultItemGroup(objDefaults),1)))
+	. . . IF +MBD'=0 DO
+	. . . . SET MATERIAL=$JUSTIFY((MATERIAL/100*MBD),0,2)
+	. . . . QUIT:+MATERIAL=0
+	. . . . SET $PIECE(POS1,Y,431)=($PIECE(POS1,Y,431)+MATERIAL)  ;MATERIAL OVERHEAD
+	. . . . SET $PIECE(POS1,Y,430)=($PIECE(POS1,Y,430)-MATERIAL)  ;MATERIAL ONLY (WITHOUT OVERHEAD)  ;FIS;18.08.05
+	. . . . SET $PIECE(POS1,Y,432)=($PIECE(POS1,Y,432)-MATERIAL)  ;MATERIAL ONLY (WITHOUT OVERHEAD)  ;FIS;18.08.05
+	. . . . NEW A
+	. . . . SET A=""
+	. . . . SET $PIECE(A,Y,2) =+$HOROLOG    ;DATUM / DATE
+	. . . . SET $PIECE(A,Y,3) =MATERIAL     ;MATERIAL OVERHEAD
+	. . . . SET $PIECE(A,Y,16)=YLOCATION    ;BETRIEB / LOCATION
+	. . . . SET $PIECE(A,Y,27)=AUFTRAG      ;AUFTRAG / ORDER
+	. . . . SET $PIECE(A,Y,28)=POS          ;POSITION / L.I.
+	. . . . SET $PIECE(A,Y,29)=ART          ;ARTIKEL / ITEM
+	. . . . SET $PIECE(A,Y,50)="MBD"        ;TRANSACTION TYPE
+	. . . . SET OK=$$^INFIBBUCH(A,YLOCATION,"","",4)   ;FINANCE TRANSACTION
+	. . . . SET $PIECE(POS1,Y,433)=($PIECE(POS1,Y,433)+MATERIAL)  ;POSTED MATERIAL OVERHEAD
+	. . . . ;DO FIBU^INARTHIST(ART,,,,,YLOCATION,,MATERIAL,AUFTRAG,POS,,,,"MBD")  ;FINANCE TRANSACTION
+	. . . ;
+	. . . NEW YFORM,YVOR,YOK
+	. . . SET YOK=$$^WWWSPEI("INAUFP",AUFTRAG_","_POS,POS1,1)
+	. ;
+	.;IF +REST2'=0 DO ^INARTHIST(ART,$$^WWWZAHL(REST2,0,$LENGTH($PIECE(REST2,".",2)))_" "_INFOTEXT,BETRIEB,,REST2*-1,,KUNDE,GESAMTHK,VONLAGER,,,,,,$GET(NOPOST),"ISS",OBERTEIL)  ;History ;FIS;TRANSACTION TYPE;10.01.05;26560
+	. ;IF +REST2'=0 DO ^INARTHIST(ART,$$^WWWZAHL(REST2,0,$LENGTH($PIECE(REST2,".",2)))_" "_INFOTEXT,BETRIEB,,-REST2,,KUNDE,GESAMTHK,VONLAGER,,,AUFTRAG,POS,,$GET(NOPOST),"ISS",OBERTEIL)  ;History ;GRF;2005-Apr-26;SR10478
+	. IF +REST2'=0 DO ^INARTHIST(ART,REST2_" "_INFOTEXT,BETRIEB,,-REST2,,KUNDE,GESAMTHK,VONLAGER,,,AUFTRAG,POS,,$GET(NOPOST),"ISS",OBERTEIL)  ;History ;GRF;2005-Apr-26;SR10478 // SR14609
+	. ;   ART,TEXT,BETRIEB,#4,-REST2,
+	. ;   #6,KUNDE,GESAMTHK,VONLAGER,#10,
+	. ;   #11,AUFTRAG,POS,#14,NOPOST,"ISS",OBERTEIL)
+	
+	KILL ^WWWSOR(YUSER_"VLP")
+	
+	IF $GET(SERIENNUMMER)="" SET REST=REST1
+	IF $GET(SERIENNUMMER)'="" IF REST1=0 IF REST'=0 SET REST=REST-1  ;WENN OK, DANN EINEN WENIGER
+	
+	IF FERTIGUNG=1 IF LFN'="" DO   ;BEI FERTIGUNG ;next to 
+	. QUIT:$GET(NOSPEI)=1  ;NICHT SPEICHERN;FIS;22891;15.12.03
+	. SET $PIECE(^INPROSTEMPT(YM,FERTIGNR,LFN,1),Y,6)=1  ;ERLEDIGT ABGEBUCHT
+	. SET $PIECE(^INPROSTEMPT(YM,FERTIGNR,LFN,1),Y,7)=$GET(SERIENNUMMER)   ;SERIENNUMMER
+	
+	; Backflush Components in Manufacture ?
+	IF FERTIGUNG'="" DO  ;IF FERTIGUNG=2 DO  ;FIS;25939;22.06.04;IMMER SPEICHERN
+	. QUIT:$GET(NOSPEI)=1  ;NICHT SPEICHERN;FIS;22891;15.12.03
+	. SET $PIECE(@DATEI1,Y,244)=+$HOROLOG
+	. IF TEIL'="" SET $PIECE(^INAUFPT(YM,AUFTRAG,POS,$TRANSLATE(TEIL,",",".")_".",1),Y,244)=+$HOROLOG
+	. IF TEIL=""  SET $PIECE(^INAUFPXL(YM,AUFTRAG,POS),Y,244)=+$HOROLOG
+	
+	IF $GET(KOST)=1 SET REST=REST_"*"_SELBSTKOST  ;RÜCKGABE DER SELBSTKOSTEN ;the total production costs 
+	QUIT REST  ;NOCH ZU BEARBEITEN ;yet within 
+	
+SERIE(SMENGE)   ;ABBUCHEN SERIENNUMMER
+	NEW SN,YI
+	
+	SET SMENGE=+$GET(SMENGE)
+	
+	;SMENGE=SERIEN ABRAGEN
+	IF $GET(SERIENNUMMER)="" DO
+	. SET SN=""
+	. FOR YI=1:1:SMENGE SET SN=$ORDER(^INWES(YM,ART,BET,LAP,WED,SN)) QUIT:SN=""  DO
+	. . IF FERTIGUNG="" SET ^INWEAUFS(YM,AUFTRAG,POS,BET,LAP,WED,SN,1)=$GET(^INWES(YM,ART,BET,LAP,WED,SN,1))
+	. . DO ^WWWSSORT("INWEAUFS",AUFTRAG_","_POS_","_BET_","_LAP_","_WED_","_SN)
+	. . DO ^INSNHIST(SN,$$^WWWTEXT(32511)_" "_AUFTRAG_"-"_POS,ART,AUFTRAG,POS)  ;VON BESTAND FÜR ;to 
+	. . KILL ^INWES(YM,ART,BET,LAP,WED,SN,1)  ;LÖSCHEN SERIENNUMMER ;Delete 
+	. . IF $DATA(^WWWSOR(YUSER_"VLP",BET,LAP,WED)) DO
+	. . . IF $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,2)="" SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,2)=SN QUIT
+	. . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,2)=$PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,2)_"|"_SN
+	
+	IF $GET(SERIENNUMMER)'="" DO   ;BESTIMMTE SERIENNUMMER UMBUCHEN ;rebook 
+	. SET SN=SERIENNUMMER 
+	. DO
+	. . IF FERTIGUNG="" SET ^INWEAUFS(YM,AUFTRAG,POS,BET,LAP,WED,SN,1)=$GET(^INWES(YM,ART,BET,LAP,WED,SN,1))
+	. . DO ^WWWSSORT("INWEAUFS",AUFTRAG_","_POS_","_BET_","_LAP_","_WED_","_SN)
+	. . DO ^INSNHIST(SN,$$^WWWTEXT(32511)_" "_AUFTRAG_"-"_POS,ART,AUFTRAG,POS)  ;VON BESTAND FÜR   AUFTRAG,POS
+	. . KILL ^INWES(YM,ART,BET,LAP,WED,SN,1)  ;LÖSCHEN SERIENNUMMER ;Delete 
+	. . IF $DATA(^WWWSOR(YUSER_"VLP",BET,LAP,WED)) DO
+	. . . IF $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,2)="" SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,2)=SN QUIT
+	. . . SET $PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,2)=$PIECE(^WWWSOR(YUSER_"VLP",BET,LAP,WED),Y,2)_"|"_SN
+	
+	QUIT
+	
+KOMMISSION
+	;-------------------------------------------------------------------------------
+	;	ERSTELLEN LAGERBESTELLUNG FÜR KOMMISSIONSWARE
+	;	EINSPRUNG HIER!!!! AUS BUCHUNG^INFREMDFERT
+	;-------------------------------------------------------------------------------
+	NEW AUFTRAGALT
+	
+	SET AUFTRAGALT=$GET(AUFTRAG)
+	;	D132	$$$INVORGCreateOrderWhenItemIsSold()
+	IF $PIECE(objDefaults,Y,132)=1 DO  ;AUTOMATISCHE BESTELLUNG DER KOMMISSIONSWARE BEI ABVERKAUF j/n ;sales order the goods on Reference next to 
+	. ;
+	. ;AUFTRAGSANLAGE
+	. NEW YAUFTRAG,YPOSITION,KONS,YKEY,ANZ,LP,AUFTRAG,POS,YI,BET
+	. ;
+	. SET AUFTRAG=""
+	. SET $PIECE(YAUFTRAG,Y,2)=2                             ;LIEFERANTENBESTELLUNG
+	. SET $PIECE(YAUFTRAG,Y,12)=$PIECE(WEN,Y,7)              ;LIEFERANTENNUMMER AUS INWEAUF ;out of 
+	. ;
+	. SET $PIECE(YPOSITION,Y,4)=$GET(ART)                    ;ARTIKELNUMMER
+	. SET $PIECE(YPOSITION,Y,5)=+$GET(REST1)                 ;MENGE ;quantity 
+	. IF $GET(MENGE)<REST1 SET $PIECE(YPOSITION,Y,5)=MENGE
+	. ;
+	. SET KONS=0  ;KONS=LIEFERANTENBESTELLUNGEN KONSOLIDIEREN (SAMMELBESTELLUNGEN) JA/NEIN = NEIN ;not 
+	. ;auftrag anlegen ;create 
+	. SET AUFTRAG=$$^INAUFANLAGE(YAUFTRAG,YPOSITION,KONS)
+	. QUIT:AUFTRAG=""
+	. ;SET $PIECE(^INAUF(YM,AUFTRAG,1),Y,263)=$$^WWWTEXT(33297)                   ;KOMMISSION ;commission 
+	. ;SET $PIECE(^INAUF(YM,AUFTRAG,1),Y,8)=AUFTRAGALT_" - "_$$^WWWTEXT(33297)    ;// SR14746;URSPRUNGSAUFTRAG
+	. DO
+	. . NEW SATZ
+	. . SET SATZ=$GET(^INAUF(YM,YAUFTRAG,1))
+	. . SET $PIECE(SATZ,Y,263)=$$^WWWTEXT(33297)                   ;KOMMISSION ;commission 
+	. . SET $PIECE(SATZ,Y,8)=AUFTRAGALT_" - "_$$^WWWTEXT(33297)    ;// SR14746;URSPRUNGSAUFTRAG
+	. . set strStatus=$$$Save("INAUF",YAUFTRAG,SATZ,$$$YES)         // SR14746
+	. ;
+	. ;WE ERFASSEN ;In Edit 
+	. SET ANZ=0
+	. SET POS="" FOR  SET POS=$ORDER(^INAUFP(YM,AUFTRAG,POS)) QUIT:POS=""  QUIT:ANZ=1  DO
+	. . SET ANZ=1
+	. . SET BET=YLOCATION
+	. . IF BET="" SET BET=1
+	. . SET LP=$GET(LAP)
+	. . IF LP="" SET LP=$PIECE($GET(^INVORGB(YM,YM,BET,1)),Y,1)  ;PRODUKTIONSLAGER
+	. . IF LP="" SET LP=0
+	. . ;AUFBEREITEN FÜR SPEICHERUNG DES WE ;to In 
+	. . DO
+	. . . NEW YFORM,YVOR,YKEY,YFELD,NOBESTAND
+	. . . SET YKEY=AUFTRAG_","_POS_","_BET_","_LP_","_+$HOROLOG
+	. . . SET YFELD=WEN                                        ;VORHER WEN1
+	. . . SET $PIECE(YFELD,Y,4)   = REST1
+	. . . SET $PIECE(YFELD,Y,109) = REST1
+	. . . SET $PIECE(YFELD,Y,23)  = REST1
+	. . . SET $PIECE(YFELD,Y,10)  = 0                             ;WARENEINGANGSMERKER, WARE GILT ALS OK
+	. . . SET $PIECE(YFELD,Y,60)  = $$^WWWTEXT(33297)_" "_ART     ;KOMMISSION ;commission 
+	. . . SET $PIECE(YFELD,Y,1)   = $$^WWWTEXT(33297)             ;KOMMISSION ;commission 
+	. . . DO ^WWWSPEI("INWEAUF",YKEY,YFELD,1)
+	. . . FOR YI=20,21,22,96 DO
+	. . . . NEW YFELD
+	. . . . SET $PIECE(YFELD,Y,20)=$$^WWWTEXT(33356)   ;ABVERKAUF AUS KOMMISSIONSWARE - CONSIGNMENT ;out of goods on Reference 
+	. . . . SET $PIECE(YFELD,Y,21)=$$^WWWTEXT(33356)   ;ABVERKAUF AUS KOMMISSIONSWARE - CONSIGNMENT ;out of goods on Reference 
+	. . . . SET $PIECE(YFELD,Y,22)=$$^WWWTEXT(33356)   ;ABVERKAUF AUS KOMMISSIONSWARE - CONSIGNMENT ;out of goods on Reference 
+	. . . . SET $PIECE(YFELD,Y,96)=$$^WWWTEXT(33297)   ;KOMMISSION ;commission 
+	. . . . SET $PIECE(^INAUF(YM,AUFTRAG,1),Y,YI)=$PIECE(YFELD,Y,YI)
+	. . . 
+	. . . SET NOBESTAND=1  ;GESETZT FÜR ROUTINE INWEAUF, KEINE BILDUNG EINER INWE
+	. . . DO ^INWEAUF      ;WE OK ABER WE NICHT BUCHEN ;In yet In Not 
+	
+	QUIT 
+	
+]]></Routine>
+</Export>

@@ -1,0 +1,420 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INWEINVP1" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INWEINVP1
+	
+#include COMSYS
+#include INConst
+	
+#define LogItem(%L,%S,%T,%E)	if %L'="" if %T'=$h do AddMessage^COMLog(%L,$$$Text(%S),.%E) set %T=$h
+#define LogMessage(%L,%S)		if %L'="" do AddMessage^COMLog(%L,$$$Text(%S))
+	;-------------------------------------------------------------------------------
+	; History:
+	; 14.08.2006	FAN		SR14857: Create Stocktake
+	;-------------------------------------------------------------------------------
+	
+CanSearch(pidStocktake="")
+	;-------------------------------------------------------------------------------
+	; Disable the button when appropriate.
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 23-May-2011	shobby	SR17559: Created
+	;-------------------------------------------------------------------------------
+	do CanCreateList(pidStocktake)	;SR17559
+	if $get(YQ) = $$$YQEnable {
+		if $get(YSEITE)'=2 {
+			set YQ = 1_"Clique na aba ""Itens"" para habilitar este botão e selecionar itens específicos para o inventário"
+		}
+	}
+	quit
+
+
+OnBeforeSave(&pobjStocktake)
+	;-------------------------------------------------------------------------------
+	; Set the System Date and Counts
+	;
+	; Params:
+	; 	pobjStocktake	ByRef	INWEINVP record
+	;
+	; Returns: Nothing
+	;
+	; History:
+	; 07-Oct-2013	SCR		CORE-266: Check that all location are all Non Lot or all Lot controlled
+	; 23-May-2011	shobby	SR17559.2: Advanced flag no longer exists.
+	; 12-May-2011	shobby	SR17559: Only select 'all' locations if not an 'advanced'
+	;							configuration.
+	; 28-May-2010	PPP		SR17296: Set the Counting List Type to 0  
+	;							- Only Items with Stock, if not yet set.
+	; 02-Jul-2009	PPP		SR16510:Snapshot Timestamp to be set by the Create
+	; 19-Sep-2008	GRF		SR15810: Restrict to locations with storages; correct
+	; 							trimming of delimiter
+	; 17-Sep-2008	GRF		SR15810: correct variables; revert $order macro
+	; 26-Oct-2007	shobby	SRBR014557: If no locations are selected then select all
+	; 15-Aug-2006	RPW		SR14857: Created
+	;-------------------------------------------------------------------------------
+	new idCompany,idLocn,strLocnList,blnNonLot,intLoc,strLocFail
+	
+	quit:$$$INWEINVPStatus(pobjStocktake)'=0
+	
+	if '$$$INWEINVPCountingList(pobjStocktake) {                //SR17296
+		set $$$INWEINVPCountingList(pobjStocktake) = 0
+	}
+	
+	if $$$INWEINVPSiteLocation(pobjStocktake)="" {
+		set strLocnList = ""
+		set idCompany   = ""
+		for {
+			set idCompany = $order(^WWW0121s(0,3,$$$YES,idCompany))
+			quit:idCompany=""
+			
+			set idLocn=""
+			for {
+				set idLocn = $order(^WWW0121s(0,3,$$$YES,idCompany,idLocn))
+				quit:idLocn=""
+				
+				set strLocnList = strLocnList_";"_idLocn
+	; FIXME : <GRF> possible MAXSTRING error? Are we better off looking up all locns at processing time?
+	; 			e.g.
+	; 				set blnFound = $$$YES
+	; 				if strLocnList'="" set blnFound = ( $find(";"_strLocnList_";" , ";"_idLocn_";") )
+			}
+		}
+		set $$$INWEINVPSiteLocation(pobjStocktake) = $extract(strLocnList,2,$length(strLocnList))
+	}
+	
+	set strLocnList	= $$$INWEINVPSiteLocation(pobjStocktake)
+	
+	set blnNonLot	= $$OnlyTrackPrograms^INBundleUtils($piece(strLocnList,";",1))
+	set strLocFail	= ""
+	for intLoc = 2:1:$length(strLocnList,";") {
+		continue:$piece(strLocnList,";",intLoc)=""
+		if $$OnlyTrackPrograms^INBundleUtils($piece(strLocnList,";",intLoc))'=blnNonLot {
+			if strLocFail="" {
+				set strLocFail = strLocFail _ ";" _ $piece(strLocnList,";",intLoc)
+				$$$StartScript()
+				write "alert('"_$$$Text($listbuild("IN01455",$piece(strLocnList,";",1)))  ;All Locations must be either all Lot controlled or all Not Lot controlled. \r \n The following Locations do not match the 1st Location %1 \r \n
+			}		
+			write $piece(strLocnList,";",intLoc)_","
+			set Q = $$$QDontSave
+		}
+	}
+	if strLocFail'="" {
+		write "');"
+		$$$EndScript()
+	}
+	
+	// Do not let save if there are repeated itens in the list
+	if ((+$$$WWWClientParamCoreChangesHEVA($get(^WWWClientParam(YM,YM,1)))) || 
+		 (+$$$WWWClientParamCoreChangesSESPE($get(^WWWClientParam(YM,YM,1)))) ||
+		 (+$$$WWWClientParamCoreChangesSESDF($get(^WWWClientParam(YM,YM,1))))) {
+		
+		if '$$$NoKey(YKEY) {
+
+			kill ^VARTempINWEINVPSave
+			set itensIncluded = $$ItensAlreadyIncluded^VARINWEINVD
+			set countDown = $length(itensIncluded,Y)
+			set controlCount = 0
+			set controlLines = 0
+			set repeatedStatus = 0
+						
+			for lineFirst = 1:1:countDown {
+				set listItensFirst = $piece(itensIncluded,Y,lineFirst)
+		
+				for lineSecond = lineFirst + 1:1:countDown {
+					
+					set listItensSecond = $piece(itensIncluded,Y,lineSecond)
+					quit:(listItensSecond="")
+					
+					if ((listItensFirst = listItensSecond) && (controlCount = 1)) {
+						continue
+					}
+										
+					if (listItensFirst = listItensSecond) {
+						set controlCount = 1
+						set repeatedStatus = 1
+						set ^VARTempINWEINVPSave(lineSecond,listItensSecond) = listItensSecond
+						set controlLines = controlLines + 1			
+					}								
+				}
+				set controlCount = 0
+		
+			}
+			
+			if (repeatedStatus) {
+	
+				set orderCount = ""
+				set orderProduct = ""
+				$$$StartScript()
+				write "alert('Os produtos abaixo estão repetidos. Favor excluí-los. \r\n\r\n"
+				for {
+					set orderCount = $order(^VARTempINWEINVPSave(orderCount))
+					quit:(orderCount="")
+					for {
+						set orderProduct = $order(^VARTempINWEINVPSave(orderCount,orderProduct))
+						quit:(orderProduct="")
+						
+						w "Linha: "_orderCount_" - ("_orderProduct_") "_$$SQLGetDescricaoProduto^VARSQL(orderProduct)_"\r\n"
+					}			
+				}
+				write "')"
+				set Q = $$$QDontSave
+				$$$EndScript()
+				quit
+			}
+			
+		}
+	}
+	quit
+	
+	
+OnBeforeButtonLine(pidStocktake) 
+    ;-------------------------------------------------------------------------------
+    ; Set form to readonly if not editable
+    ;
+    ; Params:
+    ;
+    ; Returns:
+    ;
+    ; History:
+	; 17-Sep-2008	GRF		SR15810: use macro
+    ; 15-Aug-2006	RPW		SR14857: Created
+    ;-------------------------------------------------------------------------------
+	if '$$$NoKey(pidStocktake) {
+		if '$$Editable($get(^INWEINVP(0,pidStocktake,1))) {
+			set $$$WWW120AuthorizationToModifyData(YVOR) = $$$EnumReadOnly
+		}
+	}
+	quit
+	
+	
+OnAfterDataFields(pidStocktake)
+	;-------------------------------------------------------------------------------
+	; Code to run when called by the AfterDataField event on the @netManager form.
+	; 
+	; Called By: Form INWEINVP
+	; 
+	; History:
+	; 28-Oct-2010	PPP		SR17586: Created  
+	;-------------------------------------------------------------------------------
+	new idAdj,idxStkTake
+		
+	if '$$$NoKey(pidStocktake) {
+		set idxStkTake = $$$Index(pidStocktake)
+		set idAdj      = ""
+		for {
+			set idAdj = $order(^INADJs(0,1,idxStkTake,idAdj))
+			quit:idAdj=""
+			
+			do ShowAdjustment^INADJATT(idAdj)
+		}
+	}
+	quit
+	
+	
+Editable(pobjStocktake) 
+    ;-------------------------------------------------------------------------------
+    ; Is form editable (unprocessed) ?
+    ;
+    ; Params:
+    ; pobjStocktake: The stocktake object
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 15-Aug-2006	RPW		SR14857: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,strDesc
+	
+	set strStatus = $$$OK
+	
+	if $$$INWEINVPStatus(pobjStocktake) '= 0 {     ; not "Unstarted"
+		set strStatus = $listbuild("IN00377")      ; "Record already processed"  ; FIXME $$$MakeStatus?
+	}
+	quit strStatus
+	
+	
+CreateList(pidStocktake)
+	;-------------------------------------------------------------------------------
+	; Create the stocktake list. Removed from OnAfterSave.
+	;
+	; Called By: Form INWEINVP Button 1 "Create Snapshot"
+	;
+	; Params:
+	; 	pidStocktake: The id of the stocktake.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 14-Oct-2008	GRF		SR15810: Activate INStocktakeCreate call
+	; 17-Sep-2008	GRF		SR15810: correct variables
+	; 14-May-2008	GRF		SR15743: Boolean Macros
+ 	; 25-Oct-2007	shobby	BR014730 : Check whether any of the site locations are
+ 	; 							already locked.
+	; 22-Oct-2007	PJones	BR014730 :  code to lock the site-location if this is
+	; 							doors-closed stocktake
+	; 15-Aug-2006	RPW		SR14857: Created
+	;-------------------------------------------------------------------------------
+	new blnConsolidate,blnDisplaySOH,blnSerialNumber,enumSort
+	new idCountingList,idLockedLocn,idLog,intLoop,intSelection,objStocktake
+	new strFromStore,strGroup,strLocnList,strToStore,strStatus
+	
+	set strStatus    = $$$OK
+	set objStocktake = $get(^INWEINVP(0,pidStocktake,1))
+	
+	set strGroup     = $$$INWEINVPItemGroup(objStocktake)
+	set strFromStore = $$$INWEINVPFromStockLocation(objStocktake)
+	set strToStore   = $$$INWEINVPToStockLocation(objStocktake)
+	set strLocnList  = $$$INWEINVPSiteLocation(objStocktake)
+	if $$IsLockedSiteLocations^INLocking(strLocnList,.idLockedLocn) {   ; FIXME : We don't care which one is locked so test should return
+		set strStatus = $$ReasonLocked^INLocking(idLockedLocn)          ;    strStatus with reason - only basing on first locked locn
+	}                                                                   ;     - actually returns plain str or $lb not strStatus
+		
+	if $$$ISERR(strStatus) {
+		do ReloadForm^COMUtilForm()
+		$$$Alert(strStatus)
+		
+	} else {
+		set $$$INWEINVPStatus(objStocktake) = 1
+		
+		set strStatus = $$$Save("INWEINVP",pidStocktake,objStocktake,$$$YES)
+	 
+		do StartLog^COMLog($$$Text("IN00451")_" "_pidStocktake_" ("_$$$INWEINVPRemark(objStocktake)_")",.idLog)	//SR14508 - "Generating Stocktake"
+		
+		set intSelection  = 0                                                   ; Item Selection for Counting List 
+		set blnDisplaySOH = '$$$INWEINVPDisplayStockOnHandQuantit(objStocktake)	; Display Stock On Hand Quantity 
+		set enumSort      =  $$$INWEINVPSorting(objStocktake)
+		if enumSort="" set enumSort = 1                                         ; SORTIERUNG ;sorting 
+		set blnConsolidate  = '$$$INWEINVPConsolidateReceiptDates(objStocktake) ; Checkbox reversed 	//SR14508 
+		set blnSerialNumber = $$$YES                 ;AUFNAHMEZEILE JE ARTIKEL MIT SN ;once item by means of 
+		set idCountingList  = +$$$INWEINVPCountingList(objStocktake)
+		set intDaysCount  	= +$$$INWEINVPDaysCount(objStocktake)
+	 
+		; BR014730 : lock the site-location for doors-closed stocktake
+		if ($$$INWEINVPCreateLockOnSnapshot(objStocktake) = $$$YES) {
+			do LockSiteLocationList^INLocking(strLocnList,$$$EnumINLOCKTYPEStocktake,pidStocktake)
+		}
+		
+		; **********************************
+	;	JOB START(0,pidStocktake,blnConsolidate,enumSort,intSelection,YUSER,blnDisplaySOH,blnSerialNumber,idLog,pidStocktake,strLocnList,strGroup,strFromStore,strToStore)
+		// SR17296: Added idCountingList
+		JOB TakeSnapshot^INStocktakeCreate(pidStocktake,enumSort,YUSER,blnDisplaySOH,blnSerialNumber,idLog,strLocnList,strGroup,strFromStore,strToStore,idCountingList,intDaysCount)
+		; FIXME : <GRF> What are the consequences if the job can't start (e.g. too many users)?
+		; **********************************			
+	 
+		; Ready to goto the Detail form
+		do GoToForm^COMUtilForm("COMMsg",idLog)
+	}		
+	quit
+	
+	
+CanCreateList(pidStocktake)
+	;-------------------------------------------------------------------------------
+	; If the status is 0, we can create the list.
+	;
+	; Called By: Form INWEINVP Button 1 "Create Snapshot"
+	; 
+	; Params:
+	; pidStocktake: The id of the stocktake.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 15-Aug-2006	RPW		SR1485: Created
+	;-------------------------------------------------------------------------------
+	new blnCanCreate,strStatus
+	
+	quit:$$$NoKey(pidStocktake)
+	
+	set strStatus = $$$OK
+	
+	set blnCanCreate = ($$$INWEINVPStatus($get(^INWEINVP(0,pidStocktake,1)))=0)
+	if 'blnCanCreate {
+		set strStatus = "IN00518"
+	} ; "The list for this stocktake has already been created."
+	
+	$$$YQHandler(strStatus)
+	quit
+	
+StorageSelect(pidFld) 
+	;-------------------------------------------------------------------------------
+	; Create a COMView Popup to Select a Storage
+	;
+	; Params:
+	; pidFld: The id of the field to populate.
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Dec-2010	SCR		SR17632: Created
+	;-------------------------------------------------------------------------------
+	do Initialise^COMViewCustom("INLP","StorageSelected^INWEINVP1",$$$YES)
+	do Start^COMViewCustom()
+	quit
+	
+	
+StorageSelected(pobjResultSet)
+	;-------------------------------------------------------------------------------
+	; Callback when a row in the COMView is selected
+	;
+	; Params:	pobjResultSet		: The result set
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 16-Dec-2010	SCR		SR17632: Created
+	;-------------------------------------------------------------------------------
+	new idKey,idItem,idReqLine,objReqLine,objRespLine,idReq,objResponse
+	
+	set objResponse = $$$GRIDYFELDContainer
+	
+	; vvv
+	while pobjResultSet.Next() {
+		set idKey  = $$GetID^COMViewCustom(pobjResultSet)
+		set idItem = $$$KEY2(idKey)
+		$$$Alert(idItem)
+	}
+	quit
+	;$$$Alert(objResponse)
+	;$$$GRIDAddBatchStart
+	;
+	;while pobjResultSet.Next() {
+	;	set idKey  = $$GetID^COMViewCustom(pobjResultSet)
+	;	$$$Alert(idKey)
+	;	
+	;	set idReq  = $$$KEY1(idKey)
+	;	set idItem = $$$KEY2(idKey)
+	;	$$$Alert(idItem)
+	;
+	;	
+	;	set objReqLine = $get(^INAgreeReqLine(0,idReq,idItem,1))
+	;		
+	;	set $$$INAgreeRespLineRequest(objRespLine)		= idReq
+	;	set $$$INAgreeRespLineItem(objRespLine)			= idItem // SR15553
+	;	set $$$INAgreeRespLineOpenDate(objRespLine)		= $$$INAgreeReqLineOpenDate(objReqLine)
+	;	set $$$INAgreeRespLineCloseDate(objRespLine)	= $$$INAgreeReqLineCloseDate(objReqLine)
+	;	set $$$INAgreeRespLineQty(objRespLine)			= $$$INAgreeReqLineQty(objReqLine)
+	;	set $$$INAgreeRespLineSupplier(objRespLine)		= $$$INAgreeRespSupplier(objResponse) // SR15553
+	;	set $$$INAgreeRespLineContract(objRespLine)		= $$$INAgreeRespContract(objResponse) // SR15553
+	;		
+	;	$$$GRIDAddLine(objRespLine)
+	;}
+	;
+	;$$$GRIDAddBatchStop
+	;quit
+	; ^^^
+	
+
+]]></Routine>
+</Export>

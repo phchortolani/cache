@@ -1,0 +1,476 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLPeriodTotal" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLPeriodTotal
+	
+#include %occExtent
+#include %occInclude
+#include %systemInclude
+#include FINConst
+#include COMSYS
+	
+GetPeriodTotal(pidAccount,pidPeriod,pidTranType,&parrTranTotal)
+	;-------------------------------------------------------------------------------
+	; Return period total
+	;
+	; Params:
+	;
+	; ByRefs:	parrTranTotal(idTranType) = total
+	;
+	; Returns:
+	;
+	; History:
+	; 06-Jul-2006	JW&SS	SR14525: Added array by ref
+	; 14-Apr-2005	RobertW	SR12159: Make sure that FINGLTranType is no longer shared.
+	; 25-Jun-2004	shobby	Foreign Currency.
+	;-------------------------------------------------------------------------------
+	new amt,curAmount
+	
+	kill parrTranTotal
+	
+	set pidTranType=$get(pidTranType)
+	
+	if pidTranType'="" {
+		set amt=$get(^FINGLPeriodTotal(0,pidAccount,pidPeriod,pidTranType,1))
+	}
+	if pidTranType="" {
+		set amt="",pidTranType=""
+		for  {
+			set pidTranType=$order(^FINGLPeriodTotal(0,pidAccount,pidPeriod,pidTranType))
+			quit:pidTranType=""
+			
+			if '$$$FINGLTranTypeBudget($get(^FINGLTranType(0,pidTranType,1))) {
+				set curAmount = $get(^FINGLPeriodTotal(0,pidAccount,pidPeriod,pidTranType,1))
+				set parrTranTotal(pidTranType) = curAmount
+				set amt=$$$FCAdd(amt,curAmount)
+			}
+		}
+	}
+	quit amt
+	
+AddAmount(pidAccount,pdteTransDate,idTranType,curAmount,pblnForce=0)
+	;-------------------------------------------------------------------------------
+	; Adds the an amount to the periods for an account.
+	;
+	; Returns:
+	;
+	; History:
+	; 10-Sep-2005	RPW		SR13639: Use the new GetAmount macro instead of the
+	; 						function call.
+	; 10-Aug-2005	shobby	SR12815:Check status after calling GetPeriodsForDate.
+	; 21-Sep-2004	shobby	If posting a Foreign Currency amount to a non foreign
+	; 						currency amount, convert to Base amount.
+	; 02-Jun-2004	SCR		FC Upgrade
+	; 18-Mar-2004	shobby	When forcing store totals in CacheTemp, will be moved to
+	; 						FINGLPeriodTotal later.
+	; 25-Feb-2004	shobby	Removed 'set abc=1' ; don't know why that was there.
+	; 16-Sep-2003	shobpk	Added Force flag to post to closed periods
+	; 16-Sep-2003	shobpk	Use standard save routine.
+	;-------------------------------------------------------------------------------
+	new PeriodList,CurrentPeriod,PeriodLength,intLoop,curAmountToAdd
+	new YFORM,strStatus,PeriodRec
+	
+	set YFORM="FINGLPeriodTotal"
+	set strStatus=$$GetPeriodsForDate^FINGLPeriod(pdteTransDate,.PeriodList,pblnForce)
+	if $$$ISOK(strStatus) {
+		set PeriodLength=$listlength(PeriodList)
+		
+		if PeriodLength<1 set strStatus=$$$Text($listbuild("Fin00285",$$^WWWDATE(pdteTransDate)))  ;No Periods Defined for Date %1
+		
+		if strStatus=1 {
+			for intLoop=1:1:PeriodLength {
+				set CurrentPeriod=$listget(PeriodList,intLoop)
+				if CurrentPeriod="" set strStatus=$listbuild("Fin00196")  ; Ledger Period not defined
+				if strStatus=$$$OK {
+					if pblnForce {
+						set curAmountToAdd=$$$FCAdd(curAmount,$get(^CacheTemp("FINGLPeriodTotal",YUSER,pidAccount,CurrentPeriod,idTranType)))
+						if $$$FCZero(curAmountToAdd) {
+							kill ^CacheTemp("FINGLPeriodTotal",YUSER,pidAccount,CurrentPeriod,idTranType)
+						} else {				
+							set ^CacheTemp("FINGLPeriodTotal",YUSER,pidAccount,CurrentPeriod,idTranType)=curAmountToAdd
+						}
+					} else {
+						set curAmountToAdd=$$$FCAdd(curAmount,$get(^FINGLPeriodTotal(0,pidAccount,CurrentPeriod,idTranType,1)))
+						;set curAmountToAdd=$$GetAmount^FINGLAccountProcess(pidAccount,curAmountToAdd) ;<TODO FC>
+						set curAmountToAdd=$$$GetAmount(pidAccount,curAmountToAdd) ;<TODO FC> ; SR13639
+						set strStatus = $$$Save("FINGLPeriodTotal",pidAccount_","_CurrentPeriod_","_idTranType,curAmountToAdd,$$$YES)
+					}
+				}
+				quit:$$$ISERR(strStatus)
+			}
+		}
+	}
+	quit strStatus
+	
+	
+PeriodsForAccount(pidAccount , pidPeriodType , plngYear, pidTranType)
+	;-------------------------------------------------------------------------------
+	; Display for the "Period Totals" Tab on the Finance General Ledger Account form.
+	; 
+	; History :
+	; 23-May-2006	GRF		Doco
+	; 25-Jun-2004	shobby	Foreign Currency.
+	; 19-Feb-2003	shobby	Rationalised some code using InsertCurrencyCell
+	; 19-Feb-2003	shobby	Opening and Closing values
+	;-------------------------------------------------------------------------------
+	new amt,curClosingAmount,CurrentPeriod
+	new fltBalance,fltBalanceClosing,fltOtherAmount,fltOtherAmountClosing,fltRunning
+	new intLoop,lstHeading,PeriodList,PeriodLength,strStatus
+	
+	;if $get(pidAccount)=""    set pidAccount=YKEY
+	;if $get(pidPeriodType)="" set pidPeriodType=VORG(4)
+	;if $get(plngYear)=""      set plngYear=VORG(5)
+	;if $get(pidTranType)=""   set pidTranType=VORG(6)
+	
+	if pidAccount=""    set pidAccount=" "
+	if pidPeriodType="" set pidPeriodType=$$DefaultPeriod^FINGLPeriod()
+	if plngYear=""      set plngYear=2003 //FIXME: Should be the current $h year ??
+	
+	set lstHeading = ""
+	set lstHeading = lstHeading_$listbuild($$$Text("Fin00356",0))  ;Period
+	set lstHeading = lstHeading_$listbuild($$$Text("Fin00354",0))  ;Start Date
+	set lstHeading = lstHeading_$listbuild($$$Text("Fin00355",0))  ;End Date
+	set lstHeading = lstHeading_$listbuild($$$Text("Fin00510",0))  ;Trans. Amount
+	set lstHeading = lstHeading_$listbuild($$$Text("Fin00511",0))  ;Other Amount
+	set lstHeading = lstHeading_$listbuild($$$Text("Fin00050",0))  ;Balance,
+	set lstHeading = lstHeading_$listbuild($$$Text("Fin00026",0))  ;Running
+	do Start^COMTable(lstHeading)
+	
+	;--------+------------+------------+---------------+--------------+---------+---------+
+	; Period | Start Date |  End Date  | Trans. Amount | Other Amount | Balance | Running |
+	;--------+------------+------------+---------------+--------------+---------+---------+
+	; Op Bal |            |            |               |         #.## |    #.## |    #.## |  Opening Balance
+	; 01     | 01/MM/YYYY | 31/MM/YYYY |          #.## |         #.## |    #.## |    #.## |  .
+	; 02     | 01/MM/YYYY | 31/MM/YYYY |          #.## |         #.## |    #.## |    #.## |  .
+	; ...                                                                                    Periods
+	; 12     | 01/MM/YYYY | 31/MM/YYYY |          #.## |         #.## |    #.## |    #.## |  .
+	; Cl Bal |            |            |          #.## |         #.## |    #.## |    #.## |  Closing Balance
+	;--------+------------+------------+---------------+--------------+---------+---------+
+	
+	set strStatus    = $$$OK
+	set PeriodList   = $$GetPeriodsForYear^FINGLPeriod(pidPeriodType,plngYear)
+	set PeriodLength = $listlength(PeriodList)
+	
+	;--------------------------------------- Opening Balance
+	
+	do NewLine^COMTable()
+	do InsertCell^COMTable($$^WWWTEXT("Fin00042"))		;Opening Balance
+	do InsertCell^COMTable("")		;Spot for Start Date
+	do InsertCell^COMTable("")		;Spot for End Date
+	set amt=$$GetOpeningBal(pidAccount,pidPeriodType,plngYear,pidTranType)
+	set curClosingAmount=amt
+	do InsertCurrencyCell^COMTable(amt,$$$NO)
+	
+	; Other Amount
+	set fltBalance=$$GetOpeningBal(pidAccount,pidPeriodType,plngYear,"")
+	set fltOtherAmount=$$$FCSub(fltBalance,curClosingAmount)
+	set fltOtherAmountClosing=fltOtherAmount
+	do InsertCurrencyCell^COMTable(fltOtherAmount,$$$NO)
+	
+	; Balance
+	set fltBalanceClosing=fltBalance
+	do InsertCurrencyCell^COMTable(fltBalanceClosing,$$$NO)
+	
+	; Running
+	set fltRunning=fltBalance
+	do InsertCurrencyCell^COMTable(fltRunning,$$$NO)
+	do EL^WWWTAB
+	
+	;--------------------------------------- Periods
+	
+	for intLoop=1:1:PeriodLength {
+		set CurrentPeriod=$listget(PeriodList,intLoop)
+		do NewLine^COMTable()
+		do InsertCell^COMTable($translate($justify(intLoop,2)," ","0"))		;Period Number
+		do InsertCell^COMTable($$^WWWDATE($piece($get(^FINGLPeriod(0,CurrentPeriod,1)),Y,2)))		;Start Date
+		do InsertCell^COMTable($$^WWWDATE($piece($get(^FINGLPeriod(0,CurrentPeriod,1)),Y,3)))		;End Date
+		set amt                   = $$GetPeriodTotal^FINGLPeriodTotal(pidAccount,CurrentPeriod,pidTranType)
+		set fltBalance            = $$GetPeriodTotal^FINGLPeriodTotal(pidAccount,CurrentPeriod,"")
+		set fltBalanceClosing     = $$$FCAdd(fltBalanceClosing,fltBalance)
+		set fltRunning            = $$$FCAdd(fltRunning,fltBalance)
+		set fltOtherAmount        = $$$FCSub(fltBalance,amt)
+		set fltOtherAmountClosing = $$$FCAdd(fltOtherAmountClosing,fltOtherAmount)
+		set curClosingAmount      = $$$FCAdd(curClosingAmount,amt)
+		do InsertCurrencyCell^COMTable(amt,$$$YES) ;Trans Amount
+		do InsertCurrencyCell^COMTable(fltOtherAmount,$$$YES)
+		do InsertCurrencyCell^COMTable(fltBalance,$$$YES)
+		do InsertCurrencyCell^COMTable(fltRunning,$$$NO)
+		
+		do EL^WWWTAB
+	}
+	
+	;--------------------------------------- Closing Balance
+	
+	do NewLine^COMTable()
+	do InsertCell^COMTable($$^WWWTEXT("Fin00043"))		;Opening Balance
+	do InsertCell^COMTable("")		;Spot for Start Date
+	do InsertCell^COMTable("")		;Spot for End Date
+	do InsertCurrencyCell^COMTable(curClosingAmount,$$$NO)
+	do InsertCurrencyCell^COMTable(fltOtherAmountClosing,$$$NO)
+	do InsertCurrencyCell^COMTable(fltBalanceClosing,$$$NO)
+	do InsertCurrencyCell^COMTable(fltRunning,$$$NO)
+	do EL^WWWTAB
+	
+	do Stop^COMTable()
+	quit
+ 
+ 
+OnAfterDataFields(pYKEY)
+	;-------------------------------------------------------------------------------
+	; Shows a list of budgets for an account.
+	;
+	; History:
+	; 09-Nov-2004	Paul K	Fixed subscript error
+	;-------------------------------------------------------------------------------
+	new idAccount,idPeriod,idTranType,idPeriodType,objPeriod,lngYear
+	
+	set idAccount  = $$$KEY1(pYKEY)
+	set idPeriod   = $$$KEY2(pYKEY)
+	set idTranType = $$$KEY3(pYKEY)
+	if idPeriod'="" {
+		set objPeriod    = $get(^FINGLPeriod(0,idPeriod,1))
+		set idPeriodType = $$$FINGLPeriodPeriodType(objPeriod)  ;gets period for period Type
+	
+		set lngYear = $$$FINGLPeriodYear1(objPeriod)
+		do BudgetsForAccount(idAccount,idPeriodType,lngYear,idTranType)
+	}
+	quit
+	
+	
+BudgetsForAccount(pidAccount,pidPeriodType,plngYear,pidTranType)
+	;-------------------------------------------------------------------------------
+	; Display the grid 
+	;
+	; 25-Jun-2004	shobby	Foreign Currency.
+	; 02-Mar-2004	SCR		Handle no account or no Budget type
+	; 11-Mar-2003	shobby	Added a 'Budget' column.
+	; 10-Mar-2003	shobby	Highlight the currently selected line.
+	; 21-Feb-2003	shobby	Removed period total fields and added Budget figures.
+	; 20-Feb-2003	shobby	Copied from PeriodsForAccount
+	; 19-Feb-2003	shobby	Rationalised some code using InsertCurrencyCell
+	; 19-Feb-2003	shobby	Opening and Closing values
+	;-------------------------------------------------------------------------------
+	new curClosingAmount,CurrentPeriod,intLoop
+	new fltBalance,fltBalanceClosing,fltBudget,fltBudgetClosing,fltRunning
+	new PeriodLength,PeriodList,strId,strStatus
+	
+	;if $get(pidAccount)=""    set pidAccount=YKEY
+	;if $get(pidPeriodType)="" set pidPeriodType=VORG(4)
+	;if $get(plngYear)=""      set plngYear=VORG(5)
+	;if $get(pidTranType)=""   set pidTranType=VORG(6)
+	
+	if pidAccount=""    set pidAccount=" "
+	if pidPeriodType="" set pidPeriodType=$$DefaultPeriod^FINGLPeriod()
+	if plngYear=""      set plngYear=2003
+	
+	do Start^COMTable($listbuild($$$Text("Fin00354"),$$$Text("Fin00355"),$$$Text("Fin00356"),$$$Text("Fin00050"),$$$Text("Fin00026"),$$$Text("Fin00357"),$$$Text("Fin00330")))
+	;Start Date,End Date,Period,Balance,Running,Budget,Variance
+	
+	set strStatus    = $$$OK
+	set PeriodList   = $$GetPeriodsForYear^FINGLPeriod(pidPeriodType,plngYear)
+	set PeriodLength = $listlength(PeriodList)
+	
+	;--------------------------------------- Opening Balance
+	
+	do NewLine^COMTable(YDARKGRAY)
+	do InsertCell^COMTable($$^WWWTEXT("Fin00042"))		;Opening Balance
+	do InsertCell^COMTable("")		;Spot for Start Date
+	do InsertCell^COMTable("")		;Spot for End Date
+	
+	; Balance
+	set fltBalance=$$GetOpeningBal(pidAccount,pidPeriodType,plngYear,"")
+	set fltBalanceClosing=fltBalance
+	do InsertCurrencyCell^COMTable(fltBalanceClosing,$$$NO)
+	
+	; Running
+	set fltRunning=fltBalance
+	do InsertCurrencyCell^COMTable(fltRunning,$$$NO)
+	
+	; Budget
+	set fltBudgetClosing=0
+	do InsertCurrencyCell^COMTable(fltBudgetClosing,$$$NO)
+	do InsertCurrencyCell^COMTable($$$FCSub(fltBalanceClosing,fltBudgetClosing))
+	
+	do EL^WWWTAB
+	
+	;--------------------------------------- Periods
+	
+	for intLoop=1:1:PeriodLength {
+		set CurrentPeriod = $listget(PeriodList,intLoop)
+		;do NewLine^COMTable()
+		do NewLine^COMTable($select(CurrentPeriod=$piece(YKEY,",",2):"lightgreen",1:""))
+		do InsertCell^COMTable($$^WWWDATE($piece($get(^FINGLPeriod(0,CurrentPeriod,1)),Y,2)))		;Start Date
+		do InsertCell^COMTable($$^WWWDATE($piece($get(^FINGLPeriod(0,CurrentPeriod,1)),Y,3)))		;End Date
+		set fltBalance        = $$GetPeriodTotal^FINGLPeriodTotal(pidAccount,CurrentPeriod,"")
+		set fltBalanceClosing = $$$FCAdd(fltBalanceClosing,fltBalance)
+		set fltRunning        = fltRunning+fltBalance
+		do InsertCell^COMTable($translate($justify(intLoop,2)," ","0"))		;Period Number
+		do InsertCurrencyCell^COMTable(fltBalance,$$$YES)
+		do InsertCurrencyCell^COMTable(fltRunning,$$$NO)
+		set fltBudget=0
+		if pidTranType'="" {
+			set fltBudget=$$GetPeriodTotal^FINGLPeriodTotal(pidAccount,CurrentPeriod,pidTranType)
+			set fltBudgetClosing=$$$FCAdd(fltBudgetClosing,fltBudget)
+		}
+		
+		set strId=pidAccount_","_CurrentPeriod_","_pidTranType
+		if $get(fltBudget)'="" {
+			do InsertCurrencyCell^COMTable($get(fltBudget),$$$NO,"FINGLPeriodTotal",strId,strId)
+		}
+		if $get(fltBudget)="" {
+			do InsertCell^COMTable("...........","FINGLPeriodTotal",strId,strId)
+		}
+		do InsertCurrencyCell^COMTable($$$FCSub(fltBalance,fltBudget),$$$YES) ;Variance
+		
+		do EL^WWWTAB
+	}
+	
+	;--------------------------------------- Closing Balance
+	
+	do NewLine^COMTable(YDARKGRAY)
+	do InsertCell^COMTable($$^WWWTEXT("Fin00043"))		;Closing Balance
+	do InsertCell^COMTable("")		;Spot for Start Date
+	do InsertCell^COMTable("")		;Spot for End Date
+	do InsertCurrencyCell^COMTable(fltBalanceClosing,$$$NO)
+	do InsertCurrencyCell^COMTable(fltRunning,$$$NO)
+	do InsertCurrencyCell^COMTable(fltBudgetClosing,$$$NO)		;Budget
+	do InsertCurrencyCell^COMTable($$$FCSub(fltBalanceClosing,fltBudgetClosing),$$$NO)	;Variance
+	do EL^WWWTAB
+	
+	do Stop^COMTable()
+	quit
+	
+	
+CheckForNew()
+	new blnCreateNew,idAccount,idPeriod,idTranType
+	
+	set idAccount  = $$$KEY1(YKEY)
+	set idPeriod   = $$$KEY2(YKEY)
+	set idTranType = $$$KEY3(YKEY)
+	
+	set blnCreateNew = $$$YES
+	if idAccount,idPeriod,idTranType'="" {
+		if $data(^FINGLPeriodTotal(0,idAccount,idPeriod,idTranType,1)) {
+			set blnCreateNew=$$$NO
+		}
+	}
+	if blnCreateNew {
+		do Save^FINSYS("FINGLPeriodTotal",YKEY,0,1)
+		do ^WWWREFRESH(1)
+	}
+	quit
+	
+	
+GetOpeningBal(pidAccount,pidPeriodType,plngYear,pidTranType,plngNumber,pstrCheck="Period")
+	;-------------------------------------------------------------------------------
+	; Inputs :
+	;	plngNumber is optional. if used will return up to that period number
+	;
+	; History :
+	; 13-Jul-2006	JW		SR14836: Index variable. Use it.
+	; 13-Apr-2005	PO		SR12135 Depending on pstrCheck check idPeriod/lngNumber
+	; 						against plngNumber
+	; 17-Feb-2005	PO		SR11752 Comparing lngNumber to plngNumber instead of
+	; 						idPeriod to plngNumber
+	; 13-Jul-2004	shobby	idPeriod compare to plngNumber
+	; 25-Jun-2004	shobby	Foreign Currency.
+	; 25-Mar-2004	shobby	Only calculate if pidPeriodType is not null. (TR007390)
+	; 23-Jun-2003	shobby	Someone forgot to New their variables.
+	; 13-Feb-2003	shobby	Changed initialisation of lngNumber
+	;-------------------------------------------------------------------------------
+	new lngYear,curAmount,idPeriod,lngNumber,fltAmount,idxPeriodType
+ 
+	set curAmount = 0
+ 
+	if ($get(pidPeriodType)'="") && (pstrCheck="Period")||(pstrCheck="Number") {
+		set idxPeriodType = $$$Index(pidPeriodType)		// SR14836
+		set lngYear=""
+		for {
+			set lngYear=$order(^FINGLPeriods(0,1,idxPeriodType,lngYear))	// SR14836
+			quit:(lngYear=plngYear)&&($get(plngNumber)="")
+			quit:(lngYear>plngYear)
+			quit:lngYear=""
+			
+			set lngNumber=""
+			for {
+				set lngNumber=$order(^FINGLPeriods(0,1,idxPeriodType,lngYear,lngNumber))	// SR14836
+				quit:lngNumber=""
+				quit:(pstrCheck="Number")&&(lngNumber=$get(plngNumber))&&(lngYear=plngYear) ; SR11752 ???
+				;quit:(lngNumber=$get(plngNumber))&(lngYear=plngYear)
+				
+				set idPeriod = $order(^FINGLPeriods(0,1,idxPeriodType,lngYear,lngNumber,""))	// SR14836
+				quit:(pstrCheck="Period")&&(idPeriod=$get(plngNumber))&&(lngYear=plngYear) ; SR12135 ???
+				
+				set fltAmount = $$GetPeriodTotal(pidAccount,idPeriod,pidTranType)
+				set curAmount = $$$FCAdd(curAmount,fltAmount)
+			}
+		}
+	}
+ 
+	quit curAmount
+ 
+GetTotal(pidAccount,pidPeriodType,plngStartYear, plngStartNumber,plngEndYear, plngEndNumber,pidTranType,pstrCheck="Period")
+	;-------------------------------------------------------------------------------
+	; History:
+	; 13-Apr-2005	PO		SR12135 hand across which indexes need checking in
+	; 						GetOpeningBal^FINGLPeriodTotal
+	; 25-Jun-2004	shobby	Foreign Currency.
+	;-------------------------------------------------------------------------------
+	new curOpening,curClosing
+	
+	if plngStartYear="" {
+		set curOpening=0
+	} else {
+		set curOpening=$$GetOpeningBal(pidAccount,pidPeriodType,plngStartYear,pidTranType,plngStartNumber,pstrCheck)
+	}
+	if plngEndYear="" set plngEndYear = 2050  ;hopefully long enough
+	set plngEndNumber = plngEndNumber+1
+	set curClosing    = $$GetOpeningBal(pidAccount,pidPeriodType,plngEndYear,pidTranType,plngEndNumber,pstrCheck)
+ 
+	quit $$$FCSub(curClosing,curOpening)
+ 
+OnAfterSave(pYKEY,pYFELD)
+	;-------------------------------------------------------------------------------
+	; Distribute the Budget amounts as per the user request.
+	; 
+	; History
+	; 25-Jun-2004	shobby	Foreign Currency.
+	; 11-Mar-2003	shobby	Use the virtualrounding method to determine the amounts.
+	; ??-???-2003	shobby	Creation
+	;-------------------------------------------------------------------------------
+	new blnFlag,fltAmount,fltTotalAmount,i,idPeriod,idPeriodType,intPeriods
+	new lngYear,lstAmounts,PeriodList,SQLCODE,strStatus,strAccount,strBudgetType
+	
+	if VORG(1)'=0 {
+		; spread over year
+		set blnFlag  = $$$NO
+		set idPeriod = $$$KEY2(pYKEY)
+		
+		set idPeriodType  = $$$FINGLPeriodPeriodType($get(^FINGLPeriod(0,idPeriod,1)))  ;gets period for period Type
+		set lngYear       = $$$FINGLPeriodYear1($get(^FINGLPeriod(0,idPeriod,1)))
+		set PeriodList    = $$GetPeriodsForYear^FINGLPeriod(idPeriodType,lngYear)
+		set intPeriods    = $listlength(PeriodList)
+		set strAccount    = $$$KEY1(pYKEY)
+		set strBudgetType = $$$KEY3(pYKEY)
+		if VORG(1)=2 {
+			set blnFlag        = $$$YES
+			set fltTotalAmount = pYFELD
+			set fltAmount      = pYFELD/$listlength(PeriodList)
+			do VirtualRoundEven^COMUtilNum(fltTotalAmount,$listlength(PeriodList),2,.lstAmounts)
+		}
+		
+		for loop=1:1:intPeriods do
+		. if VORG(1)=1 do
+		. . if 'blnFlag do
+		. . . if $listget(PeriodList,loop)=idPeriod do
+		. . . . set blnFlag   = $$$YES
+		. . . . set fltAmount = pYFELD
+		. if VORG(1)=2 do
+		. . set fltAmount=$listget(lstAmounts,loop)
+		. if blnFlag do
+		. . set strStatus = $$$Save("FINGLPeriodTotal",strAccount_","_$listget(PeriodList,loop)_","_strBudgetType,fltAmount,$$$YES)
+	}
+	quit
+	
+]]></Routine>
+</Export>

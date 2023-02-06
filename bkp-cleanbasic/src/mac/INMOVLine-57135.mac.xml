@@ -1,0 +1,664 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INMOVLine" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INMOVLine
+	
+#include COMGridEdit31
+#include COMSYS
+#include INConst
+#include %occInclude
+	
+#define DELIM	$char(31)
+#define FORMFldINMOVLineUnit         7
+#define FORMFldINMOVLineLineBundle   8
+#define FORMFldINMOVLineLotNo       10
+#define FORMFldINMOVLineUnitQty     11
+	
+GetDefaultStorage()
+	;-------------------------------------------------------------------------------
+	; Get the From Storage from the header
+	; 
+	; Called By :	Form INMOVLine F2 "From Storage" - Default Variable Input
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:	id Storage
+	;
+	; History:
+	; 19-Oct-2007	PPP		SR15597 - Creation
+	;-------------------------------------------------------------------------------
+	new objMov
+	
+	set objMov = $$$GRIDYFELDContainer
+	
+	quit $$$INMOVStorage(objMov)
+	
+	
+OnBeforeFormConstruction(pidField,pobjLine)
+	;-------------------------------------------------------------------------------
+	; Generate data for Unit of Measure drop down before constructing Edit Grid field
+	; Clear any errors
+	;
+	; Params:	pidField - Form Field Id
+	;			pobjLine - Adj Line record
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Oct-2007	PPP		SR15597 - Creation
+	;-------------------------------------------------------------------------------
+	new idItem
+	
+	/*if pidField = $$$FldINMOVLineUnit {
+		set idItem = $$$INMOVLineItem(pobjLine)
+		if idItem '= "" {
+			do LoadUnitOfMeasureList^INARTUtilities(idItem)
+		}
+	}*/
+	
+	quit
+
+OnBeforeDisplayCombo(pstrKeys,pobjMov,pintCol,&pSUCH)
+	;-------------------------------------------------------------------------------
+	; Populates the Unit with the UOM as defined in INARTPACK only, excludes
+	; units that the item does not come in.
+	; 
+	; set pSUCH as the items to be used when you override the list (set via blnOverride)
+	;
+	; Called By: COMGridEdit executable
+	; 
+	; Inputs:
+	;	pstrKeys		YKEY
+	;	pobjSummary		YFELD
+	; 
+	; Returns: $$$YES or $$$NO (override the data) 
+	;
+	; History:
+	; 15-Jul-2011	GRF		SR17669: Call common code
+	; 03-Nov-2009	DavidR	SR16983: Created
+	;-------------------------------------------------------------------------------
+	new blnOverride,enumLineType,enumUnit,idClassField,idItem
+
+	set blnOverride = $$$NO
+	
+	; Unit
+	;---------------------------------------
+	if pintCol = $$$FORMFldINMOVLineUnit {      ; SR17669 vvv
+		set blnOverride = $$LoadCombo^INARTPACK($$$INMOVLineItem(pobjMov),blnOverride,.pSUCH)
+	}
+	quit blnOverride
+	/*
+	if pintCol = $$$FORMFldINMOVLineUnit  {
+		kill pSUCH
+		set pSUCH  = "SUCH"
+		set idItem = $$$INMOVLineItem(pobjMov)
+		if idItem '= "" {
+			set enumUnit = ""
+			for {
+				set enumUnit = $order(^INARTPACK(YM,idItem,enumUnit))
+				quit:enumUnit=""
+				
+				set pSUCH(enumUnit) = enumUnit
+			}
+			set blnOverride = $$$YES
+		}
+	}
+	quit blnOverride
+	*/                                           ; SR17669 ^^^
+	
+	
+OnBeforeSave(pidKey,&pobjLine,pblnQtyCheck=$$$YES)
+	;-------------------------------------------------------------------------------
+	; OnBeforeSave for the INMOVLine record
+	; 
+	; Called By : OnBeforeSave for *FORM* INMOVLine - Should *** NOT *** be set as
+	;             a class hook call although it may be reasonable to have similar
+	;             testing based on pobjLine and the current persistent INMOV record
+	;
+	; Params:	pidField	- field id
+	;
+	; ByRefs:	pobjLine	- current line object
+	;
+	; Returns:  sc (should be strStatus)
+	;           YRETVAL ? implicit - how used?
+	;
+	; History:
+	; 28-Jun-2011	PPP		SR17826: Check if ToStorage is blank
+	; 07-Jun-2011	GRF		SR17716: Fix call to IsValidTSU^INLP
+	; 09-May-2011	PPP		SR17756: Added check for Valid TSU Storages
+	; 06-May-2011	PPP		SR17693: Added check for INTRANSIT Storages
+	; 04-Nov-2009	DWR		SR16853: If Qty not 0, convert to inventory unit qty
+	; 14-May-2009	PPP		SR16529: Only do checks if relevant data exists
+	; 03-Mar-2009	GRF		SR16396: Better msg on saving without selecting bundle
+	; 10-Feb-2009	GRF		SR16328: common item validation
+	; 22-Jan-2009	HQN		SR16319: Only close valid orefs
+	; 09-Jan-2009	GRF		SR16259: Check ItemPolicy is valid before proceeding
+	; 20-Oct-2008	GRF		SR16053: Remove $listbuild from inside $MakeStatus();
+	; 							Use MakeStatus for all YRETVAL; get idLocn from
+	; 							saved header record; set YRETVAL from strStatus where
+	; 							not distinct.
+	; 20-Oct-2008	HQN		SR16045: Using more detailed alMOV0003/alMOV0004 messages
+	; 17-Oct-2008	HQN		SR16045: Applied checks for Planned Quantities
+	; 17-Oct-2008	GRF		SR15804: Match strStatus to YRETVAL - MakeStatus rather
+	; 							than Text macro since DecodeError done by $$$Alert
+	; 15-Oct-2008	GRF		SR15804: StrStatus = $$$NO if YRETVAL is set; add
+	; 							pblnQtyCheck to permit initial value to be set to
+	; 							zero but not saved with that afterwards.
+	; 18-Sep-2008	GRF		SR15928: FIXME + simplify OpenId call + strStatus
+	; 20-May-2008	HQN		SR15762: Check for requesting on negative quantities
+	; 16-May-2008	HQN		SR15752: Corrected lookup of deleted copied lines for
+	; 							qty replaced ^WWWDATEN calls with $$$WWWDATEN macro
+	; 09-May-2008	HQN		SR15728: Check dBundleStock totals for while grid
+	; 07-May-2008	HQN		SR15713: Hooked into the form and now checks individual
+	; 							field values
+	; 19-Oct-2007	PPP		SR15597 - Creation
+	;-------------------------------------------------------------------------------
+	new fltConv,fltQtyReqd,fltQtySum,fltQtyPlanned,idBundle,idBundleStk,idItem
+	new idLine,idLocn,idMoveKey,idMoveLine,idMoveUnit,idStore,idToStore,intCount
+	new objBundleStock,objGridLine,objItem,objItemPolicy,sc,strStatus
+	
+	set strStatus  = $$$OK
+	
+	set idItem     = $$$INMOVLineItem(pobjLine)
+	set idStore    = $$$INMOVLineFromStorage(pobjLine)
+	set idBundle   = $$$INMOVLineBundle(pobjLine)
+	set fltQtyReqd = $$$INMOVLineQtyRequired(pobjLine)
+	set idMoveUnit = $$$INMOVLineUnit(pobjLine)
+	set idToStore  = $$$INMOVLineToStorage(pobjLine)   ; SR17693
+	set idLocn     = $$$INMOVLocation($$$GRIDYFELDContainer)
+	
+	set idMoveKey  = $$$KEY1(pidKey)
+	set idMoveLine = $$$KEY2(pidKey)
+ 
+	if (idItem'="") && (idStore'="") {
+		if idMoveKey="" {
+			set strStatus = $$$MakeStatus("IN00754")                     ; "Missing Key Value"
+			set YRETVAL   = strStatus
+		}
+		
+		; Item
+		;---------------------------------------
+		if $$$ISOK(strStatus) {
+			if idItem'="" {
+				set strStatus = $$ItemCheck(idItem,.intCount)
+				set YRETVAL   = strStatus
+			}
+		}
+		
+		; Location/Bundle
+		;---------------------------------------
+		if $$$ISOK(strStatus) {
+			if idItem '="" {
+				if idBundle = "" {
+					set strStatus = $$$MakeStatus("IN00898")   ; "A source has not been selected for the stock"
+					set YRETVAL   = strStatus
+				
+				} else {
+					set idLocn      = $$$INMOVLocation($get(^INMOV(YM,idMoveKey,1)))   ; FIXME : Obtained from container form now
+					set idBundleStk = idItem_"||"_idLocn_"||"_idStore_"||"_idBundle
+					
+					set objBundleStock = ##class(alSOH.dBundleStock).%OpenId(idBundleStk,,.sc)
+					if $$$ISERR(sc) {
+						set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+						set YRETVAL   = $$$MakeStatus("alINV0003")               ; "Bundle not found in storage"
+					}
+				}
+			}
+		}
+
+		; From Storage
+		;---------------------------------------
+		if $$$ISOK(strStatus) {   //SR17693
+			if $$IsStorageInTransit^INDRPUMLKWLIST(idLocn,idStore) {
+				set strStatus = $$$MakeStatus("IN01296")		; "Cannot Move 'To' or 'From' an InTransit Storage"
+				set YRETVAL   = strStatus
+			}
+		}
+
+		; To Storage
+		;---------------------------------------
+		if $$$ISOK(strStatus) {   //SR17693
+			if $get(idToStore)'="" {	//SR17816
+				if $$IsStorageInTransit^INDRPUMLKWLIST(idLocn,idToStore) {
+					set strStatus = $$$MakeStatus("IN01296")		; "Cannot Move 'To' or 'From' an InTransit Storage"
+					set YRETVAL   = strStatus
+			
+				} else {    //SR17756, SR17716			
+					set strStatus = $$IsValidTSU^INLP(idLocn,idToStore)
+					set YRETVAL = strStatus
+				}
+			}
+		}
+		
+		; Quantity
+		;---------------------------------------
+		if $$$ISOK(strStatus) {
+			if pblnQtyCheck && (fltQtyReqd = 0) {
+				set strStatus = $$$MakeStatus("alMOV0001")      ; "Required Quantity can not be 0"
+				set YRETVAL   = strStatus
+			}
+		}
+		if $$$ISOK(strStatus) {
+			if fltQtyReqd > objBundleStock.QtyOnHand {          ; "Not enough Items in Storage (Quantity = %1)"
+				set strStatus = $$$MakeStatus("alMOV0003",objBundleStock.QtyOnHand)
+				set YRETVAL   = strStatus
+			
+			} elseif fltQtyReqd < 0 {
+				set strStatus = $$$MakeStatus("IN00490")        ; "Quantity can not be negative."
+				set YRETVAL   = strStatus
+				
+			} else {
+				set fltQtySum = 0
+				set idLine = ""
+				for {
+					set idLine = $order($$$WWWDATEN("REFERENCEROW",idLine))
+			 		quit:(idLine = "")
+			 		continue:(idLine = idMoveLine)
+			 		continue:($get($$$WWWDATEN("KILLEDRECORD",$get($$$WWWDATEN("REFERENCEROW",idLine,1))))=$$$YES)
+			 		
+			 		set objGridLine = $$$GRIDGetYFELD(idLine)
+			 		continue:($$$INMOVLineItem(objGridLine)        '= idItem)
+			 		continue:($$$INMOVLineFromStorage(objGridLine) '= idStore)
+			 		continue:($$$INMOVLineBundle(objGridLine)      '= idBundle)
+			 		
+			 		set fltQtySum = fltQtySum + $$$INMOVLineQtyRequired(objGridLine)
+				}
+				set fltQtyPlanned = $$GetQtyPlanned^INMOVTable(idItem,idLocn,idLocn_"||"_idStore,idBundle)
+				
+				if (fltQtyReqd + fltQtySum) > (objBundleStock.QtyOnHand - fltQtyPlanned) {
+					if (fltQtyPlanned > 0) {    ;  "Not enough Items in Storage (Quantity = %1)(Planned Quantity = %2)"
+						set strStatus = $$$MakeStatus("alMOV0004",objBundleStock.QtyOnHand,fltQtyPlanned)
+						
+					} else {                    ; "Not enough Items in Storage (Quantity = %1)"
+						set strStatus = $$$MakeStatus("alMOV0003",objBundleStock.QtyOnHand)
+					}
+					set YRETVAL = strStatus
+				}
+			}
+		}
+	}
+	quit strStatus
+	
+	
+OnBluwr(pidField,&pobjLine) ; FIXME : <GRF>  See OnBlur below - May be obsolete? No current reference found FIXME : Why is pobjLine ByRef?
+	;-------------------------------------------------------------------------------
+	; On Blur from Item, Qty and Unit fields.
+	; Calculate unit, and costs
+	;
+	; Called BY :		No instances found
+	; 
+	; Params:	pidField	- field id
+	;
+	; ByRefs:	pobjLine	- current line object
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Oct-2007	PPP		SR15597 - Creation
+	;-------------------------------------------------------------------------------
+	new idItem,idUnit,curUnit,fltQuantity
+	
+	; Populate Unit Listing
+	quit
+	
+	
+OnBlur(pYM,pYFORM,pYKEY,&pYFELD,pGridRow,pGridCol,pYINHALT)
+	;-------------------------------------------------------------------------------
+	; On Blur from Item, Qty and Unit fields.
+	; Calculate unit, and costs
+	;
+	; Params:	pidField	- field id
+	;
+	; ByRefs:	pobjLine	- current line object
+	;			QOH 		- Value of QuantityOnHand Manual Field   ; see FIXME
+	;			YRED		- Error colour
+	;			YTOOLTIP
+	;			
+	; Returns:
+	;
+	; History:
+	; 12-Feb-2010	shobby	SR15753: Removed redundant code.
+	; 23-Nov-2009	DWR		SR17047: Dont format the From Storage on blur, needs 
+	; 							to remain read only
+	; 17-Nov-2009	DWR		SR17043: Need to set default unit on blur of item
+	; 03-Nov-2009	DWR		SR17006: Commented out call to LoadUnitsOfMeasure, this 
+	; 							now handled in OnBeforeDisplayCombo
+	; 10-Feb-2009	GRF		SR16328: Item testing moved to ItemCheck() for access
+	; 							through OnBeforeFormat since not effective here.
+	; 22-Sep-2008	Luke	SR15937 changed the way a item blur updates the screen 
+	; 18-Sep-2008	GRF		SR15928: cleanup multiple references to same data
+	; 08-May-2008	HQN		SR15713: AddReference to all affected columns
+	; 06-May-2008	HQN		SR15713: Merged ObBlurItem into here
+	; 06-May-2008	Luke	SR15713 - Created
+	;-------------------------------------------------------------------------------
+	new idField,idItem,objHeader,objItem
+	
+	set objHeader  = $$$GRIDYFELDContainer
+	
+	; FIXME : Check where QOH is used and pass it properly! <GRF>  Form default?
+	set idField = $$$GetClassField(pYFORM,pGridCol)
+	
+	; Item
+	;---------------------------------------
+	if idField = $$$FldINMOVLineItem {	
+		set idItem = $$$INMOVLineItem(pYFELD)
+		if idItem '= "" {
+			set $$$INMOVLineUnit(pYFELD) = $$$INARTUnitofMeasure($get(^INART(YM,idItem,1)))
+		}
+	}
+	; Redraw DynTable
+	do ShowItems^INMOVTable($$$EnumWWWDYNTABLEGridLineFocus,"INMOV"_$$$DELIM_"INMOVLine"_$$$DELIM_"dStockBundle"_$$$DELIM_pGridRow)
+	quit
+	
+	
+OnBlurQtyRequired(pintRow,pintCol,strValue,&pobjLine) ; FIXME : <GRF> Why is pobjLine ByRef? ; FIXME : "pstrValue" <GRF>
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;	OnBlur:event INMOVLine:QtyRequired FORM
+	; Inputs : 
+	;	pintRow		Grid Row Id
+	;	pintCol		Grid Col Id
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 12-Feb-2010	shobby	SR15753: Removed redundant code.
+	; 03-Oct-2008	HQN		SR15983: Corrected argument list to reflect actual
+	; 							arguments passed in from INMOVLine form definition
+	; 							Added Inputs & Called By doco
+	; 							Corrected hardcoded col reference
+	; 18-Sep-2008	GRF		SR15928: don't keep getting values from pobjLine in loop
+	; 16-May-2008	HQN		SR15752: Corrected lookup of deleted copied lines for qty
+	; 							replaced ^WWWDATEN calls with $$$WWWDATEN macro
+	; 15-May-2008	HQN		SR15728: Corrected row lookup, idLine is not row
+	; 							number for copied but not yet saved lines
+	; 06-May-2008	HQN		SR15713: Updated and hooked correctly into form
+	; 05-Nov-2007	LB		Created
+	;-------------------------------------------------------------------------------
+	quit
+	
+	
+CheckDataLine(pobjLine,&pstrError)
+	;-------------------------------------------------------------------------------
+	; !!!	Possibly OBSOLETE	!!!!
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 18-Sep-2008	GRF		SR15928: straighten out code
+	; 04-Apr-2008	Luke	Changed to check the QTY On hand of V2 Bundlestocks 
+	; 24-Jan-2008	HQN		SR15625 Changed class signature dStorage to dUStorage
+	; 07-Dec-2007	PP		Need to check for 'GetItemSOHIncBlocked' (necessary
+	; 							from Movement Lines) - (Can MOVE blocked qty)
+	; 05-Nov-2007	LB		Created
+	;-------------------------------------------------------------------------------
+	new blnError,fltQuantity,idBundle,idItem,idLocn,idStore
+	new objBundleStk,objHeader,objItem,objStore
+	
+	set pstrError   = $get(pstrError)
+	set blnError    = $$$NO
+	
+	set objHeader   = $$$GRIDYFELDContainer
+	set idLocn      = $$$INMOVLocation(objHeader)
+		
+	set idStore     = $$$INMOVLineFromStorage(pobjLine)
+	set fltQuantity = $$$INMOVLineQtyRequired(pobjLine)
+	set idBundle    = $$$INMOVLineBundle(pobjLine)
+	set idItem      = $$$INMOVLineItem(pobjLine)
+	
+	if $$$INMOVLineQtyRequired(pobjLine) <= 0 {
+		set pstrError = pstrError _$$$CRLF_$$$Text("INMOV07")   ; "Quantity must be greater than zero"
+		set blnError = $$$YES
+	}
+	
+	/* Allow same storage
+	if $$$INMOVLineToStorage(pobjLine) = idStore {
+		set pstrError = pstrError _$$$CRLF_"Can't transfer to same Storage"  
+		set blnError = $$$YES
+	}
+	*/
+	
+	//Maintain inventory
+	set objItem = $get(^INART(YM,idItem,1))
+	if $$$INARTItemWithoutInventoryMaint(objItem) {
+		set pstrError = pstrError_$$$CRLF_$$$Text("IN00445")  ; "Non-stock items can not be transferred."
+		set blnError  = $$$YES
+	}
+	
+	//check the stock on hand 
+	set objStore 	= ##class(alLOC.iLOC).GetStorage(idLocn,idStore)
+	
+	if (idBundle = "") || (idItem = "") || (objStore = $$$NULLOREF) {
+		set pstrError = pstrError _$$$CRLF_"Not all information has been set" 
+		set blnError  = $$$YES
+		
+	} else {
+		set objBundleStk = ##class(alSOH.dBundleStock).%OpenId(idItem_"||"_objStore.%Id()_"||"_ idBundle)
+		if objBundleStk '=$$$NULLOREF {
+			set pstrError = ""
+			if fltQuantity > objBundleStk.QtyOnHand {
+				set pstrError = pstrError _$$$CRLF_$$$Text("IN00437")_" = "_fltQuantity  ; "Error, Not enough SOH"
+				set blnError  = $$$YES
+			}
+			
+		} else {
+			set pstrError = pstrError _$$$CRLF_"Stock does not exist at that Storage"  ; FIXME : WWW009
+			set blnError  = $$$YES
+		}
+	}
+	quit blnError
+	
+	
+OnBeforeFormat(pstrYFIELDNAME,pstrText,pobjLine)
+	;-------------------------------------------------------------------------------
+	; 
+	; 
+	;     This tag ***MUST*** remain as a link through COMGridEdit31Events.
+	; 
+	; 
+	; Determine how particular fields on the Movement Line are to be displayed.
+	; 
+	; Called By :
+	; 	1. INMOV on loading the line               [Now calls INMOVLine2 directly]
+	; 	2. ScreenUpdateStyle^COMGridEdit31S via COMGridEdit31Events as CallEvent
+	; 	
+	; History:
+	; 03-Mar-2009	GRF		SR16396: Relocated to INMOVLine2 due to ongoing size issues
+	;-------------------------------------------------------------------------------
+	do OnBeforeFormat^INMOVLine2($get(pstrYFIELDNAME),$get(pstrText),$get(pobjLine))
+	quit
+	
+	
+ItemCheck(pidItem,&pintAttrCount)
+	;-------------------------------------------------------------------------------
+	; Common Item Validation
+	; 
+	; Called By : OnBeforeFormat^INMOVLine2, OnBeforeSave
+	; 
+	; Inputs : 
+	;	pidItem			Item Number - pre-validated to be non-null
+	;	pintAttrCount	No. of attributes (permits determination of whether "bundle
+	;				   		values" details need to be displayed (under "Lot No")
+	; 
+	; Returns : strStatus - strip prefix for tooltip conversion via $$$Text
+	;
+	; History :
+	; 31-Aug-2010	SCR		SR17528: Quick Exit if no Item
+	; 10-Feb-2009	GRF		SR16328: centralised; move OnBlur test that wasn't
+	; 							effective there
+	;-------------------------------------------------------------------------------
+	new objItem,objPolicy,objV1Item,sc,strStatus
+	
+	set strStatus     = $$$OK
+	set pintAttrCount = -1     ; "not counted" result
+	
+	if pidItem="" quit strStatus  ; SR17528
+
+	set objV1Item = $get(^INART(YM,pidItem,1))
+	
+	if $$$INARTItemWithoutInventoryMaint(objV1Item) {
+		set strStatus = $$$MakeStatus("IN00445")                     ; "Non-stock items can not be transferred."
+	
+	} else {
+		set objItem = ##class(alINV.dItem).%OpenId(pidItem,0,.sc)
+		if $$$ISOK(sc) {
+			set objPolicy = objItem.ItemPolicy
+			if objPolicy=$$$NULLOREF {
+				set strStatus = $$$MakeStatus("IN00767",pidItem)     ; "Unable to access Item Policy for Item %1"
+			} else {
+				set pintAttrCount = objPolicy.Attributes.Count()
+			}
+			do objItem.%Close()
+		} else {
+			set strStatus = $$$MakeStatus("alINV0101",pidItem)       ; "Unable to access Item Class for Item %1"
+		}
+	}
+	quit strStatus
+	
+	
+OnLineAdded(pintRow,pstrKey)
+	;-------------------------------------------------------------------------------
+	; Description : Sets YOPTION value to signify that the grid contains non-blank
+	; 	policies, Container will Use the YOPTION to determine whether the Bundle
+	; 	Column should be hidden
+	;			
+	; Called By :
+	;		
+	; Inputs : 
+	;
+	; ByRef :
+	;
+	; Returns :
+	;
+	; History :
+	; 22-Dec-2009	shobby	SR17093: Removed.  Makes the screen too slow (and sometimes crashes).
+	; 13-Aug-2008	HQN		SR15830: FIXME: Removing formatting, breaks on tab navigation
+	; 12-Aug-2008	Luke	SR15814: Corrected sc formation and use 
+	; 07-May-2008	HQN		SR15713: Changed event type from 1(blur) to 3(afterdata)
+	;-------------------------------------------------------------------------------
+	;do ShowItems^INMOVTable($$$EnumWWWDYNTABLEAfterDataFields,"INMOV"_$$$DELIM_"INMOVLine"_$$$DELIM_"dStockBundle"_$$$DELIM_pintRow)
+	quit $$$OK
+	; FIXME : Should this be enum 1 rather than enum 3? 
+	
+	
+CreateLine(pidLocn,pidItem,pidUnit,pidFromStorage,pidToStorage,pfltQty,pidBundle,pIssueLine="",&pobjMOVLine)
+	;-------------------------------------------------------------------------------
+	; Create a Movement line record
+	;
+	; Params:	pidLocn, pidItem, pidUnit, pidStorage, pidToStorage, pfltQty, pidBundle
+	; 
+	; ByRef:	pobjMOVLine - data for Movement line
+	; 
+	; Returns:	status - whether line can be created
+	;
+	; History:
+	; 02-Dec-2009	DWR		SR16853: added unit qty
+	; 03-Oct-2008   Luke    SR15979 added issueline 
+	; 07-Dec-2007	PPP		pidStorage should always be set
+	; 31-Oct-2007	PPP		SR15597 - Creation
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$$OK
+	
+	set $$$INMOVLineItem(pobjMOVLine)        = pidItem
+	set $$$INMOVLineUnit(pobjMOVLine)        = pidUnit
+	set $$$INMOVLineFromStorage(pobjMOVLine) = pidFromStorage
+	set $$$INMOVLineQtyRequired(pobjMOVLine) = pfltQty
+	set $$$INMOVLineUnitQty(pobjMOVLine)     = pfltQty
+	set $$$INMOVLineToStorage(pobjMOVLine)   = pidToStorage
+	set $$$INMOVLineBundle(pobjMOVLine)      = pidBundle
+	set $$$INMOVLineIssueLine(pobjMOVLine)   = pIssueLine
+		
+	quit strStatus
+	
+	
+GetQtyByStorage(pidItem,pidLocn,pidStore)
+	;-------------------------------------------------------------------------------
+	; Description :
+	;			
+	; Called By :
+	;		
+	; Inputs : pidItem,pidLocn,pidStore
+	;
+	; ByRef :
+	;
+	; Returns : Quantity on Hand
+	;
+	; History :
+	; 18-Sep-2008	GRF		SR15928: variable prefixes
+	; 29-Apr-2008	HQN		Corrected Lookup, dSOH is Item, Storage...Index Changed
+	; 08-Apr-2008	HQN		Moved to V2 lookup
+	; 05-Nov-2007	HQN		Created
+	;-------------------------------------------------------------------------------
+	new fltQty,objSOH
+	
+	quit:(pidStore = $$$NULLOREF) 0
+	
+	set fltQty = 0
+	set objSOH = ##class(alSOH.dSOH).%OpenId(pidItem_"||"_pidLocn_"||"_pidStore)
+	if objSOH '= $$$NULLOREF {
+		set fltQty = objSOH.QtyOnHand
+	}
+	quit fltQty
+	
+	
+OnLineDeleted(pYKEY,pintRowCount)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 13-Oct-2010	PPP		SR17566: Language Text
+	; 19-Aug-2009	GRF		SR16854: Clear DynTable on deleting a row
+	; 18-Sep-2008	GRF		SR15928: don't keep getting values from objMovLine in loop
+	; 16-May-2008	HQN		SR15752: Created
+	;-------------------------------------------------------------------------------
+	new idBundle,idCurrentLine,idItem,idLine,idParameters,idStore,objGridLine,objMovLine
+		
+	do ScreenUpdateStyle^COMGridEdit31S("pY"_$$$WWWDATEN("REFERENCEROW",1,1)_"_"_3)     ; Qty Required
+	; Clear DynTable
+	set idParameters = "INMOV"_$$$DELIM_"INMOVLine"_$$$DELIM_"dStockBundle"_$$$DELIM_""
+	kill ^CacheTempDynamicTable(YUCI,YUSER,"dStockBundle")
+	; "No Item Selected"   SR17566
+	do DrawTable^WWW120DynTable($listbuild($$$Text("IN01142")),"dStockBundle",$listbuild($listbuild("left","display")),
+	                            idParameters,"",$$$EnumWWWDYNTABLEAfterDataFields)
+	quit
+	
+	
+GetQtyRequired(pYKEY,pobjLine)
+	;-------------------------------------------------------------------------------
+	; calculate the qty required in inventory UOM
+	; 
+	; called by Core rule 1 F(3) - Quantity Required Form INMOVLine
+	;
+	; Inputs:
+	;
+	; Returns:
+	;
+	; History:
+	; 30-Nov-2009	DWR		SR16853: Created
+	;-------------------------------------------------------------------------------
+	new fltConv,fltQtyReqd,fltUnitQty,idItem,idUnit
+	
+	set fltQtyReqd = 0
+	set idUnit     = $$$INMOVLineUnit(pobjLine)
+	set idItem     = $$$INMOVLineItem(pobjLine)
+	set fltUnitQty = $$$INMOVLineUnitQty(pobjLine)	
+	
+	if (idUnit'="") && (idItem'="") && (fltUnitQty'="") {
+		set fltConv = $$GetUOMConversion^INUOMConversion(idItem,idUnit)
+		set fltQtyReqd =  fltUnitQty * fltConv
+	}
+	quit fltQtyReqd
+		
+]]></Routine>
+</Export>

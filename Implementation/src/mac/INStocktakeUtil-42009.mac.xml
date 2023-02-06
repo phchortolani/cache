@@ -1,0 +1,403 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INStocktakeUtil" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INStocktakeUtil
+	
+#include COMSYS
+#include INConst
+#include %occInclude
+	
+	;-------------------------------------------------------------------------------
+	; The V2 Stocktake suite consists of the following routines :
+	; 
+	; INStocktakeCreate		Create INWEINV from alSOH.dSOH - derived from INWEINVP1
+	; INStocktakeCount		Functional rewrite
+	; INStocktakePost		Update V2 classes              - derived from INWEINRUECK
+	; 
+	; INStocktakeReport1	Stocktake Count Report         - derived from INWEINVD
+	; INStocktakeReport2	Stocktake Difference Report    - derived from INWEINVDIF
+	; INStocktakeReport3	Stocktake Totals Report        - derived from INWEINVDS
+	; INStocktakeReportCommon	Functions shared between Reports.
+	; 
+	; There may be some calls to functions stored in the earlier routines.
+	; 
+	;-------------------------------------------------------------------------------
+	; Use of CacheTemp globals during V2 Stocktake processing :
+	; 
+	; INStocktakeCreate  -  SOH => Sort sequence (variable no of params) => INWEINV lines
+	;	^CacheTempStocktake($znspace,pidStocktake,idLocn,"_$$^WWWKEYBUILD(strSortKey)_",idBundle)"
+	; 
+	; 
+	; INStocktakeReport# -  Bundle Attributes in literal format with text internationalised
+	; 						No need for YUSER since can be shared.
+	;	^CacheTempStocktakeReport(YUCI,"AttrName",SPRACHE,intFldNo)
+	; 
+	; 
+	; INStocktakeReport# -  Sort Sequence for difference reporting
+	;                       When not required as sort criteria idItemKey & idLocnKey
+	;                       are set to a space.
+	;                       (Simpler processing than variable no of params)
+	;   ^CacheTempStocktakeReport(YUCI,"Diff",YUSER,idItemKey,idLocnKey,idLineNo)
+	; 
+	; INStocktakeReport# -  Group Totals
+	;   ^CacheTempStocktakeReport(YUCI,"Total",YUSER,idItemGroup,enumType)
+	; 
+	; INStocktakePost    -  Only apply variation once
+	;	^CacheTempStocktakePost(YUCI,pidStocktake,strMatch)
+	;
+	;	
+	; INStocktakeReport1 -  Mechanism used by INWEINVD to pass VORG array
+	;                       Not used by INWEINVDIF or INWEINVDS and overlaps other uses
+	;   *** Probably not necessary. ***
+	;	^CacheTempStocktakePara(YUSER,#)
+	;-------------------------------------------------------------------------------
+
+RebuildLocking()
+	;-------------------------------------------------------------------------------
+	; Rebuild Locking based on Stocktakes
+	;
+	; Assumes all Locking is based on open Stocktakes with locking enabled 
+	; 
+	; History:
+	; 08-Jul-2013	SCR		CORE-83: Created
+	;-------------------------------------------------------------------------------
+	new idStk,objStk,strLocations
+	set idStk	= ""
+	kill ^INLocationLocking
+	for {
+		set idStk 	= $order(^INWEINVP(YM,idStk))
+		quit:idStk=""
+		set objStk	= $get(^INWEINVP(YM,idStk,1))
+		continue:$$$INWEINVPStatus(objStk)<2
+		continue:$$$INWEINVPStatus(objStk)>4
+		continue:'$$$INWEINVPCreateLockOnSnapshot(objStk)
+		write !,"rebuilding ",idStk
+		set strLocations	= $$$INWEINVPSiteLocation(objStk)
+		write " Locs ",strLocations
+		do LockSiteLocationList^INLocking(strLocations,1,idStk)
+
+		
+	}
+	Quit
+	
+	
+GetAttributes(pidItem,pobjSTLine,penumLanguage,&parrAttr)
+	;-------------------------------------------------------------------------------
+	; Format attribute values for display with Locn/Storage so bundle can be matched
+	; 
+	; Called By : INStocktakeReport1, INStocktakeReport2
+	; 
+	; History:
+	; 04-Aug-2009	GRF		SR16510: elseif and else case so variables not reused
+	; 							or UNDEFINED
+	; 17-Jun-2009 	PPP 	SR16510: Updated routine to use INItemPolicy class
+	; 07-Oct-2008	GRF		SR15810: Created
+	;-------------------------------------------------------------------------------
+	new arrAttributes,idAttr,idForm,intFldNo,intFormFldNo,loop
+	new objAttr,objForm,objPolAttr,objPolicy,sc,strAttrName,strAttrVal,strFldName
+	
+	set sc = $$$OK
+	set intFldNo = 0
+	
+	kill parrAttr
+	
+   	if $$$ISOK(sc) {
+		set sc = ##class(alSOH.iBundle).GetItemAttributes(pidItem,.arrAttributes)
+		set idAttr = ""
+		for {
+			set idAttr = $order(arrAttributes(idAttr))
+			quit:idAttr=""
+			
+			if idAttr = "Lot Number"  {
+				set intFldNo   = $$$FldINWEINVLotNo                  ; D19
+				set strFldName = $$$StrINWEINVLotNo
+				set strAttrVal = $$$INWEINVLotNo(pobjSTLine)
+			
+			} elseif idAttr = "Use By Date"  {
+				set intFldNo   = $$$FldINWEINVExpiryDate             ; D25
+				set strFldName = $$$StrINWEINVExpiryDate
+				set strAttrVal = $$$INWEINVExpiryDate(pobjSTLine)
+				set strAttrVal = $$^WWWDATE(strAttrVal)
+			
+			} elseif idAttr = "Brand"  {
+				set intFldNo   = $$$FldINWEINVBrand                  ; D123
+				set strFldName = $$$StrINWEINVBrand
+				set strAttrVal = $$$INWEINVBrand(pobjSTLine)
+			
+			} elseif idAttr = "Owner"  {
+				set intFldNo   = $$$FldINWEINVOwner                  ; D124
+				set strFldName = $$$StrINWEINVOwner
+				set strAttrVal = $$$INWEINVOwner(pobjSTLine)
+			
+			} elseif idAttr = "Program"  {
+				set intFldNo   = $$$FldINWEINVProgram1               ; D125
+				set strFldName = $$$StrINWEINVProgram1
+				set strAttrVal = $$$INWEINVProgram1(pobjSTLine)
+			
+			} else {
+				continue
+			}
+			
+			; Explicitly 
+			set strAttrName = $get(^CacheTempStocktakeReport(YUCI,"AttrName",penumLanguage,intFldNo))
+			
+			set idForm = "INWEINVE"
+			set intFormFldNo = $order(^WWW122s(0,5,"WWW122",1,idForm,intFldNo,""))
+			
+			if (strAttrName = "") && intFormFldNo {
+				set objForm = $get(^WWW122D1(0,"idForm",intFormFldNo,0,penumLanguage,1))
+				set strAttrName = $$$WWW122D1FieldDescription(objForm)
+				
+				if strAttrName = "" {
+					set objForm  = $get(^WWW122D(0,"idForm",intFormFldNo,0,1))
+					set strAttrName = $$$WWW122DFieldDescription(objForm)
+				}
+				
+				if strAttrName = "" {
+					set objForm   = $get(^WWW122(0,"idForm",intFormFldNo,1))
+					set strAttrName = $$$WWW122ManualCaption(objForm)
+				}
+			}	
+			if strAttrName = "" {
+				set strAttrName = $get(^WWW0031(0,"INWEINV",intFldNo,penumLanguage,1))
+				if strAttrName = "" set strAttrName = strFldName
+				if strAttrName = "" set strAttrName = idAttr
+			}
+			set ^CacheTempStocktakeReport(YUCI,"AttrName",penumLanguage,intFldNo) = strAttrName
+			set parrAttr(idAttr) = strAttrName_Y_strAttrVal
+		}
+   	}
+	quit	
+	
+	
+GetSnapAdjustment(pidItem,pidStorage,pidBundle,pdteSnapped,pdteCounted)
+	;-------------------------------------------------------------------------------
+	; Find the transactions between snapshot and the count so the snapshot quantity
+	; can be amended to be compared directly with the counted quantity.
+	; 
+	; Result set ensures within date range - need to also consider whether
+	;   a) Before Snap Time if history is from the Snap Date
+	;   b) After Count Time if history is from the Count Date
+	;   
+	; Ignores entries with exact match on boundaries since as likely to be in error
+	; one way as the other.  This uncertainty is an inherent consequence of having
+	; an 'Open Door' stocktake.
+	; 
+	; Inputs:
+	;	pidItem			Item Number
+	;	pidStorage		idLocn || idStore format
+	;	pdteSnapped		$horolog format
+	;	pdteCounted		$horolog format
+	; 
+	; History:
+	; 02-Oct-2008	GRF		Created from CorrectByHistory^INWEINRUECK but based on
+	; 							alSOH.dStockHistory.  Was apparently looking at all
+	; 							storages withing filter selection rather than just
+	; 							the one being considered on the line.
+	;-------------------------------------------------------------------------------
+	new blnInclude,dteFrom,dteHistory,dteTo,fltAdjustment,idHistory
+	new objResultSet,objStkHist,sc,tmeCounted,tmeHistory,tmeSnapped
+	
+	set dteFrom    = +pdteSnapped
+	set dteTo      = +pdteCounted
+	set tmeSnapped = $piece(pdteSnapped,$$$COMMA,2)
+	set tmeCounted = $piece(pdteCounted,$$$COMMA,2)
+	
+	set fltAdjustment = 0
+	set objResultSet = ##class(%Library.ResultSet).%New("alSOH.dStockHistory:GetHistoryByStorageForPeriod")
+	set sc = objResultSet.Execute(pidItem,pidStorage,dteFrom,dteTo)
+	
+	if sc {
+		while objResultSet.Next(.sc) {
+			set idHistory = objResultSet.Data("ID")
+			set objStkHist = ##class(alSOH.dStockHistory).%OpenId(idHistory)
+			
+		;	if objStkHistory.Bundle '= pidBundle        ; TODO : ***ONLY*** Consider matching bundle properties - bundle itself may no longer exist
+			
+			if objStkHist'=$$$NULLOREF {
+				set dteHistory = objStkHist.DateConfirmed
+				set tmeHistory = objStkHist.TimeConfirmed
+				
+				set blnInclude = $$$YES
+				
+				if (dteHistory=dteFrom) && (tmeHistory<tmeSnapped) set blnInclude = $$$NO
+				if (dteHistory=dteTo)   && (tmeHistory>tmeCounted) set blnInclude = $$$NO
+				
+				if blnInclude {
+					set fltAdjustment = fltAdjustment + objStkHist.QtyMoved
+				}
+			}
+		}
+	}
+	quit fltAdjustment
+	
+	
+AreBundlesUnique(pidStocktake,&arrMatches)
+	;-------------------------------------------------------------------------------
+	; Do any of the stocktake lines contain duplications of an item/bundle
+	; combination for the same location/storage?
+	; 
+	; Returns:	Boolean result
+	; 			$$$NO will also return a populated array showing duplicated
+	; 			entries
+	; 
+	; Consider - cost of maintaining index cf time to check manually using
+	;            simpler index - e.g. 100 (Item No)
+	; 
+	; History:
+	; 05-Apr-2011	GRF		SR17699: Differentiate between id and idx names; don't
+	;							override an existing $$$NO value in blnUnique
+	; 03-Apr-2011	PPP		SR17699: Call mew method CheckUniqueUsingPolicy to check
+	;							for duplicate lines for same item in stocktake using
+	;							policy details
+	; 14-Oct-2008	GRF		SR15810: Reverse logic returned to match tag
+	; 13-Oct-2008	GRF		SR15810: Return actual rather than index keys &
+	; 							duplicated line numbers
+	; 09-Oct-2008	GRF		SR15810: Created
+	;-------------------------------------------------------------------------------
+	new blnUnique,idBundleMatch,idFirstLine,idItemMatch,idLastLine,idLocnMatch
+	new idStoreMatch,idxBundle,idxItem,idxLocn,idxStktake,idxStore,objSTLine,strLines
+	
+	set blnUnique  = $$$YES
+	set idxStktake = $$$Index(pidStocktake)
+	set idxItem    = ""
+	for {
+		set idxItem = $order(^INWEINVs(0,5,idxStktake,idxItem))
+		quit:idxItem=""
+		
+		set idxLocn = ""
+		for {
+			set idxLocn = $order(^INWEINVs(0,5,idxStktake,idxItem,idxLocn))
+			quit:idxLocn=""
+			
+			set idxStore = ""
+			for {
+				set idxStore = $order(^INWEINVs(0,5,idxStktake,idxItem,idxLocn,idxStore))
+				quit:idxStore=""
+				
+				set idxBundle = ""
+				for {
+					set idxBundle = $order(^INWEINVs(0,5,idxStktake,idxItem,idxLocn,idxStore,idxBundle))
+					quit:idxBundle=""
+					
+				; SR17699 - only for new lines ie Item/Location/Storage/Bundle does not exist
+				; This sets arrMatches if required but needs to preserve pre-existing $$$NO case
+					if $translate(idxBundle," ")="" {
+			;			set blnUnique = $$CheckUniqueUsingPolicy(pidStocktake,idxStktake,idxItem,idxLocn,idxStore,.arrMatches)
+						set blnUnique = ($$CheckUniqueUsingPolicy(pidStocktake,idxStktake,idxItem,idxLocn,idxStore,.arrMatches) && blnUnique)
+						continue
+					}
+					
+					set idFirstLine = $order(^INWEINVs(0,5,idxStktake,idxItem,idxLocn,idxStore,idxBundle,pidStocktake,""))
+					set idLastLine  = $order(^INWEINVs(0,5,idxStktake,idxItem,idxLocn,idxStore,idxBundle,pidStocktake,""),-1)
+					
+					if (idFirstLine'=idLastLine) {
+						set objSTLine     = $get(^INWEINV(0,pidStocktake,idFirstLine,1))
+						set idItemMatch   = $$$INWEINVItemNumber(objSTLine)
+						set idLocnMatch   = $$$INWEINVLocation(objSTLine)
+						set idStoreMatch  = $$$INWEINVStockLocation(objSTLine)
+						set idBundleMatch = $$$INWEINVBundleID(objSTLine)
+						
+						continue:idBundleMatch=""     ; SR17699
+						
+						set strLines = idFirstLine
+						for {
+							set idFirstLine = $order(^INWEINVs(0,5,idxStktake,idxItem,idxLocn,idxStore,idxBundle,pidStocktake,idFirstLine))
+							quit:idFirstLine=""
+							
+							set strLines = strLines_$$$COMMA_idFirstLine
+						}
+						set arrMatches(idItemMatch,idLocnMatch,idStoreMatch,idBundleMatch) = strLines
+						set blnUnique = $$$NO
+					}
+				}
+			}
+		}
+	}
+	quit blnUnique
+
+
+CheckUniqueUsingPolicy(pidStocktake,pidxStktake,pidxItem,pidxLocn,pidxStore,&parrMatches)
+	;-------------------------------------------------------------------------------
+	; Do any of the stocktake lines contain duplications based on item policies
+	; combination for the same location/storage?
+	; 
+	; Returns:	Boolean result
+	; 			$$$NO will also return a populated array showing duplicated
+	; 			entries
+	; 
+	; History:
+	; 05-Apr-2011	GRF		SR17699: Differentiate between id and idx names
+	; 03-Apr-2011	PPP		SR17699: Created
+	;-------------------------------------------------------------------------------
+	new arrPolicy,dteExp,idItemMatch,idLine,idLocnMatch,idStoreMatch
+	new objSTLine,strBrand,strLines,strLot,strOwner,strPolicy,strProgram
+	
+	set blnUnique = $$$YES
+	
+	set idLine = ""
+	for {
+		set idLine = $order(^INWEINVs(0,5,pidxStktake,pidxItem,pidxLocn,pidxStore," ",pidStocktake,idLine))
+		quit:idLine=""
+		
+		set objSTLine  = $get(^INWEINV(0,pidStocktake,idLine,1))
+		set strLot     = $$$INWEINVLotNo(objSTLine)
+		set dteExp     = $$$INWEINVExpiryDate(objSTLine)
+		set strBrand   = $$$INWEINVBrand(objSTLine)
+		set strOwner   = $$$INWEINVOwner(objSTLine)
+		set strProgram = $$$INWEINVProgram1(objSTLine)
+		
+		set strPolicy = strLot_":"_dteExp_":"_strBrand_":"_strOwner_":"_strProgram
+		if '$data(arrPolicy(strPolicy)) {
+			set arrPolicy(strPolicy) = ""
+			set strLines = idLine
+		
+		} else {
+			set strLines     = strLines_$$$COMMA_idLine		
+			set idItemMatch  = $$$INWEINVItemNumber(objSTLine)
+			set idLocnMatch  = $$$INWEINVLocation(objSTLine)
+			set idStoreMatch = $$$INWEINVStockLocation(objSTLine)
+			set parrMatches(idItemMatch,idLocnMatch,idStoreMatch," ") = strLines
+			set blnUnique = $$$NO
+		}
+	}
+	quit blnUnique
+	
+	
+CalculatePrice(ART,ART1,LFN1,BETR)
+	;-------------------------------------------------------------------------------
+	; NOTE : INTRAPREND variables are used since INARTKOST may use them - not verified
+	; 
+	; Inputs:
+	; ART		idItem
+	; ART1		objItem
+	; LFN1		objINWEINV	Stocktake Line
+	; BETR		idLocn
+	; 
+	; 
+	; History:
+	; 08-Oct-2008	GRF		SR15810: Re-written from PREIS^INWEINVDS as may not have
+	; 							variables used by this function and called from
+	; 							multiple places.
+	;-------------------------------------------------------------------------------
+	new EK,EKX,EKY,GESAMTEK
+	
+	set EK       = 0
+	set GESAMTEK = 0
+	set EKX      = $$^INARTKOST(ART,,,,1)  ;OHNE FERTIGUNG ;without 
+	set EKY      = $$^INARTKOST(ART)       ;MIT FERTIGUNG ;by means of 
+	
+	if $$$INVORGDefaultCostType($get(^INVORG(0,0,1)))=9 {
+		set EK = $$$INARTAverageCost(ART1)
+	} else {
+		set EK = $$$INWEINVUnitPrice(LFN1)
+	}
+	
+	if (EK=EKY) || (+EK=0) {
+		set EK = EKX
+	}
+	if +EK=0 set EK = $$$INARTProductionCosts(ART1)
+	quit EK
+	
+]]></Routine>
+</Export>

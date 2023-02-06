@@ -1,0 +1,508 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINAPPaymentPost" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINAPPaymentPost
+#include COMSYS
+#include FINConst
+	;-------------------------------------------------------------------------------
+	;	Supplier Payments Post
+	; 
+	; History:
+	; 19-Sep-2005	GRF		SR13481 : include - FIN changed to COMSYS
+	;-------------------------------------------------------------------------------
+	
+Post(pidPayment)
+	;-------------------------------------------------------------------------------
+	; Post AP Payment Run
+	;
+	; Returns:Status
+	;
+ 	; History
+ 	; 19-Oct-2006	JW			SR15134: Look at kill status
+ 	; 20-Mar-2006	JW			SR14444: Moved cheque number calculation into PostLine
+ 	; 07-Mar-2006 	SC			SR14036: Validate ChequeNumber+ChequeBookFirstNum. 
+ 	; 							         If not nums, must be same length.
+ 	; 15-Feb-2006	SC			SR13975: Moved ChequeBookUsed write to after PostLine, 
+ 	; 									 as post line updates Cheque Number. Do this to
+ 	; 									 ensure we write the correct Cheque Number.
+ 	; 07-Feb-2006	SC			SR14026: Raise an error if Posting to a Bank Acc with no Cheque Books. 
+ 	; 23-Jan-2006	SC			SR14036: Modify to use Text Cheques.
+ 	; 19-Jan-2006	SC			SR14016: Write to FINAPChequeBookUsed, for Cheque Register Used grid.
+ 	; 02-Dec-2005	PO			SR13948: Handle cheque numbers the same whether pay method is cheque or prepayment
+    ; 06-Nov-2005	SCR			SR13578: Added Drill Down Detail to Allocate
+ 	; 20-Oct-2005	Steve S		SR13273: Process Cheque Number on Payment Lines
+ 	; 14-Oct-2005	Steve S		SR13216: Update Lines when the post is complete
+ 	; 26-Sep-2005	PO			SR13568: Store the interface batch and block numbers on the supplier payment.
+ 	; 18-Jul-2005	RPW			SR12761: If we get error Fin00082, then use the
+	; 							UpdateLastChequeNumber routine to get the next cheque
+	; 							number and then save the record.  Removed YFORM from
+	; 							the New list.
+ 	; 02-Jun-2005	shobby		Locked a global to prevent the rare case of two
+ 	; 							Supplier Payments running at the same time (SR12245)
+	; 19-Apr-2005	SCR			SR11476 Pass YLOCATION to Allocate Block
+ 	; 27-Jan-2005	RobertW		Fixed TCOMMIT and TROLLBACK (SR11273)
+ 	; 20-Dec-2004	Steve S		SR:10923 Added code to process zero payments
+ 	; 20-Dec-2004	Steve S		Removed some redundant Status=$$$OK checks
+	; 25-Feb-2004	shobby		Removed set $$$FINAPPaymentLastChequeNumber(objFINAPPayment)
+	; 							=$$GetLastNumber^FINAPChequeBook(BankAccount)
+	;                           Next cheque number may have been entered by user.
+	; 24-Feb-2004	shobby		Assume the last cheque number was the next cheque no
+	;                           (which may have been entered by the user) then subtract
+	;                           one as 1 is added as each line is posted.
+	; 29-Jun-2003	shobby		Recalculated the last cheque number during the Post
+	; 							of a Payment (TR005413)
+	; 24-Jun-2003	shobby		TR5426 : Removed call to redundant method $$SetCurrentChequeNumber
+	; 05-Jun-2003	SCR			Changed Payment type from "PAY" to "APPAY"
+	; 02-Jun-2003	SCR			Restructured payment posting to follow the Interface Model
+	;-------------------------------------------------------------------------------
+	new Status,objPayment,Batch,BlockNumber,PaymentDate,ChequeNumber,idLine 
+	new blnUpdateNextChequeNumber,intStatus,blnPost,paymentMethod,objPayLine
+	new strDetail,strForm, idBankAccount, idFirstCheque, idIndex, objBook
+	new blnBothNums, blnBothSameLength,blnCheque
+ 
+	set blnPost=$$$YES
+	set intStatus=""
+	
+	set Status=$$Postable^FINAPPayment(pidPayment,.blnPost,.intStatus)
+	
+	if $$$ISOK(Status) { 
+		set objPayment=$get(^FINAPPayment(0,pidPayment,1))
+		set paymentMethod=$$$FINAPPaymentPaymentMethod(objPayment)
+	}
+	
+	if $$$ISOK(Status)&&(blnPost) {
+		lock +^CacheTemp(+$horolog,"FINAPPayment","Post")  ;SR12245
+		tstart
+ 
+		; SR13578 - Source Details for Drill Down - Start
+		set strForm		= $$CheckForm^FINUtils($get(YFORM),"FINAPPayment")	; Get the form using YFORM, with validation
+		set strDetail 	= "Fin00931,"_pidPayment  ;Supplier Payment Number %1
+		set Status=$$Allocate^FININTBatch(.Batch,.BlockNumber,"APPAY",$get(YLOCATION),$$$FINAPPaymentPaymentDate(objPayment),,,,strForm,pidPayment,strDetail)
+		;set Status=$$Allocate^FININTBatch(.Batch,.BlockNumber,"APPAY",$get(YLOCATION),$$$FINAPPaymentPaymentDate(objPayment))
+		; SR13578 - Source Details for Drill Down - End
+ 		; Post Lines
+ 		
+		if $$$ISOK(Status) {
+			
+			set blnCheque = (paymentMethod=$$$EnumFINARBANKLINEMETHODCheque)
+			set blnUpdateNextChequeNumber=blnCheque
+			
+			set ChequeNumber=""
+			if blnCheque {
+				set ChequeNumber=$$IncTextCheque^FINAPChequeBook($$$FINAPPaymentNextChequeNumber(objPayment),-1)  //SR14036
+			}
+			
+			set idLine=""
+			for {
+				set idLine=$order(^FINAPPaymentLine(0,pidPayment,idLine))
+				quit:idLine=""
+				quit:$$$ISERR(Status)
+				
+				set objPayLine=$get(^FINAPPaymentLine(0,pidPayment,idLine,1))
+				
+				if $$$ISOK(Status) {
+					set Status=$$PostLine(pidPayment,idLine,Batch,.BlockNumber,.ChequeNumber)
+					
+					;SR:10923 - only update cheque number if paying by cheque
+					if blnUpdateNextChequeNumber {
+						; This number is now the permanent record.
+						set $$$FINAPPaymentNextChequeNumber(objPayment)=ChequeNumber
+						set blnUpdateNextChequeNumber=$$$NO
+					}
+				}
+			}
+		}
+		; Post Block
+		if $$$ISOK(Status) set Status = $$PostBlock^FININTBatch(Batch,BlockNumber)
+		if $$$ISOK(Status) set Status = $$KillLines^FINAPPayment(pidPayment,$$$NO)  ;<SCH>	//SR15134
+		if $$$ISOK(Status) set $$$FINAPPaymentPostedDate(objPayment)=$horolog
+		;if $$$ISOK(Status) set $$$FINAPPaymentInterfaceBatchID(objPayment) = Batch_","_BlockNumber ; SR13568
+	}
+	
+	if $$$ISOK(Status) {
+		set $$$FINAPPaymentStatus(objPayment)=intStatus
+		set Status = $$$Save("FINAPPayment",pidPayment,objPayment,$$$YES)
+	}
+	
+	if $$$ISOK(Status) set Status=$$UpdateLines(pidPayment,intStatus) ;SR13216
+	
+	if $$$ISOK(Status) {
+		if $tlevel>0 tcommit
+		do ^WWWFORM
+	} else {
+		trollback 
+		; 18-Jul-2005	RPW		SR12761: If we get error Fin00082, then use the UpdateLastChequeNumber
+		; routine to get the next cheque number and then save the record.
+		if $listget(Status)="Fin00082" {
+			set YFELD=objPayment
+			do UpdateLastChequeNumber^FINAPPayment()
+			set Status = $$$Save("FINAPPayment",pidPayment,YFELD,$$$YES)
+		}
+		
+		do ^WWWINFO($$$Text(Status,0))
+	}
+	lock -^CacheTemp(+$horolog,"FINAPPayment","Post")	;SR12245
+	quit Status
+	
+	
+UpdateLines(pidPayment,pintStatus,pidBatch="")
+    ;-------------------------------------------------------------------------------
+    ; Update the payment lines to the requested status
+    ;
+    ; Returns: strStatus
+    ;
+    ; History:
+    ; 14-Oct-2005	Steve S		SR13216: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,idLine
+ 
+	set strStatus=$$$OK
+ 
+	if ($get(pidPayment)'="")&&($get(pintStatus)'="") {
+		set idLine=""
+		for {
+			set idLine=$order(^FINAPPaymentLine(0,pidPayment,idLine))
+			quit:(idLine="")||($$$ISERR(strStatus))
+			set strStatus=$$UpdateLine(pidPayment,idLine,pintStatus,pidBatch)
+		}	
+	} else {
+		set strStatus=$lb("Fin00089")  ;No Record Selected.	
+	}
+ 
+	quit strStatus
+	
+	
+UpdateLine(pidPayment,pidPaymentLine,pintStatus,pidBatch="",pidBlock="")
+    ;-------------------------------------------------------------------------------
+    ; Update a single payment line to the requested status
+    ;
+    ; Returns: strStatus
+    ;
+    ; History:
+    ; 14-Oct-2005	Steve S		SR13216: Created
+    ;-------------------------------------------------------------------------------
+	new strStatus,objFINAPPaymentLine
+ 
+	set strStatus=$$$OK
+	
+	if ($get(pidPayment)'="")&&($get(pidPaymentLine)'="") {
+		set objFINAPPaymentLine=$get(^FINAPPaymentLine(0,pidPayment,pidPaymentLine,1))
+		set $$$FINAPPaymentLineStatus(objFINAPPaymentLine)=pintStatus
+			
+		if (pidBatch'="")&&(pidBlock'="") {
+			if (pintStatus=$$$EnumFINSYSSTATUSCancelled) {
+				set $$$FINAPPaymentLineReverseInterfaceBatch(objFINAPPaymentLine)=pidBatch
+				set $$$FINAPPaymentLineReverseInterfaceBlock(objFINAPPaymentLine)=pidBlock
+				set $$$FINAPPaymentLineReversalUser(objFINAPPaymentLine)=$get(YBED)
+				set $$$FINAPPaymentLineReversalDate(objFINAPPaymentLine)=$h
+			}	
+		}
+		set strStatus=$$$Save("FINAPPaymentLine",pidPayment_","_pidPaymentLine,objFINAPPaymentLine,1)
+	} else {
+		set strStatus=$listbuild("Fin00089")  ;No Record Selected.	
+	}
+ 
+	quit strStatus
+	
+	
+GetPaymentObject(pidFINAPPayment,pobjFINAPPayment)
+	;-------------------------------------------------------------------------------
+	; Gets and validates the payment object.
+	;
+	; Returns:
+	;
+	; History:
+	; 25-Feb-2004	shobby	Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus=$$$OK
+	if ($get(pidFINAPPayment)="") {
+		set strStatus=$listbuild("Fin00166")  ; Supplier Payment Required
+	} else {
+		set pobjFINAPPayment=$get(^FINAPPayment(0,pidFINAPPayment,1))
+		if pobjFINAPPayment="" set strStatus=$listbuild("Fin00167",pidFINAPPayment)  ; Supplier Payment ´%1´ is not defined
+	}
+	quit strStatus
+	
+	
+PostLine(Pay,PayLine,Batch,BlockNumber,ChequeNumber,pblnReverse=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Update a Payment Line
+	;
+	; Returns:Status
+	;
+	; History:
+	; 06-Nov-2006	JW		SR15181: Reverted undocumented code change
+	; 20-Mar-2006	JW		SR14444: Prepayment method doesn't need to look at last cheque number.
+	;  9-Mar-2006	JW		SR13305: Don't update batch number if reversing.
+	; 02-Dec-2005	PO		SR13948: Finished off SR13931.
+	; 01-Dec-2005	PO		SR13931: Include handling of prepayments when updating cheque number.
+	; 11-Nov-2005	PO		SR13842: Do not process invoices not being paid.
+	; 19-Oct-2005	Steve S	SR13216: Store batch/block numbers
+	; 18-Jul-2005	PO		SR12850: Do not post invoices that are on hold.
+	; 20-May-2005	JW		SR12309: Prepayment field is now editable
+	; 07-Apr-2005	Paul K	Gain/Loss calculation needs to be in base currency.
+	; 20-Dec-2004	Steve S	Added code to ignore cheque numbers when posting a zero payment (SR:10923)
+	; 14-Sep-2004	SCR		Bug fix Gain & Loss
+	; 18-Jun-2004	shobby	Code Check.
+	; 09-Jun-2004	SCR		FC Gain Loss
+	; 31-May-2004	SCR		FC Upgrade
+	; 11-May-2004	shobby	Passed pblnReverse into PostInvoice
+	; 11-May-2004	shobby	Change the source from Pay to Pay_","_PayLine
+	; 27-Feb-2004	shobby	Pass reverse flag into PostAccount
+	; 26-Feb-2004	shobby	pblnReverse flag to mark when an unpost is being done.
+	; 02-Jul-2003	Paul K	Changed InterfaceType "Cash" to "PAYMENT"
+	; 10-Jun-2003	SCR		Sub Block Number
+	;-------------------------------------------------------------------------------
+	new Status,SupplierTotal,RecLine,ControlAccount,Head,Amount,Invoice,RecSupplier,Supplier,BankAccount
+	new PayAmount,DiscountTotal,Unallocated,InvoiceNumber,Param,dteGLEff
+	new strSource,SupplierFCCode,GainLoss,GainLossAccount,ControlRec
+	
+	set Status    = $$$OK
+	set strSource = Pay_","_PayLine
+	set Head      = $get(^FINAPPayment(0,Pay,1))
+	
+	do SubBlockNumber^FININTBatch(.BlockNumber) ; Increment Sub Block Number
+	
+	; Get Payment Line record
+	set SupplierTotal=0 ; Supplier Total
+	set DiscountTotal=0 ; Payment Discount
+	
+	set RecLine=$get(^FINAPPaymentLine(0,Pay,PayLine,1))
+	
+	if RecLine="" set Status=$listbuild("Fin00168")  ; Supplier Payment Line %1 in Payment ´%2´ is incorrect
+	
+	if $$$ISOK(Status) {
+		set Amount=$$$FINAPPaymentLineTotal(RecLine)
+		set Supplier=$$$FINAPPaymentLineSupplierNumber(RecLine)
+		if Supplier="" set Status=$listbuild("Fin00163")  ; Supplier Required
+	}
+	
+	if $$$ISOK(Status) {
+		set RecSupplier=$get(^FINAPSupplier(0,Supplier,1))
+		if RecSupplier="" set Status=$listbuild("Fin00164",Supplier)  ; Supplier number %1 not Found
+	} 
+	
+	if $$$ISOK(Status) {
+		set ControlAccount=$$$FINAPSupplierControlAccount(RecSupplier)
+		if ControlAccount="" set Status=$listbuild("Fin00165",Supplier)  ; Supplier control account not valid for Supplier %1
+	}
+	
+	if $$$ISOK(Status) {
+		set ControlRec=$get(^FINAPAccount(0,ControlAccount,1))
+		if ControlRec="" set Status=$listbuild("Fin00165",Supplier)  ; Supplier control account not valid for Supplier %1
+	}	
+	
+	; Update Cheque number if required!
+	if $$$ISOK(Status) { 
+		set BankAccount=$$$FINAPPaymentBankAccount(Head)
+		// SR14444 - prepayment method doesn't need to look at last cheque number.
+		
+		if ($$$FINAPPaymentPaymentMethod(Head) = $$$EnumFINARBANKLINEMETHODCheque) {	
+			set Status=$$UpdateChequeNumber^FINAPPayment(Pay,PayLine,Head,.RecLine,BankAccount,.ChequeNumber)
+			
+		} elseif ($$$FINAPPaymentPaymentMethod(Head) = $$$EnumFINARBANKLINEMETHODPrePayment) {
+			set ChequeNumber = $$$FINAPPaymentLineChequeNumber(RecLine)
+			if ChequeNumber'="" {
+				set Status = $$IsChequeUsed^FINAPChequeBook(BankAccount,ChequeNumber,Pay)
+			}
+		}
+		
+		if $$$ISOK(Status) && (ChequeNumber'="") {	//SR14444	;SR14016 - set ChequeBookUsed
+			set Status = $$InsertCheque^FINAPChequeBookUsed(BankAccount,ChequeNumber,Pay,PayLine)
+		}
+	}
+	
+	;Post Invoices
+	if $$$ISOK(Status) {
+		set Invoice=""
+		for {
+			set Invoice=$order(^FINAPPaymentInvoice(0,Pay,PayLine,Invoice))
+			quit:(Invoice="")||(Status'=$$$OK)
+			continue:'$$$FINAPPaymentInvoicePay($get(^FINAPPaymentInvoice(0,Pay,PayLine,Invoice,1))) //SR13842
+			continue:$$$FINAPInvoiceOnHold($get(^FINAPInvoice(0,Supplier,Invoice,1))) ; SR12850
+			
+			set Status=$$PostInvoice(Pay,PayLine,Invoice,Batch,BlockNumber,Supplier,ControlAccount,.SupplierTotal,pblnReverse)
+		}
+	}
+	
+	; Post Accounts
+	if $$$ISOK(Status) set Status=$$PostAccount(Pay,PayLine,Batch,BlockNumber,.SupplierTotal,pblnReverse)
+	
+	set SupplierFCCode=$$GetFCCode^FINAPSupplier(Supplier)
+	
+	; Check for Unallocated (Prepayment) SR12309
+	if $$$ISOK(Status) {
+		set Unallocated=$$$FINAPPaymentLinePrepayment(RecLine)
+		if Unallocated {
+			do Unallocated^FINAPPayment(Supplier,Unallocated,.InvoiceNumber)
+			set Param=Supplier_","_InvoiceNumber
+			set Status=$$AddLine^FININTBatch(Batch,BlockNumber,ControlAccount,Unallocated,"APP",Param,strSource,Supplier,pblnReverse)
+		}
+	}
+		
+	; Check for Gain / Loss ( if FC Supplier )
+	if $$$ISOK(Status)&&(SupplierFCCode'="") { ;SR12309
+		//set GainLoss=Amount-SupplierTotal  ;GainLoss must be in base Currency 2005-Apr-07 PJK.
+		//set GainLoss=-(Amount-SupplierTotal-Unallocated)  // SR15181
+		set GainLoss = Amount-SupplierTotal-Unallocated
+		if GainLoss {
+			set GainLossAccount=$$$FINAPAccountForeignCurrencyRealisatio(ControlRec)
+			set Param=Supplier
+			set Status=$$AddLine^FININTBatch(Batch,BlockNumber,GainLossAccount,GainLoss,"APFCGL",Param,strSource,Supplier,pblnReverse)
+		}
+	}
+	
+	; Post to Bank Account
+	if $$$ISOK(Status) {
+		set Status=$$AddLine^FININTBatch(Batch,BlockNumber,BankAccount,$$$FCSign(Amount),"PAYMENT","",strSource,ChequeNumber,pblnReverse)
+	}
+	
+	if $$$ISOK(Status) && 'pblnReverse { ;SR13216		SR13305
+		set $$$FINAPPaymentLinePostingBatchNumber(RecLine)=Batch
+		set $$$FINAPPaymentLinePostingBlock(RecLine)=BlockNumber
+		set Status=$$$Save("FINAPPaymentLine",Pay_","_PayLine,RecLine,1)
+	}
+	
+	quit Status
+	
+PostInvoice(Pay,PayLine,Invoice,Batch,BlockNumber,Supplier,ControlAccount,SupplierTotal,pblnReverse=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Post an Invoice
+	;
+	; Returns:
+	;
+	; History:
+	; 19-Sep-2005	GRF		SR13481 : pass pblnReverse to DistributeTaxDiscount
+	; 31-May-2004	SCR		FC Upgrade
+	; 11-May-2004	shobby	Included PayLine as part of strSource
+	; 11-May-2004   Shobby  New parameter pblnReverse for unposting.
+	;-------------------------------------------------------------------------------
+	new Status,RecInvoice,InvAmount,DiscAmount,Param,strSource
+	
+	; Get Invoice Record
+	set Status=$$$OK
+	set strSource=Pay_","_PayLine
+	set RecInvoice=$get(^FINAPPaymentInvoice(0,Pay,PayLine,Invoice,1))
+	if RecInvoice="" {
+		set Status=$listbuild("Fin00168",PayLine,Pay)  ; Supplier Payment Line %1 in Payment ´%2´ is incorrect
+	}
+	if Status=$$$OK {
+		set InvAmount=$$$FINAPPaymentInvoicePayAmount(RecInvoice)
+		set DiscAmount=0
+	}
+	
+	; Post Invoice
+	if (Status=$$$OK)&&(InvAmount) {
+		set Param=Supplier_","_Invoice
+		set Status=$$AddLine^FININTBatch(Batch,BlockNumber,ControlAccount,InvAmount,"APP",Param,strSource,Supplier,pblnReverse)
+		set SupplierTotal=$$$FCAdd(SupplierTotal,InvAmount)
+	}
+	if (Status=$$$OK) {
+		if $$$FINAPPaymentInvoiceDiscountApplied(RecInvoice) {
+			set DiscAmount=$$$FINAPPaymentInvoiceDiscount(RecInvoice)
+			set SupplierTotal=$$$FCSub(SupplierTotal,DiscAmount)
+		}
+	}
+	; Post Discounts
+	if (Status=$$$OK)&&(InvAmount)&&(DiscAmount) {
+		set Status=$$DistributeTaxDiscount(Pay,PayLine,Invoice,Batch,BlockNumber,Supplier,DiscAmount,pblnReverse)
+	}
+	quit Status
+	
+PostAccount(Pay,PayLine,Batch,BlockNumber,SupplierTotal,pblnReverse=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Post direct account payments
+	;
+	; Returns:
+	;
+	; History:
+	; 31-May-2004	SCR		FC Upgrade
+	; 11-May-2004	shobby	Included PayLine as part of strSource
+	; 27-Feb-2004	shobby	Flag to mark when reversing previous postings.
+	;-------------------------------------------------------------------------------
+	new Status,ExpenseGroup,PayAccount,AccAmount,AccRef,RecPayAccount
+	new strSource
+	
+ 	set Status       = $$$OK 
+ 	set strSource    = Pay_","_PayLine
+	set ExpenseGroup = ""
+	for {
+		set ExpenseGroup=$order(^FINAPPaymentAccount(0,Pay,PayLine,ExpenseGroup))
+		quit:(ExpenseGroup="")!(Status'=$$$OK)
+		
+		set PayAccount=""
+			for {
+				set PayAccount=$order(^FINAPPaymentAccount(0,Pay,PayLine,ExpenseGroup,PayAccount))
+				quit:(PayAccount="")!(Status'=$$$OK)
+				
+				set RecPayAccount=$get(^FINAPPaymentAccount(0,Pay,PayLine,ExpenseGroup,PayAccount,1))
+				set AccAmount=$$$FINAPPaymentAccountTotal(RecPayAccount)
+				set AccRef=$$$FINAPPaymentAccountReference(RecPayAccount)
+				if +AccAmount'=0 {
+					set Status=$$AddLine^FININTBatch(Batch,BlockNumber,PayAccount,AccAmount,"ACCEX","",strSource,AccRef,pblnReverse)
+					if pblnReverse set AccAmount=$$$FCSign(AccAmount)
+					set SupplierTotal=$$$FCAdd(SupplierTotal,AccAmount)
+				}
+			}
+		}
+	quit Status
+	
+DistributeTaxDiscount(Pay,PayLine,Invoice,Batch,BlockNumber,Supplier,DiscAmount,pblnReverse=$$$NO)
+	;-------------------------------------------------------------------------------
+	; Post Discount and Distribute any Rquired Taxes
+	;
+	; Returns:
+	;
+	; History:
+	; 31-Jan-2006	Steve S	SR13497: Use required discount GL Account
+	; 15-Nov-2005	RPW		SR13856: Use the new interface type DISCTAX for discount tax instead of TAX
+	; 26-Sep-2005	PO		SR13569: Do not switch the sign on the tax amount
+	; 31-May-2004	SCR		FC Upgrade
+	; 11-May-2004	shobby	Included PayLine as part of strSource
+	; 11-May-2004   Shobby  pblnReverse flag for unposting
+	;-------------------------------------------------------------------------------
+	new TaxCode,RecInv,InvTotal,RecTax,TaxKey,TaxAmount,TaxAcc,Status,DiscAcc
+	new strSource
+	
+	set Status=$$$OK
+	
+	; Loop through taxes on the original invoices
+	; Calculate tax based on the % of Discount Taken and % of the Tax taken.
+	set TaxCode=""
+	set strSource=Pay_","_PayLine
+	set RecInv=$Get(^FINAPInvoice(0,Supplier,Invoice,1))
+	set InvTotal=$$$FINAPInvoiceInvoiceTotal(RecInv)
+	for {
+		set TaxCode=$order(^FINAPInvoiceTax(0,Supplier,Invoice,TaxCode))
+		quit:(TaxCode="")||(Status'=$$$OK)
+		set RecTax=$get(^FINAPInvoiceTax(0,Supplier,Invoice,TaxCode,1))
+		if +InvTotal'=0 {
+			set TaxAmount  = $$$FINAPInvoiceTaxAmount(RecTax)*DiscAmount/InvTotal
+			set TaxAcc     = $$$FINAPInvoiceTaxAccount(RecTax)
+			set TaxAmount  = $$Round^COMUtils(TaxAmount)
+			set Status     = $$AddLine^FININTBatch(Batch,BlockNumber,TaxAcc,TaxAmount,"DISCTAX","",strSource,Supplier,pblnReverse) ; SR13856
+			set DiscAmount = $$$FCAdd(DiscAmount,TaxAmount)
+		}
+	
+	}
+	
+	; Post the Discount, less the taxes.
+	; SR13497 Use the required disc GL Account
+	; 1. Check Invoice
+	; 2. Check Supplier
+	; 3. Check Supplier Control Account
+	set DiscAcc=$$$FINAPInvoiceDiscountGLAccount(RecInv)
+	if DiscAcc="" set DiscAcc=$$$FINAPSupplierDiscountGLAccount($get(^FINAPSupplier(0,Supplier,1)))
+	if DiscAcc="" set DiscAcc=$$GetDiscountAccount^FINAPSupplier(Supplier)
+	
+	; <FIXME> Check for DiscAcc is null? Otherwise, generic FININTBatch error message!
+	set Status=$$AddLine^FININTBatch(Batch,BlockNumber,DiscAcc,$$$FCSign(DiscAmount),"SDISC","",strSource,Supplier,pblnReverse)
+	quit Status
+	
+ 
+ 
+ 
+]]></Routine>
+</Export>

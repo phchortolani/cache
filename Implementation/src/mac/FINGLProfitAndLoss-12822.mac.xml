@@ -1,0 +1,415 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="9" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="FINGLProfitAndLoss" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+FINGLProfitAndLoss
+	;------------------------------------------------------------------------------
+	; History:
+	; 30-May-2006	GRF		doco; &&
+	; 08-Jul-2003	SCR		Bug Fixes from Code Checking
+	;------------------------------------------------------------------------------
+#include COMSYS
+#include FINConst
+	
+#define GrossProfit 	"1GrossProfit"
+#define Income			"11Income"
+#define COGS			"12COGS"
+#define Tax				"Tax"
+#define Expense			"2Expense"
+#define ProfitBeforeTax "ProfitBeforeTax"
+#define ProfitAfterTax	"ProfitAfterTax"
+		
+#define NoImage			"NoImage"
+ 
+#define ArrName			^CacheTempProfitAndLoss
+#def1arg Arr(%args)		$$$ArrName(YUSER,%args)
+#define OrderArr(%1)	$$$Order2($$$ArrName,YUSER,%1)
+ 
+ 
+	//GetChildTotal(pidAccount,parrTotal,pintIndex)
+GetChildTotal(pidAccount,pidType,pintIndex)
+    ;-------------------------------------------------------------------------------
+    ; Get the balance of this accounts children
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 06-Aug-2004   Shobby   Created (SR7278)
+    ;-------------------------------------------------------------------------------
+	new fltTotal,idxAccount
+	
+	//set fltTotal=+$get(parrTotal(pidAccount,pintIndex))
+	set fltTotal=$get($$$Arr(pidAccount,pidType,pintIndex))
+	
+	if +fltTotal=0 {
+		set idxAccount=""
+		for {
+			set idxAccount=$order(^FINGLAccounts(YM,50,pidAccount,idxAccount))
+			quit:idxAccount=""
+			
+			set fltTotal=$$$FCAdd(fltTotal,$$GetChildTotal(idxAccount,pidType,pintIndex))
+		}
+	}
+	quit fltTotal
+ 
+ 
+#define From		1
+#define To			2
+#define CurrYr		1
+#define PrevYr		2
+#define Actual		"A"
+#define Budget		"B"
+#define BudgetOR	"O"
+ 
+#define IsParent	"P"
+#define Parent		0
+ 
+#define DateLastYear(%1)	$zdateh($SYSTEM.SQL.DATEADD("yy",-1,%1),3)
+ 
+#define Format(%1)			$$FormatCurrency^COMTable(%1)
+#define LstFormat(%1,%2)	$listbuild($$$Format(%1),$$$Format(%2))
+ 
+#define CText(%1)			"<center>"_$$$Text(%1)
+ 
+ 
+ProfitAndLoss(pstrVORG)
+	;------------------------------------------------------------------------------
+	; Show the Chart of Accounts
+	; 
+	; History
+	; 11-Dec-2006	shobby	SRBR014286:Corrected GIF names.
+	; 30-Jun-2006	JW		SR14528: Rewrote. Use dates not year, use local array.
+	; 29-Jul-2005	Steve S	SR13092: Don't use a display modifier
+	; 22-Jul-2005	Steve S	SR12669: Only show accounts with non-zero balance
+	; 13-Jul-2004	shobby	Renamed idPeriod to idPeriodType
+	; 03-Mar-2004	shobby	Call to indirector 'AddNode'
+	; 11-Nov-2003	shobby	Get the number of periods for the year.  Code was
+	; 						incorrectly assuming there was always 12.
+	; 23-Jun-2003	shobby	Creation
+	;-----------------------------------------------------------------------------
+	quit:($get(VORG(3))="")||($get(VORG(4))="")
+	
+	new arrDte,loopDte,loopYr,strStatus,idPeriod,idBudget,idAccount,arrCur
+	new loopType,lstHeader,lstVals,curVar,strDesc,dteStart,dteEnd,blnShowPrev
+	new idPeriodType,arrIdPeriod,idTranType,arrIntYear,lstPeriods,objFINGLAccount
+	
+	set strStatus = $$$OK
+	
+	set idBudget = VORG(2)
+	
+	set arrDte($$$From,$$$CurrYr)	= VORG(3)		//SR14528
+	set arrDte($$$To,$$$CurrYr)		= VORG(4)
+	
+	set blnShowPrev = $$$YES		; Whether to show previous year
+	
+	if arrDte($$$To,$$$CurrYr) < arrDte($$$From,$$$CurrYr) {
+		set strStatus = $listbuild("Fin01058")  ;'Date To' cannot be before 'Date From'
+	} else {		
+		set idPeriodType	  	= $$DefaultPeriod^FINGLPeriod()
+		if (idPeriodType="") || '$$$FINGLPeriodTypeActive1($get(^FINGLPeriodType(YM,idPeriodType,1))) {
+			set strStatus = '$$$OK
+		} else {
+			for loopDte = $$$From,$$$To {
+				set arrDte(loopDte,$$$PrevYr) 	= $$$DateLastYear(arrDte(loopDte,$$$CurrYr))
+			}
+			
+			for loopYr = $$$CurrYr,$$$PrevYr {
+				for loopDte = $$$From,$$$To {
+					set strStatus = $$GetPeriodForDateType^FINGLPeriod(idPeriodType,arrDte(loopDte,loopYr),$$$YES,.idPeriod) 
+					if $$$ISERR(strStatus) && (loopYr=$$$PrevYr) {
+						set blnShowPrev = $$$NO		// Don't have to show prev year.
+						set idPeriod = " "			// Set default - simpler than changing rest of code
+						set strStatus=$$$OK
+					}
+					quit:$$$ISERR(strStatus)
+					
+					set arrIdPeriod(loopDte,loopYr) = idPeriod
+					set arrIntYear(loopDte,loopYr) = $$$FINGLPeriodYear1($get(^FINGLPeriod(YM,idPeriod,1)))
+				}
+				quit:$$$ISERR(strStatus)
+			}
+		}
+		if $$$ISERR(strStatus) { 	// Write better msg to screen
+			set strStatus = $listbuild("Fin01059",idPeriodType) ; Default period "%1" not active for selected dates
+		}
+	}
+	if $$$ISOK(strStatus) {	; Loop to Calculate Totals
+		
+		if ($get(YPARA)="") || (YPARA=YFORM) {		// Only recompute if necessary
+			kill ^CacheTempProfitAndLoss(YUSER)
+			
+			for loopType = $$$EnumFINGLACCOUNTTYPEIncome,$$$EnumFINGLACCOUNTTYPEExpense {
+				$$$Order4(^FINGLAccounts,YM,4,loopType,idAccount)
+					set objFINGLAccount=$get(^FINGLAccount(YM,idAccount,1))
+					set $$$Arr(idAccount,$$$IsParent) = ($$$FINGLAccountAccountUsage(objFINGLAccount) = $$$EnumFINGLACCOUNTUSAGEParent)
+					
+					; Get balances for Account
+					for loopYr = $$$CurrYr,$$$PrevYr {
+						set arrCur($$$Actual,loopYr) 	= $$GetTotal^FINGLPeriodTotal(idAccount,idPeriodType,arrIntYear($$$From,loopYr),arrIdPeriod($$$From,loopYr),arrIntYear($$$To,loopYr),arrIdPeriod($$$To,loopYr),"")
+						set arrCur($$$Budget,loopYr)	= 0		// JW: Don't know why...
+					}
+					
+					do ProcessAccount(idAccount,.arrCur)
+					
+					for loopYr = $$$PrevYr,$$$CurrYr {
+						set $$$Arr(idAccount,$$$Budget,loopYr) = $$GetTotal^FINGLPeriodTotal(idAccount,idPeriodType,arrIntYear($$$From,loopYr),arrIdPeriod($$$From,loopYr),arrIntYear($$$To,loopYr),arrIdPeriod($$$To,loopYr),idBudget)
+					}
+					
+				$$$End
+			}
+			
+			; Process Parent Accounts.  Parent Accounts may have a budget which would override.
+			; The budgets obtained from the Accumulation of Transaction Account Budgets.
+			$$$OrderArr(idAccount)
+				if $get($$$Arr(idAccount,$$$IsParent)) {
+					for loopYr = $$$CurrYr,$$$PrevYr {
+						set $$$Arr(idAccount,$$$BudgetOR,loopYr) = $$GetChildTotal(idAccount,$$$Budget,loopYr)
+					}
+				}
+			$$$End
+			
+			$$$OrderArr(idAccount)
+				if $get($$$Arr(idAccount,$$$IsParent)) {
+					for loopYr = $$$CurrYr,$$$PrevYr {
+						set $$$Arr(idAccount,$$$Budget,loopYr) = $$$Arr(idAccount,$$$BudgetOR,loopYr)
+					}
+				}
+			$$$End
+		}
+		
+		do StartTree^COMTree($get(YPARA))
+		
+		set lstHeader = ""
+		for loopYr = $$$CurrYr,$$$PrevYr {
+			if 'blnShowPrev&&(loopYr=$$$PrevYr) {
+				set lstHeader = lstHeader_$listbuild($$$Text("Fin01061"))   ;No data available for previous year
+				quit
+			}
+			set dteStart = $$$FINGLPeriodStartDate($get(^FINGLPeriod(YM,arrIdPeriod($$$From,loopYr),1)))
+			set dteEnd = $$$FINGLPeriodEndDate($get(^FINGLPeriod(YM,arrIdPeriod($$$To,loopYr),1)))
+			
+			set lstHeader = lstHeader_$listbuild("<center>"_$$^WWWDATE(dteStart)_" - "_$$^WWWDATE(dteEnd))
+		}
+		do AddNode^COMTree("","!3","","",$$$NoImage,"","",1,lstHeader,1,"",,,3)
+		
+		set lstHeader = $listbuild($$$CText("Fin01050"),$$$CText("Fin00357"),$$$CText("Fin00330"))	;Actual, Budget, Variance
+		if blnShowPrev set lstHeader = lstHeader_lstHeader
+		do AddNode^COMTree("","!4","","",$$$NoImage,"","",1,lstHeader,1,"")
+		
+		; Loop to Create Tree
+		$$$OrderArr(idAccount) 
+			if $data($$$Arr(idAccount,$$$IsParent)) {	// Test whether is account or sub total
+			
+				if (+$get($$$Arr(idAccount,$$$Actual,$$$CurrYr))'=0) { ;SR12669
+					
+					set lstVals = ""
+					for loopYr = $$$CurrYr,$$$PrevYr {
+						for loopType = $$$Actual,$$$Budget {
+							set arrCur(loopType) = $$$Arr(idAccount,loopType,loopYr)
+							set lstVals = lstVals_$listbuild($$$Format(arrCur(loopType)))
+						}
+						set curVar = arrCur($$$Actual)-arrCur($$$Budget)
+						set lstVals = lstVals_$listbuild($$$Format(curVar))
+					}
+					
+					set strDesc = idAccount_" ("_$$$FINGLAccountDescription($get(^FINGLAccount(YM,idAccount,1)))_") "
+					
+					if $get($$$Arr(idAccount,$$$IsParent)) {
+						do AddNode($get($$$Arr(idAccount,$$$Parent)),idAccount,idAccount,strDesc,"","FINGLAccount","","",lstVals)
+					} else {
+						do AddNode^COMTree($get($$$Arr(idAccount,$$$Parent)),idAccount,idAccount,strDesc,"html.gif","FINGLAccount","","",lstVals)
+					}
+				}
+			}
+		$$$End
+		
+		;+++++++++++++++++++++++++++++++++++
+		; Notes on sign reversals:
+		; 		Income		CR		need reversal
+		; 		COGS		DR
+		; 		--------------
+		; 		GP			CR		need reversal
+		; 		Expenses	DR
+		; 		--------------
+		; 		Profit BT	CR		need reversal
+		; 		Tax			DR
+		; 		--------------
+		; 		Profit		CR		need reversal
+		;+++++++++++++++++++++++++++++++++++
+		
+		do AddNode($$$GrossProfit,$$$Income,"",$$$Text("Fin01057"),"","","",1,$$$LstFormat(-1*$get($$$Arr($$$Income,$$$Actual,$$$CurrYr)),-1*$get($$$Arr($$$Income,$$$Actual,$$$PrevYr))),1)   ;Income
+		do AddNode($$$GrossProfit,$$$COGS,"",$$$Text("Fin01056"),"","","",1,$$$LstFormat($get($$$Arr($$$COGS,$$$Actual,$$$CurrYr)),$get($$$Arr($$$COGS,$$$Actual,$$$PrevYr))),1)   ;Cost Of Goods Sold
+		do AddNode($$$ProfitBeforeTax,$$$Expense,"",$$$Text("Fin01055"),"","","",1,$$$LstFormat($get($$$Arr($$$Expense,$$$Actual,$$$CurrYr)),$get($$$Arr($$$Expense,$$$Actual,$$$PrevYr))),1)   ;Expenses
+		do AddNode($$$ProfitAfterTax,$$$Tax,"",$$$Text("Fin01054"),"","","",1,$$$LstFormat($get($$$Arr($$$Tax,$$$Actual,$$$CurrYr)),$get($$$Arr($$$Tax,$$$Actual,$$$PrevYr))),1) ;Tax
+		
+		// GrossProfit = Income + COGS
+		for loopYr = $$$CurrYr,$$$PrevYr {
+			set arrCur(loopYr)=$$$FCAdd($get($$$Arr($$$Income,$$$Actual,loopYr)),$get($$$Arr($$$COGS,$$$Actual,loopYr)))
+		}
+		do AddNode($$$ProfitBeforeTax,$$$GrossProfit,"",$$$Text("Fin01053"),"","","",1,$$$LstFormat(-1*arrCur($$$CurrYr),-1*arrCur($$$PrevYr)),1) ;Gross Profit
+		
+		// ProfitBeforeTax = Gross Profit + Expense
+		for loopYr = $$$CurrYr,$$$PrevYr {
+			set arrCur(loopYr)=$$$FCAdd(arrCur(loopYr),$get($$$Arr($$$Expense,$$$Actual,loopYr)))
+		}
+		do AddNode($$$ProfitAfterTax,$$$ProfitBeforeTax,"",$$$Text("Fin01051"),"","","",1,$$$LstFormat(-1*arrCur($$$CurrYr),-1*arrCur($$$PrevYr)),1)	  ;Profit Before Tax
+		
+		// ProfitAfterTax = ProfitBeforeTax + Tax
+		for loopYr = $$$CurrYr,$$$PrevYr {
+			set arrCur(loopYr)=$$$FCAdd(arrCur(loopYr),$get($$$Arr($$$Tax,$$$Actual,loopYr)))
+		}
+		do AddNode("",$$$ProfitAfterTax,"",$$$Text("Fin01052"),"","","",1,$$$LstFormat(-1*arrCur($$$CurrYr),-1*arrCur($$$PrevYr)),1)   ;Profit After Tax
+		
+		do StopTree^COMTree($$$YES)
+		
+	} else {
+		write "<b>"_$$$Text(strStatus)_"</b>"
+	}
+	
+	quit
+ 
+ 
+AddNode(pidParent,pidNode,pstrTitle,pstrText,pstrImage,pstrForm="",pstrParam="",
+		pblnHighLight="",pstrExtraData="",pblnLinkStopped="",plngPage="",plngOverRideId="")
+    ;-------------------------------------------------------------------------------
+    ; Optionally displays data as created by ProfitAndLoss method or formats with summary
+    ; line at bottom when a node is expanded.
+    ;
+    ; Returns:
+    ;
+    ; History:
+	; 13-May-2004	GRF		Clarify If Test
+    ; 03-Mar-2004	shobby	Created
+    ;-------------------------------------------------------------------------------
+	new strExtraData
+	/*
+	if $$$NEVER {
+		do AddNode^COMTree(pidParent,pidNode,pstrTitle,pstrText,pstrImage,pstrForm,
+		                   pstrParam,pblnHighLight,pstrExtraData,pblnLinkStopped,plngPage,plngOverRideId)
+	} else {
+	*/
+	if $data($$$Storage("Expand",pidNode)) || (pidParent="") {
+		set strExtraData=""
+	} else {
+		set strExtraData=pstrExtraData
+	}
+	
+	do AddNode^COMTree(pidParent,pidNode,pstrTitle,pstrText,pstrImage,pstrForm,
+	                   pstrParam,,strExtraData,pblnLinkStopped,plngPage,plngOverRideId)
+	do AddNode^COMTree(pidNode,"zzz"_pidNode,pstrTitle,pstrText,$$$NoImage,pstrForm,
+	                   pstrParam,1,pstrExtraData,pblnLinkStopped,plngPage,pidNode)
+	quit
+	
+	//ProcessAccount(pidFINGLAccount,pfltTotal,Bal1,Bal2,BalBudget1,BalBudget2,pblnDoIt=$$$YES)
+ProcessAccount(pidFINGLAccount,parrTotal,pblnDoIt=$$$YES)
+	;------------------------------------------------------------------------------
+	; Show the Chart of Accounts
+	; 
+	; History
+	; 30-Jun-2006	JW			SR14528: Use global not local array - changed params
+	; 14-Apr-2005	PO			SR12135 Included pblnDoIt (only used by ProcessAccount
+	; 							on recursive calls)  Used to prevent summing up amounts
+	; 							that have already been added to the total for a
+	; 							particular Account.
+	; 25-Jun-2004	shobby		Foreign Currency.
+	; 23-Jun-2003	shobby		Creation
+	;-----------------------------------------------------------------------------
+	new idParent,objFINGLAccount,objFINGLAccountParent,strParent
+	new loopType,loopYr
+	
+	set objFINGLAccount=$get(^FINGLAccount(YM,pidFINGLAccount,1))
+	set idParent=$$$FINGLAccountParent(objFINGLAccount)
+	set strParent=""
+	
+	if idParent'="" {
+		set objFINGLAccountParent=$get(^FINGLAccount(YM,idParent,1))
+		if ($$$FINGLAccountAccountType(objFINGLAccountParent)=$$$FINGLAccountAccountType(objFINGLAccount))                  &&
+		   ($$$FINGLAccountAccountTypeModifier(objFINGLAccountParent)=$$$FINGLAccountAccountTypeModifier(objFINGLAccount))    {
+			set strParent=idParent
+			do ProcessAccount(strParent,.parrTotal,$$$NO)
+			
+		} elseif $$$FINGLAccountAccountTypeModifier(objFINGLAccount)=$$$EnumFINGLACCOUNTTYPEMODIFIERTaxAccount {
+			set strParent=$$$Tax
+			do ProcessAccount(strParent,.parrTotal,pblnDoIt)
+			
+		} elseif $$$FINGLAccountAccountTypeModifier(objFINGLAccount)=$$$EnumFINGLACCOUNTTYPEMODIFIERCOGSAccount {
+			set strParent=$$$COGS
+			do ProcessAccount(strParent,.parrTotal,pblnDoIt)
+			
+		} elseif $$$FINGLAccountAccountType(objFINGLAccount)=$$$EnumFINGLACCOUNTTYPEIncome {
+			set strParent=$$$Income
+			do ProcessAccount(strParent,.parrTotal,pblnDoIt)
+			
+		} elseif $$$FINGLAccountAccountType(objFINGLAccount)=$$$EnumFINGLACCOUNTTYPEExpense {
+			set strParent=$$$Expense
+			do ProcessAccount(strParent,.parrTotal,pblnDoIt)
+		}
+	}
+ 	
+	if pblnDoIt {
+		set $$$Arr(pidFINGLAccount,$$$Parent) = strParent
+		
+		for loopType = $$$Actual,$$$Budget {
+			for loopYr = $$$PrevYr,$$$CurrYr {
+				set $$$Arr(pidFINGLAccount,loopType,loopYr) = $$$FCAdd($get($$$Arr(pidFINGLAccount,loopType,loopYr)),$get(parrTotal(loopType,loopYr)))
+			}
+		}
+		
+		
+		/*	SR14528
+		set pfltTotal(pidFINGLAccount,0) = strParent
+		set pfltTotal(pidFINGLAccount,1) = $$$FCAdd($get(pfltTotal(pidFINGLAccount,1)),Bal1)
+		set pfltTotal(pidFINGLAccount,2) = $$$FCAdd($get(pfltTotal(pidFINGLAccount,2)),Bal2)
+		set pfltTotal(pidFINGLAccount,3) = $$$FCAdd($get(pfltTotal(pidFINGLAccount,3)),BalBudget1)
+		set pfltTotal(pidFINGLAccount,4) = $$$FCAdd($get(pfltTotal(pidFINGLAccount,4)),BalBudget2)
+		*/
+	}
+ 
+	quit
+ 	
+ 
+	
+OnAfterSave()
+    ;-------------------------------------------------------------------------------
+    ;
+    ; Returns:
+    ;
+    ; History:
+    ; 28-Jun-2006	JW		SR14528: Use WWWRECALL (not CacheTemp), ReloadForm
+    ; 13-Jul-2004   Shobby  Created
+    ;-------------------------------------------------------------------------------
+	;set ^CacheTemp(YUSER,"FINGLPL",1)=$get(VORG(1))
+	;set ^CacheTemp(YUSER,"FINGLPL",2)=$get(VORG(2))
+	
+	do ReloadForm^COMUtilForm(YFORM)
+	
+	//do ^WWWFORM
+	
+	quit
+ 
+OnBeforeButtonLine(pstrLASTUSEDFORM="")
+    ;-------------------------------------------------------------------------------
+    ; Called from On Before button line in form FINGLPL
+    ;
+    ; History:
+    ; 28-Jun-2006	JW			SR14528: Use WWWRECALL (not CacheTemp)
+    ; 29-Jan-2004 	Paul K		Add test for LASTUSEDFORM SR10644
+    ; 04-Nov-2004	shobby/PK	Reworked VORG(1) to support full date not just year. (SR10644)
+    ; 13-Jul-2004   Shobby   	Created
+    ;-------------------------------------------------------------------------------
+	new intPara,objForm
+	
+	if $get(pstrLASTUSEDFORM)="FINGLPL" {
+		/*
+		set VORG(1)=$select($get(^CacheTemp(YUSER,"FINGLPL",1))="":"",1:$get(^CacheTemp(YUSER,"FINGLPL",1)))
+		set VORG(2)=$select($get(^CacheTemp(YUSER,"FINGLPL",1))="":"",1:$get(^CacheTemp(YUSER,"FINGLPL",2)))
+		*/
+		set objForm = $$RecallRecord^WWWRECALL(YBED,"FINGLPL","M")
+		for intPara=2:1:4 {
+			set VORG(intPara)=$piece(objForm,Y,intPara)
+		}
+	}
+	
+	quit
+	
+]]></Routine>
+</Export>

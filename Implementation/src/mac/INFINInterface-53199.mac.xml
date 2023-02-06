@@ -1,0 +1,782 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INFINInterface" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INFINInterface
+	;---------------------------------------
+	; Some parts taken from INARTHIST, others from INFIBBUCH
+	;---------------------------------------
+#include COMSYS
+#include INConst
+#include FINConst
+#include FINEnum
+	
+#define DiscLedgerType 4
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1_"^INFINInterface("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+	;***************************************
+	;      Formerly INARTHIST code
+	;***************************************
+	
+	;PostToFin(penumMovType,penumTxType,pstrAudit,pstrInfo,pidItem,pfltQty="",pcurValue,pidFromLocn,pidFromStore="",pidToLocn,pidToStore,pidCust="",pidOrder="",pidOrderline="",pidParent="",pstrFinRef="",penumReason="")
+PostToFin(penumMovType,penumTxType,pstrAudit,pstrInfo,pidItem,pfltQty="",pcurValue,pidFromLocn,pidFromStore="",pidToLocn,pidToStore,pidCust="",pidOrder="",pidOrderline="",pidParent="",pstrFinRef="",penumReason="",pidCCFrom="",pidCCTo="",pstrSRCDetail="",pstrSRCForm="",pstrSRCRec="")
+	;-------------------------------------------------------------------------------
+	; POST TO GENERAL LEDGER
+	; 
+	; Called By: alSFI.dStockFin::StockToFin
+	;            AutoUpdate^INStockValCCAdj
+	;            AutoUpdate^INStockValAdjust   ; DEPRECATED SR16871
+	; 
+	; Inputs:	(1-4)	penumMovType,penumTxType,pstrAudit,pstrInfo						Posting Identification
+	; 			(5-7)	pidItem,pfltQty,pcurValue										Source Tx Details
+	; 			(8-11)	pidFromLocn,pidFromStore,pidToLocn,pidToStore					Storage Info
+	; 			(12-17)	pidCust,pidOrder,pidOrderline,pidParent,pstrFinRef,penumReason	Supplementary Details
+	; 			(18-19)	pidCCFrom,pidCCTo												Cost Centre Info
+	; 			(20-22)	pstrSRCDetail,pstrSRCForm,pstrSRCRec							Finance Source Details
+	;
+	; 			penumMovType: based on objMove.MovementType.MovementTypeId
+	; 								e.g. 0 Receive Goods In, 1 Ship Goods Out, 2 Move Goods Around
+	;			penumTxType	: Account Identification Matrix Transaction Type e.g. "ADJ","ISS","REC","MVI"
+	;			pstrAudit	: source of transaction for error tracking       e.g. "alDRP.dMovementType.Adjustment"
+	;			pstrInfo	: Description of transaction for finance record  e.g. "Stock Adjustment"
+	;			
+	;			pidCCFrom,pidCCTo :	Cost Centres are normally based on from and to locations
+	;								but could represent a change in cost centre for the one locn.
+	;			pstrSRCDetail	: Source Details for FININTBatchBlock (D8)   e.g. Text No, Receipt No, Receipt Line
+	;			pstrSRCForm     : Source Form    for FININTBatchBlock (D6)   e.g. INReceipt
+	;			pstrSRCRec		; Source Record  for FININTBatchBlock (D7)   e.g. Receipt No
+	;			
+	; [NOTE : BuildBaseRecord doesn't use : pfltQty,pcurValue,pidFromLocn,pidFromStore,pidToLocn,pidToStore
+	;         if decide to pass objFINMessage in as single argument after creating in calling code <GRF>]
+	; 
+	; History :
+	; 03-Jan-2014 	shobby 	CORE-303: CacheIndex
+	; 09-Jul-2010	SCR		SR17387: Added Source Details, Source Form, Source Rec
+	; 							Note - Only done for Supplier Receipts
+	; 18-Nov-2009	GRF		SR17046/SR16871: Add From and To Cost Centres associated
+	; 							with From and To Locations; use GetGLParams
+	; 23-Sep-2009	GRF		SR16880: clarify arg list; variable prefixes; single
+	; 							call to BuildBaseRecord with less args - use 
+	; 							AddAccounts
+	; 09-Sep-2009	DWR		SR16880: Modified from FIBU^INARTHIST
+	;-------------------------------------------------------------------------------
+	new idCoGSAcct,curValuePlusSC,idCrAcct,idDrAcct,idItemCat,idItemGroup,idTax
+	new objFINMsg,objGLParams,objAccounts,objINVORG,objItem
+	
+	$$$LogR("PostToFin",penumMovType_","_penumTxType_","_pstrInfo_","_pstrSRCDetail_","_pstrSRCForm_","_pstrSRCRec)
+	$$$LogRx(pidFromLocn_","_pidFromStore_","_pidToLocn_","_pidToStore)
+	$$$LogRx(pstrFinRef_"<"_penumReason_"<"_pidOrder_","_pidOrderline_"<"_pidCCFrom_"<"_pidCCTo_"<")
+
+	;---------------------------------------
+	; Split composite value
+	;---------------------------------------
+	if pcurValue["|" {
+		set curValuePlusSC = $piece(pcurValue,"|",2)
+	} else {
+		set curValuePlusSC = pcurValue
+	}
+	
+	set curValuePlusSC = $justify(+curValuePlusSC,0,2)     ; CostWithServiceCharges
+	set pcurValue      = $justify(+pcurValue,0,2)          ; CostWithoutServiceCharges
+	
+	;---------------------------------------
+	; Location
+	;---------------------------------------
+	
+	if pidToLocn="" {   ;will it ever be called without a location? 
+		set pidToLocn = $get(YLOCATION)
+		do Dump^COMPatch("SR14389","Location not defined")
+	}
+	if pidToLocn="" set pidToLocn = $$GetTopLevel^WWW0121()  ; Top Level ;CORE-303
+	if pidToLocn="" set pidToLocn = 1     ; FIXME : Installation may not have a location "1" <GRF>
+	
+	
+	set objINVORG   = $get(^INVORG(0,0,1))
+	set objItem     = $get(^INART(0,pidItem,1))
+	;et objGLParams = $get(^INFIBPAR(0,0,pidToLocn,1))   ; SR17046/SR16871
+	set objGLParams = $$GetGLParams^WWW0121Utils(pidToLocn)
+	
+	
+	;---------------------------------------
+	; Item Group
+	;---------------------------------------
+	set idItemGroup = $$$INARTItemGroup(objItem)
+	if idItemGroup="" set idItemGroup = $$$INVORGDefaultItemGroup(objINVORG)
+	if idItemGroup="" set idItemGroup = 1        ; FIXME : This group may not exist <GRF>
+	
+	
+	;---------------------------------------
+	; Generic Details
+	;---------------------------------------
+	;set objFINMsg = $$BuildBaseRecord(pidItem,penumMovType,pstrInfo,pidOrder,pidOrderline,
+	;                                  penumTxType,pidParent,pstrFinRef,penumReason,pstrAudit,pidCust) ; SR17387
+	set objFINMsg = $$BuildBaseRecord(pidItem,penumMovType,pstrInfo,pidOrder,pidOrderline,
+	                                  penumTxType,pidParent,pstrFinRef,penumReason,pstrAudit,
+	                                  pidCust,pstrSRCDetail,pstrSRCForm,pstrSRCRec)
+	
+	;---------------------------------------
+	; Initial Accounts - may be subject to Account ID Matrix
+	; - Get Account Specification
+	;   a. Account and Cost Centre Allocations for Item Group     (^INKSTL)   [4=Inventory]
+	;   b. Account and Cost Centre Allocations for Item Category  (^INKSTL1)
+	;   c. Default Account and Cost Centre Allocations (Group 0)  (^INKSTL)
+	; - Determine CoGS, Dr and Cr accounts
+	;---------------------------------------
+	set idItemCat = $$$INARTCategory(objItem)
+	set idTax     = 0                            ; Tax Type : 0 => NO TAXES 
+	
+	; The classes ^INKSTL and ^INKSTL1 appear to have been deprecated even in INARTHIST
+	;  - will always return 99999 for idDrAcct/idCrAcct when used below.
+	;  These are replaced in routines INFIBBUCH4n from INFIBPAR settings.  FIXME : Why not set correctly here?
+	
+	set objAccounts = $get(^INKSTL(0,pidToLocn,idItemGroup,idTax,4,1))
+	if objAccounts="" if idItemCat'="" set objAccounts = $get(^INKSTL1(0,pidToLocn,idItemCat,idTax,4,1))
+	if objAccounts=""                  set objAccounts = $get(^INKSTL(0,pidToLocn,0,idTax,4,1))
+	
+	; Cost of Goods Sold Account
+	set idCoGSAcct = $piece(objAccounts,Y,4)
+	if idCoGSAcct="" set idCoGSAcct = $$$INFIBPARCostOfSalesAccount(objGLParams)
+	if idCoGSAcct="" set idCoGSAcct = 99999
+	
+	
+	; FIXME : While the naming of idCrAcct and idDrAcct are reversed (i.e. on receipt of goods we DEBIT the SOH acct)
+	;         The posting is consistent with the code in INARTHIST and the names match the fields in class INFIBBUCH.
+	;         It appears that the mix up was made in converting INFIBBUCH D4 and D5 from German to English (and
+	;         then perpetuated in FINMessage) but the INFIBBUCH4* code must be processing without worrying about the
+	;         naming.
+	
+	;+++++++++++++++++++++++++++++++++++++++
+	;   Receive Goods
+	;+++++++++++++++++++++++++++++++++++++++
+	if penumMovType=$$$EnumReceive {
+		set idCrAcct = $$$INFIBPARInventoryAccount(objGLParams) set:idCrAcct="" idCrAcct = 99999  ; Stock On Hand
+		set idDrAcct = $piece(objAccounts,Y,2)                  set:idDrAcct="" idDrAcct = 99999  ; Receiving
+ 
+		do AddAccounts(.objFINMsg,idDrAcct,idCrAcct,idCoGSAcct,idTax)
+	;	do Receipt(pidItem,pfltQty,pcurValue,curValuePlusSC,pidToLocn,pidToStore,objFINMsg,penumTxType,pstrInfo)   ; SR17046/SR16871
+		do Receipt(pidItem,pfltQty,pcurValue,curValuePlusSC,pidToLocn,pidToStore,pidCCTo,objFINMsg,penumTxType,pstrInfo)
+		
+	;+++++++++++++++++++++++++++++++++++++++
+	;   Issue Goods
+	;+++++++++++++++++++++++++++++++++++++++
+	} elseif penumMovType=$$$EnumIssue {
+		set idCrAcct = $piece(objAccounts,Y,3)                  set:idCrAcct="" idCrAcct = 99999  ; Shipping
+		set idDrAcct = $$$INFIBPARInventoryAccount(objGLParams) set:idDrAcct="" idDrAcct = 99999  ; Stock On Hand
+		
+		do AddAccounts(.objFINMsg,idDrAcct,idCrAcct,idCoGSAcct,idTax)
+	;	do Issue(pidItem,pfltQty,pcurValue,curValuePlusSC,pidToLocn,pidToStore,objFINMsg,penumTxType,pstrInfo)   ; SR17046/SR16871
+		do Issue(pidItem,pfltQty,pcurValue,curValuePlusSC,pidFromLocn,pidFromStore,pidCCFrom,objFINMsg,penumTxType,pstrInfo)
+		; FIXME : pidFromLocn,pidFromStore ???
+		;         INARTHIST appears to have use same parameters for from and to when not a movement
+		;         Need to ensure calls to PostToFin^INFINInterface pass appropriate values in fields with correct names.
+	
+		
+	;+++++++++++++++++++++++++++++++++++++++
+	;   Movements and Adjustments
+	;+++++++++++++++++++++++++++++++++++++++
+	} else {
+		set idCrAcct = $$$INFIBPARInventoryAccount(objGLParams) set:idCrAcct="" idCrAcct = 99999  ; Stock On Hand
+		set idDrAcct = $piece(objAccounts,Y,2)                  set:idDrAcct="" idDrAcct = 99999  ; Receiving
+		
+		do AddAccounts(.objFINMsg,idDrAcct,idCrAcct,idCoGSAcct,idTax)
+	;	do Movement(pidItem,pfltQty,pcurValue,curValuePlusSC,pidFromLocn,pidFromStore,pidToLocn,pidToStore,objFINMsg,penumTxType,pstrInfo)   ; SR17046/SR16871
+		do Movement(pidItem,pfltQty,pcurValue,curValuePlusSC,pidFromLocn,pidFromStore,pidCCFrom,pidToLocn,pidToStore,pidCCTo,objFINMsg,penumTxType,pstrInfo)
+	}
+	
+	quit
+	
+	
+BuildBaseRecord(pidItem,penumMovType,pstrInfo,pidOrder,pidOrderline,penumTxType,pidParent,pstrFinRef,penumReason,pstrAudit,pidCust,pstrSRCDetail,pstrSRCForm,pstrSRCRec)
+	;-------------------------------------------------------------------------------
+	; Store Generic Details
+	; 
+	; Called By: PostToFin^INFINInterface
+	; 
+	; Params:
+	;
+	; Returns: initialised IN-FIN interface record (matches INFIBBUCH/FINMessage)
+	;
+	; History:
+	; 10-Aug-2010	GRF		SR17387: restore deleted line for pstrFinRef
+	; 09-Jul-2010	SCR		SR17387: Populate Source Fields
+	; 21-Sep-2009	DWR		SR16880: Modified from BuildBaseRecord^INARTHIST
+	;-------------------------------------------------------------------------------
+	new objFINMsg,strSearchText
+ 
+	set objFINMsg=""
+	set $$$FINMessageDate1(objFINMsg)               = +$horolog
+	set $$$FINMessageText(objFINMsg)                = pstrInfo
+	set $$$FINMessageMovementFlag(objFINMsg)        = penumMovType
+	set $$$FINMessageAuditString(objFINMsg)         = pstrAudit
+	set $$$FINMessageText2(objFINMsg)               = pidCust
+	set $$$FINMessageOrderNo(objFINMsg)             = pidOrder
+	set $$$FINMessageOrderLine(objFINMsg)           = pidOrderline
+	set $$$FINMessageItem(objFINMsg)                = pidItem
+	set $$$FINMessageParentItem(objFINMsg)          = pidParent
+	set $$$FINMessageCharacteristicType(objFINMsg)  = penumTxType
+	set $$$FINMessageAdjReasonCode(objFINMsg)       = penumReason
+	set $$$FINMessageDiscountTermId(objFINMsg)      = pstrFinRef    ; aka $$$INFIBBUCHFinanceTxRef()
+	set $$$FINMessageSourceDetail(objFINMsg)        = pstrSRCDetail ;SR17387
+	set $$$FINMessageSourceForm(objFINMsg)          = pstrSRCForm	;SR17387
+	set $$$FINMessageSourceRecord(objFINMsg)        = pstrSRCRec	;SR17387
+
+
+	set strSearchText = $$GetWebServiceText()
+	if pstrInfo [ strSearchText {
+		set $$$FINMessageWebService(objFINMsg) = $piece(pstrInfo,strSearchText,2)
+	}
+	quit objFINMsg
+	
+	
+AddAccounts(&pobjFINMsg,pidDrAcct,pidCrAcct,pidCoGSAcct,pidTax)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 23-Sep-2009	GRF		SR16880: copied / modified from ^INARTHIST
+	;-------------------------------------------------------------------------------
+	set $$$FINMessageDebitAccount(pobjFINMsg)  = pidDrAcct
+	set $$$FINMessageCreditAccount(pobjFINMsg) = pidCrAcct
+	set $$$FINMessageCostGoodSld(pobjFINMsg)   = pidCoGSAcct      
+	set $$$FINMessageTax(pobjFINMsg)           = pidTax
+	quit
+	
+	
+	;Receipt(pidItem,pfltQty,pcurValue,pcurValuePlusSC,pidToLocn,pidToStore,pobjBaseMsg,penumTxType,pstrInfo)
+Receipt(pidItem,pfltQty,pcurValue,pcurValuePlusSC,pidToLocn,pidToStore,pidCCTo,pobjBaseMsg,penumTxType,pstrInfo)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 21-Sep-2009	DWR		SR16880: copied / modified from ^INARTHIST
+	;-------------------------------------------------------------------------------
+	new objFINMsg,strStatus,strWorkOrder
+	
+	$$$LogR("Receipt",pidItem_","_pfltQty_","_pcurValue)
+	$$$LogRx(pidToLocn_","_pidToStore)
+	
+	if pidToStore["|" set pidToStore = $piece(pidToStore,"|",2)     ; Was previously performed before FIBU called
+	
+	do Update^INStockVal(pidItem,pidToLocn,pidToStore,$$$YES,pfltQty,pcurValuePlusSC)
+	
+	set objFINMsg = pobjBaseMsg
+	set $$$FINMessageFromLocn(objFINMsg)        = pidToLocn
+	set $$$FINMessageFromStorage(objFINMsg)     = pidToStore
+	set $$$FINMessageQuantity(objFINMsg)        = pfltQty
+	set $$$FINMessageAmount(objFINMsg)          = pcurValue
+	set $$$FINMessageMaterialsAmount(objFINMsg) = pcurValue          ; Materials Amount defaults to total amount
+	set $$$FINMessageReceivingCostCentre(objFINMsg) = pidCCTo        ; SR17046
+	
+	set strWorkOrder = $piece($piece(pstrInfo,"#",2)," ",1)
+	if (penumTxType="REC") && (strWorkOrder'="") set objFINMsg = $$Manufacture(objFINMsg,strWorkOrder,pfltQty,pcurValue)
+	
+	set strStatus = $$CreateFINInterface(objFINMsg,pidToLocn,"","",$$$EnumStockChange)
+	quit
+	
+	
+	;Issue(pidItem,pfltQty,pcurValue,pcurValuePlusSC,pidFromLocn,pidFromStore,pobjBaseMsg,penumTxType,pstrInfo)
+Issue(pidItem,pfltQty,pcurValue,pcurValuePlusSC,pidFromLocn,pidFromStore,pidCCFrom,pobjBaseMsg,penumTxType,pstrInfo)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 21-Sep-2009	DWR		SR16880: copied / modified from ^INARTHIST
+	;-------------------------------------------------------------------------------
+	new objFINMsg,strStatus,strWorkOrder
+	
+	$$$LogR("Issue",pidItem_","_pfltQty_","_pcurValue)
+	$$$LogRx(pidFromLocn_","_pidFromStore)
+	
+	do Update^INStockVal(pidItem,pidFromLocn,pidFromStore,$$$NO,pfltQty,pcurValuePlusSC)
+	
+	set objFINMsg = pobjBaseMsg
+	set $$$FINMessageFromLocn(objFINMsg)        = pidFromLocn
+	set $$$FINMessageFromStorage(objFINMsg)     = pidFromStore
+	set $$$FINMessageQuantity(objFINMsg)        = pfltQty
+	set $$$FINMessageAmount(objFINMsg)          = pcurValue
+	set $$$FINMessageMaterialsAmount(objFINMsg) = pcurValue          ; Materials Amount defaults to total amount
+	set $$$FINMessageIssuingCostCentre(objFINMsg) = pidCCFrom        ; SR17046
+	
+	set strWorkOrder = $piece($piece(pstrInfo,"#",2)," ",1)
+	if (penumTxType="REC") && (strWorkOrder'="") set objFINMsg = $$Manufacture(objFINMsg,strWorkOrder,pfltQty,pcurValue)
+	
+	set strStatus = $$CreateFINInterface(objFINMsg,pidFromLocn,"","",$$$EnumStockChange)
+	quit
+	
+	
+	;Movement(pidItem,pfltQty,pcurValue,pcurValuePlusSC,pidFromLocn,pidFromStore,pidToLocn,pidToStore,pobjBaseMsg,penumTxType,pstrInfo)
+Movement(pidItem,pfltQty,pcurValue,pcurValuePlusSC,pidFromLocn,pidFromStore,pidCCFrom,pidToLocn,pidToStore,pidCCTo,pobjBaseMsg,penumTxType,pstrInfo)
+	;-------------------------------------------------------------------------------
+	; History :
+	; 15-Mar-2010	GRF		SR17229: CreateFINInterface from FromLocn not ToLocn
+	; 21-Sep-2009	DWR		SR16880: copied / modified from ^INARTHIST
+	;-------------------------------------------------------------------------------
+	new objFINMsg,strStatus,strWorkOrder
+	
+	$$$LogR("Movement",pidItem_","_pfltQty_","_pcurValue)
+	$$$LogRx(pidFromLocn_","_pidFromStore_","_pidToLocn_","_pidToStore)
+	
+	if pfltQty {
+		do Update^INStockVal(pidItem,pidFromLocn,pidFromStore,$$$NO, pfltQty,pcurValuePlusSC)
+		do Update^INStockVal(pidItem,pidToLocn,  pidToStore,  $$$YES,pfltQty,pcurValuePlusSC)
+	} else {
+	;	Value only Adjustments
+		do Update^INStockVal(pidItem,pidFromLocn,pidFromStore,$$$NO,0,pcurValuePlusSC)
+	}
+	
+	set objFINMsg = pobjBaseMsg
+	set $$$FINMessageFromLocn(objFINMsg)        = pidFromLocn
+	set $$$FINMessageFromStorage(objFINMsg)     = pidFromStore
+	set $$$FINMessageToLocn(objFINMsg)          = pidToLocn
+	set $$$FINMessageToStorage(objFINMsg)       = pidToStore
+	set $$$FINMessageQuantity(objFINMsg)        = pfltQty
+	set $$$FINMessageAmount(objFINMsg)          = pcurValue
+	set $$$FINMessageMaterialsAmount(objFINMsg) = pcurValue          ; Materials Amount defaults to total amount
+	set $$$FINMessageIssuingCostCentre(objFINMsg)   = pidCCFrom      ; SR17046
+	set $$$FINMessageReceivingCostCentre(objFINMsg) = pidCCTo        ; SR17046
+	
+	set strWorkOrder = $piece($piece(pstrInfo,"#",2)," ",1)
+	if (penumTxType="REC") && (strWorkOrder'="") set objFINMsg = $$Manufacture(objFINMsg,strWorkOrder,pfltQty,pcurValue)
+	
+	;et strStatus = $$CreateFINInterface(objFINMsg,pidToLocn,"","",$$$EnumStockChange)   ; SR17229
+	set strStatus = $$CreateFINInterface(objFINMsg,pidFromLocn,"","",$$$EnumStockChange)
+	quit
+	
+	
+Manufacture(pobjFINMsg,pstrWorkOrder,pfltQty,pcurValue)
+	;-------------------------------------------------------------------------------
+	; Split amount for REC of Finished Goods on Manufacturing Order
+	; 
+	; History:
+	; 21-Sep-2009	DWR		SR16880: copied from ^INARTHIST
+	;-------------------------------------------------------------------------------
+	new AmountBDN,AmountLAB,AmountMAT,AmountMBD,AUFKey,Burden,DATEI,Depth,Depth0,Difference,Duration
+	new idOrder,idOrdLine,ItemNo,ItemType,Machine,NoOfWorkers
+	new objINAUF,objINAUFPXL,objINPROXR,ParentQty,PartCost,PartKey,ServiceOH,Status
+	
+	$$$LogR("Manufacture",pobjFINMsg)
+	
+	set objINPROXR = $get(^INPROXR(0,pstrWorkOrder,1))   ; Production Cross-Reference
+	set idOrder    = $piece(objINPROXR,Y,1)			; e.g. ^INPROXR(0,100101,1)="200345~1~"     Finished Item
+	set idOrdLine  = $piece(objINPROXR,Y,2)			;      ^INPROXR(0,100102,1)="200345~1~3"    SubAssy
+	set PartKey    = $piece(objINPROXR,Y,3)			;      ^INPROXR(0,100103,1)="200345~1~3,5"  SubAssy of SubAssy
+	
+	set AmountMAT   = 0
+	set AmountLAB   = 0
+	set AmountMBD   = 0
+	set AmountBDN   = 0
+	set Status      = $$$NO
+	
+	if (idOrder'="") && (idOrdLine'="") {
+		set objINAUF = $get(^INAUF(0,idOrder,1))
+		if $$$INAUFOrderType(objINAUF)=1 {     ; Manufacturing Order
+			set Status      = $$$OK
+			
+			if $data(^INAUFPXL(0,idOrder,idOrdLine)) {
+				set AUFKey = 0_$$$COMMA_idOrder_$$$COMMA_idOrdLine
+				if PartKey'="" set AUFKey = AUFKey_$$$COMMA_PartKey
+				
+				set DATEI = "^INAUFPXL("_$$^WWWKEYBUILD(AUFKey)_")"
+				set Depth0 = $qlength(DATEI)+1
+				
+				;-----------------------
+				; Process Parent
+				;-----------------------
+				set objINAUFPXL = @DATEI      ; Parent Item
+				set ParentQty   = pfltQty
+				set AmountMBD   = AmountMBD + $piece(objINAUFPXL,Y,74)     ; Tool Costs
+				set AmountBDN   = AmountBDN + $piece(objINAUFPXL,Y,75)     ; Additional Expenses
+				
+				; TODO : Value of preparation time => LBR? <GRF>
+				
+				;-----------------------
+				; Process Parts
+				;-----------------------
+				for {
+					set DATEI = $query(@DATEI)
+					quit:DATEI=""
+					set Depth = $qlength(DATEI)
+					quit:Depth<Depth0             ; BOM finished at Main or SubAssy level
+					
+					if ($qsubscript(DATEI,2)'=idOrder) || ($qsubscript(DATEI,3)'=idOrdLine) quit
+					
+					if Depth=Depth0 {    ; skip lower Sub-Assemblies
+						set objINAUFPXL = @DATEI  ; Parts
+						
+						set ItemNo   = $piece(objINAUFPXL,Y,4)
+						set ItemType = $piece(objINAUFPXL,Y,26)
+						
+						if ItemType=2 {   ;Service
+							set Duration    = $piece(objINAUFPXL,Y,45)   ; in seconds
+							set Machine     = $piece(objINAUFPXL,Y,57)
+							set NoOfWorkers = $piece(objINAUFPXL,Y,49)
+							set Burden    = 0
+							if Machine'="" {
+								set ServiceOH = $piece($get(^INMASCH(0,Machine,1)),Y,46)
+								set Burden    = $justify(ServiceOH * Duration * ParentQty / 3600,0,2)
+								set AmountBDN = AmountBDN + Burden
+							}
+							set PartCost  = $piece(objINAUFPXL,Y,250)    ; SR13142 - this includes Service Overhead so need to deduct
+							; FIXME : It appears the amounts being stored in #250 are
+							;         ***NOT*** always inclusive of the Service Overhead. <GRF>
+							;         This may have been corrected now.  <GRF> 31-Aug-2005
+							set AmountLAB = AmountLAB + (PartCost * ParentQty) - Burden	
+						
+						} else {      ; Materials
+							; TODO ? Calculate MBD for items with INKALKART entries? <GRF>
+							set PartCost  = $piece(objINAUFPXL,Y,250)
+							set AmountMAT = AmountMAT + (PartCost * ParentQty)
+						}
+					}
+				}  ; end for
+			}
+		}
+	}
+	
+	if Status=$$$OK {
+		set Difference = pcurValue - (AmountMAT + AmountLAB + AmountMBD + AmountBDN)
+	;	set AmountBDN  = AmountBDN	+ Difference               ; TODO : Verify this is desired action
+		set AmountMAT  = AmountMAT	+ Difference               ; SR13085
+		
+		set $$$FINMessageMaterialsAmount(pobjFINMsg)  = AmountMAT		; Materials Amount
+		set $$$FINMessageLabourAmount(pobjFINMsg)     = AmountLAB		; Labour Amount
+		set $$$FINMessageMatOverheadAmt(pobjFINMsg)   = AmountMBD		; Material Overhead Amount
+		set $$$FINMessageSrvcBurdAmt(pobjFINMsg)      = AmountBDN		; Service Burden Amount
+	} else {
+		set $$$FINMessageMaterialsAmount(pobjFINMsg)  = pcurValue       ; if unable to split, leave all as Materials
+	}
+	
+	quit pobjFINMsg
+	
+	
+GetWebServiceText()
+	;-------------------------------------------------------------------------------
+	; Returns string to be used to log web service operations and to recover
+	; reference text to Interface Batch 
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns: 
+	;
+	; History:
+	; 21-Sep-2009	DWR		SR16880: copied from ^INARTHIST
+	;-------------------------------------------------------------------------------
+	new SPRACHE
+	
+	set SPRACHE="EN"
+	quit $$^WWWTEXT("Com00270")_" : "       ; "Update Stock"
+	
+	
+	
+	
+	;***************************************
+	;      Formerly INFIBUCH code
+	;***************************************
+	
+CreateFINInterface(pobjFINMsg,pidLocn,pidRecordType="",pstrKey="",penumFINTxType="") 
+	;-------------------------------------------------------------------------------
+	;	Automate FINMessage
+	;
+	; Called By : Receipt, Issue, Movement in INFINInterface
+	;
+	; Inputs:
+	; 	pobjFINMsg		The data used to create the ledger interface transactions.
+	; 					Matches class INFIBBUCH and FINMessage.        [was BUCHUNG]
+	; 	pidLocn			
+	; 	pidRecordType	Total Reservation (?)                              [BUCHART]
+	;					>	1.	STOCK ADJUSTMENT AND HISTORY FOR EACH LINE
+	;						2.	POST TOTAL AMOUNT (NOT PARTIAL PAYMENT CALCULATIONS)
+	;						3.	POST PARTIAL PAYMENT CALCULATIONS
+	;					>	4.	PROVIDE DEBIT FILE
+	; 	pstrKey			Provides a link between finance transactions for some GL
+	; 					schemes.  Initially null in code calling INFIBBUCH, the
+	; 					value set is passed to subsequent calls.               [KEY]
+	; 					* * *   It is not used with $$$DiscLedgerType.   * * *
+	; 	penumFINTxType	1 Supp Invoice, 2 Cust Invoice, 3 Stock Change, 4 Manufacture
+	; 	
+	; Returns:	strStatus (not set to other than $$$OK nor used by calling routines.
+	; 
+	; History:
+	; 05-Feb-2010	GRF		Clarify different TxType use
+	; 18-Nov-2009	GRF		SR17046: Refactored for cost centre & ledger hierarchy
+	; 21-Sep-2009	DWR		SR16880: Modified version of ^INFIBBUCH
+	;-------------------------------------------------------------------------------
+	new idLocnProfile,objGLParams,strStatus
+	
+	set strStatus = $$$OK
+	
+	if $get(pobjFINMsg)'="" {
+		set objGLParams   = $$GetGLParams^WWW0121Utils(pidLocn)  ; Inherit from Hierarchy if no INFIBPAR for pidLocn.
+		set idLocnProfile = $$$INFIBPARLocationInGL(objGLParams)
+		
+		; FIXME : No call to REGEL equivalent - special posting rules <GRF>
+		; e.g.
+	;	if penumFINTxType'="" if $data(^INFIBBUCHPARA(0,0,pidLocn,penumFINTxType)) {    ; with similar hierarchy traversal
+	;		do REGEL()
+	;	} elseif +$$$INFIBPARAttachedGL(objGLParams)'=0 {
+		
+		if +$$$INFIBPARAttachedGL(objGLParams)'=0 {
+			do CreateMsg(pobjFINMsg,objGLParams,idLocnProfile,pidRecordType,penumFINTxType,pidLocn,pstrKey)
+		}   
+	}
+	quit strStatus  ;FIXME doesn't set or read the return value for anything yet DWR
+	
+	
+OldCreateFINInterface(pobjFINMsg,pidLocn,pidRecordType="",pstrKey="",penumFINTxType="") 
+	;-------------------------------------------------------------------------------
+	;	Automate FINMessage
+	;
+	; Called By : Receipt, Issue, Movement in INFINInterface
+	;
+	; Inputs:
+	; 	pobjFINMsg		The data used to create the ledger interface transactions.
+	; 					Matches class INFIBBUCH and FINMessage.        [was BUCHUNG]
+	; 	pidLocn			
+	; 	pidRecordType	Total Reservation (?)                              [BUCHART]
+	;					>	1.	STOCK ADJUSTMENT AND HISTORY FOR EACH LINE
+	;						2.	POST TOTAL AMOUNT (NOT PARTIAL PAYMENT CALCULATIONS)
+	;						3.	POST PARTIAL PAYMENT CALCULATIONS
+	;					>	4.	PROVIDE DEBIT FILE
+	; 	pstrKey			Provides a link between finance transactions for some GL
+	; 					schemes.  Initially null in code calling INFIBBUCH, the
+	; 					value set is passed to subsequent calls.               [KEY]
+	; 					* * *   It is not used with $$$DiscLedgerType.   * * *
+	; 	penumFINTxType	0 Receive Goods In, 1 Ship Goods Out, 2 Move Goods Around
+	; 	
+	; Returns:	strStatus (not set to other than $$$OK nor used by calling routines.
+	; 
+	; History:
+	; 21-Sep-2009	DWR		SR16880: Modified version of ^INFIBBUCH
+	;-------------------------------------------------------------------------------
+	new idLocnProfile,objGLParams,strStatus
+		
+	set strStatus = $$$OK
+	
+	if $get(pobjFINMsg)'="" {
+		set idLocnProfile = $$$FINMessageCostCentreLocn(pobjFINMsg)            ; Set Locn to Cost Centre   FIXME : New cost centre logic being implemented
+		set:idLocnProfile="" idLocnProfile = $$$FINMessageInvoiceLocn(pobjFINMsg)  ; Set Locn to Invoice Locn
+		set:idLocnProfile="" idLocnProfile = pidLocn
+		
+		if idLocnProfile="" set idLocnProfile=$order(^INFIBPAR(0,0,""))
+		if idLocnProfile="" set idLocnProfile=1                          ; If no locations will substitute Profile Code 1
+	
+		; ********************************************************
+		set objGLParams = $get(^INFIBPAR(0,0,idLocnProfile,1))
+		; ********************************************************
+	
+		if $$$INFIBPARLocationInGL(objGLParams)'="" {
+			set idLocnProfile = $$$INFIBPARLocationInGL(objGLParams)
+		}
+		
+		; FIXME : No call to REGEL equivalent - special posting rules <GRF>
+		; e.g.
+	;	if penumFINTxType'="" if $data(^INFIBBUCHPARA(0,0,idLocnProfile,penumFINTxType)) {    ; check  - pidLocn instead?
+	;		do REGEL()
+	;	} elseif +$$$INFIBPARAttachedGL(objGLParams)'=0 {
+		
+		if +$$$INFIBPARAttachedGL(objGLParams)'=0 {
+			do CreateMsg(pobjFINMsg,objGLParams,idLocnProfile,pidRecordType,penumFINTxType,pidLocn,pstrKey)
+		}   
+	}
+	quit strStatus  ;FIXME doesn't set or read the return value for anything yet DWR
+	
+	
+CreateMsg(pobjFINMsg,pobjGLParams,pidLocnProfile,pidRecordType="",penumFINTxType="",pidLocn="",pstrKey="")
+	;-------------------------------------------------------------------------------
+	;
+	; Called By : CreateFINInterface^INFINInterface
+	;
+	; Inputs:
+	; 	pidLocn		FIXME : Should probably be FromLocn but appears may using ToLocn
+	; 				        incorrectly which returns wrong posting Chars.  May be a
+	; 				        similar issue with pidLocnProfile.
+	;
+	; Returns:
+	;
+	; History:
+	; 05-Feb-2010	GRF		Clarify different TxType use
+	; 04-Dec-2009	GRF		SR16871: comment out reference to $$$INFIBPARCostCenters
+	; 18-Nov-2009	GRF		SR17046: add Cost Centre processing
+	; 24-Sep-2009	GRF		SR16880: use enumGLType
+	; 21-Sep-2009	DWR		SR16880: Modified version of BUCH^INFIBBUCH
+	;-------------------------------------------------------------------------------
+	new dteMsg,enumGLType
+	new idCCFrom,idCCFromProfile,idCCTo,idCCToProfile,idPostNo,idItemGroup,strDummy
+	
+	set enumGLType  = $$$INFIBPARAttachedGL(pobjGLParams)
+	
+	; SR17046 vvv
+	set idCCFrom = $$$FINMessageIssuingCostCentre(pobjFINMsg)
+	set idCCTo   = $$$FINMessageReceivingCostCentre(pobjFINMsg)
+	if idCCFrom'="" set idCCFromProfile = $$$INKOSTLAcctProfile($get(^INKOSTL(0,idCCFrom,1)))
+	if idCCTo'=""   set idCCToProfile   = $$$INKOSTLAcctProfile($get(^INKOSTL(0,idCCTo,1)))
+	if $get(idCCFromProfile)="" set idCCFromProfile = ""   ; TODO : defaults?
+	if $get(idCCToProfile)=""   set idCCToProfile   = ""
+	; SR17046 ^^^
+	
+	;if $$$INFIBPARCostCenters(pobjGLParams)=0 {   ; SR16871 Deprecated - hidden from form
+	;	set $$$FINMessageCostCentre(pobjFINMsg) = ""   ; No Cost Centre
+	;} 
+ 
+	set idItemGroup=""
+	if $$$FINMessageItem(pobjFINMsg)'="" {
+		set idItemGroup = $$$INARTItemGroup($get(^INART(0,$$$FINMessageItem(pobjFINMsg),1)))
+		if idItemGroup="" {
+			set idItemGroup = $$$INVORGDefaultItemGroup($get(^INVORG(0,0,1)))
+		}
+	}
+	
+	if $$$FINMessageDebitAccount(pobjFINMsg)="ERLOESE" {                       ; Sales   ; FIXME : Provide English alternatives for substitutions?
+		set $$$FINMessageDebitAccount(pobjFINMsg) = $$$INFIBPARSalesAccount(pobjGLParams)
+	
+	} elseif $$$FINMessageDebitAccount(pobjFINMsg)="AUFWAND" {                 ; Misc Cost
+		set $$$FINMessageDebitAccount(pobjFINMsg) = $$$INFIBPARAccountsMiscellaneousCost(pobjGLParams)
+	}
+	
+	if $$$FINMessageCreditAccount(pobjFINMsg)="ERLOESE" {                      ; Sales
+		set $$$FINMessageCreditAccount(pobjFINMsg) = $$$INFIBPARSalesAccount(pobjGLParams)
+	
+	} elseif $$$FINMessageCreditAccount(pobjFINMsg)="AUFWAND" {                ; Misc Cost
+		set $$$FINMessageCreditAccount(pobjFINMsg) = $$$INFIBPARAccountsMiscellaneousCost(pobjGLParams)
+	}
+
+	if $$$FINMessageCostGoodSld(pobjFINMsg)="" {                               ; CoGS
+		set $$$FINMessageCostGoodSld(pobjFINMsg) = $$$INFIBPARCostOfSalesAccount(pobjGLParams)
+	}
+
+	;set $$$FINMessageDebitAccount(pobjFINMsg)  = $$Exchange($$$FINMessageDebitAccount(pobjFINMsg) ,pidLocnProfile,idItemGroup,enumGLType) ; SR17046
+	;set $$$FINMessageCreditAccount(pobjFINMsg) = $$Exchange($$$FINMessageCreditAccount(pobjFINMsg),pidLocnProfile,idItemGroup,enumGLType)
+	;set $$$FINMessageCostGoodSld(pobjFINMsg)   = $$Exchange($$$FINMessageCostGoodSld(pobjFINMsg)  ,pidLocnProfile,idItemGroup,enumGLType)
+	
+	;  FIXME : SR17046 : determine when to use idCCFromProfile & when to use idCCToProfile
+	
+	set $$$FINMessageDebitAccount(pobjFINMsg)  = $$Exchange($$$FINMessageDebitAccount(pobjFINMsg) ,pidLocnProfile,idItemGroup,idCCToProfile,enumGLType)
+	set $$$FINMessageCreditAccount(pobjFINMsg) = $$Exchange($$$FINMessageCreditAccount(pobjFINMsg),pidLocnProfile,idItemGroup,idCCToProfile,enumGLType)
+	set $$$FINMessageCostGoodSld(pobjFINMsg)   = $$Exchange($$$FINMessageCostGoodSld(pobjFINMsg)  ,pidLocnProfile,idItemGroup,idCCToProfile,enumGLType)
+	
+	;***************** CHARACTERISTIC MATCHING -> For DISCLINC ***************************
+	; NOTE : If any of the required characteristics are missing, Health Check test
+	;        will preserve pobjFINMsg in ^INFIBBUBCHOLD and clear pobjFINMsg
+	;*************************************************************************************
+
+	if enumGLType=$$$DiscLedgerType {
+		  do PostingCharMatch^INFINPostChar(.pobjFINMsg,pidRecordType,penumFINTxType,pidLocn,pstrKey)  
+	}
+	
+	if pobjFINMsg'="" {    ; record will have been cleared if Health Check failed.
+		set dteMsg = $$$FINMessageDate1(pobjFINMsg)
+		set:dteMsg="" dteMsg=+$horolog
+		
+		set idPostNo = $$^WWWNEXT("INFIBBUCH")
+		if $$$INFIBPARDatenexportprotokollieren(pobjGLParams)=$$$YES {        ; FIXME : replace German property names
+			set $$$FINMessagePostingNo(pobjFINMsg) = idPostNo
+	;	FIXME : replace next to lines with $$$Save <GRF>
+			set ^INFIBBUCHPROT(0,idPostNo,1) = pidLocnProfile_Y_dteMsg_Y_$piece($horolog,",",2)_Y_YBED  
+			do ^WWWSSORT("INFIBBUCHPROT",idPostNo)
+		}
+		
+		;-----------------------------------
+		set ^INFIBBUCH(0,pidLocn,dteMsg,idPostNo,$$$YES) = pobjFINMsg    ; $$$Save("INFIBBUCH",...)
+		;-----------------------------------
+		
+		set strDummy = ""
+		
+		if (+$$$FINMessageAmount(pobjFINMsg)'=0)             ||
+		   ($$$INFIBPARPostingOfValue0(pobjGLParams)=$$$YES) ||
+		   (penumFINTxType=$$$EnumStockChange)               ||
+		   (penumFINTxType=$$$EnumManufacture)                  {
+			
+			if enumGLType=$$$DiscLedgerType {
+				set strDummy = $$^INFIBBUCH4(pobjFINMsg,pobjGLParams,pidRecordType,pstrKey,penumFINTxType)
+			}
+		}
+	}
+	quit
+
+	
+Exchange(pidAcct,pidLocnProfile,pidItemGroup,pidCCProfile,penumGLType) private
+	;----------------------------]]><![CDATA[---------------------------------------------------
+	; 1. Find category for item group - working through group hierarchy if necessary
+	;    This check stops when a category value is found.
+	;    
+	; 2. Substitute finance codes for any {LOCATION} or {GROUP} profile references
+	;    in the account number.
+	;
+	; NOTE: The INARTGROUP data structure should no longer be used.
+	;
+	; Params:
+	;
+	; ByRefs:
+	;
+	; Returns:
+	;
+	; History:
+	; 18-Nov-2009	GRF		SR17046: Base on braces in tags and add Cost Centre
+	; 24-Sep-2009	GRF		SR16880: use penumGLType
+	; 21-Sep-2009	DWR		SR16880: copied from EXCHANGE^INFIBBUCH
+	;-------------------------------------------------------------------------------
+	new idCat,idGroupProfile,strTag
+	
+	quit:pidAcct="" ""
+	quit:pidAcct'["{" pidAcct
+	
+	set idGroupProfile = pidItemGroup
+	
+	if penumGLType=$$$DiscLedgerType {
+		; Loop through self and hierarchy until find a category match
+		while(pidItemGroup'="") {
+			set idCat = $$$INARTGROUPCategory($get(^INARTGROUP(0,pidItemGroup,1)))
+			if idCat'="" {             ; Found a group with a category so stop
+				set idGroupProfile = idCat
+				quit
+			
+			} else {                   ; Get parent & repeat
+				set pidItemGroup = $$$INItemGroupParentGroup($get(^INItemGroup(0,pidItemGroup,1)))
+			}
+		}
+	}
+	
+	for strTag = "{GROUP}","{GRUPPE}" {
+		if $find(pidAcct,strTag) set pidAcct = $piece(pidAcct,strTag,1)_idGroupProfile_$piece(pidAcct,strTag,2,9)
+	}
+	
+	for strTag = "{LOCATION}","{BETRIEB}" {
+		if $find(pidAcct,strTag) set pidAcct = $piece(pidAcct,strTag,1)_pidLocnProfile_$piece(pidAcct,strTag,2,9)
+	}
+	
+	for strTag = "{COSTCENTRE}","{COSTCENTER}" {
+		if $find(pidAcct,strTag) set pidAcct = $piece(pidAcct,strTag,1)_pidCCProfile_$piece(pidAcct,strTag,2,9)
+	}
+	
+	set pidAcct = $translate(pidAcct,"{}")
+	quit pidAcct
+	
+	/* SR17046 replaced code
+Exchange(pidAcct,pidLocnProfile,pidItemGroup,penumGLType) private
+	new idGroup,idCat
+	
+	quit:pidAcct="" ""
+	
+	if penumGLType=$$$DiscLedgerType {
+		; Loop through self and hierarchy until find a category match
+		set idGroup = pidItemGroup
+		while(idGroup'="") {
+			set idCat = $$$INARTGROUPCategory($get(^INARTGROUP(0,idGroup,1)))
+			if idCat'="" {             ; Found a group with a category so stop
+				set pidItemGroup = idCat
+				quit
+			
+			} else {                   ; Get parent & repeat
+				set idGroup = $$$INItemGroupParentGroup($get(^INItemGroup(0,idGroup,1)))
+			}
+		}
+	}
+	
+	if $find(pidAcct,"GROUP")    set pidAcct = $translate($piece(pidAcct,"GROUP",1)   _pidItemGroup  _$piece(pidAcct,"GROUP",2,9),   "{}")
+	if $find(pidAcct,"GRUPPE")   set pidAcct = $translate($piece(pidAcct,"GRUPPE",1)  _pidItemGroup  _$piece(pidAcct,"GRUPPE",2,9),  "{}")
+	if $find(pidAcct,"LOCATION") set pidAcct = $translate($piece(pidAcct,"LOCATION",1)_pidLocnProfile_$piece(pidAcct,"LOCATION",2,9),"{}")
+	if $find(pidAcct,"BETRIEB")  set pidAcct = $translate($piece(pidAcct,"BETRIEB",1) _pidLocnProfile_$piece(pidAcct,"BETRIEB",2,9), "{}")
+	
+	quit pidAcct
+	*/
+]]></Routine>
+</Export>

@@ -1,0 +1,593 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="22" zv="CACHE" ts="2001-01-01 00:00:00">
+<Routine name="INIssueAuto" type="MAC" languagemode="0" timestamp="58440,0"><![CDATA[
+INIssueAuto
+	
+ ; Create Issue an Issue
+ ; Auto Assign Bundle and Storage
+	
+#include COMSYS
+#include INConst
+#include COMDebug
+#include %occInclude
+	
+#define LogR(%1,%2) 	;
+#define LogRx(%1)		;
+#define LogRm(%1)		;
+#;define LogR(%1,%2) 	$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))= %1_"^INIssueAuto("_%2_") : "_$zh $$$JournalOn
+#;define LogRx(%1)		$$$JournalOff s ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+#;define LogRm(%1)		$$$JournalOff m ^zzLogR($g(YBED,"UNK"),$i(^zzLogR))=%1 $$$JournalOn
+	
+CreateIssue(pobjIssue,&parrIssueLines,&strStatus)
+	;-------------------------------------------------------------------------------
+	; Create & Post an Issue
+	; 
+	; Called By : PostIssue^SALIssPost
+	; Params: 	Issue Header (INIssue)
+	; 			Array of Issue Lines (INIssueLine)
+	;
+	; Returns:	Issue Number
+	; 			strStatus  (ByRef)
+	;
+	; History:
+	; 30-Nov-2010	SCR		SR17493: Added status check in Add Line loop
+	; 03-Nov-2010	SCR		SR17493: Default YFORM to INIssue if not defined ( Used by @NM processing )
+	; 02-Nov-2010	SCR		SR17493: No Locking on Save
+	; 19-Aug-2010	shobby	SR17516: Report an error if no lines were created.
+	; 05-Jun-2009	shobby	SR16630: Don't try and post if there is already a
+	; 							failure somewhere.
+	; 15-May-2009	GRF		SR16199: strStatus use clarified
+	; 01-May-2009	SCR		SR16199: Created
+	;-------------------------------------------------------------------------------
+ 	new arrLines,arrQty,idIssue,idIssueLine,idItem,idToLocn
+ 	new intIssueType,intLine,objIssueLine
+ 	
+ 	set strStatus = $$$OK
+ 	
+ 	;+++++++++++++++++++++++++++++++++++++++
+ 	tstart
+ 	;+++++++++++++++++++++++++++++++++++++++
+ 	
+ 	if $get(YFORM)="" {  ; SR17493 vvvvvv
+	 	new YFORM		; Remove on exit
+	 	set YFORM = "INIssue"
+ 	}                    ; SR17493 ^^^^^^
+ 	set idToLocn     = $$$INIssueToLocn(pobjIssue)
+ 	set intIssueType = $$$INIssueType(pobjIssue)
+ 	
+ 	set idIssue = $$^WWWNEXT("INIssue")               // @nM provided key
+	
+ 	set $$$INIssueStatus(pobjIssue)    = 1            // Open Status
+ 	set $$$INIssueReference(pobjIssue) = "POSIssue"   // Reference  (Mandatory)
+ 	
+ 	if intIssueType = 3 {          ; Sale Issue
+ 		set $$$INIssueToLocn(pobjIssue) = ""          // To Location has to be blank
+ 	
+ 	} elseif intIssueType '= 3 {   ; Department Issue
+ 		set $$$INIssueDemandType(pobjIssue) = 7       // Requisition Issue
+ 	}
+ 	
+ 	;set strStatus = $$$Save("INIssue",idIssue,pobjIssue)
+ 	set strStatus = $$$Save("INIssue",idIssue,pobjIssue,$$$YES) ; SR17493
+  	
+ 	; Get Stock from Source
+ 	if $$$ISOK(strStatus) {
+	 	set intLine=""
+	 	for {
+		 	quit:strStatus'=$$$OK
+		 	set intLine = $order(parrIssueLines(intLine))
+		 	quit:intLine=""
+		 	
+		 	set strStatus = $$Source(idIssue,pobjIssue,.parrIssueLines,intLine,.arrLines,.arrQty)
+		 ;	set objIssueLine = $get(parrIssueLines(intLine))
+	 	}
+ 	}
+ 	if $$$ISOK(strStatus) && '$data(arrLines) set strStatus = $$$MakeStatus("IN01260")
+ 	; "Unable to create Dispense due to failure to source stock correctly."  ;SR17516
+ 	
+ 	; Get Storage for put away then save the line
+ 	if $$$ISOK(strStatus) {
+	 	set idIssueLine = "" 
+ 		for {
+	 		set idIssueLine = $order(arrLines(idIssueLine))
+	 		quit:idIssueLine=""
+		 	quit:'$$$ISOK(strStatus)  ; SR17493
+	 		
+	 		set objIssueLine = $get(arrLines(idIssueLine))
+			
+	 		if intIssueType=1 {                            ; Department Issue
+	 			set idItem = $$$INIssueLineItem(objIssueLine)
+	 			set $$$INIssueLineToStorage(objIssueLine) = $$GetStorage(idItem,idToLocn)
+	 		}
+	 		set $$$INIssueLineReference(objIssueLine) = idIssue
+ 			;set strStatus = $$$Save("INIssueLine",idIssueLine,objIssueLine)
+ 			set strStatus = $$$Save("INIssueLine",idIssueLine,objIssueLine,$$$YES) ; SR17493
+ 		}
+ 	}
+ 	
+ 	//Post the Issue
+ 	
+ 	if $$$ISOK(strStatus) {
+	 	set strStatus = $$Post(idIssue)  ;SR16630
+ 	}
+ 	
+ 	;+++++++++++++++++++++++++++++++++++++++
+ 	if strStatus=$$$OK {
+		tcommit:($tlevel>0)
+ 	} else {
+	 	trollback
+ 	}
+ 	;+++++++++++++++++++++++++++++++++++++++
+ 	
+ 	quit idIssue
+	
+	
+Post(pidIssue)
+	;-------------------------------------------------------------------------------
+	; Post adjustment
+	;
+    ; Called By: 
+    ; 1. POS Issue - CreateIssue^INIssueAuto
+    ; 2. Button 1 - Form INDispenseToPatient Post (Execute OnClick )
+    ; 
+	; Returns:Status
+	;
+	; History:
+	; 15-May-2009	GRF		SR16199: sc/strStatus use clarified
+	; 11-May-2009	PPP		SR16199: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	
+	set strStatus = $$Transaction^COMTransaction("PostTxn^INIssueAuto("""_pidIssue_""")",$$$YES)
+	quit strStatus
+	
+	
+PostTxn(pidIssue)
+	;-------------------------------------------------------------------------------
+	; Post Dispense to Patient Issue
+	;
+	; Called By :
+	;	1. Post^INIssueAuto
+	;	2. Post^INDispenseToPatient
+	;	3. FirmIssue^INMOIssue
+	;	4. Post^MEDPrescriptionDispense
+	;	5. Post^INReturntoSupplierPost
+	; 
+	; Returns:Status
+	;
+	; History:
+	; 20-Feb-2012	GRF		SR17980: "Return to Supplier" txns should base unit cost
+	;							on Receipt value
+	; 18-Jun-2010	PPP		SR17299: Dispense Trans from POS also to check for
+	;							Stocktake Locking
+    ; 25-Feb-2010	PPP  	SR17185: Update the Cost on the Line at Post
+	; 25-Jun-2009	PPP		SR16686: Additional Checks for the To Location
+	; 15-May-2009	GRF		SR16199: sc/strStatus use clarified
+	; 11-May-2009	PPP		SR16199: Created
+	;-------------------------------------------------------------------------------
+	new blnOk,idType,objV1Issue,sc,strStatus
+	
+	set strStatus  = $$$OK 
+	set objV1Issue = $get(^INIssue(YM,pidIssue,1))
+	set idType     = $$$INIssueType(objV1Issue)
+	
+	if '$$$INIssuePosted(objV1Issue) {
+		//SR17299
+		if objV1Issue '= "" {
+			if $$IsLockedSiteLocation^INLocking($$$INIssueFromLocn(objV1Issue)) {
+				set strStatus = $$ReasonLocked^INLocking($$$INIssueFromLocn(objV1Issue))
+			}
+		}
+		
+		if $$$ISOK(strStatus) {
+			; SR17980 vvv
+		;	set strStatus = $$UpdateCostOnLines^INDispenseToPatient(pidIssue)
+			
+			if idType'=7 {   ; exclude "Return To Supplier"
+				set strStatus = $$UpdateCostOnLines^INDispenseToPatient(pidIssue)
+			}
+			; SR17980 ^^^
+			
+			if $$$ISOK(strStatus) {
+				if idType = 1 {		        ; Inter-Department
+					set blnOk = $$TransferLocation^WWW0121Rules(YM,$$$INIssueToLocn(objV1Issue))
+					if blnOk=$$$YES {
+						set strStatus = $$FirmDepartmentIssue(pidIssue)
+					} else {
+						set strStatus = $$$MakeStatus("IN01069",$$$INIssueToLocn(objV1Issue))
+					} ; "To Location (%1) not setup as a Transfer Location"
+					
+				} else {
+					set strStatus = $$FirmSaleIssue(pidIssue)		
+				}
+			}
+		}
+		
+	} else {
+		set strStatus = $$$MakeStatus("IN00979",pidIssue)
+	} ; "Already Processed %1 exiting..."
+	
+	quit strStatus
+	
+	
+FirmDepartmentIssue(pidIssue)
+	;-------------------------------------------------------------------------------
+	; History:
+	; 21-Aug-2012	PPP		SR18081: Added processing from Req cancellation of remainders
+	; 21-Jul-2010	PPP		SR17465: Updated to return all Error messages
+	; 15-May-2009	GRF		SR16199: sc/strStatus use clarified
+	; 11-May-2009	PPP		SR16199: Created
+	;-------------------------------------------------------------------------------
+	new objIssue,sc,strStatus
+	
+	set sc        = $$$OK
+	set strStatus = $$$OK
+	
+	set objIssue = ##class(alISS.dUIssue).%OpenId("0||"_pidIssue)
+	//set objIssue = ##class(alISS.dUIssue).GetInstance("0||"_pidIssue)
+	
+	if objIssue '= $$$NULLOREF {
+		set sc = objIssue.FirmIssue()
+		
+		//SR18081
+		if $$$ISOK(sc) {
+			set strStatus = $$UpdateReqRemainder(pidIssue)
+		}
+	}
+	
+	//if $$$ISERR(sc) set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	if $$$ISERR(sc) set strStatus = $$ISStatusToDLStatusAllMessages^COMUtilError(sc)
+	
+	quit strStatus
+	
+UpdateReqRemainder(pidIssue)
+	;-------------------------------------------------------------------------------
+	; If Req present update the Req with the Remainder Cancelled Quantity
+	;
+	;
+	; History:
+	; 20-May-2013	SCR		HEVA-95: Auto Close Remainder
+	; 21-Aug-2012	PPP		SR18081: Created
+	;-------------------------------------------------------------------------------
+	new strStatus
+	new idLn
+	new objIssue
+	new strReference
+	new idReq
+	new idReqLine
+	new objReqLine
+	new idItem
+	new fltConv
+	new fltRejected
+	new intFormFld
+	new intDecPlaces 
+	new idInventUnit 
+	new blnCloseReq,objReq
+	
+ 	set strStatus = $$$OK
+ 	set blnCloseReq = $$$OK ; CORE-95
+	set idLn = ""
+	
+	for {
+		set idLn = $order(^INIssueSummary(0,pidIssue,idLn))
+		quit:idLn=""
+		
+		set objIssue = $get(^INIssueSummary(0,pidIssue,idLn,1))
+
+		set strReference = $$$INIssueSummaryReferenceLine(objIssue)
+
+		if (strReference '= "") {
+			
+			set idReq     = $$$KEY1(strReference)
+			set idReqLine = $$$KEY2(strReference)
+			set objReqLine = $get(^INReqLine(0,idReq,idReqLine,1))
+
+			if $$$INIssueSummaryRejectRemainder(objIssue) = $$$YES {
+
+				set idItem      = $$$INReqLineItem(objReqLine)
+				set fltConv     = $$GetUOMConversion^INUOMConversion(idItem,$$$INReqLineUnit(objReqLine),.idInventUnit)
+				set fltRejected = ($$$INReqLineQtyOrdered(objReqLine)*fltConv) -
+				                   $$$INReqLineQtyIssued(objReqLine)    -
+				                   $$$INReqLineQtyCancelled(objReqLine)
+				set:fltRejected<0 fltRejected = 0
+
+				                   //$$$INIssueSummaryBaseQuantity(objIssue)
+				/*
+				w !,$$$INReqLineQtyOrdered(objReqLine)
+				w !,fltConv
+				w !,$$$INReqLineQtyIssued(objReqLine)
+				w !,$$$INReqLineQtyCancelled(objReqLine)
+				w !,$$$INIssueSummaryBaseQuantity(objIssue)
+				*/
+				
+				set intFormFld   = $$$GetFormField("INReqLine",$$$FldINReqLineQtyRejected)
+				set intDecPlaces = $$GetDecimalPlaces^COMUtilNum("INReqLine",intFormFld,idInventUnit,objReqLine,"")
+				if intDecPlaces>0 set fltRejected = +$justify(fltRejected,0,intDecPlaces)
+				
+				set $$$INReqLineQtyRejected(objReqLine)     = fltRejected
+				set $$$INReqLineDateRejection(objReqLine)   = +$horolog
+				set $$$INReqLineRejected(objReqLine)        = $$$YES
+				set $$$INReqLineReasonRejection(objReqLine) = $$$INIssueSummaryRejectionReason(objIssue)
+				set $$$INReqLineStatus(objReqLine)			= 9 ; CORE-95 Auto Close
+				
+				set strStatus = $$$Save("INReqLine",strReference,objReqLine,$$$YES)
+			
+			} else {
+				set blnCloseReq = $$$NO ; CORE-95
+			}
+		
+		}
+		
+	}
+	; CORE-95 vvvv
+	if blnCloseReq && (strStatus = $$$OK) && ($get(idReq)'="") {
+		set objReq = $get(^INReq(YM,idReq,1))
+		set $$$INReqStatus(objReq) = 9 
+		set strStatus = $$$Save("INReq",idReq,objReq,$$$YES)
+	}
+	; CORE-95 ^^^^
+
+	quit strStatus
+
+FirmSaleIssue(pidIssue)
+	;-------------------------------------------------------------------------------
+	; Firm the Issue based on the Type - Firm each Line individually
+	;
+	;
+	; History:
+	; 21-Jul-2010	PPP		SR17465: Updated to return all Error messages
+	; 05-Aug-2009	DWR		SR16818: Changed GetInstance to look at issue line, not
+	; 							issue header, this was doubling processing.
+	; 23-Jul-2009	PPP		SR16753: GetInstance of Line can be
+	;							alMAN.dUManIssueLine, alREQ.dUReqIssueLine,
+	;							alISS.dUDispenseToPatientLine, alISS.dUIssueLine
+	; 15-May-2009	GRF		SR16199: sc/strStatus use clarified
+	; 11-May-2009	PPP		SR16199: Created
+	;-------------------------------------------------------------------------------
+	new idLine,idLocn,objIssueLine,objV1Issue,sc,strStatus
+	
+	set sc = $$$OK
+ 	set strStatus = $$$OK
+	
+	set objV1Issue = $get(^INIssue(YM,pidIssue,1))
+	set idLocn = $$$INIssueFromLocn(objV1Issue)
+		
+	set idLine = ""
+	for {
+		set idLine = $order(^INIssueLine(YM,pidIssue,idLine))
+		quit:idLine=""
+		
+		set objIssueLine = ##class(alISS.dUIssueLine).GetInstance("0||"_pidIssue_"||"_idLine)
+		
+		set ^zzFellipe("Inicio",idLine,$ztimestamp) = objIssueLine
+		set sc = objIssueLine.FirmIssue()
+		set ^zzFellipe("Fim",idLine,$ztimestamp) = objIssueLine
+		quit:$$$ISERR(sc)
+	}
+	
+	if $$$ISOK(sc) {
+		set $$$INIssueStatus(objV1Issue) = 9               ; Auto Closed
+		set $$$INIssuePosted(objV1Issue) = $horolog
+		if (+$$$WWWClientParamCoreChangesALL($get(^WWWClientParam(YM,YM,1)))) {
+			set $$$INIssueFREE2(objV1Issue) = $get(YBED)
+			if ($$$INIssueType(objV1Issue) = 3) {
+				set $$$INIssueToLocn(objV1Issue) = $$$INIssueFREE4(objV1Issue)
+			}
+		}
+		set strStatus = $$$Save("INIssue",pidIssue,objV1Issue,$$$YES)
+	
+	} else {
+		set strStatus = $$ISStatusToDLStatus^COMUtilError(sc)
+	//	set strStatus = $$ISStatusToDLStatusAllMessages^COMUtilError(sc)
+	}
+	quit strStatus
+	
+	
+GetStorage(pidItem,pidLocn,&strStatus,&objStorage)
+	;-------------------------------------------------------------------------------
+	; Get the Default Receipt Storage for the Item/Location
+	;
+	; Params: 	Item
+	; 			Location
+	;
+	; Returns:	Storage
+	; 			Status (byRef)
+	;
+	; History:
+	; 24-May-2013	SCR		CORE-94: Pass back Storage Object
+	; 11-May-2009	SCR		SR16199: Created
+	;-------------------------------------------------------------------------------
+	new idStore,objLocation,objStorage
+	
+	set strStatus = $$$OK
+	set idStore   = ""
+	set objStorage= "" ; CORE-94
+	
+	if $get(pidLocn)'="" {
+		set objLocation = ##class(alLOC.dULocation).%OpenId("0||"_pidLocn)
+		set objStorage  = objLocation.GetDefaultReceiptStorage(pidItem,.strStatus)
+		
+		if strStatus=$$$OK {
+			set idStore = objStorage.StockLocation	
+		}
+	}
+	quit idStore
+	
+	
+Source(pidIssue,pobjIssue,&parrIssueLines,pintLine,&arrLines,&parrQty)
+	;-------------------------------------------------------------------------------
+	; Source Storage & Bundle for item/quantity
+	;
+	; Params:
+	; pidIssue			Issue key
+	; pobjIssue 		Issue Header (INIssue)
+	; parrIssueLines	Array of original Issue Lines (INIssueLine)
+	; pintLine			current line
+	; arrLines			Array of new lines to pass back, there could be more than 1 sourced lines for every original issue line
+	; parrQty			Array of Stock on hand per item, this is kept so the same stock is not allocated a second time.
+	;
+	; Returns:	Status
+	; 			
+	;
+	; History:
+	; 12-Jun-2009	SCR		SR16546: Use Predefined Bundle if it has been selected
+	; 15-May-2009	GRF		SR16199: strStatus use clarified
+	; 04-May-2009	SCR		SR16199: Created
+	;-------------------------------------------------------------------------------
+	new fltBal,fltIssue,fltQty,fltSource,idBundle,idItem,idIssueLine
+	new idLineBundle,idLocn,intLineCount,objLine,objIssueLine,strKey,strStatus
+	
+	set idLocn        = $$$INIssueFromLocn(pobjIssue)
+	
+	set objLine       = $get(parrIssueLines(pintLine))
+	set idItem        = $$$INIssueLineItem(objLine)
+	set idLineBundle  = $$$INIssueLineBundle(objLine)
+	set strStatus     = $$GetStockInSourceOrder(idItem,.parrQty,idLocn,idLineBundle)
+	
+	if $$$ISOK(strStatus) {
+		set fltQty = $$$INIssueLineQtyRequired(objLine)
+		set strKey = ""
+		for intLineCount=1:1 {
+			quit:fltQty=0
+			
+			set strKey = $order(parrQty(idItem,strKey))
+			quit:strKey=""
+			
+			set fltSource = $get(parrQty(idItem,strKey))
+			set fltBal    = fltSource-fltQty
+			set fltIssue  = fltQty
+			
+			set idBundle = $piece(strKey,Y,4)
+			continue:((idLineBundle'="") && (idBundle'=idLineBundle))  ; SR16546 
+			
+			if fltBal>0 {
+				set parrQty(idItem,strKey) = fltBal  ; update Source with balance
+				set fltQty = 0  ; All Done
+				
+			} elseif fltBal=0 {
+				kill parrQty(idItem,strKey)          ; Remove source entry
+				set fltQty = 0  ; All Done 
+				
+			} else {
+				kill parrQty(idItem,strKey)          ; Remove source entry
+				set fltQty   = fltQty-fltSource      ; Another Line Required
+				set fltIssue = fltSource
+			}
+			
+			set objIssueLine = objLine               ; Refresh from source record for each pass
+			set $$$INIssueLineQtyIssued(objIssueLine)   = fltIssue
+			set $$$INIssueLineQtyRequired(objIssueLine) = fltIssue
+			set $$$INIssueLineQtyPicked(objIssueLine)   = fltIssue
+			set $$$INIssueLineFromStorage(objIssueLine) = $piece(strKey,Y,3)
+			set $$$INIssueLineBundle(objIssueLine)      = $piece(strKey,Y,4)
+			; Use the Original line number for first bundle / storage
+			; then the Original.Next Line Example 1 , 1.01 , 1.02
+			set idIssueLine = pidIssue_","_$select(intLineCount=1:pintLine,1:pintLine_"."_$translate($justify(intLineCount-1,2)," ","0"))
+			set arrLines(idIssueLine) = objIssueLine
+		}
+	}
+	quit strStatus
+	
+	
+GetStockInSourceOrder(pidItem,&parrQty,pidLocn,pidBundle="")
+	;-------------------------------------------------------------------------------
+	; Get the Stock in the Sourcing order (FIFO)
+	;
+	; Params:
+	; pidItem		Item
+	; parrQty		Array of Stock on hand per item, this is kept so the same stock is not allocated a second time.
+	; pidLocn		From Location 
+	; pidBundle		option bundle id	NOT USED
+	;
+	; Returns:	Status
+	; 			
+	;
+	; History:
+	; 23-Aug-2010	shobby	SR17516: Lot Number now may include a delimiter.
+	; 12-Jun-2009	SCR		SR16546: Added Bundle selection
+	; 27-May-2009	SCR		SR16546: Changed Date processing
+	; 01-May-2009	SCR		SR16199: Created
+	;-------------------------------------------------------------------------------
+	new arrBundle,dteUseBy,fltQty,idBundle,idStorage
+	new strBundle,strDate,strKey,strLot,strStatus
+	
+	set strStatus = $$$OK
+	
+	if '$data(parrQty(pidItem)) {    ; Only do this once per Item
+		set strStatus = $$GetStockByItem^INARTMENGE(pidItem,.arrBundle,pidLocn)  //Get Stock Details
+	; FIXME : What if error? <GRF>
+			
+		set parrQty(pidItem) = 1 ; Processed Item Flag
+		
+		set idStorage = ""
+		for {
+			set idStorage = $order(arrBundle(pidItem,idStorage))
+			quit:idStorage=""
+			
+			set strLot = ""
+			for {
+				set strLot = $order(arrBundle(pidItem,idStorage,strLot))
+				quit:strLot=""
+				
+				set strBundle = $get(arrBundle(pidItem,idStorage,strLot))
+				set fltQty    = $piece(strBundle,"+",1)
+				set strDate   = $piece(strBundle,"+",2)    ; DD/MM/YYYY
+				set idBundle  = $piece(strBundle,"+",3)
+			;	if (pidBundle'="") && (idBundle'=pidBundle) continue  ; SR16546 ; Do this test at the higher level
+				set dteUseBy  = 10000
+				if strDate'="" {
+					set dteUseBy = $$^WWWDATE1(strDate)  ; SR16546
+				}
+				if fltQty<0 {
+					set dteUseBy = dteUseBy+10000 ; force -ve stock to the end of the list by adding 27 years to the expiry date!
+				}
+				set strKey = dteUseBy_Y_$piece(strLot,"#",1)_Y_$piece(idStorage,"||",2)_Y_idBundle  ;SR17516
+				set parrQty(pidItem,strKey) = fltQty
+			}
+		}
+	}
+	; t("ED3","1004||A",131)="13+18/10/2009"
+	; t("ED3","1004||A",132)="20+18/10/2009"
+	; t("ED3","1004||A",133)="18+18/10/2009"
+	; t("ED3","1004||C",123)="0+07/07/2009"
+	; t("ED3","1004||C",125)="2+18/10/2009"
+	; t("ED3","1004||C",133)="2+18/10/2009"
+	
+	set idStorage = $order(^INLP(YM,pidLocn,""))  ; Default storage 
+	; FIXME : This should check the Location setup for a Default Storage first!
+	set strKey = "xxxx"_Y_Y_pidLocn_"||"_idStorage
+	set parrQty(pidItem,strKey) = 999999999 
+	
+	quit strStatus
+	
+UpdateStatusIfFullFill(pidIssue)
+	new idReq, idReqLine, objReq, objReqLine, blAllClosed
+	
+	set idReq 	    = $$$INIssueReference($get(^INIssue(YM,pidIssue,1)))
+	set blAllClosed = $$$YES
+	set strStatus   = $$$OK
+	set idReqLine   = ""
+
+	for { 
+		set idReqLine = $order(^INReqLine(YM,idReq,idReqLine))
+		quit:(idReqLine = "")
+		set objReqLine = $get(^INReqLine(YM,idReq,idReqLine,1))
+		if ($$$INReqLineStatus(objReqLine) < 7){
+			set blAllClosed = $$$NO
+			quit
+		}
+	}
+	
+	if (blAllClosed = $$$YES){
+		set objReq = $get(^INReq(YM,idReq,1))
+		set $$$INReqStatus(objReq) = 9 
+		set strStatus = $$$Save("INReq",idReq,objReq,$$$YES)	
+	}
+	
+	if ($$$ISERR(strStatus)){
+		$$$Alert($$$MakeStatus(strStatus))
+	}
+	
+	quit strStatus
+]]></Routine>
+</Export>
